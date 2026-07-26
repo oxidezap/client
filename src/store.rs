@@ -148,7 +148,9 @@ impl ChatStore {
     /// Record a message this client just sent. Goes through the writer queue so
     /// it cannot race the server ack / receipts that follow it in event order.
     /// Status starts at [`MessageStatus::Pending`](crate::types::MessageStatus::Pending)
-    /// and is lifted by acks/receipts.
+    /// and is lifted by acks/receipts. `timestamp` is the optimistic display
+    /// time; a positive message ack replaces it with the server's `t` when
+    /// available and refreshes the conversation order.
     ///
     /// `chat` may be either of a 1:1 peer's identities (phone number or LID):
     /// the row is stored on the peer's one thread regardless — an existing
@@ -1162,6 +1164,45 @@ fn refresh_preview_if_latest(
     Ok(true)
 }
 
+struct ChatHead {
+    timestamp_ms: i64,
+    preview: Option<String>,
+    kind: Option<String>,
+}
+
+fn newest_chat_head(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+) -> QueryResult<Option<ChatHead>> {
+    use schema::messages::dsl;
+    let newest: Option<(i64, Option<String>, String, bool)> = dsl::messages
+        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
+        .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
+        .select((
+            dsl::timestamp_ms,
+            dsl::text_content,
+            dsl::kind,
+            dsl::revoked,
+        ))
+        .first(conn)
+        .optional()?;
+    Ok(newest.map(|(timestamp_ms, text, kind, revoked)| {
+        // A tombstone previews as nothing at all — its pre-revoke kind must
+        // not leak back into the chat head.
+        let (preview, kind) = if revoked {
+            (None, None)
+        } else {
+            (text, Some(kind))
+        };
+        ChatHead {
+            timestamp_ms,
+            preview,
+            kind,
+        }
+    }))
+}
+
 /// Re-derive the chat-list preview from the newest remaining message (used
 /// after deletions, where the previewed row may be gone).
 ///
@@ -1174,18 +1215,9 @@ fn recompute_chat_preview(
     device_id: i32,
     chat: &str,
 ) -> QueryResult<()> {
-    use schema::messages::dsl;
-    let newest: Option<(Option<String>, String, bool)> = dsl::messages
-        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
-        .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
-        .select((dsl::text_content, dsl::kind, dsl::revoked))
-        .first(conn)
-        .optional()?;
-    let (preview, kind) = match newest {
-        // A tombstone previews as nothing at all — its pre-revoke kind must
-        // not leak back (mirrors the revoke path's (None, None)).
-        Some((_, _, true)) | None => (None, None),
-        Some((text, kind, false)) => (text, Some(kind)),
+    let (preview, kind) = match newest_chat_head(conn, device_id, chat)? {
+        Some(head) => (head.preview, head.kind),
+        None => (None, None),
     };
     diesel::update(chat_row(device_id, chat))
         .set((
@@ -1194,6 +1226,46 @@ fn recompute_chat_preview(
         ))
         .execute(conn)?;
     Ok(())
+}
+
+/// Re-derive the chat head when the server replaces an optimistic outgoing
+/// timestamp. A deleted newer message deliberately keeps its activity time,
+/// while the preview always follows the newest surviving row.
+fn reconcile_chat_head_after_timestamp_change(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    old_timestamp_ms: i64,
+    new_timestamp_ms: i64,
+) -> QueryResult<bool> {
+    use schema::chats::dsl as chats;
+    let current_head: Option<i64> = chat_row(device_id, chat)
+        .select(chats::last_message_ts)
+        .first(conn)
+        .optional()?;
+    let Some(current_head) = current_head else {
+        return Ok(false);
+    };
+    let Some(head) = newest_chat_head(conn, device_id, chat)? else {
+        return Ok(false);
+    };
+    let updated = if current_head != old_timestamp_ms && new_timestamp_ms < current_head {
+        diesel::update(chat_row(device_id, chat))
+            .set((
+                chats::last_message_preview.eq(head.preview),
+                chats::last_message_kind.eq(head.kind),
+            ))
+            .execute(conn)?
+    } else {
+        diesel::update(chat_row(device_id, chat))
+            .set((
+                chats::last_message_ts.eq(head.timestamp_ms),
+                chats::last_message_preview.eq(head.preview),
+                chats::last_message_kind.eq(head.kind),
+            ))
+            .execute(conn)?
+    };
+    Ok(updated > 0)
 }
 
 fn apply_reaction(
@@ -1414,6 +1486,50 @@ fn apply_receipt(
     Ok(())
 }
 
+fn resolve_server_ack_message(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    ack: &wacore::types::events::ServerAck,
+    cs: &mut ChangeSet,
+) -> QueryResult<Option<(String, i64)>> {
+    use schema::messages::dsl;
+    if let Some(from) = &ack.from {
+        let chat = crate::lid::route_chat_key(conn, device_id, &from.to_string(), cs)?;
+        let timestamp_ms: Option<i64> = message_row(device_id, &chat, &ack.id)
+            .filter(dsl::from_me.eq(true))
+            .select(dsl::timestamp_ms)
+            .first(conn)
+            .optional()?;
+        if let Some(timestamp_ms) = timestamp_ms {
+            return Ok(Some((chat, timestamp_ms)));
+        }
+    }
+
+    // Some server acks omit the chat identity. The id remains safe only when
+    // it identifies exactly one outgoing row for this device.
+    let mut matches: Vec<(String, i64)> = dsl::messages
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::msg_id.eq(&ack.id))
+                .and(dsl::from_me.eq(true)),
+        )
+        .select((dsl::chat_jid, dsl::timestamp_ms))
+        .limit(2)
+        .load(conn)?;
+    if matches.len() == 1 {
+        return Ok(matches.pop());
+    }
+    if matches.len() > 1 {
+        warn!(
+            target: "ChatStore/Ack",
+            "Ignoring ambiguous message ack for reused id {}",
+            ack.id
+        );
+    }
+    Ok(None)
+}
+
 fn apply_server_ack(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -1425,46 +1541,63 @@ fn apply_server_ack(
         return Ok(());
     }
     use schema::messages::dsl;
-    let updated = if ack.error.is_some() {
+    let Some((chat, old_timestamp_ms)) = resolve_server_ack_message(conn, device_id, ack, cs)?
+    else {
+        return Ok(());
+    };
+    let target = message_row(device_id, &chat, &ack.id).filter(dsl::from_me.eq(true));
+    let status_updated = if ack.error.is_some() {
         // Nack: the server rejected the send. Only a still-pending row fails —
         // the server emits one ack per stanza, so a row past PENDING already
         // got its positive answer and a stray nack must not regress it.
-        diesel::update(
-            dsl::messages.filter(
-                dsl::device_id
-                    .eq(device_id)
-                    .and(dsl::msg_id.eq(&ack.id))
-                    .and(dsl::from_me.eq(true))
-                    .and(dsl::status.eq(wa::web_message_info::Status::PENDING as i32)),
-            ),
-        )
-        .set(dsl::status.eq(wa::web_message_info::Status::ERROR as i32))
-        .execute(conn)?
+        diesel::update(target.filter(dsl::status.eq(wa::web_message_info::Status::PENDING as i32)))
+            .set(dsl::status.eq(wa::web_message_info::Status::ERROR as i32))
+            .execute(conn)?
+            > 0
     } else {
         diesel::update(
-            dsl::messages.filter(
-                dsl::device_id
-                    .eq(device_id)
-                    .and(dsl::msg_id.eq(&ack.id))
-                    .and(dsl::from_me.eq(true))
-                    .and(dsl::status.lt(wa::web_message_info::Status::SERVER_ACK as i32)),
-            ),
+            target.filter(dsl::status.lt(wa::web_message_info::Status::SERVER_ACK as i32)),
         )
         .set(dsl::status.eq(wa::web_message_info::Status::SERVER_ACK as i32))
         .execute(conn)?
+            > 0
     };
-    if updated > 0 {
+    // A positive message ack's `t` is the server's authoritative send clock.
+    // Apply it independently of the status transition: a delivery/read receipt
+    // may have advanced the row before the ack event reaches this writer.
+    let server_timestamp_ms = ack
+        .timestamp
+        .filter(|_| ack.error.is_none())
+        .map(|timestamp| timestamp.timestamp_millis());
+    let timestamp_updated = if let Some(timestamp_ms) = server_timestamp_ms {
+        diesel::update(
+            message_row(device_id, &chat, &ack.id)
+                .filter(dsl::from_me.eq(true))
+                .filter(dsl::timestamp_ms.ne(timestamp_ms)),
+        )
+        .set(dsl::timestamp_ms.eq(timestamp_ms))
+        .execute(conn)?
+            > 0
+    } else {
+        false
+    };
+    if timestamp_updated
+        && let Some(timestamp_ms) = server_timestamp_ms
+        && reconcile_chat_head_after_timestamp_change(
+            conn,
+            device_id,
+            &chat,
+            old_timestamp_ms,
+            timestamp_ms,
+        )?
+    {
+        cs.chats = true;
+    }
+    if status_updated || timestamp_updated {
         // Resolve the chat from the row itself: the ack's `from` is the wire
         // identity, which may not be the key the row is stored under (PN/LID
         // aliasing). Emit both so consumers keyed by either get invalidated.
-        let row_chat: Option<String> = dsl::messages
-            .filter(dsl::device_id.eq(device_id).and(dsl::msg_id.eq(&ack.id)))
-            .select(dsl::chat_jid)
-            .first(conn)
-            .optional()?;
-        if let Some(chat) = row_chat {
-            cs.message_chats.insert(chat);
-        }
+        cs.message_chats.insert(chat);
         if let Some(from) = &ack.from {
             cs.message_chats.insert(from.to_string());
         }
