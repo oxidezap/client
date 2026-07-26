@@ -48,6 +48,27 @@ pub(crate) enum WriterMsg {
         text: Option<String>,
         timestamp_ms: i64,
     },
+    Edit {
+        chat: Jid,
+        target_id: String,
+        proto: Vec<u8>,
+        kind: &'static str,
+        text: Option<String>,
+        timestamp_ms: i64,
+    },
+    Revoke {
+        chat: Jid,
+        target_id: String,
+        timestamp_ms: i64,
+    },
+    Reaction {
+        chat: Jid,
+        target_id: String,
+        target_from_me: bool,
+        target_participant: Option<String>,
+        emoji: String,
+        timestamp_ms: i64,
+    },
     Reconcile(Jid),
     // String, not StoreError: one batch outcome fans out to many waiters and
     // StoreError is not Clone.
@@ -172,6 +193,85 @@ impl ChatStore {
                 proto: waproto::codec::message_to_vec(message),
                 kind: message_kind(base),
                 text: extract_text(base),
+                timestamp_ms: timestamp.timestamp_millis(),
+            })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Record an edit this client just sent for one of its own messages.
+    ///
+    /// This is the local counterpart of an inbound `MESSAGE_EDIT`: it updates
+    /// the existing row in place (or creates the same out-of-order placeholder
+    /// as the event path), preserving the edit's timestamp ordering and
+    /// tombstone rules. Goes through the writer queue; use
+    /// [`flush`](Self::flush) to await completion.
+    pub fn record_edit(
+        &self,
+        chat: &Jid,
+        target_id: &str,
+        new_content: &wa::Message,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        let base = wacore::proto_helpers::MessageExt::get_base_message(new_content);
+        self.tx
+            .send(WriterMsg::Edit {
+                chat: chat.clone(),
+                target_id: target_id.to_owned(),
+                proto: waproto::codec::message_to_vec(new_content),
+                kind: message_kind(base),
+                text: extract_text(base),
+                timestamp_ms: timestamp.timestamp_millis(),
+            })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Record a sender revoke this client just sent for one of its own
+    /// messages.
+    ///
+    /// The target becomes a tombstone and cannot be resurrected by a delayed
+    /// content delivery or edit. Goes through the writer queue; use
+    /// [`flush`](Self::flush) to await completion.
+    pub fn record_revoke(
+        &self,
+        chat: &Jid,
+        target_id: &str,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        self.tx
+            .send(WriterMsg::Revoke {
+                chat: chat.clone(),
+                target_id: target_id.to_owned(),
+                timestamp_ms: timestamp.timestamp_millis(),
+            })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Record a reaction this client just sent. An empty `emoji` removes this
+    /// client's existing reaction, matching the inbound event semantics.
+    ///
+    /// `target` is the same message key passed to `Client::send_reaction` and
+    /// must contain an id. If no stored message matches its authorship, the
+    /// queued reaction is a no-op. Goes through the writer queue; use
+    /// [`flush`](Self::flush) to await completion.
+    pub fn record_reaction(
+        &self,
+        chat: &Jid,
+        target: &wa::MessageKey,
+        emoji: &str,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        let target_id = target.id.clone().ok_or_else(|| {
+            ChatStoreError::Store(StoreError::Validation(
+                "reaction target key missing id".into(),
+            ))
+        })?;
+        self.tx
+            .send(WriterMsg::Reaction {
+                chat: chat.clone(),
+                target_id,
+                target_from_me: target.from_me.unwrap_or(false),
+                target_participant: target.participant.clone(),
+                emoji: emoji.to_owned(),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
@@ -525,11 +625,7 @@ fn apply_writer_msg(
             text,
             timestamp_ms,
         } => {
-            let wire = chat.to_string();
-            let chat_str = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
-            if chat_str != wire {
-                cs.message_chats.insert(wire);
-            }
+            let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
             let stored = insert_message(
                 conn,
                 device_id,
@@ -565,8 +661,163 @@ fn apply_writer_msg(
             cs.message_chats.insert(chat_str);
             Ok(())
         }
+        WriterMsg::Edit {
+            chat,
+            target_id,
+            proto,
+            kind,
+            text,
+            timestamp_ms,
+        } => {
+            let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
+            if !local_target_collides_with_peer(conn, device_id, &chat_str, target_id)?
+                && apply_edit(
+                    conn,
+                    device_id,
+                    &chat_str,
+                    target_id,
+                    "",
+                    true,
+                    text.as_deref(),
+                    kind,
+                    proto,
+                    *timestamp_ms,
+                )?
+            {
+                cs.chats = true;
+            }
+            cs.message_chats.insert(chat_str);
+            Ok(())
+        }
+        WriterMsg::Revoke {
+            chat,
+            target_id,
+            timestamp_ms,
+        } => {
+            let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
+            if !local_target_collides_with_peer(conn, device_id, &chat_str, target_id)?
+                && apply_revoke(
+                    conn,
+                    device_id,
+                    &chat_str,
+                    target_id,
+                    "",
+                    true,
+                    *timestamp_ms,
+                )?
+            {
+                cs.chats = true;
+            }
+            cs.message_chats.insert(chat_str);
+            Ok(())
+        }
+        WriterMsg::Reaction {
+            chat,
+            target_id,
+            target_from_me,
+            target_participant,
+            emoji,
+            timestamp_ms,
+        } => {
+            let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
+            if local_reaction_target_matches(
+                conn,
+                device_id,
+                &chat_str,
+                target_id,
+                *target_from_me,
+                target_participant.as_deref(),
+            )? {
+                // Own reactors are stored as the empty JID, the same sentinel
+                // used by history sync for key.from_me reactions.
+                apply_reaction(
+                    conn,
+                    device_id,
+                    &chat_str,
+                    target_id,
+                    "",
+                    emoji,
+                    *timestamp_ms,
+                )?;
+            }
+            cs.message_chats.insert(chat_str);
+            Ok(())
+        }
         WriterMsg::Flush(_) => Ok(()),
     }
+}
+
+fn route_writer_chat(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &Jid,
+    cs: &mut ChangeSet,
+) -> QueryResult<String> {
+    let wire = chat.to_string();
+    let routed = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
+    if routed != wire {
+        cs.message_chats.insert(wire);
+    }
+    Ok(routed)
+}
+
+/// A local amendment may create an own-message placeholder when its target is
+/// absent, but an existing peer row with the same sender-chosen id belongs to
+/// a different message and must remain untouched.
+fn local_target_collides_with_peer(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    target_id: &str,
+) -> QueryResult<bool> {
+    diesel::select(diesel::dsl::exists(
+        message_row(device_id, chat, target_id).filter(schema::messages::from_me.eq(false)),
+    ))
+    .get_result(conn)
+}
+
+/// Match the full target identity, not just its sender-chosen id. Device
+/// suffixes and known PN/LID aliases normalize before participant comparison.
+fn local_reaction_target_matches(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    target_id: &str,
+    target_from_me: bool,
+    target_participant: Option<&str>,
+) -> QueryResult<bool> {
+    let target: Option<(bool, String)> = message_row(device_id, chat, target_id)
+        .select((schema::messages::from_me, schema::messages::sender_jid))
+        .first(conn)
+        .optional()?;
+    let Some((stored_from_me, stored_sender)) = target else {
+        return Ok(false);
+    };
+    if stored_from_me != target_from_me {
+        return Ok(false);
+    }
+    if target_from_me {
+        return Ok(true);
+    }
+    let Some(participant) = target_participant else {
+        let needs_participant = Jid::from_str(chat).is_ok_and(|jid| {
+            jid.is_group() || jid.is_status_broadcast() || jid.is_broadcast_list()
+        });
+        return Ok(!needs_participant);
+    };
+    let (Ok(stored), Ok(target)) = (Jid::from_str(&stored_sender), Jid::from_str(participant))
+    else {
+        return Ok(stored_sender == participant);
+    };
+    let stored = stored.to_non_ad_string();
+    let target = target.to_non_ad_string();
+    if stored == target {
+        return Ok(true);
+    }
+    Ok(
+        crate::lid::counterpart_chat_key(conn, device_id, &stored)?.as_deref()
+            == Some(target.as_str()),
+    )
 }
 
 fn apply_event(
@@ -1278,47 +1529,34 @@ fn apply_reaction(
     ts_ms: i64,
 ) -> QueryResult<()> {
     use schema::reactions::dsl;
-    if emoji.is_empty() {
-        // Same monotonic rule as the add path: a stale remove (older than the
-        // stored reaction) must not delete a newer live one.
-        diesel::delete(
-            dsl::reactions.filter(
-                dsl::device_id
-                    .eq(device_id)
-                    .and(dsl::chat_jid.eq(chat))
-                    .and(dsl::msg_id.eq(target_id))
-                    .and(dsl::sender_jid.eq(sender))
-                    .and(dsl::ts_ms.le(ts_ms)),
-            ),
-        )
+    // Empty emoji is a removal tombstone, not a deletion: retaining its
+    // timestamp prevents an older history chunk from resurrecting the prior
+    // reaction. The read API hides these rows.
+    diesel::insert_into(dsl::reactions)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::chat_jid.eq(chat),
+            dsl::msg_id.eq(target_id),
+            dsl::sender_jid.eq(sender),
+            dsl::emoji.eq(emoji),
+            dsl::ts_ms.eq(ts_ms),
+        ))
+        .on_conflict_do_nothing()
         .execute(conn)?;
-    } else {
-        diesel::insert_into(dsl::reactions)
-            .values((
-                dsl::device_id.eq(device_id),
-                dsl::chat_jid.eq(chat),
-                dsl::msg_id.eq(target_id),
-                dsl::sender_jid.eq(sender),
-                dsl::emoji.eq(emoji),
-                dsl::ts_ms.eq(ts_ms),
-            ))
-            .on_conflict_do_nothing()
-            .execute(conn)?;
-        // Latest reaction per sender wins; a stale copy (e.g. from a history
-        // chunk) must not replace a newer live one.
-        diesel::update(
-            dsl::reactions.filter(
-                dsl::device_id
-                    .eq(device_id)
-                    .and(dsl::chat_jid.eq(chat))
-                    .and(dsl::msg_id.eq(target_id))
-                    .and(dsl::sender_jid.eq(sender))
-                    .and(dsl::ts_ms.le(ts_ms)),
-            ),
-        )
-        .set((dsl::emoji.eq(emoji), dsl::ts_ms.eq(ts_ms)))
-        .execute(conn)?;
-    }
+    // Latest reaction per sender wins; a stale copy (e.g. from a history
+    // chunk) must not replace either a newer live reaction or its tombstone.
+    diesel::update(
+        dsl::reactions.filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq(chat))
+                .and(dsl::msg_id.eq(target_id))
+                .and(dsl::sender_jid.eq(sender))
+                .and(dsl::ts_ms.le(ts_ms)),
+        ),
+    )
+    .set((dsl::emoji.eq(emoji), dsl::ts_ms.eq(ts_ms)))
+    .execute(conn)?;
     Ok(())
 }
 
