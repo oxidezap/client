@@ -167,6 +167,27 @@ pub struct StoredMessage {
     pub starred: bool,
     pub edited_at: Option<DateTime<Utc>>,
     pub revoked: bool,
+    /// Arrival order within this store, ascending. Opaque: compare it, don't
+    /// interpret it. It exists because the server's `t` is whole seconds, so
+    /// two messages exchanged in the same second carry the same `timestamp`
+    /// and something has to break the tie — this is the order the socket
+    /// delivered them in, which is the order both ends display.
+    ///
+    /// Comparable, not durable: a `VACUUM` preserves the relative order these
+    /// values encode but may renumber the values themselves, so a `seq` (or a
+    /// [`MessageCursor`] built from one) is good for a live paging session and
+    /// must not be persisted across restarts.
+    ///
+    /// It is *store* arrival, not wire arrival. Inbound rows are inserted as
+    /// the socket delivers them, but an outgoing row is inserted when the host
+    /// calls `record_outgoing`, which happens after its send resolves — so a
+    /// peer reply that is decrypted and materialized in that gap, and that
+    /// lands on the same whole second, takes the lower `seq`. That needs a full
+    /// round trip to complete inside one second while a local enqueue is still
+    /// pending, and it is bounded to same-second pairs; the ordering it
+    /// replaced was wrong for roughly three of every four such pairs, in a
+    /// fixed direction.
+    pub seq: i64,
 }
 
 /// Keyset-pagination cursor: pass the values of the oldest message you have to
@@ -174,14 +195,41 @@ pub struct StoredMessage {
 #[derive(Debug, Clone)]
 pub struct MessageCursor {
     pub timestamp_ms: i64,
-    pub msg_id: String,
+    /// [`StoredMessage::seq`] of the same message. Must match the sort's
+    /// tiebreak exactly, or a page boundary that lands inside a same-second
+    /// run would skip or repeat rows.
+    pub seq: i64,
 }
 
 impl From<&StoredMessage> for MessageCursor {
     fn from(m: &StoredMessage) -> Self {
         Self {
             timestamp_ms: m.timestamp.timestamp_millis(),
-            msg_id: m.id.clone(),
+            seq: m.seq,
+        }
+    }
+}
+
+/// Keyset-pagination cursor for the chat list: pass the values of the last
+/// chat you have to fetch the page after it.
+///
+/// The list is two ordered runs — pinned chats by pin time, then the rest by
+/// activity — so the cursor records which run it sits in (`pinned_at`) as well
+/// as where.
+#[derive(Debug, Clone)]
+pub struct ChatCursor {
+    /// `Some` for a cursor inside the pinned run, `None` for the activity run.
+    pub pinned_at_ms: Option<i64>,
+    pub last_message_ts: i64,
+    pub jid: String,
+}
+
+impl From<&ChatEntry> for ChatCursor {
+    fn from(c: &ChatEntry) -> Self {
+        Self {
+            pinned_at_ms: c.pinned_at.map(|t| t.timestamp_millis()),
+            last_message_ts: c.last_message_at.map_or(0, |t| t.timestamp_millis()),
+            jid: c.jid.to_string(),
         }
     }
 }
