@@ -1744,52 +1744,11 @@ fn apply_receipt(
     let user = receipt.source.sender.to_non_ad_string();
     let mut missed: Vec<&String> = Vec::new();
     for msg_id in &receipt.message_ids {
-        // Peer receipts only ever advance the delivery state of our own
-        // messages, and never backwards.
-        let updated = diesel::update(
-            message_row(device_id, &chat, msg_id).filter(
-                schema::messages::from_me
-                    .eq(true)
-                    .and(schema::messages::status.lt(status)),
-            ),
-        )
-        .set(schema::messages::status.eq(status))
-        .execute(conn)?;
         // Zero rows covers both the real PN/LID miss and a replay against a
         // row already at/past the target; the alt retry stays harmless for
         // the latter (advance-only) and still heals a lagging split copy.
-        if updated == 0 {
+        if !advance_status(conn, device_id, &chat, msg_id, status)? {
             missed.push(msg_id);
-        }
-
-        // Derived from the JID: the library's receipt parser leaves
-        // `source.is_group` defaulted, so the flag can't be trusted here.
-        if receipt.source.chat.is_group() {
-            use schema::message_receipts::dsl;
-            diesel::insert_into(dsl::message_receipts)
-                .values((
-                    dsl::device_id.eq(device_id),
-                    dsl::chat_jid.eq(&chat),
-                    dsl::msg_id.eq(msg_id),
-                    dsl::user_jid.eq(&user),
-                    dsl::receipt_type.eq(status),
-                    dsl::ts_ms.eq(ts_ms),
-                ))
-                .on_conflict_do_nothing()
-                .execute(conn)?;
-            // Existing row: advance only (a late "delivered" must not undo "read").
-            diesel::update(
-                dsl::message_receipts.filter(
-                    dsl::device_id
-                        .eq(device_id)
-                        .and(dsl::chat_jid.eq(&chat))
-                        .and(dsl::msg_id.eq(msg_id))
-                        .and(dsl::user_jid.eq(&user))
-                        .and(dsl::receipt_type.lt(status)),
-                ),
-            )
-            .set((dsl::receipt_type.eq(status), dsl::ts_ms.eq(ts_ms)))
-            .execute(conn)?;
         }
     }
     // A modern peer addresses the receipt by whichever identity it has for
@@ -1797,28 +1756,169 @@ fn apply_receipt(
     // misses under the mapped counterpart key (WA Web's alternate-key
     // fallback, `fixMsgKeysWithPnMapping`); costs one indexed lookup and only
     // on the miss path, so the already-consistent case stays free.
-    if !missed.is_empty()
-        && !receipt.source.chat.is_group()
-        && let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, &chat)?
-    {
-        let mut matched_alt = false;
-        for msg_id in missed {
-            matched_alt |= diesel::update(
-                message_row(device_id, &alt, msg_id).filter(
-                    schema::messages::from_me
-                        .eq(true)
-                        .and(schema::messages::status.lt(status)),
-                ),
-            )
-            .set(schema::messages::status.eq(status))
-            .execute(conn)?
-                > 0;
+    //
+    // Where a message answers under the counterpart key, its receipt belongs
+    // there too: the satellite prune is per chat and drops receipt rows whose
+    // `msg_id` is absent from *that* chat, so a row left under the wire key
+    // would be collected as an orphan.
+    let mut relocated: std::collections::HashMap<&String, String> =
+        std::collections::HashMap::new();
+    // Named by the receipt but held by no chat: the wire key is only a guess
+    // for these, resolved once below.
+    let mut unowned: Vec<&String> = Vec::new();
+    // Resolved only when something actually missed, so a receipt whose messages
+    // all answered under the key they were addressed by pays nothing extra —
+    // which is the overwhelmingly common case and the one worth keeping free.
+    let counterpart = if missed.is_empty() || receipt.source.chat.is_group() {
+        None
+    } else {
+        crate::lid::counterpart_chat_key(conn, device_id, &chat)?
+    };
+    for msg_id in missed {
+        if let Some(alt) = &counterpart
+            && advance_status(conn, device_id, alt, msg_id, status)?
+        {
+            relocated.insert(msg_id, alt.clone());
+            continue;
         }
-        if matched_alt {
-            cs.message_chats.insert(alt);
+        // The status not advancing does not mean the row is missing: a replayed
+        // receipt, or one arriving behind the state already recorded, moves
+        // nothing under either key. Whether a message is here at all is a
+        // separate question from whether this receipt changed it, and only the
+        // first decides where — or whether — the receipt is filed.
+        //
+        // The addressed key is asked first, and separately from whether it
+        // still has a `chats` row: a delete can retire the chat while its
+        // messages await cleanup, and a receipt for one of those belongs where
+        // the message is, not where the thread went.
+        if message_exists(conn, device_id, &chat, msg_id)? {
+            continue;
+        }
+        if let Some(alt) = &counterpart
+            && message_exists(conn, device_id, alt, msg_id)?
+        {
+            relocated.insert(msg_id, alt.clone());
+        } else {
+            unowned.push(msg_id);
         }
     }
+    if !relocated.is_empty()
+        && let Some(alt) = counterpart
+    {
+        cs.message_chats.insert(alt);
+    }
+
+    // Both chat kinds record the per-state rows. A group needs them to say who
+    // has read; a 1:1 needs them because the message's own `status` keeps only
+    // the state it reached, not the instant it got there — which is the half
+    // WA Web's "Delivered hh:mm / Read hh:mm" is made of.
+    //
+    // A receipt for a message no chat holds is dropped rather than parked. The
+    // id is the server's, not ours, and nothing here can tell "our send has not
+    // been recorded yet" from "this message was deleted and its receipts swept
+    // with it" — and the second reading is the common one, because a peer
+    // receipt costs a round trip to that peer and back, so it arrives well
+    // after the send it answers. Parking it re-created metadata for messages a
+    // user had deleted, which is a worse answer than a blank time on a race
+    // that resolves itself: the message's own status is only ever advanced by a
+    // receipt that finds it, and a later one for the same message will.
+    for msg_id in &receipt.message_ids {
+        let key = match relocated.get(msg_id) {
+            Some(alt) => alt,
+            None if unowned.contains(&msg_id) => continue,
+            None => &chat,
+        };
+        record_receipt(conn, device_id, key, msg_id, &user, status, ts_ms)?;
+    }
+
     cs.message_chats.insert(chat);
+    Ok(())
+}
+
+/// Move one of our messages forward to `status`, reporting whether it moved.
+///
+/// Peer receipts only ever advance the delivery state of our own messages, and
+/// never backwards — so a replay, or one arriving behind the state already
+/// recorded, moves nothing and says so.
+fn advance_status(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    msg_id: &str,
+    status: i32,
+) -> QueryResult<bool> {
+    let updated = diesel::update(
+        message_row(device_id, chat, msg_id).filter(
+            schema::messages::from_me
+                .eq(true)
+                .and(schema::messages::status.lt(status)),
+        ),
+    )
+    .set(schema::messages::status.eq(status))
+    .execute(conn)?;
+    Ok(updated > 0)
+}
+
+/// Whether this device stores an outgoing message with this id in this chat.
+fn message_exists(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    msg_id: &str,
+) -> QueryResult<bool> {
+    diesel::select(diesel::dsl::exists(
+        message_row(device_id, chat, msg_id).filter(schema::messages::from_me.eq(true)),
+    ))
+    .get_result(conn)
+}
+
+/// Record that `user` reached `status` on one message, at `ts_ms`.
+///
+/// Keeps the earliest instant for a state rather than the first one processed.
+/// A replay is a duplicate rather than a new event, and receipts do not arrive
+/// in time order: an offline queue drains after the live socket, so a peer
+/// device's delayed report can land behind a later one for the same state.
+/// Arrival order would then decide what message info shows, which is the same
+/// reason the alias merge resolves its collisions by `MIN(ts_ms)`.
+fn record_receipt(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    msg_id: &str,
+    user: &str,
+    status: i32,
+    ts_ms: i64,
+) -> QueryResult<()> {
+    use schema::message_receipts::dsl;
+    let row = || {
+        dsl::message_receipts.filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq(chat))
+                .and(dsl::msg_id.eq(msg_id))
+                .and(dsl::user_jid.eq(user))
+                .and(dsl::receipt_type.eq(status)),
+        )
+    };
+    let inserted = diesel::insert_into(dsl::message_receipts)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::chat_jid.eq(chat),
+            dsl::msg_id.eq(msg_id),
+            dsl::user_jid.eq(user),
+            dsl::receipt_type.eq(status),
+            dsl::ts_ms.eq(ts_ms),
+        ))
+        .on_conflict_do_nothing()
+        .execute(conn)?;
+    // Only a conflict leaves an instant to reconsider: a row this call created
+    // already holds `ts_ms`, and the first report of a state is the common
+    // case on a path that runs for every receipt.
+    if inserted == 0 {
+        diesel::update(row().filter(dsl::ts_ms.gt(ts_ms)))
+            .set(dsl::ts_ms.eq(ts_ms))
+            .execute(conn)?;
+    }
     Ok(())
 }
 
