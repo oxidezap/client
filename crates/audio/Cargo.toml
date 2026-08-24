@@ -19,7 +19,7 @@ log = { workspace = true }
 ogg = "0.9"
 # Kept on the same major as the library's voip-libopus dependency: two
 # semver-incompatible wrappers would each link their own copy of libopus.
-opus = "0.3"
+opus = "0.4"
 portable-atomic = { workspace = true }
 ringbuf = "0.5"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

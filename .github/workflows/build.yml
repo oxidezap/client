@@ -12,13 +12,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # audiopus_sys compiles the vendored Opus with CMake whenever pkg-config
-  # cannot find a system copy, which is every runner but Linux. That vendored
-  # CMakeLists declares a minimum below 3.5, and CMake 4 refuses it outright.
-  # Relaxing the policy floor keeps the build self-contained; installing Opus
-  # from a package manager instead would link it dynamically and make the
-  # released binary depend on the user having libopus.
-  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   build:
