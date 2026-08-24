@@ -220,6 +220,13 @@ pub struct WhatsAppClient {
     /// thread would keep its runtime and SQLite pool alive forever (bot.run()
     /// reconnects internally and never returns on its own).
     shutdown: Arc<tokio::sync::Notify>,
+    /// The session thread, kept joinable.
+    ///
+    /// `shutdown()` only asks it to stop; the thread still has to disconnect
+    /// and close SQLite. Without a handle to wait on, a process that exits
+    /// right after asking can die mid-teardown, because Rust does not wait for
+    /// threads when `main` returns.
+    worker: Option<std::thread::JoinHandle<()>>,
     /// Whether the client has been started
     started: bool,
 }
@@ -242,6 +249,7 @@ impl WhatsAppClient {
             calls: CallRegistry::default(),
             chat_store: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            worker: None,
             started: false,
         })
     }
@@ -251,6 +259,31 @@ impl WhatsAppClient {
     /// still lands (notify_one stores a permit).
     pub fn shutdown(&self) {
         self.shutdown.notify_one();
+    }
+
+    /// Ask the session to stop and wait for it to finish closing.
+    ///
+    /// The wait is what separates this from [`shutdown`](Self::shutdown): the
+    /// thread still has to disconnect the socket and close SQLite, and a
+    /// caller that exits without waiting can cut that short. Bounded, so a
+    /// wedged session delays exit rather than preventing it.
+    ///
+    /// Returns whether the thread finished within `timeout`.
+    pub fn shutdown_and_join(&mut self, timeout: std::time::Duration) -> bool {
+        self.shutdown();
+        let Some(handle) = self.worker.take() else {
+            return true;
+        };
+
+        // `JoinHandle` has no timed join, so wait on a channel the joining
+        // thread signals instead: the session still gets to finish, and a
+        // stuck one cannot hold the process open forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(timeout).is_ok()
     }
 
     /// Get the runtime handle for UI async operations
@@ -307,9 +340,12 @@ impl WhatsAppClient {
                     .await;
                 });
             });
-        if spawned.is_err() {
-            self.started = false;
-            return Err("failed to spawn WhatsApp client thread");
+        match spawned {
+            Ok(handle) => self.worker = Some(handle),
+            Err(_) => {
+                self.started = false;
+                return Err("failed to spawn WhatsApp client thread");
+            }
         }
 
         Ok(ui_rx)

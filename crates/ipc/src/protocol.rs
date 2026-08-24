@@ -43,6 +43,10 @@ pub enum ConnectionState {
         qr: Option<String>,
         pair_code: Option<String>,
     },
+    /// Paired, now replaying history. Distinct from `Pairing` so a front end
+    /// drops the QR the moment it is consumed, and distinct from `Connected`
+    /// because the account is not usable yet.
+    Syncing,
     Connected,
     Disconnected {
         reason: String,
@@ -76,7 +80,20 @@ pub struct ChatSummary {
     pub jid: String,
     pub name: String,
     pub unread: u32,
+    /// Marked unread by hand, which WhatsApp stores as a `-1` sentinel and the
+    /// store hydrates as `unread == 0` plus this flag. A count alone cannot
+    /// express "badge with no number", so a client reading only `unread` would
+    /// render such a chat as read.
+    pub manually_unread: bool,
     pub last_message: Option<MessagePreview>,
+}
+
+impl ChatSummary {
+    /// Whether this chat should carry an unread badge at all.
+    #[must_use]
+    pub fn has_unread(&self) -> bool {
+        self.unread > 0 || self.manually_unread
+    }
 }
 
 /// Everything a freshly connected client needs before it starts applying
@@ -130,6 +147,15 @@ pub enum DaemonMessage {
         version: StateVersion,
         event: DaemonEvent,
     },
+    /// A command was understood. Carries no result: state changes arrive as
+    /// [`DaemonMessage::Update`], so a command that succeeds is visible in the
+    /// stream rather than in its acknowledgement.
+    Accepted,
+    /// A command was understood but this daemon cannot act on it yet. Distinct
+    /// from an error: the frame was valid and the client is not at fault.
+    Unsupported {
+        request: String,
+    },
     /// The client fell too far behind and its stream was truncated. Whatever
     /// it holds is now untrustworthy, so it must snapshot again rather than
     /// keep applying.
@@ -141,6 +167,16 @@ pub enum DaemonMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum ClientRequest {
+    /// First frame on every connection, before anything else.
+    ///
+    /// The daemon answers with [`DaemonMessage::Hello`] on a match and
+    /// [`ProtocolError::VersionMismatch`] otherwise. Checking before the
+    /// snapshot is the point: a client that cannot parse the state should
+    /// never be handed it, and a daemon that cannot parse the client's
+    /// commands should not act on them.
+    Hello {
+        protocol: u32,
+    },
     /// Ask for a fresh snapshot, after a [`DaemonMessage::Resync`] or on
     /// reconnect.
     Snapshot,
@@ -209,6 +245,7 @@ mod tests {
             jid: "1@s.whatsapp.net".into(),
             name: "n".into(),
             unread,
+            manually_unread: false,
             last_message: None,
         };
         let snapshot = StateSnapshot {
@@ -227,6 +264,7 @@ mod tests {
                 jid: "12025550143@s.whatsapp.net".into(),
                 name: "Alice".into(),
                 unread: 2,
+                manually_unread: false,
                 last_message: Some(MessagePreview {
                     text: "hi".into(),
                     from_me: false,

@@ -46,27 +46,24 @@ async fn run() -> Result<()> {
         }
     };
 
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-
-    tokio::select! {
-        result = session_bridge::run(Arc::clone(&hub)) => {
-            if let Err(e) = result {
-                log::error!("session ended: {e}");
-            }
+    let outcome = tokio::select! {
+        // The bridge owns the shutdown signal: it has a session thread to wait
+        // for, and a future cancelled by `select!` cannot wait for anything.
+        result = session_bridge::run(Arc::clone(&hub), shutdown_signal()) => {
+            result.context("session ended")
         }
         result = server::run(Arc::clone(&hub)) => {
-            // The socket failing is fatal: a daemon no front end can reach is
-            // a background process with no way to be used or stopped.
-            if let Err(e) = result {
-                log::error!("ipc server stopped: {e:#}");
-            }
+            // Fatal, and it has to reach the exit code: a supervisor that sees
+            // status zero treats a daemon nobody can connect to as a clean
+            // stop and never restarts it.
+            result.context("ipc server stopped")
         }
-        () = &mut shutdown => log::info!("shutting down"),
-    }
+    };
 
+    // Before returning, so the icon goes away with the process rather than
+    // lingering until the host notices the name dropped off the bus.
     drop(tray);
-    Ok(())
+    outcome
 }
 
 /// Resolve on the first termination signal.

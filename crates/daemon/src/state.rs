@@ -115,6 +115,16 @@ impl StateHub {
         }
     }
 
+    /// The JIDs currently held, for a caller that has to diff a complete
+    /// reload against them.
+    ///
+    /// Returns owned strings rather than a borrow: the lock must not be held
+    /// while the caller decides what to remove, since deciding involves
+    /// touching the hub again.
+    pub fn known_chat_jids(&self) -> Vec<String> {
+        self.lock().chats.keys().cloned().collect()
+    }
+
     /// Record a change and publish it.
     ///
     /// Returns the version it produced. The lock covers the mutation and the
@@ -181,10 +191,15 @@ impl Inner {
     fn tray_state(&self) -> TrayState {
         TrayState {
             connected: self.connection.is_connected(),
-            unread: self
-                .chats
-                .values()
-                .fold(0u32, |acc, c| acc.saturating_add(c.unread)),
+            // A manually-unread chat carries a badge with no number, so it
+            // counts as one for a tray that can only show a total.
+            unread: self.chats.values().fold(0u32, |acc, c| {
+                acc.saturating_add(if c.unread == 0 && c.manually_unread {
+                    1
+                } else {
+                    c.unread
+                })
+            }),
         }
     }
 }
@@ -199,6 +214,7 @@ mod tests {
             jid: jid.into(),
             name: jid.into(),
             unread,
+            manually_unread: false,
             last_message: Some(MessagePreview {
                 text: "t".into(),
                 from_me: false,
@@ -290,6 +306,41 @@ mod tests {
 
         hub.apply(DaemonEvent::ChatUpdated(chat("a@s.whatsapp.net", 2, 99)));
         assert!(tray.has_changed().unwrap(), "a new unread count must");
+    }
+
+    /// A chat marked unread by hand carries a badge with no number. Counting
+    /// only the numeric field would render it as read.
+    #[tokio::test]
+    async fn a_manually_unread_chat_reaches_the_tray() {
+        let hub = StateHub::new();
+        let mut summary = chat("a@s.whatsapp.net", 0, 10);
+        summary.manually_unread = true;
+        hub.apply(DaemonEvent::ChatUpdated(summary));
+
+        let mut tray = hub.watch_tray();
+        assert_eq!(
+            tray.borrow_and_update().unread,
+            1,
+            "badge-only chats count as one"
+        );
+    }
+
+    /// A complete reload is the store's whole truth, so what it omits is gone.
+    /// The daemon has to be able to see which chats those are.
+    #[test]
+    fn known_chat_jids_reports_what_a_complete_reload_must_be_diffed_against() {
+        let hub = StateHub::new();
+        hub.apply(DaemonEvent::ChatUpdated(chat("a@s.whatsapp.net", 0, 10)));
+        hub.apply(DaemonEvent::ChatUpdated(chat("b@s.whatsapp.net", 0, 20)));
+
+        let mut known = hub.known_chat_jids();
+        known.sort();
+        assert_eq!(known, ["a@s.whatsapp.net", "b@s.whatsapp.net"]);
+
+        hub.apply(DaemonEvent::ChatRemoved {
+            jid: "a@s.whatsapp.net".into(),
+        });
+        assert_eq!(hub.known_chat_jids(), ["b@s.whatsapp.net"]);
     }
 
     /// With nobody connected the daemon still tracks state, but must not pay
