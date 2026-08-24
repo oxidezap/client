@@ -235,33 +235,54 @@ async fn read_frame(
 
 /// The body of [`read_frame`], over any reader, so the framing rules can be
 /// tested without a socket.
+///
+/// `buf` is owned by the caller across calls, and is deliberately NOT cleared
+/// on entry: `read_until` is not cancellation-safe and this future is one arm
+/// of the connection's `select!`, so a read that loses the race is dropped
+/// after having already consumed bytes off the socket. Those bytes are the
+/// head of the next frame and exist nowhere else — clearing here would drop
+/// them and hand the caller the tail of a request as if it were a whole one.
+/// Only a frame that has been returned (or abandoned) empties the buffer.
 async fn read_frame_generic<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     buf: &mut Vec<u8>,
 ) -> Result<Option<FrameRead>> {
-    buf.clear();
-    // Cap this read alone, then hand the limit back for the next one.
-    let read = {
-        let mut limited = reader.take(MAX_REQUEST_BYTES as u64);
-        limited.read_until(b'\n', buf).await?
-    };
+    loop {
+        // The cap bounds a frame, so bytes carried over from a cancelled read
+        // count against it: reading a frame in slices must not add up to an
+        // unbounded one.
+        let allowance = MAX_REQUEST_BYTES.saturating_sub(buf.len());
+        let read = {
+            let mut limited = reader.take(allowance as u64);
+            limited.read_until(b'\n', buf).await?
+        };
 
-    if read == 0 {
-        return Ok(None);
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            break;
+        }
+        if buf.len() >= MAX_REQUEST_BYTES {
+            // No newline within the cap: there is no way to tell where this
+            // frame was meant to end, so nothing carries over.
+            buf.clear();
+            return Ok(Some(FrameRead::TooLong));
+        }
+        if read == 0 {
+            // End of stream: an empty buffer is the ordinary close, and a
+            // trailing frame that never got its newline is still a frame.
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
     }
 
-    if buf.len() == MAX_REQUEST_BYTES && !buf.ends_with(b"\n") {
-        return Ok(Some(FrameRead::TooLong));
-    }
-
-    if buf.last() == Some(&b'\n') {
-        buf.pop();
-    }
-
-    Ok(Some(match std::str::from_utf8(buf) {
+    let frame = match std::str::from_utf8(buf) {
         Ok(line) => FrameRead::Line(line.to_string()),
         Err(_) => FrameRead::NotUtf8,
-    }))
+    };
+    buf.clear();
+    Ok(Some(frame))
 }
 
 /// The outcome of reading one frame.
@@ -589,6 +610,70 @@ mod tests {
             read_frame_generic(&mut reader, &mut buf).await,
             Ok(Some(FrameRead::Line(_)))
         ));
+    }
+
+    /// `read_until` is not cancellation-safe, and this read is one arm of the
+    /// connection's `select!`: an update winning the race drops the future
+    /// mid-frame. The bytes it already consumed are gone from the socket, so
+    /// they have to survive in the buffer or the client's request comes back
+    /// truncated — as a malformed frame at best, and as a different, valid
+    /// request at worst.
+    #[tokio::test]
+    async fn a_cancelled_read_keeps_the_bytes_it_already_took() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(server);
+        let mut buf = Vec::new();
+
+        use tokio::io::AsyncWriteExt as _;
+        client.write_all(b"{\"request\":\"snap").await.unwrap();
+
+        // No newline yet, so the read is still pending when the other arm of
+        // the select wins and this future is dropped.
+        tokio::select! {
+            frame = read_frame_generic(&mut reader, &mut buf) => {
+                panic!("a partial frame must not complete: {frame:?}")
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        client.write_all(b"shot\"}\n").await.unwrap();
+        match read_frame_generic(&mut reader, &mut buf).await {
+            Ok(Some(FrameRead::Line(line))) => assert!(
+                is_snapshot_request(&line),
+                "frame lost its head across the cancellation: {line}"
+            ),
+            other => panic!("expected the whole frame, got {other:?}"),
+        }
+    }
+
+    /// The cap bounds a frame, so what a cancelled read left behind counts
+    /// against it: carrying bytes over must not become a way to send an
+    /// unbounded one in slices.
+    #[tokio::test]
+    async fn carried_over_bytes_still_count_against_the_cap() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut reader = BufReader::new(server);
+        let mut buf = Vec::new();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            let chunk = "x".repeat(8 * 1024);
+            // Never a newline: this is one frame, and it outgrows the cap.
+            for _ in 0..(MAX_REQUEST_BYTES / chunk.len()) + 2 {
+                if client.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        match read_frame_generic(&mut reader, &mut buf).await {
+            Ok(Some(FrameRead::TooLong)) => {}
+            Ok(Some(FrameRead::Line(line))) => {
+                panic!("an unterminated frame parsed as a line of {}", line.len())
+            }
+            other => panic!("expected the cap to bite, got {other:?}"),
+        }
+        assert!(buf.is_empty(), "an abandoned frame must not carry over");
     }
 
     /// Two daemons starting together can both see a stale socket; the lock is
