@@ -2,7 +2,7 @@
 # (`oxidezapd`) and a TUI front end land beside it, which is why the front end
 # is already a member instead of the root package.
 [workspace]
-members = ["crates/audio", "crates/core", "crates/gui", "crates/session"]
+members = ["crates/audio", "crates/chat-store", "crates/core", "crates/gui", "crates/session"]
 resolver = "3"
 
 [workspace.package]
