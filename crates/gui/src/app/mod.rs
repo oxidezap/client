@@ -239,6 +239,18 @@ pub fn init_chat_list_bindings(cx: &mut gpui::App) {
 // Action to navigate back to chat list on mobile
 actions!(mobile_nav, [NavigateBack]);
 
+/// Why a chat is being opened, which decides where keyboard focus lands.
+///
+/// Clicking a chat means "I want to talk to this person", so the composer
+/// takes focus and typing just works. Arrow-key navigation means "show me
+/// this one" — moving focus to the composer there would take the arrow keys
+/// away from the list the user is still walking through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatOpen {
+    ToCompose,
+    ToPreview,
+}
+
 /// Main application struct
 pub struct WhatsAppApp {
     /// Current application state
@@ -658,7 +670,7 @@ impl WhatsAppApp {
         };
 
         let next_jid = cache.chats[next_index].jid.clone();
-        self.select_chat(next_jid, window, cx);
+        self.select_chat(next_jid, ChatOpen::ToPreview, window, cx);
         self.chat_list_scroll
             .scroll_to_item(next_index, ScrollStrategy::Top);
     }
@@ -682,7 +694,7 @@ impl WhatsAppApp {
         };
 
         let prev_jid = cache.chats[prev_index].jid.clone();
-        self.select_chat(prev_jid, window, cx);
+        self.select_chat(prev_jid, ChatOpen::ToPreview, window, cx);
         self.chat_list_scroll
             .scroll_to_item(prev_index, ScrollStrategy::Top);
     }
@@ -719,7 +731,13 @@ impl WhatsAppApp {
 
     // ========== Actions ==========
 
-    pub fn select_chat(&mut self, jid: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn select_chat(
+        &mut self,
+        jid: String,
+        open: ChatOpen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,
         // or it would stay "typing..." and the eventual paused would land on
@@ -750,6 +768,18 @@ impl WhatsAppApp {
         }
         self.selected_chat = Some(jid.clone());
         self.navigate_to_chat();
+
+        if open == ChatOpen::ToCompose {
+            // After `navigate_to_chat`, so on mobile the composer exists on the
+            // panel being switched to rather than the one being left.
+            self.ensure_input_area(window, cx);
+            if let Some(input_area) = self.input_area.clone() {
+                // Read the handle out before focusing: `focus` needs `&mut App`
+                // and `read` holds `cx` borrowed for as long as its result lives.
+                let handle = input_area.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+        }
 
         // Collect unread messages from others to send read receipts
         let unread_messages: Vec<(String, String)> = self

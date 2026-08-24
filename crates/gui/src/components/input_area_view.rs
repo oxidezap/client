@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use whatsapp_rust::wacore::time::Instant;
 
-use gpui::{Entity, EventEmitter, Task, WeakEntity, Window, div, prelude::*, px};
+use gpui::{
+    App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, div, prelude::*, px,
+};
 use gpui_component::{
     ActiveTheme, Icon, IconName,
     button::{Button, ButtonVariants},
@@ -159,6 +161,16 @@ impl InputAreaView {
     /// chat switch, which routes the paused presence itself); otherwise the
     /// state machine would stay Composing and swallow the first keystroke's
     /// StartedTyping in the newly selected chat.
+    /// The composer's focus target.
+    ///
+    /// Exposed as a handle rather than a `focus()` helper because focusing
+    /// needs `&mut App`, which the caller already holds; returning the handle
+    /// keeps this borrow read-only and lets the caller decide when to move
+    /// focus.
+    pub fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
+        self.input.read(cx).focus_handle(cx)
+    }
+
     pub fn reset_typing(&mut self) {
         self.typing_state = TypingState::Idle;
         self.typing_monitor_task = None;

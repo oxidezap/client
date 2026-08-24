@@ -3,7 +3,7 @@
 use gpui::{App, Entity, SharedString, div, prelude::*, px};
 use gpui_component::ActiveTheme as _;
 
-use crate::app::WhatsAppApp;
+use crate::app::{ChatOpen, WhatsAppApp};
 use crate::responsive::ResponsiveLayout;
 
 use oxidezap_core::Chat;
@@ -56,7 +56,9 @@ pub fn render_chat_item(
             el.hover(move |s| s.bg(hover))
         })
         .on_click(move |_, window, cx| {
-            entity.update(cx, |this, cx| this.select_chat(jid.clone(), window, cx));
+            entity.update(cx, |this, cx| {
+                this.select_chat(jid.clone(), ChatOpen::ToCompose, window, cx)
+            });
         })
         .child(Avatar::from_initial(initial, layout.avatar_size()))
         .child(
