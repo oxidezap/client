@@ -1,0 +1,26 @@
+//! The wire protocol between `oxidezapd` and its front ends.
+//!
+//! Types only: no sockets, no runtime. Both sides depend on this crate so a
+//! protocol change breaks compilation rather than a running client.
+//!
+//! # Why a state version
+//!
+//! A client that connects mid-stream needs the current state and every event
+//! after it, with nothing lost or applied twice. Taking a snapshot and *then*
+//! subscribing drops whatever happens in between; subscribing and then
+//! snapshotting delivers events the snapshot already reflects.
+//!
+//! Every mutation bumps [`StateVersion`]. The snapshot carries the version it
+//! was taken at, each event carries the version it produced, and a client
+//! discards events at or below its snapshot's version. The daemon can then
+//! subscribe first and snapshot second, which loses nothing, and the duplicate
+//! window resolves on the client with a comparison rather than a lock.
+
+mod protocol;
+mod transport;
+
+pub use protocol::{
+    ChatSummary, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview,
+    ProtocolError, StateSnapshot, StateVersion,
+};
+pub use transport::{PROTOCOL_VERSION, socket_path};

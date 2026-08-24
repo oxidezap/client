@@ -8,16 +8,16 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-[lints]
-workspace = true
-
 [dependencies]
 async-channel = "2"
 log = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 oxidezap-audio = { workspace = true }
+oxidezap-chat-store = { workspace = true, features = ["search"] }
 oxidezap-core = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 whatsapp-rust = { workspace = true }
-oxidezap-chat-store = { workspace = true, features = ["search"] }
+
+[lints]
+workspace = true

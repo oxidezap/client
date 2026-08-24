@@ -11,6 +11,16 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The target dir is restored from cache each run, so incremental state is
+  # always cold: it cannot speed anything up and only inflates what gets
+  # cached. (rust-cache sets this too; stating it here keeps the reason
+  # visible next to the setting that depends on it.)
+  CARGO_INCREMENTAL: "0"
+  # Full DWARF is a quarter of the cached target dir and buys nothing here:
+  # a panic's file and line come from `panic::Location`, which is compiled in
+  # regardless, and line tables keep backtraces readable when RUST_BACKTRACE
+  # is on. Measured on this workspace: 2.4 GB -> 1.8 GB, same build time.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   check:
@@ -32,6 +42,15 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep the dependency build even when a lint or a test fails: the
+          # failure is in our code, and throwing away everything it compiled
+          # makes the next attempt pay for all of it again.
+          cache-on-failure: "true"
+          # Only main writes the cache. GitHub gives a repository 10 GB total
+          # and evicts least-recently-used, so letting every PR save a ~4 GB
+          # entry would push out the one branch every PR restores from.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       # --all-features so the chat store's `search` feature (FTS5) is covered;
       # a default-features run silently skips its index and query tests.
@@ -58,4 +77,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check -p oxidezap-chat-store -p oxidezap-core --all-features

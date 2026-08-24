@@ -8,11 +8,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-[lints]
-workspace = true
-
 [dependencies]
 async-trait = "0.1"
 chrono = { workspace = true, features = ["std", "clock"] }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
+
+[lints]
+workspace = true

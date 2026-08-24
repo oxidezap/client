@@ -18,4 +18,14 @@ LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLI
 rustflags = [
     "-Clink-arg=-fuse-ld=lld",
     "-Clink-arg=-Wl,--icf=all",
+    # `panic = "abort"` stops unwinding, but rustc still emits unwind tables
+    # for every function: 2.6 MB of .eh_frame, .eh_frame_hdr and
+    # .gcc_except_table in this binary, 6% of it, that nothing can ever walk.
+    # Frame pointers keep a backtrace walkable without them, at the cost of one
+    # register. Technique and the pairing come from Bun's build.
+    "-Cforce-unwind-tables=no",
+    "-Cforce-frame-pointers=yes",
+    # Drop the legacy SysV .hash section; glibc has preferred .gnu.hash since
+    # 2.5 and lld emits both by default.
+    "-Clink-arg=-Wl,--hash-style=gnu",
 ]
