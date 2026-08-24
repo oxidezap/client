@@ -4,15 +4,15 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 
 ## Crates
 
-- **oxidezap-core** — domain types (chats, messages, calls, UI events). No UI, no I/O.
-- **oxidezap-audio** — capture, playback, Opus encoding, waveforms. cpal; no UI.
-- **oxidezap-chat-store** — materializes the library's event stream into chats,
+- **oxidezap-core**: domain types (chats, messages, calls, UI events). No UI, no I/O.
+- **oxidezap-audio**: capture, playback, Opus encoding, waveforms. cpal; no UI.
+- **oxidezap-chat-store**: materializes the library's event stream into chats,
   messages, receipts and an FTS5 search index. Owns its schema and migrations;
   consumes only the library's public event surface. Extracted from
   whatsapp-rust, where it was application logic living in a protocol repo.
-- **oxidezap-session** — the WhatsApp connection: events, sends, store hydration.
+- **oxidezap-session**: the WhatsApp connection: events, sends, store hydration.
   Knows nothing about how anything is drawn. `oxidezapd` will wrap this crate.
-- **oxidezap-gui** — GPUI front end, binary `oxidezap`. Owns video decode, which
+- **oxidezap-gui**: GPUI front end, binary `oxidezap`. Owns video decode, which
   writes straight into `gpui::RenderImage` and is not reusable off GPUI.
 
 A front end depends on session/core/audio, never the reverse.
@@ -25,7 +25,7 @@ cargo clippy --workspace --all-targets -- -D warnings   # what CI enforces
 cargo test --workspace
 ```
 
-Stable Rust. Debug builds keep gpui at opt-level 3 — without it the UI is
+Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is
 unusable.
 
 ## The library dependency
@@ -36,14 +36,14 @@ revisions. Never pin them individually by `rev`: the resulting mismatch surfaces
 as "expected `Jid`, found `Jid`" and reads like a compiler bug.
 
 Because profile settings only apply from the workspace root, the per-package
-`opt-level` sweep in the library's own manifest is *not* inherited — the release
+`opt-level` sweep in the library's own manifest is *not* inherited, so the release
 profile here repeats it deliberately.
 
 ## Gotchas
 
 - **Logout is not a disconnect.** A server 401 means the stored credentials are
   dead; reconnecting with them loops forever. `AppState::LoggedOut` exists to
-  force the only real recovery — wipe local state, pair again.
+  force the only real recovery: wipe local state, pair again.
 - **The store is one file.** Device identity, Signal state and chat history all
   live in the same SQLite database, and chat rows are keyed by device id. A
   partial wipe orphans everything behind the new device, so
@@ -52,7 +52,7 @@ profile here repeats it deliberately.
   state per `Arc<Image>` and rebuilding one re-decodes the bytes. Whoever
   replaces a preview with real bytes must evict the entry.
 - **The chat store's writer queue is ordered on purpose.** Anything that
-  targets a row — an ack, a nack, a local send failure — goes through the same
+  targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row
   past PENDING already has a real server answer and must never be regressed.
 - **SQLite is bundled and trimmed** in `.cargo/config.toml`. FTS5 must stay:
@@ -64,7 +64,7 @@ profile here repeats it deliberately.
 Colours come from `cx.theme()`. The palette is registered once in `theme.rs`
 into gpui-component's `Theme` global, so our surfaces and the library's own
 controls resolve the same tokens. A literal colour in a component is invisible
-to theme switching and drifts the moment either side changes — the two
+to theme switching and drifts the moment either side changes. The two
 exceptions are message bubbles (`theme::brand`, which encode authorship and
 have no semantic token) and text drawn on the QR code's white raster.
 
@@ -85,4 +85,4 @@ list's `&mut Context` closure rejects.
 
 Clickable `div`s that remain are deliberate: a chat row and a media thumbnail
 are surfaces, not commands, and have no semantic component to compose from.
-Anything that *is* a command — call accept/decline, back — is a `Button`.
+Anything that *is* a command (call accept/decline, back) is a `Button`.

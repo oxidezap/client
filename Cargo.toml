@@ -81,7 +81,7 @@ incremental = false
 
 # Off-hot-path crates run per connection / sync / request, not per frame, so
 # size-optimizing them shrinks the binary at no measurable cost. This mirrors
-# the same sweep in whatsapp-rust's own manifest — profile settings only apply
+# the same sweep in whatsapp-rust's own manifest, because profile settings only apply
 # from the workspace root, so consuming those crates by git does not inherit
 # them. Media decode (image, openh264, symphonia, mp4) and the per-message
 # crypto/protocol crates deliberately stay at opt-level 3.

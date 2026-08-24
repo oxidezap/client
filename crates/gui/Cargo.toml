@@ -1,6 +1,6 @@
 [package]
 name = "oxidezap-gui"
-description = "Unofficial WhatsApp client — GPUI front end"
+description = "Unofficial WhatsApp client: GPUI front end"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,7 +22,7 @@ env_logger = "0.11"
 
 # UI framework: GPUI upstream + gpui-component. gpui-component leaves its gpui
 # dep unpinned (tracks zed HEAD), and cargo forbids [patch]-pinning a source to
-# itself — so the rev pin lives in this workspace's committed Cargo.lock
+# itself, so the rev pin lives in this workspace's committed Cargo.lock
 # (`cargo update -p gpui --precise <rev>` to move it). Same-source everywhere =
 # one gpui in the tree, no fork.
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
@@ -44,7 +44,7 @@ smallvec = "1"
 smol = "2"
 # Decodes the AAC track lifted out of an MP4 video. The container is demuxed by
 # the `mp4` crate and voice notes are Opus (handled in `oxidezap-audio`), so
-# only the AAC codec and the ISO-MP4 reader are reachable from here — every
+# only the AAC codec and the ISO-MP4 reader are reachable from here. Every
 # other format symphonia can register is dead weight in the probe tables.
 symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
