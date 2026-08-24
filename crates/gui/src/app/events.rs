@@ -15,7 +15,12 @@ impl WhatsAppApp {
                 cx.notify();
             }
             UiEvent::HistoryLoaded { chats, complete } => {
-                info!("Loaded {} chats from durable history", chats.len());
+                // Debug, not info: a store invalidation reloads history, and
+                // acks and receipts make several of those per message.
+                debug!(
+                    "Loaded {} chats from durable history (complete: {complete})",
+                    chats.len()
+                );
                 // Prune only against a COMPLETE load: there absence means the
                 // chat was archived/deleted (possibly on another device), so
                 // it must leave the UI too. A truncated load can't distinguish

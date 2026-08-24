@@ -38,7 +38,7 @@ use gpui_component::input::InputState;
 actions!(chat_list, [SelectUp, SelectDown]);
 
 use crate::components::{InputAreaEvent, InputAreaView};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 
 use crate::responsive::{MobilePanel, ResponsiveLayout};

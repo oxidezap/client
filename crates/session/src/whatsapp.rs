@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use log::{debug, error, info, warn};
-use oxidezap_chat_store::ChatStore;
+use oxidezap_chat_store::{ChatEntry, ChatStore, StoreChange};
 use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
@@ -425,6 +425,9 @@ impl WhatsAppClient {
         // JIDs normalize through the same PN->LID mapping live events use.
         match Self::load_history(&chat_store, &bot.client()).await {
             Ok((chats, complete)) if !chats.is_empty() => {
+                // The one hydration worth an info line: the reloads that
+                // follow are routine and say so at debug.
+                info!("Hydrated {} chats from durable history", chats.len());
                 let _ = ui_tx.send(UiEvent::HistoryLoaded { chats, complete });
             }
             Ok(_) => {}
@@ -1613,7 +1616,6 @@ impl WhatsAppClient {
         bot: &Bot,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        use oxidezap_chat_store::StoreChange;
         use tokio::sync::broadcast::error::RecvError;
 
         let client = bot.client();
@@ -1621,20 +1623,23 @@ impl WhatsAppClient {
         tokio::spawn(async move {
             let mut open = true;
             while open {
+                let mut scope = ReloadScope::empty();
                 match changes.recv().await {
-                    // Contacts too: a push-name landing after the chat row
-                    // must refresh chats stuck on the JID placeholder.
-                    Ok(
-                        StoreChange::Chats | StoreChange::Messages { .. } | StoreChange::Contacts,
-                    ) => {}
-                    // Missed changes are covered by the full reload below.
-                    Err(RecvError::Lagged(_)) => {}
+                    Ok(change) => scope.widen(Some(&change)),
+                    Err(RecvError::Lagged(_)) => scope.widen(None),
                     Err(RecvError::Closed) => break,
                 }
                 // Drain the burst; a quiet window flushes the reload.
                 loop {
                     match tokio::time::timeout(Self::RELOAD_DEBOUNCE, changes.recv()).await {
-                        Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => continue,
+                        Ok(Ok(change)) => {
+                            scope.widen(Some(&change));
+                            continue;
+                        }
+                        Ok(Err(RecvError::Lagged(_))) => {
+                            scope.widen(None);
+                            continue;
+                        }
                         Ok(Err(RecvError::Closed)) => {
                             // Reload once more: these changes were committed.
                             open = false;
@@ -1643,10 +1648,13 @@ impl WhatsAppClient {
                         Err(_) => break,
                     }
                 }
-                // An empty load still goes out: the UI prunes against the
-                // loaded set, so deleting/archiving the last chat elsewhere
-                // must clear the list here too.
-                match Self::load_history(&chat_store, &client).await {
+                // An empty COMPLETE load still goes out: the UI prunes
+                // against the loaded set, so deleting/archiving the last chat
+                // elsewhere must clear the list here too. An empty narrowed
+                // one names nothing the list shows (an archived chat, or one
+                // past the window) and has nothing to say.
+                match Self::load_history_scoped(&chat_store, &client, scope.chats()).await {
+                    Ok((chats, complete)) if chats.is_empty() && !complete => {}
                     Ok((chats, complete)) => {
                         if ui_tx
                             .send(UiEvent::HistoryLoaded { chats, complete })
@@ -1671,8 +1679,31 @@ impl WhatsAppClient {
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
     ) -> Result<(Vec<oxidezap_core::Chat>, bool), oxidezap_chat_store::ChatStoreError> {
-        let entries = chat_store.chats(false, Self::HISTORY_CHAT_LIMIT).await?;
-        let complete = (entries.len() as i64) < Self::HISTORY_CHAT_LIMIT;
+        Self::load_history_scoped(chat_store, client, None).await
+    }
+
+    /// [`load_history`](Self::load_history), restricted to the chats `only`
+    /// names when it names any.
+    ///
+    /// The whole-list rebuild is what every invalidation used to cost: one
+    /// message page, its reactions and its sender names per chat, for all of
+    /// them, and receipts alone fire it several times per sent message. A
+    /// receipt or an ack moves rows inside one conversation and leaves the
+    /// list's order, membership and names exactly as they were, so the load
+    /// it triggers can be that conversation's.
+    async fn load_history_scoped(
+        chat_store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        only: Option<&HashSet<String>>,
+    ) -> Result<(Vec<oxidezap_core::Chat>, bool), oxidezap_chat_store::ChatStoreError> {
+        let mut entries = chat_store.chats(false, Self::HISTORY_CHAT_LIMIT).await?;
+        // A narrowed load says nothing about the chats it left out, so it is
+        // never the whole display list and must never drive the UI's prune.
+        let complete = only.is_none() && (entries.len() as i64) < Self::HISTORY_CHAT_LIMIT;
+        if let Some(only) = only {
+            let wanted = Self::alias_closure(client, &entries, only).await;
+            entries.retain(|entry| wanted.contains(&entry.jid.to_non_ad_string()));
+        }
         let mut chats: Vec<oxidezap_core::Chat> = Vec::with_capacity(entries.len());
         let mut contact_names: HashMap<String, Option<String>> = HashMap::new();
         // Sender-name lookups memoized across the whole load: group pages
@@ -1764,6 +1795,30 @@ impl WhatsAppClient {
             chats.push(chat);
         }
         Ok((chats, complete))
+    }
+
+    /// Every storage key the invalidated chats are held under.
+    ///
+    /// A PN/LID pair collapses into one chat on load, and the collapse is what
+    /// makes its unread counter the pair's sum: rebuilding one half alone
+    /// would not be a smaller answer but a wrong one. The expansion runs off
+    /// the entries the invalidated keys match, so it costs a mapping lookup
+    /// per named chat rather than one per chat in the list.
+    async fn alias_closure(
+        client: &Arc<Client>,
+        entries: &[ChatEntry],
+        only: &HashSet<String>,
+    ) -> HashSet<String> {
+        let mut wanted = only.clone();
+        for entry in entries {
+            if !only.contains(&entry.jid.to_non_ad_string()) {
+                continue;
+            }
+            let identity = history_chat_identity(client, &entry.jid).await;
+            wanted.insert(identity.canonical_jid);
+            wanted.extend(identity.contact_jids.iter().map(Jid::to_string));
+        }
+        wanted
     }
 
     /// Reactions live in their own table, so hydrated messages come out with
@@ -2126,6 +2181,52 @@ async fn mark_send_failed(chat_store: &ChatStoreHandle, jid: &Jid, message_id: &
     }
 }
 
+/// What a debounced window of store invalidations forces a reload to cover.
+///
+/// The store names the chat behind every message-level change, and a change
+/// confined to message rows leaves the list's order, membership and names
+/// alone — so the window can be answered by rebuilding just those chats.
+/// Anything else in the window (or a gap in it) widens the reload back to the
+/// whole list, because that is the only load allowed to prune.
+#[derive(Debug, PartialEq, Eq)]
+enum ReloadScope {
+    /// Only these chats' message sets moved.
+    Chats(HashSet<String>),
+    /// Rebuild the display list.
+    Everything,
+}
+
+impl ReloadScope {
+    fn empty() -> Self {
+        ReloadScope::Chats(HashSet::new())
+    }
+
+    /// Fold one invalidation in. `None` is a lagged receiver: what it dropped
+    /// is unknowable, so it counts as everything.
+    fn widen(&mut self, change: Option<&StoreChange>) {
+        match (&mut *self, change) {
+            (ReloadScope::Everything, _) => {}
+            // Contacts too: a push name landing after the chat row must
+            // refresh chats stuck on the JID placeholder, and naming is
+            // resolved for the whole list at load time.
+            (_, None) | (_, Some(StoreChange::Chats | StoreChange::Contacts)) => {
+                *self = ReloadScope::Everything;
+            }
+            (ReloadScope::Chats(chats), Some(StoreChange::Messages { chat })) => {
+                chats.insert(chat.to_non_ad_string());
+            }
+        }
+    }
+
+    /// The chats to rebuild, or `None` for the whole list.
+    fn chats(&self) -> Option<&HashSet<String>> {
+        match self {
+            ReloadScope::Chats(chats) => Some(chats),
+            ReloadScope::Everything => None,
+        }
+    }
+}
+
 struct HistoryChatIdentity {
     canonical_jid: String,
     contact_jids: Vec<Jid>,
@@ -2238,13 +2339,59 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ReadBoundary, is_masked_phone_label, media_metadata, merge_alias_history_messages,
-        read_message_range,
+        ReadBoundary, ReloadScope, StoreChange, is_masked_phone_label, media_metadata,
+        merge_alias_history_messages, read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, fallback_chat_name};
     use whatsapp_rust::buffa::MessageField;
     use whatsapp_rust::wacore_binary::Jid;
     use whatsapp_rust::waproto::whatsapp as wa;
+
+    fn messages_change(chat: &str) -> StoreChange {
+        StoreChange::Messages {
+            chat: chat.parse().expect("test JID"),
+        }
+    }
+
+    /// Acks and receipts are message-level, and a peer answers a single send
+    /// with several of them; rebuilding the whole chat list for each is the
+    /// work this narrowing exists to skip.
+    #[test]
+    fn message_only_invalidations_narrow_the_reload() {
+        let mut scope = ReloadScope::empty();
+        scope.widen(Some(&messages_change("12025550143@s.whatsapp.net")));
+        // The same chat named twice in one window is one chat to rebuild.
+        scope.widen(Some(&messages_change("12025550143:12@s.whatsapp.net")));
+        scope.widen(Some(&messages_change("120363000000000001@g.us")));
+
+        let chats = scope.chats().expect("narrowed reload");
+        assert_eq!(chats.len(), 2);
+        assert!(chats.contains("12025550143@s.whatsapp.net"));
+        assert!(chats.contains("120363000000000001@g.us"));
+    }
+
+    /// Ordering, membership and naming are resolved across the whole list, and
+    /// only a whole-list load may prune it.
+    #[test]
+    fn list_level_invalidations_widen_the_reload() {
+        for change in [StoreChange::Chats, StoreChange::Contacts] {
+            let mut scope = ReloadScope::empty();
+            scope.widen(Some(&messages_change("12025550143@s.whatsapp.net")));
+            scope.widen(Some(&change));
+            scope.widen(Some(&messages_change("120363000000000001@g.us")));
+            assert_eq!(scope.chats(), None, "{change:?} must force a full reload");
+        }
+    }
+
+    /// A lagged receiver dropped changes it cannot name, so the reload has to
+    /// assume the worst of them.
+    #[test]
+    fn a_gap_in_the_window_widens_the_reload() {
+        let mut scope = ReloadScope::empty();
+        scope.widen(Some(&messages_change("12025550143@s.whatsapp.net")));
+        scope.widen(None);
+        assert_eq!(scope.chats(), None);
+    }
 
     #[test]
     fn history_fallbacks_do_not_expose_internal_lids() {
