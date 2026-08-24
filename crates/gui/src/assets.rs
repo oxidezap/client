@@ -49,3 +49,40 @@ impl AssetSource for Assets {
         Ok(items)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `#[folder]`/`#[include]` pair is resolved at build time, so a
+    /// renamed or moved icon fails here rather than as a blank button.
+    #[test]
+    fn every_embedded_icon_loads() {
+        let icons: Vec<String> = CustomIcons::iter().map(|p| p.to_string()).collect();
+        assert!(!icons.is_empty(), "no icons were embedded at all");
+
+        for name in &icons {
+            let loaded = Assets
+                .load(name)
+                .unwrap_or_else(|e| panic!("{name} failed to load: {e}"));
+            let bytes = loaded.unwrap_or_else(|| panic!("{name} resolved to nothing"));
+            assert!(
+                bytes.starts_with(b"<svg") || bytes.starts_with(b"<?xml"),
+                "{name} does not look like an SVG"
+            );
+        }
+    }
+
+    /// `list` is what gpui asks for icon lookup; a prefix that matches nothing
+    /// is a silently missing icon rather than an error.
+    #[test]
+    fn list_returns_our_icons_under_their_prefix() {
+        let listed = Assets.list("icons/").expect("list");
+        for name in CustomIcons::iter() {
+            assert!(
+                listed.iter().any(|p| p.as_ref() == name.as_ref()),
+                "{name} missing from list"
+            );
+        }
+    }
+}
