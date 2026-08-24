@@ -108,6 +108,73 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.http]
 opt-level = "z"
+# The desktop-integration and one-shot subsystems. None of these run per
+# frame or per message: naga compiles shaders once at renderer start, the
+# D-Bus stack carries notifications, keyring reads and accessibility events,
+# SVG rasterization happens when an icon is first loaded, and the regex
+# engines back syntax highlighting. Size-optimizing them costs nothing a user
+# can perceive.
+[profile.release.package.naga]
+opt-level = "z"
+[profile.release.package.zbus]
+opt-level = "z"
+[profile.release.package.zvariant]
+opt-level = "z"
+[profile.release.package.accesskit_unix]
+opt-level = "z"
+[profile.release.package.accesskit_atspi_common]
+opt-level = "z"
+[profile.release.package.accesskit_consumer]
+opt-level = "z"
+[profile.release.package.atspi-common]
+opt-level = "z"
+[profile.release.package.atspi-proxies]
+opt-level = "z"
+[profile.release.package.oo7]
+opt-level = "z"
+[profile.release.package.notify-rust]
+opt-level = "z"
+[profile.release.package.ashpd]
+opt-level = "z"
+[profile.release.package.usvg]
+opt-level = "z"
+[profile.release.package.resvg]
+opt-level = "z"
+[profile.release.package.rustybuzz]
+opt-level = "z"
+[profile.release.package.tiny-skia]
+opt-level = "z"
+[profile.release.package.regex-automata]
+opt-level = "z"
+[profile.release.package.regex]
+opt-level = "z"
+[profile.release.package.fancy-regex]
+opt-level = "z"
+[profile.release.package.syntect]
+opt-level = "z"
+[profile.release.package.markdown]
+opt-level = "z"
+[profile.release.package.html5ever]
+opt-level = "z"
+
+# s, not z: these sit on a path a user can feel, but not one that runs per
+# frame. Image decode happens once per attachment, the Wayland protocol
+# marshals input events, and TLS runs at connect plus per record.
+[profile.release.package.image]
+opt-level = "s"
+[profile.release.package.zune-jpeg]
+opt-level = "s"
+[profile.release.package.image-webp]
+opt-level = "s"
+[profile.release.package.png]
+opt-level = "s"
+[profile.release.package.wayland-client]
+opt-level = "s"
+[profile.release.package.wayland-backend]
+opt-level = "s"
+[profile.release.package.calloop]
+opt-level = "s"
+
 # s = data-path framing kept a notch faster than z.
 [profile.release.package.rustls]
 opt-level = "s"

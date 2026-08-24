@@ -7,3 +7,15 @@
 # dlopen surface. STAT4/DBSTAT/RTREE/FTS3/SOUNDEX are upstream-default-off
 # features libsqlite3-sys turns on; none are exercised here.
 LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_SOUNDEX -DSQLITE_OMIT_JSON -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_PROGRESS_CALLBACK"
+
+[target.x86_64-unknown-linux-gnu]
+# lld folds byte-identical sections with --icf=all. Fat LTO leaves a lot of
+# them: `cargo bsize` counted 315 KiB across 1309 groups, including three
+# copies of waproto's `Message::clone` at 73 KiB each. The library's own
+# workspace does the same thing, and measures it as a win there too.
+#
+# Scoped to this target so macOS and Windows keep their platform linkers.
+rustflags = [
+    "-Clink-arg=-fuse-ld=lld",
+    "-Clink-arg=-Wl,--icf=all",
+]
