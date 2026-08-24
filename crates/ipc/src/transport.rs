@@ -5,10 +5,14 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
-/// 2: `Pairing` gained a required expiry, `ShowWindow` and `SendFailed` were
-/// added, and `Unsupported` was removed once every request the protocol
-/// defines became one the daemon acts on. A v1 client would fail to parse the
-/// first and would not recognise the others.
+/// 2: `Pairing` carries a [`PairingCode`] per credential rather than two bare
+/// strings, `MessagePreview` names the message it describes, `MarkRead`
+/// echoes that name back, `ShowWindow`, `SendFailed`, `Refused` and
+/// `TooManyClients` were added, and `Unsupported` was removed once every
+/// request the protocol defines became one the daemon acts on. A v1 peer
+/// would misparse the first three and not recognise the rest.
+///
+/// [`PairingCode`]: crate::PairingCode
 pub const PROTOCOL_VERSION: u32 = 2;
 
 const SOCKET_NAME: &str = "daemon.sock";

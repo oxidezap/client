@@ -39,18 +39,14 @@ impl StateVersion {
 pub enum ConnectionState {
     Connecting,
     /// Waiting for the user to scan a QR code or enter a pair code.
+    ///
+    /// Both at once is normal: a user who asks for a phone-number code while
+    /// a QR is on screen has two live credentials, and either may be renewed
+    /// without touching the other. They are therefore separate fields with
+    /// separate deadlines, and an event about one never clears the other.
     Pairing {
-        qr: Option<String>,
-        pair_code: Option<String>,
-        /// When the code stops working, as a Unix timestamp in milliseconds.
-        ///
-        /// A deadline rather than the "expires in N seconds" the session
-        /// reports: a snapshot is served whenever a client connects, and a
-        /// relative duration replayed thirty seconds later would hand that
-        /// client a full countdown for a code that is nearly dead. Absolute
-        /// survives being repeated. Both sides are on one machine, so they
-        /// share the clock this is read against.
-        expires_at_ms: i64,
+        qr: Option<PairingCode>,
+        pair_code: Option<PairingCode>,
     },
     /// Paired, now replaying history. Distinct from `Pairing` so a front end
     /// drops the QR the moment it is consumed, and distinct from `Connected`
@@ -72,9 +68,34 @@ impl ConnectionState {
     }
 }
 
+/// One pairing credential and how long it is good for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingCode {
+    pub code: String,
+    /// When it stops working, as a Unix timestamp in milliseconds.
+    ///
+    /// A deadline rather than the "expires in N seconds" the session reports:
+    /// a snapshot is served whenever a client connects, and a relative
+    /// duration replayed thirty seconds later would hand that client a full
+    /// countdown for a code that is nearly dead. An absolute one survives
+    /// being repeated. Both sides are on one machine, so they share the clock
+    /// this is read against.
+    pub expires_at_ms: i64,
+}
+
 /// The newest message in a chat, as much as a list needs to render a row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessagePreview {
+    /// Which message this describes, when the daemon holds it.
+    ///
+    /// The identity [`timestamp_ms`](Self::timestamp_ms) is not: WhatsApp
+    /// stamps messages to the second, so two arrivals in the same second are
+    /// indistinguishable by time alone. [`ClientRequest::MarkRead`] echoes
+    /// this back, and that is the whole reason it exists.
+    ///
+    /// `None` when the store has published a chat's preview text without the
+    /// message behind it, which happens before history is hydrated.
+    pub id: Option<String>,
     pub text: String,
     pub from_me: bool,
     pub timestamp_ms: i64,
@@ -167,8 +188,9 @@ pub enum DaemonMessage {
     /// [`DaemonMessage::SendFailed`] when it makes nothing of it at all.
     ///
     /// The daemon answers this only after the session has taken the command,
-    /// not on handing it to a queue: a command refused at execution time
-    /// comes back as [`ProtocolError::NoSession`] instead.
+    /// not on handing it to a queue: a command that fails at execution time
+    /// comes back as [`ProtocolError::NoSession`] (the account is gone) or
+    /// [`ProtocolError::Refused`] (the daemon will not do it as asked).
     Accepted,
     /// Somebody asked for a front end to come forward: the tray's "Open"
     /// item, or another client's [`ClientRequest::ShowWindow`].
@@ -215,8 +237,19 @@ pub enum ClientRequest {
         jid: String,
         text: String,
     },
+    /// Mark a chat read, up to the point the client has actually seen.
+    ///
+    /// `through_message_id` is the [`MessagePreview::id`] the client holds for
+    /// this chat, or `None` if it holds no preview. It is not advisory: a read
+    /// action clears a chat by whole seconds, so a request from a client that
+    /// has fallen behind would consume arrivals nobody ever saw — and a
+    /// timestamp could not tell them apart, because WhatsApp stamps to the
+    /// second and a burst of two lands on the same one. The daemon refuses
+    /// when this is not the message it would name in a snapshot right now, and
+    /// the client resends after catching up.
     MarkRead {
         jid: String,
+        through_message_id: Option<String>,
     },
     /// Ask the daemon to bring a front end to the foreground, which is what
     /// the tray's "Open" item does.
@@ -238,6 +271,14 @@ pub enum ProtocolError {
     Malformed { detail: String },
     #[error("no session: {detail}")]
     NoSession { detail: String },
+    /// The frame was valid and the session is alive; the daemon will not do
+    /// this. Distinct from [`ProtocolError::NoSession`], which is about the
+    /// account being unreachable, and from
+    /// [`ProtocolError::Malformed`], which is about the client's frame: this
+    /// one says the request was understood and declined, and `detail` says
+    /// what the client would have to change.
+    #[error("refused: {detail}")]
+    Refused { detail: String },
     /// The daemon is already serving as many front ends as it will. Sent
     /// before the connection closes, so a client retries rather than guessing
     /// why the socket went quiet.
@@ -332,12 +373,19 @@ mod tests {
 
     /// The reason the deadline is absolute: a snapshot replays this state to
     /// every client that connects, however long after the code was issued.
+    /// And the reason there are two of them: a QR renewed while a phone-number
+    /// code is live must not restate that code's deadline as its own.
     #[test]
-    fn a_pairing_deadline_survives_the_wire_unchanged() {
+    fn each_pairing_credential_carries_its_own_deadline() {
         let state = ConnectionState::Pairing {
-            qr: Some("2@abc".into()),
-            pair_code: None,
-            expires_at_ms: 1_700_000_060_000,
+            qr: Some(PairingCode {
+                code: "2@abc".into(),
+                expires_at_ms: 1_700_000_060_000,
+            }),
+            pair_code: Some(PairingCode {
+                code: "ABCD-1234".into(),
+                expires_at_ms: 1_700_000_180_000,
+            }),
         };
         let line = serde_json::to_string(&state).unwrap();
         assert_eq!(
@@ -368,6 +416,7 @@ mod tests {
                 unread: 2,
                 manually_unread: false,
                 last_message: Some(MessagePreview {
+                    id: Some("3EB0".into()),
                     text: "hi".into(),
                     from_me: false,
                     timestamp_ms: 1_700_000_000_000,

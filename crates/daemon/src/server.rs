@@ -145,6 +145,11 @@ const EMFILE: i32 = 24;
 const ENFILE: i32 = 23;
 
 /// Tell a client we are full, then close.
+///
+/// Spawned rather than written inline: the accept loop must not wait on a
+/// peer. The task is still bounded — one small frame into a socket nobody has
+/// had a chance to fill, then done — so a refused client costs a write, not a
+/// slot.
 async fn reject(stream: UnixStream) {
     log::warn!("refusing a client: already serving {MAX_CLIENTS}");
     let (_, mut writer) = stream.into_split();
@@ -646,9 +651,20 @@ async fn handle_request(line: &str, hub: &StateHub, commands: &Commands) -> Answ
         ClientRequest::SendText { jid, text } => {
             Answer::frame(dispatch(hub, commands, Action::SendText { jid, text }).await)
         }
-        ClientRequest::MarkRead { jid } => {
-            Answer::frame(dispatch(hub, commands, Action::MarkRead { jid }).await)
-        }
+        ClientRequest::MarkRead {
+            jid,
+            through_message_id,
+        } => Answer::frame(
+            dispatch(
+                hub,
+                commands,
+                Action::MarkRead {
+                    jid,
+                    through_message_id,
+                },
+            )
+            .await,
+        ),
         // The daemon has no window of its own, so this is relayed rather than
         // acted on: whoever owns a window is the only one that can raise it.
         // Published to every client, including the one that asked, because a
@@ -695,7 +711,8 @@ async fn dispatch(hub: &StateHub, commands: &Commands, action: Action) -> Option
 
     match answer.await {
         Ok(CommandOutcome::Accepted) => accepted(),
-        Ok(CommandOutcome::Refused(reason)) => no_session(&reason),
+        Ok(CommandOutcome::NoSession(detail)) => no_session(&detail),
+        Ok(CommandOutcome::Refused(detail)) => refused(&detail),
         // The bridge took the command and died before answering.
         Err(_) => no_session("the session stopped before it answered"),
     }
@@ -707,6 +724,13 @@ fn accepted() -> Option<String> {
 
 fn no_session(detail: &str) -> Option<String> {
     serde_json::to_string(&DaemonMessage::Error(ProtocolError::NoSession {
+        detail: detail.into(),
+    }))
+    .ok()
+}
+
+fn refused(detail: &str) -> Option<String> {
+    serde_json::to_string(&DaemonMessage::Error(ProtocolError::Refused {
         detail: detail.into(),
     }))
     .ok()
@@ -821,16 +845,36 @@ mod tests {
         // Connected as far as this connection can see, and refused anyway:
         // exactly the race the answer channel exists for.
         let hub = connected_hub();
-        let (commands, _taken) = bridge(CommandOutcome::Refused("not connected".into()));
+        let (commands, _taken) = bridge(CommandOutcome::Refused("has moved on".into()));
 
         let line = request_line(&ClientRequest::MarkRead {
             jid: "a@s.whatsapp.net".into(),
+            through_message_id: None,
         });
         let answer = handle_request(&line, &hub, &commands).await;
         assert!(matches!(
             parse(answer.frame),
-            DaemonMessage::Error(ProtocolError::NoSession { ref detail })
-                if detail == "not connected"
+            DaemonMessage::Error(ProtocolError::Refused { ref detail })
+                if detail == "has moved on"
+        ));
+    }
+
+    /// The other way a command can come back: the account went away while the
+    /// request was in the bridge's hands. A different answer, because a client
+    /// can see that state coming and wait it out rather than change anything.
+    #[tokio::test]
+    async fn a_session_lost_mid_command_is_reported_as_such() {
+        let hub = connected_hub();
+        let (commands, _taken) = bridge(CommandOutcome::NoSession("not connected".into()));
+
+        let line = request_line(&ClientRequest::SendText {
+            jid: "a@s.whatsapp.net".into(),
+            text: "hi".into(),
+        });
+        let answer = handle_request(&line, &hub, &commands).await;
+        assert!(matches!(
+            parse(answer.frame),
+            DaemonMessage::Error(ProtocolError::NoSession { .. })
         ));
     }
 

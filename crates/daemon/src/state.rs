@@ -360,6 +360,7 @@ mod tests {
             unread,
             manually_unread: false,
             last_message: Some(MessagePreview {
+                id: Some(format!("{jid}-newest")),
                 text: "t".into(),
                 from_me: false,
                 timestamp_ms: ts,

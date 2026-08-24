@@ -66,6 +66,22 @@ profile here repeats it deliberately.
   store reload is the store's whole truth *about rows it has*, and during
   pairing it has none while live messages already exist. Only store-backed
   chats are diffed against a reload; see `StateHub::store_backed_chat_jids`.
+- **A daemon frame is either state or news, and they use different channels.**
+  State carries a version and is recoverable from a snapshot; a window request
+  or a failed send is neither, so it must not ride a channel a client stops
+  reading while it resynchronizes. `StateHub::apply` versus `StateHub::signal`.
+- **A read the daemon issues has to outlive the reload already in flight.**
+  The store's reloader was woken by the very message that raised the badge, so
+  it still reports the old count moments later. `ReadTracker::read_through`
+  suppresses exactly that window, and is spent the moment the chat advances or
+  the store agrees — otherwise a deliberate unread from another device would
+  be papered over too.
+- **A read is bounded by what the *requester* saw**, not by what the daemon
+  knows: `MarkRead` names the preview's message id, and anything else is
+  refused. Not a timestamp — WhatsApp stamps to the second, so two arrivals in
+  one burst compare equal and a client that saw only the first would slip
+  through. A read action clears whole seconds, so an unchecked request from a
+  stale client consumes arrivals nobody ever laid eyes on.
 - **The chat store's writer queue is ordered on purpose.** Anything that
   targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row

@@ -953,8 +953,19 @@ impl WhatsAppClient {
         None
     }
 
-    /// Send a text message to a chat
-    pub fn send_message(&self, jid_str: &str, content: &str, local_id: String) {
+    /// Send a text message to a chat.
+    ///
+    /// The returned handle completes when the send has run to its conclusion,
+    /// successful or not. A caller that only fires and forgets can drop it;
+    /// one that has to bound how much work it has outstanding (the daemon,
+    /// driven by a program rather than by a person clicking) needs to know
+    /// when the work it asked for is over.
+    pub fn send_message(
+        &self,
+        jid_str: &str,
+        content: &str,
+        local_id: String,
+    ) -> tokio::task::JoinHandle<()> {
         let client_handle = self.client_handle.clone();
         let chat_store = self.chat_store.clone();
         let ui_sender = self.ui_sender.clone();
@@ -1016,7 +1027,7 @@ impl WhatsAppClient {
                 )
                 .await;
             }
-        });
+        })
     }
 
     /// Download media using DownloadableMedia info
@@ -1207,16 +1218,26 @@ impl WhatsAppClient {
     /// # Arguments
     /// * `chat_jid_str` - The JID of the chat (e.g., "123456@s.whatsapp.net")
     /// * `messages` - List of (message_id, sender_jid_string) tuples
-    pub fn send_read_receipts(&self, chat_jid_str: &str, messages: Vec<(String, String)>) {
-        if messages.is_empty() {
-            return;
-        }
-
+    ///
+    /// Returns a handle that completes when the receipts have gone out; see
+    /// [`WhatsAppClient::send_message`] for why.
+    pub fn send_read_receipts(
+        &self,
+        chat_jid_str: &str,
+        messages: Vec<(String, String)>,
+    ) -> tokio::task::JoinHandle<()> {
         let client_handle = self.client_handle.clone();
         let chat_jid_str = chat_jid_str.to_string();
         let runtime = self.runtime.clone();
 
         runtime.spawn(async move {
+            // Inside the task, not before it: the caller gets a handle it can
+            // await either way, rather than having to special-case nothing to
+            // do.
+            if messages.is_empty() {
+                return;
+            }
+
             let chat_jid: Jid = match chat_jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -1266,11 +1287,18 @@ impl WhatsAppClient {
             } else {
                 error!("Client not available for sending read receipts");
             }
-        });
+        })
     }
 
     /// Synchronize a bounded read action so newer messages remain unread.
-    pub fn mark_chat_read(&self, chat_jid_str: &str, last_displayed: Option<ReadBoundary>) {
+    ///
+    /// Returns a handle that completes when the action has run; see
+    /// [`WhatsAppClient::send_message`] for why.
+    pub fn mark_chat_read(
+        &self,
+        chat_jid_str: &str,
+        last_displayed: Option<ReadBoundary>,
+    ) -> tokio::task::JoinHandle<()> {
         let client_handle = self.client_handle.clone();
         let chat_jid_str = chat_jid_str.to_string();
         let runtime = self.runtime.clone();
@@ -1295,7 +1323,7 @@ impl WhatsAppClient {
             {
                 warn!("Failed to mark chat {} as read: {}", chat_jid.observe(), e);
             }
-        });
+        })
     }
 
     /// Accept an incoming call: signaling, callKey decrypt, relay connect and
