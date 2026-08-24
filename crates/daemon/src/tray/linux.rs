@@ -89,18 +89,16 @@ struct LinuxTray {
     handle: Handle<Item>,
 }
 
+#[async_trait::async_trait]
 impl super::Tray for LinuxTray {
-    fn update(&mut self, state: &TrayState) {
+    async fn update(&mut self, state: &TrayState) {
         let state = state.clone();
-        // `update` is async and this trait is not: the handle is cheap to
-        // clone and the update is fire-and-forget, so it goes on the runtime
-        // rather than blocking the watcher loop.
-        let handle = self.handle.clone();
-        tokio::spawn(async move {
-            handle
-                .update(move |item: &mut Item| item.state = state)
-                .await;
-        });
+        // Awaited rather than spawned: the watcher calls this in order, and
+        // letting each D-Bus update race the next allows an older state to
+        // land last and stick.
+        self.handle
+            .update(move |item: &mut Item| item.state = state)
+            .await;
     }
 }
 

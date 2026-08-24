@@ -46,24 +46,48 @@ async fn run() -> Result<()> {
         }
     };
 
-    let outcome = tokio::select! {
-        // The bridge owns the shutdown signal: it has a session thread to wait
-        // for, and a future cancelled by `select!` cannot wait for anything.
-        result = session_bridge::run(Arc::clone(&hub), shutdown_signal()) => {
-            result.context("session ended")
-        }
+    // One shutdown signal, watched by the bridge and raised by whoever stops
+    // first. The bridge must never be cancelled: it owns the session thread,
+    // and a future dropped mid-await cannot wait for anything. Racing it in a
+    // `select!` is exactly what would drop it, so the server's exit becomes a
+    // notification rather than a competing branch.
+    let stop = Arc::new(tokio::sync::Notify::new());
+
+    let session = {
+        let hub = Arc::clone(&hub);
+        let stop = Arc::clone(&stop);
+        tokio::spawn(
+            async move { session_bridge::run(hub, async move { stop.notified().await }).await },
+        )
+    };
+
+    let server_outcome = tokio::select! {
         result = server::run(Arc::clone(&hub)) => {
             // Fatal, and it has to reach the exit code: a supervisor that sees
             // status zero treats a daemon nobody can connect to as a clean
             // stop and never restarts it.
             result.context("ipc server stopped")
         }
+        () = shutdown_signal() => {
+            log::info!("shutting down");
+            Ok(())
+        }
+    };
+
+    // Whichever ended, the session still has to disconnect and close SQLite.
+    stop.notify_waiters();
+    let session_outcome = match session.await {
+        Ok(result) => result.context("session ended"),
+        Err(e) => Err(anyhow::anyhow!("session task panicked: {e}")),
     };
 
     // Before returning, so the icon goes away with the process rather than
     // lingering until the host notices the name dropped off the bus.
     drop(tray);
-    outcome
+
+    // The server's failure is the more actionable one when both fail: the
+    // session error is usually a consequence of tearing down.
+    server_outcome.and(session_outcome)
 }
 
 /// Resolve on the first termination signal.

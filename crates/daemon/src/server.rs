@@ -156,29 +156,86 @@ fn prepare_socket_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
 }
 
-/// Longest frame a client may send.
+/// Longest single frame a client may send.
 ///
-/// `lines()` grows its buffer until it sees a newline, so a client that never
-/// sends one would grow it without limit and take the WhatsApp session down
-/// with the daemon. Requests are small; a megabyte is far past any legitimate
-/// one and still cheap to refuse.
-const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+/// Per frame, not per connection: a reader capped for its whole lifetime would
+/// give a long-lived front end an artificial EOF once its small, valid
+/// requests happened to add up. Requests are tiny; a megabyte is far past any
+/// legitimate one and still cheap to refuse.
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Read one newline-delimited frame, bounded independently of every other.
+///
+/// Returns `None` at end of stream. Reads bytes rather than lines because a
+/// frame with invalid UTF-8 is a malformed frame the client can recover from,
+/// not a reason to drop a connection: `next_line` would surface it as an I/O
+/// error indistinguishable from a broken socket.
+async fn read_frame(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    buf: &mut Vec<u8>,
+) -> Result<Option<FrameRead>> {
+    read_frame_generic(reader, buf).await
+}
+
+/// The body of [`read_frame`], over any reader, so the framing rules can be
+/// tested without a socket.
+async fn read_frame_generic<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    buf: &mut Vec<u8>,
+) -> Result<Option<FrameRead>> {
+    buf.clear();
+    // Cap this read alone, then hand the limit back for the next one.
+    let read = {
+        let mut limited = reader.take(MAX_REQUEST_BYTES as u64);
+        limited.read_until(b'\n', buf).await?
+    };
+
+    if read == 0 {
+        return Ok(None);
+    }
+
+    if buf.len() == MAX_REQUEST_BYTES && !buf.ends_with(b"\n") {
+        return Ok(Some(FrameRead::TooLong));
+    }
+
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+
+    Ok(Some(match std::str::from_utf8(buf) {
+        Ok(line) => FrameRead::Line(line.to_string()),
+        Err(_) => FrameRead::NotUtf8,
+    }))
+}
+
+/// The outcome of reading one frame.
+#[derive(Debug)]
+enum FrameRead {
+    Line(String),
+    /// Well-framed bytes that are not text. Answerable, so the connection
+    /// survives a client with an encoding bug.
+    NotUtf8,
+    /// No newline within the cap. The stream cannot be resynchronized, since
+    /// there is no way to tell where this frame was meant to end.
+    TooLong,
+}
 
 async fn serve_client(stream: UnixStream, hub: Arc<StateHub>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader.take(MAX_REQUEST_BYTES)).lines();
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::with_capacity(1024);
 
     // Version first, state second. A client that cannot parse this daemon's
     // frames should never be handed a snapshot, and a daemon that cannot parse
     // that client's commands must not act on them.
-    match lines.next_line().await? {
-        Some(line) => {
+    match read_frame(&mut reader, &mut buf).await? {
+        Some(FrameRead::Line(line)) => {
             if let Some(rejection) = check_hello(&line) {
                 write_line(&mut writer, &rejection).await?;
                 return Ok(());
             }
         }
-        None => return Ok(()),
+        Some(_) | None => return Ok(()),
     }
 
     // Subscribe BEFORE snapshotting. Anything published in the window between
@@ -189,13 +246,20 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>) -> Result<()> {
     let hello = hub.hello_frame().context("serializing the snapshot")?;
     write_line(&mut writer, &hello).await?;
 
+    // Set once the client has been told to resync. Until it asks for a
+    // snapshot its view is known-stale, so further updates are worthless to it
+    // and the request side takes priority: otherwise a continuous backlog
+    // keeps `updates` ready forever and the recovery request is never read.
+    let mut awaiting_resync = false;
+
     loop {
         tokio::select! {
-            // Biased: drain published state before reading more requests, so a
-            // client that floods the socket cannot starve its own event stream.
+            // Normally drain published state before reading more requests, so
+            // a client that floods the socket cannot starve its own event
+            // stream. After a lag that inverts, because recovery comes first.
             biased;
 
-            update = updates.recv() => match update {
+            update = updates.recv(), if !awaiting_resync => match update {
                 Ok(frame) => write_line(&mut writer, &frame).await?,
                 Err(RecvError::Lagged(missed)) => {
                     // The stream was truncated, so whatever the client holds is
@@ -205,20 +269,53 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>) -> Result<()> {
                     log::debug!("client fell {missed} frames behind; asking it to resync");
                     let frame = serde_json::to_string(&DaemonMessage::Resync)?;
                     write_line(&mut writer, &frame).await?;
+                    awaiting_resync = true;
                 }
                 Err(RecvError::Closed) => return Ok(()),
             },
 
-            line = lines.next_line() => match line? {
-                Some(line) => {
+            frame = read_frame(&mut reader, &mut buf) => match frame? {
+                Some(FrameRead::Line(line)) => {
+                    if is_snapshot_request(&line) {
+                        awaiting_resync = false;
+                    }
                     if let Some(reply) = handle_request(&line, &hub) {
                         write_line(&mut writer, &reply).await?;
                     }
+                }
+                Some(FrameRead::NotUtf8) => {
+                    let frame = serde_json::to_string(&DaemonMessage::Error(
+                        oxidezap_ipc::ProtocolError::Malformed {
+                            detail: "frame was not valid UTF-8".into(),
+                        },
+                    ))?;
+                    write_line(&mut writer, &frame).await?;
+                }
+                Some(FrameRead::TooLong) => {
+                    // Unlike the other two this ends the connection: with no
+                    // newline there is no way to know where the frame was meant
+                    // to end, so the stream cannot be resynchronized.
+                    let frame = serde_json::to_string(&DaemonMessage::Error(
+                        oxidezap_ipc::ProtocolError::Malformed {
+                            detail: format!("frame exceeded {MAX_REQUEST_BYTES} bytes"),
+                        },
+                    ))?;
+                    write_line(&mut writer, &frame).await?;
+                    return Ok(());
                 }
                 None => return Ok(()),
             },
         }
     }
+}
+
+/// Whether a frame is a snapshot request. Parsing it here only gates update
+/// delivery; a frame that fails to parse is answered by `handle_request`.
+fn is_snapshot_request(line: &str) -> bool {
+    matches!(
+        serde_json::from_str::<ClientRequest>(line),
+        Ok(ClientRequest::Snapshot)
+    )
 }
 
 /// Validate the client's opening frame, returning a rejection to send when it
@@ -374,6 +471,60 @@ mod tests {
         assert!(matches!(
             reply,
             DaemonMessage::Error(oxidezap_ipc::ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// The cap is per frame, not per connection: a long-lived client sending
+    /// small valid requests must never hit an artificial EOF because they
+    /// added up.
+    #[tokio::test]
+    async fn the_size_cap_applies_to_each_frame_separately() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut reader = BufReader::new(server);
+        let mut buf = Vec::new();
+
+        // More total bytes than the cap, in frames far below it.
+        let frame = "x".repeat(1000);
+        let frames = (MAX_REQUEST_BYTES / 1000) + 10;
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            for _ in 0..frames {
+                let _ = client.write_all(frame.as_bytes()).await;
+                let _ = client.write_all(b"\n").await;
+            }
+        });
+
+        for i in 0..frames {
+            match read_frame_generic(&mut reader, &mut buf).await {
+                Ok(Some(FrameRead::Line(line))) => assert_eq!(line.len(), 1000),
+                other => panic!("frame {i} of {frames} was cut short: {other:?}"),
+            }
+        }
+    }
+
+    /// A frame that is not text is the client's bug, and it can recover from
+    /// being told. Dropping the connection would take its valid requests with
+    /// it.
+    #[tokio::test]
+    async fn invalid_utf8_is_a_recoverable_frame_not_a_dead_connection() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(server);
+        let mut buf = Vec::new();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            let _ = client.write_all(&[0xff, 0xfe, b'\n']).await;
+            let _ = client.write_all(b"{\"request\":\"snapshot\"}\n").await;
+        });
+
+        assert!(matches!(
+            read_frame_generic(&mut reader, &mut buf).await,
+            Ok(Some(FrameRead::NotUtf8))
+        ));
+        // The stream survives it.
+        assert!(matches!(
+            read_frame_generic(&mut reader, &mut buf).await,
+            Ok(Some(FrameRead::Line(_)))
         ));
     }
 
