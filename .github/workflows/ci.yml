@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig1-dev libfreetype6-dev
+          version: 1.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      # --all-features so the chat store's `search` feature (FTS5) is covered;
+      # a default-features run silently skips its index and query tests.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+
+  # The chat store is a library crate an embedder can depend on, and it lost
+  # the MSRV job it had in whatsapp-rust when it moved here. The GUI is
+  # deliberately excluded: it tracks gpui's git HEAD, which has no MSRV to
+  # promise. Keep this toolchain and workspace.package.rust-version in step.
+  msrv:
+    name: MSRV (library crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check -p oxidezap-chat-store -p oxidezap-core --all-features

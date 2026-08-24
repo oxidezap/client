@@ -1,81 +1,64 @@
-# Standalone workspace, excluded from the repository root workspace: the gpui
-# dependency tree (and its [patch]) stays out of the library's Cargo.lock, CI
-# and MSRV. The app tracks the library via path deps, so an API change in the
-# lib breaks this build in the same PR that makes it.
+# Workspace root. `crates/gui` is the only member today; the daemon
+# (`oxidezapd`) and a TUI front end land beside it, which is why the front end
+# is already a member instead of the root package.
 [workspace]
+members = ["crates/audio", "crates/core", "crates/gui", "crates/session"]
+resolver = "3"
 
-# Mirror the root workspace's safeguards (see /clippy.toml for the lists):
-# wacore::time instead of std clocks, portable-atomic for 64-bit atomics.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+authors = ["João Lucas <jlucaso@hotmail.com>"]
+repository = "https://github.com/oxidezap/client"
+
+# Mirror the library's safeguards (see /clippy.toml): wacore::time instead of
+# std clocks, portable-atomic for 64-bit atomics.
 [workspace.lints.clippy]
 disallowed_methods = "deny"
 disallowed_types = "deny"
 
-[package]
-name = "whatsapp-desktop"
-version = "0.1.0"
-edition = "2024"
-authors = ["João Lucas <jlucaso@hotmail.com>"]
-license = "MIT"
-description = "WhatsApp desktop client built on whatsapp-rust + GPUI"
+[workspace.dependencies]
+oxidezap-audio = { path = "crates/audio" }
+oxidezap-chat-store = { path = "crates/chat-store" }
+oxidezap-core = { path = "crates/core" }
+oxidezap-session = { path = "crates/session" }
 
-[[bin]]
-name = "whatsapp-desktop"
-path = "src/main.rs"
+# The library and its satellites. One git source, one branch: cargo resolves
+# every entry below to the SAME commit, so `cargo update` moves them together
+# and no two crates can drift onto incompatible revisions. The exact commit is
+# pinned in the committed Cargo.lock.
+#
+# `whatsapp-rust` re-exports wacore, wacore-binary and waproto wholesale, so
+# anything already depending on it reaches them through that and does not
+# declare them here. The satellites below stay because `oxidezap-core`,
+# `-audio` and `-chat-store` deliberately do NOT depend on `whatsapp-rust`:
+# they are domain types, device I/O and storage, and routing them through the
+# client would drag the whole Tokio runtime, VoIP stack and transport into
+# crates that need none of it. `SharedSqlite` is also not re-exported, so the
+# chat store needs sqlite-storage directly regardless.
+#
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", features = ["voip"] }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 
-[lints]
-workspace = true
-
-[dependencies]
+# Mirrored from the library workspace: the chat store was authored against
+# these exact feature sets, and default-features would pull in backends it
+# deliberately avoids.
 anyhow = "1.0"
-async-channel = "2"
-async-trait = "0.1"
-base64 = "0.22"
-buffa = "0.8"
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-
-# Audio capture/playback (PTT voice messages + calls)
-cpal = "0.18"
-env_logger = "0.11"
-
-# UI framework: GPUI upstream + gpui-component. gpui-component leaves its gpui
-# dep unpinned (tracks zed HEAD), and cargo forbids [patch]-pinning a source to
-# itself — so the rev pin lives in THIS workspace's committed Cargo.lock
-# (`cargo update -p gpui --precise <rev>` to move it). Same-source everywhere =
-# one gpui in the tree, no fork.
-gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "0775df394083c1ed74f36f846b78868d1267398f" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git", rev = "0775df394083c1ed74f36f846b78868d1267398f" }
-
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-# Ordered maps for deterministic cache eviction
-indexmap = "2"
+buffa = { version = "0.9.1", default-features = false, features = ["json"] }
+chrono = { version = "0.4", default-features = false }
+diesel = { version = "2.3.11", default-features = false, features = ["sqlite", "r2d2", "32-column-tables"] }
+diesel_migrations = { version = "2.3.2", default-features = false, features = ["sqlite"] }
+flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 log = "0.4"
-mp4 = "0.14"
-ogg = "0.9"
-openh264 = "0.9" # H.264 software decoder
-opus = "0.3"
-qrcode = "0.14"
-portable-atomic = "1"
-rand = "0.10"
-ringbuf = "0.5"
-rust-embed = "8"
-smallvec = "1"
-# Async utilities (GPUI-compatible timers)
-smol = "2"
-# Audio processing (waveform generation)
-symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4", "mp3", "ogg", "pcm"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-
-# The library and its satellites, by path: always the checkout's version.
-wacore = { path = "../../wacore" }
-wacore-binary = { path = "../../wacore/binary" }
-waproto = { path = "../../waproto" }
-whatsapp-rust = { path = "../..", features = ["voip"] }
-whatsapp-rust-chat-store = { path = "../../storages/chat-store", features = ["search"] }
-whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage" }
-whatsapp-rust-tokio-transport = { path = "../../transports/tokio-transport" }
-whatsapp-rust-ureq-http-client = { path = "../../http_clients/ureq-client" }
+portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+serde_json = { version = "1.0", default-features = false }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", default-features = false }
 
 [profile.dev]
 # gpui is unusably slow unoptimized; match zed's own dev profile for it.
@@ -83,5 +66,58 @@ whatsapp-rust-ureq-http-client = { path = "../../http_clients/ureq-client" }
 opt-level = 3
 
 [profile.release]
-lto = "thin"
+opt-level = 3
+debug = false
+# fat LTO + a single codegen unit is worth several MiB across a tree this size.
+# It costs release build time, which is why the nightly job builds the same
+# profile only on main rather than per PR.
+lto = "fat"
+codegen-units = 1
+# gpui only reaches for catch_unwind in its test harness, so aborting loses no
+# runtime recovery and drops the unwind tables.
+panic = "abort"
 strip = true
+incremental = false
+
+# Off-hot-path crates run per connection / sync / request, not per frame, so
+# size-optimizing them shrinks the binary at no measurable cost. This mirrors
+# the same sweep in whatsapp-rust's own manifest — profile settings only apply
+# from the workspace root, so consuming those crates by git does not inherit
+# them. Media decode (image, openh264, symphonia, mp4) and the per-message
+# crypto/protocol crates deliberately stay at opt-level 3.
+# z = persistence, media HTTP and TLS PKI.
+[profile.release.package.diesel]
+opt-level = "z"
+[profile.release.package.diesel_migrations]
+opt-level = "z"
+[profile.release.package.r2d2]
+opt-level = "z"
+[profile.release.package.whatsapp-rust-sqlite-storage]
+opt-level = "z"
+[profile.release.package.libsqlite3-sys]
+opt-level = "z"
+[profile.release.package.ureq]
+opt-level = "z"
+[profile.release.package.ureq-proto]
+opt-level = "z"
+[profile.release.package.whatsapp-rust-ureq-http-client]
+opt-level = "z"
+[profile.release.package.rustls-webpki]
+opt-level = "z"
+[profile.release.package.webpki-roots]
+opt-level = "z"
+[profile.release.package.http]
+opt-level = "z"
+# s = data-path framing kept a notch faster than z.
+[profile.release.package.rustls]
+opt-level = "s"
+[profile.release.package.tokio-websockets]
+opt-level = "s"
+[profile.release.package.whatsapp-rust-tokio-transport]
+opt-level = "s"
+[profile.release.package.wacore-appstate]
+opt-level = "s"
+[profile.release.package.chrono]
+opt-level = "s"
+[profile.release.package.serde_json]
+opt-level = "s"

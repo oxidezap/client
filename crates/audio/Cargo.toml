@@ -1,0 +1,26 @@
+[package]
+name = "oxidezap-audio"
+description = "Capture, playback and Opus encoding for voice messages and calls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-channel = "2"
+cpal = "0.18"
+log = { workspace = true }
+ogg = "0.9"
+# Kept on the same major as the library's voip-libopus dependency: two
+# semver-incompatible wrappers would each link their own copy of libopus.
+opus = "0.3"
+portable-atomic = { workspace = true }
+ringbuf = "0.5"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+wacore = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+name = "oxidezap-session"
+description = "Headless WhatsApp session: connection, event stream, sends, store hydration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-channel = "2"
+log = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+oxidezap-audio = { workspace = true }
+oxidezap-core = { workspace = true }
+
+whatsapp-rust = { workspace = true }
+oxidezap-chat-store = { workspace = true, features = ["search"] }

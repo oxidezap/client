@@ -1,0 +1,44 @@
+# Rolling build of main. The `nightly` tag is moved on every push, so the
+# release page always holds exactly one set of development binaries.
+name: Nightly
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: nightly
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish rolling nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Recreate rather than edit: `gh release edit` cannot move a tag, and
+          # a stale tag would leave the assets pointing at an older commit.
+          gh release delete nightly --yes --cleanup-tag || true
+          gh release create nightly artifacts/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Nightly (${GITHUB_SHA:0:7})" \
+            --notes "Unsigned development build of \`main\` (\`$GITHUB_SHA\`). Expect breakage, and expect macOS Gatekeeper and Windows SmartScreen to object."

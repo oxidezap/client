@@ -1,258 +1,55 @@
-# WhatsApp Desktop
+# oxidezap
 
-A native WhatsApp client built with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the GPU-accelerated UI framework from Zed) that integrates with the `whatsapp-rust` library.
+An unofficial WhatsApp client in Rust, built on [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust).
 
-## Why GPUI?
+Not affiliated with, endorsed by, or connected to WhatsApp or Meta.
 
-- **GPU-accelerated rendering** via Vulkan/Metal/DX12 (using Blade graphics backend)
-- **Reactive architecture** - UI only re-renders when state changes
-- **Hybrid immediate/retained mode** - best of both worlds
-- **Battle-tested** - powers the Zed code editor
-- **Rich component library** via [gpui-component](https://longbridge.github.io/gpui-component/)
+## Status
 
-## Architecture
+Early. Pairing, chats with durable history, media, and 1:1 voice calls work; see
+[known limitations](#known-limitations) before relying on it.
 
-```text
-apps/desktop/
-├── src/
-│   ├── main.rs              # Entry point
-│   ├── assets.rs            # Embedded asset source (icons)
-│   ├── responsive.rs        # ResponsiveLayout: window-size-aware dimensions
-│   ├── theme.rs             # Colors and layout constants
-│   ├── utils.rs             # Shared helpers (time format, media scaling, MIME)
-│   ├── app/                 # WhatsAppApp: state, event handling, render dispatch
-│   │   ├── mod.rs           # Struct, UiEvent handling, playback/recording control
-│   │   ├── calls.rs         # Call UI state (incoming/outgoing/active)
-│   │   ├── chats.rs         # Chat list cache
-│   │   ├── media/mod.rs     # Active media playback state
-│   │   └── messages.rs      # Message list cache for VirtualList
-│   ├── client/              # WhatsApp client wrapper
-│   │   ├── mod.rs
-│   │   └── whatsapp.rs      # Tokio-side client, durable history, UiEvent bridge
-│   ├── audio/               # PTT + call audio
-│   │   ├── call_device.rs   # cpal mic/speaker bridge for voice calls
-│   │   ├── encoder.rs       # Opus/OGG encoding for voice notes
-│   │   ├── player.rs        # Voice note playback
-│   │   ├── recorder.rs      # PTT capture
-│   │   └── waveform.rs      # Waveform generation
-│   ├── video/               # Video message playback
-│   │   ├── audio.rs         # MP4 audio track extraction (AAC→ADTS)
-│   │   ├── player.rs        # Playback state machine
-│   │   └── streaming.rs     # H.264 decoding (openh264)
-│   ├── state/               # Application state
-│   │   ├── mod.rs
-│   │   ├── app_state.rs     # AppState enum (Loading, Connected, etc.)
-│   │   ├── chat.rs          # Chat, ChatMessage, MediaContent structs
-│   │   ├── call.rs          # IncomingCall, OutgoingCall, ActiveCall structs
-│   │   └── events.rs        # UiEvent enum for client->UI communication
-│   ├── components/          # Reusable UI components
-│   │   ├── mod.rs
-│   │   ├── avatar.rs        # Avatar with gpui-component
-│   │   ├── call_popup.rs    # Incoming call popup
-│   │   ├── chat_header.rs   # Chat header bar with call buttons
-│   │   ├── chat_item.rs     # Single chat in list
-│   │   ├── chat_list.rs     # Chat list sidebar with VirtualList
-│   │   ├── input_area_view.rs # Message input + PTT recording controls
-│   │   ├── message_bubble.rs # Message bubble with media support
-│   │   ├── message_list.rs  # Message list with VirtualList
-│   │   └── outgoing_call_popup.rs # Outgoing/active call popup
-│   └── views/               # Application views
-│       ├── mod.rs
-│       ├── loading.rs       # Loading/connecting spinner views
-│       ├── pairing.rs       # QR code/pair code view
-│       ├── error.rs         # Error view with retry button
-│       └── chat.rs          # Main connected view
-├── Cargo.toml
-└── README.md
-```
+## Layout
 
-## Module Overview
+The connection lives in `crates/session` and knows nothing about how it is drawn,
+so a front end is a thin consumer of it. `crates/gui` is the first one — a GPUI
+desktop app producing the `oxidezap` binary. A background daemon (`oxidezapd`)
+and a TUI are the reason the split exists; neither is written yet.
 
-### `theme.rs`
-Contains WhatsApp dark theme colors and layout constants:
-- `colors::*` - Background, text, accent colors
-- `layout::*` - Dimensions for sidebar, headers, avatars, etc.
+`crates/core` holds the domain types both sides speak, and `crates/audio` the
+capture, playback and Opus encoding shared by voice messages and calls.
 
-### `components/`
-Reusable UI components built with GPUI and gpui-component:
-- **Avatar** - User avatar with initials fallback (uses gpui-component)
-- **ChatItem** - Single chat entry in the sidebar list
-- **ChatList** - VirtualList-based scrollable chat sidebar
-- **MessageBubble** - Message bubble with media (images, stickers, audio, docs)
-- **MessageList** - VirtualList-based scrollable message area
-- **ChatHeader** - Header bar showing chat name and avatar
-- **InputArea** - Message input with send button
+## Build
 
-### `views/`
-Application views for different states:
-- **Loading/Connecting** - Spinner with status message
-- **Pairing** - QR code display and pair code
-- **Error** - Error message with retry button
-- **Chat** - Main connected view with sidebar and chat area
-
-### `app/`
-Main application logic:
-- `WhatsAppApp` struct with all state
-- Event handling from WhatsApp client
-- Render dispatch based on AppState
-- Media playback and PTT recording control
-
-## GPUI Concepts
-
-### Render Trait
-
-Components implement the `Render` trait:
-
-```rust
-impl Render for WhatsAppApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Process events and dispatch to appropriate view
-        match &self.app_state {
-            AppState::Loading => render_loading_view(),
-            AppState::Connected => render_connected_view(self, window, cx),
-            // ...
-        }
-    }
-}
-```
-
-### Reactive Updates
-
-GPUI uses `cx.notify()` to trigger re-renders when state changes:
-
-```rust
-fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
-    match event {
-        UiEvent::Connected => {
-            self.app_state = AppState::Connected;
-            cx.notify(); // Trigger re-render
-        }
-        // ...
-    }
-}
-```
-
-### VirtualList for Performance
-
-Large lists use VirtualList for efficient rendering:
-
-```rust
-v_virtual_list(
-    entity,
-    "message-list",
-    item_sizes,
-    |_view, visible_range, _scroll_handle, _cx| {
-        visible_range
-            .map(|ix| render_message_bubble(messages[ix].clone()))
-            .collect()
-    },
-)
-.track_scroll(&scroll_handle)
-```
-
-### Styling (Tailwind-like API)
-
-```rust
-div()
-    .flex()
-    .flex_col()
-    .gap_4()
-    .p_4()
-    .bg(rgb(colors::BG_SECONDARY))
-    .rounded(px(layout::RADIUS_MEDIUM))
-    .text_color(rgb(colors::TEXT_PRIMARY))
-```
-
-## Data Flow
-
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│                         WhatsAppApp                             │
-│                                                                 │
-│  ┌─────────────────┐         ┌─────────────────────────────┐   │
-│  │   WhatsAppClient│────────►│  mpsc::UnboundedReceiver    │   │
-│  │  (background    │ UiEvent │  (polled via animation      │   │
-│  │   thread)       │         │   frame callback)           │   │
-│  └─────────────────┘         └──────────────┬──────────────┘   │
-│                                             │                   │
-│                                             ▼                   │
-│                              ┌──────────────────────────────┐  │
-│                              │  handle_event()              │  │
-│                              │  - Updates app_state         │  │
-│                              │  - Calls cx.notify()         │  │
-│                              └──────────────┬───────────────┘  │
-│                                             │                   │
-│                                             ▼                   │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                     render()                             │   │
-│  │                                                          │   │
-│  │  match app_state:                                        │   │
-│  │    Loading    -> render_loading_view()                   │   │
-│  │    Connecting -> render_connecting_view()                │   │
-│  │    Pairing    -> render_pairing_view()                   │   │
-│  │    Connected  -> render_connected_view()                 │   │
-│  │    Error      -> render_error_view()                     │   │
-│  │                                                          │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## gpui-component
-
-We use the [gpui-component](https://longbridge.github.io/gpui-component/) library for pre-built UI components:
-
-- **Avatar** - User profile with fallback initials
-- **Button** - Primary, secondary, danger variants
-- **Input** - Text input with placeholder
-- **Spinner** - Loading indicator
-- **Scrollbar** - Custom scrollbar for lists
-- **VirtualList** - Efficient scrollable lists
-- And 50+ more components
-
-## Running
+Stable Rust. On Linux you also need the ALSA, X11/Wayland and fontconfig
+development packages:
 
 ```bash
-# Development build
-cargo run --manifest-path apps/desktop/Cargo.toml
-
-# Release build (optimized)
-cargo run --release --manifest-path apps/desktop/Cargo.toml
+sudo apt install libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libwayland-dev libxcb1-dev libfontconfig1-dev libfreetype6-dev
+cargo run --release
 ```
 
-## Dependencies
+The first build compiles the GPUI tree and takes a while. Debug builds keep gpui
+itself optimized (see `[profile.dev.package.gpui]`), which is what makes them
+usable at all.
 
-- **gpui**: GPU-accelerated UI framework (from Zed)
-- **gpui-component**: Pre-built UI components
-- **tokio**: Async runtime
-- **whatsapp-rust**: WhatsApp Web client library
-- **chrono**: Date/time handling
-- **log/env_logger**: Logging
-- **image**: Image decoding (PNG, JPEG, WebP)
+## Data
 
-## Features Status
+State lives in one SQLite file under the platform data directory
+(`~/.local/share/whatsapp-rust-desktop/whatsapp.db` on Linux): device identity,
+Signal state and chat history together. Deleting it unlinks the device and
+discards local history.
 
-- [x] Basic app structure with GPUI
-- [x] Loading/Connecting views with Spinner
-- [x] Pairing view with QR code rendering
-- [x] Connected view with chat layout
-- [x] Error view with retry button
-- [x] Event handling from WhatsApp client
-- [x] Chat list with VirtualList
-- [x] Message bubbles with media support
-- [x] Image/sticker display
-- [x] Video and voice note playback
-- [x] PTT voice note recording
-- [x] Input field for messages
-- [x] Modular component architecture
-- [x] Call UI (incoming/outgoing popups over the library's VoIP facade)
-- [x] Durable chat history (SQLite via whatsapp-rust-chat-store)
-- [x] Message sending status (pending, sent, delivered, read, failed)
+## Known limitations
 
-## Future Improvements
+- Voice calls only — the library's call facade is 1:1 audio, so the video call
+  button places a voice call.
+- Media bubbles re-download on demand after a restart.
+- Reactions persist but are not hydrated into the UI at startup.
+- Release binaries are unsigned: macOS Gatekeeper and Windows SmartScreen will
+  both object until they are.
 
-- [x] Contact name resolution from address book
-- [ ] Group chat features (participants, admin actions)
-- [ ] Settings/preferences screen
-- [ ] Notification system
-- [ ] Video calls
-- [ ] Theme customization
+## License
+
+MIT.
