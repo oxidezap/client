@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use oxidezap_core::{ChatMessage, UiEvent};
 use oxidezap_ipc::{ChatSummary, ConnectionState, DaemonEvent, MessagePreview};
 use oxidezap_session::{ReadBoundary, WhatsAppClient};
-use wacore_binary::jid::{Jid, JidExt};
+use wacore_binary::jid::{Jid, JidExt, observe_str};
 
 use crate::state::{Change, StateHub};
 
@@ -24,13 +24,38 @@ use crate::state::{Change, StateHub};
 /// session has no part in (a snapshot, a window) never reach here, so this
 /// enum is exactly the set of actions that touch the account.
 #[derive(Debug)]
-pub enum SessionCommand {
+pub enum Action {
     SendText { jid: String, text: String },
     MarkRead { jid: String },
 }
 
+/// An action plus the channel its answer goes back on.
+///
+/// The answer is the point. Handing a command to a queue is not the same as
+/// the session taking it: the account can disconnect in between, and a client
+/// told `Accepted` on admission alone would never learn that its message was
+/// dropped on the floor. Waiting for this is also what bounds the work — a
+/// connection has one command outstanding at a time, so the client cap caps
+/// the queue.
+#[derive(Debug)]
+pub struct SessionCommand {
+    pub action: Action,
+    pub reply: tokio::sync::oneshot::Sender<CommandOutcome>,
+}
+
+/// What became of one command.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// The session took it. What the network makes of it shows up in the
+    /// event stream, not here.
+    Accepted,
+    /// The session would not, with a reason meant for a person reading a
+    /// client's error message.
+    Refused(String),
+}
+
 /// The end of the command channel the server holds.
-pub type Commands = tokio::sync::mpsc::UnboundedSender<SessionCommand>;
+pub type Commands = tokio::sync::mpsc::Sender<SessionCommand>;
 
 /// Run the session until it ends or `shutdown` resolves.
 ///
@@ -41,7 +66,7 @@ pub type Commands = tokio::sync::mpsc::UnboundedSender<SessionCommand>;
 /// below reachable on every exit path.
 pub async fn run(
     hub: Arc<StateHub>,
-    mut commands: tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
+    mut commands: tokio::sync::mpsc::Receiver<SessionCommand>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let mut client = WhatsAppClient::new().context("opening the local store")?;
@@ -111,27 +136,53 @@ pub fn close(mut client: WhatsAppClient) {
     }
 }
 
-/// Act on one client command.
+/// Act on one client command, and answer the connection that asked.
 fn execute(
     client: &WhatsAppClient,
     hub: &StateHub,
     reads: &mut ReadTracker,
     command: SessionCommand,
 ) {
-    match command {
-        SessionCommand::SendText { jid, text } => {
+    let SessionCommand { action, reply } = command;
+    // A refusal nobody is listening for is not worth logging: the client hung
+    // up, which is its right.
+    let _ = reply.send(act(client, hub, reads, action));
+}
+
+fn act(
+    client: &WhatsAppClient,
+    hub: &StateHub,
+    reads: &mut ReadTracker,
+    action: Action,
+) -> CommandOutcome {
+    // Checked again here, not only where the request arrived. The account can
+    // drop in the window between the two, and the session's own answer to a
+    // command it cannot carry out is a log line the requester never sees.
+    let connection = hub.connection();
+    if !connection.is_connected() {
+        return CommandOutcome::Refused(format!("not connected: {connection:?}"));
+    }
+
+    match action {
+        Action::SendText { jid, text } => {
             // The optimistic bubble a GUI would draw has no equivalent here:
             // the daemon holds summaries, not messages, and the store's
             // reload republishes the chat once the row lands. The local id
             // still has to be unique, because the session renames it to the
             // real message id and a collision would rename the wrong send.
             client.send_message(&jid, &text, next_local_id());
+            CommandOutcome::Accepted
         }
-        SessionCommand::MarkRead { jid } => {
-            let (boundary, unread) = reads.mark_read(&jid);
+        Action::MarkRead { jid } => {
+            let boundary = match reads.boundary(&jid, hub) {
+                Ok(boundary) => boundary,
+                Err(reason) => return CommandOutcome::Refused(reason),
+            };
+
             // Receipts turn the sender's ticks blue; the bounded chat action
             // persists the read across devices without swallowing anything
             // newer. Both are what the GUI does on opening a chat.
+            let unread = reads.take_receipts(&jid);
             if !unread.is_empty() {
                 client.send_read_receipts(&jid, unread);
             }
@@ -146,6 +197,7 @@ fn execute(
                 summary.manually_unread = false;
                 hub.apply(Change::live(DaemonEvent::ChatUpdated(summary)));
             }
+            CommandOutcome::Accepted
         }
     }
 }
@@ -261,17 +313,38 @@ impl ReadTracker {
         }
     }
 
-    /// Take what a read action needs, and forget the receipts it consumes.
+    /// Where a read action for `jid` must stop, or why it must not run.
     ///
-    /// The boundary stays: it describes where the chat ends, which the next
-    /// read still has to know even though these receipts have gone out.
-    fn mark_read(&mut self, jid: &str) -> (Option<ReadBoundary>, Vec<(String, String)>) {
-        let Some(reads) = self.chats.get_mut(jid) else {
-            // A chat the daemon has never seen a message in: the bounded
-            // action still marks it read, it just has nothing to bound.
-            return (None, Vec::new());
-        };
-        (reads.boundary(), reads.unread.drain(..).collect())
+    /// `Ok(None)` is not "no bound": it is "there is nothing to bound". An
+    /// unbounded read action clears a chat by its own timestamp, so issuing
+    /// one for a chat the daemon knows holds messages it has not seen would
+    /// consume arrivals the requester never laid eyes on — a delayed or stale
+    /// client silently marking future messages read. Only a chat with nothing
+    /// behind it may go without a bound, and the hub is what tells the two
+    /// apart: a summary with no preview has no message under it.
+    fn boundary(&self, jid: &str, hub: &StateHub) -> Result<Option<ReadBoundary>, String> {
+        if let Some(boundary) = self.chats.get(jid).and_then(ChatReads::boundary) {
+            return Ok(Some(boundary));
+        }
+        match hub.chat(jid) {
+            Some(summary) if summary.last_message.is_none() => Ok(None),
+            Some(_) => Err(format!(
+                "no message boundary known for {}; let its history load before marking it read",
+                observe_str(jid)
+            )),
+            None => Err(format!("no such chat: {}", observe_str(jid))),
+        }
+    }
+
+    /// Take the receipts this chat owes, leaving the boundary behind.
+    ///
+    /// The boundary describes where the chat ends, which the next read still
+    /// has to know even though these receipts have gone out.
+    fn take_receipts(&mut self, jid: &str) -> Vec<(String, String)> {
+        self.chats
+            .get_mut(jid)
+            .map(|reads| reads.unread.drain(..).collect())
+            .unwrap_or_default()
     }
 
     fn forget(&mut self, jid: &str) {
@@ -313,6 +386,20 @@ fn translate(event: UiEvent, hub: &StateHub) -> Vec<Change> {
         // and every client waits on a state that will never change.
         UiEvent::Error(detail) => {
             vec![connection(ConnectionState::Disconnected { reason: detail })]
+        }
+        // Not a state change: the chat is exactly as it was, one message
+        // short. Published rather than swallowed, because a client that asked
+        // for a send has no other way to learn it did not happen — the
+        // acknowledgement said the session took the command, not that the
+        // network took the message.
+        UiEvent::SendFailed {
+            chat_jid, reason, ..
+        } => {
+            hub.signal(&oxidezap_ipc::DaemonMessage::SendFailed {
+                jid: chat_jid,
+                reason,
+            });
+            Vec::new()
         }
         // Live traffic, applied directly rather than waiting for the store to
         // republish. The reloader that produces `HistoryLoaded` debounces on a
@@ -432,6 +519,7 @@ fn chat_updated(chat: &oxidezap_core::Chat) -> Change {
 mod tests {
     use super::*;
     use oxidezap_core::Chat;
+    use oxidezap_ipc::DaemonMessage;
 
     fn message(id: &str, sender: &str, secs: i64, from_me: bool, read: bool) -> ChatMessage {
         ChatMessage {
@@ -642,7 +730,9 @@ mod tests {
             None,
         ));
 
-        let (boundary, unread) = reads.mark_read("1@s.whatsapp.net");
+        let hub = StateHub::new();
+        let boundary = reads.boundary("1@s.whatsapp.net", &hub).unwrap();
+        let unread = reads.take_receipts("1@s.whatsapp.net");
         let (secs, ids) = boundary.expect("a chat with messages has a boundary");
         assert_eq!(secs, 20);
         let mut at_boundary: Vec<&str> = ids.iter().map(|(id, ..)| id.as_str()).collect();
@@ -653,8 +743,14 @@ mod tests {
         owed.sort_unstable();
         assert_eq!(owed, ["a", "b", "older"]);
 
-        let (_, again) = reads.mark_read("1@s.whatsapp.net");
-        assert!(again.is_empty(), "a receipt is owed once, not every time");
+        assert!(
+            reads.take_receipts("1@s.whatsapp.net").is_empty(),
+            "a receipt is owed once, not every time"
+        );
+        assert!(
+            reads.boundary("1@s.whatsapp.net", &hub).unwrap().is_some(),
+            "the boundary outlives the receipts: the next read still needs it"
+        );
     }
 
     /// One abandoned conversation must not grow the daemon without bound.
@@ -668,7 +764,7 @@ mod tests {
                 None,
             ));
         }
-        let (_, unread) = reads.mark_read("1@s.whatsapp.net");
+        let unread = reads.take_receipts("1@s.whatsapp.net");
         assert_eq!(unread.len(), MAX_TRACKED_UNREAD);
         assert_eq!(unread.first().unwrap().0, "m5", "the oldest went first");
     }
@@ -692,7 +788,95 @@ mod tests {
             complete: true,
         });
 
-        let (_, unread) = reads.mark_read("1@s.whatsapp.net");
+        let unread = reads.take_receipts("1@s.whatsapp.net");
         assert!(unread.is_empty(), "read elsewhere, so nothing is owed");
+    }
+
+    /// An unbounded read action clears a chat by its own timestamp. Issuing
+    /// one for a chat the daemon knows holds messages it has not seen would
+    /// consume arrivals the requester never laid eyes on, so a stale client
+    /// asking to mark such a chat read is told no instead.
+    #[test]
+    fn a_chat_with_unseen_messages_will_not_be_marked_read_unbounded() {
+        let reads = ReadTracker::default();
+        let hub = StateHub::new();
+        hub.apply(Change::from_store(DaemonEvent::ChatUpdated(ChatSummary {
+            jid: "1@s.whatsapp.net".into(),
+            name: "n".into(),
+            unread: 4,
+            manually_unread: false,
+            // A preview with no message behind it: hydrated summary, messages
+            // not loaded. Exactly the case the daemon cannot bound.
+            last_message: Some(MessagePreview {
+                text: "hi".into(),
+                from_me: false,
+                timestamp_ms: 10_000,
+            }),
+        })));
+
+        let refusal = reads
+            .boundary("1@s.whatsapp.net", &hub)
+            .expect_err("must not run unbounded");
+        assert!(refusal.contains("no message boundary"), "{refusal}");
+    }
+
+    /// The other side of it: a chat with nothing behind it has nothing to
+    /// bound, and refusing that would make a badge-only chat impossible to
+    /// clear.
+    #[test]
+    fn a_chat_with_nothing_behind_it_needs_no_boundary() {
+        let reads = ReadTracker::default();
+        let hub = StateHub::new();
+        hub.apply(Change::from_store(DaemonEvent::ChatUpdated(ChatSummary {
+            jid: "1@s.whatsapp.net".into(),
+            name: "n".into(),
+            unread: 0,
+            manually_unread: true,
+            last_message: None,
+        })));
+
+        assert_eq!(reads.boundary("1@s.whatsapp.net", &hub), Ok(None));
+    }
+
+    /// A chat the daemon has never held at all is not something it can act
+    /// on, bounded or otherwise.
+    #[test]
+    fn an_unknown_chat_is_refused_outright() {
+        let reads = ReadTracker::default();
+        let hub = StateHub::new();
+        assert!(
+            reads
+                .boundary("nobody@s.whatsapp.net", &hub)
+                .unwrap_err()
+                .contains("no such chat")
+        );
+    }
+
+    /// A failed send changes no state, so no snapshot can carry it: without
+    /// this the client that asked for the send never learns it did not
+    /// happen.
+    #[tokio::test]
+    async fn a_failed_send_is_published_rather_than_swallowed() {
+        let hub = StateHub::new();
+        let mut signals = hub.subscribe_signals();
+
+        let changes = translate(
+            UiEvent::SendFailed {
+                chat_jid: "1@s.whatsapp.net".into(),
+                message_id: "m1".into(),
+                reason: "no route".into(),
+            },
+            &hub,
+        );
+        assert!(changes.is_empty(), "the chat is exactly as it was");
+
+        let frame: DaemonMessage = serde_json::from_str(&signals.recv().await.unwrap()).unwrap();
+        assert_eq!(
+            frame,
+            DaemonMessage::SendFailed {
+                jid: "1@s.whatsapp.net".into(),
+                reason: "no route".into(),
+            }
+        );
     }
 }

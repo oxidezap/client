@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::session_bridge::{Commands, SessionCommand};
+use crate::session_bridge::{Action, CommandOutcome, Commands, SessionCommand};
 use crate::state::StateHub;
 
 /// Owns the listening socket and removes it on drop.
@@ -75,7 +75,7 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// and low enough that a reconnect loop in a broken client cannot exhaust the
 /// daemon's descriptors. Turned away with an error frame rather than a
 /// silently dropped connection, so the client can tell why.
-const MAX_CLIENTS: usize = 32;
+pub const MAX_CLIENTS: usize = 32;
 
 /// Serve until the future is dropped.
 ///
@@ -433,6 +433,10 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
     // each frame lets the client drop the overlap. Snapshotting first would
     // lose that window instead.
     let mut updates = hub.subscribe();
+    // Never resubscribed and never paused, unlike `updates`: a window request
+    // dropped here is gone for good, since it carries no version and no
+    // snapshot contains it.
+    let mut signals = hub.subscribe_signals();
     let hello = hub.hello_frame().context("serializing the snapshot")?;
     write_line(&mut writer, &hello).await?;
 
@@ -464,6 +468,20 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
                 Err(RecvError::Closed) => return Ok(()),
             },
 
+            // Not gated on `awaiting_resync`. A client recovering its state
+            // is exactly when the tray's Open item is most likely to be
+            // clicked, and there is nothing here for a snapshot to restore.
+            signal = signals.recv() => match signal {
+                Ok(frame) => write_line(&mut writer, &frame).await?,
+                // Nothing to converge: these are news, not state, and a
+                // client that missed one has missed one. Said out loud so it
+                // is not mistaken for a state gap.
+                Err(RecvError::Lagged(missed)) => {
+                    log::debug!("client missed {missed} pass-through frames");
+                }
+                Err(RecvError::Closed) => return Ok(()),
+            },
+
             // Cancellation-safe: `read_frame` carries a partial frame in
             // `buf` across losing this race. See its documentation.
             frame = read_frame(&mut reader, &mut buf) => match frame? {
@@ -478,8 +496,17 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
                         updates = hub.subscribe();
                         awaiting_resync = false;
                     }
-                    if let Some(reply) = handle_request(&line, &hub, &commands) {
-                        write_line(&mut writer, &reply).await?;
+                    let answer = handle_request(&line, &hub, &commands).await;
+                    if let Some(frame) = answer.frame {
+                        write_line(&mut writer, &frame).await?;
+                    }
+                    if answer.shutdown {
+                        // After the write, not before. Signalling first lets
+                        // the daemon tear this task down mid-answer, and a
+                        // client that asked politely to stop the daemon would
+                        // see EOF where the protocol promised it a reply.
+                        crate::shutdown::request("ipc client");
+                        return Ok(());
                     }
                 }
                 Some(FrameRead::NotUtf8) => {
@@ -577,31 +604,50 @@ fn check_hello(line: &str) -> Option<String> {
     }
 }
 
-/// Handle one request, returning a frame to send back when there is one.
+/// What the connection does with one request.
+struct Answer {
+    /// The frame to send back, if there is one. Every request has one today;
+    /// the option is what keeps a future fire-and-forget request from having
+    /// to invent an acknowledgement.
+    frame: Option<String>,
+    /// Whether to stop the daemon once that frame is on the wire.
+    shutdown: bool,
+}
+
+impl Answer {
+    fn frame(frame: Option<String>) -> Self {
+        Self {
+            frame,
+            shutdown: false,
+        }
+    }
+}
+
+/// Handle one request.
 ///
 /// Every request gets exactly one answer, including the ones that fail: a
 /// client waiting on a reply that was never going to arrive is worse than a
 /// client told no.
-fn handle_request(line: &str, hub: &StateHub, commands: &Commands) -> Option<String> {
+async fn handle_request(line: &str, hub: &StateHub, commands: &Commands) -> Answer {
     let request: ClientRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
             // A malformed frame is the client's bug, not a reason to drop the
             // connection: it gets told and the stream stays usable.
-            return malformed(&e.to_string()).ok();
+            return Answer::frame(malformed(&e.to_string()).ok());
         }
     };
 
     match request {
-        ClientRequest::Snapshot => hub.hello_frame().ok(),
+        ClientRequest::Snapshot => Answer::frame(hub.hello_frame().ok()),
         // A second hello is harmless but says nothing; acknowledging keeps the
         // rule that every request gets exactly one answer.
-        ClientRequest::Hello { .. } => accepted(),
+        ClientRequest::Hello { .. } => Answer::frame(accepted()),
         ClientRequest::SendText { jid, text } => {
-            dispatch(hub, commands, SessionCommand::SendText { jid, text })
+            Answer::frame(dispatch(hub, commands, Action::SendText { jid, text }).await)
         }
         ClientRequest::MarkRead { jid } => {
-            dispatch(hub, commands, SessionCommand::MarkRead { jid })
+            Answer::frame(dispatch(hub, commands, Action::MarkRead { jid }).await)
         }
         // The daemon has no window of its own, so this is relayed rather than
         // acted on: whoever owns a window is the only one that can raise it.
@@ -609,35 +655,49 @@ fn handle_request(line: &str, hub: &StateHub, commands: &Commands) -> Option<Str
         // front end that sent this on a user's behalf wants the window up
         // regardless of which process is holding it.
         ClientRequest::ShowWindow => {
-            hub.broadcast(&DaemonMessage::ShowWindow);
-            accepted()
+            hub.signal(&DaemonMessage::ShowWindow);
+            Answer::frame(accepted())
         }
-        // Acknowledged before it happens, because it will not be acknowledged
-        // after: the signal tears down the session and the socket with it.
-        ClientRequest::Shutdown => {
-            crate::shutdown::request("ipc client");
-            accepted()
-        }
+        // The acknowledgement goes out first; see the caller.
+        ClientRequest::Shutdown => Answer {
+            frame: accepted(),
+            shutdown: true,
+        },
     }
 }
 
-/// Hand a command to the session, refusing it while there is no session to
-/// carry it out.
+/// Hand a command to the session and wait for what became of it.
 ///
-/// Refused early rather than queued: a send that lands in the channel while
-/// the account is offline would be answered `Accepted` and then fail out of
-/// sight, and the client has no way to learn that. `NoSession` is a state the
-/// client can already see in the connection field, so the answer matches what
-/// it is looking at.
-fn dispatch(hub: &StateHub, commands: &Commands, command: SessionCommand) -> Option<String> {
+/// Waiting, rather than answering on admission to the queue, is what makes
+/// `Accepted` mean something: the account can drop between the check here and
+/// the moment the bridge picks the command up, and a client told yes on
+/// admission would never learn its message went nowhere. It is also the
+/// backpressure — a connection has one command outstanding at a time, so the
+/// client cap is also the cap on queued work.
+async fn dispatch(hub: &StateHub, commands: &Commands, action: Action) -> Option<String> {
+    // Refused early as well as late: a client that is watching the connection
+    // state should get the answer it can already predict, without the round
+    // trip.
     let connection = hub.connection();
     if !connection.is_connected() {
         return no_session(&format!("not connected: {connection:?}"));
     }
-    match commands.send(command) {
-        Ok(()) => accepted(),
+
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    if commands
+        .send(SessionCommand { action, reply })
+        .await
+        .is_err()
+    {
         // The bridge is gone: the daemon is on its way down.
-        Err(_) => no_session("the session is shutting down"),
+        return no_session("the session is shutting down");
+    }
+
+    match answer.await {
+        Ok(CommandOutcome::Accepted) => accepted(),
+        Ok(CommandOutcome::Refused(reason)) => no_session(&reason),
+        // The bridge took the command and died before answering.
+        Err(_) => no_session("the session stopped before it answered"),
     }
 }
 
@@ -716,55 +776,116 @@ mod tests {
         serde_json::to_string(request).unwrap()
     }
 
-    fn reply(line: &str, hub: &StateHub, commands: &Commands) -> DaemonMessage {
-        serde_json::from_str(&handle_request(line, hub, commands).unwrap()).unwrap()
+    fn parse(frame: Option<String>) -> DaemonMessage {
+        serde_json::from_str(&frame.expect("every request gets an answer")).unwrap()
+    }
+
+    /// A stand-in bridge: takes one command and answers it. The join handle
+    /// yields what it was asked to do, so a test can assert on both halves.
+    fn bridge(outcome: CommandOutcome) -> (Commands, tokio::task::JoinHandle<Option<Action>>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(MAX_CLIENTS);
+        let task = tokio::spawn(async move {
+            let SessionCommand { action, reply } = rx.recv().await?;
+            let _ = reply.send(outcome);
+            Some(action)
+        });
+        (tx, task)
     }
 
     /// The follow-up this replaced: these parsed and were answered
     /// `Unsupported`. They now reach the session.
-    #[test]
-    fn a_command_reaches_the_session_rather_than_being_refused() {
+    #[tokio::test]
+    async fn a_command_reaches_the_session_rather_than_being_refused() {
         let hub = connected_hub();
-        let (commands, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, taken) = bridge(CommandOutcome::Accepted);
 
         let line = request_line(&ClientRequest::SendText {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
         });
-        assert_eq!(reply(&line, &hub, &commands), DaemonMessage::Accepted);
+        let answer = handle_request(&line, &hub, &commands).await;
+        assert_eq!(parse(answer.frame), DaemonMessage::Accepted);
+        assert!(!answer.shutdown);
         assert!(matches!(
-            rx.try_recv(),
-            Ok(SessionCommand::SendText { jid, text }) if jid == "a@s.whatsapp.net" && text == "hi"
+            taken.await.unwrap(),
+            Some(Action::SendText { jid, text }) if jid == "a@s.whatsapp.net" && text == "hi"
         ));
+    }
+
+    /// `Accepted` has to mean the session took it, not that a queue did. The
+    /// account can drop between the check at the door and the moment the
+    /// bridge picks the command up, and a client told yes on admission alone
+    /// would never learn its message went nowhere.
+    #[tokio::test]
+    async fn a_refusal_at_execution_time_reaches_the_client() {
+        // Connected as far as this connection can see, and refused anyway:
+        // exactly the race the answer channel exists for.
+        let hub = connected_hub();
+        let (commands, _taken) = bridge(CommandOutcome::Refused("not connected".into()));
 
         let line = request_line(&ClientRequest::MarkRead {
             jid: "a@s.whatsapp.net".into(),
         });
-        assert_eq!(reply(&line, &hub, &commands), DaemonMessage::Accepted);
+        let answer = handle_request(&line, &hub, &commands).await;
         assert!(matches!(
-            rx.try_recv(),
-            Ok(SessionCommand::MarkRead { jid }) if jid == "a@s.whatsapp.net"
+            parse(answer.frame),
+            DaemonMessage::Error(ProtocolError::NoSession { ref detail })
+                if detail == "not connected"
         ));
     }
 
     /// Accepting a send the account cannot carry out would answer `Accepted`
     /// and then fail out of sight, where the client can never learn of it.
-    #[test]
-    fn a_command_is_refused_while_there_is_no_session_to_carry_it() {
+    #[tokio::test]
+    async fn a_command_is_refused_while_there_is_no_session_to_carry_it() {
         // Fresh hub: `Connecting`, which is what a daemon looks like before it
         // has an account and after it loses one.
         let hub = StateHub::new();
-        let (commands, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, taken) = bridge(CommandOutcome::Accepted);
 
         let line = request_line(&ClientRequest::SendText {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
         });
+        let answer = handle_request(&line, &hub, &commands).await;
         assert!(matches!(
-            reply(&line, &hub, &commands),
+            parse(answer.frame),
             DaemonMessage::Error(ProtocolError::NoSession { .. })
         ));
-        assert!(rx.try_recv().is_err(), "nothing was queued behind the no");
+
+        drop(commands);
+        assert!(
+            taken.await.unwrap().is_none(),
+            "nothing was queued behind the no"
+        );
+    }
+
+    /// The acknowledgement has to be on the wire before the daemon is asked
+    /// to stop, or the shutdown races the answer and a client that asked
+    /// politely sees EOF where the protocol promised it a reply. Signalling
+    /// is therefore the caller's job, after the write.
+    #[tokio::test]
+    async fn a_shutdown_is_acknowledged_before_it_is_carried_out() {
+        let hub = connected_hub();
+        let (commands, _taken) = bridge(CommandOutcome::Accepted);
+
+        let answer = handle_request(&request_line(&ClientRequest::Shutdown), &hub, &commands).await;
+        assert_eq!(parse(answer.frame), DaemonMessage::Accepted);
+        assert!(answer.shutdown, "and only then is the daemon asked to stop");
+    }
+
+    /// A frame that does not parse is the client's bug, not a reason to drop
+    /// its connection: it gets told, and its next request still works.
+    #[tokio::test]
+    async fn a_malformed_frame_is_answered_and_does_not_end_the_connection() {
+        let hub = StateHub::new();
+        let (commands, _taken) = bridge(CommandOutcome::Accepted);
+        let answer = handle_request("not json at all", &hub, &commands).await;
+        assert!(matches!(
+            parse(answer.frame),
+            DaemonMessage::Error(ProtocolError::Malformed { .. })
+        ));
+        assert!(!answer.shutdown);
     }
 
     /// The daemon owns no window, so this is a relay: whoever has one is the
@@ -772,18 +893,21 @@ mod tests {
     #[tokio::test]
     async fn a_window_request_is_published_rather_than_acted_on() {
         let hub = StateHub::new();
-        let (commands, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut updates = hub.subscribe();
+        let (commands, taken) = bridge(CommandOutcome::Accepted);
+        let mut signals = hub.subscribe_signals();
 
         let line = request_line(&ClientRequest::ShowWindow);
-        assert_eq!(reply(&line, &hub, &commands), DaemonMessage::Accepted);
+        let answer = handle_request(&line, &hub, &commands).await;
+        assert_eq!(parse(answer.frame), DaemonMessage::Accepted);
+
+        let frame: DaemonMessage = serde_json::from_str(&signals.recv().await.unwrap()).unwrap();
+        assert_eq!(frame, DaemonMessage::ShowWindow);
+
+        drop(commands);
         assert!(
-            rx.try_recv().is_err(),
+            taken.await.unwrap().is_none(),
             "the session has no part in a window"
         );
-
-        let frame: DaemonMessage = serde_json::from_str(&updates.recv().await.unwrap()).unwrap();
-        assert_eq!(frame, DaemonMessage::ShowWindow);
     }
 
     /// The cap is per frame, not per connection: a long-lived client sending
@@ -934,7 +1058,7 @@ mod tests {
     async fn a_client_that_never_speaks_does_not_hold_its_slot_forever() {
         let (client, server) = UnixStream::pair().unwrap();
         let hub = StateHub::new();
-        let (commands, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
         // Returns rather than parking forever; the paused clock reaches the
         // handshake deadline as soon as nothing else can run.

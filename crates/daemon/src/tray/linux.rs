@@ -63,7 +63,7 @@ impl KsniTray for Item {
                 // attached publishes it to nobody, which is the honest
                 // outcome: there is no window to raise.
                 activate: Box::new(|item: &mut Self| {
-                    item.hub.broadcast(&DaemonMessage::ShowWindow);
+                    item.hub.signal(&DaemonMessage::ShowWindow);
                 }),
                 ..Default::default()
             }

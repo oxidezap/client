@@ -34,6 +34,15 @@ fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
+    // Registered before anything can ask us to stop. Both the tray's Quit
+    // item and an IPC `Shutdown` raise SIGTERM at this process, and until
+    // these handlers exist SIGTERM still has its default disposition: the
+    // process would die on the spot, without disconnecting the session or
+    // closing SQLite — the exact teardown the signal was chosen to reach. The
+    // tray is registered on a bus a user can click within microseconds, so
+    // this is not a theoretical window.
+    let mut termination = Termination::install()?;
+
     // Before anything else touches the account. The socket is only the
     // visible half of "one daemon per user"; the real invariant is one
     // WhatsApp session over one SQLite file, and a second process that opened
@@ -67,11 +76,12 @@ async fn run() -> Result<()> {
     // forever on a notification that was already spent.
     let stop = Arc::new(tokio::sync::Notify::new());
 
-    // Unbounded, because the only producer is a bounded set of connections
-    // whose commands are tiny and whose consumer never blocks: `execute`
-    // hands work to the session's own runtime and returns. A bound here would
-    // buy backpressure the socket already provides.
-    let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Bounded, and sized to the client cap it can never exceed: a connection
+    // waits for its command's answer before reading the next request, so at
+    // most one command per connection is ever outstanding. That is what keeps
+    // one broken front end from accumulating work — an unbounded channel
+    // would let it queue payloads, and spawn session tasks, without limit.
+    let (commands, command_rx) = tokio::sync::mpsc::channel(server::MAX_CLIENTS);
 
     let mut session = {
         let hub = Arc::clone(&hub);
@@ -95,7 +105,7 @@ async fn run() -> Result<()> {
         joined = &mut session => {
             return finish(joined, tray, Ok(()));
         }
-        () = shutdown_signal() => {
+        () = termination.recv() => {
             log::info!("shutting down");
             Ok(())
         }
@@ -125,29 +135,47 @@ fn finish(
     server_outcome.and(session_outcome)
 }
 
-/// Resolve on the first termination signal.
+/// The termination signals, registered up front.
+///
+/// A struct rather than a function because *when* the handlers are installed
+/// matters more than what they do: tokio registers them when the stream is
+/// built, so building them lazily inside the shutdown branch would leave a
+/// window in which SIGTERM still killed the process outright.
 ///
 /// Both SIGINT and SIGTERM: a daemon is as likely to be stopped by a service
 /// manager as by a terminal, and leaving SIGTERM to the default handler would
 /// skip the teardown below it.
-async fn shutdown_signal() {
+struct Termination {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("cannot listen for SIGTERM: {e}");
-                return;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl Termination {
+    fn install() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
+                terminate: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
+            })
         }
+        #[cfg(not(unix))]
+        Ok(Self {})
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+
+    /// Resolve on the first termination signal.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }

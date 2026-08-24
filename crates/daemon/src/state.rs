@@ -12,6 +12,10 @@
 //! * **A broadcast** of already-serialized frames for connected clients. Frames
 //!   are serialized once for all of them rather than once per client, and not
 //!   at all when nobody is listening.
+//! * **A second broadcast** for frames that are not state: a window request, a
+//!   send that failed. They carry no version and no snapshot can recover
+//!   them, so they must not travel on a channel a client stops reading while
+//!   it resynchronizes.
 //! * **A `watch`** for the tray, which only cares about the latest value and
 //!   coalesces bursts on its own.
 
@@ -32,6 +36,14 @@ use tokio::sync::{broadcast, watch};
 /// `Resync` and rebuilds from a snapshot, which is correct, just more
 /// expensive than keeping up.
 const BROADCAST_CAPACITY: usize = 256;
+
+/// How many pass-through frames may queue for one client.
+///
+/// Small, because these are user-initiated: a tray click, a send that failed.
+/// A client far enough behind to overrun even this has bigger problems than a
+/// missed window raise, and unlike state there is nothing to converge — a
+/// dropped one is simply gone, which is why it is not worth buffering deeply.
+const SIGNAL_CAPACITY: usize = 32;
 
 /// What the tray renders. Small and comparable so `watch` can drop
 /// no-op updates before they reach the icon.
@@ -99,12 +111,22 @@ pub struct StateHub {
     /// Pre-serialized frames. `Arc<str>` so fanning out to N clients costs N
     /// refcount bumps rather than N serializations.
     updates: broadcast::Sender<Arc<str>>,
+    /// Frames that are not state, on their own channel.
+    ///
+    /// Separate from `updates` because a client that has been told to resync
+    /// stops reading that one until its snapshot arrives, and a window
+    /// request published in that window would simply be lost: it has no
+    /// version, and no snapshot contains it. The tray's Open item doing
+    /// nothing precisely while the front end is recovering is the failure
+    /// this avoids.
+    signals: broadcast::Sender<Arc<str>>,
     tray: watch::Sender<TrayState>,
 }
 
 impl StateHub {
     pub fn new() -> Arc<Self> {
         let (updates, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (signals, _) = broadcast::channel(SIGNAL_CAPACITY);
         let (tray, _) = watch::channel(TrayState {
             connected: false,
             unread: 0,
@@ -116,6 +138,7 @@ impl StateHub {
                 chats: std::collections::HashMap::new(),
             }),
             updates,
+            signals,
             tray,
         })
     }
@@ -128,6 +151,15 @@ impl StateHub {
     /// the overlap. The reverse order would lose those events entirely.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<str>> {
         self.updates.subscribe()
+    }
+
+    /// Subscribe to the frames that are not state.
+    ///
+    /// Never resubscribed and never paused: unlike `updates`, dropping one of
+    /// these loses it for good, so a client keeps reading them through a
+    /// resync.
+    pub fn subscribe_signals(&self) -> broadcast::Receiver<Arc<str>> {
+        self.signals.subscribe()
     }
 
     pub fn watch_tray(&self) -> watch::Receiver<TrayState> {
@@ -199,18 +231,18 @@ impl StateHub {
 
     /// Publish a frame that is not state.
     ///
-    /// No version, because nothing changed: [`DaemonMessage::ShowWindow`] is a
-    /// request passed through to whoever owns a window, not something a
-    /// snapshot could ever reflect. Serialized only when someone is listening,
-    /// like every other frame.
-    pub fn broadcast(&self, message: &DaemonMessage) {
-        if self.updates.receiver_count() == 0 {
+    /// No version, because nothing changed: a window request is passed
+    /// through to whoever owns a window, and a failed send is news about one
+    /// message rather than a fact a snapshot could hold. Serialized only when
+    /// someone is listening, like every other frame.
+    pub fn signal(&self, message: &DaemonMessage) {
+        if self.signals.receiver_count() == 0 {
             return;
         }
         match serde_json::to_string(message) {
             // Err means every receiver dropped since the count above.
             Ok(line) => {
-                let _ = self.updates.send(Arc::from(line.as_str()));
+                let _ = self.signals.send(Arc::from(line.as_str()));
             }
             Err(e) => log::error!("dropping unserializable frame: {e}"),
         }
@@ -510,14 +542,39 @@ mod tests {
     #[tokio::test]
     async fn a_pass_through_frame_carries_no_version() {
         let hub = StateHub::new();
-        let mut rx = hub.subscribe();
+        let mut signals = hub.subscribe_signals();
         let before = hub.snapshot().version;
 
-        hub.broadcast(&DaemonMessage::ShowWindow);
+        hub.signal(&DaemonMessage::ShowWindow);
 
         assert_eq!(hub.snapshot().version, before, "state did not move");
-        let frame: DaemonMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        let frame: DaemonMessage = serde_json::from_str(&signals.recv().await.unwrap()).unwrap();
         assert_eq!(frame, DaemonMessage::ShowWindow);
+    }
+
+    /// The two channels exist so a client that has stopped reading state can
+    /// still be reached. Sharing one would drop a window request exactly
+    /// while the front end was resynchronizing — and nothing would ever
+    /// redeliver it, because it has no version and no snapshot holds it.
+    #[tokio::test]
+    async fn a_signal_reaches_a_client_that_is_not_reading_state() {
+        let hub = StateHub::new();
+        let mut signals = hub.subscribe_signals();
+        // The state receiver exists but is never read: a client awaiting the
+        // snapshot it was told to ask for.
+        let _updates = hub.subscribe();
+
+        for i in 0..(BROADCAST_CAPACITY + 10) {
+            hub.apply(live(chat("a@s.whatsapp.net", i as u32, i as i64)));
+        }
+        hub.signal(&DaemonMessage::ShowWindow);
+
+        let frame: DaemonMessage = serde_json::from_str(&signals.recv().await.unwrap()).unwrap();
+        assert_eq!(
+            frame,
+            DaemonMessage::ShowWindow,
+            "a state backlog did not push it out"
+        );
     }
 
     /// A client that stalls must not grow the daemon without bound; it gets

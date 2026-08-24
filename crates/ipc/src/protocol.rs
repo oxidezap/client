@@ -162,9 +162,13 @@ pub enum DaemonMessage {
         version: StateVersion,
         event: DaemonEvent,
     },
-    /// A command was understood. Carries no result: state changes arrive as
-    /// [`DaemonMessage::Update`], so a command that succeeds is visible in the
-    /// stream rather than in its acknowledgement.
+    /// A command reached the session. Carries no result beyond that: what the
+    /// network makes of it arrives as [`DaemonMessage::Update`], or as
+    /// [`DaemonMessage::SendFailed`] when it makes nothing of it at all.
+    ///
+    /// The daemon answers this only after the session has taken the command,
+    /// not on handing it to a queue: a command refused at execution time
+    /// comes back as [`ProtocolError::NoSession`] instead.
     Accepted,
     /// Somebody asked for a front end to come forward: the tray's "Open"
     /// item, or another client's [`ClientRequest::ShowWindow`].
@@ -172,6 +176,17 @@ pub enum DaemonMessage {
     /// Carries no version because it changes no state. A front end with a
     /// window raises it; one without (a notifier, a CLI) ignores it.
     ShowWindow,
+    /// A message the daemon accepted could not be delivered.
+    ///
+    /// Also versionless, and for the same reason: nothing about the daemon's
+    /// state changed, so no snapshot could ever carry it. Not attributed to
+    /// the request that caused it — the protocol has no request ids — so a
+    /// front end reports it against the chat, which is where a user is
+    /// looking when they wonder whether their message went out.
+    SendFailed {
+        jid: String,
+        reason: String,
+    },
     /// The client fell too far behind and its stream was truncated. Whatever
     /// it holds is now untrustworthy, so it must snapshot again rather than
     /// keep applying.
