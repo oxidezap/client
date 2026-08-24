@@ -23,7 +23,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true
@@ -41,4 +41,6 @@ jobs:
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "Nightly (${GITHUB_SHA:0:7})" \
-            --notes "Unsigned development build of \`main\` (\`$GITHUB_SHA\`). Expect breakage, and expect macOS Gatekeeper and Windows SmartScreen to object."
+            --notes "Unsigned development build of \`main\` (\`$GITHUB_SHA\`). Expect breakage.
+
+Download the binary for your platform and run it. On Linux and macOS it arrives without the execute bit, so \`chmod +x\` it first; on macOS also clear the quarantine flag with \`xattr -dr com.apple.quarantine\`, and on Windows expect SmartScreen to object. All three are consequences of the binaries being unsigned."

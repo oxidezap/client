@@ -73,29 +73,24 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} --bin oxidezap
 
-      - name: Package
+      - name: Name the binary for its platform
         shell: bash
         run: |
           set -euo pipefail
-          staging="oxidezap-${{ inputs.version }}-${{ matrix.name }}"
-          mkdir -p "$staging"
+          # The binary is the deliverable. Wrapping it in a tarball of a
+          # directory meant three unpackings before reaching it, since
+          # upload-artifact zips whatever it is given regardless.
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/oxidezap.exe" "$staging/"
+            src="target/${{ matrix.target }}/release/oxidezap.exe"
+            dst="oxidezap-${{ inputs.version }}-${{ matrix.name }}.exe"
           else
-            cp "target/${{ matrix.target }}/release/oxidezap" "$staging/"
+            src="target/${{ matrix.target }}/release/oxidezap"
+            dst="oxidezap-${{ inputs.version }}-${{ matrix.name }}"
           fi
-          cp README.md LICENSE "$staging/"
-          # zip on Windows, tar.gz elsewhere: what each platform's users can
-          # open without installing anything.
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "$staging.zip" "$staging"
-            echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
-          else
-            tar czf "$staging.tar.gz" "$staging"
-            echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
-          fi
+          mv "$src" "$dst"
+          echo "ASSET=$dst" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: oxidezap-${{ matrix.name }}
           path: ${{ env.ASSET }}

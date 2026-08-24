@@ -32,11 +32,19 @@ Prebuilt binaries for Linux, macOS and Windows are attached to each
 [release](https://github.com/oxidezap/client/releases). Builds of `main` are
 published continuously under the `nightly` tag.
 
-They are unsigned, so macOS Gatekeeper and Windows SmartScreen will object.
-On macOS, clear the quarantine flag before the first run:
+Each asset is the binary itself, named for its platform. On Linux and macOS
+it arrives without the execute bit:
 
 ```bash
-xattr -dr com.apple.quarantine oxidezap
+chmod +x oxidezap-linux-x86_64
+./oxidezap-linux-x86_64
+```
+
+The binaries are unsigned, so macOS Gatekeeper and Windows SmartScreen will
+object. On macOS, clear the quarantine flag before the first run:
+
+```bash
+xattr -dr com.apple.quarantine oxidezap-macos-aarch64
 ```
 
 ## Build
