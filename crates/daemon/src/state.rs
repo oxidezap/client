@@ -115,6 +115,15 @@ impl StateHub {
         }
     }
 
+    /// The summary held for `jid`, if any.
+    ///
+    /// Lets a caller build the next summary from the current one, which is how
+    /// a live message updates a chat without waiting for the store to hand
+    /// back a whole reloaded list.
+    pub fn chat(&self, jid: &str) -> Option<ChatSummary> {
+        self.lock().chats.get(jid).cloned()
+    }
+
     /// The JIDs currently held, for a caller that has to diff a complete
     /// reload against them.
     ///

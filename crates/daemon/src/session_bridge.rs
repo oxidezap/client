@@ -122,6 +122,35 @@ fn translate(event: UiEvent, hub: &StateHub) -> Vec<DaemonEvent> {
                 ConnectionState::Disconnected { reason: detail },
             )]
         }
+        // Live traffic, applied directly rather than waiting for the store to
+        // republish. The reloader that produces `HistoryLoaded` debounces on a
+        // quiet window, so on a busy account it can stay silent through an
+        // entire burst; without these the tray badge and every client snapshot
+        // would freeze for exactly as long as the account is active.
+        UiEvent::MessageReceived {
+            chat_jid,
+            message,
+            sender_name,
+        } => {
+            let mut summary = hub.chat(&chat_jid).unwrap_or_else(|| ChatSummary {
+                jid: chat_jid.clone(),
+                // A chat the store has not handed us yet: name it after the
+                // sender rather than leaving it blank until the reload lands.
+                name: sender_name.unwrap_or_else(|| chat_jid.clone()),
+                unread: 0,
+                manually_unread: false,
+                last_message: None,
+            });
+            if !message.is_from_me && !message.is_read {
+                summary.unread = summary.unread.saturating_add(1);
+            }
+            summary.last_message = Some(MessagePreview {
+                text: message.content.clone(),
+                from_me: message.is_from_me,
+                timestamp_ms: message.timestamp.timestamp_millis(),
+            });
+            vec![DaemonEvent::ChatUpdated(summary)]
+        }
         UiEvent::HistoryLoaded { chats, complete } => {
             let mut events: Vec<DaemonEvent> = Vec::with_capacity(chats.len() + 1);
 

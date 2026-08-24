@@ -32,6 +32,14 @@ impl Drop for Server {
 /// Bind the socket and serve until the future is dropped.
 pub async fn run(hub: Arc<StateHub>) -> Result<()> {
     let path = socket_path().context("no runtime directory to place the socket in")?;
+
+    // Held for the whole run. Probe-remove-bind is three syscalls and cannot
+    // be made atomic on its own: two daemons starting together can both see a
+    // stale socket, and the second would then unlink the first's freshly bound
+    // one and take its place. The lock makes that sequence exclusive, and
+    // holding it afterwards is what makes a second daemon fail fast instead of
+    // racing at all.
+    let _lock = acquire_startup_lock(&path)?;
     let listener = bind(&path)?;
     let _guard = Server { path: path.clone() };
     log::info!("listening on {}", path.display());
@@ -71,6 +79,54 @@ fn bind(path: &Path) -> Result<UnixListener> {
     log::warn!("removing a stale socket at {}", path.display());
     std::fs::remove_file(path).context("removing a stale socket")?;
     UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
+}
+
+/// An exclusive lock on this user's daemon, released when the file closes.
+struct StartupLock {
+    _file: std::fs::File,
+}
+
+/// Take the per-user startup lock, or report who already holds it.
+///
+/// `flock` rather than a pid file: the kernel releases it when the process
+/// dies however it dies, so a crashed daemon leaves nothing to clean up and
+/// no stale pid to misread.
+#[cfg(unix)]
+fn acquire_startup_lock(socket: &Path) -> Result<StartupLock> {
+    use std::os::unix::io::AsRawFd;
+
+    let path = socket.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    // SAFETY: a valid fd from the handle above; flock touches no memory.
+    let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!(
+            "another daemon holds {} ({err}); refusing to start a second session",
+            path.display()
+        );
+    }
+
+    Ok(StartupLock { _file: file })
+}
+
+#[cfg(not(unix))]
+fn acquire_startup_lock(_socket: &Path) -> Result<StartupLock> {
+    Ok(StartupLock {
+        _file: std::fs::File::open(std::env::temp_dir()).context("opening a placeholder handle")?,
+    })
 }
 
 /// Whether something is accepting connections on `path`.
@@ -277,6 +333,13 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>) -> Result<()> {
             frame = read_frame(&mut reader, &mut buf) => match frame? {
                 Some(FrameRead::Line(line)) => {
                     if is_snapshot_request(&line) {
+                        // Resubscribe BEFORE snapshotting, the same ordering
+                        // the connection opened with. Reusing the old receiver
+                        // would leave it at the cursor that already lagged, so
+                        // a client recovering during heavy traffic would lag
+                        // again immediately on events the new snapshot already
+                        // covers, and loop through `Resync` forever.
+                        updates = hub.subscribe();
                         awaiting_resync = false;
                     }
                     if let Some(reply) = handle_request(&line, &hub) {
@@ -526,6 +589,31 @@ mod tests {
             read_frame_generic(&mut reader, &mut buf).await,
             Ok(Some(FrameRead::Line(_)))
         ));
+    }
+
+    /// Two daemons starting together can both see a stale socket; the lock is
+    /// what stops the second from unlinking the first's freshly bound one.
+    #[test]
+    fn the_startup_lock_is_exclusive() {
+        let dir = std::env::temp_dir().join(format!("oxidezap-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("daemon.sock");
+
+        let first = acquire_startup_lock(&socket).expect("first daemon takes the lock");
+        assert!(
+            acquire_startup_lock(&socket).is_err(),
+            "a second daemon must not get in"
+        );
+
+        // Released with the handle, so a restart is not blocked by the last run.
+        drop(first);
+        assert!(
+            acquire_startup_lock(&socket).is_ok(),
+            "lock outlived its holder"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The fallback directory sits at a predictable path in a world-writable

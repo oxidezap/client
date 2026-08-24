@@ -51,9 +51,14 @@ async fn run() -> Result<()> {
     // and a future dropped mid-await cannot wait for anything. Racing it in a
     // `select!` is exactly what would drop it, so the server's exit becomes a
     // notification rather than a competing branch.
+    //
+    // `notify_one`, not `notify_waiters`: the latter wakes only tasks already
+    // parked, so a server that fails fast (a second daemon finding the socket
+    // taken) would signal before the bridge ever waits, and the bridge would
+    // then wait forever on a notification that was already spent.
     let stop = Arc::new(tokio::sync::Notify::new());
 
-    let session = {
+    let mut session = {
         let hub = Arc::clone(&hub);
         let stop = Arc::clone(&stop);
         tokio::spawn(
@@ -68,6 +73,13 @@ async fn run() -> Result<()> {
             // stop and never restarts it.
             result.context("ipc server stopped")
         }
+        // Watched here too, because the bridge can fail synchronously: a
+        // runtime it cannot build, a thread it cannot spawn. Those emit no
+        // event, so without this arm the daemon would keep serving an initial
+        // `Connecting` snapshot for a session that does not exist.
+        joined = &mut session => {
+            return finish(joined, tray, Ok(()));
+        }
         () = shutdown_signal() => {
             log::info!("shutting down");
             Ok(())
@@ -75,16 +87,24 @@ async fn run() -> Result<()> {
     };
 
     // Whichever ended, the session still has to disconnect and close SQLite.
-    stop.notify_waiters();
-    let session_outcome = match session.await {
+    stop.notify_one();
+    finish(session.await, tray, server_outcome)
+}
+
+/// Fold the session's outcome into the server's and drop the tray.
+///
+/// The tray goes before returning so the icon disappears with the process
+/// rather than lingering until the host notices the name leave the bus.
+fn finish(
+    joined: Result<Result<()>, tokio::task::JoinError>,
+    tray: Option<tray::TrayHandle>,
+    server_outcome: Result<()>,
+) -> Result<()> {
+    let session_outcome = match joined {
         Ok(result) => result.context("session ended"),
         Err(e) => Err(anyhow::anyhow!("session task panicked: {e}")),
     };
-
-    // Before returning, so the icon goes away with the process rather than
-    // lingering until the host notices the name dropped off the bus.
     drop(tray);
-
     // The server's failure is the more actionable one when both fail: the
     // session error is usually a consequence of tearing down.
     server_outcome.and(session_outcome)
