@@ -12,9 +12,6 @@ repository.workspace = true
 name = "oxidezap"
 path = "src/main.rs"
 
-[lints]
-workspace = true
-
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["std", "clock"] }
@@ -26,9 +23,9 @@ env_logger = "0.11"
 # (`cargo update -p gpui --precise <rev>` to move it). Same-source everywhere =
 # one gpui in the tree, no fork.
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component.git" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Ordered maps for deterministic cache eviction
@@ -36,8 +33,12 @@ indexmap = "2"
 log = { workspace = true }
 mp4 = "0.14"
 openh264 = "0.9" # H.264 software decoder
-qrcode = "0.14"
+
+oxidezap-audio = { workspace = true }
+oxidezap-core = { workspace = true }
+oxidezap-session = { workspace = true }
 portable-atomic = { workspace = true }
+qrcode = "0.14"
 rust-embed = "8"
 smallvec = "1"
 # Async utilities (GPUI-compatible timers)
@@ -49,8 +50,7 @@ smol = "2"
 symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
-oxidezap-audio = { workspace = true }
-oxidezap-core = { workspace = true }
-oxidezap-session = { workspace = true }
-
 whatsapp-rust = { workspace = true }
+
+[lints]
+workspace = true

@@ -8,9 +8,6 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-[lints]
-workspace = true
-
 [dependencies]
 anyhow = { workspace = true }
 async-channel = "2"
@@ -24,3 +21,6 @@ portable-atomic = { workspace = true }
 ringbuf = "0.5"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 wacore = { workspace = true }
+
+[lints]
+workspace = true
