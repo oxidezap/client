@@ -42,6 +42,15 @@ pub enum ConnectionState {
     Pairing {
         qr: Option<String>,
         pair_code: Option<String>,
+        /// When the code stops working, as a Unix timestamp in milliseconds.
+        ///
+        /// A deadline rather than the "expires in N seconds" the session
+        /// reports: a snapshot is served whenever a client connects, and a
+        /// relative duration replayed thirty seconds later would hand that
+        /// client a full countdown for a code that is nearly dead. Absolute
+        /// survives being repeated. Both sides are on one machine, so they
+        /// share the clock this is read against.
+        expires_at_ms: i64,
     },
     /// Paired, now replaying history. Distinct from `Pairing` so a front end
     /// drops the QR the moment it is consumed, and distinct from `Connected`
@@ -108,8 +117,14 @@ pub struct StateSnapshot {
 }
 
 impl StateSnapshot {
-    /// Unread across every chat, saturating rather than wrapping so a
-    /// pathological count cannot render as a small number.
+    /// How many unread *messages* there are across every chat.
+    ///
+    /// A message count, not a badge count: a chat marked unread by hand
+    /// carries [`ChatSummary::has_unread`] but contributes nothing here,
+    /// because it has no unread message to count. A caller rendering "N
+    /// unread" wants this; a caller deciding whether to show a dot at all
+    /// wants `has_unread`. Saturating rather than wrapping, so a pathological
+    /// count cannot render as a small number.
     #[must_use]
     pub fn total_unread(&self) -> u32 {
         self.chats
@@ -151,11 +166,12 @@ pub enum DaemonMessage {
     /// [`DaemonMessage::Update`], so a command that succeeds is visible in the
     /// stream rather than in its acknowledgement.
     Accepted,
-    /// A command was understood but this daemon cannot act on it yet. Distinct
-    /// from an error: the frame was valid and the client is not at fault.
-    Unsupported {
-        request: String,
-    },
+    /// Somebody asked for a front end to come forward: the tray's "Open"
+    /// item, or another client's [`ClientRequest::ShowWindow`].
+    ///
+    /// Carries no version because it changes no state. A front end with a
+    /// window raises it; one without (a notifier, a CLI) ignores it.
+    ShowWindow,
     /// The client fell too far behind and its stream was truncated. Whatever
     /// it holds is now untrustworthy, so it must snapshot again rather than
     /// keep applying.
@@ -189,7 +205,12 @@ pub enum ClientRequest {
     },
     /// Ask the daemon to bring a front end to the foreground, which is what
     /// the tray's "Open" item does.
+    ///
+    /// The daemon has no window of its own, so it relays this to every
+    /// connected client as [`DaemonMessage::ShowWindow`] rather than acting on
+    /// it: whoever owns a window is the only one that can raise it.
     ShowWindow,
+    /// Stop the daemon: disconnect the session, close the store, exit.
     Shutdown,
 }
 
@@ -202,6 +223,11 @@ pub enum ProtocolError {
     Malformed { detail: String },
     #[error("no session: {detail}")]
     NoSession { detail: String },
+    /// The daemon is already serving as many front ends as it will. Sent
+    /// before the connection closes, so a client retries rather than guessing
+    /// why the socket went quiet.
+    #[error("daemon is already serving {limit} clients")]
+    TooManyClients { limit: usize },
 }
 
 #[cfg(test)]
@@ -254,6 +280,67 @@ mod tests {
             chats: vec![chat(u32::MAX), chat(5)],
         };
         assert_eq!(snapshot.total_unread(), u32::MAX);
+    }
+
+    /// The two are different questions, and the tray and a chat row ask
+    /// different ones. A badge-only chat must show a dot and add nothing to
+    /// "N unread".
+    #[test]
+    fn a_badge_only_chat_counts_as_unread_but_not_as_a_message() {
+        let mut chat = ChatSummary {
+            jid: "1@s.whatsapp.net".into(),
+            name: "n".into(),
+            unread: 0,
+            manually_unread: true,
+            last_message: None,
+        };
+        assert!(chat.has_unread(), "it carries a badge");
+
+        let snapshot = StateSnapshot {
+            version: StateVersion::INITIAL,
+            connection: ConnectionState::Connected,
+            chats: vec![chat.clone()],
+        };
+        assert_eq!(
+            snapshot.total_unread(),
+            0,
+            "with no unread message behind it"
+        );
+
+        chat.unread = 3;
+        let snapshot = StateSnapshot {
+            chats: vec![chat],
+            ..snapshot
+        };
+        assert_eq!(snapshot.total_unread(), 3);
+    }
+
+    /// The reason the deadline is absolute: a snapshot replays this state to
+    /// every client that connects, however long after the code was issued.
+    #[test]
+    fn a_pairing_deadline_survives_the_wire_unchanged() {
+        let state = ConnectionState::Pairing {
+            qr: Some("2@abc".into()),
+            pair_code: None,
+            expires_at_ms: 1_700_000_060_000,
+        };
+        let line = serde_json::to_string(&state).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ConnectionState>(&line).unwrap(),
+            state
+        );
+    }
+
+    /// A frame with no payload still has to be distinguishable from every
+    /// other, which is what the type tag is for.
+    #[test]
+    fn a_payloadless_frame_is_still_tagged() {
+        let line = serde_json::to_string(&DaemonMessage::ShowWindow).unwrap();
+        assert_eq!(line, r#"{"type":"show_window"}"#);
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            DaemonMessage::ShowWindow
+        );
     }
 
     #[test]

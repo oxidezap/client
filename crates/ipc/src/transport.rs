@@ -4,7 +4,12 @@ use std::path::PathBuf;
 
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2: `Pairing` gained a required expiry, `ShowWindow` was added, and
+/// `Unsupported` was removed once every request the protocol defines became
+/// one the daemon acts on. A v1 client would fail to parse the first and
+/// would not recognise the second.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 const SOCKET_NAME: &str = "daemon.sock";
 const DIR_NAME: &str = "oxidezap";
@@ -38,16 +43,9 @@ pub fn socket_path() -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn uid_suffix() -> String {
-    // SAFETY: getuid is always safe; it reads a process property and cannot fail.
-    unsafe { libc_getuid() }.to_string()
-}
-
-#[cfg(unix)]
-unsafe fn libc_getuid() -> u32 {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
+    // rustix rather than a hand-rolled `extern "C"`: the same syscall with no
+    // `unsafe` at this call site, from a crate already in the tree.
+    rustix::process::getuid().as_raw().to_string()
 }
 
 #[cfg(not(unix))]

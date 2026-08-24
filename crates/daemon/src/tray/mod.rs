@@ -31,7 +31,7 @@ pub trait Tray: Send {
 
 /// Start a tray and keep it following the hub until the returned handle drops.
 pub async fn spawn(hub: Arc<StateHub>) -> Result<TrayHandle> {
-    let tray = platform_tray().await?;
+    let tray = platform_tray(Arc::clone(&hub)).await?;
     let mut watch = hub.watch_tray();
 
     let task = tokio::spawn(async move {
@@ -68,11 +68,11 @@ impl Drop for TrayHandle {
 }
 
 #[cfg(target_os = "linux")]
-async fn platform_tray() -> Result<Box<dyn Tray>> {
-    linux::start().await
+async fn platform_tray(hub: Arc<StateHub>) -> Result<Box<dyn Tray>> {
+    linux::start(hub).await
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn platform_tray() -> Result<Box<dyn Tray>> {
+async fn platform_tray(_hub: Arc<StateHub>) -> Result<Box<dyn Tray>> {
     anyhow::bail!("no tray implementation for this platform yet")
 }

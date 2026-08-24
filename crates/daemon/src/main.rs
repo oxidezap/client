@@ -7,6 +7,7 @@
 
 mod server;
 mod session_bridge;
+mod shutdown;
 mod state;
 mod tray;
 
@@ -33,6 +34,14 @@ fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
+    // Before anything else touches the account. The socket is only the
+    // visible half of "one daemon per user"; the real invariant is one
+    // WhatsApp session over one SQLite file, and a second process that opened
+    // the store and connected before discovering the lock was taken would
+    // have already broken it. Taking the claim here, rather than inside the
+    // server, is what keeps that from being a race between two tasks.
+    let claim = server::claim()?;
+
     let hub = StateHub::new();
 
     // The tray is optional by design: no StatusNotifierItem host (a bare WM, a
@@ -53,21 +62,27 @@ async fn run() -> Result<()> {
     // notification rather than a competing branch.
     //
     // `notify_one`, not `notify_waiters`: the latter wakes only tasks already
-    // parked, so a server that fails fast (a second daemon finding the socket
-    // taken) would signal before the bridge ever waits, and the bridge would
-    // then wait forever on a notification that was already spent.
+    // parked, so a server that fails fast (a socket it cannot bind) would
+    // signal before the bridge ever waits, and the bridge would then wait
+    // forever on a notification that was already spent.
     let stop = Arc::new(tokio::sync::Notify::new());
+
+    // Unbounded, because the only producer is a bounded set of connections
+    // whose commands are tiny and whose consumer never blocks: `execute`
+    // hands work to the session's own runtime and returns. A bound here would
+    // buy backpressure the socket already provides.
+    let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let mut session = {
         let hub = Arc::clone(&hub);
         let stop = Arc::clone(&stop);
-        tokio::spawn(
-            async move { session_bridge::run(hub, async move { stop.notified().await }).await },
-        )
+        tokio::spawn(async move {
+            session_bridge::run(hub, command_rx, async move { stop.notified().await }).await
+        })
     };
 
     let server_outcome = tokio::select! {
-        result = server::run(Arc::clone(&hub)) => {
+        result = server::run(&claim, Arc::clone(&hub), commands) => {
             // Fatal, and it has to reach the exit code: a supervisor that sees
             // status zero treats a daemon nobody can connect to as a clean
             // stop and never restarts it.

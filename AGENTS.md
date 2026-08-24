@@ -11,9 +11,16 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   consumes only the library's public event surface. Extracted from
   whatsapp-rust, where it was application logic living in a protocol repo.
 - **oxidezap-session**: the WhatsApp connection: events, sends, store hydration.
-  Knows nothing about how anything is drawn. `oxidezapd` will wrap this crate.
+  Knows nothing about how anything is drawn.
+- **oxidezap-ipc**: the wire protocol between the daemon and its front ends.
+  Types only, no sockets and no runtime, so a protocol change breaks
+  compilation on both sides rather than a running client.
+- **oxidezap-daemon**: binary `oxidezapd`. Wraps the session, serves front ends
+  over a per-user Unix socket and carries a tray presence. The first consumer
+  of the session crate not knowing how anything is drawn.
 - **oxidezap-gui**: GPUI front end, binary `oxidezap`. Owns video decode, which
-  writes straight into `gpui::RenderImage` and is not reusable off GPUI.
+  writes straight into `gpui::RenderImage` and is not reusable off GPUI. Still
+  owns its own session rather than talking to the daemon.
 
 A front end depends on session/core/audio, never the reverse.
 
@@ -51,6 +58,14 @@ profile here repeats it deliberately.
 - **Decoded images are cached by message id**, because GPUI tracks animation
   state per `Arc<Image>` and rebuilding one re-decodes the bytes. Whoever
   replaces a preview with real bytes must evict the entry.
+- **The daemon's state version is what makes a mid-stream join safe.** The
+  server subscribes and then snapshots, so the window between the two is
+  delivered twice rather than lost, and the client drops the overlap by
+  comparing versions. Reversing the order loses it instead.
+- **A daemon chat that only ever arrived live is not prunable.** A complete
+  store reload is the store's whole truth *about rows it has*, and during
+  pairing it has none while live messages already exist. Only store-backed
+  chats are diffed against a reload; see `StateHub::store_backed_chat_jids`.
 - **The chat store's writer queue is ordered on purpose.** Anything that
   targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row

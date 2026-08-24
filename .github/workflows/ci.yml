@@ -5,6 +5,13 @@ on:
     branches: ["main"]
   pull_request:
 
+# Least privilege. Nothing here writes to the repository, and a compromised
+# action reaching a token that can is the whole risk; `contents: read` is what
+# checkout needs and nothing beyond it. Stated rather than left to the
+# repository default, which is a setting this file cannot see.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -57,10 +64,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
 
-  # The chat store is a library crate an embedder can depend on, and it lost
-  # the MSRV job it had in whatsapp-rust when it moved here. The GUI is
-  # deliberately excluded: it tracks gpui's git HEAD, which has no MSRV to
-  # promise. Keep this toolchain and workspace.package.rust-version in step.
+  # The library crates an embedder can depend on: the chat store, which lost
+  # the MSRV job it had in whatsapp-rust when it moved here, and the IPC
+  # protocol, which a front end outside this workspace compiles against. The
+  # GUI is deliberately excluded: it tracks gpui's git HEAD, which has no MSRV
+  # to promise. Keep this toolchain and workspace.package.rust-version in step.
   msrv:
     name: MSRV (library crates)
     runs-on: ubuntu-latest
@@ -79,4 +87,4 @@ jobs:
           key: msrv
           cache-on-failure: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check -p oxidezap-chat-store -p oxidezap-core --all-features
+      - run: cargo check -p oxidezap-chat-store -p oxidezap-core -p oxidezap-ipc --all-features

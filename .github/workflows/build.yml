@@ -10,6 +10,11 @@ on:
         required: true
         type: string
 
+# Read-only, and a called workflow does not inherit the caller's permissions
+# unless they are passed: building never needs to write to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
