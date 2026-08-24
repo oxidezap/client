@@ -1393,6 +1393,96 @@ async fn invalidation_broadcast_fires_per_batch() {
     assert!(got_chats && got_messages);
 }
 
+/// A subscriber's only answer to an invalidation is to re-query, so one for a
+/// batch that touched no row costs a full reload for nothing. Peers ack per
+/// device: the second device's receipt finds the message already at that
+/// state, moves nothing, and files a receipt row that is already there.
+#[tokio::test]
+async fn repeated_peer_receipt_does_not_broadcast() {
+    let (_store, chat_store) = test_store().await;
+    let peer = jid(PEER);
+
+    chat_store
+        .record_outgoing(
+            &peer,
+            "OUT-DUP",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [peer_receipt(
+            peer.clone(),
+            vec!["OUT-DUP"],
+            ReceiptType::Delivered,
+            1_700_000_010,
+        )],
+    )
+    .await;
+
+    // Subscribed only now: what the first receipt broadcast was real work.
+    let mut changes = chat_store.subscribe();
+    feed(
+        &chat_store,
+        [peer_receipt(
+            Jid {
+                device: 12,
+                ..peer.clone()
+            },
+            vec!["OUT-DUP"],
+            ReceiptType::Delivered,
+            1_700_000_011,
+        )],
+    )
+    .await;
+
+    // flush() returned, so any invalidation this batch had is already queued.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), changes.recv())
+            .await
+            .is_err(),
+        "a receipt that changed nothing must not invalidate"
+    );
+    let msg = chat_store.message(&peer, "OUT-DUP").await.unwrap().unwrap();
+    assert_eq!(msg.status, MessageStatus::Delivered);
+}
+
+/// Receipts for messages no chat holds are dropped, not parked — so the batch
+/// writes nothing at all and has nothing to announce either.
+#[tokio::test]
+async fn receipt_for_unheld_message_does_not_broadcast() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("oi"),
+            incoming_info(PEER, PEER, "MSG-U", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let mut changes = chat_store.subscribe();
+    feed(
+        &chat_store,
+        [peer_receipt(
+            jid(PEER),
+            vec!["GHOST-1"],
+            ReceiptType::Delivered,
+            1_700_000_010,
+        )],
+    )
+    .await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), changes.recv())
+            .await
+            .is_err(),
+        "a receipt naming no stored message must not invalidate"
+    );
+}
+
 #[tokio::test]
 async fn group_receipts_track_per_user_state() {
     let (_store, chat_store) = test_store().await;

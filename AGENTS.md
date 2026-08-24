@@ -55,6 +55,12 @@ profile here repeats it deliberately.
   targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row
   past PENDING already has a real server answer and must never be regressed.
+- **An invalidation is a claim that something changed.** A subscriber answers
+  `StoreChange` by re-querying, so emitting one for a batch that wrote nothing
+  — a receipt repeated by another of the peer's devices, a nack against a row
+  already acked — buys a reload for nothing. The reload is scoped to what the
+  window named: `Messages` rebuilds those chats (and their PN/LID aliases),
+  anything else rebuilds the whole list, which is the only load that may prune.
 - **SQLite is bundled and trimmed** in `.cargo/config.toml`. FTS5 must stay:
   the `search` feature builds its index on it.
 - **No real PII in tests**, including fixtures derived from captures.
