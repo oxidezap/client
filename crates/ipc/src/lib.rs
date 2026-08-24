@@ -21,6 +21,6 @@ mod transport;
 
 pub use protocol::{
     ChatSummary, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview,
-    ProtocolError, StateSnapshot, StateVersion,
+    PairingCode, ProtocolError, StateSnapshot, StateVersion,
 };
 pub use transport::{PROTOCOL_VERSION, socket_path};
