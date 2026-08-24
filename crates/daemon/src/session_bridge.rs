@@ -48,7 +48,15 @@ pub async fn run(
     }
 
     // Reached whether the session ended on its own or a signal arrived.
-    close(client);
+    //
+    // On a blocking thread, for two reasons that both end in a panic
+    // otherwise: joining the session thread blocks, and dropping the client
+    // drops the tokio runtime it owns, which tokio refuses inside an async
+    // context ("Cannot drop a runtime in a context where blocking is not
+    // allowed").
+    if let Err(e) = tokio::task::spawn_blocking(move || close(client)).await {
+        log::error!("session teardown did not complete: {e}");
+    }
     Ok(())
 }
 
