@@ -34,6 +34,20 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          cat > notes.md <<'NOTES'
+          Unsigned development build of `main`. Expect breakage.
+
+          Download the binary for your platform and run it. On Linux and macOS
+          it arrives without the execute bit, so `chmod +x` it first. On macOS
+          also clear the quarantine flag:
+
+              xattr -dr com.apple.quarantine oxidezap-macos-aarch64
+
+          On Windows, SmartScreen will object. All of this follows from the
+          binaries being unsigned.
+          NOTES
+          echo "" >> notes.md
+          echo "Built from \`$GITHUB_SHA\`." >> notes.md
           # Recreate rather than edit: `gh release edit` cannot move a tag, and
           # a stale tag would leave the assets pointing at an older commit.
           gh release delete nightly --yes --cleanup-tag || true
@@ -41,6 +55,4 @@ jobs:
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "Nightly (${GITHUB_SHA:0:7})" \
-            --notes "Unsigned development build of \`main\` (\`$GITHUB_SHA\`). Expect breakage.
-
-Download the binary for your platform and run it. On Linux and macOS it arrives without the execute bit, so \`chmod +x\` it first; on macOS also clear the quarantine flag with \`xattr -dr com.apple.quarantine\`, and on Windows expect SmartScreen to object. All three are consequences of the binaries being unsigned."
+            --notes-file notes.md
