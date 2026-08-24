@@ -348,7 +348,9 @@ fn decode_ogg(ogg_data: &[u8]) -> Result<Vec<f32>, PlayerError> {
                 output.truncate(n * channel_count);
                 let mono = if channel_count == 2 {
                     output
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|pair| (pair[0] + pair[1]) / 2.0)
                         .collect()
                 } else {
