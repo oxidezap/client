@@ -1768,12 +1768,19 @@ fn apply_receipt(
     // One read-by row per participant, not per device: a member reading on
     // their phone and on Web emits one receipt each.
     let user = receipt.source.sender.to_non_ad_string();
+    // A subscriber answers an invalidation by re-querying, so one for a
+    // receipt that wrote nothing costs a full reload for nothing — and
+    // nothing is the common case, because peers ack once per device and only
+    // the first of those acks moves anything.
+    let mut wrote = false;
     let mut missed: Vec<&String> = Vec::new();
     for msg_id in &receipt.message_ids {
         // Zero rows covers both the real PN/LID miss and a replay against a
         // row already at/past the target; the alt retry stays harmless for
         // the latter (advance-only) and still heals a lagging split copy.
-        if !advance_status(conn, device_id, &chat, msg_id, status)? {
+        if advance_status(conn, device_id, &chat, msg_id, status)? {
+            wrote = true;
+        } else {
             missed.push(msg_id);
         }
     }
@@ -1804,6 +1811,7 @@ fn apply_receipt(
         if let Some(alt) = &counterpart
             && advance_status(conn, device_id, alt, msg_id, status)?
         {
+            wrote = true;
             relocated.insert(msg_id, alt.clone());
             continue;
         }
@@ -1828,11 +1836,14 @@ fn apply_receipt(
             unowned.push(msg_id);
         }
     }
-    if !relocated.is_empty()
-        && let Some(alt) = counterpart
-    {
-        cs.message_chats.insert(alt);
-    }
+    // Held back until the batch is known to have written something: the
+    // counterpart key is only interesting to a subscriber if a row under it
+    // moved, and a replay relocates without touching anything.
+    let alt_key = if relocated.is_empty() {
+        None
+    } else {
+        counterpart
+    };
 
     // Both chat kinds record the per-state rows. A group needs them to say who
     // has read; a 1:1 needs them because the message's own `status` keeps only
@@ -1854,10 +1865,15 @@ fn apply_receipt(
             None if unowned.contains(&msg_id) => continue,
             None => &chat,
         };
-        record_receipt(conn, device_id, key, msg_id, &user, status, ts_ms)?;
+        wrote |= record_receipt(conn, device_id, key, msg_id, &user, status, ts_ms)?;
     }
 
-    cs.message_chats.insert(chat);
+    if wrote {
+        cs.message_chats.insert(chat);
+        if let Some(alt) = alt_key {
+            cs.message_chats.insert(alt);
+        }
+    }
     Ok(())
 }
 
@@ -1906,6 +1922,10 @@ fn message_exists(
 /// device's delayed report can land behind a later one for the same state.
 /// Arrival order would then decide what message info shows, which is the same
 /// reason the alias merge resolves its collisions by `MIN(ts_ms)`.
+///
+/// Reports whether the row is new or its instant moved: a receipt repeated by
+/// another of the peer's devices lands on the row the first one filed and
+/// leaves it exactly as it was, which is not a change to announce.
 fn record_receipt(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -1914,7 +1934,7 @@ fn record_receipt(
     user: &str,
     status: i32,
     ts_ms: i64,
-) -> QueryResult<()> {
+) -> QueryResult<bool> {
     use schema::message_receipts::dsl;
     let row = || {
         dsl::message_receipts.filter(
@@ -1941,11 +1961,12 @@ fn record_receipt(
     // already holds `ts_ms`, and the first report of a state is the common
     // case on a path that runs for every receipt.
     if inserted == 0 {
-        diesel::update(row().filter(dsl::ts_ms.gt(ts_ms)))
+        let corrected = diesel::update(row().filter(dsl::ts_ms.gt(ts_ms)))
             .set(dsl::ts_ms.eq(ts_ms))
             .execute(conn)?;
+        return Ok(corrected > 0);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Which outgoing row a server ack belongs to, if one can be named.
