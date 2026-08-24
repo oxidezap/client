@@ -1,0 +1,35 @@
+[package]
+name = "oxidezap-daemon"
+description = "Background WhatsApp session with a tray presence and an IPC surface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxidezapd"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
+
+oxidezap-core = { workspace = true }
+oxidezap-ipc = { workspace = true }
+oxidezap-session = { workspace = true }
+
+# StatusNotifierItem over D-Bus, which is what a modern Linux tray actually
+# speaks. `tray-icon` would be cross-platform in one crate, but its default
+# features pull GTK3 and libxdo: a whole toolkit for one icon, in a binary
+# whose UI talks to wayland and wgpu directly. ksni reuses the zbus already in
+# the tree. Other platforms get their own impl behind `tray::Tray`.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3"

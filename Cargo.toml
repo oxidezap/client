@@ -2,7 +2,7 @@
 # (`oxidezapd`) and a TUI front end land beside it, which is why the front end
 # is already a member instead of the root package.
 [workspace]
-members = ["crates/audio", "crates/chat-store", "crates/core", "crates/gui", "crates/session"]
+members = ["crates/audio", "crates/chat-store", "crates/core", "crates/daemon", "crates/gui", "crates/ipc", "crates/session"]
 resolver = "3"
 
 [workspace.package]
@@ -23,6 +23,7 @@ disallowed_types = "deny"
 oxidezap-audio = { path = "crates/audio" }
 oxidezap-chat-store = { path = "crates/chat-store" }
 oxidezap-core = { path = "crates/core" }
+oxidezap-ipc = { path = "crates/ipc" }
 oxidezap-session = { path = "crates/session" }
 
 # The library and its satellites. One git source, one branch: cargo resolves
@@ -56,6 +57,7 @@ diesel_migrations = { version = "2.3.2", default-features = false, features = ["
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 log = "0.4"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
