@@ -7,6 +7,7 @@
 
 mod server;
 mod session_bridge;
+mod shutdown;
 mod state;
 mod tray;
 
@@ -33,6 +34,23 @@ fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
+    // Registered before anything can ask us to stop. Both the tray's Quit
+    // item and an IPC `Shutdown` raise SIGTERM at this process, and until
+    // these handlers exist SIGTERM still has its default disposition: the
+    // process would die on the spot, without disconnecting the session or
+    // closing SQLite — the exact teardown the signal was chosen to reach. The
+    // tray is registered on a bus a user can click within microseconds, so
+    // this is not a theoretical window.
+    let mut termination = Termination::install()?;
+
+    // Before anything else touches the account. The socket is only the
+    // visible half of "one daemon per user"; the real invariant is one
+    // WhatsApp session over one SQLite file, and a second process that opened
+    // the store and connected before discovering the lock was taken would
+    // have already broken it. Taking the claim here, rather than inside the
+    // server, is what keeps that from being a race between two tasks.
+    let claim = server::claim()?;
+
     let hub = StateHub::new();
 
     // The tray is optional by design: no StatusNotifierItem host (a bare WM, a
@@ -53,21 +71,28 @@ async fn run() -> Result<()> {
     // notification rather than a competing branch.
     //
     // `notify_one`, not `notify_waiters`: the latter wakes only tasks already
-    // parked, so a server that fails fast (a second daemon finding the socket
-    // taken) would signal before the bridge ever waits, and the bridge would
-    // then wait forever on a notification that was already spent.
+    // parked, so a server that fails fast (a socket it cannot bind) would
+    // signal before the bridge ever waits, and the bridge would then wait
+    // forever on a notification that was already spent.
     let stop = Arc::new(tokio::sync::Notify::new());
+
+    // Bounded, and sized to the client cap it can never exceed: a connection
+    // waits for its command's answer before reading the next request, so at
+    // most one command per connection is ever outstanding. That is what keeps
+    // one broken front end from accumulating work — an unbounded channel
+    // would let it queue payloads, and spawn session tasks, without limit.
+    let (commands, command_rx) = tokio::sync::mpsc::channel(server::MAX_CLIENTS);
 
     let mut session = {
         let hub = Arc::clone(&hub);
         let stop = Arc::clone(&stop);
-        tokio::spawn(
-            async move { session_bridge::run(hub, async move { stop.notified().await }).await },
-        )
+        tokio::spawn(async move {
+            session_bridge::run(hub, command_rx, async move { stop.notified().await }).await
+        })
     };
 
     let server_outcome = tokio::select! {
-        result = server::run(Arc::clone(&hub)) => {
+        result = server::run(&claim, Arc::clone(&hub), commands) => {
             // Fatal, and it has to reach the exit code: a supervisor that sees
             // status zero treats a daemon nobody can connect to as a clean
             // stop and never restarts it.
@@ -80,7 +105,7 @@ async fn run() -> Result<()> {
         joined = &mut session => {
             return finish(joined, tray, Ok(()));
         }
-        () = shutdown_signal() => {
+        () = termination.recv() => {
             log::info!("shutting down");
             Ok(())
         }
@@ -110,29 +135,47 @@ fn finish(
     server_outcome.and(session_outcome)
 }
 
-/// Resolve on the first termination signal.
+/// The termination signals, registered up front.
+///
+/// A struct rather than a function because *when* the handlers are installed
+/// matters more than what they do: tokio registers them when the stream is
+/// built, so building them lazily inside the shutdown branch would leave a
+/// window in which SIGTERM still killed the process outright.
 ///
 /// Both SIGINT and SIGTERM: a daemon is as likely to be stopped by a service
 /// manager as by a terminal, and leaving SIGTERM to the default handler would
 /// skip the teardown below it.
-async fn shutdown_signal() {
+struct Termination {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("cannot listen for SIGTERM: {e}");
-                return;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl Termination {
+    fn install() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
+                terminate: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
+            })
         }
+        #[cfg(not(unix))]
+        Ok(Self {})
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+
+    /// Resolve on the first termination signal.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }

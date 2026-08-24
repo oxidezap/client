@@ -21,8 +21,21 @@ log = { workspace = true }
 oxidezap-core = { workspace = true }
 oxidezap-ipc = { workspace = true }
 oxidezap-session = { workspace = true }
+portable-atomic = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
+# The clock behind the pairing deadline and the local send id, through the
+# library's pluggable TimeProvider rather than std (see /clippy.toml).
+wacore = { workspace = true }
+# `Jid` parsing: a group's sender is a participant, not the conversation, and
+# only a real JID parse can tell those apart.
+wacore-binary = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true, features = ["std", "clock"] }
+# `start_paused`: the handshake deadline is ten seconds of wall clock, and a
+# test that actually waited it out would be ten seconds of CI.
+tokio = { workspace = true, features = ["test-util"] }
 
 # StatusNotifierItem over D-Bus, which is what a modern Linux tray actually
 # speaks. `tray-icon` would be cross-platform in one crate, but its default
@@ -31,6 +44,12 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "ti
 # the tree. Other platforms get their own impl behind `tray::Tray`.
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.3"
+
+# The Unix syscalls the daemon makes directly: flock for the startup lock,
+# getuid for the socket directory's ownership check, kill for the one
+# shutdown path. Safe wrappers, so none of them needs an `unsafe` block.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [lints]
 workspace = true

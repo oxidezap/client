@@ -14,5 +14,9 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 
+# `socket_path` needs the uid for its TMPDIR fallback.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [lints]
 workspace = true

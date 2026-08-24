@@ -5725,14 +5725,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "env_logger",
  "ksni",
  "log",
  "oxidezap-core",
  "oxidezap-ipc",
  "oxidezap-session",
+ "portable-atomic",
+ "rustix 1.1.4",
  "serde_json",
  "tokio",
+ "wacore",
+ "wacore-binary",
 ]
 
 [[package]]
@@ -5769,6 +5774,7 @@ name = "oxidezap-ipc"
 version = "0.1.0"
 dependencies = [
  "oxidezap-core",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

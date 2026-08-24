@@ -1,13 +1,19 @@
 //! StatusNotifierItem tray, via ksni.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use ksni::{Handle, Icon, MenuItem, ToolTip, Tray as KsniTray, TrayMethods, menu::StandardItem};
+use oxidezap_ipc::DaemonMessage;
 
-use crate::state::TrayState;
+use crate::state::{StateHub, TrayState};
 
 /// The icon's model. ksni renders from this; the daemon updates it.
 struct Item {
     state: TrayState,
+    /// Held so the menu can publish. The tray is otherwise a pure observer;
+    /// its two menu items are the one place it speaks back.
+    hub: Arc<StateHub>,
 }
 
 impl KsniTray for Item {
@@ -51,36 +57,32 @@ impl KsniTray for Item {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         vec![
             StandardItem {
+                label: "Open".into(),
+                // The daemon has no window, so this is a request passed
+                // through to whoever has one. A session with no front end
+                // attached publishes it to nobody, which is the honest
+                // outcome: there is no window to raise.
+                activate: Box::new(|item: &mut Self| {
+                    item.hub.signal(&DaemonMessage::ShowWindow);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
+            StandardItem {
                 label: "Quit".into(),
                 // The daemon owns shutdown, so the menu asks rather than
                 // exits: tearing the process down from a D-Bus callback would
                 // skip the session teardown.
                 activate: Box::new(|_: &mut Self| {
-                    log::info!("tray requested quit");
-                    // SIGTERM to ourselves reuses the one shutdown path the
-                    // daemon already has, instead of adding a second one.
-                    #[cfg(unix)]
-                    unsafe {
-                        libc_raise_sigterm();
-                    }
+                    // Reuses the one shutdown path the daemon already has,
+                    // instead of adding a second one.
+                    crate::shutdown::request("tray menu");
                 }),
                 ..Default::default()
             }
             .into(),
         ]
-    }
-}
-
-#[cfg(unix)]
-unsafe fn libc_raise_sigterm() {
-    unsafe extern "C" {
-        fn raise(sig: i32) -> i32;
-    }
-    const SIGTERM: i32 = 15;
-    // SAFETY: raising a signal at our own process is always defined; the
-    // daemon installs a SIGTERM handler at startup.
-    unsafe {
-        raise(SIGTERM);
     }
 }
 
@@ -102,12 +104,13 @@ impl super::Tray for LinuxTray {
     }
 }
 
-pub async fn start() -> Result<Box<dyn super::Tray>> {
+pub async fn start(hub: Arc<StateHub>) -> Result<Box<dyn super::Tray>> {
     let item = Item {
         state: TrayState {
             connected: false,
             unread: 0,
         },
+        hub,
     };
     let handle = item
         .spawn()

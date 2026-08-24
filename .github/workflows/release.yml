@@ -11,6 +11,11 @@ on:
         required: true
         type: string
 
+# Read for everything by default; the publish job below raises its own to
+# `contents: write`, which is the only thing here that needs it.
+permissions:
+  contents: read
+
 jobs:
   build:
     uses: ./.github/workflows/build.yml
