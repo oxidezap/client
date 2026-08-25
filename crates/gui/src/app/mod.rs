@@ -20,6 +20,7 @@ mod recovery;
 mod search;
 mod settings;
 mod timeline_ctl;
+mod viewer;
 
 pub use calls::CallCard;
 pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
@@ -28,6 +29,7 @@ pub use media::RecordingState;
 pub use messages::{MessageListCache, TimelineItem};
 pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
+pub use viewer::MediaViewer;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -57,6 +59,10 @@ actions!(
         ToggleMute,
         /// Bring a minimised call card back to full size.
         ReturnToCall,
+        /// The previous picture in the fullscreen viewer.
+        ViewerPrev,
+        /// The next picture in the fullscreen viewer.
+        ViewerNext,
     ]
 );
 
@@ -92,6 +98,10 @@ const CHAT_LIST_CONTEXT: &str = "ChatList";
 /// Key context for the call card. Scoped rather than global so Enter/Escape
 /// keep their meaning in the composer while no call is up.
 pub const CALL_CONTEXT: &str = "Call";
+
+/// Key context for the fullscreen viewer, so the arrow keys walk pictures
+/// there and still move the caret in the composer everywhere else.
+pub const VIEWER_CONTEXT: &str = "MediaViewer";
 
 /// Search debounce delay in milliseconds
 const SEARCH_DEBOUNCE_MS: u64 = 150;
@@ -129,6 +139,33 @@ async fn download_with_timeout(
 /// ($XDG_DOWNLOAD_DIR, then $HOME or %USERPROFILE% + /Downloads, then the CWD
 /// like the database fallback when no home is known) and return the path
 /// written.
+/// A name for media the sender never named.
+///
+/// The message id keeps two photos from the same conversation out of each
+/// other's way, and the extension is what lets the file open at all.
+fn default_media_name(message_id: &str, mime_type: &str) -> String {
+    let extension = match mime_type.split(';').next().unwrap_or("").trim() {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        _ => "bin",
+    };
+    // Ids are opaque and long; the tail is enough to tell two apart and short
+    // enough to stay a file name.
+    let suffix: String = message_id
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .iter()
+        .rev()
+        .collect();
+    format!("oxidezap-{suffix}.{extension}")
+}
+
 fn save_to_downloads(file_name: &str, data: &[u8]) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
     use std::path::PathBuf;
@@ -269,6 +306,10 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
         KeyBinding::new("escape", DeclineCall, Some(CALL_CONTEXT)),
         KeyBinding::new("secondary-shift-m", ToggleMute, Some(CALL_CONTEXT)),
         KeyBinding::new("secondary-shift-c", ReturnToCall, None),
+        // Walking pictures, scoped to the viewer for the same reason: the
+        // arrow keys belong to the composer's caret everywhere else.
+        KeyBinding::new("left", ViewerPrev, Some(VIEWER_CONTEXT)),
+        KeyBinding::new("right", ViewerNext, Some(VIEWER_CONTEXT)),
         // Dismissing the topmost surface is a window-level command; each
         // overlay decides in turn whether it is the one that closes.
         KeyBinding::new("escape", CloseOverlay, None),
@@ -307,8 +348,13 @@ pub struct WhatsAppApp {
     /// Focus target for the call card, so its actions are reachable from
     /// the keyboard while it floats over the app.
     call_focus: FocusHandle,
+    /// Focus target for the fullscreen viewer, which owns the arrow keys
+    /// only while it is up.
+    viewer_focus: FocusHandle,
     /// Search input state for chat list (created lazily when window is available)
     chat_search_input: Option<Entity<InputState>>,
+    /// The picture being looked at full screen, when one is.
+    media_viewer: Option<MediaViewer>,
     /// Searching inside the open conversation, when that is open. Separate
     /// from the list's field, which filters chats by name.
     conversation_search: Option<ConversationSearch>,
@@ -475,7 +521,9 @@ impl WhatsAppApp {
             chat_list_scroll: VirtualListScrollHandle::new(),
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
+            viewer_focus: cx.focus_handle(),
             chat_search_input: None, // Created lazily when window is available
+            media_viewer: None,
             conversation_search: None,
             conversation_search_input: None,
             chat_search_query: String::new(),
@@ -957,6 +1005,13 @@ impl WhatsAppApp {
             .is_some_and(|search| search.jid != jid)
         {
             self.conversation_search = None;
+        }
+        if self
+            .media_viewer
+            .as_ref()
+            .is_some_and(|viewer| viewer.jid != jid)
+        {
+            self.media_viewer = None;
         }
         self.selected_chat = Some(jid.clone());
         self.navigate_to_chat();

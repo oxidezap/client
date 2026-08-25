@@ -364,6 +364,46 @@ impl WhatsAppApp {
         })
         .detach();
     }
+    /// Save a picture already in hand to the Downloads directory.
+    ///
+    /// Distinct from `download_document`, which fetches first: by the time
+    /// the viewer can show a picture its bytes are local, and re-fetching
+    /// them to save them would cost a round trip for nothing.
+    pub fn save_media(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(media) = self
+            .selected_chat_data()
+            .and_then(|chat| {
+                chat.messages
+                    .iter()
+                    .find(|message| message.id == message_id)
+                    .cloned()
+            })
+            .and_then(|message| message.media)
+            .filter(|media| !media.data.is_empty())
+        else {
+            warn!("nothing to save for {message_id}");
+            return;
+        };
+
+        let file_name = media
+            .file_name
+            .clone()
+            .unwrap_or_else(|| default_media_name(message_id, &media.mime_type));
+        let data = Arc::clone(&media.data);
+        let id = message_id.to_string();
+
+        cx.spawn(async move |_entity: WeakEntity<Self>, cx| {
+            let saved = cx
+                .background_spawn(async move { save_to_downloads(&file_name, &data) })
+                .await;
+            match saved {
+                Ok(path) => info!("Saved {} to {}", id, path.display()),
+                Err(e) => warn!("Failed to save {}: {}", id, e),
+            }
+        })
+        .detach();
+    }
+
     /// Get the video player state for a message (if any)
     pub fn video_player_state(&self, message_id: &str) -> Option<VideoPlayerState> {
         self.video_players.get(message_id).map(|p| p.state())

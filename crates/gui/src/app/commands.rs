@@ -25,6 +25,87 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    pub fn media_viewer(&self) -> Option<&MediaViewer> {
+        self.media_viewer.as_ref()
+    }
+
+    pub fn viewer_focus(&self) -> &FocusHandle {
+        &self.viewer_focus
+    }
+
+    /// The message the viewer is showing, resolved against the live chat so
+    /// a download that finished behind it is what gets drawn.
+    pub fn media_viewer_message(&self) -> Option<&ChatMessage> {
+        let viewer = self.media_viewer.as_ref()?;
+        let id = viewer.current_id()?;
+        self.find_chat(&viewer.jid)?
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+    }
+
+    /// Open a picture full screen.
+    ///
+    /// Silently does nothing for anything that is not a downloaded picture:
+    /// the bubble decides what is tappable, and this is the backstop for a
+    /// row that changed under the click.
+    pub fn open_media_viewer(
+        &mut self,
+        message_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(jid) = self.selected_chat.clone() else {
+            return;
+        };
+        let Some(chat) = self.find_chat(&jid) else {
+            return;
+        };
+        let Some(viewer) = MediaViewer::open(jid, message_id, &chat.messages) else {
+            return;
+        };
+        self.media_viewer = Some(viewer);
+        // A photo and a voice note both want the speakers; opening one stops
+        // the other rather than talking over it.
+        self.stop_current_media();
+        // Take focus so the arrow keys walk pictures rather than moving the
+        // composer's caret behind the scrim.
+        window.focus(&self.viewer_focus, cx);
+        cx.notify();
+    }
+
+    pub fn close_media_viewer(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.media_viewer.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Walk to the next picture in the conversation.
+    pub fn step_media_viewer(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(messages) = self
+            .media_viewer
+            .as_ref()
+            .and_then(|viewer| self.find_chat(&viewer.jid))
+            .map(|chat| chat.messages.clone())
+        else {
+            return;
+        };
+        let Some(viewer) = &mut self.media_viewer else {
+            return;
+        };
+        // Re-resolve first: a download finishing adds a picture either side,
+        // and stepping over a stale list would skip it.
+        if !viewer.refresh(&messages) {
+            self.media_viewer = None;
+            cx.notify();
+            return;
+        }
+        viewer.step(forward);
+        cx.notify();
+    }
+
     pub fn conversation_search(&self) -> Option<&ConversationSearch> {
         self.conversation_search.as_ref()
     }
@@ -178,6 +259,9 @@ impl WhatsAppApp {
         // Escape refuses that caller and leaves the call underneath alone.
         if self.call_state.waiting().is_some() {
             self.decline_waiting_call(cx);
+            return;
+        }
+        if self.close_media_viewer(cx) {
             return;
         }
         if self.settings.is_some() {

@@ -1,7 +1,7 @@
 //! The connected view: sidebar, conversation, and whatever floats over them.
 
 use gpui::{
-    App, Context, Entity, IntoElement, ParentElement, Styled, Window, div,
+    App, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Window, div,
     prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
@@ -11,8 +11,9 @@ use gpui_component::{Icon, IconName};
 
 use crate::app::{MessageListCache, WhatsAppApp};
 use crate::components::{
-    ChatListProps, EmptyState, InputAreaView, ProductIcon, render_call_card, render_chat_header,
-    render_chat_list, render_conversation_search, render_message_list,
+    ChatListProps, EmptyState, InputAreaView, ProductIcon, ViewerProps, render_call_card,
+    render_chat_header, render_chat_list, render_conversation_search, render_media_viewer,
+    render_message_list,
 };
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
@@ -44,6 +45,7 @@ pub fn render_connected_view(
         });
     }
     let call_focus = app.call_focus().clone();
+    let viewer_focus = app.viewer_focus().clone();
 
     let list_props = ChatListProps {
         cache: app.get_chat_list_cache(),
@@ -96,6 +98,46 @@ pub fn render_connected_view(
         )
         .into_any_element()
     });
+    // The picture, when one is open. Above the conversation and below the
+    // call card: a photo can wait, an incoming call cannot.
+    let viewer = app.media_viewer().and_then(|viewer| {
+        let message = app.media_viewer_message()?.clone();
+        let media = message.media.as_ref()?;
+        let image = (!media.data.is_empty())
+            .then(|| app.get_decoded_image(&message.id, &media.data, &media.mime_type));
+        let frame = app.video_current_frame(&message.id);
+        let author = if message.is_from_me {
+            SharedString::from("You")
+        } else {
+            message
+                .sender_name
+                .clone()
+                .or_else(|| {
+                    selected_chat
+                        .as_ref()
+                        .and_then(|chat| chat.participants.get(&message.sender).cloned())
+                })
+                .or_else(|| selected_chat.as_ref().map(|chat| chat.name.clone()))
+                .unwrap_or_else(|| "Unknown contact".to_string())
+                .into()
+        };
+        Some(
+            render_media_viewer(
+                viewer,
+                ViewerProps {
+                    message,
+                    image,
+                    frame,
+                    author,
+                },
+                entity.clone(),
+                &viewer_focus,
+                *layout.metrics(),
+                cx,
+            )
+            .into_any_element(),
+        )
+    });
     let call_card = render_call_card(
         app.call_state(),
         app.call_card(),
@@ -139,6 +181,7 @@ pub fn render_connected_view(
                     ))
                 }),
         )
+        .children(viewer)
         // The card floats: it does not take the app's input, so the
         // conversation underneath stays usable for the whole call.
         .children(call_card)

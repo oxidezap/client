@@ -77,7 +77,21 @@ pub(super) fn render_media_content(
                             .child(image),
                     )
                 } else {
-                    el.child(image)
+                    // The bytes are real, so the picture can be looked at.
+                    // A bubble is a thumbnail of a photo; this is the photo.
+                    let open_id: SharedString = format!("img-open-{message_id}").into();
+                    el.child(
+                        div()
+                            .id(open_id)
+                            .cursor_pointer()
+                            .on_click(move |_, window, cx| {
+                                let msg_id = message_id.clone();
+                                entity.update(cx, |app, cx| {
+                                    app.open_media_viewer(&msg_id, window, cx)
+                                });
+                            })
+                            .child(image),
+                    )
                 }
             } else if let Some(dl) = media_content.downloadable.clone() {
                 // Eager download failed but the metadata survived: keep the
