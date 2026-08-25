@@ -120,10 +120,14 @@ impl WhatsAppApp {
             }
             UiEvent::Disconnected(reason) => {
                 self.app_state = AppState::Error(reason);
+                // The screen offers a retry; arming it is what makes the
+                // countdown on that button mean something.
+                self.schedule_retry(cx);
                 cx.notify();
             }
             UiEvent::Error(msg) => {
                 self.app_state = AppState::Error(msg);
+                self.schedule_retry(cx);
                 cx.notify();
             }
             UiEvent::MessageReceived {

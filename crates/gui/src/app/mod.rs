@@ -16,6 +16,7 @@ mod media;
 mod media_ctl;
 mod messages;
 mod recording;
+mod recovery;
 mod settings;
 mod timeline_ctl;
 
@@ -349,6 +350,13 @@ pub struct WhatsAppApp {
     /// completions autoplay only if they still match it, so a stale download
     /// can't steal playback from media the user started meanwhile.
     pending_media_request: Option<String>,
+    /// When the automatic retry fires, while the error screen is up.
+    retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Counts the retry down. Only alive while the error screen is.
+    #[allow(dead_code)]
+    retry_task: Option<Task<()>>,
+    /// Whether the error screen's technical detail is unfolded.
+    error_detail_open: bool,
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
@@ -454,6 +462,9 @@ impl WhatsAppApp {
             audio_owner: None,
             active_media: ActiveMedia::None,
             pending_media_request: None,
+            retry_at: None,
+            retry_task: None,
+            error_detail_open: false,
             downloads_in_flight: std::collections::HashSet::new(),
             call_state: CallState::new(),
             name_cache: HashMap::new(),
@@ -1508,7 +1519,14 @@ impl Render for WhatsAppApp {
                 render_settings_view(self, window, cx).into_any_element()
             }
             AppState::Connected => render_connected_view(self, window, cx).into_any_element(),
-            AppState::Error(msg) => render_error_view(msg, entity, cx).into_any_element(),
+            AppState::Error(msg) => render_error_view(
+                msg,
+                self.retry_countdown(),
+                self.error_detail_open,
+                entity,
+                cx,
+            )
+            .into_any_element(),
             AppState::LoggedOut { message } => {
                 render_logged_out_view(message, entity, cx).into_any_element()
             }

@@ -1,38 +1,175 @@
-//! Error view
+//! Connection failure.
+//!
+//! An error screen has two readers: the person who wants to know whether to
+//! wait, and the person who is going to report it. The first gets a plain
+//! sentence and a retry; the second gets the technical detail, folded away so
+//! it does not shout at the first.
 
-use gpui::{App, Entity, div, prelude::*, px};
+use gpui::{
+    App, Entity, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+    Styled, div, prelude::FluentBuilder as _,
+};
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{Icon, IconName};
 
 use super::centered_view;
 use crate::app::WhatsAppApp;
+use crate::components::ProductIcon;
+use crate::theme::{ActiveProductTheme as _, Metrics};
 
-/// Render error view
-pub fn render_error_view(error: &str, entity: Entity<WhatsAppApp>, cx: &App) -> impl IntoElement {
-    centered_view(px(24.0), cx)
+pub fn render_error_view(
+    error: &str,
+    retry_in: Option<u64>,
+    show_detail: bool,
+    entity: Entity<WhatsAppApp>,
+    cx: &App,
+) -> impl IntoElement {
+    let metrics = cx.product().metrics;
+    let retry_entity = entity.clone();
+    let detail_entity = entity;
+    let detail = error.to_string();
+
+    centered_view(metrics.space_xxl(), cx)
         .child(
             div()
-                .text_color(cx.theme().danger)
-                .text_2xl()
-                .font_weight(gpui::FontWeight::BOLD)
-                .child("Error"),
+                .size(metrics.avatar_call())
+                .rounded_full()
+                .bg(cx.theme().secondary)
+                .border_1()
+                .border_color(cx.theme().border)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(ProductIcon::WifiOff)
+                        .size(metrics.icon())
+                        .text_color(cx.theme().warning),
+                ),
         )
         .child(
             div()
-                .text_color(cx.theme().foreground)
-                .text_base()
-                .max_w(px(400.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(metrics.space_md())
+                .max_w(metrics.call_card_width_wide())
                 .text_center()
-                .child(error.to_string()),
+                .child(
+                    div()
+                        .text_size(metrics.text_heading())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(cx.theme().foreground)
+                        .child("Can't reach WhatsApp"),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_secondary())
+                        .text_color(cx.theme().muted_foreground)
+                        // What it means and what happens next, in the order a
+                        // reader needs them. Not the raw transport error.
+                        .child(
+                            "Your messages are safe on this device. \
+                             We'll keep trying to reconnect.",
+                        ),
+                ),
         )
         .child(
-            Button::new("retry")
-                .label("Retry")
-                .primary()
-                .on_click(move |_, _, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.retry_connection(cx);
-                    });
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.space_lg())
+                .child(
+                    Button::new("retry")
+                        .label(match retry_in {
+                            // A countdown answers "is it stuck?" without the
+                            // user having to guess.
+                            Some(secs) if secs > 0 => format!("Retry in {secs}s"),
+                            _ => "Retry now".to_string(),
+                        })
+                        .primary()
+                        .on_click(move |_, _, cx| {
+                            retry_entity.update(cx, |this, cx| this.retry_connection(cx));
+                        }),
+                )
+                .child(
+                    // The app is usable offline — history is local. Saying so
+                    // is what stops this screen from being a dead end.
+                    Button::new("work-offline")
+                        .label("Work offline")
+                        .outline()
+                        .on_click({
+                            let entity = detail_entity.clone();
+                            move |_, _, cx| {
+                                entity.update(cx, |this, cx| this.work_offline(cx));
+                            }
+                        }),
+                ),
+        )
+        .child(render_detail(
+            detail,
+            show_detail,
+            detail_entity,
+            metrics,
+            cx,
+        ))
+}
+
+/// The technical cause, folded away.
+fn render_detail(
+    detail: String,
+    is_open: bool,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(metrics.space_lg())
+        .max_w(metrics.call_card_width_wide())
+        .child(
+            div()
+                .id("error-detail-toggle")
+                .flex()
+                .items_center()
+                .gap(metrics.space_sm())
+                .cursor_pointer()
+                .text_size(metrics.text_small())
+                .text_color(subtle)
+                .child(
+                    Icon::new(if is_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(metrics.icon_small()),
+                )
+                .child(if is_open {
+                    "Hide technical detail"
+                } else {
+                    "Technical detail"
+                })
+                .on_click(move |_, _window, cx| {
+                    entity.update(cx, |app, cx| app.toggle_error_detail(cx));
                 }),
         )
+        .when(is_open, |el| {
+            el.child(
+                div()
+                    .w_full()
+                    .p(metrics.space_lg())
+                    .rounded(metrics.radius_md())
+                    .bg(cx.theme().secondary)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(metrics.text_meta())
+                    .text_color(cx.theme().muted_foreground)
+                    .child(detail),
+            )
+        })
 }
