@@ -1945,6 +1945,17 @@ impl WhatsAppClient {
             handle.wait_ended().await;
             let call_id = handle.call_id().to_string();
             calls.active.lock().await.remove(&call_id);
+            // Every call that ever had a handle drains through here, whatever
+            // ended it, so this is where a lane is paid for. The sweep in
+            // `set_call_muted` is not made redundant by it: a window that fell
+            // behind can stamp a request against a call this watcher has
+            // already run for, and that lane has no second ending to be
+            // removed on.
+            calls
+                .mute
+                .lock()
+                .expect("mute lanes poisoned")
+                .remove(&call_id);
             Self::notify_call_ended(&ui_sender, &call_id).await;
         });
     }
