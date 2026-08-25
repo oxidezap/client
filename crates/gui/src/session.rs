@@ -20,10 +20,21 @@ use std::sync::{Arc, Mutex};
 use log::{debug, error, info, warn};
 use oxidezap_core::{DownloadableMedia, MediaContent, UiEvent};
 use oxidezap_ipc::{
-    CallAction, ClientRequest, DaemonMessage, PROTOCOL_VERSION, RequestId, media_path, socket_path,
+    CallAction, ClientRequest, ConnectionState, DaemonMessage, PROTOCOL_VERSION, RequestId,
+    StateSnapshot, media_path, socket_path,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::{mpsc, oneshot};
+
+/// How many session events may wait for a UI that is busy drawing.
+///
+/// Bounded on purpose. Unbounded, a stalled window keeps draining the socket
+/// and buffering everything the account does, so the daemon sees a reader that
+/// is keeping up and never truncates it — and this side grows without limit.
+/// Bounded, the reader stops reading, the daemon's own bounded broadcast
+/// overruns, and it says `Resync`. That is the recovery this protocol already
+/// has; the point is to reach it rather than to hide from it.
+const EVENT_QUEUE: usize = 512;
 
 /// Answers still owed to a caller, by the id they were asked under.
 type Pending = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Vec<u8>, String>>>>>;
@@ -47,7 +58,7 @@ impl Session {
     /// Returns the events it will publish. The daemon reloads history for a
     /// client that asks for events, so the chats arrive without being asked
     /// for separately.
-    pub fn connect() -> std::io::Result<(Self, mpsc::UnboundedReceiver<UiEvent>)> {
+    pub fn connect() -> std::io::Result<(Self, mpsc::Receiver<UiEvent>)> {
         let stream = connect_or_start()?;
         let reader = stream.try_clone()?;
 
@@ -63,7 +74,7 @@ impl Session {
             session_events: true,
         })?;
 
-        let (events, rx) = mpsc::unbounded_channel();
+        let (events, rx) = mpsc::channel(EVENT_QUEUE);
         let pending = Arc::clone(&session.pending);
         let writer = Arc::clone(&session.writer);
         std::thread::Builder::new()
@@ -202,25 +213,6 @@ impl Session {
         self.tell(&ClientRequest::ForgetSession);
     }
 
-    /// Wait for a daemon we have asked to stop to actually be gone.
-    ///
-    /// Reconnecting straight away lands on the socket of the process that is
-    /// still tearing down — it has a session to disconnect and a database to
-    /// close — and that connection dies with it. Blocking, so call it off the
-    /// UI thread; bounded, so a daemon that will not die leaves the front end
-    /// with an error rather than a spinner.
-    pub fn wait_for_shutdown() {
-        let Some(path) = socket_path() else { return };
-        let deadline = wacore::time::Instant::now() + START_TIMEOUT;
-        while UnixStream::connect(&path).is_ok() {
-            if wacore::time::Instant::now() >= deadline {
-                warn!("the old daemon is still listening on {}", path.display());
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-
     /// Fetch media, answered when the bytes are on disk.
     ///
     /// The same signature the old client had, so the callers that thread this
@@ -282,7 +274,7 @@ fn write_request(writer: &Writer, request: &ClientRequest) -> std::io::Result<()
 /// Read frames until the daemon goes away.
 fn read_frames(
     stream: UnixStream,
-    events: &mpsc::UnboundedSender<UiEvent>,
+    events: &mpsc::Sender<UiEvent>,
     pending: &Pending,
     writer: &Writer,
 ) {
@@ -305,7 +297,7 @@ fn read_frames(
                 // On this thread rather than the UI's: a history load names
                 // every photo in the account, and reading them is I/O.
                 load_media(&mut event);
-                if events.send(event).is_err() {
+                if events.blocking_send(event).is_err() {
                     break;
                 }
             }
@@ -324,6 +316,23 @@ fn read_frames(
                         .and_then(|path| std::fs::read(path).map_err(|e| e.to_string()))
                 }));
             }
+            // The first frame on every connection, and the only place this
+            // side learns what it has attached to. A window reopened onto a
+            // daemon that connected long ago would otherwise sit on its
+            // loading screen forever: `Connected` was published before this
+            // client subscribed and nothing replays it.
+            Ok(DaemonMessage::Hello { protocol, snapshot }) => {
+                if protocol != PROTOCOL_VERSION {
+                    let _ = events.blocking_send(UiEvent::Error(format!(
+                        "the daemon speaks protocol {protocol}, this build speaks \
+                         {PROTOCOL_VERSION}; they were built from different commits"
+                    )));
+                    break;
+                }
+                if events.blocking_send(catch_up(&snapshot)).is_err() {
+                    break;
+                }
+            }
             // The daemon truncated our stream. Nothing here can patch the
             // gap — this side holds messages, not summaries — so it starts
             // over, which is what attaching does anyway. Asked from this
@@ -336,14 +345,65 @@ fn read_frames(
                 }
             }
             Ok(DaemonMessage::Error(e)) => error!("daemon refused a request: {e}"),
-            // Summaries, acknowledgements and window requests: the daemon
-            // serves other front ends too, and this one derives its own state
-            // from the session stream.
+            // Summaries and acknowledgements: the daemon serves other front
+            // ends too, and this one derives its own state from the session
+            // stream. `ShowWindow` is not ignored so much as unimplemented —
+            // see the note in `app`.
             Ok(_) => {}
             Err(e) => error!("unparsable frame from the daemon: {e}"),
         }
     }
+
+    // Whatever ended this, the front end is now talking to nobody, and every
+    // caller waiting on a download is waiting on an answer that will never
+    // come.
     info!("daemon connection closed");
+    for (_, tx) in pending.lock().unwrap_or_else(|e| e.into_inner()).drain() {
+        let _ = tx.send(Err("the daemon connection closed".to_string()));
+    }
+    let _ = events.blocking_send(UiEvent::Error(
+        "Lost the connection to the daemon".to_string(),
+    ));
+}
+
+/// Turn the state a client attaches to into the events it would have seen.
+///
+/// The snapshot says where the connection stands; the front end only knows how
+/// to react to the event that put it there. Rather than teach it a second
+/// vocabulary, the one frame it gets on attaching is translated into the one
+/// it already handles.
+fn catch_up(snapshot: &StateSnapshot) -> UiEvent {
+    match &snapshot.connection {
+        ConnectionState::Connecting => UiEvent::InitComplete,
+        ConnectionState::Pairing { qr, pair_code } => match (qr, pair_code) {
+            // A QR is what the pairing screen shows when it has both.
+            (Some(qr), _) => UiEvent::QrCode {
+                code: qr.code.clone(),
+                timeout_secs: remaining_secs(qr.expires_at_ms),
+            },
+            (None, Some(code)) => UiEvent::PairCode {
+                code: code.code.clone(),
+                timeout_secs: remaining_secs(code.expires_at_ms),
+            },
+            // Pairing with neither credential yet: still coming.
+            (None, None) => UiEvent::InitComplete,
+        },
+        // The event that leaves the pairing screen for the syncing one.
+        ConnectionState::Syncing => UiEvent::PairSuccess,
+        ConnectionState::Connected => UiEvent::Connected,
+        ConnectionState::Disconnected { reason } => UiEvent::Disconnected(reason.clone()),
+        ConnectionState::LoggedOut { message } => UiEvent::LoggedOut(message.clone()),
+    }
+}
+
+/// What is left of a pairing credential's life, as the front end counts it.
+///
+/// The wire carries a deadline precisely so this can be worked out on
+/// arrival; a code that has already expired reports zero rather than
+/// underflowing into a full countdown.
+fn remaining_secs(expires_at_ms: i64) -> u64 {
+    let left = expires_at_ms.saturating_sub(wacore::time::now_millis());
+    u64::try_from(left / 1_000).unwrap_or(0)
 }
 
 /// Fill in the media bytes the daemon left in its cache.
@@ -379,45 +439,59 @@ fn fill(media: &mut Option<MediaContent>) {
     }
 }
 
-/// How long to keep trying a daemon we have just started.
+/// How long to keep trying before giving the user an error instead.
 const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Connect, starting `oxidezapd` if nothing is listening yet.
+/// How long to leave a daemon we started to take its lock and bind.
+const START_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Connect, starting `oxidezapd` for as long as nothing is listening.
 ///
 /// The front end no longer owns a session, so there has to be one: a first run
 /// on a fresh machine would otherwise show an error where it should show a QR
-/// code. Starting it is safe to race — the daemon takes a per-user lock and a
-/// second one exits — so two front ends opening at once end up on the same
-/// session rather than fighting over the store.
+/// code.
+///
+/// Starting one is safe to race, because the daemon takes a per-user lock and
+/// the loser exits. That is also why one attempt is not enough. A daemon
+/// started while another is still tearing down loses the lock and exits, and
+/// the socket was unlinked before that lock was released — so there is a
+/// window where nothing is listening, nothing is starting, and a single-shot
+/// spawn has already given up. Retrying until the deadline is what closes it,
+/// and it is why nothing here watches the socket to decide the old daemon has
+/// gone: the socket goes first.
 fn connect_or_start() -> std::io::Result<UnixStream> {
     let path = socket_path().ok_or_else(|| {
         std::io::Error::other("no runtime directory to look for the daemon's socket in")
     })?;
-    if let Ok(stream) = UnixStream::connect(&path) {
-        return Ok(stream);
-    }
-
-    info!("no daemon listening on {}; starting one", path.display());
     let program = daemon_program();
-    std::process::Command::new(&program).spawn().map_err(|e| {
-        std::io::Error::other(format!("could not start {}: {e}", program.display()))
-    })?;
-
-    // Polled rather than waited on: the daemon binds after it has taken its
-    // lock and prepared its directory, and there is no signal for that short
-    // of the socket appearing.
     let deadline = wacore::time::Instant::now() + START_TIMEOUT;
+
     loop {
         match UnixStream::connect(&path) {
             Ok(stream) => return Ok(stream),
             Err(e) if wacore::time::Instant::now() >= deadline => {
                 return Err(std::io::Error::other(format!(
-                    "started {} but it never listened on {}: {e}",
-                    program.display(),
+                    "no daemon listening on {} after {START_TIMEOUT:?}: {e}",
                     path.display()
                 )));
             }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => {}
+        }
+
+        info!("no daemon on {}; starting one", path.display());
+        std::process::Command::new(&program).spawn().map_err(|e| {
+            std::io::Error::other(format!("could not start {}: {e}", program.display()))
+        })?;
+
+        // Polled rather than waited on: the daemon binds after it has taken
+        // its lock and prepared its directory, and there is no signal for that
+        // short of the socket answering.
+        let attempt = wacore::time::Instant::now() + START_ATTEMPT;
+        while wacore::time::Instant::now() < attempt {
+            if let Ok(stream) = UnixStream::connect(&path) {
+                return Ok(stream);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 }

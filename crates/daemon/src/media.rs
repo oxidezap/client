@@ -89,12 +89,29 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
     // Through a temporary and a rename: a reader that opens the key must
     // never see half a file, and the reader is another process racing this
     // one by design.
-    let temp = path.with_extension(format!("part{}", std::process::id()));
+    let temp = path.with_extension(format!("part{}", write_ticket()));
     std::fs::write(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
     std::fs::rename(&temp, &path).with_context(|| format!("renaming into {}", path.display()))?;
 
     sweep_occasionally(dir, bytes.len() as u64);
     Ok(key.to_string())
+}
+
+/// A name no other in-progress write is using.
+///
+/// The process id alone is not enough: two clients of the same daemon asking
+/// for the same uncached media both miss the check above, and would then race
+/// on one temporary where a rename can take the file out from under the other
+/// write.
+fn write_ticket() -> String {
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The bytes held under `key`, if any.

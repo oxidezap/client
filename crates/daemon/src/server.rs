@@ -452,15 +452,11 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
     // Subscribed before the reload is asked for, and for the same reason the
     // snapshot is taken after subscribing: the load must not land in the
     // window between the two.
-    let mut sessions = if attached.session_events {
-        hub.subscribe_sessions()
-    } else {
-        // A receiver whose sender is already gone, so the branch below can be
-        // unconditional rather than an `Option` inside a `select!`. It costs
-        // the daemon nothing: with no real subscriber it never serializes a
-        // session event in the first place.
-        tokio::sync::broadcast::channel(1).1
-    };
+    // Subscribed either way, and read only when asked for. A receiver whose
+    // sender was already gone would look exactly like a closed channel, and
+    // the branch below ends the connection on one — which would disconnect
+    // every summary-only client the moment it said hello.
+    let mut sessions = hub.subscribe_sessions();
 
     // Frames addressed to this connection alone: a download's answer belongs
     // to whoever asked, and the ids are client-chosen.
@@ -508,7 +504,7 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
             // Neither of these is gated on `awaiting_resync`: a session
             // event is not a summary, and a download this client asked for is
             // its own answer. Both are lost for good if dropped.
-            session = sessions.recv() => match session {
+            session = sessions.recv(), if attached.session_events => match session {
                 Ok(frame) => write_line(&mut writer, &frame).await?,
                 // A front end that overruns cannot patch the gap from a
                 // snapshot: it holds messages, not summaries. Telling it to
@@ -721,45 +717,53 @@ async fn handle_request(
             jid,
             text,
             local_id,
-        } => Answer::frame(
-            dispatch(
+        } => {
+            let result = dispatch(
                 hub,
                 commands,
                 Action::SendText {
-                    jid,
+                    jid: jid.clone(),
                     text,
-                    local_id,
+                    local_id: local_id.clone(),
                 },
             )
-            .await,
-        ),
+            .await;
+            if let Err(e) = &result {
+                note_send_failure(outbox, &jid, local_id.as_deref(), e);
+            }
+            Answer::frame(answer(result))
+        }
         ClientRequest::SendAudio {
             jid,
             upload,
             duration_secs,
             waveform,
             local_id,
-        } => Answer::frame(
-            dispatch(
+        } => {
+            let result = dispatch(
                 hub,
                 commands,
                 Action::SendAudio {
-                    jid,
+                    jid: jid.clone(),
                     upload,
                     duration_secs,
                     waveform,
-                    local_id,
+                    local_id: local_id.clone(),
                 },
             )
-            .await,
-        ),
-        ClientRequest::Typing { jid, composing } => {
-            Answer::frame(dispatch(hub, commands, Action::Typing { jid, composing }).await)
+            .await;
+            if let Err(e) = &result {
+                note_send_failure(outbox, &jid, local_id.as_deref(), e);
+            }
+            Answer::frame(answer(result))
         }
+        ClientRequest::Typing { jid, composing } => Answer::frame(answer(
+            dispatch(hub, commands, Action::Typing { jid, composing }).await,
+        )),
         ClientRequest::Call(action) => {
-            Answer::frame(dispatch(hub, commands, Action::Call(action)).await)
+            Answer::frame(answer(dispatch(hub, commands, Action::Call(action)).await))
         }
-        ClientRequest::Download { id, media } => Answer::frame(
+        ClientRequest::Download { id, media } => Answer::frame(answer(
             dispatch(
                 hub,
                 commands,
@@ -770,29 +774,17 @@ async fn handle_request(
                 },
             )
             .await,
-        ),
+        )),
         ClientRequest::ReloadHistory => {
-            Answer::frame(dispatch(hub, commands, Action::ReloadHistory).await)
+            Answer::frame(answer(dispatch(hub, commands, Action::ReloadHistory).await))
         }
-        // Not gated on being connected: dead credentials are exactly when the
-        // account is unreachable, and refusing the only recovery then would
-        // leave the user with no way out.
-        ClientRequest::ForgetSession => Answer::frame(
-            match commands.try_send(SessionCommand {
-                action: Action::ForgetSession,
-                reply: {
-                    let (reply, _) = tokio::sync::oneshot::channel();
-                    reply
-                },
-            }) {
-                Ok(()) => accepted(),
-                Err(_) => no_session("the session is shutting down"),
-            },
-        ),
+        ClientRequest::ForgetSession => {
+            Answer::frame(answer(dispatch(hub, commands, Action::ForgetSession).await))
+        }
         ClientRequest::MarkRead {
             jid,
             through_message_id,
-        } => Answer::frame(
+        } => Answer::frame(answer(
             dispatch(
                 hub,
                 commands,
@@ -802,7 +794,7 @@ async fn handle_request(
                 },
             )
             .await,
-        ),
+        )),
         // The daemon has no window of its own, so this is relayed rather than
         // acted on: whoever owns a window is the only one that can raise it.
         // Published to every client, including the one that asked, because a
@@ -828,13 +820,18 @@ async fn handle_request(
 /// admission would never learn its message went nowhere. It is also the
 /// backpressure — a connection has one command outstanding at a time, so the
 /// client cap is also the cap on queued work.
-async fn dispatch(hub: &StateHub, commands: &Commands, action: Action) -> Option<String> {
+async fn dispatch(
+    hub: &StateHub,
+    commands: &Commands,
+    action: Action,
+) -> Result<(), ProtocolError> {
     // Refused early as well as late: a client that is watching the connection
     // state should get the answer it can already predict, without the round
-    // trip.
+    // trip. Only for what actually needs the network — see
+    // [`Action::needs_network`].
     let connection = hub.connection();
-    if !connection.is_connected() {
-        return no_session(&format!("not connected: {connection:?}"));
+    if action.needs_network() && !connection.is_connected() {
+        return Err(no_session(format!("not connected: {connection:?}")));
     }
 
     let (reply, answer) = tokio::sync::oneshot::channel();
@@ -844,15 +841,45 @@ async fn dispatch(hub: &StateHub, commands: &Commands, action: Action) -> Option
         .is_err()
     {
         // The bridge is gone: the daemon is on its way down.
-        return no_session("the session is shutting down");
+        return Err(no_session("the session is shutting down"));
     }
 
     match answer.await {
-        Ok(CommandOutcome::Accepted) => accepted(),
-        Ok(CommandOutcome::NoSession(detail)) => no_session(&detail),
-        Ok(CommandOutcome::Refused(detail)) => refused(&detail),
+        Ok(CommandOutcome::Accepted) => Ok(()),
+        Ok(CommandOutcome::NoSession(detail)) => Err(no_session(detail)),
+        Ok(CommandOutcome::Refused(detail)) => Err(ProtocolError::Refused { detail }),
         // The bridge took the command and died before answering.
-        Err(_) => no_session("the session stopped before it answered"),
+        Err(_) => Err(no_session("the session stopped before it answered")),
+    }
+}
+
+/// The frame that answers a command, whichever way it went.
+fn answer(result: Result<(), ProtocolError>) -> Option<String> {
+    match result {
+        Ok(()) => accepted(),
+        Err(e) => serde_json::to_string(&DaemonMessage::Error(e)).ok(),
+    }
+}
+
+/// Tell a client its send never happened, in the terms it already renders.
+///
+/// A front end draws the message the moment it asks, and an error frame it can
+/// only log leaves that bubble pending forever. `local_id` is the correlation
+/// this protocol already has — the client chose it precisely so it could match
+/// the rename — so a refusal comes back as the `SendFailed` the client already
+/// handles rather than as anything new.
+fn note_send_failure(outbox: &Outbox, jid: &str, local_id: Option<&str>, error: &ProtocolError) {
+    // Nothing was drawn, so there is nothing to correct.
+    let Some(message_id) = local_id else { return };
+    let event = oxidezap_core::UiEvent::SendFailed {
+        chat_jid: jid.to_string(),
+        message_id: message_id.to_string(),
+        reason: error.to_string(),
+    };
+    if let Ok(frame) = serde_json::to_string(&DaemonMessage::Session {
+        event: Box::new(event),
+    }) {
+        let _ = outbox.try_send(frame);
     }
 }
 
@@ -860,18 +887,10 @@ fn accepted() -> Option<String> {
     serde_json::to_string(&DaemonMessage::Accepted).ok()
 }
 
-fn no_session(detail: &str) -> Option<String> {
-    serde_json::to_string(&DaemonMessage::Error(ProtocolError::NoSession {
+fn no_session(detail: impl Into<String>) -> ProtocolError {
+    ProtocolError::NoSession {
         detail: detail.into(),
-    }))
-    .ok()
-}
-
-fn refused(detail: &str) -> Option<String> {
-    serde_json::to_string(&DaemonMessage::Error(ProtocolError::Refused {
-        detail: detail.into(),
-    }))
-    .ok()
+    }
 }
 
 async fn write_line(writer: &mut tokio::net::unix::OwnedWriteHalf, line: &str) -> Result<()> {
@@ -1275,6 +1294,135 @@ mod tests {
             serde_json::from_str::<DaemonMessage>(&answer).unwrap(),
             DaemonMessage::Error(ProtocolError::Malformed { .. })
         ));
+    }
+
+    /// The regression this replaced: a summary-only client was handed its
+    /// snapshot and then dropped, because the branch serving session events
+    /// ended the connection on a closed channel and opting out produced one.
+    #[tokio::test]
+    async fn a_client_that_wants_only_summaries_stays_connected() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let hub = connected_hub();
+        let (commands, _taken) = bridge(CommandOutcome::Accepted);
+
+        let served = tokio::spawn(serve_client(server, Arc::clone(&hub), commands));
+        client
+            .write_all(format!("{}\n", hello(PROTOCOL_VERSION, false)).as_bytes())
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+                DaemonMessage::Hello { .. }
+            ),
+            "expected a snapshot, got {line}"
+        );
+
+        // Still there: a summary reaches it rather than an EOF.
+        hub.apply(crate::state::Change::live(
+            oxidezap_ipc::DaemonEvent::ChatRemoved {
+                jid: "a@s.whatsapp.net".into(),
+            },
+        ));
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+                DaemonMessage::Update { .. }
+            ),
+            "the connection was dropped instead: {line}"
+        );
+        served.abort();
+    }
+
+    /// The other half: a client that asked for events gets them, and the
+    /// summary stream keeps working alongside.
+    #[tokio::test]
+    async fn a_client_that_asked_for_events_receives_them() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let hub = connected_hub();
+        let (commands, _taken) = bridge(CommandOutcome::Accepted);
+
+        let served = tokio::spawn(serve_client(server, Arc::clone(&hub), commands));
+        client
+            .write_all(format!("{}\n", hello(PROTOCOL_VERSION, true)).as_bytes())
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap(); // the hello
+
+        hub.publish_session(
+            serde_json::to_string(&DaemonMessage::Session {
+                event: Box::new(oxidezap_core::UiEvent::Connected),
+            })
+            .unwrap(),
+        );
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+                DaemonMessage::Session { .. }
+            ),
+            "expected a session event, got {line}"
+        );
+        served.abort();
+    }
+
+    /// Forgetting the session is the only way out of dead credentials, and
+    /// dead credentials are a state the account is unreachable in. Gating it
+    /// on a connection refuses it exactly when it is wanted.
+    #[test]
+    fn the_local_actions_do_not_need_a_connection() {
+        assert!(!Action::ForgetSession.needs_network());
+        assert!(!Action::ReloadHistory.needs_network());
+        assert!(
+            Action::SendText {
+                jid: "a@s.whatsapp.net".into(),
+                text: "hi".into(),
+                local_id: None,
+            }
+            .needs_network()
+        );
+    }
+
+    /// A refused send leaves a message the client has already drawn. It comes
+    /// back as the failure the client already renders, keyed by the local id
+    /// it chose for exactly this.
+    #[tokio::test]
+    async fn a_refused_send_is_reported_against_the_message_it_drew() {
+        // Not connected, so the send is refused at the door.
+        let hub = StateHub::new();
+        let (commands, _taken) = bridge(CommandOutcome::Accepted);
+        let (outbox, mut inbox) = tokio::sync::mpsc::channel(OUTBOX_CAPACITY);
+
+        let line = request_line(&ClientRequest::SendText {
+            jid: "a@s.whatsapp.net".into(),
+            text: "hi".into(),
+            local_id: Some("local_1".into()),
+        });
+        let answer = handle_request(&line, &hub, &commands, &outbox).await;
+        assert!(matches!(
+            parse(answer.frame),
+            DaemonMessage::Error(ProtocolError::NoSession { .. })
+        ));
+
+        let frame: DaemonMessage = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+        match frame {
+            DaemonMessage::Session { event } => assert!(
+                matches!(*event, oxidezap_core::UiEvent::SendFailed { ref message_id, .. }
+                    if message_id == "local_1"),
+                "expected the bubble to be failed, got {event:?}"
+            ),
+            other => panic!("expected a session event, got {other:?}"),
+        }
     }
 
     /// A peer that connects and says nothing costs a task and a descriptor

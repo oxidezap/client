@@ -337,7 +337,7 @@ pub struct WhatsAppApp {
 impl WhatsAppApp {
     /// Spawn the event handling task that processes UI events from the WhatsApp client
     fn spawn_event_task(
-        mut ui_rx: tokio::sync::mpsc::UnboundedReceiver<UiEvent>,
+        mut ui_rx: tokio::sync::mpsc::Receiver<UiEvent>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -824,15 +824,11 @@ impl WhatsAppApp {
             return;
         }
 
-        // Only once the old daemon has gone. Reconnecting now would land on
-        // the socket of the process that is still closing the database it has
-        // just been told to delete.
-        self.reconnect_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            cx.background_spawn(async { Session::wait_for_shutdown() })
-                .await;
-            let _ = entity.update(cx, |app, cx| app.retry_connection(cx));
-        }));
-        cx.notify();
+        // Reconnecting rides straight into the same retry loop a cold start
+        // uses: the old daemon is still closing the database it has just been
+        // told to delete, so the first attempts fail and the loop keeps
+        // starting one until the lock it is waiting on is free.
+        self.retry_connection(cx);
     }
 
     pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
@@ -927,15 +923,22 @@ impl WhatsAppApp {
         }
     }
 
-    /// Unique optimistic-bubble id: a millisecond timestamp alone collides on
-    /// fast double-sends (add_message would dedup one bubble away and
-    /// MessageIdAssigned could rename the wrong one).
+    /// Unique optimistic-bubble id.
+    ///
+    /// A millisecond timestamp alone collides on fast double-sends
+    /// (`add_message` would dedup one bubble away and `MessageIdAssigned`
+    /// could rename the wrong one), and a timestamp plus a counter collides
+    /// across processes: two windows on the same daemon each start their
+    /// counter at zero, and the daemon broadcasts every assignment to both.
+    /// The process id is what keeps them apart, and it also namespaces the
+    /// media-cache file a voice note is staged in.
     fn next_local_id(prefix: &str) -> String {
         use portable_atomic::AtomicU64;
         use std::sync::atomic::Ordering;
         static SEQ: AtomicU64 = AtomicU64::new(0);
         format!(
-            "{prefix}_{}_{}",
+            "{prefix}_{}_{}_{}",
+            std::process::id(),
             whatsapp_rust::wacore::time::now_millis(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         )

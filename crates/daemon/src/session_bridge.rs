@@ -68,6 +68,18 @@ pub enum Action {
     ForgetSession,
 }
 
+impl Action {
+    /// Whether carrying this out needs a live connection to WhatsApp.
+    ///
+    /// Reloading history reads the local store and forgetting the session
+    /// deletes it. Gating those on a connection refuses them exactly when
+    /// they are wanted: dead credentials are a state the account is
+    /// unreachable in by definition, and re-pairing is the only way out of it.
+    pub fn needs_network(&self) -> bool {
+        !matches!(self, Self::ReloadHistory | Self::ForgetSession)
+    }
+}
+
 /// Frames addressed to one connection rather than broadcast.
 ///
 /// A download's answer belongs to the client that asked for it: ids are
@@ -152,7 +164,14 @@ pub async fn run(
                 None => break,
             },
             command = commands.recv(), if !commands_closed => match command {
-                Some(command) => bridge.execute(&client, command),
+                Some(command) => {
+                    bridge.execute(&client, command);
+                    // Asked to forget: stop here so the teardown below runs
+                    // before anything deletes the file it is closing.
+                    if bridge.forget {
+                        break;
+                    }
+                }
                 None => commands_closed = true,
             },
             () = &mut shutdown => break,
@@ -168,6 +187,16 @@ pub async fn run(
     // allowed").
     if let Err(e) = tokio::task::spawn_blocking(move || close(client)).await {
         log::error!("session teardown did not complete: {e}");
+    }
+
+    // After the teardown, never before: the store is one file and the session
+    // was holding it open. Unlinking it first leaves the closing session free
+    // to write a fresh WAL beside a database that is already gone.
+    if bridge.forget {
+        match oxidezap_session::wipe_local_state() {
+            Ok(()) => log::info!("local state wiped; pair again on the next start"),
+            Err(e) => log::error!("could not wipe local state: {e}"),
+        }
     }
     Ok(())
 }
@@ -192,6 +221,9 @@ struct Bridge {
     hub: Arc<StateHub>,
     reads: ReadTracker,
     in_flight: Arc<Semaphore>,
+    /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
+    /// and wipes once the session has let go of the store.
+    forget: bool,
 }
 
 impl Bridge {
@@ -200,6 +232,7 @@ impl Bridge {
             hub,
             reads: ReadTracker::default(),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            forget: false,
         }
     }
 
@@ -241,7 +274,7 @@ impl Bridge {
         // to a command it cannot carry out is a log line the requester never
         // sees.
         let connection = self.hub.connection();
-        if !connection.is_connected() {
+        if action.needs_network() && !connection.is_connected() {
             return CommandOutcome::NoSession(format!("not connected: {connection:?}"));
         }
 
@@ -334,19 +367,13 @@ impl Bridge {
                 client.reload_history();
                 CommandOutcome::Accepted
             }
+            // Deferred rather than done here, because the file to delete is
+            // the one the session still has open. The event loop already ends
+            // by disconnecting and closing SQLite; the wipe belongs after
+            // that, and reusing that path is what makes the ordering hold.
             Action::ForgetSession => {
-                // The wipe deletes the file the session is holding open, so
-                // the session stops first and the daemon follows it out. The
-                // caller is told yes because the wipe itself succeeded; what
-                // it asked for is a daemon that comes back unpaired.
-                client.shutdown();
-                match oxidezap_session::wipe_local_state() {
-                    Ok(()) => {
-                        crate::shutdown::request("local state wiped; pair again on restart");
-                        CommandOutcome::Accepted
-                    }
-                    Err(e) => CommandOutcome::Refused(format!("could not wipe local state: {e}")),
-                }
+                self.forget = true;
+                CommandOutcome::Accepted
             }
         }
     }
