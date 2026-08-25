@@ -99,14 +99,16 @@ profile here repeats it deliberately.
   store reload is the store's whole truth *about rows it has*, and during
   pairing it has none while live messages already exist. Only store-backed
   chats are diffed against a reload; see `StateHub::store_backed_chat_jids`.
-- **A call that ends with nothing to write down says so in the state.** A
+- **How a call ended is said in the state, not derived from its absence.** A
   front end learns a call is over by watching the stage disappear, and it
   writes the conversation's record from the stage it was holding — so a call
-  answered on another device reads as missed, and one the daemon refused to
-  place reads as an attempt that was never made. `CallState::unrecorded`
-  travels in the same frame as the removal, because an explanation sent
-  beside it rides a different channel and can arrive after the record it was
-  meant to prevent.
+  answered on another device reads as missed, one the daemon refused to place
+  reads as an attempt that was never made, and one *another window* declined
+  reads as missed in every window but that one. `CallState::ending` is the one
+  answer to all three: `Ending::Nothing` for the calls with no honest local
+  record, `Ending::As` for an outcome only the acting side knew. It travels in
+  the same frame as the removal, because an explanation sent beside it rides a
+  different channel and can arrive after the record it was meant to change.
 - **Whenever the stage empties, the parked caller comes forward.** A second
   offer during a call waits behind the one on screen, and nothing draws a
   waiting call on its own — so a stage cleared without promoting it leaves

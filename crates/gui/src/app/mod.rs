@@ -202,9 +202,9 @@ use crate::views::{
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
     ActiveCall, AppState, Availability, CachedQrCode, CallOutcome, CallRecord, CallState, Chat,
-    ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, Issued, MediaContent, MediaType,
-    MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Resend, Stage,
-    SystemNotice, TypingSummary, UiEvent,
+    ChatMessage, ComposingKind, DownloadableMedia, Ending, IncomingCall, Issued, MediaContent,
+    MediaType, MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Resend,
+    Stage, SystemNotice, TypingSummary, UiEvent,
 };
 
 // ChatListCache is now in chats.rs and re-exported above
@@ -1138,6 +1138,46 @@ impl WhatsAppApp {
         self.visible_chat = jid;
     }
 
+    /// Drop everything this window learned from the account it is leaving.
+    ///
+    /// Not only the chats. Anything keyed by a JID or a message id belongs to
+    /// the account that produced it, and the next account can share those
+    /// keys: a group survives a re-pair, and a contact certainly does. A
+    /// draft is the one that bites — text composed under the old account
+    /// reappearing in the composer of the new one, ready to be sent to
+    /// someone it was never written for.
+    fn forget_account_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.chats.clear();
+        self.selected_chat = None;
+        self.visible_chat = None;
+        self.message_list_cache.borrow_mut().clear();
+        self.chat_list_cache.borrow_mut().take();
+        *self.status_feed_cache.borrow_mut() = None;
+        self.decoded_images.borrow_mut().clear();
+        self.timeline_anchor = None;
+        // Composed text, and the reply bar it may be answering.
+        self.drafts.clear();
+        self.reply_to = None;
+        if let Some(input) = self.input_area.clone() {
+            input.update(cx, |view, cx| {
+                view.set_reply(None, cx);
+                view.swap_text("", window, cx);
+            });
+        }
+        // Names, presence, watched updates, notices with nowhere to go yet.
+        self.name_cache.clear();
+        self.watched_status.clear();
+        self.pending_notices.clear();
+        self.presence = PresenceRegistry::new();
+        // Anything mid-flight against a message id that is about to be gone.
+        self.stop_current_media();
+        self.video_players.clear();
+        self.downloads_in_flight.clear();
+        self.media_viewer = None;
+        self.conversation_search = None;
+        self.chat_search_query.clear();
+    }
+
     /// Everything that has to stop when the connected view goes away.
     ///
     /// The controls that stop them are drawn by that view, so anything still
@@ -1571,7 +1611,7 @@ impl WhatsAppApp {
     /// 401 loop. The store belongs to the daemon, so the wipe is a request
     /// rather than something this side does: it is the process holding the
     /// SQLite file open, and it stops itself once the file is gone.
-    pub fn reset_and_pair_again(&mut self, cx: &mut Context<Self>) {
+    pub fn reset_and_pair_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.app_state = AppState::Loading;
 
         let asked = self
@@ -1581,10 +1621,7 @@ impl WhatsAppApp {
             .is_some();
         self.event_task.take();
 
-        // Everything hydrated from the old device is now stale.
-        self.chats.clear();
-        self.selected_chat = None;
-        self.message_list_cache.borrow_mut().clear();
+        self.forget_account_state(window, cx);
 
         if !asked {
             self.app_state =

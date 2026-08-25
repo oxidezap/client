@@ -5,6 +5,11 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 12: the call state's note about a departing call names the outcome to
+/// write, not just that there is none. A decline is a refusal only the
+/// declining window knows about; every other one watched the same stage
+/// disappear and wrote it down as missed.
+///
 /// 11: `DaemonEvent::AccountChanged`. The linked identity was daemon state
 /// with no event, so it travelled only in the hello snapshot — and a window
 /// attached before pairing finished never learned whose account it was.
@@ -56,7 +61,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

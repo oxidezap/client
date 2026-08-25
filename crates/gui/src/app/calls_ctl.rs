@@ -258,10 +258,17 @@ impl WhatsAppApp {
             .waiting()
             .filter(|waiting| !calls.holds(waiting.call_id()))
             .cloned();
-        if let Some(waiting) = abandoned
-            && !calls.is_unrecorded(waiting.call_id())
-        {
-            self.record_call(&Stage::Incoming(waiting.into_call()), cx);
+        if let Some(waiting) = abandoned {
+            match calls.ending_for(waiting.call_id()) {
+                Some(Ending::Nothing) => {}
+                ending => {
+                    let outcome = match ending {
+                        Some(Ending::As(outcome)) => Some(outcome),
+                        _ => None,
+                    };
+                    self.record_call_as(&Stage::Incoming(waiting.into_call()), outcome, cx);
+                }
+            }
         }
         let ended = self
             .call_state
@@ -275,8 +282,15 @@ impl WhatsAppApp {
             // incoming and as an attempt when it was outgoing, and a call
             // answered on the phone is the opposite of missed — the badge and
             // the "call back" prompt were for something already dealt with.
-            if !calls.is_unrecorded(stage.call_id()) {
-                self.record_call(&stage, cx);
+            match calls.ending_for(stage.call_id()) {
+                Some(Ending::Nothing) => {}
+                ending => {
+                    let outcome = match ending {
+                        Some(Ending::As(outcome)) => Some(outcome),
+                        _ => None,
+                    };
+                    self.record_call_as(&stage, outcome, cx);
+                }
             }
             // A card minimised for that call must not swallow the next ring.
             self.call_card.call_ended();

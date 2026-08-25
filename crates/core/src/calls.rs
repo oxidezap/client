@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
-use super::system_notice::format_duration;
+use super::system_notice::{CallOutcome, format_duration};
 
 /// A call that is connected and running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,20 +186,36 @@ pub enum Admission {
 pub struct CallState {
     stage: Option<Stage>,
     waiting: Option<WaitingCall>,
-    /// The last call this device has nothing truthful to write down about.
+    /// What to write down for the call that has just left this state.
     ///
-    /// Two things end that way: another of the account's devices took it —
-    /// answered there or refused there — and a call the daemon would not
-    /// place because one was already up, which a window had already drawn
-    /// optimistically before it asked.
+    /// A front end learns a call is over by watching the stage disappear, and
+    /// writes the conversation's record from the stage it last held — so
+    /// disappearing is all it can see, and an incoming stage that vanishes
+    /// reads as missed. That is wrong in three ways, and this is the one
+    /// answer for all of them: another of the account's devices took the call
+    /// (nothing to write), the daemon refused to place one a window had
+    /// already drawn (nothing to write), or *someone* declined it — in this
+    /// window or another one — which is a refusal rather than a missed call.
     ///
-    /// Part of the state rather than an event beside it. A front end learns
-    /// a call is over by watching the stage disappear, and it writes the
-    /// conversation's record from the stage it last held; state and news
+    /// `None` inside the pair means write nothing at all; `Some` names the
+    /// outcome to write instead of the derived one.
+    ///
+    /// Part of the state rather than an event beside it. State and news
     /// travel on different channels, so an explanation sent alongside can
     /// arrive after the record it was meant to change. In the same frame as
     /// the removal it cannot.
-    unrecorded: Option<CallId>,
+    ending: Option<(CallId, Option<CallOutcome>)>,
+}
+
+/// What a departing call should be written into the conversation as.
+///
+/// See [`CallState::ending_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// Nothing at all: this device has no truthful record to write.
+    Nothing,
+    /// This, rather than whatever the stage would have implied.
+    As(CallOutcome),
 }
 
 impl CallState {
@@ -510,7 +526,7 @@ impl CallState {
     pub fn end_elsewhere(&mut self, call_id: &CallId) -> bool {
         let ended = self.end(call_id);
         if ended {
-            self.unrecorded = Some(call_id.clone());
+            self.ending = Some((call_id.clone(), None));
         }
         ended
     }
@@ -521,12 +537,33 @@ impl CallState {
     /// the stage it drew is not in this state and never was, so there is
     /// nothing to remove — only something to stop it writing down.
     pub fn mark_unrecorded(&mut self, call_id: &CallId) {
-        self.unrecorded = Some(call_id.clone());
+        self.ending = Some((call_id.clone(), None));
+    }
+
+    /// Say what `call_id` should be written down as, whoever is asking.
+    ///
+    /// For an outcome only the acting side knows: a decline is a refusal, and
+    /// every *other* window sees the same stage disappear and would write it
+    /// down as missed — an unread badge and a "call back" prompt for a call
+    /// its owner had just refused.
+    pub fn mark_ended_as(&mut self, call_id: &CallId, outcome: CallOutcome) {
+        self.ending = Some((call_id.clone(), Some(outcome)));
+    }
+
+    /// What this state says to write down for `call_id`, if it says anything.
+    pub fn ending_for(&self, call_id: &str) -> Option<Ending> {
+        match &self.ending {
+            Some((id, outcome)) if id == call_id => Some(match outcome {
+                Some(outcome) => Ending::As(*outcome),
+                None => Ending::Nothing,
+            }),
+            _ => None,
+        }
     }
 
     /// Whether `call_id` is one this device has no record to write.
     pub fn is_unrecorded(&self, call_id: &str) -> bool {
-        self.unrecorded.as_deref() == Some(call_id)
+        matches!(self.ending_for(call_id), Some(Ending::Nothing))
     }
 
     pub fn end(&mut self, call_id: &CallId) -> bool {
@@ -731,6 +768,28 @@ mod tests {
         missed.set_incoming(incoming("call-2"));
         assert!(missed.end(&"call-2".to_string()));
         assert!(!missed.is_unrecorded("call-2"));
+    }
+
+    /// A decline is an ending only the window that did it knows about. Every
+    /// other one sees the same incoming stage disappear, and without being
+    /// told would write down a missed call — a badge and a "call back" prompt
+    /// for a call its owner had just refused.
+    #[test]
+    fn a_declined_call_says_so_rather_than_reading_as_missed() {
+        let mut state = CallState::new();
+        state.set_incoming(incoming("call-1"));
+
+        assert!(state.end(&"call-1".to_string()));
+        state.mark_ended_as(&"call-1".to_string(), CallOutcome::Declined);
+
+        assert_eq!(
+            state.ending_for("call-1"),
+            Some(Ending::As(CallOutcome::Declined))
+        );
+        // Named, so it is written down — just not as what the stage implied.
+        assert!(!state.is_unrecorded("call-1"));
+        // And it says nothing about any other call.
+        assert_eq!(state.ending_for("call-2"), None);
     }
 
     fn incoming(id: &str) -> IncomingCall {

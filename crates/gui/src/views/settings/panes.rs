@@ -307,8 +307,8 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
                             .label("Clear data and pair again")
                             .danger()
                             .outline()
-                            .on_click(move |_, _window, cx| {
-                                entity.update(cx, |app, cx| app.reset_and_pair_again(cx));
+                            .on_click(move |_, window, cx| {
+                                entity.update(cx, |app, cx| app.reset_and_pair_again(window, cx));
                             }),
                     ),
                 ),

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use oxidezap_core::{Chat, ChatMessage, MediaContent, UiEvent};
+use oxidezap_core::{CallOutcome, Chat, ChatMessage, MediaContent, UiEvent};
 use oxidezap_ipc::{
     CallAction, ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview,
     PairingCode, RequestId,
@@ -206,9 +206,18 @@ pub async fn run(
     // drops the tokio runtime it owns, which tokio refuses inside an async
     // context ("Cannot drop a runtime in a context where blocking is not
     // allowed").
-    if let Err(e) = tokio::task::spawn_blocking(move || close(client)).await {
-        log::error!("session teardown did not complete: {e}");
-    }
+    let grace = if bridge.forget {
+        FORGET_GRACE
+    } else {
+        SHUTDOWN_GRACE
+    };
+    let closed = match tokio::task::spawn_blocking(move || close(client, grace)).await {
+        Ok(closed) => closed,
+        Err(e) => {
+            log::error!("session teardown did not complete: {e}");
+            false
+        }
+    };
 
     // Before anything is deleted, and on a blocking thread because joining
     // one is: the publisher writes this account's media, and a wipe that
@@ -223,7 +232,19 @@ pub async fn run(
     // After the teardown, never before: the store is one file and the session
     // was holding it open. Unlinking it first leaves the closing session free
     // to write a fresh WAL beside a database that is already gone.
-    if bridge.forget {
+    // And only once it *has* torn down. Giving up waiting is not the same as
+    // being finished: a session still closing can write a fresh WAL beside a
+    // database that has just been unlinked, and the store is one file — a
+    // partial wipe orphans everything behind the new device. Refusing to
+    // delete leaves the old account intact, which is a state the user can act
+    // on again; racing leaves one nobody can.
+    if bridge.forget && !closed {
+        log::error!(
+            "local state was NOT wiped: the session is still closing, and deleting the store \
+             from under it would leave a partial wipe. Start oxidezap again and repeat \
+             \"clear data and pair again\"."
+        );
+    } else if bridge.forget {
         match oxidezap_session::wipe_local_state() {
             Ok(()) => log::info!("local state wiped; pair again on the next start"),
             Err(e) => log::error!("could not wipe local state: {e}"),
@@ -244,12 +265,26 @@ pub async fn run(
 /// not die has to be killed, which is worse than one that gave up waiting.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long to wait when the store is about to be deleted.
+///
+/// Longer than the ordinary grace, because a wipe is only safe once the
+/// session has actually let go of SQLite. Still bounded — a daemon that will
+/// not die has to be killed — but here the answer to running out of patience
+/// is to skip the wipe rather than to race it.
+const FORGET_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Stop the session and wait for its thread, so the socket is closed and
 /// SQLite is flushed before the process goes away.
-pub fn close(mut client: WhatsAppClient) {
-    if !client.shutdown_and_join(SHUTDOWN_GRACE) {
-        log::warn!("session did not finish closing within {SHUTDOWN_GRACE:?}");
+///
+/// Returns whether it actually finished. On the ordinary path that answer is
+/// only worth logging; on the forget path it decides whether anything may be
+/// deleted at all.
+pub fn close(mut client: WhatsAppClient, grace: std::time::Duration) -> bool {
+    let closed = client.shutdown_and_join(grace);
+    if !closed {
+        log::warn!("session did not finish closing within {grace:?}");
     }
+    closed
 }
 
 /// Everything the event loop carries between one event and the next.
@@ -453,6 +488,16 @@ impl Bridge {
         // sees.
         let connection = self.hub.connection();
         if action.needs_network() && !connection.is_connected() {
+            // The same un-drawing the server does one layer up, because this
+            // check exists for the window between the two: a call the asking
+            // window has already drawn must not be left to disappear on the
+            // next snapshot, which is what a front end writes down as an
+            // attempt nobody answered.
+            if let Action::Call(CallAction::Start { placeholder_id, .. }) = &action {
+                self.hub
+                    .calls(|calls| calls.mark_unrecorded(placeholder_id));
+                self.hub.republish_calls();
+            }
             return CommandOutcome::NoSession(format!("not connected: {connection:?}"));
         }
 
@@ -592,9 +637,16 @@ impl Bridge {
                         });
                         client.accept_call(&call_id);
                     }
+                    // A decline is the one ending only the declining side
+                    // knows about. Every other window watches the same stage
+                    // disappear and, with nothing said, writes it down as
+                    // missed — an unread badge and a "call back" prompt for a
+                    // call its owner had just refused. Said in the state
+                    // frame, so it cannot arrive after the record it prevents.
                     CallAction::Decline { call_id } => {
                         self.hub.calls(|calls| {
                             calls.end(&call_id);
+                            calls.mark_ended_as(&call_id, CallOutcome::Declined);
                         });
                         client.decline_call(&call_id);
                     }

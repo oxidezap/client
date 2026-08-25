@@ -80,6 +80,12 @@ enum Awaiting {
     Send {
         chat_jid: String,
         local_id: String,
+        /// A recording staged in the media cache for this request, if there
+        /// is one. `media::take` is what normally removes it — and that only
+        /// runs if the daemon actually acts on the request, so a send that
+        /// never got that far would leave the file behind and every retry
+        /// would stage another.
+        staged: Option<std::path::PathBuf>,
     },
 }
 
@@ -107,7 +113,18 @@ impl Awaiting {
                 log::debug!("storage query failed: {detail}");
                 drop(tx);
             }
-            Self::Send { chat_jid, local_id } => {
+            Self::Send {
+                chat_jid,
+                local_id,
+                staged,
+            } => {
+                // Nothing will ever read these bytes: the request they were
+                // staged for is not going to run. Best-effort, and silent on
+                // a file that is already gone — the daemon may have taken it
+                // and failed afterwards.
+                if let Some(path) = staged {
+                    let _ = std::fs::remove_file(path);
+                }
                 // The message is already drawn; without this it stays pending
                 // forever.
                 if let Some(events) = events {
@@ -247,7 +264,16 @@ impl Session {
                     // `blocking_send`, so a full queue would park the only
                     // thread that could empty it — the window stops rather
                     // than saying the message did not go.
-                    Awaiting::Send { chat_jid, local_id } => {
+                    Awaiting::Send {
+                        chat_jid,
+                        local_id,
+                        staged,
+                    } => {
+                        // Same reason as in `failed`: this request is not
+                        // going to run, so its staged recording is dead.
+                        if let Some(path) = staged {
+                            let _ = std::fs::remove_file(path);
+                        }
                         self.report_send_failed(&chat_jid, &local_id, detail);
                     }
                     waiting => waiting.failed(&detail, None),
@@ -274,6 +300,7 @@ impl Session {
             Awaiting::Send {
                 chat_jid: jid.to_string(),
                 local_id,
+                staged: None,
             },
         );
     }
@@ -325,6 +352,7 @@ impl Session {
             Awaiting::Send {
                 chat_jid: jid.to_string(),
                 local_id,
+                staged: Some(path),
             },
         );
     }

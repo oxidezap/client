@@ -22,7 +22,7 @@ mod system_notice;
 
 pub use app_state::{AppState, CachedQrCode, Issued, Lifetime};
 pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
-pub use calls::{ActiveCall, Admission, CallState, Stage, WaitingCall};
+pub use calls::{ActiveCall, Admission, CallState, Ending, Stage, WaitingCall};
 pub use chat::STATUS_BROADCAST_JID;
 pub use chat::fallback_chat_name;
 pub use chat::{Chat, ChatMessage, DownloadableMedia, MediaContent, MediaType, Resend};

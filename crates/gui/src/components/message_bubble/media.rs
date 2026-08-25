@@ -691,7 +691,12 @@ fn render_video_player(
                         .icon(
                             Icon::default()
                                 .path("icons/pause.svg")
-                                .text_color(gpui::rgba(0xFFFFFF66))
+                                // The same ink as the controls it replaces:
+                                // this one sits over a *playing* frame rather
+                                // than the wash, which is exactly when a
+                                // fixed white is a guess about someone else's
+                                // video.
+                                .text_color(on_scrim.opacity(0.6))
                                 .size(px(24.)),
                         )
                         .ghost()
