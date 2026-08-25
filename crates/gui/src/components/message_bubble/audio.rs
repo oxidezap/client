@@ -163,6 +163,7 @@ fn render_waveform(
         .id(id)
         .relative()
         .flex_1()
+        .min_w_0()
         .h(height)
         .flex()
         .items_center()

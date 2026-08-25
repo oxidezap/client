@@ -2,6 +2,8 @@
 
 use gpui::{App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::*};
 use gpui_component::ActiveTheme as _;
+use gpui_component::Selectable as _;
+use gpui_component::button::{Button, ButtonVariants as _};
 
 use crate::app::{ChatFilter, WhatsAppApp};
 use crate::theme::Metrics;
@@ -42,8 +44,14 @@ fn render_chip(
 ) -> impl IntoElement + use<> {
     let primary = cx.theme().primary;
 
-    div()
-        .id(SharedString::from(format!("filter-{}", filter.id())))
+    // A `Button`, styled as the design's pill. Narrowing the conversation list
+    // is a command, and this row is the only route to it — as a `div` it had
+    // no focus handle and no keyboard activation, so the filter existed only
+    // for a pointer. `Styled` and `ParentElement` are both implemented on
+    // `Button`, so the shape survives the change.
+    Button::new(SharedString::from(format!("filter-{}", filter.id())))
+        .ghost()
+        .selected(is_selected)
         .h(metrics.filter_chip_height())
         .px(metrics.space_lg())
         .rounded_full()
@@ -52,7 +60,6 @@ fn render_chip(
         .items_center()
         .gap(metrics.space_sm())
         .flex_shrink_0()
-        .cursor_pointer()
         .text_size(metrics.text_small())
         // Selection is a fill plus a border plus the ink, because one step of
         // lightness on a dark palette is not a state.
@@ -63,10 +70,8 @@ fn render_chip(
                     .text_color(primary)
                     .font_weight(gpui::FontWeight::MEDIUM)
             } else {
-                let hover = cx.theme().list_hover;
                 el.border_color(cx.theme().border)
                     .text_color(cx.theme().muted_foreground)
-                    .hover(move |s| s.bg(hover))
             }
         })
         .child(filter.label())

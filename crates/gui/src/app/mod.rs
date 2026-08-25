@@ -1550,8 +1550,9 @@ impl WhatsAppApp {
             self.name_cache.insert(message.sender.clone(), name.clone());
         }
 
-        // For group chats, set sender_name on the message for display
-        if is_group && !message.is_from_me {
+        // For group chats — and the status broadcast, which is likewise a
+        // stream of other people's rows — set sender_name for display.
+        if (is_group || is_status) && !message.is_from_me {
             message.sender_name = sender_name
                 .clone()
                 .or_else(|| self.name_cache.get(&message.sender).cloned());

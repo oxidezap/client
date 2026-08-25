@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
-use crate::chat::{Chat, ChatMessage};
+use wacore_binary::jid::Jid;
+
+use crate::chat::{Chat, ChatMessage, fallback_chat_name};
 
 /// One contact's run of updates, newest run first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,13 +184,15 @@ fn author_name(message: &ChatMessage, chat: &Chat) -> String {
     {
         return name.clone();
     }
+    // Whatever is left, through the same fallback every other unnamed JID in
+    // the app goes through. Prefixing the user part with "+" was wrong for the
+    // common case here: a status arrives from a LID, which is not a phone
+    // number, and printing it as one invents a number nobody can dial.
     message
         .sender
-        .split('@')
-        .next()
-        .filter(|user| !user.is_empty())
-        .map(|user| format!("+{user}"))
-        .unwrap_or_else(|| "Unknown contact".to_string())
+        .parse::<Jid>()
+        .map(|jid| fallback_chat_name(&jid))
+        .unwrap_or_else(|_| "Unknown contact".to_string())
 }
 
 #[cfg(test)]
@@ -280,6 +284,16 @@ mod tests {
             true,
         )]));
         assert_eq!(feed.authors()[0].name, "+5511999999999");
+
+        // A LID is not a phone number and must not be printed as one.
+        let lid = StatusFeed::from_chat(&broadcast(vec![update(
+            "2",
+            "39492358562039@lid",
+            None,
+            1,
+            true,
+        )]));
+        assert_eq!(lid.authors()[0].name, "Unknown contact");
     }
 
     #[test]

@@ -92,6 +92,16 @@ impl SettingsState {
     pub fn config_path(&self) -> Option<std::path::PathBuf> {
         config::config_path()
     }
+
+    /// What Save would write, as text.
+    ///
+    /// The pane named the file and stopped there, which left no way to see
+    /// what a preset actually *is* — or to check what an edit did — without
+    /// leaving the app to open the file. This is the same serialization the
+    /// writer uses, so what is shown is what would land.
+    pub fn draft_json(&self) -> String {
+        config::preview(&self.draft)
+    }
 }
 
 #[cfg(test)]

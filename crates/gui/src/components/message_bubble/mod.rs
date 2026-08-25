@@ -173,6 +173,10 @@ pub fn render_message_bubble(
                     div()
                         .id(bubble_id)
                         .max_w(layout.max_bubble_width())
+                        // The guarantee, not the fix: whatever a child does
+                        // with an unbreakable token, a URL, or a caption, it
+                        // is painted inside the bubble or not at all.
+                        .overflow_hidden()
                         .px(metrics.bubble_padding_x())
                         .py(metrics.bubble_padding_y())
                         // Asymmetric corners: the tight one marks the side the
@@ -232,6 +236,19 @@ pub fn render_message_bubble(
                                             el.child(
                                                 div()
                                                     .flex_1()
+                                                    // A flex item's minimum is
+                                                    // its *min-content* width
+                                                    // unless told otherwise,
+                                                    // and for one unbroken
+                                                    // 60-character word that
+                                                    // is the whole word. The
+                                                    // bubble's max width then
+                                                    // clamped the box while
+                                                    // the text kept drawing
+                                                    // past it, across the
+                                                    // conversation and out of
+                                                    // the window.
+                                                    .min_w_0()
                                                     .text_size(metrics.text_body())
                                                     .text_color(cx.theme().foreground)
                                                     .child(content),

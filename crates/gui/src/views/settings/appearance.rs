@@ -6,7 +6,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
+use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
 
 use crate::app::{SettingsState, WhatsAppApp};
 use crate::theme::config::{MAX_FONT_SIZE, MIN_FONT_SIZE};
@@ -81,24 +81,26 @@ fn render_preset_card(
 ) -> impl IntoElement + use<> {
     let palette = preset.palette();
 
-    div()
-        .id(SharedString::from(format!("preset-{}", preset.id())))
+    // A card, but a command: choosing a preset applies it. As a `div` these
+    // were the one settings control a keyboard could not reach, which is a
+    // poor showing for the accessibility pane's neighbour.
+    Button::new(SharedString::from(format!("preset-{}", preset.id())))
+        .ghost()
+        .selected(is_selected)
         .w(metrics.call_card_width() * 0.45)
+        .h_auto()
         .flex()
         .flex_col()
         .gap(metrics.space_md())
         .p(metrics.space_md())
         .rounded(metrics.radius_lg())
         .border_1()
-        .cursor_pointer()
         .map(|el| {
             if is_selected {
                 el.border_color(cx.theme().primary)
                     .bg(cx.theme().list_active)
             } else {
-                let hover = cx.theme().list_hover;
                 el.border_color(cx.theme().border)
-                    .hover(move |s| s.bg(hover))
             }
         })
         .child(render_swatch(&palette, metrics, cx))
@@ -403,6 +405,24 @@ fn render_theme_file(
                     .text_size(metrics.text_meta())
                     .text_color(cx.theme().muted_foreground)
                     .child(path),
+            )
+            // What Save would put in that file. Read-only on purpose: this
+            // pane's controls are the way to change it, and a text field
+            // would be a second, worse editor of the same thing.
+            .child(
+                div()
+                    .id("theme-json")
+                    .max_h(metrics.reading_width() / 2.0)
+                    .overflow_y_scroll()
+                    .p(metrics.space_lg())
+                    .rounded(metrics.radius_md())
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(metrics.text_micro())
+                    .text_color(cx.theme().muted_foreground)
+                    .child(settings.draft_json()),
             )
             // Only when there is something to say. The file is usually fine,
             // and an empty "no problems" panel is noise.

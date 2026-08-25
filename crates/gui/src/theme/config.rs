@@ -304,6 +304,16 @@ pub fn save_to(path: &Path, settings: &ThemeSettings) -> std::io::Result<()> {
     std::fs::write(path, json)
 }
 
+/// The theme as it would be written, for showing rather than saving.
+///
+/// Shares [`save_to`]'s serialization deliberately: a preview built any other
+/// way is a second thing to keep in step, and the whole point of showing it is
+/// that it is the truth.
+pub fn preview(settings: &ThemeSettings) -> String {
+    serde_json::to_string_pretty(&settings.to_file())
+        .unwrap_or_else(|err| format!("// this theme cannot be written: {err}"))
+}
+
 /// The file's last-modified time, used to notice an edit made outside the app.
 pub fn modified_at(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path)

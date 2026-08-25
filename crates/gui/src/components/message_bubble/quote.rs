@@ -1,10 +1,8 @@
 //! The quote bar inside a reply.
 
-use gpui::{
-    App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div,
-};
+use gpui::{App, Entity, IntoElement, ParentElement, SharedString, Styled, div};
 use gpui_component::ActiveTheme as _;
+use gpui_component::button::{Button, ButtonVariants as _};
 use oxidezap_core::QuotedMessage;
 
 use crate::app::WhatsAppApp;
@@ -30,14 +28,18 @@ pub fn render_quote(
     };
     let summary: SharedString = quoted.summary().to_string().into();
 
-    div()
-        .id(SharedString::from(format!("quote-{target}")))
+    // Jumping to the original is a command, so it is a `Button` — that is
+    // what carries focus and keyboard activation. Styled flat and full width,
+    // because inside a bubble it has to read as the quote it is, not as a
+    // control sitting on top of one.
+    Button::new(SharedString::from(format!("quote-{target}")))
+        .ghost()
+        .w_full()
+        .h_auto()
         .flex()
         .gap(metrics.space_md())
         .py(metrics.space_xxs())
         .rounded(metrics.radius_sm())
-        .cursor_pointer()
-        .hover(|s| s.opacity(0.8))
         .child(
             div()
                 .w(metrics.selection_bar_width())

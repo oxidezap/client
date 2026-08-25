@@ -1924,7 +1924,9 @@ impl WhatsAppClient {
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
                 Self::hydrate_reactions(chat_store, &entry.jid, &mut msgs).await;
-                if existing.is_group {
+                // Groups *and* the status broadcast: both carry rows written
+                // by many people, and a hydrated row has no push name on it.
+                if existing.is_group || existing.is_status {
                     Self::hydrate_sender_names(chat_store, client, &mut msgs, &mut sender_names)
                         .await;
                 }
@@ -1960,7 +1962,7 @@ impl WhatsAppClient {
             page.reverse(); // store returns newest-first; the UI renders oldest-first
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_reactions(chat_store, &entry.jid, &mut chat.messages).await;
-            if chat.is_group {
+            if chat.is_group || chat.is_status {
                 Self::hydrate_sender_names(
                     chat_store,
                     client,

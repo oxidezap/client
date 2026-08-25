@@ -125,7 +125,10 @@ pub fn active_audio(
                             // seconds tick.
                             div()
                                 .font_family(cx.theme().mono_font_family.clone())
-                                .text_size(metrics.text_meta())
+                                // The number the person on a call is actually
+                                // looking for, so it is not set at the size of
+                                // a timestamp.
+                                .text_size(metrics.text_strong())
                                 .text_color(cx.theme().primary)
                                 .child(call.elapsed_label()),
                         ),
@@ -145,7 +148,7 @@ pub fn active_audio(
                         })
                         .child(mic_state(call.muted, metrics, cx)),
                 )
-                .child(controls(call, entity, metrics)),
+                .child(controls(call, entity, metrics, cx)),
         )
 }
 
@@ -186,6 +189,7 @@ fn controls(
     call: &ActiveCall,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
+    cx: &App,
 ) -> impl IntoElement + use<> {
     let mute_entity = entity.clone();
     let end_entity = entity;
@@ -203,10 +207,13 @@ fn controls(
     div()
         .w_full()
         .flex()
-        .items_center()
+        .items_start()
         .justify_center()
         .gap(metrics.space_lg())
-        .child(
+        .child(labelled(
+            if muted { "Unmute" } else { "Mute" },
+            metrics,
+            cx,
             round(
                 "call-mute",
                 if muted {
@@ -222,39 +229,77 @@ fn controls(
             .on_click(move |_, _window, cx| {
                 mute_entity.update(cx, |app, cx| app.toggle_call_muted(cx));
             }),
-        )
+        ))
         // Drawn and disabled: the shape of a call should not change the day
         // these land, and a tooltip explains the state rather than leaving a
         // dead button to be discovered.
-        .child(
+        .child(labelled(
+            "Output",
+            metrics,
+            cx,
             round(
                 "call-audio-device",
                 ProductIcon::Volume.into(),
                 "Choosing an output device is not supported yet",
             )
             .disabled(true),
-        )
-        .child(
+        ))
+        .child(labelled(
+            "Video",
+            metrics,
+            cx,
             round(
                 "call-video",
                 ProductIcon::Video.into(),
                 "Video calls are not supported yet",
             )
             .disabled(true),
-        )
-        .child(
+        ))
+        .child(labelled(
+            "Add",
+            metrics,
+            cx,
             round(
                 "call-add",
                 ProductIcon::UserPlus.into(),
                 "Group calls are not supported yet",
             )
             .disabled(true),
-        )
-        .child(
+        ))
+        .child(labelled(
+            "End",
+            metrics,
+            cx,
             round("call-end", ProductIcon::PhoneOff.into(), "End call")
                 .danger()
                 .on_click(move |_, _window, cx| {
                     end_entity.update(cx, |app, cx| app.hang_up(cx));
                 }),
+        ))
+}
+
+/// A control with its name under it.
+///
+/// Five identical circles told apart only by a glyph and a tooltip is a
+/// guessing game, and in a call nobody wants to hover four buttons to find the
+/// one that mutes. The label is what makes the row readable at a glance —
+/// small and quiet, so it names the control without competing with it.
+fn labelled<C: IntoElement>(
+    label: &'static str,
+    metrics: Metrics,
+    cx: &App,
+    control: C,
+) -> impl IntoElement + use<C> {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(metrics.space_xxs())
+        .child(control)
+        .child(
+            div()
+                .text_size(metrics.text_micro())
+                .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+                .child(label),
         )
 }
