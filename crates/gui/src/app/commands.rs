@@ -370,8 +370,12 @@ impl WhatsAppApp {
         match crate::theme::config::save(&settings.draft) {
             Ok(path) => {
                 info!("Wrote theme to {}", path.display());
-                settings.original = settings.draft.clone();
+                // Cleared *before* the copy, or `original` keeps the warnings
+                // the save just made untrue: reverting in the same session, or
+                // closing and reopening Settings, resurrected complaints about
+                // a file that is now valid.
                 settings.draft.problems.clear();
+                settings.original = settings.draft.clone();
             }
             Err(err) => {
                 error!("Could not write theme.json: {err}");

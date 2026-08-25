@@ -720,6 +720,7 @@ async fn handle_request(
             duration_secs,
             waveform,
             local_id,
+            quoted,
         } => acted(
             dispatch(
                 hub,
@@ -730,6 +731,7 @@ async fn handle_request(
                     duration_secs,
                     waveform,
                     local_id,
+                    quoted,
                 },
             )
             .await,

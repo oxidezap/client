@@ -43,6 +43,7 @@ pub enum Action {
         duration_secs: u32,
         waveform: Vec<u8>,
         local_id: Option<String>,
+        quoted: Option<oxidezap_core::QuotedMessage>,
     },
     MarkRead {
         jid: String,
@@ -447,6 +448,7 @@ impl Bridge {
                 duration_secs,
                 waveform,
                 local_id,
+                quoted,
             } => {
                 // Through the cache, not the socket: a voice note is the one
                 // thing a client sends that is too big for a frame. Taken
@@ -469,6 +471,7 @@ impl Bridge {
                         duration_secs,
                         waveform,
                         local_id.unwrap_or_else(next_local_id),
+                        quoted,
                     )],
                 );
                 CommandOutcome::Accepted

@@ -988,6 +988,12 @@ impl WhatsAppClient {
 
             // Only return if we have either thumbnail or downloadable info
             if !thumbnail_data.is_empty() || downloadable.is_some() {
+                // A video's `data` is never the video: these are the JPEG
+                // bytes of its poster frame, which is what the mime type
+                // beside them already says. Calling them the full media wrote
+                // a thumbnail under the full-video cache key, and every later
+                // read of that key handed back a still.
+                let data_is_preview = !thumbnail_data.is_empty();
                 return Some(MediaContent {
                     media_type: MediaType::Video,
                     data: Arc::new(thumbnail_data),
@@ -1000,7 +1006,7 @@ impl WhatsAppClient {
                     downloadable,
                     is_animated: false,
                     duration_secs: video.seconds,
-                    data_is_preview: false,
+                    data_is_preview,
                     waveform: None,
                 });
             }
@@ -1225,6 +1231,7 @@ impl WhatsAppClient {
         duration_secs: u32,
         waveform: Vec<u8>,
         local_id: String,
+        quoted: Option<oxidezap_core::QuotedMessage>,
     ) -> tokio::task::JoinHandle<()> {
         let chat_store = self.chat_store.clone();
         let ui_sender = self.ui_sender.clone();
@@ -1277,9 +1284,25 @@ impl WhatsAppClient {
                     ..Default::default()
                 };
 
-                let message = wa::Message {
-                    audio_message: whatsapp_rust::buffa::MessageField::some(audio_message),
-                    ..Default::default()
+                // Quoted the same way the text path does it, because a voice
+                // note answering a message is a reply — the recipient should
+                // see the quote bar over it, not a bare note.
+                let message = match &quoted {
+                    Some(quoted) => wa::Message {
+                        audio_message: whatsapp_rust::buffa::MessageField::some(
+                            wa::message::AudioMessage {
+                                context_info: whatsapp_rust::buffa::MessageField::some(
+                                    quote_context(quoted),
+                                ),
+                                ..audio_message
+                            },
+                        ),
+                        ..Default::default()
+                    },
+                    None => wa::Message {
+                        audio_message: whatsapp_rust::buffa::MessageField::some(audio_message),
+                        ..Default::default()
+                    },
                 };
 
                 // Same ordering as the text path: record before sending so
@@ -2204,6 +2227,8 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
         if thumbnail.is_empty() && downloadable.is_none() {
             return None;
         }
+        // The same as the live path: a poster frame, not the video.
+        let data_is_preview = !thumbnail.is_empty();
         return Some(MediaContent {
             media_type: MediaType::Video,
             data: Arc::new(thumbnail),
@@ -2216,7 +2241,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             downloadable,
             is_animated: false,
             duration_secs: video.seconds,
-            data_is_preview: false,
+            data_is_preview,
             waveform: None,
         });
     }

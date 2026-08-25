@@ -168,11 +168,21 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// The foreground that reads on `surface`, chosen by contrast rather than
-    /// assumed — a light preset needs dark ink on `primary` where a dark one
-    /// needs the reverse.
+    /// The foreground that reads on `surface`, chosen by *measuring* both
+    /// candidates rather than by guessing from the surface alone.
+    ///
+    /// A single luminance threshold assumes the two inks sit either side of
+    /// it, and in the light preset they do not: `foreground` is a dark navy
+    /// and `primary` is a mid-tone green, so a surface below the threshold
+    /// picked the ink it shared a luminance with — about 1.8:1, which is not
+    /// text. Comparing the two is the same amount of arithmetic and cannot be
+    /// wrong for a palette nobody has checked by hand.
     pub fn on(&self, surface: Rgb) -> Rgb {
-        if surface.luminance() > 0.4 {
+        let against = |ink: Rgb| {
+            let (a, b) = (ink.luminance(), surface.luminance());
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        if against(self.background) >= against(self.foreground) {
             self.background
         } else {
             self.foreground
@@ -380,6 +390,39 @@ mod tests {
     fn contrast(a: Rgb, b: Rgb) -> f32 {
         let (x, y) = (a.luminance(), b.luminance());
         (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// `on` picks the ink that actually reads, in every preset and on every
+    /// surface it is asked about. A threshold on the surface alone put the
+    /// light preset's dark navy on its mid-tone green at about 1.8:1.
+    #[test]
+    fn the_chosen_ink_is_always_the_higher_contrast_one() {
+        for preset in Preset::ALL {
+            let p = preset.palette();
+            for (surface_name, surface) in [
+                ("primary", p.primary),
+                ("background", p.background),
+                ("elevated", p.elevated),
+                ("secondary", p.secondary),
+                ("danger", p.danger),
+                ("warning", p.warning),
+                ("success", p.success),
+            ] {
+                let chosen = p.on(surface);
+                let other = if chosen == p.background {
+                    p.foreground
+                } else {
+                    p.background
+                };
+                assert!(
+                    contrast(chosen, surface) >= contrast(other, surface),
+                    "{}: on {surface_name} it picked the worse ink ({:.2}:1 over {:.2}:1)",
+                    preset.id(),
+                    contrast(chosen, surface),
+                    contrast(other, surface),
+                );
+            }
+        }
     }
 
     /// Every ink, on every surface it can land on, in every preset.

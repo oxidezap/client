@@ -196,6 +196,17 @@ impl WhatsAppApp {
             return;
         };
         let local_id = Self::next_local_id("local_audio");
+        // Taken, not read. Recording is a way of answering, so an open reply
+        // draft belongs to *this* send — and leaving it armed made it attach
+        // itself to whatever was typed next, which is the half of the bug
+        // nobody would connect to having pressed the microphone.
+        let quoted = self.reply_to.take().map(|draft| QuotedMessage {
+            message_id: draft.message_id,
+            sender: draft.sender,
+            sender_name: draft.sender_name,
+            preview: draft.preview,
+            kind: None,
+        });
         // Shared with the bubble below rather than moved: our own voice note
         // should draw the same shape the recipient sees, not a flat bar.
         let envelope = Arc::new(waveform.clone());
@@ -205,9 +216,10 @@ impl WhatsAppApp {
             duration_secs,
             waveform,
             local_id.clone(),
+            quoted.clone(),
         );
 
-        let msg = ChatMessage::new_outgoing_with_media(
+        let mut msg = ChatMessage::new_outgoing_with_media(
             local_id,
             String::new(),
             MediaContent {
@@ -227,8 +239,16 @@ impl WhatsAppApp {
             },
         );
 
+        // The bubble shows the quote too, or the sender sees a bare note
+        // where the recipient sees a reply.
+        msg.quoted = quoted;
+
         if self.add_message_to_chat(&jid, msg) {
             self.scroll_to_last_message();
+        }
+        // The draft is gone from the input as well as from the model.
+        if let Some(input) = &self.input_area {
+            input.update(cx, |view, cx| view.set_reply(None, cx));
         }
         self.recording_state = RecordingState::Idle;
         self.update_input_recording(cx);

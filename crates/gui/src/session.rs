@@ -132,6 +132,13 @@ pub struct Session {
     writer: Mutex<Endpoint>,
     pending: Pending,
     next_id: AtomicU64,
+    /// The same channel the reader publishes on.
+    ///
+    /// A send can fail on *this* side — the socket is gone, or the recording
+    /// could not be staged in the media cache — and the front end has already
+    /// drawn the message. Without a way to say so from here those failures had
+    /// nowhere to go, and the bubble sat pending for good with no retry.
+    events: mpsc::Sender<FromDaemon>,
 }
 
 impl Session {
@@ -143,11 +150,13 @@ impl Session {
     pub fn connect() -> std::io::Result<(Self, mpsc::Receiver<FromDaemon>)> {
         let stream = connect_or_start()?;
         let reader = stream.try_clone()?;
+        let (events, rx) = mpsc::channel(EVENT_QUEUE);
 
         let session = Self {
             writer: Mutex::new(stream),
             pending: Pending::default(),
             next_id: AtomicU64::new(1),
+            events: events.clone(),
         };
         // Before the reader starts, because the daemon serves nothing until it
         // has one and answers it with the history this connection asked for.
@@ -156,13 +165,29 @@ impl Session {
             session_events: true,
         })?;
 
-        let (events, rx) = mpsc::channel(EVENT_QUEUE);
         let pending = Arc::clone(&session.pending);
         std::thread::Builder::new()
             .name("oxidezap-ipc".to_string())
             .spawn(move || read_frames(reader, &events, &pending))?;
 
         Ok((session, rx))
+    }
+
+    /// Report a send that failed before it ever left this process.
+    ///
+    /// The message is already on screen, so something has to move it off
+    /// `Pending`. `try_send` rather than a blocking one: this runs on the GPUI
+    /// executor, where blocking on a tokio channel is not allowed, and a queue
+    /// that full has bigger problems than one lost failure.
+    fn report_send_failed(&self, chat_jid: &str, local_id: &str, reason: String) {
+        error!("send failed before it left: {reason}");
+        let _ = self
+            .events
+            .try_send(FromDaemon::Session(Box::new(UiEvent::SendFailed {
+                chat_jid: chat_jid.to_string(),
+                message_id: local_id.to_string(),
+                reason,
+            })));
     }
 
     /// Send a request nobody is waiting on an answer for.
@@ -215,7 +240,10 @@ impl Session {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&id)
             {
-                waiting.failed(&format!("could not reach the daemon: {e}"), None);
+                waiting.failed(
+                    &format!("could not reach the daemon: {e}"),
+                    Some(&self.events),
+                );
             }
         }
         id
@@ -249,20 +277,32 @@ impl Session {
         duration_secs: u32,
         waveform: Vec<u8>,
         local_id: String,
+        quoted: Option<QuotedMessage>,
     ) {
         // Through the media cache: a voice note is the one thing this side
         // sends that does not belong in a frame. The key is the local id,
         // which is already unique per recording.
         let upload = format!("u-{}", sanitize(&local_id));
         let Some(path) = media_path(&upload) else {
-            error!("no media cache to stage the recording in");
+            self.report_send_failed(
+                jid,
+                &local_id,
+                "no media cache to stage the recording".into(),
+            );
             return;
         };
         if let Some(dir) = path.parent()
             && let Err(e) =
                 std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &audio))
         {
-            error!("could not stage the recording: {e}");
+            // The caller draws the bubble either way, and nothing was
+            // registered as pending here — so this is the only chance to say
+            // the recording is not going anywhere.
+            self.report_send_failed(
+                jid,
+                &local_id,
+                format!("could not stage the recording: {e}"),
+            );
             return;
         }
         self.ask(
@@ -272,6 +312,7 @@ impl Session {
                 duration_secs,
                 waveform,
                 local_id: Some(local_id.clone()),
+                quoted,
             },
             Awaiting::Send {
                 chat_jid: jid.to_string(),

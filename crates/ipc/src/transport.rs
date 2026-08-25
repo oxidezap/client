@@ -5,6 +5,10 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 9: `SendAudio` carries what it quotes, the same way `SendText` does.
+/// Recording is a way of answering, and a reply draft open when the
+/// microphone was pressed had nowhere to go.
+///
 /// 8: the account identity carries its LID as well as its phone number. A
 /// chat with your own number can be keyed by either alias, and a client
 /// holding only one of them cannot recognise the other.
@@ -43,7 +47,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

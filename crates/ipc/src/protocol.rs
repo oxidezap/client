@@ -382,6 +382,15 @@ pub enum ClientRequest {
         duration_secs: u32,
         waveform: Vec<u8>,
         local_id: Option<String>,
+        /// The message being replied to, when this is a reply.
+        ///
+        /// The same field [`ClientRequest::SendText`] carries, for the same
+        /// reason: recording is a way of answering, not a different kind of
+        /// message. Without it a reply draft open when the user pressed the
+        /// microphone was silently dropped — and worse, stayed armed and
+        /// attached itself to whatever was typed next.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quoted: Option<QuotedMessage>,
     },
     /// Tell the peer whether we are typing. One request rather than two,
     /// because it is one piece of state with two values.
