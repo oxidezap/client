@@ -2046,7 +2046,7 @@ impl WhatsAppClient {
                 page.reverse();
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
-                Self::hydrate_reactions(chat_store, &entry.jid, &mut msgs).await;
+                Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut msgs).await;
                 // Groups *and* the status broadcast: both carry rows written
                 // by many people, and a hydrated row has no push name on it.
                 if existing.is_group || existing.is_status {
@@ -2093,7 +2093,8 @@ impl WhatsAppClient {
                 .await?;
             page.reverse(); // store returns newest-first; the UI renders oldest-first
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
-            Self::hydrate_reactions(chat_store, &entry.jid, &mut chat.messages).await;
+            Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut chat.messages)
+                .await;
             if chat.is_group || chat.is_status {
                 let is_status = chat.is_status;
                 Self::hydrate_sender_names(
@@ -2160,12 +2161,12 @@ impl WhatsAppClient {
     /// must not abort the whole history load and blank the chat list.
     async fn hydrate_reactions(
         chat_store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        names: &NameBook,
         chat_jid: &Jid,
         msgs: &mut [ChatMessage],
     ) {
         for msg in msgs.iter_mut() {
-            // The store keeps one row per sender (latest wins), matching the
-            // live add_reaction semantics, so a plain rebuild is enough.
             let entries = match chat_store.reactions(chat_jid, &msg.id).await {
                 Ok(entries) => entries,
                 Err(e) => {
@@ -2173,11 +2174,28 @@ impl WhatsAppClient {
                     continue;
                 }
             };
+            // The store keeps one row per sender, and the live path publishes
+            // reactors under their canonical JID — so a row stored under one
+            // alias has to be read back under the same name, or a later
+            // replacement or removal cannot find it and the two aliases stand
+            // as two people. Coalesced here as well as renamed: two rows *are*
+            // two rows in the table, and the answer is the same one the live
+            // path gives, which is that the newest wins. Rows arrive oldest
+            // first, so the last write is it.
+            //
+            // A linear scan rather than a map: a message has a handful of
+            // reactors, and keeping the order they were stored in is what
+            // makes a reloaded row draw them the way the live one did.
+            let mut latest: Vec<(String, String)> = Vec::new();
             for entry in entries {
-                msg.reactions
-                    .entry(entry.emoji)
-                    .or_default()
-                    .push(entry.sender_jid.to_string());
+                let who = names.identity(client, &entry.sender_jid).await;
+                match latest.iter_mut().find(|(jid, _)| *jid == who.canonical_jid) {
+                    Some((_, emoji)) => *emoji = entry.emoji,
+                    None => latest.push((who.canonical_jid.clone(), entry.emoji)),
+                }
+            }
+            for (sender, emoji) in latest {
+                msg.reactions.entry(emoji).or_default().push(sender);
             }
         }
     }

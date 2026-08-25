@@ -12,6 +12,7 @@
 //! bookkeeping, just files whose names say what is in them.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
@@ -241,6 +242,17 @@ impl Wipe {
     }
 }
 
+/// A payload a front end staged for a send that has not run yet.
+///
+/// The one thing under this roof that is not a cache: there is no other copy,
+/// so nothing may drop it to reclaim space. Asked directly rather than through
+/// [`Wipe::Cache`], which is deliberately narrower — it names the two prefixes
+/// a "clear cached media" is entitled to, and the budget sweep has to reclaim
+/// more than that.
+fn is_staged_upload(name: &str) -> bool {
+    name.starts_with("u-")
+}
+
 /// Which cache the writers still in flight think they are writing into.
 ///
 /// A download dispatched before a wipe finishes after it, and the eager cache
@@ -248,6 +260,15 @@ impl Wipe {
 /// so the answer is the same as everywhere else in this codebase: bump a
 /// number and let the writer notice.
 static CACHE_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
+/// Held across a wipe, and across an epoch-checked write.
+///
+/// The epoch alone is only a check-then-act: an eager writer could read a
+/// matching epoch, a wipe could then bump it and delete everything, and the
+/// writer's rename could land afterwards — repopulating a directory the user
+/// had just been told was empty. Nothing else in this module needs the lock,
+/// because nothing else claims to be ordered against a wipe.
+static WIPE_LOCK: Mutex<()> = Mutex::new(());
 
 /// What to hand back to [`put_since`] later.
 pub fn epoch() -> usize {
@@ -262,6 +283,9 @@ pub fn epoch() -> usize {
 /// merely where they are remembered, so refusing it would fail the download
 /// rather than keep the directory tidy.
 pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
+    // Held across the check *and* the write, so a wipe cannot land between
+    // them. See `WIPE_LOCK`.
+    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if CACHE_EPOCH.load(Ordering::SeqCst) != epoch {
         anyhow::bail!("the media cache was cleared while this was being prepared");
     }
@@ -278,6 +302,9 @@ pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
 ///
 /// Best-effort per entry: one unreadable file must not abandon the rest.
 pub fn wipe(scope: Wipe) -> Result<()> {
+    // For the whole wipe, so an epoch-checked write is either wholly before
+    // it — and deleted by it — or wholly after, and kept.
+    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Before the deletions, not after: a writer that reads the epoch between
     // the two would otherwise believe its file survived the wipe that is
     // about to remove it.
@@ -321,6 +348,18 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         if !meta.is_file() {
             continue;
         }
+        // Everything but a staged upload is evictable, which is more than
+        // `Wipe::Cache` names: the `m-` files an older build left behind are
+        // orphans with nothing else to clear them — `message_key` says as much
+        // — and `cache_usage` bills the directory by every file in it, so the
+        // budget has to be enforced over the same set. A staged upload is the
+        // exception because it is the only copy of a voice note somebody is
+        // waiting to have sent, and it never counted toward the budget it
+        // would be dropped for: `put` is what feeds the sweep, and an upload
+        // is written by the front end, not through it.
+        if is_staged_upload(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
         let age = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
         total = total.saturating_add(meta.len());
         files.push((age, meta.len(), entry.path()));
@@ -354,6 +393,20 @@ mod tests {
         assert!(
             !Wipe::Cache.takes("u-local_audio-7"),
             "somebody is still waiting for that to be sent"
+        );
+    }
+
+    /// The budget sweep reclaims more than a "clear cached media" does: the
+    /// orphans of an older build have nothing else to remove them, and they
+    /// are billed to the user by `cache_usage` either way.
+    #[test]
+    fn the_budget_sweep_spares_only_a_staged_upload() {
+        assert!(is_staged_upload("u-local_audio-7"));
+        assert!(!is_staged_upload("f-3EB0ABC"));
+        assert!(!is_staged_upload("d-9f86d081884c7d65"));
+        assert!(
+            !is_staged_upload("m-3EB0ABC"),
+            "an orphan of the build that wrote thumbnails under the message key"
         );
     }
 

@@ -1526,6 +1526,28 @@ impl WhatsAppApp {
         }
     }
 
+    /// Move a chat to where its `last_message_time` belongs, newest first.
+    ///
+    /// [`Self::move_chat_to_top`] is right for live traffic, where whatever
+    /// bumped the chat arrived just now and so is the newest thing the window
+    /// holds. A system notice is not always that: the held ones are replayed
+    /// immediately after a history load, carrying whatever clock they arrived
+    /// with, so one can advance its own conversation and still be older than
+    /// another chat's head. Dropping it at index 0 would stand it above a
+    /// strictly newer row in a list the sidebar draws newest-first.
+    ///
+    /// `None` sorts last, which is where `Reverse(last_message_time)` puts a
+    /// chat with nothing in it.
+    fn reposition_chat_by_time(&mut self, index: usize) {
+        if index >= self.chats.len() {
+            return;
+        }
+        let chat = self.chats.remove(index);
+        let target = slot_newest_first(&self.chats, chat.last_message_time);
+        self.chats.insert(target, chat);
+        // Note: chat cache invalidation is handled by the caller
+    }
+
     /// Get the chat list scroll handle
     pub fn chat_list_scroll(&self) -> &VirtualListScrollHandle {
         &self.chat_list_scroll
@@ -2322,8 +2344,14 @@ impl WhatsAppApp {
     /// A group changed, or something else happened *to* a chat.
     ///
     /// Inserted the way hydrated history is, not the way a message is: no
-    /// unread bump, no preview change. Nobody replies to "Ana changed the
-    /// group name", and a badge for one would be a badge for nothing to read.
+    /// unread bump. Nobody replies to "Ana changed the group name", and a
+    /// badge for one would be a badge for nothing to read.
+    ///
+    /// The sidebar is the exception, and deliberately so: `preview_for` draws
+    /// the last row, so a notice that *is* the last row is already the line
+    /// the list shows. Leaving the head metadata behind then made the row
+    /// disagree with itself — the new text under the previous message's
+    /// clock, still sitting at the previous message's place in the list.
     ///
     /// The row is local to this window's session, like a call record: the
     /// store does not hold group notifications, so there is nothing to
@@ -2336,7 +2364,7 @@ impl WhatsAppApp {
         notice: SystemNotice,
         cx: &mut Context<Self>,
     ) {
-        let Some(chat) = self.find_chat_mut(&chat_jid) else {
+        let Some(index) = self.chats.iter().position(|chat| chat.jid == chat_jid) else {
             // A notification for a chat this window has never loaded — which
             // is the *normal* order for the one that says you were added to a
             // group. Fabricating the chat around it would draw a conversation
@@ -2350,6 +2378,7 @@ impl WhatsAppApp {
                 .push((notice_id, at, notice));
             return;
         };
+        let chat = &mut self.chats[index];
         if chat.messages.iter().any(|message| message.id == notice_id) {
             return;
         }
@@ -2358,6 +2387,12 @@ impl WhatsAppApp {
         message.is_read = true;
         message.system = Some(notice);
         chat.insert_history_message(message);
+        // The head metadata, when this is now the newest thing in the
+        // conversation. Not the unread count: see above.
+        if chat.last_message_time.is_none_or(|last| at > last) {
+            chat.last_message_time = Some(at);
+            self.reposition_chat_by_time(index);
+        }
 
         self.invalidate_message_cache(&chat_jid);
         // And the sidebar, when the notice is now the last thing in the
@@ -2484,6 +2519,9 @@ impl WhatsAppApp {
 
                 let alive = entity.update(cx, |app, cx| {
                     let pairing = matches!(app.app_state, AppState::WaitingForPairing { .. });
+                    if theme_changed {
+                        app.adopt_reloaded_theme(cx);
+                    }
                     if pairing || theme_changed {
                         cx.notify();
                     }
@@ -2592,5 +2630,68 @@ impl Render for WhatsAppApp {
             .flatten();
 
         root.child(body).children(call_overlay)
+    }
+}
+
+/// Where a chat whose head is `at` belongs in a newest-first list that does
+/// not contain it: the first slot whose neighbour is strictly older.
+///
+/// `None` is older than any timestamp, so an empty conversation lands at the
+/// end — the same place `Reverse(last_message_time)` puts it.
+fn slot_newest_first(rest: &[Chat], at: Option<chrono::DateTime<chrono::Utc>>) -> usize {
+    rest.iter()
+        .position(|other| other.last_message_time < at)
+        .unwrap_or(rest.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::from_timestamp(secs, 0)
+    }
+
+    fn chat(jid: &str, secs: Option<i64>) -> Chat {
+        let mut chat = Chat::new(jid.to_string());
+        chat.last_message_time = secs.and_then(at);
+        chat
+    }
+
+    #[test]
+    fn the_newest_head_goes_first() {
+        let rest = [chat("b", Some(30)), chat("c", Some(20))];
+        assert_eq!(slot_newest_first(&rest, at(40)), 0);
+    }
+
+    #[test]
+    fn a_head_older_than_another_chat_stays_under_it() {
+        // The case a plain bump to index 0 got wrong: a held notice replayed
+        // after a history load advances its own conversation and is still
+        // older than the chat above it.
+        let rest = [chat("b", Some(30)), chat("c", Some(10))];
+        assert_eq!(slot_newest_first(&rest, at(20)), 1);
+    }
+
+    #[test]
+    fn the_oldest_head_goes_last() {
+        let rest = [chat("b", Some(30)), chat("c", Some(20))];
+        assert_eq!(slot_newest_first(&rest, at(10)), 2);
+    }
+
+    /// `None` is below every `Some`, and the predicate is strict, so an empty
+    /// conversation clears neither the dated chat nor the empty one already
+    /// sitting there: it goes to the very end. That is the tie rule below,
+    /// applied to two chats that are equally undated.
+    #[test]
+    fn an_empty_conversation_sorts_last_of_all() {
+        let rest = [chat("b", Some(30)), chat("c", None)];
+        assert_eq!(slot_newest_first(&rest, None), 2);
+    }
+
+    #[test]
+    fn an_equal_head_keeps_the_incumbent_above_it() {
+        let rest = [chat("b", Some(30)), chat("c", Some(10))];
+        assert_eq!(slot_newest_first(&rest, at(30)), 1);
     }
 }
