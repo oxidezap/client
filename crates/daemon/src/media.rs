@@ -192,6 +192,28 @@ fn sweep_occasionally(dir: &std::path::Path, written: u64) {
     }
 }
 
+/// What the media cache occupies: bytes, and how many files.
+///
+/// A walk, not a running total: the sweep deletes and the writers add from
+/// several tasks, and a counter kept alongside them would be one more thing to
+/// keep true. The directory holds a few hundred flat files at most, so asking
+/// it is cheap enough to do when a person opens the Storage pane.
+pub fn cache_usage() -> (u64, u64) {
+    let Some(dir) = oxidezap_ipc::media_dir() else {
+        return (0, 0);
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return (0, 0);
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .fold((0, 0), |(bytes, files), meta| {
+            (bytes + meta.len(), files + 1)
+        })
+}
+
 /// Delete every cached file.
 ///
 /// Part of "clear data and pair again", and not optional: the store is one

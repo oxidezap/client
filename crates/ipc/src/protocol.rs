@@ -213,6 +213,16 @@ pub enum DaemonMessage {
         protocol: u32,
         snapshot: StateSnapshot,
     },
+    /// What this account occupies on disk, answering
+    /// [`ClientRequest::StorageUsage`].
+    Storage {
+        id: RequestId,
+        /// The store: the database and its journal files.
+        database_bytes: u64,
+        /// The media cache: photos, video, audio and documents.
+        media_bytes: u64,
+        media_files: u64,
+    },
     /// A change, tagged with the version it produced.
     Update {
         version: StateVersion,
@@ -411,6 +421,19 @@ pub enum ClientRequest {
         jid: String,
         through_message_id: Option<String>,
     },
+    /// Ask what this account is taking up on disk.
+    ///
+    /// Answered with [`DaemonMessage::Storage`] under the request's id. The
+    /// daemon is the only process that opens the store or writes the media
+    /// cache, so it is the only one that can measure either — a front end
+    /// asking the filesystem would be guessing at paths it does not own.
+    StorageUsage,
+    /// Delete the cached media, keeping the store.
+    ///
+    /// Distinct from [`ForgetSession`](Self::ForgetSession): the history stays
+    /// and every message keeps its `downloadable`, so what this costs is a
+    /// re-download of anything looked at again.
+    ClearMediaCache,
     /// Ask the daemon to bring a front end to the foreground, which is what
     /// the tray's "Open" item does.
     ///

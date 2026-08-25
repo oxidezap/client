@@ -790,6 +790,44 @@ async fn handle_request(
             )
             .await,
         ),
+        // Measured here rather than by the client: the daemon is the only
+        // process that opens the store or writes the media cache, so a front
+        // end asking the filesystem would be guessing at paths it does not
+        // own. No session needed — this is two directory reads.
+        ClientRequest::StorageUsage => {
+            // Answered under an id like a download, because the numbers are
+            // the answer rather than an acknowledgement of it.
+            let Some(id) = id else {
+                return Answer::frame(
+                    error_frame(
+                        None,
+                        ProtocolError::Malformed {
+                            detail: "a storage query needs an id to answer under".into(),
+                        },
+                    )
+                    .ok(),
+                );
+            };
+            let (media_bytes, media_files) = crate::media::cache_usage();
+            Answer::frame(
+                serde_json::to_string(&DaemonMessage::Storage {
+                    id,
+                    database_bytes: database_bytes(),
+                    media_bytes,
+                    media_files,
+                })
+                .ok(),
+            )
+        }
+        // The store stays; every message keeps its `downloadable`, so what
+        // this costs is a re-download of whatever is looked at again.
+        ClientRequest::ClearMediaCache => {
+            acted(
+                crate::media::wipe_cache().map_err(|e| ProtocolError::Malformed {
+                    detail: format!("could not clear the media cache: {e}"),
+                }),
+            )
+        }
         // The daemon has no window of its own, so this is relayed rather than
         // acted on: whoever owns a window is the only one that can raise it.
         // Published to every client, including the one that asked, because a
@@ -858,6 +896,17 @@ fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<St
         Ok(()) => serde_json::to_string(&DaemonMessage::Accepted { id }).ok(),
         Err(error) => error_frame(id, error).ok(),
     }
+}
+
+/// The store's footprint: the database plus the journal files SQLite would
+/// replay into it. All three are the same data, so all three are counted.
+fn database_bytes() -> u64 {
+    let base = oxidezap_session::resolve_database_path();
+    ["", "-wal", "-shm"]
+        .iter()
+        .filter_map(|suffix| std::fs::metadata(format!("{base}{suffix}")).ok())
+        .map(|meta| meta.len())
+        .sum()
 }
 
 fn no_session(detail: impl Into<String>) -> ProtocolError {

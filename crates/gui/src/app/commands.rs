@@ -227,6 +227,10 @@ impl WhatsAppApp {
     pub fn open_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.is_none() {
             self.settings = Some(SettingsState::new(cx.product().settings()));
+            // Asked on open rather than on reaching the pane: it is two
+            // directory reads in another process, and a pane that starts on
+            // "measuring…" every time is worse than one that is already right.
+            self.refresh_storage_usage(cx);
             cx.notify();
         }
     }
@@ -236,6 +240,11 @@ impl WhatsAppApp {
             && settings.section != section
         {
             settings.section = section;
+            if section == SettingsSection::Storage {
+                // Re-measured on arrival: a download since the pane was last
+                // open has changed the number it is about to show.
+                self.refresh_storage_usage(cx);
+            }
             cx.notify();
         }
     }

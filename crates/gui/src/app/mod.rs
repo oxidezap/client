@@ -477,6 +477,8 @@ pub struct WhatsAppApp {
     account_jid: Option<String>,
     /// The Settings screen, when it is open. `None` is the conversation view.
     settings: Option<SettingsState>,
+    /// What this account occupies on disk, as the daemon last measured it.
+    storage_usage: Option<crate::session::StorageUsage>,
     /// Which of the sidebar's destinations is on screen.
     destination: Destination,
     /// Whose status updates are open, and which one of them.
@@ -601,6 +603,7 @@ impl WhatsAppApp {
             decoded_images: RefCell::new(IndexMap::new()),
             message_list_cache: RefCell::new(HashMap::new()),
             chat_list_cache: RefCell::new(None),
+            storage_usage: None,
             destination: Destination::default(),
             status_pane: StatusPane::default(),
             status_feed_cache: RefCell::new(None),

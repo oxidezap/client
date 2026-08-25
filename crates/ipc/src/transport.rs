@@ -5,6 +5,11 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 7: `StorageUsage` and `ClearMediaCache`, answered by
+/// `DaemonMessage::Storage`. The daemon is the only process that opens the
+/// store or writes the media cache, so it is the only one that can measure
+/// either.
+///
 /// 6: `DaemonEvent::CallsChanged` publishes the call state to every front
 /// end. The daemon makes some call transitions itself — accepting one brings
 /// the media up in the process that owns the microphone — and a second window
@@ -34,7 +39,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

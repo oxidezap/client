@@ -5,6 +5,10 @@
 //! the wrong shape for it. It opens over the conversation view and Escape
 //! closes it.
 
+use gpui::{Context, WeakEntity};
+
+use crate::app::WhatsAppApp;
+use crate::session::StorageUsage;
 use crate::theme::{ThemeSettings, config};
 
 /// A destination in the settings nav.
@@ -101,6 +105,44 @@ impl SettingsState {
     /// writer uses, so what is shown is what would land.
     pub fn draft_json(&self) -> String {
         config::preview(&self.draft)
+    }
+}
+
+impl WhatsAppApp {
+    /// What the store and the media cache occupy, as last measured.
+    pub fn storage_usage(&self) -> Option<StorageUsage> {
+        self.storage_usage
+    }
+
+    /// Ask the daemon to measure again.
+    ///
+    /// The daemon owns both paths, so it is the only process that can answer;
+    /// this side holds the last answer and shows it while a new one is on the
+    /// way, because a number that blanks every time the pane opens reads as a
+    /// failure.
+    pub fn refresh_storage_usage(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        let waiting = client.storage_usage();
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let Ok(usage) = waiting.await else {
+                return;
+            };
+            let _ = entity.update(cx, |app, cx| {
+                app.storage_usage = Some(usage);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Delete the cached media and re-measure.
+    pub fn clear_media_cache(&mut self, cx: &mut Context<Self>) {
+        if let Some(client) = &self.client {
+            client.clear_media_cache();
+        }
+        self.refresh_storage_usage(cx);
     }
 }
 

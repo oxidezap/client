@@ -35,6 +35,14 @@ use tokio::sync::{mpsc, oneshot};
 /// has; the point is to reach it rather than to hide from it.
 const EVENT_QUEUE: usize = 512;
 
+/// What this account occupies on disk, as the daemon measured it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageUsage {
+    pub database_bytes: u64,
+    pub media_bytes: u64,
+    pub media_files: u64,
+}
+
 /// What the reader hands the front end.
 ///
 /// Wider than `UiEvent`, and deliberately not part of it: the session says
@@ -65,6 +73,8 @@ pub enum FromDaemon {
 /// drew is already able to render.
 enum Awaiting {
     Download(oneshot::Sender<Result<Vec<u8>, String>>),
+    /// What this account occupies on disk, for the Storage pane.
+    Storage(oneshot::Sender<StorageUsage>),
     /// A message drawn before it was sent. On refusal it has to stop being
     /// pending, and the front end is the side that knows which bubble it is.
     Send {
@@ -78,6 +88,7 @@ impl Awaiting {
     fn is_abandoned(&self) -> bool {
         match self {
             Self::Download(tx) => tx.is_closed(),
+            Self::Storage(tx) => tx.is_closed(),
             // A drawn message is never abandoned: the bubble stays on screen
             // until something resolves it.
             Self::Send { .. } => false,
@@ -89,6 +100,12 @@ impl Awaiting {
         match self {
             Self::Download(tx) => {
                 let _ = tx.send(Err(detail.to_string()));
+            }
+            // Dropping the sender is the failure: the pane it feeds shows
+            // what it knows and says the rest is unavailable.
+            Self::Storage(tx) => {
+                log::debug!("storage query failed: {detail}");
+                drop(tx);
             }
             Self::Send { chat_jid, local_id } => {
                 // The message is already drawn; without this it stays pending
@@ -342,6 +359,21 @@ impl Session {
     /// The same signature the old client had, so the callers that thread this
     /// receiver through a timeout did not change. The bytes come back rather
     /// than a path because that is what every caller wanted anyway.
+    /// Ask what the store and the media cache occupy.
+    ///
+    /// The daemon measures, because it is the only process that owns either
+    /// path. The answer arrives under this request's id.
+    pub fn storage_usage(&self) -> oneshot::Receiver<StorageUsage> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(ClientRequest::StorageUsage, Awaiting::Storage(tx));
+        rx
+    }
+
+    /// Delete the cached media, keeping the history.
+    pub fn clear_media_cache(&self) {
+        self.tell(ClientRequest::ClearMediaCache);
+    }
+
     pub fn download_downloadable_media(
         &self,
         media: DownloadableMedia,
@@ -460,6 +492,22 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
             // itself. Everything else in a snapshot is rebuilt from the
             // session stream; a call the *daemon* answered is not in that
             // stream at all, so without this a second window keeps ringing.
+            Ok(DaemonMessage::Storage {
+                id,
+                database_bytes,
+                media_bytes,
+                media_files,
+            }) => match take_pending(pending, id) {
+                Some(Awaiting::Storage(tx)) => {
+                    let _ = tx.send(StorageUsage {
+                        database_bytes,
+                        media_bytes,
+                        media_files,
+                    });
+                }
+                Some(waiting) => waiting.failed("unexpected storage answer", Some(events)),
+                None => debug!("a storage answer arrived for {id}, which nobody is waiting on"),
+            },
             Ok(DaemonMessage::Update {
                 event: DaemonEvent::CallsChanged(calls),
                 ..

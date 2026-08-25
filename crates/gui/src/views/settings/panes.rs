@@ -8,7 +8,7 @@
 use gpui::{AnyElement, App, Entity, IntoElement, ParentElement, Styled, div};
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Icon, IconName};
+use gpui_component::{Disableable as _, Icon, IconName};
 
 use crate::app::{SettingsSection, WhatsAppApp};
 use crate::components::ProductIcon;
@@ -25,8 +25,8 @@ pub fn render(
         SettingsSection::Account => account(app, metrics, cx),
         SettingsSection::Notifications => notifications(metrics, cx),
         SettingsSection::AudioVideo => audio_video(metrics, cx),
-        SettingsSection::Privacy => privacy(entity, metrics, cx),
-        SettingsSection::Storage => storage(metrics, cx),
+        SettingsSection::Privacy => privacy(entity.clone(), metrics, cx),
+        SettingsSection::Storage => storage(app, entity, metrics, cx),
         SettingsSection::Advanced => advanced(metrics, cx),
         // Rendered by its own module.
         SettingsSection::Appearance => div().into_any_element(),
@@ -36,7 +36,7 @@ pub fn render(
         .flex()
         .flex_col()
         .gap(metrics.space_xxl())
-        .max_w(gpui::px(720.0))
+        .max_w(metrics.reading_width())
         .child(body)
         .into_any_element()
 }
@@ -289,34 +289,108 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
         .into_any_element()
 }
 
-fn storage(metrics: Metrics, cx: &App) -> AnyElement {
+fn storage(
+    app: &WhatsAppApp,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> AnyElement {
+    let usage = app.storage_usage();
+
     div()
         .flex()
         .flex_col()
         .gap(metrics.space_xxl())
         .child(group(
             label("ON DISK", metrics, cx),
-            pending(
-                "The message store belongs to the daemon, which is the only \
-                 process that opens it. Reporting its size — and clearing it — \
-                 needs a request this protocol version does not have yet.",
-                metrics,
-                cx,
-            ),
+            div()
+                .flex()
+                .flex_col()
+                .child(row(
+                    "Messages and keys".to_string(),
+                    // Until the first answer arrives. The daemon measures, and
+                    // it is another process: there is a frame or two where the
+                    // honest thing to show is that nobody has counted yet.
+                    usage.map_or_else(
+                        || "measuring…".to_string(),
+                        |u| format_bytes(u.database_bytes),
+                    ),
+                    metrics,
+                    cx,
+                ))
+                .child(row(
+                    "Downloaded media".to_string(),
+                    usage.map_or_else(
+                        || "measuring…".to_string(),
+                        |u| format!("{} · {}", format_bytes(u.media_bytes), files(u.media_files)),
+                    ),
+                    metrics,
+                    cx,
+                )),
             metrics,
         ))
         .child(group(
-            label("MEDIA", metrics, cx),
-            pending(
-                "Downloaded media is held in memory for the session and fetched \
-                 again after a restart. An on-disk cache is the fix, and is what \
-                 would give this section something to clear.",
-                metrics,
-                cx,
-            ),
+            label("MEDIA CACHE", metrics, cx),
+            div()
+                .flex()
+                .flex_col()
+                .gap(metrics.space_lg())
+                .child(
+                    div()
+                        .text_size(metrics.text_small())
+                        .text_color(cx.theme().muted_foreground)
+                        // What it costs, so the button is a decision rather
+                        // than a dare: the history is untouched and every
+                        // message keeps the means to fetch its media again.
+                        .child(
+                            "Clearing the cache keeps every message. Anything you \
+                             open again is downloaded again.",
+                        ),
+                )
+                .child(
+                    div().flex().child(
+                        Button::new("clear-media-cache")
+                            .label("Clear cached media")
+                            .outline()
+                            .disabled(usage.is_none_or(|u| u.media_files == 0))
+                            .on_click(move |_, _window, cx| {
+                                entity.update(cx, |app, cx| app.clear_media_cache(cx));
+                            }),
+                    ),
+                ),
             metrics,
         ))
         .into_any_element()
+}
+
+/// A size a person can read. Binary units, because that is what a filesystem
+/// reports and a number that disagrees with `du` invites a bug report.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    // One decimal below ten, none above: "1.4 MiB" is useful, "847.3 MiB" is
+    // three digits of noise.
+    if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+fn files(count: u64) -> String {
+    if count == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{count} files")
+    }
 }
 
 fn advanced(metrics: Metrics, cx: &App) -> AnyElement {
