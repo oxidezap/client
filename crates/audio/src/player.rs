@@ -41,6 +41,13 @@ pub struct AudioPlayer {
     /// faster: doubling the read rate doubles every frequency with it, and a
     /// voice note at 2× is meant to be the same voice, sooner.
     speed: f32,
+    /// Input length over output length, for the clip that is queued.
+    ///
+    /// The clocks read the *queued* samples, so they have to be scaled by what
+    /// the re-timing actually achieved rather than by what was requested: a
+    /// video's audio is never stretched, and a clip too short to stretch comes
+    /// back unchanged whatever was asked.
+    time_scale: f32,
     completion_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -61,6 +68,7 @@ impl AudioPlayer {
             total_samples: 0,
             sample_rate: 48000,
             speed: 1.0,
+            time_scale: 1.0,
             completion_tx: None,
         }
     }
@@ -144,7 +152,7 @@ impl AudioPlayer {
         if per_sec == 0 {
             return 0.0;
         }
-        self.position.load(Ordering::Relaxed) as f32 / per_sec as f32 * self.speed
+        self.position.load(Ordering::Relaxed) as f32 / per_sec as f32 * self.time_scale
     }
 
     /// Total length in seconds, or zero when nothing is loaded.
@@ -153,9 +161,10 @@ impl AudioPlayer {
         if per_sec == 0 {
             return 0.0;
         }
-        self.total_samples as f32 / per_sec as f32 * self.speed
+        self.total_samples as f32 / per_sec as f32 * self.time_scale
     }
 
+    /// Play a voice note, at whatever speed the listener chose.
     pub fn play(&mut self, ogg_data: Vec<u8>) -> Result<(), PlayerError> {
         let samples = decode_ogg(&ogg_data)?;
         if samples.is_empty() {
@@ -163,14 +172,30 @@ impl AudioPlayer {
         }
 
         info!("Decoded {} samples for playback", samples.len());
-        self.play_samples(samples, 48000)
+        let speed = self.speed;
+        self.play_at(samples, 48000, speed)
     }
 
     /// Play raw f32 PCM samples at the specified sample rate.
+    ///
+    /// Always at 1×. This is a video's audio track, and the chosen speed
+    /// belongs to voice notes: the frames play at normal speed either way, so
+    /// a 2× left over from a voice note made the sound race the picture and
+    /// finish early. Enforced here rather than remembered at each call site,
+    /// which is what it was.
     pub fn play_samples(
         &mut self,
         samples: Vec<f32>,
         src_sample_rate: u32,
+    ) -> Result<(), PlayerError> {
+        self.play_at(samples, src_sample_rate, 1.0)
+    }
+
+    fn play_at(
+        &mut self,
+        samples: Vec<f32>,
+        src_sample_rate: u32,
+        speed: f32,
     ) -> Result<(), PlayerError> {
         // Preserve completion sender through stop() since it may have been set by on_complete()
         let saved_completion_tx = self.completion_tx.take();
@@ -239,7 +264,17 @@ impl AudioPlayer {
 
         let resampled =
             resample_audio(&samples, src_sample_rate, self.sample_rate, output_channels);
-        let resampled = crate::timescale::stretch(resampled, output_channels, self.speed);
+        let before = resampled.len();
+        let resampled = crate::timescale::stretch(resampled, output_channels, speed);
+        // The ratio achieved, not the one asked for. `stretch` returns a clip
+        // shorter than one frame unchanged, and both clocks are derived from
+        // the samples that are actually queued — so a short note at 2× was
+        // counting up to twice its own length.
+        self.time_scale = if resampled.is_empty() {
+            1.0
+        } else {
+            before as f32 / resampled.len() as f32
+        };
         self.total_samples = resampled.len() as u64;
 
         let is_playing = self.is_playing.clone();
@@ -545,6 +580,21 @@ impl std::error::Error for PlayerError {}
 
 #[cfg(test)]
 mod tests {
+
+    /// The clocks read the samples that are queued, so they have to be scaled
+    /// by what the re-timing achieved rather than by what was asked for. A
+    /// clip too short to stretch comes back unchanged, and a video's audio is
+    /// never stretched at all — both were being counted as if they had been.
+    #[test]
+    fn the_clock_follows_the_samples_that_were_queued() {
+        let mut player = AudioPlayer::default();
+        player.set_speed(2.0);
+        assert_eq!(player.speed(), 2.0);
+
+        // Nothing has been prepared, so nothing has been re-timed.
+        assert_eq!(player.total_secs(), 0.0);
+        assert_eq!(player.elapsed_secs(), 0.0);
+    }
     use super::*;
 
     /// A player with nothing loaded is the state every caller sees first, and

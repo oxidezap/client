@@ -527,6 +527,10 @@ pub struct WhatsAppApp {
     /// one thing that changes with nothing happening.
     #[allow(dead_code)]
     status_tick: Option<Task<()>>,
+    /// Polls `theme.json` for an edit, and repaints the pairing countdown.
+    /// Both are things that change with no event to carry them.
+    #[allow(dead_code)]
+    heartbeat: Option<Task<()>>,
 }
 
 impl WhatsAppApp {
@@ -650,6 +654,7 @@ impl WhatsAppApp {
             settings: None,
             tick_task: None,
             status_tick: None,
+            heartbeat: None,
             recording_tick: None,
         }
     }
@@ -1908,6 +1913,54 @@ fn newest_shared_message(chat: &Chat) -> Option<String> {
         .rev()
         .find(|message| message.system.is_none())
         .map(|message| message.id.clone())
+}
+
+impl WhatsAppApp {
+    /// One second, for the two things that change with no event behind them.
+    ///
+    /// A pairing code expires on a wall clock, and `theme.json` changes when a
+    /// person saves it in an editor. Neither produces anything to react to, so
+    /// without this the countdown sat at the second it was issued until an
+    /// unrelated event repainted the window, and `reload_if_changed` — written
+    /// to be polled — had no caller at all.
+    ///
+    /// One task rather than two, and it only runs while there is something to
+    /// watch: it stops as soon as pairing ends, unless a theme file exists to
+    /// keep watching.
+    fn ensure_heartbeat(&mut self, cx: &mut Context<Self>) {
+        if self.heartbeat.is_some() {
+            return;
+        }
+        self.heartbeat = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            loop {
+                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                // A `stat` unless the stamp moved, which is why polling a
+                // file a person edits by hand is affordable.
+                let (theme_changed, watching) = cx.update(|cx| {
+                    (
+                        crate::theme::reload_if_changed(cx),
+                        crate::theme::watches_a_file(cx),
+                    )
+                });
+
+                let alive = entity.update(cx, |app, cx| {
+                    let pairing = matches!(app.app_state, AppState::WaitingForPairing { .. });
+                    if pairing || theme_changed {
+                        cx.notify();
+                    }
+                    // The countdown stops mattering the moment pairing ends;
+                    // the file does not.
+                    pairing || watching
+                });
+                match alive {
+                    Ok(true) => continue,
+                    // Nothing left to tick, or the view is gone.
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            let _ = entity.update(cx, |app, _| app.heartbeat = None);
+        }));
+    }
 }
 
 impl Focusable for WhatsAppApp {

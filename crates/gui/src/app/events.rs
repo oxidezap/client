@@ -12,6 +12,9 @@ impl WhatsAppApp {
         match event {
             UiEvent::InitComplete => {
                 self.app_state = AppState::Connecting;
+                // From here on there is a `theme.json` to watch, whether or
+                // not this session ever reaches the pairing screen.
+                self.ensure_heartbeat(cx);
                 cx.notify();
             }
             UiEvent::HistoryLoaded { chats, complete } => {
@@ -93,6 +96,9 @@ impl WhatsAppApp {
                     timeout_secs,
                     issued_at: wacore::time::now_utc(),
                 };
+                // The countdown on that screen is read off the clock during
+                // render, and nothing else repaints while it is up.
+                self.ensure_heartbeat(cx);
                 cx.notify();
             }
             UiEvent::PairCode { code, timeout_secs } => {
@@ -106,6 +112,7 @@ impl WhatsAppApp {
                     timeout_secs,
                     issued_at: wacore::time::now_utc(),
                 };
+                self.ensure_heartbeat(cx);
                 cx.notify();
             }
             UiEvent::PairSuccess => {

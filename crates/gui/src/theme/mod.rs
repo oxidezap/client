@@ -126,6 +126,13 @@ pub fn install(settings: ThemeSettings, cx: &mut App) {
     cx.set_global(ProductTheme::from_settings(settings));
 }
 
+/// Whether there is a `theme.json` worth polling at all.
+///
+/// No file means nothing can change, and the poll can stop.
+pub fn watches_a_file(cx: &App) -> bool {
+    cx.global::<ProductTheme>().path.is_some()
+}
+
 /// Reinstall the theme if the file changed on disk since it was last read.
 ///
 /// Polling rather than watching is deliberate: a watcher would be a new
