@@ -47,8 +47,8 @@ jobs:
           holds the WhatsApp session, and the first starts the second when
           nothing is already running. Keep them in the same directory.
 
-          On Linux and macOS they arrive without the execute bit, so `chmod +x`
-          them first. On macOS also clear the quarantine flag:
+          The tarballs carry the execute bit. On macOS, clear the quarantine
+          flag before the first run:
 
               xattr -dr com.apple.quarantine oxidezap oxidezapd
 

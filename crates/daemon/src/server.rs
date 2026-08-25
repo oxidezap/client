@@ -429,11 +429,14 @@ where
     // Subscribed before the reload is asked for, and for the same reason the
     // snapshot is taken after subscribing: the load must not land in the
     // window between the two.
-    // Subscribed either way, and read only when asked for. A receiver whose
-    // sender was already gone would look exactly like a closed channel, and
-    // the branch below ends the connection on one — which would disconnect
-    // every summary-only client the moment it said hello.
-    let mut sessions = hub.subscribe_sessions();
+    // Only for a client that asked. The count of these receivers is what
+    // tells the bridge whether to prepare session events at all — writing
+    // every photo in the account to the cache and serializing its whole
+    // traffic — so a tray holding one it never reads would make it do all of
+    // that for nobody. An `Option` rather than a receiver whose sender is
+    // already gone, because that looks exactly like a closed channel and the
+    // branch below ends the connection on one.
+    let mut sessions = attached.session_events.then(|| hub.subscribe_sessions());
 
     // Frames addressed to this connection alone: a download's answer belongs
     // to whoever asked, and the ids are client-chosen.
@@ -481,7 +484,10 @@ where
             // Neither of these is gated on `awaiting_resync`: a session
             // event is not a summary, and a download this client asked for is
             // its own answer. Both are lost for good if dropped.
-            session = sessions.recv(), if attached.session_events => match session {
+            // The guard is what makes the `expect` safe: `select!` evaluates
+            // it before the future.
+            session = async { sessions.as_mut().expect("guarded").recv().await },
+                if sessions.is_some() => match session {
                 Ok(frame) => write_line(&mut writer, &frame).await?,
                 // A front end that overruns cannot patch the gap from a
                 // snapshot: it holds messages, not summaries. Telling it to
@@ -740,8 +746,8 @@ async fn handle_request(
         ClientRequest::Call(action) => {
             Answer::frame(answer(dispatch(hub, commands, Action::Call(action)).await))
         }
-        ClientRequest::Download { id, media } => Answer::frame(answer(
-            dispatch(
+        ClientRequest::Download { id, media } => {
+            let result = dispatch(
                 hub,
                 commands,
                 Action::Download {
@@ -750,8 +756,16 @@ async fn handle_request(
                     answer_to: outbox.clone(),
                 },
             )
-            .await,
-        )),
+            .await;
+            if let Err(e) = &result {
+                // The request carries an id so its answer can be found. A
+                // refusal that arrives as a bare error is one the client
+                // cannot match to anything, so it waits out its own timeout
+                // and keeps the entry until the connection closes.
+                let _ = outbox.try_send(download_failed(id, e));
+            }
+            Answer::frame(answer(result))
+        }
         ClientRequest::ReloadHistory => {
             Answer::frame(answer(dispatch(hub, commands, Action::ReloadHistory).await))
         }
@@ -858,6 +872,17 @@ fn note_send_failure(outbox: &Outbox, jid: &str, local_id: Option<&str>, error: 
     }) {
         let _ = outbox.try_send(frame);
     }
+}
+
+/// A download that never started, under the id it was asked for.
+fn download_failed(id: oxidezap_ipc::RequestId, error: &ProtocolError) -> String {
+    serde_json::to_string(&DaemonMessage::Downloaded {
+        id,
+        result: Err(error.to_string()),
+    })
+    // A `Result<String, String>` cannot fail to serialize; spelling the
+    // fallback out beats an unwrap on a path that answers an error.
+    .unwrap_or_else(|e| format!(r#"{{"type":"error","error":"malformed","detail":"{e}"}}"#))
 }
 
 fn accepted() -> Option<String> {

@@ -38,15 +38,11 @@ const EVENT_QUEUE: usize = 512;
 /// Answers still owed to a caller, by the id they were asked under.
 type Pending = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Vec<u8>, String>>>>>;
 
-/// The write half, shared with the reader thread.
-///
-/// Shared because recovery is something the reader decides: it is the side
-/// that sees a `Resync`, and answering one means sending a request.
-type Writer = Arc<Mutex<Endpoint>>;
-
 /// A connection to `oxidezapd`.
 pub struct Session {
-    writer: Writer,
+    /// The write half. The reader thread holds its own handle, so this is not
+    /// shared with it: recovery is reconnecting, not writing.
+    writer: Mutex<Endpoint>,
     pending: Pending,
     next_id: AtomicU64,
 }
@@ -62,7 +58,7 @@ impl Session {
         let reader = stream.try_clone()?;
 
         let session = Self {
-            writer: Arc::new(Mutex::new(stream)),
+            writer: Mutex::new(stream),
             pending: Pending::default(),
             next_id: AtomicU64::new(1),
         };
@@ -75,16 +71,20 @@ impl Session {
 
         let (events, rx) = mpsc::channel(EVENT_QUEUE);
         let pending = Arc::clone(&session.pending);
-        let writer = Arc::clone(&session.writer);
         std::thread::Builder::new()
             .name("oxidezap-ipc".to_string())
-            .spawn(move || read_frames(reader, &events, &pending, &writer))?;
+            .spawn(move || read_frames(reader, &events, &pending))?;
 
         Ok((session, rx))
     }
 
     fn send(&self, request: &ClientRequest) -> std::io::Result<()> {
-        write_request(&self.writer, request)
+        let mut line = serde_json::to_vec(request).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write_all(&line)
     }
 
     /// Send and log rather than propagate.
@@ -261,24 +261,14 @@ fn sanitize(id: &str) -> String {
         .collect()
 }
 
-fn write_request(writer: &Writer, request: &ClientRequest) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(request).map_err(std::io::Error::other)?;
-    line.push(b'\n');
-    writer
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .write_all(&line)
-}
-
 /// Read frames until the daemon goes away.
-fn read_frames(
-    stream: Endpoint,
-    events: &mpsc::Sender<UiEvent>,
-    pending: &Pending,
-    writer: &Writer,
-) {
+fn read_frames(stream: Endpoint, events: &mpsc::Sender<UiEvent>, pending: &Pending) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
+    // What to tell the user when this ends. The generic message is right for
+    // a daemon that simply went away, and wrong for every case this side
+    // actually diagnosed.
+    let mut reason: Option<String> = None;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -322,26 +312,35 @@ fn read_frames(
             // client subscribed and nothing replays it.
             Ok(DaemonMessage::Hello { protocol, snapshot }) => {
                 if protocol != PROTOCOL_VERSION {
-                    let _ = events.blocking_send(UiEvent::Error(format!(
-                        "the daemon speaks protocol {protocol}, this build speaks \
-                         {PROTOCOL_VERSION}; they were built from different commits"
-                    )));
+                    reason = Some(format!(
+                        "The daemon speaks protocol {protocol} and this window speaks \
+                         {PROTOCOL_VERSION}. They were built from different commits — stop \
+                         the daemon and start it from this build."
+                    ));
                     break;
                 }
-                if events.blocking_send(catch_up(&snapshot)).is_err() {
+                if catch_up(&snapshot)
+                    .into_iter()
+                    .any(|event| events.blocking_send(event).is_err())
+                {
                     break;
                 }
             }
-            // The daemon truncated our stream. Nothing here can patch the
-            // gap — this side holds messages, not summaries — so it starts
-            // over, which is what attaching does anyway. Asked from this
-            // thread because this is the thread that finds out.
+            // The daemon truncated our stream, so arbitrary events are gone.
+            // Asking for the history back would restore the chats and nothing
+            // else: a `LoggedOut`, a `CallEnded`, a `SendFailed` cannot be
+            // rebuilt from the store, and this side would sit with a call
+            // dialog open or a message pending forever. Attaching again is
+            // what rebuilds all of it, and the app already reconnects when
+            // this connection ends.
             Ok(DaemonMessage::Resync) => {
-                warn!("fell behind the daemon; asking for the history again");
-                if let Err(e) = write_request(writer, &ClientRequest::ReloadHistory) {
-                    error!("could not ask the daemon to resend the history: {e}");
-                    break;
-                }
+                warn!("fell behind the daemon; reattaching from scratch");
+                reason = Some(
+                    "Fell behind the daemon and lost part of the stream. \
+                     Reconnect to start over."
+                        .to_string(),
+                );
+                break;
             }
             Ok(DaemonMessage::Error(e)) => error!("daemon refused a request: {e}"),
             // Summaries and acknowledgements: the daemon serves other front
@@ -361,38 +360,59 @@ fn read_frames(
         let _ = tx.send(Err("the daemon connection closed".to_string()));
     }
     let _ = events.blocking_send(UiEvent::Error(
-        "Lost the connection to the daemon".to_string(),
+        reason.unwrap_or_else(|| "Lost the connection to the daemon".to_string()),
     ));
 }
 
 /// Turn the state a client attaches to into the events it would have seen.
 ///
-/// The snapshot says where the connection stands; the front end only knows how
-/// to react to the event that put it there. Rather than teach it a second
-/// vocabulary, the one frame it gets on attaching is translated into the one
+/// The snapshot says where things stand; the front end only knows how to react
+/// to the events that put them there. Rather than teach it a second
+/// vocabulary, the one frame it gets on attaching is translated into the ones
 /// it already handles.
-fn catch_up(snapshot: &StateSnapshot) -> UiEvent {
+fn catch_up(snapshot: &StateSnapshot) -> Vec<UiEvent> {
+    let mut events = Vec::new();
     match &snapshot.connection {
-        ConnectionState::Connecting => UiEvent::InitComplete,
-        ConnectionState::Pairing { qr, pair_code } => match (qr, pair_code) {
-            // A QR is what the pairing screen shows when it has both.
-            (Some(qr), _) => UiEvent::QrCode {
-                code: qr.code.clone(),
-                timeout_secs: remaining_secs(qr.expires_at_ms),
-            },
-            (None, Some(code)) => UiEvent::PairCode {
-                code: code.code.clone(),
-                timeout_secs: remaining_secs(code.expires_at_ms),
-            },
+        ConnectionState::Connecting => events.push(UiEvent::InitComplete),
+        ConnectionState::Pairing { qr, pair_code } => {
+            // Both, when there are both. A user who asked for a phone code
+            // while a QR was on screen has two live credentials, and picking
+            // one would make the other vanish from a window that had only just
+            // opened. The QR goes last so it is the one the screen settles on,
+            // which is what the pairing view shows when it has both.
+            if let Some(code) = pair_code {
+                events.push(UiEvent::PairCode {
+                    code: code.code.clone(),
+                    timeout_secs: remaining_secs(code.expires_at_ms),
+                });
+            }
+            if let Some(qr) = qr {
+                events.push(UiEvent::QrCode {
+                    code: qr.code.clone(),
+                    timeout_secs: remaining_secs(qr.expires_at_ms),
+                });
+            }
             // Pairing with neither credential yet: still coming.
-            (None, None) => UiEvent::InitComplete,
-        },
+            if events.is_empty() {
+                events.push(UiEvent::InitComplete);
+            }
+        }
         // The event that leaves the pairing screen for the syncing one.
-        ConnectionState::Syncing => UiEvent::PairSuccess,
-        ConnectionState::Connected => UiEvent::Connected,
-        ConnectionState::Disconnected { reason } => UiEvent::Disconnected(reason.clone()),
-        ConnectionState::LoggedOut { message } => UiEvent::LoggedOut(message.clone()),
+        ConnectionState::Syncing => events.push(UiEvent::PairSuccess),
+        ConnectionState::Connected => events.push(UiEvent::Connected),
+        ConnectionState::Disconnected { reason } => {
+            events.push(UiEvent::Disconnected(reason.clone()));
+        }
+        ConnectionState::LoggedOut { message } => {
+            events.push(UiEvent::LoggedOut(message.clone()));
+        }
     }
+
+    // Whatever is ringing. The offer went out as an event before this window
+    // existed and no history contains it, so without this a call rings on in
+    // the daemon with nothing anywhere to answer it.
+    events.extend(snapshot.ringing.iter().cloned().map(UiEvent::IncomingCall));
+    events
 }
 
 /// What is left of a pairing credential's life, as the front end counts it.

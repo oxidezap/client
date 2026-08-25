@@ -34,13 +34,13 @@ Prebuilt binaries for Linux, macOS and Windows are attached to each
 [release](https://github.com/oxidezap/client/releases). Builds of `main` are
 published continuously under the `nightly` tag.
 
-Each asset holds two binaries that belong together: `oxidezap` is the window
-and `oxidezapd` holds the session. Keep them in the same directory — the
-window looks for the daemon beside itself. On Linux and macOS they arrive
-without the execute bit:
+Each asset is an archive holding two binaries that belong together:
+`oxidezap` is the window and `oxidezapd` holds the session. Keep them in the
+same directory — the window looks for the daemon beside itself.
 
 ```bash
-chmod +x oxidezap oxidezapd
+tar -xzf oxidezap-nightly-linux-x86_64.tar.gz
+cd oxidezap-nightly-linux-x86_64
 ./oxidezap
 ```
 

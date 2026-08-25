@@ -111,6 +111,11 @@ struct ChatEntry {
 struct Inner {
     version: StateVersion,
     connection: ConnectionState,
+    /// Calls ringing right now, by call id.
+    ///
+    /// Not a chat and not a summary, so it rides neither: it exists so a
+    /// window opened mid-ring has something to answer.
+    ringing: std::collections::HashMap<String, oxidezap_core::IncomingCall>,
     /// Chats keyed by JID. A map, not a Vec: every update is a lookup by JID,
     /// and a Vec would make a rename or a receipt O(n) over every chat.
     chats: std::collections::HashMap<String, ChatEntry>,
@@ -153,6 +158,7 @@ impl StateHub {
             inner: Mutex::new(Inner {
                 version: StateVersion::INITIAL,
                 connection: ConnectionState::Connecting,
+                ringing: std::collections::HashMap::new(),
                 chats: std::collections::HashMap::new(),
             }),
             updates,
@@ -230,7 +236,26 @@ impl StateHub {
             version: inner.version,
             connection: inner.connection.clone(),
             chats,
+            ringing: inner.ringing.values().cloned().collect(),
         }
+    }
+
+    /// Remember a call that is ringing, so a window opened during it can
+    /// answer.
+    pub fn start_ringing(&self, call: oxidezap_core::IncomingCall) {
+        self.lock().ringing.insert(call.call_id.clone(), call);
+    }
+
+    /// Forget one that has been answered or has stopped.
+    pub fn stop_ringing(&self, call_id: &str) {
+        self.lock().ringing.remove(call_id);
+    }
+
+    /// The calls currently ringing, for a test or a caller that only wants
+    /// those.
+    #[cfg(test)]
+    pub fn snapshot_ringing(&self) -> Vec<oxidezap_core::IncomingCall> {
+        self.lock().ringing.values().cloned().collect()
     }
 
     /// Where the connection stands right now.

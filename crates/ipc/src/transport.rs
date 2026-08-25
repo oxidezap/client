@@ -49,7 +49,7 @@ pub fn endpoint_path() -> Option<PathBuf> {
         // session. The same reason the Unix fallback carries the uid.
         Some(PathBuf::from(format!(
             r"\\.\pipe\{DIR_NAME}-{}",
-            user_suffix()
+            user_suffix()?
         )))
     }
     #[cfg(not(any(unix, windows)))]
@@ -90,7 +90,7 @@ pub fn state_dir() -> Option<PathBuf> {
 
         // Only reachable when XDG_RUNTIME_DIR is unset, which is unusual on a
         // desktop; the uid keeps the fallback per-user anyway.
-        Some(tmp.join(format!("{DIR_NAME}-{}", user_suffix())))
+        Some(tmp.join(format!("{DIR_NAME}-{}", user_suffix()?)))
     }
 }
 
@@ -135,16 +135,37 @@ pub fn media_dir() -> Option<PathBuf> {
 }
 
 /// What distinguishes one user's daemon from another's on the same machine.
+///
+/// `None` when the platform will not say, which is a reason to report that
+/// there is nowhere to listen rather than to invent a name every user would
+/// share.
 #[cfg(unix)]
-fn user_suffix() -> String {
+fn user_suffix() -> Option<String> {
     // rustix rather than a hand-rolled `extern "C"`: the same syscall with no
     // `unsafe` at this call site, from a crate already in the tree.
-    rustix::process::getuid().as_raw().to_string()
+    Some(rustix::process::getuid().as_raw().to_string())
 }
 
 #[cfg(not(unix))]
-fn user_suffix() -> String {
-    std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string())
+fn user_suffix() -> Option<String> {
+    // `USERNAME` alone is not an identity — two accounts from different
+    // domains can share one, and a pipe name is machine-wide — so the domain
+    // comes along, which together are the account name Windows itself shows.
+    // A SID would be exact and needs a Windows API this crate otherwise has
+    // no use for; what is left is two same-named accounts whose domains also
+    // collide once sanitized, which is a far narrower case than the single
+    // shared fallback this replaced.
+    let user = std::env::var("USERNAME").ok().filter(|v| !v.is_empty())?;
+    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+    // A pipe name cannot carry a separator, and neither can a directory
+    // component.
+    Some(
+        format!("{domain}-{user}")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(64)
+            .collect(),
+    )
 }
 
 #[cfg(test)]

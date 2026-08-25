@@ -91,10 +91,37 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
     // one by design.
     let temp = path.with_extension(format!("part{}", write_ticket()));
     std::fs::write(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
-    std::fs::rename(&temp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    if let Err(e) = std::fs::rename(&temp, &path) {
+        // Windows will not rename onto an existing file, and two clients
+        // asking for the same uncached media both miss the check above. The
+        // other write winning is a cache hit, not a failure — the bytes are
+        // content-addressed, so whatever is there is what this was going to
+        // put there.
+        let _ = std::fs::remove_file(&temp);
+        if !std::fs::metadata(&path).is_ok_and(|meta| meta.len() == bytes.len() as u64) {
+            return Err(e).with_context(|| format!("renaming into {}", path.display()));
+        }
+        return Ok(key.to_string());
+    }
 
     sweep_occasionally(dir, bytes.len() as u64);
     Ok(key.to_string())
+}
+
+/// Read what is under `key` and remove it.
+///
+/// For payloads a client staged rather than the daemon cached: their bytes
+/// never counted toward the sweep, so nothing else would ever clear them.
+pub fn take(key: &str) -> Option<Vec<u8>> {
+    let path = oxidezap_ipc::media_path(key)?;
+    let bytes = std::fs::read(&path).ok()?;
+    if let Err(e) = std::fs::remove_file(&path) {
+        log::warn!(
+            "could not clear the staged upload at {}: {e}",
+            path.display()
+        );
+    }
+    Some(bytes)
 }
 
 /// A name no other in-progress write is using.
@@ -112,11 +139,6 @@ fn write_ticket() -> String {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-/// The bytes held under `key`, if any.
-pub fn get(key: &str) -> Option<Vec<u8>> {
-    std::fs::read(oxidezap_ipc::media_path(key)?).ok()
 }
 
 /// Whether `key` is already cached, without reading it.

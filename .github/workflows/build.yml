@@ -77,23 +77,32 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} --bin oxidezap --bin oxidezapd
 
-      - name: Name the binaries for their platform
+      - name: Package the binaries for their platform
         shell: bash
         run: |
           set -euo pipefail
-          # A directory rather than the bare binary this used to be: the two
-          # have to land beside each other, and upload-artifact zips whatever
-          # it is given regardless.
+          # One archive per platform, and the platform is in its *file* name.
+          # A directory would not do: `upload-artifact` stores a directory's
+          # contents at the artifact root, and the publish jobs download every
+          # platform with `merge-multiple`, so three sets of identically named
+          # binaries would land on top of each other and only one platform
+          # would survive into the release.
           out="oxidezap-${{ inputs.version }}-${{ matrix.name }}"
           mkdir -p "$out"
           if [ "${{ runner.os }}" = "Windows" ]; then
             mv "target/${{ matrix.target }}/release/oxidezap.exe" "$out/"
             mv "target/${{ matrix.target }}/release/oxidezapd.exe" "$out/"
+            7z a -tzip "$out.zip" "$out" > /dev/null
+            echo "ASSET=$out.zip" >> "$GITHUB_ENV"
           else
             mv "target/${{ matrix.target }}/release/oxidezap" "$out/"
             mv "target/${{ matrix.target }}/release/oxidezapd" "$out/"
+            # Preserving the execute bit, which the bare binaries never had:
+            # an archive can carry it where a raw asset download cannot.
+            chmod +x "$out/oxidezap" "$out/oxidezapd"
+            tar -czf "$out.tar.gz" "$out"
+            echo "ASSET=$out.tar.gz" >> "$GITHUB_ENV"
           fi
-          echo "ASSET=$out" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v5
         with:

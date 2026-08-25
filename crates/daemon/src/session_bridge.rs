@@ -246,7 +246,22 @@ impl Bridge {
             self.hub.signal(&frame);
         }
 
-        self.forward(&event);
+        // A ringing call is state, not just an event: see
+        // `StateSnapshot::ringing`.
+        match &event {
+            UiEvent::IncomingCall(call) => self.hub.start_ringing(call.clone()),
+            UiEvent::CallAccepted(id) | UiEvent::CallEnded(id) => self.hub.stop_ringing(id),
+            _ => {}
+        }
+
+        // Prepared before the state changes and published after it. A front
+        // end reacts to what it is told the instant it is told — a message
+        // arriving in the open chat is marked read immediately — and the
+        // runtime is multithreaded, so that `MarkRead` can reach another
+        // worker while this one has not applied the message yet. `read_plan`
+        // would refuse it as stale, after the client had already cleared its
+        // own badge and with nothing to make it ask again.
+        let frame = self.session_frame(&event);
 
         for change in self.translate(event) {
             // A chat that left the store owes nothing and will never be read
@@ -256,6 +271,10 @@ impl Bridge {
                 self.reads.forget(jid);
             }
             self.hub.apply(change);
+        }
+
+        if let Some(frame) = frame {
+            self.hub.publish_session(frame);
         }
     }
 
@@ -306,8 +325,11 @@ impl Bridge {
                 local_id,
             } => {
                 // Through the cache, not the socket: a voice note is the one
-                // thing a client sends that is too big for a frame.
-                let Some(audio) = crate::media::get(&upload) else {
+                // thing a client sends that is too big for a frame. Taken
+                // rather than read: the client wrote it directly, so its bytes
+                // never counted toward the cache's own sweep and nothing else
+                // would ever remove it.
+                let Some(audio) = crate::media::take(&upload) else {
                     return CommandOutcome::Refused(format!(
                         "no audio cached under {upload}; write it before sending"
                     ));
@@ -417,22 +439,25 @@ impl Bridge {
         CommandOutcome::Accepted
     }
 
-    /// Hand one session event to the front ends that asked for them.
+    /// The frame that carries one session event, if anyone wants it.
     ///
-    /// Nothing happens when nobody is listening, which is the common case: a
-    /// tray wants summaries, and preparing an event means writing every photo
-    /// in it to the cache.
-    fn forward(&self, event: &UiEvent) {
+    /// `None` when nobody is listening, which is the common case: a tray wants
+    /// summaries, and preparing an event means writing every photo in it to
+    /// the cache.
+    fn session_frame(&self, event: &UiEvent) -> Option<String> {
         if !self.hub.wants_session_events() {
-            return;
+            return None;
         }
         let mut event = event.clone();
         externalize_media(&mut event);
         match serde_json::to_string(&DaemonMessage::Session {
             event: Box::new(event),
         }) {
-            Ok(frame) => self.hub.publish_session(frame),
-            Err(e) => log::error!("dropping unserializable session event: {e}"),
+            Ok(frame) => Some(frame),
+            Err(e) => {
+                log::error!("dropping unserializable session event: {e}");
+                None
+            }
         }
     }
 
@@ -1337,6 +1362,53 @@ mod tests {
     #[test]
     fn an_absurd_pairing_lifetime_saturates_rather_than_wrapping() {
         assert_eq!(deadline_ms(u64::MAX), i64::MAX);
+    }
+
+    /// A front end reacts to what it is told the instant it is told, and the
+    /// runtime is multithreaded. Publishing before applying lets a `MarkRead`
+    /// racing a message find a hub that has not seen it — refused as stale,
+    /// after the client had already cleared its own badge.
+    #[tokio::test]
+    async fn the_hub_is_current_before_anyone_is_told() {
+        let mut bridge = bridge();
+        let mut sessions = bridge.hub.subscribe_sessions();
+
+        bridge.observe(received(
+            "1@s.whatsapp.net",
+            message("m1", "1@s.whatsapp.net", 10, false, false),
+            None,
+        ));
+
+        // The frame is on the wire, so the state it describes must already be
+        // readable — including the boundary a reader would immediately act on.
+        let frame: DaemonMessage = serde_json::from_str(&sessions.recv().await.unwrap()).unwrap();
+        assert!(matches!(frame, DaemonMessage::Session { .. }));
+        assert!(
+            bridge.read_plan("1@s.whatsapp.net", Some("m1")).is_ok(),
+            "a read racing this event would have been refused as stale"
+        );
+    }
+
+    /// A call rings in the daemon, so a window opened during it has no other
+    /// way to learn about the offer: it went out once, before that window
+    /// existed, and no history contains it.
+    #[test]
+    fn a_ringing_call_is_state_a_new_window_can_attach_to() {
+        let mut bridge = bridge();
+        let call = oxidezap_core::IncomingCall {
+            call_id: "call-1".into(),
+            caller_name: "Alice".into(),
+            caller_jid: "1@s.whatsapp.net".into(),
+            is_video: false,
+            is_offline: false,
+            received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        bridge.observe(UiEvent::IncomingCall(call));
+        assert_eq!(bridge.hub.snapshot_ringing().len(), 1);
+
+        // Answered or hung up, it is no longer something to attach to.
+        bridge.observe(UiEvent::CallEnded("call-1".into()));
+        assert!(bridge.hub.snapshot_ringing().is_empty());
     }
 
     /// A failed send changes no state, so no snapshot can carry it: without

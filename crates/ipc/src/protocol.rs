@@ -1,6 +1,6 @@
 //! Messages exchanged over the socket.
 
-use oxidezap_core::{DownloadableMedia, UiEvent};
+use oxidezap_core::{DownloadableMedia, IncomingCall, UiEvent};
 use serde::{Deserialize, Serialize};
 
 /// Monotonic counter over daemon state.
@@ -136,6 +136,14 @@ pub struct StateSnapshot {
     pub version: StateVersion,
     pub connection: ConnectionState,
     pub chats: Vec<ChatSummary>,
+    /// Calls ringing right now.
+    ///
+    /// State rather than an event, because a front end that opens while the
+    /// phone is ringing has no way back to the offer: it went out once,
+    /// before this client existed, and no history contains it. Without this a
+    /// call rings on in the daemon with nothing anywhere to answer it.
+    #[serde(default)]
+    pub ringing: Vec<IncomingCall>,
 }
 
 impl StateSnapshot {
@@ -453,6 +461,7 @@ mod tests {
             version: StateVersion::INITIAL,
             connection: ConnectionState::Connected,
             chats: vec![chat(u32::MAX), chat(5)],
+            ringing: Vec::new(),
         };
         assert_eq!(snapshot.total_unread(), u32::MAX);
     }
@@ -475,6 +484,7 @@ mod tests {
             version: StateVersion::INITIAL,
             connection: ConnectionState::Connected,
             chats: vec![chat.clone()],
+            ringing: Vec::new(),
         };
         assert_eq!(
             snapshot.total_unread(),
