@@ -11,18 +11,22 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   consumes only the library's public event surface. Extracted from
   whatsapp-rust, where it was application logic living in a protocol repo.
 - **oxidezap-session**: the WhatsApp connection: events, sends, store hydration.
-  Knows nothing about how anything is drawn.
+  Knows nothing about how anything is drawn, and nothing about IPC either —
+  the daemon translates requests onto its methods.
 - **oxidezap-ipc**: the wire protocol between the daemon and its front ends.
   Types only, no sockets and no runtime, so a protocol change breaks
-  compilation on both sides rather than a running client.
-- **oxidezap-daemon**: binary `oxidezapd`. Wraps the session, serves front ends
-  over a per-user Unix socket and carries a tray presence. The first consumer
-  of the session crate not knowing how anything is drawn.
-- **oxidezap-gui**: GPUI front end, binary `oxidezap`. Owns video decode, which
-  writes straight into `gpui::RenderImage` and is not reusable off GPUI. Still
-  owns its own session rather than talking to the daemon.
+  compilation on both sides rather than a running client. The domain types in
+  `oxidezap-core` *are* the wire format; this crate adds the framing around
+  them.
+- **oxidezap-daemon**: binary `oxidezapd`. The only process that opens the
+  store or holds a WhatsApp connection. Serves front ends over a per-user Unix
+  socket and carries a tray presence.
+- **oxidezap-gui**: GPUI front end, binary `oxidezap`. Talks to the daemon and
+  starts one if none is listening. Owns video decode, which writes straight
+  into `gpui::RenderImage` and is not reusable off GPUI.
 
-A front end depends on session/core/audio, never the reverse.
+A front end depends on ipc/core/audio and never on session: there is exactly
+one WhatsApp session per user, and it lives in the daemon.
 
 ## Build & verify
 
@@ -30,6 +34,9 @@ A front end depends on session/core/audio, never the reverse.
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings   # what CI enforces
 cargo test --workspace
+
+# Running it: two binaries, and the window looks for the daemon beside itself.
+cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxidezap
 ```
 
 Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is
@@ -48,6 +55,15 @@ profile here repeats it deliberately.
 
 ## Gotchas
 
+- **The front end owns no session.** `oxidezap` starts `oxidezapd` when none is
+  listening and speaks to it; the two ship together and the release packages
+  them in one directory. A front end that cannot reach the daemon has no
+  fallback, by design — a second session on the same store is the thing the
+  split exists to prevent.
+- **Calls ring in the daemon.** `oxidezap-session` is what opens the mic and
+  speaker, so the process that owns the session owns the audio device. That
+  follows from the split rather than being chosen, and it is why a call still
+  works with the window closed.
 - **Logout is not a disconnect.** A server 401 means the stored credentials are
   dead; reconnecting with them loops forever. `AppState::LoggedOut` exists to
   force the only real recovery: wipe local state, pair again.
@@ -119,6 +135,10 @@ list's `&mut Context` closure rejects.
   guides want per-feature entities; that is a bigger change than moving code.
 - **Two large files outside the GUI**: `session/whatsapp.rs` (~2.3k) and
   `chat-store/store.rs` (~3.1k).
+- **A front end cannot say what went wrong with a command.** `Accepted` means
+  the session took it; per-request outcomes would need request ids on more
+  than downloads. A failed send arrives as `SendFailed` against the chat, not
+  against the request that caused it.
 
 Clickable `div`s that remain are deliberate: a chat row and a media thumbnail
 are surfaces, not commands, and have no semantic component to compose from.

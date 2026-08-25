@@ -194,7 +194,14 @@ pub enum DaemonMessage {
     ///
     /// Media bytes are the exception that does not travel: see
     /// [`oxidezap_core::MediaContent::cache_key`].
-    Session(Box<UiEvent>),
+    ///
+    /// A named field rather than a newtype: this enum is internally tagged, so
+    /// a newtype variant is flattened into the same map as `type` — which
+    /// happens to round-trip today and would stop the day an event named a
+    /// field `type`. Nesting it under a key of its own cannot collide.
+    Session {
+        event: Box<UiEvent>,
+    },
     /// The answer to a [`ClientRequest::Download`], by its id.
     ///
     /// A cache key rather than bytes, for the same reason: the client reads
@@ -303,6 +310,13 @@ pub enum ClientRequest {
         id: RequestId,
         media: Box<DownloadableMedia>,
     },
+    /// Ask for the whole history again.
+    ///
+    /// What a client does after [`DaemonMessage::Resync`]: a front end that
+    /// holds messages cannot patch a gap from a snapshot the way a summary
+    /// client can, so it starts over. Sent for it automatically when it
+    /// attaches, which is the same situation.
+    ReloadHistory,
     /// Wipe local state and pair again.
     ///
     /// A server 401 means the stored credentials are dead and reconnecting

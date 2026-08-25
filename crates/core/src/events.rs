@@ -15,6 +15,7 @@ pub use wacore::types::presence::ReceiptType;
 /// which travel through the daemon's cache — see
 /// [`MediaContent::cache_key`](super::chat::MediaContent::cache_key).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UiEvent {
     InitComplete,
     /// Durable history hydrated from the chat store at startup.

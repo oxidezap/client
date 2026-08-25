@@ -401,7 +401,9 @@ impl Bridge {
         }
         let mut event = event.clone();
         externalize_media(&mut event);
-        match serde_json::to_string(&DaemonMessage::Session(Box::new(event))) {
+        match serde_json::to_string(&DaemonMessage::Session {
+            event: Box::new(event),
+        }) {
             Ok(frame) => self.hub.publish_session(frame),
             Err(e) => log::error!("dropping unserializable session event: {e}"),
         }

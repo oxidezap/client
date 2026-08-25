@@ -42,11 +42,15 @@ jobs:
           cat > notes.md <<'NOTES'
           Unsigned development build of `main`. Expect breakage.
 
-          Download the binary for your platform and run it. On Linux and macOS
-          it arrives without the execute bit, so `chmod +x` it first. On macOS
-          also clear the quarantine flag:
+          Download the archive for your platform and unpack it. It holds two
+          binaries that belong together: `oxidezap` is the window, `oxidezapd`
+          holds the WhatsApp session, and the first starts the second when
+          nothing is already running. Keep them in the same directory.
 
-              xattr -dr com.apple.quarantine oxidezap-macos-aarch64
+          On Linux and macOS they arrive without the execute bit, so `chmod +x`
+          them first. On macOS also clear the quarantine flag:
+
+              xattr -dr com.apple.quarantine oxidezap oxidezapd
 
           On Windows, SmartScreen will object. All of this follows from the
           binaries being unsigned.

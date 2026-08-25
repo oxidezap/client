@@ -5759,14 +5759,16 @@ dependencies = [
  "openh264",
  "oxidezap-audio",
  "oxidezap-core",
- "oxidezap-session",
+ "oxidezap-ipc",
  "portable-atomic",
  "qrcode",
  "rust-embed",
+ "serde_json",
  "smallvec",
  "smol",
  "symphonia",
  "tokio",
+ "wacore",
  "whatsapp-rust",
 ]
 

@@ -12,19 +12,21 @@ Read [known limitations](#known-limitations) before relying on it.
 
 ## Layout
 
-The WhatsApp connection lives in `crates/session` and knows nothing about how
-it is drawn, so a front end is a thin consumer of it. `crates/gui` is the
-first one, a GPUI desktop app producing the `oxidezap` binary. A background
-daemon (`oxidezapd`) and a TUI are the reason for the split; neither is
-written yet.
+The WhatsApp connection lives in one background process, `oxidezapd`. It holds
+the session, owns the store, shows a tray icon and serves front ends over a
+per-user socket. `oxidezap` is the GPUI desktop window; it owns no session of
+its own and starts the daemon when none is running. One session per user, one
+process that opens the database, however many windows you like.
 
 | Crate | What it owns |
 | --- | --- |
-| `oxidezap-core` | Domain types: chats, messages, calls, UI events. No UI, no I/O. |
+| `oxidezap-core` | Domain types: chats, messages, calls, UI events. No UI, no I/O — and the daemon's wire format. |
 | `oxidezap-audio` | Capture, playback, Opus encoding, waveforms. |
 | `oxidezap-chat-store` | SQLite chat history materialized from the event stream, with FTS5 search. |
 | `oxidezap-session` | Connection, event stream, sends, store hydration. |
-| `oxidezap-gui` | GPUI front end, plus video decode. |
+| `oxidezap-ipc` | The protocol between the daemon and its front ends. Types only. |
+| `oxidezap-daemon` | `oxidezapd`: the session, the socket and the tray. |
+| `oxidezap-gui` | `oxidezap`: GPUI front end, plus video decode. |
 
 ## Install
 
@@ -32,19 +34,21 @@ Prebuilt binaries for Linux, macOS and Windows are attached to each
 [release](https://github.com/oxidezap/client/releases). Builds of `main` are
 published continuously under the `nightly` tag.
 
-Each asset is the binary itself, named for its platform. On Linux and macOS
-it arrives without the execute bit:
+Each asset holds two binaries that belong together: `oxidezap` is the window
+and `oxidezapd` holds the session. Keep them in the same directory — the
+window looks for the daemon beside itself. On Linux and macOS they arrive
+without the execute bit:
 
 ```bash
-chmod +x oxidezap-linux-x86_64
-./oxidezap-linux-x86_64
+chmod +x oxidezap oxidezapd
+./oxidezap
 ```
 
 The binaries are unsigned, so macOS Gatekeeper and Windows SmartScreen will
 object. On macOS, clear the quarantine flag before the first run:
 
 ```bash
-xattr -dr com.apple.quarantine oxidezap-macos-aarch64
+xattr -dr com.apple.quarantine oxidezap oxidezapd
 ```
 
 ## Build
@@ -55,7 +59,10 @@ development packages:
 ```bash
 sudo apt install libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev \
   libwayland-dev libxcb1-dev libfontconfig1-dev libfreetype6-dev
-cargo run --release
+
+# Both, because the window starts the daemon beside itself.
+cargo build --release --bin oxidezap --bin oxidezapd
+./target/release/oxidezap
 ```
 
 The first build compiles the GPUI tree and takes a while. Debug builds keep

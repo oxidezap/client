@@ -11,6 +11,7 @@ mod assets;
 mod components;
 mod layout;
 mod responsive;
+mod session;
 mod theme;
 mod utils;
 mod video;

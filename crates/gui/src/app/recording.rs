@@ -103,23 +103,25 @@ impl WhatsAppApp {
             recorded.duration_secs
         );
 
-        let Some(runtime) = self.client.as_ref().map(WhatsAppClient::runtime) else {
-            warn!("Cannot send audio: client is unavailable");
+        if self.client.is_none() {
+            warn!("Cannot send audio: not connected to the daemon");
             self.recording_state = RecordingState::Idle;
             self.update_input_recording(cx);
             cx.notify();
             return;
-        };
+        }
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let encoded = runtime
-                .spawn_blocking(move || {
+            // GPUI's own background pool. This used to borrow the session's
+            // tokio runtime, which was only ever within reach because the
+            // session lived in this process.
+            let encoded = cx
+                .background_spawn(async move {
                     let waveform = generate_waveform(&recorded.samples);
                     encode_to_opus_ogg(&recorded)
                         .map(|ogg| (ogg, waveform, recorded.duration_secs))
                         .map_err(|error| error.to_string())
                 })
-                .await
-                .unwrap_or_else(|error| Err(format!("encoder task failed: {error}")));
+                .await;
             let _ = entity.update(cx, |app, cx| {
                 app.finish_recording_send(jid, encoded, cx);
             });

@@ -70,25 +70,30 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Both binaries, because they are one product now: the front end owns no
+      # WhatsApp session and starts `oxidezapd` beside itself when none is
+      # running. Shipping the UI alone would ship something that cannot
+      # connect to anything.
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin oxidezap
+        run: cargo build --release --target ${{ matrix.target }} --bin oxidezap --bin oxidezapd
 
-      - name: Name the binary for its platform
+      - name: Name the binaries for their platform
         shell: bash
         run: |
           set -euo pipefail
-          # The binary is the deliverable. Wrapping it in a tarball of a
-          # directory meant three unpackings before reaching it, since
-          # upload-artifact zips whatever it is given regardless.
+          # A directory rather than the bare binary this used to be: the two
+          # have to land beside each other, and upload-artifact zips whatever
+          # it is given regardless.
+          out="oxidezap-${{ inputs.version }}-${{ matrix.name }}"
+          mkdir -p "$out"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            src="target/${{ matrix.target }}/release/oxidezap.exe"
-            dst="oxidezap-${{ inputs.version }}-${{ matrix.name }}.exe"
+            mv "target/${{ matrix.target }}/release/oxidezap.exe" "$out/"
+            mv "target/${{ matrix.target }}/release/oxidezapd.exe" "$out/"
           else
-            src="target/${{ matrix.target }}/release/oxidezap"
-            dst="oxidezap-${{ inputs.version }}-${{ matrix.name }}"
+            mv "target/${{ matrix.target }}/release/oxidezap" "$out/"
+            mv "target/${{ matrix.target }}/release/oxidezapd" "$out/"
           fi
-          mv "$src" "$dst"
-          echo "ASSET=$dst" >> "$GITHUB_ENV"
+          echo "ASSET=$out" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v5
         with:

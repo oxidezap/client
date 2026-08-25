@@ -771,6 +771,9 @@ async fn handle_request(
             )
             .await,
         ),
+        ClientRequest::ReloadHistory => {
+            Answer::frame(dispatch(hub, commands, Action::ReloadHistory).await)
+        }
         // Not gated on being connected: dead credentials are exactly when the
         // account is unreachable, and refusing the only recovery then would
         // leave the user with no way out.

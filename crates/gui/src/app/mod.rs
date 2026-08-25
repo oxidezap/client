@@ -42,6 +42,7 @@ use log::{debug, error, info, warn};
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 
 use crate::responsive::{MobilePanel, ResponsiveLayout};
+use crate::session::Session;
 use crate::utils::mime_to_image_format;
 use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
 use crate::views::pairing::generate_qr_png;
@@ -54,7 +55,6 @@ use oxidezap_core::{
     AppState, CachedQrCode, Chat, ChatMessage, DownloadableMedia, IncomingCall, MediaContent,
     MediaType, OutgoingCall, ReceiptType, UiEvent,
 };
-use oxidezap_session::{ReadBoundary, WhatsAppClient};
 
 // ChatListCache is now in chats.rs and re-exported above
 // RecordingState is now in media/mod.rs and re-exported above
@@ -260,7 +260,7 @@ pub struct WhatsAppApp {
     /// Currently selected chat JID
     selected_chat: Option<String>,
     /// WhatsApp client wrapper
-    client: Option<WhatsAppClient>,
+    client: Option<Session>,
     /// Scroll handle for chat list
     chat_list_scroll: VirtualListScrollHandle,
     /// Focus handle for chat list keyboard navigation
@@ -288,6 +288,11 @@ pub struct WhatsAppApp {
     /// Background task for event polling (must be retained)
     #[allow(dead_code)]
     event_task: Option<Task<()>>,
+    /// Reconnecting to the daemon, which can mean starting one and waiting
+    /// for it to listen. Retained for the same reason: dropping the task
+    /// cancels it.
+    #[allow(dead_code)]
+    reconnect_task: Option<Task<()>>,
     /// Audio recorder for PTT messages
     audio_recorder: AudioRecorder,
     /// Current recording state
@@ -350,10 +355,7 @@ impl WhatsAppApp {
 
     /// Create a new WhatsApp application
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let bootstrap = WhatsAppClient::new().and_then(|mut client| {
-            let ui_rx = client.start().map_err(std::io::Error::other)?;
-            Ok((client, ui_rx))
-        });
+        let bootstrap = Session::connect();
         let (app_state, client, event_task) = match bootstrap {
             Ok((client, ui_rx)) => (
                 AppState::Loading,
@@ -361,7 +363,7 @@ impl WhatsAppApp {
                 Some(Self::spawn_event_task(ui_rx, cx)),
             ),
             Err(e) => (
-                AppState::Error(format!("Failed to start client: {e}")),
+                AppState::Error(format!("Failed to reach the daemon: {e}")),
                 None,
                 None,
             ),
@@ -383,6 +385,7 @@ impl WhatsAppApp {
             composing_chat: None,
             drafts: HashMap::new(),
             event_task,
+            reconnect_task: None,
             audio_recorder: AudioRecorder::new(),
             recording_state: RecordingState::default(),
             recording_chat: None,
@@ -534,25 +537,6 @@ impl WhatsAppApp {
     /// Find a chat by JID (mutable)
     fn find_chat_mut(&mut self, jid: &str) -> Option<&mut Chat> {
         self.chats.iter_mut().find(|c| c.jid == jid)
-    }
-
-    fn read_boundary(chat: &Chat) -> Option<ReadBoundary> {
-        let last = chat.messages.last()?;
-        let ts_secs = last.timestamp.timestamp();
-        let ids = chat
-            .messages
-            .iter()
-            .rev()
-            .take_while(|message| message.timestamp.timestamp() == ts_secs)
-            .map(|message| {
-                (
-                    message.id.clone(),
-                    message.is_from_me,
-                    (!message.is_from_me).then(|| message.sender.clone()),
-                )
-            })
-            .collect();
-        Some((ts_secs, ids))
     }
 
     /// Add a message to a chat, bumping it to the top of the list only when
@@ -781,39 +765,18 @@ impl WhatsAppApp {
             }
         }
 
-        // Collect unread messages from others to send read receipts
-        let unread_messages: Vec<(String, String)> = self
-            .find_chat(&jid)
-            .map(|chat| {
-                chat.messages
-                    .iter()
-                    .filter(|msg| !msg.is_from_me && !msg.is_read)
-                    .map(|msg| (msg.id.clone(), msg.sender.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Send read receipts to WhatsApp
-        if !unread_messages.is_empty() {
-            info!(
-                "Sending read receipts for {} messages in {}",
-                unread_messages.len(),
-                observe_str(&jid)
-            );
-            if let Some(client) = &self.client {
-                client.send_read_receipts(&jid, unread_messages);
-            }
-        }
-
-        // The bounded action also covers unread rows not loaded by the UI.
+        // One request, where this used to send receipts and a bounded chat
+        // action separately: the daemon owns both, along with the boundary
+        // that keeps a read from swallowing anything newer. All it needs from
+        // here is the message this side is looking at.
         if let Some(chat) = self
             .find_chat(&jid)
             .filter(|c| c.unread_count > 0 || c.manually_unread)
         {
-            // Include same-second siblings so none can re-badge on hydration.
-            let last_displayed = Self::read_boundary(chat);
+            info!("Marking {} read", observe_str(&jid));
+            let newest = chat.messages.last().map(|m| m.id.clone());
             if let Some(client) = &self.client {
-                client.mark_chat_read(&jid, last_displayed);
+                client.mark_chat_read(&jid, newest);
             }
         }
 
@@ -836,14 +799,17 @@ impl WhatsAppApp {
     ///
     /// Split from [`retry_connection`](Self::retry_connection) because the
     /// server rejected the stored credentials: reconnecting with them is the
-    /// 401 loop. The client is torn down first so nothing holds the SQLite file
-    /// open while it is deleted.
+    /// 401 loop. The store belongs to the daemon, so the wipe is a request
+    /// rather than something this side does: it is the process holding the
+    /// SQLite file open, and it stops itself once the file is gone.
     pub fn reset_and_pair_again(&mut self, cx: &mut Context<Self>) {
         self.app_state = AppState::Loading;
 
-        if let Some(client) = self.client.take() {
-            client.shutdown();
-        }
+        let asked = self
+            .client
+            .take()
+            .inspect(Session::forget_session)
+            .is_some();
         self.event_task.take();
 
         // Everything hydrated from the old device is now stale.
@@ -851,41 +817,51 @@ impl WhatsAppApp {
         self.selected_chat = None;
         self.message_list_cache.borrow_mut().clear();
 
-        if let Err(e) = oxidezap_session::wipe_local_state() {
-            self.app_state = AppState::Error(format!("Failed to clear local data: {e}"));
+        if !asked {
+            self.app_state =
+                AppState::Error("Not connected to the daemon, so nothing was cleared".to_string());
             cx.notify();
             return;
         }
 
-        self.retry_connection(cx);
+        // Only once the old daemon has gone. Reconnecting now would land on
+        // the socket of the process that is still closing the database it has
+        // just been told to delete.
+        self.reconnect_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            cx.background_spawn(async { Session::wait_for_shutdown() })
+                .await;
+            let _ = entity.update(cx, |app, cx| app.retry_connection(cx));
+        }));
+        cx.notify();
     }
 
     pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
         self.app_state = AppState::Loading;
 
-        // Tear down the old client's background thread first; otherwise every
-        // retry stacks another live runtime + DB pool on the same file.
-        if let Some(client) = self.client.take() {
-            client.shutdown();
-        }
+        // Drop the old connection first: a second one alongside it would be
+        // served the whole history again for nothing.
+        self.client.take();
         self.event_task.take();
 
-        // A failed rebuild routes back to the error screen (retry stays
-        // available) instead of panicking the UI thread.
-        match WhatsAppClient::new() {
-            Ok(mut client) => match client.start() {
-                Ok(ui_rx) => {
-                    self.event_task = Some(Self::spawn_event_task(ui_rx, cx));
-                    self.client = Some(client);
+        // Off the UI thread: connecting can mean starting a daemon and
+        // waiting for it to listen, which is a spinner rather than a frozen
+        // window only if it happens somewhere else. A failure routes back to
+        // the error screen, where retry stays available.
+        self.reconnect_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let connected = cx.background_spawn(async { Session::connect() }).await;
+            let _ = entity.update(cx, |app, cx| {
+                match connected {
+                    Ok((client, ui_rx)) => {
+                        app.event_task = Some(Self::spawn_event_task(ui_rx, cx));
+                        app.client = Some(client);
+                    }
+                    Err(e) => {
+                        app.app_state = AppState::Error(format!("Failed to reach the daemon: {e}"));
+                    }
                 }
-                Err(e) => {
-                    self.app_state = AppState::Error(format!("Failed to restart client: {e}"));
-                }
-            },
-            Err(e) => {
-                self.app_state = AppState::Error(format!("Failed to restart client: {e}"));
-            }
-        }
+                cx.notify();
+            });
+        }));
         cx.notify();
     }
 
@@ -1103,9 +1079,8 @@ impl WhatsAppApp {
 
         // A message landing in the currently open chat is read immediately:
         // receipt out now, no badge (select_chat won't re-run to send it).
-        let read_now = (!message.is_from_me
-            && self.selected_chat.as_deref() == Some(chat_jid.as_str()))
-        .then(|| (message.id.clone(), message.sender.clone()));
+        let read_now =
+            !message.is_from_me && self.selected_chat.as_deref() == Some(chat_jid.as_str());
 
         // Cache the sender's name if provided
         if let Some(ref name) = sender_name {
@@ -1180,12 +1155,13 @@ impl WhatsAppApp {
             self.invalidate_chat_cache();
         }
 
-        if let Some(receipt) = read_now {
-            let boundary = self.find_chat(&chat_jid).and_then(Self::read_boundary);
+        if read_now {
+            let newest = self
+                .find_chat(&chat_jid)
+                .and_then(|chat| chat.messages.last().map(|m| m.id.clone()));
             if let Some(client) = &self.client {
-                client.send_read_receipts(&chat_jid, vec![receipt]);
-                // Persist this immediate read so hydration cannot re-badge it.
-                client.mark_chat_read(&chat_jid, boundary);
+                // Receipt and the persisted read in one: see `select_chat`.
+                client.mark_chat_read(&chat_jid, newest);
             }
             if let Some(chat) = self.find_chat_mut(&chat_jid) {
                 chat.mark_as_read();
