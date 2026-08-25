@@ -220,6 +220,13 @@ pub struct WhatsAppClient {
     /// thread would keep its runtime and SQLite pool alive forever (bot.run()
     /// reconnects internally and never returns on its own).
     shutdown: Arc<tokio::sync::Notify>,
+    /// Asks the history reloader for a full pass.
+    ///
+    /// The reloader is otherwise driven by store invalidations, which is right
+    /// while a front end is attached and wrong the moment one attaches: it has
+    /// no chats and nothing has changed, so nothing would arrive until the
+    /// next message did.
+    reload: Arc<tokio::sync::Notify>,
     /// The session thread, kept joinable.
     ///
     /// `shutdown()` only asks it to stop; the thread still has to disconnect
@@ -249,6 +256,7 @@ impl WhatsAppClient {
             calls: CallRegistry::default(),
             chat_store: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            reload: Arc::new(tokio::sync::Notify::new()),
             worker: None,
             started: false,
         })
@@ -320,6 +328,7 @@ impl WhatsAppClient {
         let chat_store = self.chat_store.clone();
         let runtime = self.runtime.clone();
         let shutdown = self.shutdown.clone();
+        let reload = self.reload.clone();
 
         let spawned = std::thread::Builder::new()
             .name("oxidezap-session".to_string())
@@ -336,6 +345,7 @@ impl WhatsAppClient {
                         chat_store,
                         ui_sender.clone(),
                         shutdown,
+                        reload,
                     )
                     .await;
                 });
@@ -359,6 +369,7 @@ impl WhatsAppClient {
         chat_store_handle: ChatStoreHandle,
         ui_sender: UiEventSender,
         shutdown: Arc<tokio::sync::Notify>,
+        reload: Arc<tokio::sync::Notify>,
     ) {
         // Device store + durable chat history share one SQLite file (one pool,
         // one WAL writer).
@@ -446,7 +457,13 @@ impl WhatsAppClient {
         // never observe pre-commit state (no flush barrier, no dispatch-order
         // dependency), and the debounce coalesces history-sync bursts into one
         // reload. HistoryLoaded merges, so re-sending is safe.
-        Self::spawn_history_reloader(chat_store.subscribe(), chat_store.clone(), &bot, &ui_tx);
+        Self::spawn_history_reloader(
+            chat_store.subscribe(),
+            chat_store.clone(),
+            &bot,
+            &ui_tx,
+            reload,
+        );
 
         // Store client reference for UI to use
         {
@@ -537,7 +554,7 @@ impl WhatsAppClient {
                         caller_name,
                         caller_jid,
                         *is_video,
-                        offer,
+                        &offer,
                     );
                     let _ = ui_tx.send(UiEvent::IncomingCall(ui_call));
                 }
@@ -778,6 +795,7 @@ impl WhatsAppClient {
             return Some(MediaContent {
                 media_type: MediaType::Sticker,
                 data: Arc::new(data),
+                cache_key: None,
                 mime_type,
                 width: sticker.width,
                 height: sticker.height,
@@ -832,6 +850,7 @@ impl WhatsAppClient {
             return Some(MediaContent {
                 media_type: MediaType::Image,
                 data: Arc::new(data),
+                cache_key: None,
                 mime_type,
                 width: image.width,
                 height: image.height,
@@ -877,6 +896,7 @@ impl WhatsAppClient {
                 return Some(MediaContent {
                     media_type: MediaType::Video,
                     data: Arc::new(thumbnail_data),
+                    cache_key: None,
                     mime_type: "image/jpeg".to_string(), // Thumbnail is JPEG
                     width: video.width,
                     height: video.height,
@@ -912,6 +932,7 @@ impl WhatsAppClient {
                 return Some(MediaContent {
                     media_type: MediaType::Audio,
                     data: Arc::new(vec![]), // Empty until downloaded
+                    cache_key: None,
                     mime_type: mime_type.to_string(),
                     width: None,
                     height: None,
@@ -941,6 +962,7 @@ impl WhatsAppClient {
             return Some(MediaContent {
                 media_type: MediaType::Document,
                 data: Arc::new(vec![]),
+                cache_key: None,
                 mime_type: mime,
                 width: None,
                 height: None,
@@ -1071,6 +1093,8 @@ impl WhatsAppClient {
     }
 
     /// Send a PTT audio message to a chat
+    /// Returns a handle that completes when the send has run its course; see
+    /// [`WhatsAppClient::send_message`] for why.
     pub fn send_audio_message(
         &self,
         jid_str: &str,
@@ -1078,7 +1102,7 @@ impl WhatsAppClient {
         duration_secs: u32,
         waveform: Vec<u8>,
         local_id: String,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let chat_store = self.chat_store.clone();
         let ui_sender = self.ui_sender.clone();
         let client_handle = self.client_handle.clone();
@@ -1165,7 +1189,7 @@ impl WhatsAppClient {
                 )
                 .await;
             }
-        });
+        })
     }
 
     /// Send "composing" chat state (typing indicator)
@@ -1291,6 +1315,15 @@ impl WhatsAppClient {
                 error!("Client not available for sending read receipts");
             }
         })
+    }
+
+    /// Ask for a full history reload.
+    ///
+    /// For a front end that has just attached: nothing in the store has
+    /// changed, so the invalidation stream has nothing to say, and without
+    /// this the new arrival would sit empty until the next message arrived.
+    pub fn reload_history(&self) {
+        self.reload.notify_one();
     }
 
     /// Synchronize a bounded read action so newer messages remain unread.
@@ -1643,6 +1676,7 @@ impl WhatsAppClient {
         chat_store: Arc<ChatStore>,
         bot: &Bot,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
+        reload: Arc<tokio::sync::Notify>,
     ) {
         use tokio::sync::broadcast::error::RecvError;
 
@@ -1652,10 +1686,16 @@ impl WhatsAppClient {
             let mut open = true;
             while open {
                 let mut scope = ReloadScope::empty();
-                match changes.recv().await {
-                    Ok(change) => scope.widen(Some(&change)),
-                    Err(RecvError::Lagged(_)) => scope.widen(None),
-                    Err(RecvError::Closed) => break,
+                // Either a store change or somebody asking outright. An
+                // explicit ask widens to everything, because the asker is a
+                // front end that has just attached and holds nothing.
+                tokio::select! {
+                    change = changes.recv() => match change {
+                        Ok(change) => scope.widen(Some(&change)),
+                        Err(RecvError::Lagged(_)) => scope.widen(None),
+                        Err(RecvError::Closed) => break,
+                    },
+                    () = reload.notified() => scope.widen(None),
                 }
                 // Drain the burst; a quiet window flushes the reload.
                 loop {
@@ -1958,6 +1998,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
         return Some(MediaContent {
             media_type: MediaType::Sticker,
             data: Arc::new(thumbnail),
+            cache_key: None,
             mime_type: if has_preview {
                 "image/png".to_string()
             } else {
@@ -1999,6 +2040,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
         return Some(MediaContent {
             media_type: MediaType::Image,
             data: Arc::new(thumbnail),
+            cache_key: None,
             mime_type: "image/jpeg".to_string(),
             width: image.width,
             height: image.height,
@@ -2038,6 +2080,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
         return Some(MediaContent {
             media_type: MediaType::Video,
             data: Arc::new(thumbnail),
+            cache_key: None,
             mime_type: "image/jpeg".to_string(),
             width: video.width,
             height: video.height,
@@ -2067,6 +2110,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
         return Some(MediaContent {
             media_type: MediaType::Audio,
             data: Arc::new(vec![]),
+            cache_key: None,
             mime_type: mime.clone(),
             width: None,
             height: None,
@@ -2093,6 +2137,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
         return Some(MediaContent {
             media_type: MediaType::Document,
             data: Arc::new(vec![]),
+            cache_key: None,
             mime_type: mime,
             width: None,
             height: None,

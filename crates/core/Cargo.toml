@@ -10,7 +10,12 @@ repository.workspace = true
 
 [dependencies]
 async-trait = "0.1"
-chrono = { workspace = true, features = ["std", "clock"] }
+# `serde` on chrono: message and chat timestamps cross the daemon socket.
+chrono = { workspace = true, features = ["std", "clock", "serde"] }
+# These types are the daemon's wire format as well as its domain model: a
+# front end in another process receives `UiEvent` itself rather than a
+# parallel set of protocol structs that would have to be kept in step.
+serde = { workspace = true }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 

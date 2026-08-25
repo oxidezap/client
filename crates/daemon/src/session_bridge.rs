@@ -11,9 +11,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use oxidezap_core::{Chat, ChatMessage, UiEvent};
+use oxidezap_core::{Chat, ChatMessage, MediaContent, UiEvent};
 use oxidezap_ipc::{
-    ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview, PairingCode,
+    CallAction, ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview,
+    PairingCode, RequestId,
 };
 use oxidezap_session::{ReadBoundary, WhatsAppClient};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -31,6 +32,15 @@ pub enum Action {
     SendText {
         jid: String,
         text: String,
+        local_id: Option<String>,
+    },
+    SendAudio {
+        jid: String,
+        /// Cache key the client wrote the encoded audio under.
+        upload: String,
+        duration_secs: u32,
+        waveform: Vec<u8>,
+        local_id: Option<String>,
     },
     MarkRead {
         jid: String,
@@ -38,7 +48,44 @@ pub enum Action {
         /// [`oxidezap_ipc::ClientRequest::MarkRead`].
         through_message_id: Option<String>,
     },
+    Typing {
+        jid: String,
+        composing: bool,
+    },
+    Call(CallAction),
+    /// Fetch media and answer on `answer_to` rather than through the command's
+    /// own reply, which resolves in microseconds while this takes seconds.
+    Download {
+        id: RequestId,
+        media: Box<oxidezap_core::DownloadableMedia>,
+        answer_to: Outbox,
+    },
+    /// Reload the whole history, for a front end that has just attached and
+    /// holds nothing.
+    ReloadHistory,
+    /// Wipe local state so the user can pair again. The daemon owns the store
+    /// file, so it is the only process that may delete it.
+    ForgetSession,
 }
+
+impl Action {
+    /// Whether carrying this out needs a live connection to WhatsApp.
+    ///
+    /// Reloading history reads the local store and forgetting the session
+    /// deletes it. Gating those on a connection refuses them exactly when
+    /// they are wanted: dead credentials are a state the account is
+    /// unreachable in by definition, and re-pairing is the only way out of it.
+    pub fn needs_network(&self) -> bool {
+        !matches!(self, Self::ReloadHistory | Self::ForgetSession)
+    }
+}
+
+/// Frames addressed to one connection rather than broadcast.
+///
+/// A download's answer belongs to the client that asked for it: ids are
+/// client-chosen, so putting them on a shared channel would hand one front
+/// end another's media.
+pub type Outbox = tokio::sync::mpsc::Sender<String>;
 
 /// An action plus the channel its answer goes back on.
 ///
@@ -117,7 +164,14 @@ pub async fn run(
                 None => break,
             },
             command = commands.recv(), if !commands_closed => match command {
-                Some(command) => bridge.execute(&client, command),
+                Some(command) => {
+                    bridge.execute(&client, command);
+                    // Asked to forget: stop here so the teardown below runs
+                    // before anything deletes the file it is closing.
+                    if bridge.forget {
+                        break;
+                    }
+                }
                 None => commands_closed = true,
             },
             () = &mut shutdown => break,
@@ -133,6 +187,16 @@ pub async fn run(
     // allowed").
     if let Err(e) = tokio::task::spawn_blocking(move || close(client)).await {
         log::error!("session teardown did not complete: {e}");
+    }
+
+    // After the teardown, never before: the store is one file and the session
+    // was holding it open. Unlinking it first leaves the closing session free
+    // to write a fresh WAL beside a database that is already gone.
+    if bridge.forget {
+        match oxidezap_session::wipe_local_state() {
+            Ok(()) => log::info!("local state wiped; pair again on the next start"),
+            Err(e) => log::error!("could not wipe local state: {e}"),
+        }
     }
     Ok(())
 }
@@ -155,16 +219,53 @@ pub fn close(mut client: WhatsAppClient) {
 /// Everything the event loop carries between one event and the next.
 struct Bridge {
     hub: Arc<StateHub>,
+    /// Events on their way to the front ends that asked for them.
+    ///
+    /// A thread of its own, because preparing one writes every photo it
+    /// carries to the cache: a history load is one event and hundreds of
+    /// synchronous writes, and doing that on a runtime worker stops the accept
+    /// loop, every connection task and the shutdown branch for its duration.
+    /// One thread, and a queue, so the order the daemon publishes in is still
+    /// the order things happened.
+    publish: tokio::sync::mpsc::UnboundedSender<UiEvent>,
     reads: ReadTracker,
     in_flight: Arc<Semaphore>,
+    /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
+    /// and wipes once the session has let go of the store.
+    forget: bool,
 }
 
 impl Bridge {
     fn new(hub: Arc<StateHub>) -> Self {
+        // Unbounded, and the bound that matters is upstream: the only producer
+        // is the event loop draining the session's own unbounded channel, so a
+        // limit here could only stall the loop this exists to unblock or drop
+        // events no client could then recover.
+        let (publish, mut queue) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
+        let publisher = Arc::clone(&hub);
+        std::thread::Builder::new()
+            .name("oxidezap-publish".to_string())
+            .spawn(move || {
+                while let Some(mut event) = queue.blocking_recv() {
+                    externalize_media(&mut event);
+                    match serde_json::to_string(&DaemonMessage::Session {
+                        event: Box::new(event),
+                    }) {
+                        Ok(frame) => publisher.publish_session(frame),
+                        Err(e) => log::error!("dropping unserializable session event: {e}"),
+                    }
+                }
+            })
+            // A daemon that cannot spawn a thread is a daemon that will not
+            // get far; failing here beats doing the writes on a worker.
+            .expect("spawning the publish thread");
+
         Self {
             hub,
+            publish,
             reads: ReadTracker::default(),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            forget: false,
         }
     }
 
@@ -178,6 +279,23 @@ impl Bridge {
             self.hub.signal(&frame);
         }
 
+        // A ringing call is state, not just an event: see
+        // `StateSnapshot::ringing`.
+        match &event {
+            UiEvent::IncomingCall(call) => self.hub.start_ringing(call.clone()),
+            UiEvent::CallAccepted(id) | UiEvent::CallEnded(id) => self.hub.stop_ringing(id),
+            _ => {}
+        }
+
+        // Cloned before `translate` consumes it, queued after the hub has it.
+        // A front end reacts to what it is told the instant it is told — a
+        // message arriving in the open chat is marked read immediately — and
+        // the runtime is multithreaded, so that `MarkRead` can reach another
+        // worker while this one has not applied the message yet. `read_plan`
+        // would refuse it as stale, after the client had cleared its own badge
+        // and with nothing to make it ask again.
+        let pending = self.hub.wants_session_events().then(|| event.clone());
+
         for change in self.translate(event) {
             // A chat that left the store owes nothing and will never be read
             // again; keeping its ids would leak one entry per deleted
@@ -186,6 +304,12 @@ impl Bridge {
                 self.reads.forget(jid);
             }
             self.hub.apply(change);
+        }
+
+        if let Some(event) = pending {
+            // The receiver lives as long as the thread, which lives as long as
+            // the daemon.
+            let _ = self.publish.send(event);
         }
     }
 
@@ -204,29 +328,150 @@ impl Bridge {
         // to a command it cannot carry out is a log line the requester never
         // sees.
         let connection = self.hub.connection();
-        if !connection.is_connected() {
+        if action.needs_network() && !connection.is_connected() {
             return CommandOutcome::NoSession(format!("not connected: {connection:?}"));
         }
 
         match action {
-            Action::SendText { jid, text } => {
+            Action::SendText {
+                jid,
+                text,
+                local_id,
+            } => {
                 let Some(permit) = self.permit() else {
                     return too_busy();
                 };
-                // The optimistic bubble a GUI would draw has no equivalent
-                // here: the daemon holds summaries, not messages, and the
-                // store's reload republishes the chat once the row lands. The
-                // local id still has to be unique, because the session renames
-                // it to the real message id and a collision would rename the
+                // The id is the client's when it has one: it drew the message
+                // before it was sent and cannot match the rename otherwise.
+                // The daemon makes one up for a client that draws nothing — it
+                // still has to be unique, because a collision would rename the
                 // wrong send.
-                hold(permit, [client.send_message(&jid, &text, next_local_id())]);
+                hold(
+                    permit,
+                    [client.send_message(&jid, &text, local_id.unwrap_or_else(next_local_id))],
+                );
+                CommandOutcome::Accepted
+            }
+            Action::SendAudio {
+                jid,
+                upload,
+                duration_secs,
+                waveform,
+                local_id,
+            } => {
+                // Through the cache, not the socket: a voice note is the one
+                // thing a client sends that is too big for a frame. Taken
+                // rather than read: the client wrote it directly, so its bytes
+                // never counted toward the cache's own sweep and nothing else
+                // would ever remove it.
+                let Some(audio) = crate::media::take(&upload) else {
+                    return CommandOutcome::Refused(format!(
+                        "no audio cached under {upload}; write it before sending"
+                    ));
+                };
+                let Some(permit) = self.permit() else {
+                    return too_busy();
+                };
+                hold(
+                    permit,
+                    [client.send_audio_message(
+                        &jid,
+                        audio,
+                        duration_secs,
+                        waveform,
+                        local_id.unwrap_or_else(next_local_id),
+                    )],
+                );
                 CommandOutcome::Accepted
             }
             Action::MarkRead {
                 jid,
                 through_message_id,
             } => self.mark_read(client, &jid, through_message_id.as_deref()),
+            // No permit: these send one small stanza and hold nothing open,
+            // and a typing indicator refused for being busy would be a worse
+            // answer than a late one.
+            Action::Typing { jid, composing } => {
+                if composing {
+                    client.send_composing(&jid);
+                } else {
+                    client.send_paused(&jid);
+                }
+                CommandOutcome::Accepted
+            }
+            Action::Call(action) => {
+                match action {
+                    CallAction::Start {
+                        jid,
+                        video,
+                        placeholder_id,
+                    } => client.start_call(&jid, video, placeholder_id),
+                    CallAction::Accept { call_id } => client.accept_call(&call_id),
+                    CallAction::Decline { call_id } => client.decline_call(&call_id),
+                    CallAction::Cancel { call_id } => client.cancel_call(&call_id),
+                    CallAction::SetMuted { call_id, muted } => {
+                        client.set_call_muted(&call_id, muted);
+                    }
+                }
+                CommandOutcome::Accepted
+            }
+            Action::Download {
+                id,
+                media,
+                answer_to,
+            } => self.download(client, id, *media, answer_to),
+            Action::ReloadHistory => {
+                client.reload_history();
+                CommandOutcome::Accepted
+            }
+            // Deferred rather than done here, because the file to delete is
+            // the one the session still has open. The event loop already ends
+            // by disconnecting and closing SQLite; the wipe belongs after
+            // that, and reusing that path is what makes the ordering hold.
+            Action::ForgetSession => {
+                self.forget = true;
+                CommandOutcome::Accepted
+            }
         }
+    }
+
+    /// Fetch media and answer the connection that asked.
+    ///
+    /// Answered out of band because it takes seconds: holding the command's
+    /// own reply open would stop that connection reading anything else, and a
+    /// front end scrolling a chat asks for several at once.
+    fn download(
+        &self,
+        client: &WhatsAppClient,
+        id: RequestId,
+        media: oxidezap_core::DownloadableMedia,
+        answer_to: Outbox,
+    ) -> CommandOutcome {
+        let key = crate::media::download_key(&media.file_enc_sha256);
+        // Already here: the same media shared into two chats, or a front end
+        // that restarted. No network, no permit, no wait.
+        if crate::media::has(&key) {
+            let _ = answer_to.try_send(downloaded(id, Ok(key)));
+            return CommandOutcome::Accepted;
+        }
+
+        let Some(permit) = self.permit() else {
+            return too_busy();
+        };
+        let bytes = client.download_downloadable_media(media);
+        tokio::spawn(async move {
+            let result = match bytes.await {
+                Ok(Ok(bytes)) => crate::media::put(&key, &bytes).map_err(|e| e.to_string()),
+                Ok(Err(e)) => Err(e),
+                // The session went away mid-download.
+                Err(_) => Err("the session stopped before the download finished".to_string()),
+            };
+            // `try_send` rather than `send`: a client that has stopped reading
+            // its own answers must not park this task forever.
+            let _ = answer_to.try_send(downloaded(id, result));
+            drop(permit);
+        });
+        CommandOutcome::Accepted
     }
 
     /// Mark a chat read, no further than the requester has actually seen.
@@ -476,6 +721,52 @@ fn too_busy() -> CommandOutcome {
     CommandOutcome::Refused(format!(
         "{MAX_IN_FLIGHT} operations are already in flight; retry shortly"
     ))
+}
+
+/// Move an event's media bytes into the cache and leave a key behind.
+///
+/// The bytes stay where they were in this process — `data` is skipped by
+/// serde, so the frame carries the key alone. A front end reads the file once
+/// and decodes it into the image cache it already keeps.
+///
+/// Writing is skipped for anything already cached, which is most of it after
+/// the first attach: a message's media is addressed by its message id, and a
+/// message's media does not change.
+fn externalize_media(event: &mut UiEvent) {
+    match event {
+        UiEvent::MessageReceived { message, .. } => cache_media(&message.id, &mut message.media),
+        UiEvent::HistoryLoaded { chats, .. } => {
+            for chat in chats {
+                for message in &mut chat.messages {
+                    let id = message.id.clone();
+                    cache_media(&id, &mut message.media);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cache_media(message_id: &str, media: &mut Option<MediaContent>) {
+    let Some(media) = media else { return };
+    if media.data.is_empty() {
+        return;
+    }
+    let key = crate::media::message_key(message_id);
+    match crate::media::put(&key, &media.data) {
+        Ok(key) => media.cache_key = Some(key),
+        // The front end still gets the message; the media renders as the
+        // download it also is. A cache that cannot be written is not a reason
+        // to drop a conversation.
+        Err(e) => log::warn!("could not cache media for a message: {e}"),
+    }
+}
+
+fn downloaded(id: RequestId, result: Result<String, String>) -> String {
+    // A `Result<String, String>` cannot fail to serialize, so the fallback is
+    // unreachable; spelling it out beats an unwrap in a spawned task.
+    serde_json::to_string(&DaemonMessage::Downloaded { id, result })
+        .unwrap_or_else(|e| format!(r#"{{"type":"error","error":"malformed","detail":"{e}"}}"#))
 }
 
 /// A frame that is news rather than state, if this event is one.
@@ -1084,6 +1375,53 @@ mod tests {
     #[test]
     fn an_absurd_pairing_lifetime_saturates_rather_than_wrapping() {
         assert_eq!(deadline_ms(u64::MAX), i64::MAX);
+    }
+
+    /// A front end reacts to what it is told the instant it is told, and the
+    /// runtime is multithreaded. Publishing before applying lets a `MarkRead`
+    /// racing a message find a hub that has not seen it — refused as stale,
+    /// after the client had already cleared its own badge.
+    #[tokio::test]
+    async fn the_hub_is_current_before_anyone_is_told() {
+        let mut bridge = bridge();
+        let mut sessions = bridge.hub.subscribe_sessions();
+
+        bridge.observe(received(
+            "1@s.whatsapp.net",
+            message("m1", "1@s.whatsapp.net", 10, false, false),
+            None,
+        ));
+
+        // The frame is on the wire, so the state it describes must already be
+        // readable — including the boundary a reader would immediately act on.
+        let frame: DaemonMessage = serde_json::from_str(&sessions.recv().await.unwrap()).unwrap();
+        assert!(matches!(frame, DaemonMessage::Session { .. }));
+        assert!(
+            bridge.read_plan("1@s.whatsapp.net", Some("m1")).is_ok(),
+            "a read racing this event would have been refused as stale"
+        );
+    }
+
+    /// A call rings in the daemon, so a window opened during it has no other
+    /// way to learn about the offer: it went out once, before that window
+    /// existed, and no history contains it.
+    #[test]
+    fn a_ringing_call_is_state_a_new_window_can_attach_to() {
+        let mut bridge = bridge();
+        let call = oxidezap_core::IncomingCall {
+            call_id: "call-1".into(),
+            caller_name: "Alice".into(),
+            caller_jid: "1@s.whatsapp.net".into(),
+            is_video: false,
+            is_offline: false,
+            received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        bridge.observe(UiEvent::IncomingCall(call));
+        assert_eq!(bridge.hub.snapshot_ringing().len(), 1);
+
+        // Answered or hung up, it is no longer something to attach to.
+        bridge.observe(UiEvent::CallEnded("call-1".into()));
+        assert!(bridge.hub.snapshot_ringing().is_empty());
     }
 
     /// A failed send changes no state, so no snapshot can carry it: without

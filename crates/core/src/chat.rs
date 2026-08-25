@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wacore::download::{Downloadable, MediaType as DownloadMediaType};
@@ -31,7 +32,7 @@ pub fn fallback_chat_name(jid: &Jid) -> String {
 }
 
 /// Type of media content
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaType {
     /// Image (JPEG, PNG, WebP)
     Image,
@@ -60,7 +61,7 @@ impl MediaType {
 
 /// Information needed to download encrypted media from WhatsApp servers.
 /// This is stored separately from the thumbnail/preview data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadableMedia {
     /// Direct path for CDN URL construction
     pub direct_path: String,
@@ -75,6 +76,7 @@ pub struct DownloadableMedia {
     /// Duration in seconds (for video/audio)
     pub duration_secs: Option<u32>,
     /// Download media type (for key derivation)
+    #[serde(with = "download_type")]
     pub download_type: DownloadMediaType,
 }
 
@@ -107,12 +109,25 @@ impl Downloadable for DownloadableMedia {
 }
 
 /// Media content attached to a message
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaContent {
     /// Type of media
     pub media_type: MediaType,
     /// Raw data for display (thumbnail for video, full data for images/stickers)
+    ///
+    /// Never serialized. For an image this is the whole photo, and a megabyte
+    /// of it has no business inside a newline-delimited JSON frame; a front
+    /// end in another process reads it out of the daemon's media cache under
+    /// [`cache_key`](Self::cache_key) instead. Skipping it here rather than
+    /// remembering not to send it is what makes that mechanical.
+    #[serde(skip)]
     pub data: Arc<Vec<u8>>,
+    /// Where the daemon's media cache holds [`data`](Self::data).
+    ///
+    /// Set by the daemon as it hands the message to another process, and
+    /// `None` in the process that already has the bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
     /// MIME type of the display data (may differ from downloadable media)
     pub mime_type: String,
     /// Width in pixels (if known)
@@ -153,7 +168,7 @@ impl MediaContent {
 }
 
 /// A chat message
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// Unique message ID
     pub id: String,
@@ -299,8 +314,101 @@ impl ChatMessage {
     }
 }
 
+/// `wacore`'s download [`MediaType`](DownloadMediaType) on the wire.
+///
+/// It is `#[non_exhaustive]` and carries no serde of its own, so this maps it
+/// to a stable name rather than to a variant index that a new variant
+/// upstream would silently shift. An unknown name is an error rather than a
+/// guess: picking the wrong key derivation would decrypt to noise.
+mod download_type {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use wacore::download::MediaType;
+
+    fn name(value: MediaType) -> Option<&'static str> {
+        Some(match value {
+            MediaType::Image => "image",
+            MediaType::Video => "video",
+            MediaType::Audio => "audio",
+            MediaType::Document => "document",
+            MediaType::History => "history",
+            MediaType::AppState => "app_state",
+            MediaType::Sticker => "sticker",
+            MediaType::StickerPack => "sticker_pack",
+            MediaType::StickerPackThumbnail => "sticker_pack_thumbnail",
+            MediaType::LinkThumbnail => "link_thumbnail",
+            MediaType::ProductCatalogImage => "product_catalog_image",
+            _ => return None,
+        })
+    }
+
+    fn parse(name: &str) -> Option<MediaType> {
+        Some(match name {
+            "image" => MediaType::Image,
+            "video" => MediaType::Video,
+            "audio" => MediaType::Audio,
+            "document" => MediaType::Document,
+            "history" => MediaType::History,
+            "app_state" => MediaType::AppState,
+            "sticker" => MediaType::Sticker,
+            "sticker_pack" => MediaType::StickerPack,
+            "sticker_pack_thumbnail" => MediaType::StickerPackThumbnail,
+            "link_thumbnail" => MediaType::LinkThumbnail,
+            "product_catalog_image" => MediaType::ProductCatalogImage,
+            _ => return None,
+        })
+    }
+
+    pub fn serialize<S: Serializer>(value: &MediaType, s: S) -> Result<S::Ok, S::Error> {
+        match name(*value) {
+            Some(name) => name.serialize(s),
+            None => Err(serde::ser::Error::custom(format!(
+                "unnameable download media type {value:?}"
+            ))),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MediaType, D::Error> {
+        let name = String::deserialize(d)?;
+        parse(&name).ok_or_else(|| serde::de::Error::custom(format!("unknown media type {name}")))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Both directions from one list, so a variant added to one and not
+        /// the other cannot pass unnoticed.
+        #[test]
+        fn every_name_round_trips() {
+            for value in [
+                MediaType::Image,
+                MediaType::Video,
+                MediaType::Audio,
+                MediaType::Document,
+                MediaType::History,
+                MediaType::AppState,
+                MediaType::Sticker,
+                MediaType::StickerPack,
+                MediaType::StickerPackThumbnail,
+                MediaType::LinkThumbnail,
+                MediaType::ProductCatalogImage,
+            ] {
+                let name = name(value).expect("every variant is nameable");
+                assert_eq!(parse(name), Some(value), "{name}");
+            }
+        }
+
+        /// An unknown name must not fall back to a variant: the wrong media
+        /// type derives the wrong key and decrypts to noise.
+        #[test]
+        fn an_unknown_name_is_refused() {
+            assert_eq!(parse("something_new"), None);
+        }
+    }
+}
+
 /// A chat/conversation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chat {
     /// JID (Jabber ID) - unique identifier
     pub jid: String,
@@ -647,6 +755,7 @@ mod tests {
         MediaContent {
             media_type: MediaType::Image,
             data: Arc::new(data),
+            cache_key: None,
             mime_type: "image/jpeg".to_string(),
             width: None,
             height: None,
