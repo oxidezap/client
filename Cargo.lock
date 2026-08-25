@@ -5777,6 +5777,7 @@ dependencies = [
 name = "oxidezap-ipc"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "oxidezap-core",
  "rustix 1.1.4",
  "serde",

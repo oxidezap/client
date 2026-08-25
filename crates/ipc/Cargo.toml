@@ -19,5 +19,11 @@ thiserror = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
+# `getpeereid`, which is how every Unix but Linux answers "who is on the other
+# end of this socket". Linux answers `SO_PEERCRED`, which rustix already has —
+# and which is why `libc` is not needed there.
+[target.'cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

@@ -81,19 +81,42 @@ impl Endpoint {
 /// answered. The kernel knows who that is, so ask it.
 #[cfg(unix)]
 fn check_peer(stream: &Inner) -> std::io::Result<()> {
-    let peer = rustix::net::sockopt::socket_peercred(stream)?;
-    let us = rustix::process::getuid();
-    if peer.uid == us {
+    let peer = peer_uid(stream)?;
+    let us = rustix::process::getuid().as_raw();
+    if peer == us {
         return Ok(());
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
         format!(
-            "the daemon socket is owned by uid {}, not by us ({}); refusing to talk to it",
-            peer.uid.as_raw(),
-            us.as_raw()
+            "the daemon socket is owned by uid {peer}, not by us ({us}); refusing to talk to it"
         ),
     ))
+}
+
+/// Who is on the other end, as the kernel sees it.
+///
+/// Two calls for one question, because Unix never agreed on it: Linux answers
+/// `SO_PEERCRED`, and everyone else answers `getpeereid`. Both are read off
+/// the connected socket rather than taken on trust, which is the point.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_uid(stream: &Inner) -> std::io::Result<u32> {
+    Ok(rustix::net::sockopt::socket_peercred(stream)?.uid.as_raw())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn peer_uid(stream: &Inner) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut uid = 0;
+    let mut gid = 0;
+    // SAFETY: a connected socket's fd, and two out-pointers to locals.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if rc == 0 {
+        Ok(uid)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 impl Read for Endpoint {
