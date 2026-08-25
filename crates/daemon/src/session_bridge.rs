@@ -251,7 +251,9 @@ pub async fn run(
         }
         // The store is one file; the media is a directory beside it, and it
         // is just as much this account's data.
-        if let Err(e) = crate::media::wipe_cache() {
+        // Everything, staged uploads included: the account is going, and so
+        // is anything that was going to be sent under it.
+        if let Err(e) = crate::media::wipe(crate::media::Wipe::Everything) {
             log::error!("could not clear the media cache: {e}");
         }
     }
@@ -1006,13 +1008,19 @@ fn too_busy() -> CommandOutcome {
 /// the first attach: a message's media is addressed by its message id, and a
 /// message's media does not change.
 fn externalize_media(event: &mut UiEvent) {
+    // Read once for the whole event: this runs on the publish thread behind
+    // an unbounded queue, so a clear can land between being handed the event
+    // and writing its media. See `media::put_since`.
+    let epoch = crate::media::epoch();
     match event {
-        UiEvent::MessageReceived { message, .. } => cache_media(&message.id, &mut message.media),
+        UiEvent::MessageReceived { message, .. } => {
+            cache_media(epoch, &message.id, &mut message.media)
+        }
         UiEvent::HistoryLoaded { chats, .. } => {
             for chat in chats {
                 for message in &mut chat.messages {
                     let id = message.id.clone();
-                    cache_media(&id, &mut message.media);
+                    cache_media(epoch, &id, &mut message.media);
                 }
             }
         }
@@ -1020,7 +1028,7 @@ fn externalize_media(event: &mut UiEvent) {
     }
 }
 
-fn cache_media(message_id: &str, media: &mut Option<MediaContent>) {
+fn cache_media(cache_epoch: usize, message_id: &str, media: &mut Option<MediaContent>) {
     let Some(media) = media else { return };
     let key = crate::media::message_key(message_id);
 
@@ -1051,7 +1059,11 @@ fn cache_media(message_id: &str, media: &mut Option<MediaContent>) {
         return;
     }
 
-    match crate::media::put(&key, &media.data) {
+    // Nobody asked for this one: it is the eager cache of media that arrived
+    // with a message, and the front end can fetch it on demand if it is not
+    // here. So a clear that lands while it is queued wins, and the directory
+    // the user just emptied stays empty.
+    match crate::media::put_since(cache_epoch, &key, &media.data) {
         Ok(key) => media.cache_key = Some(key),
         // The front end still gets the message; the media renders as the
         // download it also is. A cache that cannot be written is not a reason

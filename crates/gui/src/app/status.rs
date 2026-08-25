@@ -335,6 +335,14 @@ impl WhatsAppApp {
         };
         let feed = self.status_feed();
         let Some(author) = feed.author(&author_jid) else {
+            // Their whole run is gone — the last of it lapsed, or the only
+            // update they had was taken back. Same as an anchor that is no
+            // longer in the run, except that there is nothing behind it
+            // either: stop what was playing and close the reader, which would
+            // otherwise be an empty state with no way out of it on a phone.
+            self.status_pane.follow(None);
+            self.stop_status_media(Some(anchor));
+            self.close_status(cx);
             return;
         };
         match feed.updates_of(author).position(|m| m.id == anchor) {

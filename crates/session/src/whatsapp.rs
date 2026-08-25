@@ -804,10 +804,18 @@ impl WhatsAppClient {
 
                 let normalized_chat_jid = normalize_chat_jid(client, &chat_jid).await;
 
+                // One person, one reaction. `ChatMessage::add_reaction` keys
+                // by this string and enforces one per sender — and a removal
+                // is an *empty* reaction matched the same way — so a react
+                // under the phone number and its replacement or removal under
+                // the LID were two different people: the first emoji stayed up
+                // and the second was counted beside it.
+                let reactor = names.identity(client, &info.source.sender).await;
+
                 let _ = ui_tx.send(UiEvent::ReactionReceived {
                     chat_jid: normalized_chat_jid,
                     message_id: target_id.clone(),
-                    sender: info.source.sender.to_string(),
+                    sender: reactor.canonical_jid.clone(),
                     emoji,
                 });
             }

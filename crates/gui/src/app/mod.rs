@@ -1229,11 +1229,11 @@ impl WhatsAppApp {
                 view.swap_text("", window, cx);
             });
         }
-        // Names, presence, watched updates, notices with nowhere to go yet.
+        // Names, watched updates, notices with nowhere to go yet. Presence
+        // and the composing state left with `leave_connected_view`, above.
         self.name_cache.clear();
         self.watched_status.clear();
         self.pending_notices.clear();
-        self.presence = PresenceRegistry::new();
         // Anything mid-flight against a message id that is about to be gone.
         // Playback itself is already stopped, above.
         self.video_players.clear();
@@ -1259,6 +1259,22 @@ impl WhatsAppApp {
             self.cancel_recording(cx);
         }
         self.stop_current_media();
+        // Who was around was true of the connection that has just ended. A
+        // typing notice expires on its own, but `Availability::Online` has no
+        // TTL — nothing but another presence event ever takes it down, and
+        // that event is exactly what a dropped connection stops delivering.
+        // The header went on saying a contact was online for as long as the
+        // window stayed open.
+        self.presence = PresenceRegistry::new();
+        // The composer may have said this window was typing. `composing_chat`
+        // names a chat in the account being left, and the view's own timeout
+        // would send its `paused` down whatever session comes next — after
+        // swallowing the first keystroke there as an already-live
+        // composition.
+        self.composing_chat = None;
+        if let Some(input) = self.input_area.clone() {
+            input.update(cx, |view, _| view.reset_typing());
+        }
     }
 
     /// Put the caret where typing goes.
@@ -1471,6 +1487,16 @@ impl WhatsAppApp {
             }
         }
         self.forget_missing_selection();
+        // The viewer names a chat and a message in it, and resolves them every
+        // frame: one left open over a chat that has just gone draws nothing,
+        // keeps the keyboard, and swallows the Escape meant to close it.
+        if self
+            .media_viewer
+            .as_ref()
+            .is_some_and(|viewer| gone.iter().any(|jid| jid == &viewer.jid))
+        {
+            self.media_viewer = None;
+        }
         self.invalidate_chat_cache();
     }
 

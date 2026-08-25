@@ -12,6 +12,7 @@
 //! bookkeeping, just files whose names say what is in them.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -214,16 +215,73 @@ pub fn cache_usage() -> (u64, u64) {
         })
 }
 
-/// Delete every cached file.
+/// How much of the directory a wipe is entitled to.
 ///
-/// Part of "clear data and pair again", and not optional: the store is one
-/// file, but the media beside it is a directory that can hold half a gigabyte
-/// of the *previous* account's photos, videos and documents. Leaving it in
-/// place means pairing a different account onto a cache of someone else's
-/// pictures, with no control anywhere that clears them.
+/// The directory holds two different things under one roof. `f-` and `d-` are
+/// the cache: bytes the daemon fetched, which it can always fetch again.
+/// `u-` is not — it is a payload a front end staged for a send that has not
+/// run yet, and the only copy of it. Deleting one turns an unrelated "clear
+/// cached media" into a voice note that fails with "no audio cached".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wipe {
+    /// Cached downloads only.
+    Cache,
+    /// Everything, staged uploads included: the account is going, and so is
+    /// anything that was going to be sent under it.
+    Everything,
+}
+
+impl Wipe {
+    /// Whether a file named `name` is this wipe's to take.
+    fn takes(self, name: &str) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Cache => name.starts_with("f-") || name.starts_with("d-"),
+        }
+    }
+}
+
+/// Which cache the writers still in flight think they are writing into.
+///
+/// A download dispatched before a wipe finishes after it, and the eager cache
+/// of an inbound message can be queued across one. Neither can be cancelled,
+/// so the answer is the same as everywhere else in this codebase: bump a
+/// number and let the writer notice.
+static CACHE_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
+/// What to hand back to [`put_since`] later.
+pub fn epoch() -> usize {
+    CACHE_EPOCH.load(Ordering::SeqCst)
+}
+
+/// Cache `bytes` unless the cache has been cleared since `epoch`.
+///
+/// For writes nobody is waiting on — the eager cache of an inbound message,
+/// which the front end can always fetch on demand instead. A download somebody
+/// *asked* for uses [`put`]: the file is how those bytes are delivered, not
+/// merely where they are remembered, so refusing it would fail the download
+/// rather than keep the directory tidy.
+pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
+    if CACHE_EPOCH.load(Ordering::SeqCst) != epoch {
+        anyhow::bail!("the media cache was cleared while this was being prepared");
+    }
+    put(key, bytes)
+}
+
+/// Delete the cached files this wipe is entitled to.
+///
+/// Part of "clear data and pair again", and not optional there: the store is
+/// one file, but the media beside it is a directory that can hold half a
+/// gigabyte of the *previous* account's photos, videos and documents. Leaving
+/// it in place means pairing a different account onto a cache of someone
+/// else's pictures, with no control anywhere that clears them.
 ///
 /// Best-effort per entry: one unreadable file must not abandon the rest.
-pub fn wipe_cache() -> Result<()> {
+pub fn wipe(scope: Wipe) -> Result<()> {
+    // Before the deletions, not after: a writer that reads the epoch between
+    // the two would otherwise believe its file survived the wipe that is
+    // about to remove it.
+    CACHE_EPOCH.fetch_add(1, Ordering::SeqCst);
     let Some(dir) = oxidezap_ipc::media_dir() else {
         return Ok(());
     };
@@ -236,14 +294,18 @@ pub fn wipe_cache() -> Result<()> {
 
     let mut removed = 0usize;
     for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|kind| kind.is_file())
-            && std::fs::remove_file(entry.path()).is_ok()
-        {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if !scope.takes(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
     }
     log::info!(
-        "cleared {removed} cached media files from {}",
+        "cleared {removed} media files ({scope:?}) from {}",
         dir.display()
     );
     Ok(())
@@ -282,6 +344,27 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A "clear cached media" that takes a staged upload with it turns an
+    /// unrelated cleanup into a voice note that fails with "no audio cached".
+    #[test]
+    fn clearing_the_cache_spares_a_staged_upload() {
+        assert!(Wipe::Cache.takes("f-3EB0ABC"));
+        assert!(Wipe::Cache.takes("d-9f86d081884c7d65"));
+        assert!(
+            !Wipe::Cache.takes("u-local_audio-7"),
+            "somebody is still waiting for that to be sent"
+        );
+    }
+
+    /// The account is going, and so is anything that was going to be sent
+    /// under it.
+    #[test]
+    fn forgetting_an_account_takes_everything() {
+        assert!(Wipe::Everything.takes("f-3EB0ABC"));
+        assert!(Wipe::Everything.takes("d-9f86d081884c7d65"));
+        assert!(Wipe::Everything.takes("u-local_audio-7"));
+    }
 
     /// A message id comes off the network. One carrying a separator would name
     /// a file outside the cache, which the daemon writes to as the user who

@@ -825,8 +825,12 @@ async fn handle_request(
         // this costs is a re-download of whatever is looked at again.
         ClientRequest::ClearMediaCache => {
             acted(
-                crate::media::wipe_cache().map_err(|e| ProtocolError::Malformed {
-                    detail: format!("could not clear the media cache: {e}"),
+                // Cached downloads only: a staged upload belongs to a send
+                // that has not run yet. See `media::Wipe`.
+                crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| {
+                    ProtocolError::Malformed {
+                        detail: format!("could not clear the media cache: {e}"),
+                    }
                 }),
             )
         }

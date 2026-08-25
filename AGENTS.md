@@ -176,6 +176,14 @@ profile here repeats it deliberately.
   close it. `invalidate_message_cache` is the announcement that a chat's
   history changed, which makes it the whole set of ways the thing being
   looked at can stop existing.
+- **The media directory holds two different things.** `f-`/`d-` is the
+  cache — bytes the daemon fetched and can fetch again — and `u-` is a payload
+  a front end staged for a send that has not run yet, which is its only copy.
+  `Wipe::Cache` is what "clear cached media" may take; `Wipe::Everything` is
+  for the account leaving. A writer that cannot be cancelled asks
+  `media::epoch` instead: the eager cache of an inbound message loses to a
+  clear, and a download somebody asked for does not, because there the file is
+  how the bytes are delivered rather than where they are remembered.
 - **Nothing may still be writing this account's media when it is deleted.**
   The publish thread externalizes media behind an unbounded queue, so an
   event accepted before `ForgetSession` can still be in it. `stop_publishing`
