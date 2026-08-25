@@ -20,14 +20,12 @@ mod recovery;
 mod settings;
 mod timeline_ctl;
 
-pub use calls::{ActiveCall, CallState as CallStateMachine, Stage};
+pub use calls::CallCard;
 pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
 pub use chats::{ChatFilter, ChatListCache};
 pub use media::RecordingState;
 pub use messages::{MessageListCache, TimelineItem};
 pub use settings::{SettingsSection, SettingsState};
-
-use calls::CallState;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -65,7 +63,7 @@ use log::{debug, error, info, warn};
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 
 use crate::responsive::{MobilePanel, ResponsiveLayout};
-use crate::session::Session;
+use crate::session::{FromDaemon, Session};
 use crate::theme::ActiveProductTheme as _;
 use crate::utils::mime_to_image_format;
 use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
@@ -76,9 +74,10 @@ use crate::views::{
 };
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
-    AppState, Availability, CachedQrCode, CallOutcome, CallRecord, Chat, ChatMessage,
-    ComposingKind, DownloadableMedia, IncomingCall, MediaContent, MediaType, MessageStatus,
-    OutgoingCall, PresenceRegistry, ReceiptType, SystemNotice, TypingSummary, UiEvent,
+    ActiveCall, AppState, Availability, CachedQrCode, CallOutcome, CallRecord, CallState, Chat,
+    ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, MediaContent, MediaType,
+    MessageStatus, OutgoingCall, PresenceRegistry, ReceiptType, Stage, SystemNotice, TypingSummary,
+    UiEvent,
 };
 
 // ChatListCache is now in chats.rs and re-exported above
@@ -365,8 +364,11 @@ pub struct WhatsAppApp {
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
-    /// Call state (incoming and outgoing calls)
+    /// What call is happening. Adopted whole from the daemon on attach, and
+    /// advanced by the same events the daemon applies to its own copy.
     call_state: CallState,
+    /// Where *this* window puts the card for it.
+    call_card: CallCard,
     /// Cache of JID -> display name mappings (from notify/pushname attribute)
     name_cache: HashMap<String, String>,
     /// Video players for each message (message_id -> VideoPlayer)
@@ -407,14 +409,33 @@ pub struct WhatsAppApp {
 impl WhatsAppApp {
     /// Spawn the event handling task that processes UI events from the WhatsApp client
     fn spawn_event_task(
-        mut ui_rx: tokio::sync::mpsc::Receiver<UiEvent>,
+        mut ui_rx: tokio::sync::mpsc::Receiver<FromDaemon>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            while let Some(event) = ui_rx.recv().await {
-                let result = entity.update(cx, |app, cx| {
-                    app.handle_event(event, cx);
-                });
+            while let Some(message) = ui_rx.recv().await {
+                let result = match message {
+                    FromDaemon::Session(event) => entity.update(cx, |app, cx| {
+                        app.handle_event(*event, cx);
+                    }),
+                    // Adopted whole rather than replayed: these are the calls
+                    // that were already happening when this window attached,
+                    // and a call this account placed was never an event.
+                    FromDaemon::Calls(calls) => entity.update(cx, |app, cx| {
+                        app.call_state = *calls;
+                        cx.notify();
+                    }),
+                    // The tray's "Open", or another front end asking on a
+                    // user's behalf. One window, so there is one to raise.
+                    FromDaemon::ShowWindow => {
+                        cx.update(|cx| {
+                            if let Some(window) = cx.windows().first() {
+                                let _ = window.update(cx, |_, window, _| window.activate_window());
+                            }
+                        });
+                        Ok(())
+                    }
+                };
                 if result.is_err() {
                     // Entity was dropped, stop the loop
                     break;
@@ -470,6 +491,7 @@ impl WhatsAppApp {
             error_detail_open: false,
             downloads_in_flight: std::collections::HashSet::new(),
             call_state: CallState::new(),
+            call_card: CallCard::default(),
             name_cache: HashMap::new(),
             video_players: HashMap::new(),
             video_update_task: None,
@@ -649,7 +671,7 @@ impl WhatsAppApp {
                 is_group,
                 max_media_size,
                 metrics,
-                typing.is_some(),
+                typing.as_ref(),
             )
         {
             return cached.clone();
@@ -734,17 +756,29 @@ impl WhatsAppApp {
         &self.message_list_scroll
     }
 
-    /// Scroll to the last message in the currently selected chat.
-    /// Uses scroll_to_item with the actual message count (not scroll_to_bottom,
-    /// which relies on internal state that may be stale before paint).
+    /// Scroll to the foot of the currently selected chat.
+    ///
+    /// Timeline coordinates, not message coordinates: dividers, the
+    /// encryption notice and the typing row are items too, so the message
+    /// count stopped naming the last bubble the moment the list grew rows
+    /// nobody typed. `scroll_to_bottom` is not the answer either — it reads
+    /// internal state that is stale before paint — so this asks the cache
+    /// which item the last row actually is.
     fn scroll_to_last_message(&self) {
-        if let Some(ref jid) = self.selected_chat
-            && let Some(chat) = self.find_chat(jid)
-            && !chat.messages.is_empty()
-        {
-            self.message_list_scroll
-                .scroll_to_item(chat.messages.len() - 1, ScrollStrategy::Top);
-        }
+        let Some(jid) = self.selected_chat.as_ref() else {
+            return;
+        };
+        let last = {
+            let cache = self.message_list_cache.borrow();
+            cache.get(jid).map(|cache| cache.items.len())
+        };
+        // No cache yet means nothing has been laid out to scroll to; the
+        // first paint starts at the foot anyway.
+        let Some(count) = last.filter(|count| *count > 0) else {
+            return;
+        };
+        self.message_list_scroll
+            .scroll_to_item(count - 1, ScrollStrategy::Top);
     }
 
     /// Get the isolated input area view entity

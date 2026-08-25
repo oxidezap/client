@@ -148,9 +148,11 @@ impl WhatsAppApp {
                     // (timestamp, id) and the rename can reorder same-second
                     // siblings.
                     chat.rename_message(&local_id, &message_id);
-                    // Being given a real id *is* the server's acknowledgement,
-                    // so this is where the first tick comes from.
-                    chat.advance_status(std::slice::from_ref(&message_id), MessageStatus::Sent);
+                    // A rename, not an acknowledgement: this id is invented
+                    // locally *before* the send is even awaited, so ticking
+                    // it as Sent here would promise delivery for a message
+                    // still queued — or about to fail. The tick comes from
+                    // the store's own ServerAck, through the reload.
                 }
                 self.invalidate_message_cache(&chat_jid);
                 self.invalidate_chat_cache();
@@ -240,6 +242,9 @@ impl WhatsAppApp {
                     self.record_call(&stage, cx);
                 }
                 if self.call_state.end(&call_id) {
+                    // A card minimised for this call must not swallow the
+                    // next one's ring.
+                    self.call_card.call_ended();
                     cx.notify();
                 }
             }

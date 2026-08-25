@@ -10,9 +10,10 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _};
 
-use crate::app::{ActiveCall, WhatsAppApp};
+use crate::app::WhatsAppApp;
 use crate::components::{Avatar, ProductIcon};
 use crate::theme::{ActiveProductTheme as _, Metrics};
+use oxidezap_core::ActiveCall;
 
 /// The card header shown while a call is live: a dot, a label, and the two
 /// window controls.

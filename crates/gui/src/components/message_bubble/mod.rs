@@ -16,10 +16,11 @@ use std::sync::Arc;
 
 use gpui::{
     App, Entity, Image, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _,
+    Styled, div, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
-use gpui_component::{h_flex, v_flex};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Sizable as _, h_flex, v_flex};
 
 pub use audio::SPEEDS;
 pub use system::render_encryption_notice;
@@ -212,18 +213,23 @@ pub fn render_message_bubble(
                         ),
                 )
                 .when(failed, |el| {
+                    // Sending again is a command, not a surface: a styled div
+                    // has no keyboard activation, so a failed message would
+                    // only be recoverable with a pointer.
                     el.child(
-                        div()
-                            .id(SharedString::from(format!("retry-{message_id}")))
-                            .mt(metrics.space_xs())
-                            .text_size(metrics.text_micro())
-                            .text_color(cx.theme().danger)
-                            .cursor_pointer()
-                            .child("Not sent · tap to retry")
-                            .on_click(move |_, window, cx| {
-                                retry_entity
-                                    .update(cx, |app, cx| app.retry_send(&retry_id, window, cx));
-                            }),
+                        div().mt(metrics.space_xs()).child(
+                            Button::new(SharedString::from(format!("retry-{message_id}")))
+                                .label("Not sent · retry")
+                                .ghost()
+                                .danger()
+                                .xsmall()
+                                .tooltip("Send this message again")
+                                .on_click(move |_, window, cx| {
+                                    retry_entity.update(cx, |app, cx| {
+                                        app.retry_send(&retry_id, window, cx)
+                                    });
+                                }),
+                        ),
                     )
                 })
                 .when(has_reactions, |el| {

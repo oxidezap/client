@@ -1,0 +1,574 @@
+//! Which calls are happening.
+//!
+//! Domain state, not view state: the transitions here are what a call *is* —
+//! ringing, dialling, connected, gone — and the process holding the session
+//! has to track them as closely as the one drawing them. Keeping one
+//! implementation is also what lets a front end attaching mid-call be handed
+//! this whole thing rather than a replay of events it missed.
+//!
+//! There is one call at a time and it moves through one sequence, so this is
+//! a state machine rather than two independent `Option`s. The missing state
+//! was the important one: accepting a call used to clear the incoming offer
+//! and leave nothing behind, so the audio ran on with no duration, no mute and
+//! no way to hang up. [`Stage::Active`] is that state.
+//!
+//! Where the card sits and whether it is collapsed is *not* here: that is one
+//! window's presentation of this state, and a second front end attaching must
+//! not inherit it.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use super::call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
+use super::system_notice::format_duration;
+
+/// A call that is connected and running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveCall {
+    pub call_id: CallId,
+    pub peer_jid: String,
+    pub peer_name: String,
+    /// Whether the call was *offered* as video. The library is audio-only, so
+    /// this shapes the card and nothing else; the video controls it reveals
+    /// are drawn disabled.
+    pub is_video: bool,
+    pub started_at: DateTime<Utc>,
+    pub muted: bool,
+}
+
+impl ActiveCall {
+    /// How long the call has been up.
+    ///
+    /// Clamped at zero: `started_at` comes from the same clock the UI reads,
+    /// but a clock that steps backwards would otherwise render a negative
+    /// duration.
+    pub fn elapsed(&self) -> chrono::Duration {
+        (wacore::time::now_utc() - self.started_at).max(chrono::Duration::zero())
+    }
+
+    /// `m:ss`, growing an hour field only once there is one.
+    pub fn elapsed_label(&self) -> String {
+        format_duration(self.elapsed().num_seconds().max(0) as u32)
+    }
+
+    pub fn initial(&self) -> char {
+        self.peer_name.chars().next().unwrap_or('?')
+    }
+}
+
+/// Where a call is in its life.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    /// Someone is calling; the card offers accept and decline.
+    Incoming(IncomingCall),
+    /// We are calling out; the card offers cancel.
+    Outgoing(OutgoingCall),
+    /// Connected.
+    Active(ActiveCall),
+}
+
+impl Stage {
+    /// The other party's JID, whichever stage we are in.
+    pub fn peer_jid(&self) -> &str {
+        match self {
+            Self::Incoming(call) => &call.caller_jid,
+            Self::Outgoing(call) => &call.recipient_jid,
+            Self::Active(call) => &call.peer_jid,
+        }
+    }
+
+    pub fn peer_name(&self) -> &str {
+        match self {
+            Self::Incoming(call) => &call.caller_name,
+            Self::Outgoing(call) => &call.recipient_name,
+            Self::Active(call) => &call.peer_name,
+        }
+    }
+
+    pub fn call_id(&self) -> &str {
+        match self {
+            Self::Incoming(call) => &call.call_id,
+            Self::Outgoing(call) => &call.call_id,
+            Self::Active(call) => &call.call_id,
+        }
+    }
+
+    pub fn is_video(&self) -> bool {
+        match self {
+            Self::Incoming(call) => call.is_video,
+            Self::Outgoing(call) => call.is_video,
+            Self::Active(call) => call.is_video,
+        }
+    }
+
+    pub fn active(&self) -> Option<&ActiveCall> {
+        match self {
+            Self::Active(call) => Some(call),
+            _ => None,
+        }
+    }
+
+    /// Whether the call is still ringing, which is what makes Enter mean
+    /// "accept" rather than "send".
+    pub fn is_ringing(&self) -> bool {
+        matches!(self, Self::Incoming(_) | Self::Outgoing(_))
+    }
+
+    /// Whether *we* are the ones being called. An outgoing call is also
+    /// ringing, but nothing about it can be accepted.
+    pub fn is_incoming(&self) -> bool {
+        matches!(self, Self::Incoming(_))
+    }
+}
+
+/// A second call arriving while one is up.
+///
+/// The old behaviour was a `warn!` and silence: the caller heard ringing that
+/// the user never saw. Now it is surfaced so it can be refused deliberately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingCall {
+    pub call_id: CallId,
+    pub caller_name: String,
+}
+
+/// The one call, and whatever is queued behind it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallState {
+    stage: Option<Stage>,
+    waiting: Option<WaitingCall>,
+}
+
+impl CallState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn stage(&self) -> Option<&Stage> {
+        self.stage.as_ref()
+    }
+
+    pub fn waiting(&self) -> Option<&WaitingCall> {
+        self.waiting.as_ref()
+    }
+
+    pub fn incoming(&self) -> Option<&IncomingCall> {
+        match &self.stage {
+            Some(Stage::Incoming(call)) => Some(call),
+            _ => None,
+        }
+    }
+
+    pub fn outgoing(&self) -> Option<&OutgoingCall> {
+        match &self.stage {
+            Some(Stage::Outgoing(call)) => Some(call),
+            _ => None,
+        }
+    }
+
+    pub fn outgoing_mut(&mut self) -> Option<&mut OutgoingCall> {
+        match &mut self.stage {
+            Some(Stage::Outgoing(call)) => Some(call),
+            _ => None,
+        }
+    }
+
+    pub fn active(&self) -> Option<&ActiveCall> {
+        self.stage.as_ref().and_then(Stage::active)
+    }
+
+    pub fn has_incoming(&self) -> bool {
+        self.incoming().is_some()
+    }
+
+    pub fn has_outgoing(&self) -> bool {
+        self.outgoing().is_some()
+    }
+
+    /// Whether any call at all is up, which is what makes a new one wait.
+    pub fn is_busy(&self) -> bool {
+        self.stage.is_some()
+    }
+
+    /// An offer arrived.
+    ///
+    /// Returns whether it became the current call. A second offer during a
+    /// live call is parked in [`Self::waiting`] instead of clobbering the
+    /// first, which would desync the UI from the call registry.
+    pub fn set_incoming(&mut self, call: IncomingCall) -> bool {
+        if self.stage.is_some() {
+            log::warn!(
+                "parking incoming call {} behind {}",
+                call.call_id,
+                self.stage.as_ref().map_or("?", Stage::call_id)
+            );
+            self.waiting = Some(WaitingCall {
+                call_id: call.call_id.clone(),
+                caller_name: call.caller_name.clone(),
+            });
+            return false;
+        }
+        self.stage = Some(Stage::Incoming(call));
+        true
+    }
+
+    /// We placed a call.
+    pub fn set_outgoing(&mut self, call: OutgoingCall) {
+        if let Some(prev) = &self.stage {
+            log::warn!(
+                "replacing call {} with outgoing {}",
+                prev.call_id(),
+                call.call_id
+            );
+        }
+        self.stage = Some(Stage::Outgoing(call));
+    }
+
+    /// Take the ringing offer, for accept or decline.
+    pub fn take_incoming(&mut self) -> Option<IncomingCall> {
+        match self.stage.take() {
+            Some(Stage::Incoming(call)) => Some(call),
+            other => {
+                self.stage = other;
+                None
+            }
+        }
+    }
+
+    pub fn take_outgoing(&mut self) -> Option<OutgoingCall> {
+        match self.stage.take() {
+            Some(Stage::Outgoing(call)) => Some(call),
+            other => {
+                self.stage = other;
+                None
+            }
+        }
+    }
+
+    /// Take whatever call is up, for hanging up.
+    pub fn take(&mut self) -> Option<Stage> {
+        self.stage.take()
+    }
+
+    /// Drop the ringing offer if it is the one named.
+    ///
+    /// Named calls only: an id for a call that is not the current one leaves
+    /// the current one alone, which is what keeps a late ack for a call
+    /// already gone from cancelling its successor.
+    pub fn dismiss_incoming(&mut self, call_id: &CallId) -> bool {
+        if matches!(&self.stage, Some(Stage::Incoming(call)) if call.call_id == *call_id) {
+            self.stage = None;
+            return true;
+        }
+        false
+    }
+
+    pub fn dismiss_outgoing(&mut self, call_id: &CallId) -> bool {
+        if matches!(&self.stage, Some(Stage::Outgoing(call)) if call.call_id == *call_id) {
+            self.stage = None;
+            return true;
+        }
+        false
+    }
+
+    /// The call connected: this is the state that used to be missing.
+    ///
+    /// Accepts from either direction — we answered, or the peer answered us —
+    /// and starts the clock now rather than when the offer arrived, so the
+    /// duration counts talking time and not ringing time.
+    pub fn connect(&mut self, call_id: &CallId) -> bool {
+        let Some(stage) = self.stage.take() else {
+            return false;
+        };
+        if stage.call_id() != call_id {
+            self.stage = Some(stage);
+            return false;
+        }
+        if matches!(stage, Stage::Active(_)) {
+            // Already connected: a repeated accept must not restart the clock.
+            self.stage = Some(stage);
+            return false;
+        }
+        let active = ActiveCall {
+            call_id: call_id.clone(),
+            peer_jid: stage.peer_jid().to_string(),
+            peer_name: stage.peer_name().to_string(),
+            is_video: stage.is_video(),
+            started_at: wacore::time::now_utc(),
+            muted: false,
+        };
+        self.stage = Some(Stage::Active(active));
+        true
+    }
+
+    /// Accepting locally: the media is up before any peer answer arrives.
+    pub fn connect_accepted(&mut self, call: &IncomingCall) {
+        self.stage = Some(Stage::Active(ActiveCall {
+            call_id: call.call_id.clone(),
+            peer_jid: call.caller_jid.clone(),
+            peer_name: call.caller_name.clone(),
+            is_video: call.is_video,
+            started_at: wacore::time::now_utc(),
+            muted: false,
+        }));
+    }
+
+    /// Set the microphone state, returning whether it changed.
+    ///
+    /// The daemon owns the device, so the front end asks and this records
+    /// what was asked for; a toggle computed in one window would disagree
+    /// with a second window watching the same call.
+    pub fn set_muted(&mut self, muted: bool) -> bool {
+        match &mut self.stage {
+            Some(Stage::Active(call)) if call.muted != muted => {
+                call.muted = muted;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Toggle the microphone, returning the new state.
+    pub fn toggle_muted(&mut self) -> Option<bool> {
+        match &mut self.stage {
+            Some(Stage::Active(call)) => {
+                call.muted = !call.muted;
+                Some(call.muted)
+            }
+            _ => None,
+        }
+    }
+
+    /// End whatever call carries `call_id`.
+    ///
+    /// Returns whether anything changed, so an ack for a call already gone
+    /// does not buy a redraw.
+    pub fn end(&mut self, call_id: &CallId) -> bool {
+        if self.waiting.as_ref().is_some_and(|w| w.call_id == *call_id) {
+            self.waiting = None;
+            return true;
+        }
+        if self.stage.as_ref().is_some_and(|s| s.call_id() == call_id) {
+            self.stage = None;
+            return true;
+        }
+        false
+    }
+
+    /// Clear the parked second call, once it has been refused.
+    pub fn take_waiting(&mut self) -> Option<WaitingCall> {
+        self.waiting.take()
+    }
+
+    /// The outgoing call reached the peer's device.
+    pub fn set_outgoing_ringing(&mut self, call_id: &CallId) -> bool {
+        match &mut self.stage {
+            Some(Stage::Outgoing(call)) if call.call_id == *call_id => {
+                call.set_state(OutgoingCallState::Ringing);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The peer answered a call we placed.
+    ///
+    /// Kept as its own name because that is what the event says; it is
+    /// [`Self::connect`] with the outgoing direction already known.
+    pub fn set_outgoing_connected(&mut self, call_id: &CallId) -> bool {
+        if !matches!(&self.stage, Some(Stage::Outgoing(call)) if call.call_id == *call_id) {
+            return false;
+        }
+        self.connect(call_id)
+    }
+
+    /// The placeholder id we invented is replaced by the server's real one.
+    pub fn update_outgoing_call_id(&mut self, recipient_jid: &str, new_call_id: CallId) -> bool {
+        match &mut self.stage {
+            Some(Stage::Outgoing(call)) if call.recipient_jid == recipient_jid => {
+                call.call_id = new_call_id;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The call to a recipient failed before it ever got an id.
+    pub fn dismiss_outgoing_for_recipient(&mut self, recipient_jid: &str) -> bool {
+        if matches!(&self.stage, Some(Stage::Outgoing(call)) if call.recipient_jid == recipient_jid)
+        {
+            self.stage = None;
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
+    use wacore_binary::jid::Jid;
+
+    /// A minimal library offer.
+    ///
+    /// The state machine never reads it — only the daemon's voip facade does —
+    /// but `IncomingCall::new` takes one, so the fixture has to produce it. It
+    /// is `#[non_exhaustive]` with a builder, so this is the only way in.
+    fn offer(id: &str) -> WaIncomingCall {
+        let jid: Jid = "a@s.whatsapp.net".parse().expect("valid jid");
+        WaIncomingCall::builder()
+            .from(jid.clone())
+            .stanza_id(id.to_string())
+            .timestamp(wacore::time::now_utc())
+            .offline(false)
+            .action(CallAction::Offer {
+                call_id: id.to_string(),
+                call_creator: jid,
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            })
+            .build()
+    }
+
+    fn incoming(id: &str) -> IncomingCall {
+        IncomingCall::new(
+            id.to_string(),
+            "Ana".to_string(),
+            "a@s.whatsapp.net".to_string(),
+            false,
+            &offer(id),
+        )
+    }
+
+    fn outgoing(id: &str) -> OutgoingCall {
+        OutgoingCall::new(
+            id.to_string(),
+            "b@s.whatsapp.net".to_string(),
+            "Bruno".to_string(),
+            false,
+        )
+    }
+
+    #[test]
+    fn accepting_leaves_a_live_call_behind() {
+        // The regression this whole state machine exists for: the UI used to
+        // clear the offer and show nothing while the audio kept running.
+        let mut state = CallState::new();
+        let call = incoming("CALL");
+        state.set_incoming(call.clone());
+        let taken = state.take_incoming().expect("an offer was ringing");
+        state.connect_accepted(&taken);
+
+        let active = state.active().expect("the call is up");
+        assert_eq!(active.call_id, "CALL");
+        assert_eq!(active.peer_name, "Ana");
+        assert!(!active.muted);
+    }
+
+    #[test]
+    fn the_peer_answering_connects_an_outgoing_call() {
+        let mut state = CallState::new();
+        state.set_outgoing(outgoing("CALL"));
+        assert!(state.connect(&"CALL".to_string()));
+        assert!(state.active().is_some());
+    }
+
+    #[test]
+    fn an_answer_for_a_different_call_is_ignored() {
+        let mut state = CallState::new();
+        state.set_outgoing(outgoing("CALL"));
+        assert!(!state.connect(&"OTHER".to_string()));
+        assert!(state.outgoing().is_some(), "the real call is untouched");
+    }
+
+    #[test]
+    fn connecting_twice_does_not_restart_the_clock() {
+        let mut state = CallState::new();
+        state.set_outgoing(outgoing("CALL"));
+        assert!(state.connect(&"CALL".to_string()));
+        let started = state.active().unwrap().started_at;
+        assert!(!state.connect(&"CALL".to_string()));
+        assert_eq!(state.active().unwrap().started_at, started);
+    }
+
+    #[test]
+    fn a_second_offer_waits_instead_of_replacing_the_live_call() {
+        let mut state = CallState::new();
+        state.set_incoming(incoming("FIRST"));
+        assert!(!state.set_incoming(incoming("SECOND")));
+
+        assert_eq!(state.stage().unwrap().call_id(), "FIRST");
+        assert_eq!(state.waiting().unwrap().call_id, "SECOND");
+    }
+
+    #[test]
+    fn refusing_the_waiting_call_leaves_the_first_alone() {
+        let mut state = CallState::new();
+        state.set_incoming(incoming("FIRST"));
+        state.set_incoming(incoming("SECOND"));
+
+        assert!(state.end(&"SECOND".to_string()));
+        assert!(state.waiting().is_none());
+        assert_eq!(state.stage().unwrap().call_id(), "FIRST");
+    }
+
+    #[test]
+    fn dismissing_names_the_call_it_dismisses() {
+        let mut state = CallState::new();
+        state.set_incoming(incoming("CALL"));
+        assert!(!state.dismiss_incoming(&"OTHER".to_string()));
+        assert!(state.has_incoming(), "a stale ack cancels nothing");
+        assert!(state.dismiss_incoming(&"CALL".to_string()));
+        assert!(!state.is_busy());
+    }
+
+    #[test]
+    fn muting_toggles_only_while_connected() {
+        let mut state = CallState::new();
+        state.set_incoming(incoming("CALL"));
+        assert_eq!(state.toggle_muted(), None, "nothing to mute while ringing");
+
+        let taken = state.take_incoming().unwrap();
+        state.connect_accepted(&taken);
+        assert_eq!(state.toggle_muted(), Some(true));
+        assert_eq!(state.toggle_muted(), Some(false));
+    }
+
+    #[test]
+    fn ending_an_unrelated_call_changes_nothing() {
+        let mut state = CallState::new();
+        state.set_incoming(incoming("CALL"));
+        assert!(!state.end(&"OTHER".to_string()));
+        assert!(state.is_busy());
+    }
+
+    #[test]
+    fn duration_counts_talking_time_not_ringing_time() {
+        let mut state = CallState::new();
+        state.set_incoming(incoming("CALL"));
+        let taken = state.take_incoming().unwrap();
+        state.connect_accepted(&taken);
+        // Just connected, so the clock starts at zero rather than at whenever
+        // the offer first arrived.
+        assert_eq!(state.active().unwrap().elapsed_label(), "0:00");
+    }
+
+    /// The snapshot a front end attaching mid-call is handed.
+    #[test]
+    fn a_live_call_survives_the_wire() {
+        let mut state = CallState::new();
+        state.set_outgoing(outgoing("CALL"));
+        state.connect(&"CALL".to_string());
+        state.set_incoming(incoming("SECOND"));
+
+        let json = serde_json::to_string(&state).expect("serializable");
+        let back: CallState = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back, state);
+    }
+}

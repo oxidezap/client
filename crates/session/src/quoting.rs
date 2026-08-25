@@ -25,9 +25,10 @@ pub fn quoted_from(message: &wa::Message) -> Option<QuotedMessage> {
     let sender = context.participant.clone().unwrap_or_default();
     Some(QuotedMessage {
         message_id,
-        // Push names for the quoted author are not in the envelope; the chat
-        // fills this in from its participant map, which knows the current
-        // name rather than the one at quoting time.
+        // Push names for the quoted author are not in the envelope.
+        // `Chat::name_quoted_author` fills this in when the message joins its
+        // chat, from the participant map and the original message — which
+        // know the current name rather than the one at quoting time.
         sender_name: String::new(),
         sender,
         preview: base

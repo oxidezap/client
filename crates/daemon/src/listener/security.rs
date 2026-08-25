@@ -11,18 +11,16 @@
 
 use std::io;
 
-use windows_sys::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, SET_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    ACL, GetTokenInformation, InitializeSecurityDescriptor, NO_INHERITANCE, PSECURITY_DESCRIPTOR,
-    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER,
-    TokenUser,
+    ACL, InitializeSecurityDescriptor, NO_INHERITANCE, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// A `SECURITY_ATTRIBUTES` whose DACL grants this user and nobody else.
 ///
@@ -42,10 +40,11 @@ pub struct UserOnly {
 
 impl UserOnly {
     pub fn new() -> io::Result<Self> {
-        let token = current_user_token()?;
-        // SAFETY: `token` is a `TOKEN_USER` followed by its SID, as
-        // `GetTokenInformation` wrote it, and it outlives every use below.
-        let sid = unsafe { (*token.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        // The same token the endpoint's name is derived from, so the pipe and
+        // the entry that guards it name one identity rather than two.
+        let token = oxidezap_ipc::windows_user::token()?;
+        // SAFETY: the buffer came from that call and outlives every use below.
+        let sid = unsafe { oxidezap_ipc::windows_user::sid_of(&token) };
 
         let mut access = EXPLICIT_ACCESS_W {
             grfAccessPermissions: FILE_ALL_ACCESS,
@@ -116,55 +115,6 @@ impl Drop for UserOnly {
             // SAFETY: allocated by `SetEntriesInAclW`, freed once, and
             // nothing else holds it.
             unsafe { LocalFree(self.acl.cast::<HLOCAL>() as HLOCAL) };
-        }
-    }
-}
-
-/// The `TOKEN_USER` of the process, SID and all.
-fn current_user_token() -> io::Result<Vec<u8>> {
-    let mut token: HANDLE = std::ptr::null_mut();
-    // SAFETY: a valid out-pointer; the pseudo-handle needs no closing.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let token = OwnedToken(token);
-
-    let mut needed = 0u32;
-    // SAFETY: asking for the size first is how this call is specified; it
-    // fails with `ERROR_INSUFFICIENT_BUFFER` and sets `needed`.
-    unsafe {
-        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
-    }
-    if needed == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut buffer = vec![0u8; needed as usize];
-    // SAFETY: the buffer is exactly the size the call just asked for.
-    let ok = unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        ) != 0
-    };
-    if ok {
-        Ok(buffer)
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Closes the token handle however this function leaves.
-struct OwnedToken(HANDLE);
-
-impl Drop for OwnedToken {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: opened above and closed once.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
         }
     }
 }

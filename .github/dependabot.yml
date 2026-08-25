@@ -1,0 +1,16 @@
+# Pinned actions stop moving on their own, which is the point — and would also
+# mean they stop getting fixes. This is what keeps the pins current: Dependabot
+# opens a PR when an action's tag moves, with the new commit and the release
+# notes that go with it, so an update is a reviewed change rather than
+# something that happened while nobody was looking.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # One PR for all of them: they move together and reviewing eight separate
+    # SHA bumps is worse than reviewing one.
+    groups:
+      actions:
+        patterns: ["*"]

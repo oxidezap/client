@@ -5,8 +5,13 @@ use gpui::{Pixels, Point};
 use super::*;
 
 impl WhatsAppApp {
-    pub fn call_state(&self) -> &CallStateMachine {
+    pub fn call_state(&self) -> &CallState {
         &self.call_state
+    }
+
+    /// This window's placement of the card, which no other window shares.
+    pub fn call_card(&self) -> &CallCard {
+        &self.call_card
     }
 
     pub fn incoming_call(&self) -> Option<&IncomingCall> {
@@ -45,16 +50,24 @@ impl WhatsAppApp {
         cx.notify();
     }
 
-    /// Decline the incoming call.
-    pub fn decline_call(&mut self, cx: &mut Context<Self>) {
-        // A parked second call is what Decline refers to while one is live.
-        if let Some(waiting) = self.call_state.take_waiting() {
-            if let Some(client) = &self.client {
-                client.decline_call(waiting.call_id.as_str());
-            }
-            cx.notify();
+    /// Refuse the second call parked behind the one on screen.
+    ///
+    /// Its own command, reached from its own strip on the card. Folding it
+    /// into `decline_call` made the *visible* Decline button refuse a caller
+    /// the user could not see, and leave the ringing one ringing.
+    pub fn decline_waiting_call(&mut self, cx: &mut Context<Self>) {
+        let Some(waiting) = self.call_state.take_waiting() else {
             return;
+        };
+        info!("Declining waiting call {}", waiting.call_id);
+        if let Some(client) = &self.client {
+            client.decline_call(waiting.call_id.as_str());
         }
+        cx.notify();
+    }
+
+    /// Decline the incoming call the card is showing.
+    pub fn decline_call(&mut self, cx: &mut Context<Self>) {
         let Some(client) = &self.client else {
             warn!("Cannot decline call: client is unavailable");
             return;
@@ -82,6 +95,7 @@ impl WhatsAppApp {
         };
         let call_id = stage.call_id().to_string();
         info!("Ending call {call_id}");
+        self.call_card.call_ended();
         self.record_call(&stage, cx);
         if let Some(client) = &self.client {
             match &stage {
@@ -110,12 +124,12 @@ impl WhatsAppApp {
     }
 
     pub fn set_call_minimized(&mut self, minimized: bool, cx: &mut Context<Self>) {
-        self.call_state.set_minimized(minimized);
+        self.call_card.set_minimized(minimized);
         cx.notify();
     }
 
     pub fn begin_call_drag(&mut self, at: Point<Pixels>) {
-        self.call_state.begin_drag(at);
+        self.call_card.begin_drag(at);
     }
 
     pub fn drag_call_card(
@@ -124,14 +138,14 @@ impl WhatsAppApp {
         limit: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        if self.call_state.drag_to(at) {
-            self.call_state.clamp_offset(limit);
+        if self.call_card.drag_to(at) {
+            self.call_card.clamp_offset(limit);
             cx.notify();
         }
     }
 
     pub fn end_call_drag(&mut self) {
-        self.call_state.end_drag();
+        self.call_card.end_drag();
     }
 
     /// Start a call to the specified JID.
@@ -175,7 +189,7 @@ impl WhatsAppApp {
     /// Bring a minimised call back, or focus the card if it is already open.
     pub fn return_to_call(&mut self, cx: &mut Context<Self>) {
         if self.call_state.is_busy() {
-            self.call_state.set_minimized(false);
+            self.call_card.set_minimized(false);
             cx.notify();
         }
     }

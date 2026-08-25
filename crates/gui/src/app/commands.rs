@@ -73,8 +73,10 @@ impl WhatsAppApp {
     /// Ordered from the top down. A call card is above Settings, and a reply
     /// being composed is below both because it lives inside the composer.
     pub fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The waiting strip is the topmost thing on screen when it is up, so
+        // Escape refuses that caller and leaves the call underneath alone.
         if self.call_state.waiting().is_some() {
-            self.decline_call(cx);
+            self.decline_waiting_call(cx);
             return;
         }
         if self.settings.is_some() {

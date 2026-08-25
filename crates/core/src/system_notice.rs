@@ -72,7 +72,7 @@ pub enum SystemNotice {
 }
 
 /// `m:ss`, or `h:mm:ss` past an hour.
-fn format_duration(total_secs: u32) -> String {
+pub(crate) fn format_duration(total_secs: u32) -> String {
     let (hours, minutes, seconds) = (total_secs / 3600, (total_secs / 60) % 60, total_secs % 60);
     if hours > 0 {
         format!("{hours}:{minutes:02}:{seconds:02}")

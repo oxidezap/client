@@ -21,10 +21,11 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Icon, IconName, Sizable as _};
 
-use crate::app::{CALL_CONTEXT, CallStateMachine, DeclineCall, Stage, ToggleMute, WhatsAppApp};
+use crate::app::{AcceptCall, CALL_CONTEXT, CallCard, DeclineCall, ToggleMute, WhatsAppApp};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use gpui::AppContext as _;
+use oxidezap_core::{CallState, Stage};
 
 use super::ProductIcon;
 
@@ -46,7 +47,8 @@ impl gpui::Render for DragPreview {
 /// Returns nothing when no call is up, so the caller can attach it
 /// unconditionally.
 pub fn render_call_card(
-    state: &CallStateMachine,
+    state: &CallState,
+    card: &CallCard,
     entity: Entity<WhatsAppApp>,
     focus_handle: &gpui::FocusHandle,
     layout: ResponsiveLayout,
@@ -58,15 +60,36 @@ pub fn render_call_card(
     // Mobile has nowhere to float a card without covering the conversation, so
     // the call becomes a banner pinned under the header instead.
     if layout.is_mobile() {
-        return Some(mobile_banner(stage, entity, focus_handle, metrics, cx).into_any_element());
+        let waiting = state
+            .waiting()
+            .map(|waiting| waiting_strip(&waiting.caller_name, entity.clone(), metrics, cx));
+        return Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(mobile_banner(stage, entity, focus_handle, metrics, cx))
+                .children(waiting)
+                .into_any_element(),
+        );
     }
 
-    let offset = state.offset();
-    let body = if state.is_minimized() {
+    let offset = card.offset();
+    let body = if card.is_minimized() {
         minimized_pill(stage, entity.clone(), metrics, cx).into_any_element()
     } else {
-        expanded_card(stage, state, entity.clone(), layout, metrics, cx).into_any_element()
+        expanded_card(stage, card, entity.clone(), layout, metrics, cx).into_any_element()
     };
+    // A second caller gets their own strip and their own Decline. Routing the
+    // card's Decline at them instead would refuse someone the user cannot see
+    // and leave the visible call ringing.
+    let waiting = state
+        .waiting()
+        .map(|waiting| waiting_strip(&waiting.caller_name, entity.clone(), metrics, cx));
 
     Some(
         div()
@@ -76,6 +99,12 @@ pub fn render_call_card(
             .absolute()
             .top(metrics.space_xxl() + offset.y)
             .right(metrics.space_xxl() - offset.x)
+            .on_action({
+                let entity = entity.clone();
+                move |_: &AcceptCall, _window, cx| {
+                    entity.update(cx, |app, cx| app.accept_call(cx));
+                }
+            })
             .on_action({
                 let entity = entity.clone();
                 move |_: &ToggleMute, _window, cx| {
@@ -88,14 +117,61 @@ pub fn render_call_card(
                     entity.update(cx, |app, cx| app.hang_up(cx));
                 }
             })
+            .flex()
+            .flex_col()
+            .gap(metrics.space_sm())
+            .items_end()
             .child(body)
+            .children(waiting)
             .into_any_element(),
     )
 }
 
+/// "Marcos is also calling", with the one control that answers it.
+///
+/// Refusing is all it offers: answering would mean dropping the call already
+/// up, and the library has no way to hold one.
+fn waiting_strip(
+    caller_name: &str,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let label = format!("{caller_name} is also calling");
+
+    div()
+        .flex()
+        .items_center()
+        .gap(metrics.space_md())
+        .pl(metrics.space_lg())
+        .pr(metrics.space_md())
+        .py(metrics.space_sm())
+        .rounded_full()
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().border)
+        .shadow_lg()
+        .child(
+            div()
+                .text_size(metrics.text_meta())
+                .text_color(cx.theme().foreground)
+                .child(label),
+        )
+        .child(
+            Button::new("waiting-decline")
+                .icon(ProductIcon::PhoneOff)
+                .danger()
+                .small()
+                .tooltip("Decline the waiting call")
+                .on_click(move |_, _window, cx| {
+                    entity.update(cx, |app, cx| app.decline_waiting_call(cx));
+                }),
+        )
+}
+
 fn expanded_card(
     stage: &Stage,
-    state: &CallStateMachine,
+    card: &CallCard,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     metrics: Metrics,
@@ -142,7 +218,7 @@ fn expanded_card(
         // sits above everything and must not read as part of the page.
         .shadow_2xl()
         .overflow_hidden()
-        .child(drag_handle(state, entity.clone(), layout, metrics, cx))
+        .child(drag_handle(card, entity.clone(), layout, metrics, cx))
         .child(body)
 }
 
@@ -152,7 +228,7 @@ fn expanded_card(
 /// buttons, and a card that moves when you miss the mute target is worse than
 /// one that only moves from its handle.
 fn drag_handle(
-    state: &CallStateMachine,
+    card: &CallCard,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     metrics: Metrics,
@@ -178,7 +254,7 @@ fn drag_handle(
         .bg(cx.theme().popover)
         .border_b_1()
         .border_color(cx.theme().border)
-        .cursor(if state.is_dragging() {
+        .cursor(if card.is_dragging() {
             gpui::CursorStyle::ClosedHand
         } else {
             gpui::CursorStyle::OpenHand
@@ -282,21 +358,41 @@ fn mobile_banner(
 ) -> impl IntoElement + use<> {
     let accept_entity = entity.clone();
     let end_entity = entity.clone();
-    let is_ringing = stage.is_ringing();
+    let action_entity = entity;
+    // Only an *incoming* call can be accepted. An outgoing one is ringing
+    // too, and offering Accept for it produced a button that found no offer
+    // and did nothing.
+    let is_incoming = stage.is_incoming();
     let name = stage.peer_name().to_string();
-    let detail = stage
-        .active()
-        .map(|call| call.elapsed_label())
-        .unwrap_or_else(|| "incoming call".to_string());
+    let detail = match stage {
+        Stage::Active(call) => call.elapsed_label(),
+        Stage::Incoming(_) => "incoming call".to_string(),
+        Stage::Outgoing(call) => outgoing_label(call).to_string(),
+    };
 
     div()
         .id("call-banner")
         .key_context(CALL_CONTEXT)
         .track_focus(focus_handle)
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
+        .on_action({
+            let entity = action_entity.clone();
+            move |_: &AcceptCall, _window, cx| {
+                entity.update(cx, |app, cx| app.accept_call(cx));
+            }
+        })
+        .on_action({
+            let entity = action_entity.clone();
+            move |_: &ToggleMute, _window, cx| {
+                entity.update(cx, |app, cx| app.toggle_call_muted(cx));
+            }
+        })
+        .on_action({
+            let entity = action_entity;
+            move |_: &DeclineCall, _window, cx| {
+                entity.update(cx, |app, cx| app.hang_up(cx));
+            }
+        })
+        .w_full()
         .flex()
         .items_center()
         .gap(metrics.space_lg())
@@ -333,7 +429,7 @@ fn mobile_banner(
                         .child(detail),
                 ),
         )
-        .when(is_ringing, |el| {
+        .when(is_incoming, |el| {
             el.child(
                 Button::new("call-accept")
                     .icon(ProductIcon::Phone)
@@ -349,10 +445,26 @@ fn mobile_banner(
             Button::new("call-hang-up")
                 .icon(ProductIcon::PhoneOff)
                 .danger()
-                .tooltip(if is_ringing { "Decline" } else { "End call" })
+                .tooltip(match stage {
+                    Stage::Incoming(_) => "Decline",
+                    Stage::Outgoing(_) => "Cancel",
+                    Stage::Active(_) => "End call",
+                })
                 .h(metrics.touch_target())
                 .on_click(move |_, _window, cx| {
                     end_entity.update(cx, |app, cx| app.hang_up(cx));
                 }),
         )
+}
+
+/// What a call we placed is doing, in the words the peer's side would use.
+fn outgoing_label(call: &oxidezap_core::OutgoingCall) -> &'static str {
+    use oxidezap_core::OutgoingCallState;
+    match call.state {
+        OutgoingCallState::Initiating => "calling…",
+        OutgoingCallState::Ringing => "ringing…",
+        OutgoingCallState::Connected => "connected",
+        OutgoingCallState::Declined => "declined",
+        OutgoingCallState::Timeout => "no answer",
+    }
 }

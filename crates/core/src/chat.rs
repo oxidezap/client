@@ -564,8 +564,70 @@ impl Chat {
     }
 
     /// Update a participant's display name (for group chats)
+    ///
+    /// Back-fills the quotes that named this participant and had nobody to
+    /// name: a reply can arrive before the push name that explains who it is
+    /// answering, and the quote bar would otherwise keep saying "Message"
+    /// for the rest of the session.
     pub fn update_participant(&mut self, jid: String, name: String) {
+        for message in &mut self.messages {
+            if let Some(quoted) = message.quoted.as_mut()
+                && quoted.sender_name.is_empty()
+                && quoted.sender == jid
+            {
+                quoted.sender_name.clone_from(&name);
+            }
+        }
         self.participants.insert(jid, name);
+    }
+
+    /// Give a reply's quote bar the name of whoever it is answering.
+    ///
+    /// The envelope carries the quoted author's JID and never their push
+    /// name, so this is the only place the two meet: the chat holds the
+    /// participant map, and its own name is the answer in a 1:1 where there
+    /// is no map to hold.
+    fn name_quoted_author(&self, message: &mut ChatMessage) {
+        let Some(quoted) = message.quoted.as_mut() else {
+            return;
+        };
+        if !quoted.sender_name.is_empty() {
+            return;
+        }
+        // The original is often still loaded, and it is the better answer:
+        // it knows whether the reader wrote it, and carries the name it was
+        // received under.
+        if let Some(original) = self
+            .messages
+            .iter()
+            .find(|message| message.id == quoted.message_id)
+        {
+            if original.is_from_me {
+                quoted.sender_name = "You".to_string();
+                return;
+            }
+            if let Some(name) = &original.sender_name {
+                quoted.sender_name.clone_from(name);
+                return;
+            }
+        }
+        // An empty participant means the quote came off a 1:1, where the only
+        // two authors are the chat and the reader.
+        if quoted.sender.is_empty() {
+            if !self.is_group {
+                quoted.sender_name = self.name.clone();
+            }
+            return;
+        }
+        if let Some(name) = self.participants.get(&quoted.sender) {
+            quoted.sender_name.clone_from(name);
+        } else if !self.is_group {
+            quoted.sender_name = self.name.clone();
+        } else if let Ok(jid) = quoted.sender.parse::<Jid>() {
+            // Better than "Message": a number is at least *someone*, and the
+            // real name replaces it as soon as a push name arrives.
+            quoted.sender_name = fallback_chat_name(&jid);
+        }
     }
 
     /// Get a participant's display name, with fallback to JID prefix
@@ -582,7 +644,8 @@ impl Chat {
     /// Returns true when the message became the chat's newest content, so the
     /// caller knows whether to bump the chat in the list; duplicates and older
     /// backfills return false.
-    pub fn add_message(&mut self, message: ChatMessage) -> bool {
+    pub fn add_message(&mut self, mut message: ChatMessage) -> bool {
+        self.name_quoted_author(&mut message);
         // Redelivery of a message we already show (live traffic overlapping
         // hydrated history): no duplicate bubble, no recount. Id-only, not
         // (timestamp, id): the optimistic bubble's UI clock and the store's
@@ -679,6 +742,7 @@ impl Chat {
     /// authoritative (edits and revokes materialize there), so the hydrated
     /// copy must not be dropped in favor of stale content.
     pub fn insert_history_message(&mut self, mut message: ChatMessage) {
+        self.name_quoted_author(&mut message);
         // Id-only match: the hydrated copy may carry a slightly different
         // timestamp than the optimistic bubble. Remove-and-reinsert keeps
         // the (timestamp, id) sort invariant when the timestamp shifted.

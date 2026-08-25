@@ -10,6 +10,8 @@ repository.workspace = true
 
 [dependencies]
 async-trait = "0.1"
+# Only for the call-state transitions, which refuse a second offer and say so.
+log = { workspace = true }
 # `serde` on chrono: message and chat timestamps cross the daemon socket.
 chrono = { workspace = true, features = ["std", "clock", "serde"] }
 # These types are the daemon's wire format as well as its domain model: a
@@ -21,3 +23,7 @@ wacore-binary = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The call snapshot crosses the daemon socket; the round trip is a test.
+serde_json = { workspace = true, features = ["std"] }

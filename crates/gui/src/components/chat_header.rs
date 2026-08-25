@@ -61,7 +61,18 @@ pub fn render_chat_header(
     let metrics = *layout.metrics();
     let name: SharedString = chat.name.clone().into();
     let subtitle = subtitle(chat, typing, availability);
-    let is_online = matches!(availability, Some(Availability::Online));
+    // No badge until presence actually arrives. A contact who has told us
+    // nothing is not "away": most contacts are in that state before the first
+    // presence event, and a dot claiming otherwise is a made-up fact.
+    let presence = if chat.is_group {
+        None
+    } else {
+        match availability {
+            Some(Availability::Online) => Some(Presence::Online),
+            Some(Availability::LastSeen(_) | Availability::Unknown) => Some(Presence::Away),
+            None => None,
+        }
+    };
 
     div()
         .h(layout.header_height())
@@ -76,7 +87,7 @@ pub fn render_chat_header(
         .border_b_1()
         .border_color(cx.theme().border)
         .child(render_identity(
-            chat, name, subtitle, is_online, &entity, layout, metrics, cx,
+            chat, name, subtitle, presence, &entity, layout, metrics, cx,
         ))
         .child(render_actions(chat, entity, layout, metrics, cx))
 }
@@ -86,18 +97,13 @@ fn render_identity(
     chat: &Chat,
     name: SharedString,
     subtitle: Option<(String, bool)>,
-    is_online: bool,
+    presence: Option<Presence>,
     entity: &Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let back_entity = entity.clone();
-    let presence = (!chat.is_group).then_some(if is_online {
-        Presence::Online
-    } else {
-        Presence::Away
-    });
 
     div()
         .flex()

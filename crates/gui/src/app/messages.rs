@@ -54,8 +54,11 @@ pub struct MessageListCache {
     /// The scale the heights were measured against. A base-font or density
     /// change moves every row, and a stale measurement clips content.
     pub metrics: Metrics,
-    /// Whether a typing row was included, so its arrival rebuilds the list.
-    pub has_typing: bool,
+    /// The typing row that was included, so its arrival — or a change of who
+    /// is typing — rebuilds the list. Not a bare flag: the row carries the
+    /// names, and in a group it grows an avatar per typist, so a summary that
+    /// changed while staying `Some` moves geometry as well as text.
+    pub typing: Option<TypingSummary>,
     /// The rows, dividers and typing indicator included.
     pub items: Arc<[TimelineItem]>,
     /// Pre-computed item sizes for virtual list
@@ -74,8 +77,7 @@ impl MessageListCache {
         typing: Option<TypingSummary>,
     ) -> Self {
         let messages_arc: Arc<[ChatMessage]> = Arc::from(messages);
-        let has_typing = typing.is_some();
-        let items = build_items(messages, typing);
+        let items = build_items(messages, typing.clone());
 
         let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
             items
@@ -103,7 +105,7 @@ impl MessageListCache {
             is_group,
             max_media_size,
             metrics,
-            has_typing,
+            typing,
             items: items.into(),
             item_sizes,
             messages: messages_arc,
@@ -117,13 +119,13 @@ impl MessageListCache {
         is_group: bool,
         max_media_size: f32,
         metrics: Metrics,
-        has_typing: bool,
+        typing: Option<&TypingSummary>,
     ) -> bool {
         self.message_count == message_count
             && self.is_group == is_group
             && self.max_media_size == max_media_size
             && self.metrics == metrics
-            && self.has_typing == has_typing
+            && self.typing.as_ref() == typing
     }
 }
 
@@ -403,17 +405,50 @@ mod tests {
         let cache = MessageListCache::new(&messages, false, 300.0, Metrics::default(), None);
         let zoomed = Metrics::new(20.0, crate::theme::metrics::Density::Comfortable);
         assert!(
-            !cache.is_valid_for(1, false, 300.0, zoomed, false),
+            !cache.is_valid_for(1, false, 300.0, zoomed, None),
             "rows measured at one base font cannot be reused at another"
         );
-        assert!(cache.is_valid_for(1, false, 300.0, Metrics::default(), false));
+        assert!(cache.is_valid_for(1, false, 300.0, Metrics::default(), None));
     }
 
     #[test]
     fn typing_arriving_invalidates_the_list() {
         let messages = vec![message("a", false, at(14, 9))];
         let cache = MessageListCache::new(&messages, false, 300.0, Metrics::default(), None);
-        assert!(!cache.is_valid_for(1, false, 300.0, Metrics::default(), true));
+        assert!(!cache.is_valid_for(1, false, 300.0, Metrics::default(), Some(&typing(&["Ana"]))));
+    }
+
+    /// A second typist in a group adds an avatar to the row, so a summary
+    /// that changed while staying `Some` is a different timeline.
+    #[test]
+    fn a_changed_typing_summary_invalidates_the_list() {
+        let messages = vec![message("a", false, at(14, 9))];
+        let cache = MessageListCache::new(
+            &messages,
+            true,
+            300.0,
+            Metrics::default(),
+            Some(typing(&["Ana"])),
+        );
+        assert!(cache.is_valid_for(1, true, 300.0, Metrics::default(), Some(&typing(&["Ana"]))));
+        assert!(
+            !cache.is_valid_for(
+                1,
+                true,
+                300.0,
+                Metrics::default(),
+                Some(&typing(&["Ana", "Marcos"]))
+            ),
+            "the row grew an avatar"
+        );
+    }
+
+    fn typing(names: &[&str]) -> TypingSummary {
+        TypingSummary {
+            names: names.iter().map(|n| (*n).to_string()).collect(),
+            total: names.len(),
+            kind: oxidezap_core::ComposingKind::Text,
+        }
     }
 
     #[test]

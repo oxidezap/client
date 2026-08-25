@@ -35,6 +35,14 @@ pub fn render_connected_view(
     let chat_search_input = app.chat_search_input().cloned();
     let message_list_scroll = app.message_list_scroll();
     let input_area = app.input_area();
+    // The composer draws itself into the slot the layout gave it, and only
+    // this side knows what that is: left to its own defaults it used the
+    // desktop height and icon size on a phone.
+    if let Some(input) = &input_area {
+        input.update(cx, |view, cx| {
+            view.set_layout(layout.input_area_height(), layout.min_touch_target(), cx);
+        });
+    }
     let call_focus = app.call_focus().clone();
 
     let list_props = ChatListProps {
@@ -75,7 +83,14 @@ pub fn render_connected_view(
             .is_none_or(|chat| chat.jid != call.peer_jid)
     });
     let banner = return_banner.map(|call| (call.peer_name.clone(), call.elapsed_label()));
-    let call_card = render_call_card(app.call_state(), entity.clone(), &call_focus, layout, cx);
+    let call_card = render_call_card(
+        app.call_state(),
+        app.call_card(),
+        entity.clone(),
+        &call_focus,
+        layout,
+        cx,
+    );
 
     div()
         .relative()
