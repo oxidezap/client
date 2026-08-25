@@ -62,7 +62,7 @@ pub fn render_call_card(
     if layout.is_mobile() {
         let waiting = state
             .waiting()
-            .map(|waiting| waiting_strip(&waiting.caller_name, entity.clone(), metrics, cx));
+            .map(|waiting| waiting_strip(waiting.caller_name(), entity.clone(), metrics, cx));
         return Some(
             div()
                 .absolute()
@@ -95,7 +95,7 @@ pub fn render_call_card(
     // and leave the visible call ringing.
     let waiting = state
         .waiting()
-        .map(|waiting| waiting_strip(&waiting.caller_name, entity.clone(), metrics, cx));
+        .map(|waiting| waiting_strip(waiting.caller_name(), entity.clone(), metrics, cx));
 
     Some(
         div()

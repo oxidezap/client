@@ -455,6 +455,18 @@ impl Bridge {
                         video,
                         placeholder_id,
                     } => {
+                        // Refused here, not merely in the window that asked.
+                        // Two front ends can both pass their own `is_busy`
+                        // check before either has seen the other's state, and
+                        // `set_outgoing` replaces the stage — which left the
+                        // first call running with no UI anywhere and no way to
+                        // hang it up. The daemon owns the session and the
+                        // audio devices, so its state is the one that decides.
+                        if self.hub.call_state().is_busy() {
+                            return CommandOutcome::Refused(
+                                "a call is already up; end it before placing another".to_string(),
+                            );
+                        }
                         // The name off the chat list, the same place a front
                         // end would look.
                         let name = self

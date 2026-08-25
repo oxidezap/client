@@ -292,8 +292,8 @@ impl StateHub {
     /// What is happening on the call front right now.
     ///
     /// The snapshot reads the field directly; this is for a caller that wants
-    /// only the calls.
-    #[cfg(test)]
+    /// only the calls — the bridge asks before placing one, because whether
+    /// this account is already on a call is the daemon's fact, not a window's.
     pub fn call_state(&self) -> oxidezap_core::CallState {
         self.lock().calls.clone()
     }

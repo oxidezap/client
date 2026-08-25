@@ -512,8 +512,7 @@ impl WhatsAppApp {
                     // that were already happening when this window attached,
                     // and a call this account placed was never an event.
                     FromDaemon::Calls(calls) => entity.update(cx, |app, cx| {
-                        app.call_state = *calls;
-                        cx.notify();
+                        app.adopt_calls(*calls, cx);
                     }),
                     // Announced on connect, before this window existed, so it
                     // arrives with the snapshot rather than as an event.

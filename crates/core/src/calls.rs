@@ -131,11 +131,26 @@ impl Stage {
 /// A second call arriving while one is up.
 ///
 /// The old behaviour was a `warn!` and silence: the caller heard ringing that
-/// the user never saw. Now it is surfaced so it can be refused deliberately.
+/// the user never saw. Now it is surfaced so it can be refused deliberately —
+/// or answered, once the call in front of it ends.
+///
+/// The offer is kept whole rather than reduced to a name and an id, because
+/// the caller is still ringing when the first call ends and what should happen
+/// then is that their offer becomes *the* call. Rebuilding an `IncomingCall`
+/// from a summary is not something this can do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitingCall {
-    pub call_id: CallId,
-    pub caller_name: String,
+    call: IncomingCall,
+}
+
+impl WaitingCall {
+    pub fn call_id(&self) -> &CallId {
+        &self.call.call_id
+    }
+
+    pub fn caller_name(&self) -> &str {
+        &self.call.caller_name
+    }
 }
 
 /// The one call, and whatever is queued behind it.
@@ -208,10 +223,7 @@ impl CallState {
                 call.call_id,
                 self.stage.as_ref().map_or("?", Stage::call_id)
             );
-            self.waiting = Some(WaitingCall {
-                call_id: call.call_id.clone(),
-                caller_name: call.caller_name.clone(),
-            });
+            self.waiting = Some(WaitingCall { call });
             return false;
         }
         self.stage = Some(Stage::Incoming(call));
@@ -265,7 +277,11 @@ impl CallState {
         // A parked second offer is an incoming call too. Matching only the
         // stage left a refused caller sitting in the state, to be published
         // back to the front end that had just refused them.
-        if self.waiting.as_ref().is_some_and(|w| w.call_id == *call_id) {
+        if self
+            .waiting
+            .as_ref()
+            .is_some_and(|w| w.call_id() == call_id)
+        {
             self.waiting = None;
             return true;
         }
@@ -365,15 +381,33 @@ impl CallState {
     /// Returns whether anything changed, so an ack for a call already gone
     /// does not buy a redraw.
     pub fn end(&mut self, call_id: &CallId) -> bool {
-        if self.waiting.as_ref().is_some_and(|w| w.call_id == *call_id) {
+        if self
+            .waiting
+            .as_ref()
+            .is_some_and(|w| w.call_id() == call_id)
+        {
             self.waiting = None;
             return true;
         }
         if self.stage.as_ref().is_some_and(|s| s.call_id() == call_id) {
-            self.stage = None;
+            // Whoever was parked behind it is still ringing, and with the
+            // stage empty nothing draws them — the card returns early with no
+            // stage, so the caller would ring on with no way to answer or
+            // refuse them. Ending the call in front promotes the one behind.
+            self.stage = self.waiting.take().map(|w| Stage::Incoming(w.call));
             return true;
         }
         false
+    }
+
+    /// Whether this state names `call_id` anywhere — as the stage or parked
+    /// behind it.
+    pub fn holds(&self, call_id: &str) -> bool {
+        self.stage.as_ref().is_some_and(|s| s.call_id() == call_id)
+            || self
+                .waiting
+                .as_ref()
+                .is_some_and(|w| w.call_id() == call_id)
     }
 
     /// Clear the parked second call, once it has been refused.
@@ -539,7 +573,7 @@ mod tests {
         assert!(!state.set_incoming(incoming("SECOND")));
 
         assert_eq!(state.stage().unwrap().call_id(), "FIRST");
-        assert_eq!(state.waiting().unwrap().call_id, "SECOND");
+        assert_eq!(state.waiting().unwrap().call_id(), "SECOND");
     }
 
     /// A stale window can ask to mute a call that has already ended. Applying
@@ -556,6 +590,36 @@ mod tests {
 
         assert!(state.set_muted(&"SECOND".to_string(), true));
         assert!(state.active().unwrap().muted);
+    }
+
+    /// The parked caller is still ringing when the call in front of them
+    /// ends. Nothing draws a waiting call on its own, so leaving it parked
+    /// meant a caller with no way to be answered or refused.
+    #[test]
+    fn ending_a_call_promotes_whoever_was_waiting_behind_it() {
+        let mut state = CallState::default();
+        state.set_incoming(incoming("FIRST"));
+        state.connect(&"FIRST".to_string());
+        assert!(!state.set_incoming(incoming("SECOND")), "parked");
+
+        assert!(state.end(&"FIRST".to_string()));
+        assert_eq!(state.incoming().map(|c| c.call_id.as_str()), Some("SECOND"));
+        assert!(
+            state.waiting().is_none(),
+            "it is the call now, not the queue"
+        );
+    }
+
+    #[test]
+    fn a_state_knows_which_calls_it_names() {
+        let mut state = CallState::default();
+        state.set_incoming(incoming("FIRST"));
+        state.connect(&"FIRST".to_string());
+        state.set_incoming(incoming("SECOND"));
+
+        assert!(state.holds("FIRST"));
+        assert!(state.holds("SECOND"), "parked counts as held");
+        assert!(!state.holds("THIRD"));
     }
 
     #[test]

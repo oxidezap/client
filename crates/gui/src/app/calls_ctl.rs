@@ -59,9 +59,9 @@ impl WhatsAppApp {
         let Some(waiting) = self.call_state.take_waiting() else {
             return;
         };
-        info!("Declining waiting call {}", waiting.call_id);
+        info!("Declining waiting call {}", waiting.call_id());
         if let Some(client) = &self.client {
-            client.decline_call(waiting.call_id.as_str());
+            client.decline_call(waiting.call_id().as_str());
         }
         cx.notify();
     }
@@ -79,6 +79,12 @@ impl WhatsAppApp {
                 observe_str(&call.caller_jid)
             );
             client.decline_call(call.call_id.as_str());
+            // A refusal is not a missed call, and a local reject emits no
+            // `CallEnded` to write one later — so the record is made here,
+            // saying what actually happened. The mobile decline goes through
+            // `hang_up`, which records it as missed; this is the outcome the
+            // enum has been carrying unused.
+            self.record_call_as(&Stage::Incoming(call), Some(CallOutcome::Declined), cx);
             cx.notify();
         }
     }
@@ -207,7 +213,44 @@ impl WhatsAppApp {
     /// call the user never saw is the case this exists for — and it is why the
     /// row is built from what the UI watched rather than queried back.
     pub(super) fn record_call(&mut self, stage: &Stage, cx: &mut Context<Self>) {
-        let (peer_jid, is_video, outcome, is_outgoing) = match stage {
+        self.record_call_as(stage, None, cx);
+    }
+
+    /// Take the daemon's call state as authoritative.
+    ///
+    /// With one wrinkle. The daemon's state update and the session's
+    /// `CallEnded` news travel on two channels, and the state one is served
+    /// first, so a call the peer ended can be gone from the state before the
+    /// event that writes it down arrives — and the stage is where the
+    /// duration and the direction live. It is recorded here, on the way out.
+    /// Recording it twice is harmless: a record is keyed by the call id and
+    /// `Chat::add_message` refuses a duplicate.
+    pub(super) fn adopt_calls(&mut self, calls: CallState, cx: &mut Context<Self>) {
+        let ended = self
+            .call_state
+            .stage()
+            .filter(|stage| !calls.holds(stage.call_id()))
+            .cloned();
+        if let Some(stage) = ended {
+            self.record_call(&stage, cx);
+            // A card minimised for that call must not swallow the next ring.
+            self.call_card.call_ended();
+        }
+        self.call_state = calls;
+        cx.notify();
+    }
+
+    /// Write a call down, with `outcome` when the caller knows better than the
+    /// stage does — declining is the case: the stage still says "incoming",
+    /// and only the person who pressed the button knows it was refused rather
+    /// than missed.
+    fn record_call_as(
+        &mut self,
+        stage: &Stage,
+        outcome: Option<CallOutcome>,
+        cx: &mut Context<Self>,
+    ) {
+        let (peer_jid, is_video, derived, is_outgoing) = match stage {
             Stage::Active(call) => (
                 call.peer_jid.clone(),
                 call.is_video,
@@ -232,7 +275,7 @@ impl WhatsAppApp {
         let record = CallRecord {
             is_video,
             is_outgoing,
-            outcome,
+            outcome: outcome.unwrap_or(derived),
         };
         let mut message = ChatMessage::new_incoming(
             format!("call-{}", stage.call_id()),
