@@ -27,6 +27,14 @@ pub struct AudioPlayer {
     /// `sample_rate`s worth of them. Without this the clock ran at double
     /// speed on any stereo device and passed the clip's stated length.
     channels: usize,
+    /// Whether the clip ran to its end.
+    ///
+    /// Distinct from `!is_playing`, which is also true while paused. The
+    /// stream is still open after a natural completion — the callback only
+    /// clears the flag — so rewinding `position` would set it playing again
+    /// with nobody listening and no completion left to fire. Seeks are refused
+    /// while this is set; the caller starts the clip over instead.
+    finished: Arc<AtomicBool>,
     /// How fast the next clip is played, pitch preserved.
     ///
     /// Applied when the samples are prepared rather than by reading the stream
@@ -48,6 +56,7 @@ impl AudioPlayer {
             stream: None,
             is_playing: Arc::new(AtomicBool::new(false)),
             position: Arc::new(AtomicUsize::new(0)),
+            finished: Arc::new(AtomicBool::new(false)),
             channels: 1,
             total_samples: 0,
             sample_rate: 48000,
@@ -101,9 +110,9 @@ impl AudioPlayer {
     /// counter is in interleaved samples, so the target is rounded down to a
     /// frame boundary — landing mid-frame on a stereo stream swaps the
     /// channels for the rest of the clip.
-    pub fn seek(&self, fraction: f32) {
-        if self.total_samples == 0 {
-            return;
+    pub fn seek(&self, fraction: f32) -> bool {
+        if self.total_samples == 0 || self.finished.load(Ordering::Relaxed) {
+            return false;
         }
         let channels = self.channels.max(1);
         let target = (fraction.clamp(0.0, 1.0) * self.total_samples as f32) as usize;
@@ -113,6 +122,12 @@ impl AudioPlayer {
         // last moment".
         let last = (self.total_samples as usize).saturating_sub(channels);
         self.position.store(aligned.min(last), Ordering::Relaxed);
+        true
+    }
+
+    /// Whether the loaded clip played to its end.
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
     }
 
     /// Interleaved samples in one second of output.
@@ -230,6 +245,8 @@ impl AudioPlayer {
         let is_playing = self.is_playing.clone();
         let position = self.position.clone();
         position.store(0, Ordering::Relaxed);
+        let finished = self.finished.clone();
+        finished.store(false, Ordering::Relaxed);
 
         let completion_tx: Arc<Mutex<Option<oneshot::Sender<()>>>> =
             Arc::new(Mutex::new(self.completion_tx.take()));
@@ -245,6 +262,7 @@ impl AudioPlayer {
                 audio_data,
                 position,
                 is_playing,
+                finished,
                 completion_tx,
             ),
             SampleFormat::I16 => build_stream::<i16>(
@@ -253,6 +271,7 @@ impl AudioPlayer {
                 audio_data,
                 position,
                 is_playing,
+                finished,
                 completion_tx,
             ),
             SampleFormat::U16 => build_stream::<u16>(
@@ -261,6 +280,7 @@ impl AudioPlayer {
                 audio_data,
                 position,
                 is_playing,
+                finished,
                 completion_tx,
             ),
             other => Err(PlayerError::StreamError(format!(
@@ -294,6 +314,7 @@ impl AudioPlayer {
     pub fn stop(&mut self) {
         self.stream.take();
         self.is_playing.store(false, Ordering::Relaxed);
+        self.finished.store(false, Ordering::Relaxed);
         self.position.store(0, Ordering::Relaxed);
         self.total_samples = 0;
         self.channels = 1;
@@ -332,9 +353,11 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
     audio: Arc<Vec<f32>>,
     position: Arc<AtomicUsize>,
     is_playing: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
     completion_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 ) -> Result<Stream, PlayerError> {
     let err_is_playing = is_playing.clone();
+    let err_finished = finished.clone();
     let err_completion = completion_tx.clone();
     device
         .build_output_stream(
@@ -349,11 +372,13 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
                         s
                     } else {
                         // Mark as done and notify completion (only once)
-                        if is_playing.swap(false, Ordering::Relaxed)
-                            && let Ok(mut guard) = completion_tx.lock()
-                            && let Some(tx) = guard.take()
-                        {
-                            let _ = tx.send(());
+                        if is_playing.swap(false, Ordering::Relaxed) {
+                            finished.store(true, Ordering::Relaxed);
+                            if let Ok(mut guard) = completion_tx.lock()
+                                && let Some(tx) = guard.take()
+                            {
+                                let _ = tx.send(());
+                            }
                         }
                         0.0
                     };
@@ -367,11 +392,13 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
                 // A dead stream produces no further callbacks, so clearing the
                 // flag and settling the completion here is the only thing that
                 // keeps a waiter from hanging on audio that stopped.
-                if err_is_playing.swap(false, Ordering::Relaxed)
-                    && let Ok(mut guard) = err_completion.lock()
-                    && let Some(tx) = guard.take()
-                {
-                    let _ = tx.send(());
+                if err_is_playing.swap(false, Ordering::Relaxed) {
+                    err_finished.store(true, Ordering::Relaxed);
+                    if let Ok(mut guard) = err_completion.lock()
+                        && let Some(tx) = guard.take()
+                    {
+                        let _ = tx.send(());
+                    }
                 }
             },
             None,

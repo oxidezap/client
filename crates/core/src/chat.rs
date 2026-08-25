@@ -864,6 +864,13 @@ impl Chat {
         self.messages
             .iter_mut()
             .find(|m| m.id == message_id && m.is_from_me)
+            // Only a row still in flight. A `SendFailed` can arrive *after*
+            // the server's own acknowledgement — the send future returns its
+            // error late — and regressing a Sent, Delivered or Read bubble to
+            // Failed contradicts an answer the server already gave. The
+            // store's writer refuses the same regression for the same reason;
+            // this is the front end keeping the same rule.
+            .filter(|m| m.status.is_pending())
             .map(|m| m.status.advance(MessageStatus::Failed))
             .is_some()
     }
@@ -907,6 +914,31 @@ mod tests {
             quoted: None,
             system: None,
         }
+    }
+
+    /// A late `SendFailed` must not overwrite an answer the server already
+    /// gave. The store's writer refuses the same regression.
+    #[test]
+    fn a_failure_after_the_acknowledgement_does_not_regress_the_row() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        let mut sent = make_message("m1", 10);
+        sent.is_from_me = true;
+        sent.status = MessageStatus::Delivered;
+        chat.messages.push(sent);
+
+        assert!(!chat.mark_send_failed("m1"), "nothing to fail");
+        assert_eq!(chat.messages[0].status, MessageStatus::Delivered);
+    }
+
+    #[test]
+    fn a_failure_while_still_pending_marks_the_row() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        let mut pending = make_message("m1", 10);
+        pending.is_from_me = true;
+        chat.messages.push(pending);
+
+        assert!(chat.mark_send_failed("m1"));
+        assert_eq!(chat.messages[0].status, MessageStatus::Failed);
     }
 
     fn make_media(data: Vec<u8>, data_is_preview: bool) -> MediaContent {

@@ -1111,6 +1111,13 @@ impl WhatsAppApp {
         {
             self.media_viewer = None;
         }
+        // And so does a reply. The draft is one shared field feeding one
+        // shared composer, so a reply begun in A and sent from B quoted A's
+        // message — putting A's text in front of B as the thing being
+        // answered.
+        if self.selected_chat.as_deref() != Some(jid.as_str()) && self.reply_to.is_some() {
+            self.cancel_reply(cx);
+        }
         self.selected_chat = Some(jid.clone());
         self.navigate_to_chat();
 
@@ -1313,6 +1320,25 @@ impl WhatsAppApp {
 
     /// Send a message to the currently selected chat
     fn send_message(&mut self, text: &str, cx: &mut Context<Self>) {
+        // Taken, not read: a reply is answered once. Leaving the draft in
+        // place quoted the same message from every message that followed.
+        let quoted = self.reply_to.take().map(|draft| QuotedMessage {
+            message_id: draft.message_id,
+            sender: draft.sender,
+            sender_name: draft.sender_name,
+            preview: draft.preview,
+            kind: None,
+        });
+        self.send_quoted(text, quoted, cx);
+    }
+
+    /// Send `text`, quoting whatever the caller says it quotes.
+    ///
+    /// Split from [`send_message`](Self::send_message) so a retry can carry
+    /// the *original* message's quote: retrying is presented as sending the
+    /// failed message again, and the reply draft that produced it was
+    /// consumed when it was first sent.
+    fn send_quoted(&mut self, text: &str, quoted: Option<QuotedMessage>, cx: &mut Context<Self>) {
         // Check if connected before attempting to send
         if !self.is_connected() {
             warn!("Cannot send message: not connected");
@@ -1324,15 +1350,6 @@ impl WhatsAppApp {
         };
 
         let local_id = Self::next_local_id("local");
-        // Taken, not read: a reply is answered once. Leaving the draft in
-        // place quoted the same message from every message that followed.
-        let quoted = self.reply_to.take().map(|draft| QuotedMessage {
-            message_id: draft.message_id,
-            sender: draft.sender,
-            sender_name: draft.sender_name,
-            preview: draft.preview,
-            kind: None,
-        });
         let Some(client) = &self.client else {
             warn!("Cannot send message: client is unavailable");
             return;
@@ -1478,6 +1495,16 @@ impl WhatsAppApp {
             message.sender_name = sender_name
                 .clone()
                 .or_else(|| self.name_cache.get(&message.sender).cloned());
+        }
+
+        // Their message ends their typing, more reliably than `paused` does:
+        // the peer that stopped composing is not obliged to say so, and a
+        // sender whose message just arrived is definitively no longer
+        // mid-word. Without this the header and the sidebar row went on
+        // claiming they were typing for the whole 10-second TTL, underneath
+        // the message they had already sent.
+        if !message.is_from_me {
+            self.presence.clear_composing(&chat_jid, &message.sender);
         }
 
         // Find the chat index so we can move it to the top after adding message

@@ -28,6 +28,8 @@ fn is_callable_user(jid: &str) -> bool {
 ///
 /// Ordered by which fact is most current: someone typing now beats a presence
 /// reading, which beats the static member count.
+///
+/// A group with nobody typing has no subtitle at all: see below.
 fn subtitle(
     chat: &Chat,
     typing: Option<&TypingSummary>,
@@ -37,8 +39,12 @@ fn subtitle(
         return Some((summary.compact_label(chat.is_group), true));
     }
     if chat.is_group {
-        let members = chat.participants.len();
-        return (members > 0).then(|| (format!("{members} members"), false));
+        // No member count. `participants` is not a roster — it is filled only
+        // when a live message supplies that sender's name, so a fifty-person
+        // group with one recently observed sender reported "1 members".
+        // Nothing in the library's public surface answers the real question
+        // yet, and saying nothing beats saying something false.
+        return None;
     }
     match availability {
         Some(Availability::Online) => Some(("online".to_string(), false)),
@@ -336,14 +342,27 @@ mod tests {
         assert!(is_typing);
     }
 
+    /// `participants` collects the senders that have been *seen*, so its
+    /// length is not the group's size and must never be presented as one.
     #[test]
-    fn a_group_counts_its_members() {
-        assert_eq!(subtitle(&group_with(4), None, None).unwrap().0, "4 members");
+    fn a_group_does_not_pass_its_known_senders_off_as_a_member_count() {
+        assert!(subtitle(&group_with(4), None, None).is_none());
+        assert!(subtitle(&group_with(0), None, None).is_none());
     }
 
+    /// What a group *does* say is who is typing, which is a fact about now
+    /// and true whatever the roster is.
     #[test]
-    fn a_group_with_no_known_members_says_nothing_rather_than_zero() {
-        assert!(subtitle(&group_with(0), None, None).is_none());
+    fn a_group_still_reports_who_is_typing() {
+        let summary = TypingSummary {
+            names: vec!["Ana".to_string()],
+            total: 1,
+            kind: ComposingKind::Text,
+        };
+        assert_eq!(
+            subtitle(&group_with(4), Some(&summary), None).unwrap().0,
+            "Ana typing…"
+        );
     }
 
     #[test]

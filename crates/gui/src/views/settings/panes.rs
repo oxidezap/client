@@ -267,7 +267,8 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
                         // here that cannot be undone.
                         .child(
                             "Unlinking clears this device's local data — messages, \
-                             contacts and keys — and starts a new link from the QR code.",
+                             contacts, keys and downloaded media — and starts a new link \
+                             from the QR code.",
                         ),
                 )
                 .child(

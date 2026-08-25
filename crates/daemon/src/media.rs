@@ -192,6 +192,41 @@ fn sweep_occasionally(dir: &std::path::Path, written: u64) {
     }
 }
 
+/// Delete every cached file.
+///
+/// Part of "clear data and pair again", and not optional: the store is one
+/// file, but the media beside it is a directory that can hold half a gigabyte
+/// of the *previous* account's photos, videos and documents. Leaving it in
+/// place means pairing a different account onto a cache of someone else's
+/// pictures, with no control anywhere that clears them.
+///
+/// Best-effort per entry: one unreadable file must not abandon the rest.
+pub fn wipe_cache() -> Result<()> {
+    let Some(dir) = oxidezap_ipc::media_dir() else {
+        return Ok(());
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // Never downloaded anything, so there is nothing to clear.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_file())
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    log::info!(
+        "cleared {removed} cached media files from {}",
+        dir.display()
+    );
+    Ok(())
+}
+
 /// Delete oldest-first until the cache is under budget.
 fn sweep(dir: &std::path::Path) -> Result<()> {
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();

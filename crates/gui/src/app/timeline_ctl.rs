@@ -113,8 +113,12 @@ impl WhatsAppApp {
             return;
         }
         let content = message.content.clone();
+        // A reply that failed is retried as a reply. The draft that produced
+        // it was consumed by the first send, so the quote has to come from
+        // the message itself.
+        let quoted = message.quoted.clone();
         let _ = window;
-        self.send_message(&content, cx);
+        self.send_quoted(&content, quoted, cx);
     }
 
     /// Offer the emoji picker for a message.

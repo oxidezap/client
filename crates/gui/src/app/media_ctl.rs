@@ -86,6 +86,15 @@ impl WhatsAppApp {
         if self.audio_owner.as_deref() != Some(message_id) {
             return;
         }
+        // A clip that ran to its end still owns an open stream, so rewinding
+        // its position alone would replay the audio with the UI insisting
+        // nothing is playing and no completion left to fire. Scrubbing a
+        // finished note means playing it again from the bytes still held.
+        if self.audio_player.is_finished()
+            && let Some(bytes) = self.audio_source.clone()
+        {
+            self.play_audio(message_id.to_string(), (*bytes).clone(), cx);
+        }
         self.audio_player.seek(fraction);
         self.ensure_playback_tick(cx);
         cx.notify();

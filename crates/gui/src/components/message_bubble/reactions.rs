@@ -7,7 +7,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Icon, Sizable as _};
+use gpui_component::{Disableable as _, Icon, Sizable as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::ProductIcon;
@@ -82,9 +82,7 @@ pub fn render_hover_actions(
     _cx: &App,
 ) -> impl IntoElement + use<> {
     let reply_id = message_id.clone();
-    let reply_entity = entity.clone();
-    let react_entity = entity;
-    let react_id = message_id.clone();
+    let reply_entity = entity;
     let has_text = !content.is_empty();
 
     let action = |id: SharedString, icon: Icon, tip: &'static str| {
@@ -102,16 +100,17 @@ pub fn render_hover_actions(
         .gap(metrics.space_xxs())
         .items_center()
         .child(
+            // Drawn and disabled: there is no picker behind it and no
+            // outbound reaction request in the session API, so the click it
+            // used to accept went to a `debug!` and nowhere else. The slot
+            // stays because reactions are already *rendered* on bubbles —
+            // hiding it would suggest they are not a thing here.
             action(
                 format!("react-{message_id}").into(),
                 ProductIcon::Smile.into(),
-                "React",
+                "Reacting is not available yet",
             )
-            .on_click(move |_, window, cx| {
-                react_entity.update(cx, |app, cx| {
-                    app.open_reaction_picker(&react_id, window, cx)
-                });
-            }),
+            .disabled(true),
         )
         .child(
             action(

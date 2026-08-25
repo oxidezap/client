@@ -334,9 +334,14 @@ impl CallState {
     /// The daemon owns the device, so the front end asks and this records
     /// what was asked for; a toggle computed in one window would disagree
     /// with a second window watching the same call.
-    pub fn set_muted(&mut self, muted: bool) -> bool {
+    pub fn set_muted(&mut self, call_id: &CallId, muted: bool) -> bool {
         match &mut self.stage {
-            Some(Stage::Active(call)) if call.muted != muted => {
+            // The id has to match. A window that fell behind can ask to mute
+            // a call that has already ended, and applying that to whatever
+            // call is live *now* left the daemon's snapshot claiming a
+            // microphone was muted while it was still open — the audio handle
+            // is looked up by the stale id and never touched.
+            Some(Stage::Active(call)) if call.call_id == *call_id && call.muted != muted => {
                 call.muted = muted;
                 true
             }
@@ -535,6 +540,22 @@ mod tests {
 
         assert_eq!(state.stage().unwrap().call_id(), "FIRST");
         assert_eq!(state.waiting().unwrap().call_id, "SECOND");
+    }
+
+    /// A stale window can ask to mute a call that has already ended. Applying
+    /// that to whatever call is live now makes the snapshot lie about a
+    /// microphone the audio handle never touched.
+    #[test]
+    fn muting_a_call_that_ended_does_not_mute_its_successor() {
+        let mut state = CallState::default();
+        state.set_incoming(incoming("SECOND"));
+        state.connect(&"SECOND".to_string());
+
+        assert!(!state.set_muted(&"FIRST".to_string(), true));
+        assert!(!state.active().unwrap().muted, "the live call is untouched");
+
+        assert!(state.set_muted(&"SECOND".to_string(), true));
+        assert!(state.active().unwrap().muted);
     }
 
     #[test]

@@ -199,6 +199,11 @@ pub async fn run(
             Ok(()) => log::info!("local state wiped; pair again on the next start"),
             Err(e) => log::error!("could not wipe local state: {e}"),
         }
+        // The store is one file; the media is a directory beside it, and it
+        // is just as much this account's data.
+        if let Err(e) = crate::media::wipe_cache() {
+            log::error!("could not clear the media cache: {e}");
+        }
     }
     Ok(())
 }
@@ -495,7 +500,7 @@ impl Bridge {
                     }
                     CallAction::SetMuted { call_id, muted } => {
                         self.hub.calls(|calls| {
-                            calls.set_muted(muted);
+                            calls.set_muted(&call_id, muted);
                         });
                         client.set_call_muted(&call_id, muted);
                     }
