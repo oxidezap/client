@@ -1,11 +1,17 @@
-//! Call state management for the WhatsApp UI
+//! Which calls are happening.
 //!
-//! This module manages incoming and outgoing call state.
+//! Domain state, not view state: the transitions here are what a call *is* —
+//! ringing, dialling, connected, gone — and the process holding the session
+//! has to track them as closely as the one drawing them. Keeping one
+//! implementation is also what lets a front end attaching mid-call be handed
+//! this whole thing rather than a replay of events it missed.
 
-use oxidezap_core::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
+use serde::{Deserialize, Serialize};
+
+use super::call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
 
 /// Unified call state management
-#[derive(Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallState {
     /// Current incoming call (if any)
     incoming: Option<IncomingCall>,

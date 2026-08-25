@@ -1,6 +1,6 @@
 //! Messages exchanged over the socket.
 
-use oxidezap_core::{DownloadableMedia, IncomingCall, UiEvent};
+use oxidezap_core::{CallState, DownloadableMedia, UiEvent};
 use serde::{Deserialize, Serialize};
 
 /// Monotonic counter over daemon state.
@@ -136,14 +136,15 @@ pub struct StateSnapshot {
     pub version: StateVersion,
     pub connection: ConnectionState,
     pub chats: Vec<ChatSummary>,
-    /// Calls ringing right now.
+    /// Which calls are happening.
     ///
-    /// State rather than an event, because a front end that opens while the
-    /// phone is ringing has no way back to the offer: it went out once,
-    /// before this client existed, and no history contains it. Without this a
-    /// call rings on in the daemon with nothing anywhere to answer it.
+    /// The whole state rather than the events that produced it: a call that
+    /// is ringing was offered once, before this client existed, and a call
+    /// this account placed was never an event at all — the front end that
+    /// dialled built it locally. Neither is reconstructible from a replay, and
+    /// both sides already share [`CallState`], so the snapshot hands it over.
     #[serde(default)]
-    pub ringing: Vec<IncomingCall>,
+    pub calls: CallState,
 }
 
 impl StateSnapshot {
@@ -207,26 +208,26 @@ pub enum DaemonMessage {
     /// a newtype variant is flattened into the same map as `type` — which
     /// happens to round-trip today and would stop the day an event named a
     /// field `type`. Nesting it under a key of its own cannot collide.
-    Session {
-        event: Box<UiEvent>,
-    },
-    /// The answer to a [`ClientRequest::Download`], by its id.
+    Session { event: Box<UiEvent> },
+    /// The bytes a [`ClientRequest::Download`] asked for are in the cache.
     ///
-    /// A cache key rather than bytes, for the same reason: the client reads
-    /// the file at [`crate::media_path`].
-    Downloaded {
-        id: RequestId,
-        result: Result<String, String>,
-    },
+    /// A cache key rather than bytes, for the same reason media never travels
+    /// as a frame: the client reads the file at [`crate::media_path`]. A
+    /// download that failed comes back as [`DaemonMessage::Error`] under the
+    /// same id, like every other request.
+    Downloaded { id: RequestId, key: String },
     /// A command reached the session. Carries no result beyond that: what the
     /// network makes of it arrives as [`DaemonMessage::Update`], or as
     /// [`DaemonMessage::SendFailed`] when it makes nothing of it at all.
     ///
     /// The daemon answers this only after the session has taken the command,
     /// not on handing it to a queue: a command that fails at execution time
-    /// comes back as [`ProtocolError::NoSession`] (the account is gone) or
-    /// [`ProtocolError::Refused`] (the daemon will not do it as asked).
-    Accepted,
+    /// comes back as an [`DaemonMessage::Error`] instead.
+    Accepted {
+        /// The [`Request::id`] this answers, when the client sent one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<RequestId>,
+    },
     /// Somebody asked for a front end to come forward: the tray's "Open"
     /// item, or another client's [`ClientRequest::ShowWindow`].
     ///
@@ -240,18 +241,51 @@ pub enum DaemonMessage {
     /// the request that caused it — the protocol has no request ids — so a
     /// front end reports it against the chat, which is where a user is
     /// looking when they wonder whether their message went out.
-    SendFailed {
-        jid: String,
-        reason: String,
-    },
+    SendFailed { jid: String, reason: String },
     /// The client fell too far behind and its stream was truncated. Whatever
     /// it holds is now untrustworthy, so it must snapshot again rather than
     /// keep applying.
     Resync,
-    Error(ProtocolError),
+    /// Something went wrong, and which request it went wrong for.
+    ///
+    /// The id is why a client no longer has to guess: before it existed, a
+    /// refused send could only be reported by inventing a failure against the
+    /// message it drew, and a refused download by nothing at all.
+    Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<RequestId>,
+        error: ProtocolError,
+    },
 }
 
-/// A client-to-daemon frame.
+/// A client-to-daemon frame: one request, and the id its answers carry.
+///
+/// Flattened, so the wire stays one object per frame — `{"id":7,
+/// "request":"send_text",...}` — rather than nesting a request inside an
+/// envelope for the sake of one field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Request {
+    /// Echoed on every answer to this request.
+    ///
+    /// Optional because a client that never looks at an answer should not
+    /// have to invent one, and because the daemon's behaviour cannot depend
+    /// on getting it: an id is how a client finds its own answer, not how the
+    /// daemon decides anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<RequestId>,
+    #[serde(flatten)]
+    pub request: ClientRequest,
+}
+
+impl Request {
+    /// A request nobody is waiting on an answer for.
+    #[must_use]
+    pub fn bare(request: ClientRequest) -> Self {
+        Self { id: None, request }
+    }
+}
+
+/// What a client asks the daemon to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum ClientRequest {
@@ -311,11 +345,10 @@ pub enum ClientRequest {
     Call(CallAction),
     /// Fetch media the daemon has not cached yet.
     ///
-    /// The only request whose answer is neither a state change nor an
-    /// acknowledgement, which is why it carries an id: several downloads are
-    /// normally in flight and their answers arrive out of order.
+    /// The one request whose answer is neither a state change nor an
+    /// acknowledgement: it takes seconds, several are normally in flight, and
+    /// the answer is [`DaemonMessage::Downloaded`] under the request's id.
     Download {
-        id: RequestId,
         media: Box<DownloadableMedia>,
     },
     /// Ask for the whole history again.
@@ -461,7 +494,7 @@ mod tests {
             version: StateVersion::INITIAL,
             connection: ConnectionState::Connected,
             chats: vec![chat(u32::MAX), chat(5)],
-            ringing: Vec::new(),
+            calls: CallState::default(),
         };
         assert_eq!(snapshot.total_unread(), u32::MAX);
     }
@@ -484,7 +517,7 @@ mod tests {
             version: StateVersion::INITIAL,
             connection: ConnectionState::Connected,
             chats: vec![chat.clone()],
-            ringing: Vec::new(),
+            calls: CallState::default(),
         };
         assert_eq!(
             snapshot.total_unread(),
@@ -521,6 +554,35 @@ mod tests {
             serde_json::from_str::<ConnectionState>(&line).unwrap(),
             state
         );
+    }
+
+    /// The envelope is flat on the wire: one object per frame, with the id
+    /// beside the request rather than wrapping it.
+    #[test]
+    fn a_request_carries_its_id_without_nesting() {
+        let line = serde_json::to_string(&Request {
+            id: Some(7),
+            request: ClientRequest::MarkRead {
+                jid: "1@s.whatsapp.net".into(),
+                through_message_id: Some("3EB0".into()),
+            },
+        })
+        .unwrap();
+        assert!(
+            line.starts_with(r#"{"id":7,"request":"mark_read""#),
+            "{line}"
+        );
+        assert_eq!(serde_json::from_str::<Request>(&line).unwrap().id, Some(7));
+    }
+
+    /// A client that never reads an answer should not have to invent an id,
+    /// and one sent by an older peer that does not know the field still
+    /// parses.
+    #[test]
+    fn an_id_is_optional_in_both_directions() {
+        let line = serde_json::to_string(&Request::bare(ClientRequest::Snapshot)).unwrap();
+        assert_eq!(line, r#"{"request":"snapshot"}"#);
+        assert!(serde_json::from_str::<Request>(&line).unwrap().id.is_none());
     }
 
     /// A frame with no payload still has to be distinguishable from every

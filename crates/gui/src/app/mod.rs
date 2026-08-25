@@ -6,7 +6,6 @@
 //! - `messages`: Message list caching and height calculation
 //! - `calls`: Call state management (incoming/outgoing)
 
-mod calls;
 mod calls_ctl;
 mod chats;
 mod events;
@@ -19,7 +18,7 @@ pub use chats::ChatListCache;
 pub use media::RecordingState;
 pub use messages::MessageListCache;
 
-use calls::CallState;
+use oxidezap_core::CallState;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -42,7 +41,7 @@ use log::{debug, error, info, warn};
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 
 use crate::responsive::{MobilePanel, ResponsiveLayout};
-use crate::session::Session;
+use crate::session::{FromDaemon, Session};
 use crate::utils::mime_to_image_format;
 use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
 use crate::views::pairing::generate_qr_png;
@@ -337,14 +336,33 @@ pub struct WhatsAppApp {
 impl WhatsAppApp {
     /// Spawn the event handling task that processes UI events from the WhatsApp client
     fn spawn_event_task(
-        mut ui_rx: tokio::sync::mpsc::Receiver<UiEvent>,
+        mut ui_rx: tokio::sync::mpsc::Receiver<FromDaemon>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            while let Some(event) = ui_rx.recv().await {
-                let result = entity.update(cx, |app, cx| {
-                    app.handle_event(event, cx);
-                });
+            while let Some(message) = ui_rx.recv().await {
+                let result = match message {
+                    FromDaemon::Session(event) => entity.update(cx, |app, cx| {
+                        app.handle_event(*event, cx);
+                    }),
+                    // Adopted whole rather than replayed: these are the calls
+                    // that were already happening when this window attached,
+                    // and a call this account placed was never an event.
+                    FromDaemon::Calls(calls) => entity.update(cx, |app, cx| {
+                        app.call_state = *calls;
+                        cx.notify();
+                    }),
+                    // The tray's "Open", or another front end asking on a
+                    // user's behalf. One window, so there is one to raise.
+                    FromDaemon::ShowWindow => {
+                        cx.update(|cx| {
+                            if let Some(window) = cx.windows().first() {
+                                let _ = window.update(cx, |_, window, _| window.activate_window());
+                            }
+                        });
+                        Ok(())
+                    }
+                };
                 if result.is_err() {
                     // Entity was dropped, stop the loop
                     break;

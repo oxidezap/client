@@ -17,9 +17,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use log::{debug, error, info, warn};
-use oxidezap_core::{DownloadableMedia, MediaContent, UiEvent};
+use oxidezap_core::{CallState, DownloadableMedia, MediaContent, UiEvent};
 use oxidezap_ipc::{
-    CallAction, ClientRequest, ConnectionState, DaemonMessage, Endpoint, PROTOCOL_VERSION,
+    CallAction, ClientRequest, ConnectionState, DaemonMessage, Endpoint, PROTOCOL_VERSION, Request,
     RequestId, StateSnapshot, endpoint_path, media_path,
 };
 use portable_atomic::AtomicU64;
@@ -35,8 +35,76 @@ use tokio::sync::{mpsc, oneshot};
 /// has; the point is to reach it rather than to hide from it.
 const EVENT_QUEUE: usize = 512;
 
-/// Answers still owed to a caller, by the id they were asked under.
-type Pending = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Vec<u8>, String>>>>>;
+/// What the reader hands the front end.
+///
+/// Wider than `UiEvent`, and deliberately not part of it: the session says
+/// what happened to the account, while a window request and the call state a
+/// client attached to are things the *daemon* says to a front end. Keeping
+/// them apart is what stops the session's vocabulary from growing terms only
+/// one transport uses.
+pub enum FromDaemon {
+    /// Something the session said.
+    Session(Box<UiEvent>),
+    /// The calls in progress at the moment this client attached.
+    ///
+    /// State rather than a replay: a call this account placed was never an
+    /// event — the front end that dialled built it locally — so there is
+    /// nothing to replay it from.
+    Calls(Box<CallState>),
+    /// Somebody asked for a front end to come forward.
+    ShowWindow,
+}
+
+/// What to do when a request comes back, by the id it was sent under.
+///
+/// The daemon answers everything under the id it was asked with, so this is
+/// the whole of the front end's bookkeeping: a download hands bytes to whoever
+/// is waiting, and a send that was refused becomes the failure the message it
+/// drew is already able to render.
+enum Awaiting {
+    Download(oneshot::Sender<Result<Vec<u8>, String>>),
+    /// A message drawn before it was sent. On refusal it has to stop being
+    /// pending, and the front end is the side that knows which bubble it is.
+    Send {
+        chat_jid: String,
+        local_id: String,
+    },
+}
+
+impl Awaiting {
+    /// Whether nobody is listening for this any more.
+    fn is_abandoned(&self) -> bool {
+        match self {
+            Self::Download(tx) => tx.is_closed(),
+            // A drawn message is never abandoned: the bubble stays on screen
+            // until something resolves it.
+            Self::Send { .. } => false,
+        }
+    }
+
+    /// Report that this never happened, in the terms its caller understands.
+    fn failed(self, detail: &str, events: Option<&mpsc::Sender<FromDaemon>>) {
+        match self {
+            Self::Download(tx) => {
+                let _ = tx.send(Err(detail.to_string()));
+            }
+            Self::Send { chat_jid, local_id } => {
+                // The message is already drawn; without this it stays pending
+                // forever.
+                if let Some(events) = events {
+                    let _ =
+                        events.blocking_send(FromDaemon::Session(Box::new(UiEvent::SendFailed {
+                            chat_jid,
+                            message_id: local_id,
+                            reason: detail.to_string(),
+                        })));
+                }
+            }
+        }
+    }
+}
+
+type Pending = Arc<Mutex<HashMap<RequestId, Awaiting>>>;
 
 /// A connection to `oxidezapd`.
 pub struct Session {
@@ -53,7 +121,7 @@ impl Session {
     /// Returns the events it will publish. The daemon reloads history for a
     /// client that asks for events, so the chats arrive without being asked
     /// for separately.
-    pub fn connect() -> std::io::Result<(Self, mpsc::Receiver<UiEvent>)> {
+    pub fn connect() -> std::io::Result<(Self, mpsc::Receiver<FromDaemon>)> {
         let stream = connect_or_start()?;
         let reader = stream.try_clone()?;
 
@@ -64,7 +132,7 @@ impl Session {
         };
         // Before the reader starts, because the daemon serves nothing until it
         // has one and answers it with the history this connection asked for.
-        session.send(&ClientRequest::Hello {
+        session.send(ClientRequest::Hello {
             protocol: PROTOCOL_VERSION,
             session_events: true,
         })?;
@@ -78,7 +146,12 @@ impl Session {
         Ok((session, rx))
     }
 
-    fn send(&self, request: &ClientRequest) -> std::io::Result<()> {
+    /// Send a request nobody is waiting on an answer for.
+    fn send(&self, request: ClientRequest) -> std::io::Result<()> {
+        self.send_frame(&Request::bare(request))
+    }
+
+    fn send_frame(&self, request: &Request) -> std::io::Result<()> {
         let mut line = serde_json::to_vec(request).map_err(std::io::Error::other)?;
         line.push(b'\n');
         self.writer
@@ -92,18 +165,55 @@ impl Session {
     /// Every caller here is a UI action whose outcome arrives as an event, and
     /// a socket that has broken takes the whole session with it — there is no
     /// per-action recovery for the caller to perform.
-    fn tell(&self, request: &ClientRequest) {
+    fn tell(&self, request: ClientRequest) {
         if let Err(e) = self.send(request) {
             error!("could not reach the daemon: {e}");
         }
     }
 
+    /// Send a request and remember what its answer means.
+    fn ask(&self, request: ClientRequest, waiting: Awaiting) -> RequestId {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            // Whoever gave up is no longer listening, and its answer may never
+            // come. Swept here rather than on a timer: this is the only thing
+            // that grows the map, so it is the only place that needs to shrink
+            // it.
+            pending.retain(|_, waiting| !waiting.is_abandoned());
+            pending.insert(id, waiting);
+        }
+        if let Err(e) = self.send_frame(&Request {
+            id: Some(id),
+            request,
+        }) {
+            error!("could not reach the daemon: {e}");
+            // Answer here rather than leaving the caller waiting on a request
+            // that never went out.
+            if let Some(waiting) = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id)
+            {
+                waiting.failed(&format!("could not reach the daemon: {e}"), None);
+            }
+        }
+        id
+    }
+
     pub fn send_message(&self, jid: &str, text: &str, local_id: String) {
-        self.tell(&ClientRequest::SendText {
-            jid: jid.to_string(),
-            text: text.to_string(),
-            local_id: Some(local_id),
-        });
+        self.ask(
+            ClientRequest::SendText {
+                jid: jid.to_string(),
+                text: text.to_string(),
+                local_id: Some(local_id.clone()),
+            },
+            Awaiting::Send {
+                chat_jid: jid.to_string(),
+                local_id,
+            },
+        );
     }
 
     pub fn send_audio_message(
@@ -129,13 +239,19 @@ impl Session {
             error!("could not stage the recording: {e}");
             return;
         }
-        self.tell(&ClientRequest::SendAudio {
-            jid: jid.to_string(),
-            upload,
-            duration_secs,
-            waveform,
-            local_id: Some(local_id),
-        });
+        self.ask(
+            ClientRequest::SendAudio {
+                jid: jid.to_string(),
+                upload,
+                duration_secs,
+                waveform,
+                local_id: Some(local_id.clone()),
+            },
+            Awaiting::Send {
+                chat_jid: jid.to_string(),
+                local_id,
+            },
+        );
     }
 
     pub fn send_composing(&self, jid: &str) {
@@ -147,7 +263,7 @@ impl Session {
     }
 
     fn typing(&self, jid: &str, composing: bool) {
-        self.tell(&ClientRequest::Typing {
+        self.tell(ClientRequest::Typing {
             jid: jid.to_string(),
             composing,
         });
@@ -161,7 +277,7 @@ impl Session {
     /// holds, and the daemon refuses anything else — a read is irreversible
     /// and must not reach past what the user has seen.
     pub fn mark_chat_read(&self, jid: &str, through_message_id: Option<String>) {
-        self.tell(&ClientRequest::MarkRead {
+        self.tell(ClientRequest::MarkRead {
             jid: jid.to_string(),
             through_message_id,
         });
@@ -201,7 +317,7 @@ impl Session {
     }
 
     fn call(&self, action: CallAction) {
-        self.tell(&ClientRequest::Call(action));
+        self.tell(ClientRequest::Call(action));
     }
 
     /// Wipe the local store and pair again.
@@ -209,7 +325,7 @@ impl Session {
     /// The daemon owns that file and stops itself once it is gone, so this is
     /// the last thing this connection will be told anything on.
     pub fn forget_session(&self) {
-        self.tell(&ClientRequest::ForgetSession);
+        self.tell(ClientRequest::ForgetSession);
     }
 
     /// Fetch media, answered when the bytes are on disk.
@@ -222,33 +338,12 @@ impl Session {
         media: DownloadableMedia,
     ) -> oneshot::Receiver<Result<Vec<u8>, String>> {
         let (tx, rx) = oneshot::channel();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            // Whoever timed out is no longer listening, and its answer may
-            // never come — a frame the daemon dropped from a full outbox has
-            // nothing left to arrive. Swept here rather than on a timer: this
-            // is the only thing that grows the map, so it is the only place
-            // that needs to shrink it.
-            pending.retain(|_, waiting| !waiting.is_closed());
-            pending.insert(id, tx);
-        }
-
-        if let Err(e) = self.send(&ClientRequest::Download {
-            id,
-            media: Box::new(media),
-        }) {
-            // Answer here rather than leaving the caller waiting on a request
-            // that never went out.
-            if let Some(tx) = self
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id)
-            {
-                let _ = tx.send(Err(format!("could not reach the daemon: {e}")));
-            }
-        }
+        self.ask(
+            ClientRequest::Download {
+                media: Box::new(media),
+            },
+            Awaiting::Download(tx),
+        );
         rx
     }
 }
@@ -268,7 +363,7 @@ fn sanitize(id: &str) -> String {
 }
 
 /// Read frames until the daemon goes away.
-fn read_frames(stream: Endpoint, events: &mpsc::Sender<UiEvent>, pending: &Pending) {
+fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pending) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     // What to tell the user when this ends. The generic message is right for
@@ -292,44 +387,43 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<UiEvent>, pending: &Pendi
                 // On this thread rather than the UI's: a history load names
                 // every photo in the account, and reading them is I/O.
                 load_media(&mut event);
-                if events.blocking_send(event).is_err() {
+                if events
+                    .blocking_send(FromDaemon::Session(Box::new(event)))
+                    .is_err()
+                {
                     break;
                 }
             }
-            Ok(DaemonMessage::Downloaded { id, result }) => {
-                let Some(tx) = pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id)
-                else {
+            Ok(DaemonMessage::Downloaded { id, key }) => {
+                let Some(waiting) = take_pending(pending, id) else {
                     debug!("a download answer arrived for {id}, which nobody is waiting on");
                     continue;
                 };
-                let _ = tx.send(result.and_then(|key| {
-                    media_path(&key)
-                        .ok_or_else(|| format!("the daemon named an unusable cache key: {key}"))
-                        .and_then(|path| std::fs::read(path).map_err(|e| e.to_string()))
-                }));
-            }
-            // The first frame on every connection, and the only place this
-            // side learns what it has attached to. A window reopened onto a
-            // daemon that connected long ago would otherwise sit on its
-            // loading screen forever: `Connected` was published before this
-            // client subscribed and nothing replays it.
-            Ok(DaemonMessage::Hello { protocol, snapshot }) => {
-                if protocol != PROTOCOL_VERSION {
-                    reason = Some(format!(
-                        "The daemon speaks protocol {protocol} and this window speaks \
-                         {PROTOCOL_VERSION}. They were built from different commits — stop \
-                         the daemon and start it from this build."
-                    ));
-                    break;
+                let bytes = media_path(&key)
+                    .ok_or_else(|| format!("the daemon named an unusable cache key: {key}"))
+                    .and_then(|path| std::fs::read(path).map_err(|e| e.to_string()));
+                match waiting {
+                    Awaiting::Download(tx) => {
+                        let _ = tx.send(bytes);
+                    }
+                    // Nothing but a download asks for one.
+                    waiting => waiting.failed("unexpected download answer", Some(events)),
                 }
-                if catch_up(&snapshot)
-                    .into_iter()
-                    .any(|event| events.blocking_send(event).is_err())
-                {
-                    break;
+            }
+            // Every command is answered under the id it was asked with, which
+            // is why this side no longer has to guess what a failure was
+            // about.
+            Ok(DaemonMessage::Accepted { id }) => {
+                if let Some(id) = id {
+                    take_pending(pending, id);
+                }
+            }
+            Ok(DaemonMessage::Error { id, error }) => {
+                match id.and_then(|id| take_pending(pending, id)) {
+                    Some(waiting) => waiting.failed(&error.to_string(), Some(events)),
+                    // A refusal for nothing in particular: a malformed frame,
+                    // or a request sent without an id.
+                    None => error!("daemon refused a request: {error}"),
                 }
             }
             // The daemon truncated our stream, so arbitrary events are gone.
@@ -348,11 +442,13 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<UiEvent>, pending: &Pendi
                 );
                 break;
             }
-            Ok(DaemonMessage::Error(e)) => error!("daemon refused a request: {e}"),
-            // Summaries and acknowledgements: the daemon serves other front
-            // ends too, and this one derives its own state from the session
-            // stream. `ShowWindow` is not ignored so much as unimplemented —
-            // see the note in `app`.
+            Ok(DaemonMessage::ShowWindow) => {
+                if events.blocking_send(FromDaemon::ShowWindow).is_err() {
+                    break;
+                }
+            }
+            // Summaries: the daemon serves other front ends too, and this one
+            // derives its own state from the session stream.
             Ok(_) => {}
             Err(e) => error!("unparsable frame from the daemon: {e}"),
         }
@@ -362,12 +458,25 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<UiEvent>, pending: &Pendi
     // caller waiting on a download is waiting on an answer that will never
     // come.
     info!("daemon connection closed");
-    for (_, tx) in pending.lock().unwrap_or_else(|e| e.into_inner()).drain() {
-        let _ = tx.send(Err("the daemon connection closed".to_string()));
+    let abandoned: Vec<Awaiting> = pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .map(|(_, waiting)| waiting)
+        .collect();
+    for waiting in abandoned {
+        waiting.failed("the daemon connection closed", Some(events));
     }
-    let _ = events.blocking_send(UiEvent::Error(
+    let _ = events.blocking_send(FromDaemon::Session(Box::new(UiEvent::Error(
         reason.unwrap_or_else(|| "Lost the connection to the daemon".to_string()),
-    ));
+    ))));
+}
+
+fn take_pending(pending: &Pending, id: RequestId) -> Option<Awaiting> {
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id)
 }
 
 /// Turn the state a client attaches to into the events it would have seen.
@@ -376,10 +485,10 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<UiEvent>, pending: &Pendi
 /// to the events that put them there. Rather than teach it a second
 /// vocabulary, the one frame it gets on attaching is translated into the ones
 /// it already handles.
-fn catch_up(snapshot: &StateSnapshot) -> Vec<UiEvent> {
+fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     let mut events = Vec::new();
     match &snapshot.connection {
-        ConnectionState::Connecting => events.push(UiEvent::InitComplete),
+        ConnectionState::Connecting => events.push(session(UiEvent::InitComplete)),
         ConnectionState::Pairing { qr, pair_code } => {
             // Both, when there are both. A user who asked for a phone code
             // while a QR was on screen has two live credentials, and picking
@@ -387,38 +496,42 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<UiEvent> {
             // opened. The QR goes last so it is the one the screen settles on,
             // which is what the pairing view shows when it has both.
             if let Some(code) = pair_code {
-                events.push(UiEvent::PairCode {
+                events.push(session(UiEvent::PairCode {
                     code: code.code.clone(),
                     timeout_secs: remaining_secs(code.expires_at_ms),
-                });
+                }));
             }
             if let Some(qr) = qr {
-                events.push(UiEvent::QrCode {
+                events.push(session(UiEvent::QrCode {
                     code: qr.code.clone(),
                     timeout_secs: remaining_secs(qr.expires_at_ms),
-                });
+                }));
             }
             // Pairing with neither credential yet: still coming.
             if events.is_empty() {
-                events.push(UiEvent::InitComplete);
+                events.push(session(UiEvent::InitComplete));
             }
         }
         // The event that leaves the pairing screen for the syncing one.
-        ConnectionState::Syncing => events.push(UiEvent::PairSuccess),
-        ConnectionState::Connected => events.push(UiEvent::Connected),
+        ConnectionState::Syncing => events.push(session(UiEvent::PairSuccess)),
+        ConnectionState::Connected => events.push(session(UiEvent::Connected)),
         ConnectionState::Disconnected { reason } => {
-            events.push(UiEvent::Disconnected(reason.clone()));
+            events.push(session(UiEvent::Disconnected(reason.clone())));
         }
         ConnectionState::LoggedOut { message } => {
-            events.push(UiEvent::LoggedOut(message.clone()));
+            events.push(session(UiEvent::LoggedOut(message.clone())));
         }
     }
 
-    // Whatever is ringing. The offer went out as an event before this window
-    // existed and no history contains it, so without this a call rings on in
-    // the daemon with nothing anywhere to answer it.
-    events.extend(snapshot.ringing.iter().cloned().map(UiEvent::IncomingCall));
+    // Whatever is happening on the call front, as state. The offer for a
+    // ringing call went out before this window existed, and a call this
+    // account placed was never an event at all.
+    events.push(FromDaemon::Calls(Box::new(snapshot.calls.clone())));
     events
+}
+
+fn session(event: UiEvent) -> FromDaemon {
+    FromDaemon::Session(Box::new(event))
 }
 
 /// What is left of a pairing credential's life, as the front end counts it.

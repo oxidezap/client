@@ -5,6 +5,13 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 4: every request may carry an id, and every answer echoes it. Before that
+/// a refused send could only be reported by inventing a failure against the
+/// message the client had drawn, and a refused download by nothing at all.
+/// The snapshot also carries the whole `CallState` rather than a list of
+/// ringing calls, because a call this account placed was never an event and
+/// no replay reconstructs it.
+///
 /// 3: the session's own event stream, opt-in at the hello, plus the requests
 /// a full front end needs to drive it — audio, typing, calls, downloads and
 /// `ForgetSession`. Media travels through [`media_path`] rather than the
@@ -19,7 +26,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]
@@ -146,26 +153,25 @@ fn user_suffix() -> Option<String> {
     Some(rustix::process::getuid().as_raw().to_string())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn user_suffix() -> Option<String> {
-    // `USERNAME` alone is not an identity — two accounts from different
-    // domains can share one, and a pipe name is machine-wide — so the domain
-    // comes along, which together are the account name Windows itself shows.
-    // A SID would be exact and needs a Windows API this crate otherwise has
-    // no use for; what is left is two same-named accounts whose domains also
-    // collide once sanitized, which is a far narrower case than the single
-    // shared fallback this replaced.
-    let user = std::env::var("USERNAME").ok().filter(|v| !v.is_empty())?;
-    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
-    // A pipe name cannot carry a separator, and neither can a directory
-    // component.
+    // The SID, not `USERNAME`. A pipe name is machine-wide and an environment
+    // variable is not an identity: two accounts from different domains can
+    // share a name, and a process controls its own environment. This is the
+    // identity the kernel uses, and the same one the daemon's access-control
+    // entry names.
+    let sid = crate::windows_user::sid_string().ok()?;
     Some(
-        format!("{domain}-{user}")
-            .chars()
+        sid.chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(64)
+            .take(96)
             .collect(),
     )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn user_suffix() -> Option<String> {
+    None
 }
 
 #[cfg(test)]
