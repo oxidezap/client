@@ -402,6 +402,11 @@ impl CallState {
         }
         if matches!(&self.stage, Some(Stage::Incoming(call)) if call.call_id == *call_id) {
             self.stage = None;
+            // The stage emptied, so whoever was parked behind it comes
+            // forward — the same rule `take` and `end` follow. Refusing the
+            // call on screen with a second one waiting otherwise left that
+            // caller ringing with `is_busy` saying no call was up at all.
+            self.promote_waiting();
             return true;
         }
         false
@@ -410,6 +415,7 @@ impl CallState {
     pub fn dismiss_outgoing(&mut self, call_id: &CallId) -> bool {
         if matches!(&self.stage, Some(Stage::Outgoing(call)) if call.call_id == *call_id) {
             self.stage = None;
+            self.promote_waiting();
             return true;
         }
         false
@@ -656,6 +662,47 @@ mod tests {
                 group_jid: None,
             })
             .build()
+    }
+
+    /// Every way the call on screen goes away, with someone parked behind
+    /// it. Each of these clears the stage for good, so each has to let the
+    /// waiting caller through — and a caller nothing draws is a caller with
+    /// no Accept and no Decline.
+    #[test]
+    fn dismissing_the_call_in_front_promotes_whoever_was_waiting() {
+        // Refusing the offer on screen while a second one waits behind it.
+        let mut declined = CallState::default();
+        declined.set_incoming(incoming("FIRST"));
+        assert_eq!(declined.set_incoming(incoming("SECOND")), Admission::Parked);
+        assert!(declined.dismiss_incoming(&"FIRST".to_string()));
+        assert_eq!(
+            declined.incoming().map(|c| c.call_id.as_str()),
+            Some("SECOND")
+        );
+        assert!(declined.waiting().is_none());
+
+        // Cancelling a call this device placed while one waits behind it.
+        let mut cancelled = CallState::default();
+        cancelled.set_outgoing(outgoing("MINE"));
+        assert_eq!(
+            cancelled.set_incoming(incoming("THEIRS")),
+            Admission::Parked
+        );
+        assert!(cancelled.dismiss_outgoing(&"MINE".to_string()));
+        assert_eq!(
+            cancelled.incoming().map(|c| c.call_id.as_str()),
+            Some("THEIRS")
+        );
+        assert!(cancelled.waiting().is_none());
+
+        // And refusing the *parked* one leaves the call in front alone.
+        let mut parked = CallState::default();
+        parked.set_incoming(incoming("FIRST"));
+        parked.connect(&"FIRST".to_string());
+        assert_eq!(parked.set_incoming(incoming("SECOND")), Admission::Parked);
+        assert!(parked.dismiss_incoming(&"SECOND".to_string()));
+        assert_eq!(parked.active().map(|c| c.call_id.as_str()), Some("FIRST"));
+        assert!(parked.waiting().is_none());
     }
 
     /// The two ways a call leaves without leaving a record. A front end

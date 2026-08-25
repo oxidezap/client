@@ -49,11 +49,16 @@ pub fn render_connected_view(
     }
     // What this frame draws as the conversation, which is what decides
     // whether an arriving message has been seen. On a phone the chat list and
-    // the conversation are the same slot, and Status replaces both.
+    // the conversation are the same slot, Status replaces both, and the
+    // fullscreen viewer covers whatever is underneath it — a picture at the
+    // size of the window is a mode, so the timeline behind it is no more
+    // visible than a chat on another screen.
     app.note_visible_conversation(
-        (app.destination() == Destination::Chats && layout.show_chat_area())
-            .then(|| selected_jid.clone())
-            .flatten(),
+        (app.destination() == Destination::Chats
+            && layout.show_chat_area()
+            && app.media_viewer().is_none())
+        .then(|| selected_jid.clone())
+        .flatten(),
     );
 
     let call_focus = app.call_focus().clone();

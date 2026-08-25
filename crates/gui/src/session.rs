@@ -20,7 +20,7 @@ use log::{debug, error, info, warn};
 use oxidezap_core::{CallState, DownloadableMedia, MediaContent, QuotedMessage, UiEvent};
 use oxidezap_ipc::{
     CallAction, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, Endpoint,
-    PROTOCOL_VERSION, Request, RequestId, StateSnapshot, endpoint_path, media_path,
+    PROTOCOL_VERSION, Request, RequestId, StateSnapshot, StateVersion, endpoint_path, media_path,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::{mpsc, oneshot};
@@ -456,6 +456,16 @@ fn sanitize(id: &str) -> String {
 fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pending) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
+    // How far the state this side holds has been carried.
+    //
+    // The daemon subscribes a client and *then* snapshots it, so everything
+    // published in between arrives twice — once inside the snapshot and once
+    // as an update — and the version on each frame is what tells them apart.
+    // Applying the overlap again is not harmless: a `CallsChanged` from before
+    // the snapshot puts a call back on a stage the snapshot had already
+    // cleared, and the next frame removing it reads as that call ending, which
+    // writes a record for a call that never happened.
+    let mut applied = StateVersion::INITIAL;
     // What to tell the user when this ends. The generic message is right for
     // a daemon that simply went away, and wrong for every case this side
     // actually diagnosed.
@@ -481,6 +491,7 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
             // depend on it — "(You)", the read ticks in your own chat — had
             // nothing to compare against.
             Ok(DaemonMessage::Hello { protocol, snapshot }) if protocol == PROTOCOL_VERSION => {
+                applied = snapshot.version;
                 if catch_up(&snapshot)
                     .into_iter()
                     .any(|event| events.blocking_send(event).is_err())
@@ -591,12 +602,17 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
                 Some(waiting) => waiting.failed("unexpected storage answer", Some(events)),
                 None => debug!("a storage answer arrived for {id}, which nobody is waiting on"),
             },
+            // Already inside the snapshot this connection started from. The
+            // daemon publishes the overlap rather than risking a gap; dropping
+            // it is this side's half of that bargain.
+            Ok(DaemonMessage::Update { version, .. }) if version.is_covered_by(applied) => {}
             // The account, once the daemon knows it. A window attached
             // during pairing had nothing in its snapshot to know it from.
             Ok(DaemonMessage::Update {
+                version,
                 event: DaemonEvent::AccountChanged(account),
-                ..
             }) => {
+                applied = version;
                 if events
                     .blocking_send(FromDaemon::Account(Some(account)))
                     .is_err()
@@ -605,9 +621,10 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
                 }
             }
             Ok(DaemonMessage::Update {
+                version,
                 event: DaemonEvent::CallsChanged(calls),
-                ..
             }) => {
+                applied = version;
                 if events
                     .blocking_send(FromDaemon::Calls(Box::new(calls)))
                     .is_err()
@@ -615,6 +632,11 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
                     break;
                 }
             }
+            // Chat summaries, which this front end derives from the session
+            // stream instead. The version still advances: it describes how far
+            // the *state* has been carried, not how much of it this client
+            // happens to use.
+            Ok(DaemonMessage::Update { version, .. }) => applied = version,
             // Summaries: the daemon serves other front ends too, and this one
             // derives its own state from the session stream.
             Ok(_) => {}
