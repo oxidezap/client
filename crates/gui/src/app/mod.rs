@@ -2322,8 +2322,14 @@ impl WhatsAppApp {
     /// A group changed, or something else happened *to* a chat.
     ///
     /// Inserted the way hydrated history is, not the way a message is: no
-    /// unread bump, no preview change. Nobody replies to "Ana changed the
-    /// group name", and a badge for one would be a badge for nothing to read.
+    /// unread bump. Nobody replies to "Ana changed the group name", and a
+    /// badge for one would be a badge for nothing to read.
+    ///
+    /// The sidebar is the exception, and deliberately so: `preview_for` draws
+    /// the last row, so a notice that *is* the last row is already the line
+    /// the list shows. Leaving the head metadata behind then made the row
+    /// disagree with itself — the new text under the previous message's
+    /// clock, still sitting at the previous message's place in the list.
     ///
     /// The row is local to this window's session, like a call record: the
     /// store does not hold group notifications, so there is nothing to
@@ -2336,7 +2342,7 @@ impl WhatsAppApp {
         notice: SystemNotice,
         cx: &mut Context<Self>,
     ) {
-        let Some(chat) = self.find_chat_mut(&chat_jid) else {
+        let Some(index) = self.chats.iter().position(|chat| chat.jid == chat_jid) else {
             // A notification for a chat this window has never loaded — which
             // is the *normal* order for the one that says you were added to a
             // group. Fabricating the chat around it would draw a conversation
@@ -2350,6 +2356,7 @@ impl WhatsAppApp {
                 .push((notice_id, at, notice));
             return;
         };
+        let chat = &mut self.chats[index];
         if chat.messages.iter().any(|message| message.id == notice_id) {
             return;
         }
@@ -2358,6 +2365,15 @@ impl WhatsAppApp {
         message.is_read = true;
         message.system = Some(notice);
         chat.insert_history_message(message);
+        // The head metadata, when this is now the newest thing in the
+        // conversation. Not the unread count: see above.
+        let leads = chat.last_message_time.is_none_or(|last| at > last);
+        if leads {
+            chat.last_message_time = Some(at);
+        }
+        if leads {
+            self.move_chat_to_top(index);
+        }
 
         self.invalidate_message_cache(&chat_jid);
         // And the sidebar, when the notice is now the last thing in the
@@ -2484,6 +2500,9 @@ impl WhatsAppApp {
 
                 let alive = entity.update(cx, |app, cx| {
                     let pairing = matches!(app.app_state, AppState::WaitingForPairing { .. });
+                    if theme_changed {
+                        app.adopt_reloaded_theme(cx);
+                    }
                     if pairing || theme_changed {
                         cx.notify();
                     }

@@ -12,6 +12,7 @@
 //! bookkeeping, just files whose names say what is in them.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
@@ -249,6 +250,15 @@ impl Wipe {
 /// number and let the writer notice.
 static CACHE_EPOCH: AtomicUsize = AtomicUsize::new(0);
 
+/// Held across a wipe, and across an epoch-checked write.
+///
+/// The epoch alone is only a check-then-act: an eager writer could read a
+/// matching epoch, a wipe could then bump it and delete everything, and the
+/// writer's rename could land afterwards — repopulating a directory the user
+/// had just been told was empty. Nothing else in this module needs the lock,
+/// because nothing else claims to be ordered against a wipe.
+static WIPE_LOCK: Mutex<()> = Mutex::new(());
+
 /// What to hand back to [`put_since`] later.
 pub fn epoch() -> usize {
     CACHE_EPOCH.load(Ordering::SeqCst)
@@ -262,6 +272,9 @@ pub fn epoch() -> usize {
 /// merely where they are remembered, so refusing it would fail the download
 /// rather than keep the directory tidy.
 pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
+    // Held across the check *and* the write, so a wipe cannot land between
+    // them. See `WIPE_LOCK`.
+    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if CACHE_EPOCH.load(Ordering::SeqCst) != epoch {
         anyhow::bail!("the media cache was cleared while this was being prepared");
     }
@@ -278,6 +291,9 @@ pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
 ///
 /// Best-effort per entry: one unreadable file must not abandon the rest.
 pub fn wipe(scope: Wipe) -> Result<()> {
+    // For the whole wipe, so an epoch-checked write is either wholly before
+    // it — and deleted by it — or wholly after, and kept.
+    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Before the deletions, not after: a writer that reads the epoch between
     // the two would otherwise believe its file survived the wipe that is
     // about to remove it.
@@ -319,6 +335,13 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         let entry = entry?;
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
+            continue;
+        }
+        // Only the cache is evictable. A staged upload is the only copy of
+        // a voice note somebody is waiting to have sent, and it never counted
+        // toward the budget it would be dropped for — `put` is what feeds the
+        // sweep, and an upload is written by the front end, not through it.
+        if !Wipe::Cache.takes(&entry.file_name().to_string_lossy()) {
             continue;
         }
         let age = meta.modified().unwrap_or(std::time::UNIX_EPOCH);

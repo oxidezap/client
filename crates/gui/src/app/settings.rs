@@ -9,7 +9,7 @@ use gpui::{Context, WeakEntity};
 
 use crate::app::WhatsAppApp;
 use crate::session::StorageUsage;
-use crate::theme::{ThemeSettings, config};
+use crate::theme::{ActiveProductTheme as _, ThemeSettings, config};
 
 /// A destination in the settings nav.
 ///
@@ -109,6 +109,32 @@ impl SettingsState {
 }
 
 impl WhatsAppApp {
+    /// Put an open Settings screen back in step with a theme file that
+    /// changed underneath it.
+    ///
+    /// The pane holds two copies — the draft it is editing and the state it
+    /// would revert to — and the heartbeat installs an external edit into the
+    /// global without either of them hearing about it. The controls then
+    /// describe a palette the window is not showing, and the next density or
+    /// preset click writes that whole stale palette back over the edit.
+    ///
+    /// A clean draft is nobody's work, so it adopts the file. A dirty one is
+    /// somebody's, in progress, and is re-applied instead: the person
+    /// choosing a colour right now outranks a background write, and the two
+    /// agreeing again is what matters either way.
+    pub(super) fn adopt_reloaded_theme(&mut self, cx: &mut gpui::App) {
+        let Some(settings) = &mut self.settings else {
+            return;
+        };
+        let loaded = cx.product().settings();
+        if settings.is_dirty() {
+            crate::theme::install(settings.draft.clone(), cx);
+            return;
+        }
+        settings.draft = loaded.clone();
+        settings.original = loaded;
+    }
+
     /// What the store and the media cache occupy, as last measured.
     pub fn storage_usage(&self) -> Option<StorageUsage> {
         self.storage_usage
