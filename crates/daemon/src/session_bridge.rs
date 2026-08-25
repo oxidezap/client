@@ -11,9 +11,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use oxidezap_core::{Chat, ChatMessage, UiEvent};
+use oxidezap_core::{Chat, ChatMessage, MediaContent, UiEvent};
 use oxidezap_ipc::{
-    ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview, PairingCode,
+    CallAction, ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview,
+    PairingCode, RequestId,
 };
 use oxidezap_session::{ReadBoundary, WhatsAppClient};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -31,6 +32,15 @@ pub enum Action {
     SendText {
         jid: String,
         text: String,
+        local_id: Option<String>,
+    },
+    SendAudio {
+        jid: String,
+        /// Cache key the client wrote the encoded audio under.
+        upload: String,
+        duration_secs: u32,
+        waveform: Vec<u8>,
+        local_id: Option<String>,
     },
     MarkRead {
         jid: String,
@@ -38,7 +48,32 @@ pub enum Action {
         /// [`oxidezap_ipc::ClientRequest::MarkRead`].
         through_message_id: Option<String>,
     },
+    Typing {
+        jid: String,
+        composing: bool,
+    },
+    Call(CallAction),
+    /// Fetch media and answer on `answer_to` rather than through the command's
+    /// own reply, which resolves in microseconds while this takes seconds.
+    Download {
+        id: RequestId,
+        media: Box<oxidezap_core::DownloadableMedia>,
+        answer_to: Outbox,
+    },
+    /// Reload the whole history, for a front end that has just attached and
+    /// holds nothing.
+    ReloadHistory,
+    /// Wipe local state so the user can pair again. The daemon owns the store
+    /// file, so it is the only process that may delete it.
+    ForgetSession,
 }
+
+/// Frames addressed to one connection rather than broadcast.
+///
+/// A download's answer belongs to the client that asked for it: ids are
+/// client-chosen, so putting them on a shared channel would hand one front
+/// end another's media.
+pub type Outbox = tokio::sync::mpsc::Sender<String>;
 
 /// An action plus the channel its answer goes back on.
 ///
@@ -178,6 +213,8 @@ impl Bridge {
             self.hub.signal(&frame);
         }
 
+        self.forward(&event);
+
         for change in self.translate(event) {
             // A chat that left the store owes nothing and will never be read
             // again; keeping its ids would leak one entry per deleted
@@ -209,23 +246,164 @@ impl Bridge {
         }
 
         match action {
-            Action::SendText { jid, text } => {
+            Action::SendText {
+                jid,
+                text,
+                local_id,
+            } => {
                 let Some(permit) = self.permit() else {
                     return too_busy();
                 };
-                // The optimistic bubble a GUI would draw has no equivalent
-                // here: the daemon holds summaries, not messages, and the
-                // store's reload republishes the chat once the row lands. The
-                // local id still has to be unique, because the session renames
-                // it to the real message id and a collision would rename the
+                // The id is the client's when it has one: it drew the message
+                // before it was sent and cannot match the rename otherwise.
+                // The daemon makes one up for a client that draws nothing — it
+                // still has to be unique, because a collision would rename the
                 // wrong send.
-                hold(permit, [client.send_message(&jid, &text, next_local_id())]);
+                hold(
+                    permit,
+                    [client.send_message(&jid, &text, local_id.unwrap_or_else(next_local_id))],
+                );
+                CommandOutcome::Accepted
+            }
+            Action::SendAudio {
+                jid,
+                upload,
+                duration_secs,
+                waveform,
+                local_id,
+            } => {
+                // Through the cache, not the socket: a voice note is the one
+                // thing a client sends that is too big for a frame.
+                let Some(audio) = crate::media::get(&upload) else {
+                    return CommandOutcome::Refused(format!(
+                        "no audio cached under {upload}; write it before sending"
+                    ));
+                };
+                let Some(permit) = self.permit() else {
+                    return too_busy();
+                };
+                hold(
+                    permit,
+                    [client.send_audio_message(
+                        &jid,
+                        audio,
+                        duration_secs,
+                        waveform,
+                        local_id.unwrap_or_else(next_local_id),
+                    )],
+                );
                 CommandOutcome::Accepted
             }
             Action::MarkRead {
                 jid,
                 through_message_id,
             } => self.mark_read(client, &jid, through_message_id.as_deref()),
+            // No permit: these send one small stanza and hold nothing open,
+            // and a typing indicator refused for being busy would be a worse
+            // answer than a late one.
+            Action::Typing { jid, composing } => {
+                if composing {
+                    client.send_composing(&jid);
+                } else {
+                    client.send_paused(&jid);
+                }
+                CommandOutcome::Accepted
+            }
+            Action::Call(action) => {
+                match action {
+                    CallAction::Start {
+                        jid,
+                        video,
+                        placeholder_id,
+                    } => client.start_call(&jid, video, placeholder_id),
+                    CallAction::Accept { call_id } => client.accept_call(&call_id),
+                    CallAction::Decline { call_id } => client.decline_call(&call_id),
+                    CallAction::Cancel { call_id } => client.cancel_call(&call_id),
+                    CallAction::SetMuted { call_id, muted } => {
+                        client.set_call_muted(&call_id, muted);
+                    }
+                }
+                CommandOutcome::Accepted
+            }
+            Action::Download {
+                id,
+                media,
+                answer_to,
+            } => self.download(client, id, *media, answer_to),
+            Action::ReloadHistory => {
+                client.reload_history();
+                CommandOutcome::Accepted
+            }
+            Action::ForgetSession => {
+                // The wipe deletes the file the session is holding open, so
+                // the session stops first and the daemon follows it out. The
+                // caller is told yes because the wipe itself succeeded; what
+                // it asked for is a daemon that comes back unpaired.
+                client.shutdown();
+                match oxidezap_session::wipe_local_state() {
+                    Ok(()) => {
+                        crate::shutdown::request("local state wiped; pair again on restart");
+                        CommandOutcome::Accepted
+                    }
+                    Err(e) => CommandOutcome::Refused(format!("could not wipe local state: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Fetch media and answer the connection that asked.
+    ///
+    /// Answered out of band because it takes seconds: holding the command's
+    /// own reply open would stop that connection reading anything else, and a
+    /// front end scrolling a chat asks for several at once.
+    fn download(
+        &self,
+        client: &WhatsAppClient,
+        id: RequestId,
+        media: oxidezap_core::DownloadableMedia,
+        answer_to: Outbox,
+    ) -> CommandOutcome {
+        let key = crate::media::download_key(&media.file_enc_sha256);
+        // Already here: the same media shared into two chats, or a front end
+        // that restarted. No network, no permit, no wait.
+        if crate::media::has(&key) {
+            let _ = answer_to.try_send(downloaded(id, Ok(key)));
+            return CommandOutcome::Accepted;
+        }
+
+        let Some(permit) = self.permit() else {
+            return too_busy();
+        };
+        let bytes = client.download_downloadable_media(media);
+        tokio::spawn(async move {
+            let result = match bytes.await {
+                Ok(Ok(bytes)) => crate::media::put(&key, &bytes).map_err(|e| e.to_string()),
+                Ok(Err(e)) => Err(e),
+                // The session went away mid-download.
+                Err(_) => Err("the session stopped before the download finished".to_string()),
+            };
+            // `try_send` rather than `send`: a client that has stopped reading
+            // its own answers must not park this task forever.
+            let _ = answer_to.try_send(downloaded(id, result));
+            drop(permit);
+        });
+        CommandOutcome::Accepted
+    }
+
+    /// Hand one session event to the front ends that asked for them.
+    ///
+    /// Nothing happens when nobody is listening, which is the common case: a
+    /// tray wants summaries, and preparing an event means writing every photo
+    /// in it to the cache.
+    fn forward(&self, event: &UiEvent) {
+        if !self.hub.wants_session_events() {
+            return;
+        }
+        let mut event = event.clone();
+        externalize_media(&mut event);
+        match serde_json::to_string(&DaemonMessage::Session(Box::new(event))) {
+            Ok(frame) => self.hub.publish_session(frame),
+            Err(e) => log::error!("dropping unserializable session event: {e}"),
         }
     }
 
@@ -476,6 +654,52 @@ fn too_busy() -> CommandOutcome {
     CommandOutcome::Refused(format!(
         "{MAX_IN_FLIGHT} operations are already in flight; retry shortly"
     ))
+}
+
+/// Move an event's media bytes into the cache and leave a key behind.
+///
+/// The bytes stay where they were in this process — `data` is skipped by
+/// serde, so the frame carries the key alone. A front end reads the file once
+/// and decodes it into the image cache it already keeps.
+///
+/// Writing is skipped for anything already cached, which is most of it after
+/// the first attach: a message's media is addressed by its message id, and a
+/// message's media does not change.
+fn externalize_media(event: &mut UiEvent) {
+    match event {
+        UiEvent::MessageReceived { message, .. } => cache_media(&message.id, &mut message.media),
+        UiEvent::HistoryLoaded { chats, .. } => {
+            for chat in chats {
+                for message in &mut chat.messages {
+                    let id = message.id.clone();
+                    cache_media(&id, &mut message.media);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cache_media(message_id: &str, media: &mut Option<MediaContent>) {
+    let Some(media) = media else { return };
+    if media.data.is_empty() {
+        return;
+    }
+    let key = crate::media::message_key(message_id);
+    match crate::media::put(&key, &media.data) {
+        Ok(key) => media.cache_key = Some(key),
+        // The front end still gets the message; the media renders as the
+        // download it also is. A cache that cannot be written is not a reason
+        // to drop a conversation.
+        Err(e) => log::warn!("could not cache media for a message: {e}"),
+    }
+}
+
+fn downloaded(id: RequestId, result: Result<String, String>) -> String {
+    // A `Result<String, String>` cannot fail to serialize, so the fallback is
+    // unreachable; spelling it out beats an unwrap in a spawned task.
+    serde_json::to_string(&DaemonMessage::Downloaded { id, result })
+        .unwrap_or_else(|e| format!(r#"{{"type":"error","error":"malformed","detail":"{e}"}}"#))
 }
 
 /// A frame that is news rather than state, if this event is one.

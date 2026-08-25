@@ -1,11 +1,20 @@
 //! UI events for communication between client and UI.
 
+use serde::{Deserialize, Serialize};
+
 use super::call::{CallId, IncomingCall};
 use super::chat::ChatMessage;
 
 pub use wacore::types::presence::ReceiptType;
 
-#[derive(Debug)]
+/// One thing the session has to say.
+///
+/// Also the daemon's wire format: a front end in another process receives
+/// these rather than a parallel set of protocol structs that would have to be
+/// kept in step with them. The one thing that does not cross is media bytes,
+/// which travel through the daemon's cache — see
+/// [`MediaContent::cache_key`](super::chat::MediaContent::cache_key).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UiEvent {
     InitComplete,
     /// Durable history hydrated from the chat store at startup.

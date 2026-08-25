@@ -5,6 +5,7 @@
 //! meet at [`state::StateHub`], which is the only thing that mutates, and each
 //! observes it through the channel that suits it.
 
+mod media;
 mod server;
 mod session_bridge;
 mod shutdown;

@@ -16,6 +16,9 @@
 //!   send that failed. They carry no version and no snapshot can recover
 //!   them, so they must not travel on a channel a client stops reading while
 //!   it resynchronizes.
+//! * **A third broadcast** carrying the session's own events, for a front end
+//!   that owns chats and messages rather than a summary of them. Opt-in,
+//!   because it is the whole traffic of the account.
 //! * **A `watch`** for the tray, which only cares about the latest value and
 //!   coalesces bursts on its own.
 
@@ -44,6 +47,13 @@ const BROADCAST_CAPACITY: usize = 256;
 /// missed window raise, and unlike state there is nothing to converge — a
 /// dropped one is simply gone, which is why it is not worth buffering deeply.
 const SIGNAL_CAPACITY: usize = 32;
+
+/// How many session events a front end may fall behind by.
+///
+/// Deeper than the summary stream: one history load is a single event but a
+/// burst of messages is many, and a front end that overruns has to rebuild
+/// from a fresh load rather than from a cheap snapshot.
+const SESSION_CAPACITY: usize = 1024;
 
 /// What the tray renders. Small and comparable so `watch` can drop
 /// no-op updates before they reach the icon.
@@ -120,6 +130,13 @@ pub struct StateHub {
     /// nothing precisely while the front end is recovering is the failure
     /// this avoids.
     signals: broadcast::Sender<Arc<str>>,
+    /// The session's own events, for front ends that asked for them.
+    ///
+    /// Its own channel rather than a flag on `updates`: a tray subscribes to
+    /// summaries and would otherwise pay the serialization of every message in
+    /// the account, and a front end subscribes to events and has no use for
+    /// summaries it derives itself.
+    sessions: broadcast::Sender<Arc<str>>,
     tray: watch::Sender<TrayState>,
 }
 
@@ -127,6 +144,7 @@ impl StateHub {
     pub fn new() -> Arc<Self> {
         let (updates, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (signals, _) = broadcast::channel(SIGNAL_CAPACITY);
+        let (sessions, _) = broadcast::channel(SESSION_CAPACITY);
         let (tray, _) = watch::channel(TrayState {
             connected: false,
             unread: 0,
@@ -139,6 +157,7 @@ impl StateHub {
             }),
             updates,
             signals,
+            sessions,
             tray,
         })
     }
@@ -160,6 +179,29 @@ impl StateHub {
     /// resync.
     pub fn subscribe_signals(&self) -> broadcast::Receiver<Arc<str>> {
         self.signals.subscribe()
+    }
+
+    /// Subscribe to the session's own events.
+    pub fn subscribe_sessions(&self) -> broadcast::Receiver<Arc<str>> {
+        self.sessions.subscribe()
+    }
+
+    /// Whether any front end is listening for session events.
+    ///
+    /// Asked before the work of preparing one: media has to be written to the
+    /// cache before an event can be serialized, and with nobody attached that
+    /// is a copy of every photo in the account for no reader.
+    pub fn wants_session_events(&self) -> bool {
+        self.sessions.receiver_count() > 0
+    }
+
+    /// Publish one session event, already serialized.
+    ///
+    /// Takes a frame rather than the event because preparing it is not free —
+    /// see [`StateHub::wants_session_events`] — and the caller is the only one
+    /// that can do it.
+    pub fn publish_session(&self, frame: String) {
+        let _ = self.sessions.send(Arc::from(frame.as_str()));
     }
 
     pub fn watch_tray(&self) -> watch::Receiver<TrayState> {

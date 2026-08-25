@@ -5,6 +5,12 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 3: the session's own event stream, opt-in at the hello, plus the requests
+/// a full front end needs to drive it — audio, typing, calls, downloads and
+/// `ForgetSession`. Media travels through [`media_path`] rather than the
+/// socket, and `SendText` gained the local id a client that draws the message
+/// before it is sent has to know.
+///
 /// 2: `Pairing` carries a [`PairingCode`] per credential rather than two bare
 /// strings, `MessagePreview` names the message it describes, `MarkRead`
 /// echoes that name back, `ShowWindow`, `SendFailed`, `Refused` and
@@ -13,10 +19,11 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 const SOCKET_NAME: &str = "daemon.sock";
 const DIR_NAME: &str = "oxidezap";
+const MEDIA_DIR: &str = "media";
 
 /// Path of the daemon's listening socket.
 ///
@@ -45,6 +52,37 @@ pub fn socket_path() -> Option<PathBuf> {
     Some(tmp.join(format!("{DIR_NAME}-{uid}")).join(SOCKET_NAME))
 }
 
+/// Where a media payload with this cache key lives.
+///
+/// A photo is megabytes and the socket carries newline-delimited JSON, so
+/// media never travels as a frame: the side that has the bytes writes them
+/// here and the other side reads the file. Both derive the path from the same
+/// place the socket comes from, so they cannot disagree about it.
+///
+/// The directory is the daemon's, mode 0700 like its parent, and both
+/// processes run as the same user — a client writing a voice note into it is
+/// putting a file in its own scratch space, not reaching into the daemon.
+///
+/// Returns `None` for the same reason [`socket_path`] does, and for a key that
+/// is not a plain name: a key is echoed from a peer, and one carrying a
+/// separator or a leading dot would name a file outside the cache.
+#[must_use]
+pub fn media_path(key: &str) -> Option<PathBuf> {
+    let sane = !key.is_empty()
+        && key.len() <= 128
+        && !key.starts_with('.')
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    sane.then(media_dir).flatten().map(|dir| dir.join(key))
+}
+
+/// The directory [`media_path`] resolves into.
+#[must_use]
+pub fn media_dir() -> Option<PathBuf> {
+    Some(socket_path()?.parent()?.join(MEDIA_DIR))
+}
+
 #[cfg(unix)]
 fn uid_suffix() -> String {
     // rustix rather than a hand-rolled `extern "C"`: the same syscall with no
@@ -70,6 +108,30 @@ mod tests {
             .join(SOCKET_NAME);
         assert_eq!(path.file_name().unwrap(), SOCKET_NAME);
         assert!(path.starts_with("/run/user/1000"));
+    }
+
+    /// A cache key is echoed from a peer. One carrying a separator or a
+    /// leading dot names a file outside the cache, and the daemon writes
+    /// there as the user who owns the session.
+    #[test]
+    fn a_key_that_could_escape_the_cache_resolves_to_nothing() {
+        for key in [
+            "../../.ssh/authorized_keys",
+            "sub/dir",
+            ".hidden",
+            "",
+            "/etc/passwd",
+        ] {
+            assert!(media_path(key).is_none(), "{key} was allowed");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_key_lands_inside_the_cache() {
+        let dir = media_dir().expect("a cache directory is always derivable");
+        let path = media_path("a1b2c3.jpg").expect("a plain name is a key");
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        assert!(path.starts_with(dir));
     }
 
     #[test]

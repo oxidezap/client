@@ -20,7 +20,7 @@ mod protocol;
 mod transport;
 
 pub use protocol::{
-    ChatSummary, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview,
-    PairingCode, ProtocolError, StateSnapshot, StateVersion,
+    CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage,
+    MessagePreview, PairingCode, ProtocolError, RequestId, StateSnapshot, StateVersion,
 };
-pub use transport::{PROTOCOL_VERSION, socket_path};
+pub use transport::{PROTOCOL_VERSION, media_dir, media_path, socket_path};

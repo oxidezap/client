@@ -1,14 +1,13 @@
 //! Call state structures for the UI.
 
-use std::sync::Arc;
-
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use wacore::types::call::IncomingCall as WaIncomingCall;
 
 /// Call ids are plain strings on the wire (and in the voip facade).
 pub type CallId = String;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutgoingCallState {
     Initiating,
     Ringing,
@@ -17,7 +16,7 @@ pub enum OutgoingCallState {
     Timeout,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutgoingCall {
     pub call_id: CallId,
     pub recipient_name: String,
@@ -70,7 +69,7 @@ impl OutgoingCall {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncomingCall {
     pub call_id: CallId,
     pub caller_name: String,
@@ -78,17 +77,21 @@ pub struct IncomingCall {
     pub is_video: bool,
     pub is_offline: bool,
     pub received_at: DateTime<Utc>,
-    /// The library offer payload; `client.voip().accept()/reject()` consume it.
-    pub offer: Arc<WaIncomingCall>,
 }
 
 impl IncomingCall {
+    /// Build a ringing call from the library's offer.
+    ///
+    /// The offer itself does not come along: whoever accepts or declines looks
+    /// it up by call id in the session's own registry, so a copy here would be
+    /// a second owner of a payload only one process can act on — and one that
+    /// could not cross the daemon socket if it tried.
     pub fn new(
         call_id: impl Into<CallId>,
         caller_name: String,
         caller_jid: String,
         is_video: bool,
-        offer: Arc<WaIncomingCall>,
+        offer: &WaIncomingCall,
     ) -> Self {
         Self {
             call_id: call_id.into(),
@@ -97,7 +100,6 @@ impl IncomingCall {
             is_video,
             is_offline: offer.offline,
             received_at: wacore::time::now_utc(),
-            offer,
         }
     }
 

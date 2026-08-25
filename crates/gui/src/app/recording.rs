@@ -165,6 +165,7 @@ impl WhatsAppApp {
             MediaContent {
                 media_type: MediaType::Audio,
                 data: Arc::new(ogg_data),
+                cache_key: None,
                 mime_type: "audio/ogg; codecs=opus".to_string(),
                 width: None,
                 height: None,
