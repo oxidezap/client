@@ -60,6 +60,9 @@ pub fn render_chat_header(
     chat: &Chat,
     typing: Option<&TypingSummary>,
     availability: Option<&Availability>,
+    // Whether this conversation is with the account's own number, which is
+    // the one case where the name alone does not identify it.
+    is_own_number: bool,
     // Whether this window can reach the network at all. Offline, a call
     // button that still looked live would place a call into nothing.
     can_send: bool,
@@ -68,7 +71,11 @@ pub fn render_chat_header(
     cx: &App,
 ) -> impl IntoElement {
     let metrics = *layout.metrics();
-    let name: SharedString = chat.name.clone().into();
+    let name: SharedString = if is_own_number {
+        format!("{} (You)", chat.name).into()
+    } else {
+        chat.name.clone().into()
+    };
     let subtitle = subtitle(chat, typing, availability);
     // No badge until presence actually arrives. A contact who has told us
     // nothing is not "away": most contacts are in that state before the first

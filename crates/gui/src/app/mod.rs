@@ -629,9 +629,34 @@ impl WhatsAppApp {
     pub fn responsive_layout(&self, window: &Window, cx: &App) -> ResponsiveLayout {
         ResponsiveLayout::new(
             window.viewport_size(),
-            self.mobile_panel,
+            self.visible_panel(),
             cx.product().metrics,
         )
+    }
+
+    /// Which panel a phone-width window is showing.
+    ///
+    /// Derived, not merely stored. A phone shows one panel at a time, and the
+    /// stored one is a record of where the *user* went — which can name the
+    /// conversation panel while there is no conversation in it: select a chat
+    /// on a wide window, close it, then narrow the window, and the phone
+    /// layout had a panel with nothing in it and no list to pick from. The
+    /// list is what a window falls back to, because it is the one panel that
+    /// is never empty of things to do.
+    fn visible_panel(&self) -> MobilePanel {
+        match self.mobile_panel {
+            MobilePanel::Chat if !self.has_something_to_show() => MobilePanel::ChatList,
+            panel => panel,
+        }
+    }
+
+    /// Whether the conversation panel has anything in it, whichever
+    /// destination the window is on.
+    fn has_something_to_show(&self) -> bool {
+        match self.destination {
+            Destination::Chats => self.selected_chat.is_some(),
+            Destination::Status => self.status_pane.is_open(),
+        }
     }
 
     /// Get the current mobile panel state
@@ -642,6 +667,10 @@ impl WhatsAppApp {
     /// Navigate back to chat list (for mobile)
     pub fn navigate_back(&mut self, cx: &mut Context<Self>) {
         self.mobile_panel = MobilePanel::ChatList;
+        // Leaving the panel means leaving what was in it: a status left open
+        // would put the window straight back into it on the next layout,
+        // since the panel is derived from whether there is anything to show.
+        self.status_pane.close();
         cx.notify();
     }
 
@@ -691,6 +720,7 @@ impl WhatsAppApp {
                     (self.selected_chat.as_deref() != Some(chat.jid.as_str()))
                         .then(|| self.drafts.get(&chat.jid).map(String::as_str))
                         .flatten(),
+                    self.is_own_number(&chat.jid),
                 )
             })
             .collect();
@@ -774,6 +804,24 @@ impl WhatsAppApp {
     /// The account's own number, when the session has said.
     pub fn account_jid(&self) -> Option<&str> {
         self.account_jid.as_deref()
+    }
+
+    /// Whether `jid` addresses this account's own number.
+    ///
+    /// Through the library's own comparison rather than a string match: the
+    /// account is announced as a JID with a device on it and the chat is keyed
+    /// without one, so the two never match outright, and `is_same_user_as` is
+    /// the rule that already knows which parts of a JID are its identity.
+    pub fn is_own_number(&self, jid: &str) -> bool {
+        let Some(own) = self
+            .account_jid
+            .as_deref()
+            .and_then(|own| own.parse::<Jid>().ok())
+        else {
+            return false;
+        };
+        jid.parse::<Jid>()
+            .is_ok_and(|other| own.to_non_ad().is_same_user_as(&other.to_non_ad()))
     }
 
     /// Whether this device is paired at all.

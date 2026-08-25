@@ -22,12 +22,23 @@ use gpui_component::Root;
 use crate::app::{WhatsAppApp, init_app_bindings};
 
 fn main() {
+    // The renderer, the bus and the text shaper all narrate at debug level,
+    // and none of it is about this app. `cosmic_text` in particular reports
+    // every family it walks past while looking for a glyph — "failed to find
+    // family 'FreeSans'" is it working, not it failing, and one message with
+    // an unusual script produces a dozen. Turning `RUST_LOG=debug` on to look
+    // at *our* logs should not bury them. An explicit `RUST_LOG` still wins:
+    // these are floors for modules the user did not ask about.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .filter_module("blade_graphics", log::LevelFilter::Warn)
         .filter_module("naga", log::LevelFilter::Warn)
         .filter_module("zbus", log::LevelFilter::Warn)
         .filter_module("tracing", log::LevelFilter::Warn)
         .filter_module("gpui", log::LevelFilter::Warn)
+        .filter_module("cosmic_text", log::LevelFilter::Warn)
+        .filter_module("wgpu_core", log::LevelFilter::Warn)
+        .filter_module("wgpu_hal", log::LevelFilter::Warn)
+        .filter_module("font_kit", log::LevelFilter::Warn)
         .init();
 
     gpui_platform::application()

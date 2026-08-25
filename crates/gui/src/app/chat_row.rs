@@ -90,10 +90,15 @@ impl ChatRow {
     ///
     /// `typing` and `draft` are transient state the front end owns; the chat
     /// itself knows nothing about either.
-    pub fn new(chat: &Chat, typing: Option<TypingSummary>, draft: Option<&str>) -> Self {
+    pub fn new(
+        chat: &Chat,
+        typing: Option<TypingSummary>,
+        draft: Option<&str>,
+        is_own_number: bool,
+    ) -> Self {
         Self {
             jid: chat.jid.clone(),
-            name: single_line(&chat.name),
+            name: display_name(&chat.name, is_own_number),
             is_group: chat.is_group,
             timestamp: chat.last_message_time,
             unread: if chat.unread_count > 0 {
@@ -198,6 +203,21 @@ fn body_for(last: &ChatMessage) -> String {
     }
 }
 
+/// The name as the list shows it.
+///
+/// WhatsApp marks the conversation with your own number "(You)", and it is
+/// the one row where the name alone is ambiguous: a second number of yours is
+/// saved under a person's name like any other contact, so without the suffix
+/// it reads as somebody else.
+fn display_name(name: &str, is_own_number: bool) -> String {
+    let name = single_line(name);
+    if is_own_number {
+        format!("{name} (You)")
+    } else {
+        name
+    }
+}
+
 /// Collapse whitespace so a multi-line message cannot stretch a fixed row.
 fn single_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -258,9 +278,22 @@ mod tests {
         }
     }
 
+    /// The one row where the name alone is ambiguous: a second number of
+    /// yours is saved under a person's name like any other contact.
+    #[test]
+    fn your_own_number_is_marked_as_yours() {
+        let mut chat = chat(false);
+        chat.name = "Jlucaso 2".to_string();
+        assert_eq!(
+            ChatRow::new(&chat, None, None, true).name,
+            "Jlucaso 2 (You)"
+        );
+        assert_eq!(ChatRow::new(&chat, None, None, false).name, "Jlucaso 2");
+    }
+
     #[test]
     fn a_chat_with_nothing_in_it_says_so() {
-        let row = ChatRow::new(&chat(false), None, None);
+        let row = ChatRow::new(&chat(false), None, None, false);
         assert_eq!(row.preview, Preview::Empty);
     }
 
@@ -268,7 +301,7 @@ mod tests {
     fn typing_outranks_both_the_draft_and_the_last_message() {
         let mut chat = chat(false);
         chat.messages.push(message(false, "achado n e roubado"));
-        let row = ChatRow::new(&chat, Some(typing("Ana")), Some("meio escrito"));
+        let row = ChatRow::new(&chat, Some(typing("Ana")), Some("meio escrito"), false);
         assert!(matches!(row.preview, Preview::Typing(_)));
     }
 
@@ -276,7 +309,7 @@ mod tests {
     fn a_draft_outranks_the_last_message() {
         let mut chat = chat(false);
         chat.messages.push(message(false, "ping"));
-        let row = ChatRow::new(&chat, None, Some("meio escrito"));
+        let row = ChatRow::new(&chat, None, Some("meio escrito"), false);
         assert_eq!(row.preview, Preview::Draft("meio escrito".to_string()));
     }
 
@@ -284,7 +317,7 @@ mod tests {
     fn whitespace_only_draft_is_not_a_draft() {
         let mut chat = chat(false);
         chat.messages.push(message(false, "ping"));
-        let row = ChatRow::new(&chat, None, Some("   \n "));
+        let row = ChatRow::new(&chat, None, Some("   \n "), false);
         assert!(matches!(row.preview, Preview::Message { .. }));
     }
 
@@ -294,14 +327,16 @@ mod tests {
         let mut msg = message(false, "achado n e roubado");
         msg.sender_name = Some("Ana".to_string());
         group.messages.push(msg.clone());
-        let Preview::Message { prefix, .. } = ChatRow::new(&group, None, None).preview else {
+        let Preview::Message { prefix, .. } = ChatRow::new(&group, None, None, false).preview
+        else {
             panic!("expected a message preview");
         };
         assert_eq!(prefix.as_deref(), Some("Ana"));
 
         let mut direct = chat(false);
         direct.messages.push(msg);
-        let Preview::Message { prefix, .. } = ChatRow::new(&direct, None, None).preview else {
+        let Preview::Message { prefix, .. } = ChatRow::new(&direct, None, None, false).preview
+        else {
             panic!("expected a message preview");
         };
         assert_eq!(prefix, None, "there is only one person it could be");
@@ -313,7 +348,8 @@ mod tests {
         let mut msg = message(true, "pong");
         msg.status = MessageStatus::Read;
         chat.messages.push(msg);
-        let Preview::Message { status, prefix, .. } = ChatRow::new(&chat, None, None).preview
+        let Preview::Message { status, prefix, .. } =
+            ChatRow::new(&chat, None, None, false).preview
         else {
             panic!("expected a message preview");
         };
@@ -327,7 +363,8 @@ mod tests {
         let mut msg = message(false, "");
         msg.media = Some(audio(Some(14)));
         chat.messages.push(msg);
-        let Preview::Message { text, glyph, .. } = ChatRow::new(&chat, None, None).preview else {
+        let Preview::Message { text, glyph, .. } = ChatRow::new(&chat, None, None, false).preview
+        else {
             panic!("expected a message preview");
         };
         assert_eq!(text, "Voice message · 0:14");
@@ -340,7 +377,8 @@ mod tests {
         let mut msg = message(false, "olha isso");
         msg.media = Some(audio(Some(14)));
         chat.messages.push(msg);
-        let Preview::Message { text, glyph, .. } = ChatRow::new(&chat, None, None).preview else {
+        let Preview::Message { text, glyph, .. } = ChatRow::new(&chat, None, None, false).preview
+        else {
             panic!("expected a message preview");
         };
         assert_eq!(text, "olha isso");
@@ -352,7 +390,7 @@ mod tests {
         let mut chat = chat(false);
         chat.messages
             .push(message(false, "line one\nline two\ttab"));
-        let Preview::Message { text, .. } = ChatRow::new(&chat, None, None).preview else {
+        let Preview::Message { text, .. } = ChatRow::new(&chat, None, None, false).preview else {
             panic!("expected a message preview");
         };
         assert_eq!(text, "line one line two tab");
@@ -362,11 +400,14 @@ mod tests {
     fn a_manual_unread_has_no_number_to_show() {
         let mut chat = chat(false);
         chat.manually_unread = true;
-        assert_eq!(ChatRow::new(&chat, None, None).unread, Unread::Marked);
+        assert_eq!(
+            ChatRow::new(&chat, None, None, false).unread,
+            Unread::Marked
+        );
 
         chat.unread_count = 3;
         assert_eq!(
-            ChatRow::new(&chat, None, None).unread,
+            ChatRow::new(&chat, None, None, false).unread,
             Unread::Count(3),
             "a real count wins over the sentinel"
         );

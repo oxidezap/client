@@ -173,6 +173,10 @@ pub fn render_connected_view(
     // replaced rather than disabled in place, because the interesting part is
     // the way out, not the field.
     let is_offline = app.is_offline();
+    // "(You)" on the conversation with your own number, as on its list row.
+    let is_own_number = selected_chat
+        .as_ref()
+        .is_some_and(|chat| app.is_own_number(&chat.jid));
     let can_send = app.can_send();
 
     let call_card = render_call_card(
@@ -226,6 +230,7 @@ pub fn render_connected_view(
                         input_area,
                         can_send,
                         is_offline,
+                        is_own_number,
                     },
                     &message_list,
                     entity.clone(),
@@ -272,6 +277,8 @@ struct ChatAreaProps<'a> {
     /// Whether anything can be sent from here at all.
     can_send: bool,
     is_offline: bool,
+    /// Whether the open conversation is with this account's own number.
+    is_own_number: bool,
 }
 
 fn render_chat_area(
@@ -291,6 +298,7 @@ fn render_chat_area(
         input_area,
         can_send,
         is_offline,
+        is_own_number,
     } = props;
     let metrics = *layout.metrics();
     let base = if layout.is_mobile() {
@@ -330,6 +338,7 @@ fn render_chat_area(
                     chat,
                     typing,
                     availability,
+                    is_own_number,
                     can_send,
                     entity.clone(),
                     layout,
