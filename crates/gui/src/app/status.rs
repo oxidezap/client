@@ -260,7 +260,7 @@ impl WhatsAppApp {
     /// nothing else ever stops it: closing the reader only cleared the
     /// selection, so the frame task kept running and the audio kept going over
     /// whatever the window showed next.
-    fn leave_shown_status(&mut self) {
+    pub(super) fn leave_shown_status(&mut self) {
         let shown = self.shown_status_message_id();
         self.stop_status_media(shown);
     }

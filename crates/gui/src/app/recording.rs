@@ -82,9 +82,14 @@ impl WhatsAppApp {
         }
 
         self.recording_state = RecordingState::Recording;
-        // Bind the note to the chat it started in: resolving the destination
-        // at stop time would misdeliver if the user switches chats meanwhile.
-        self.recording_chat = self.selected_chat.clone();
+        // Bind the note to the chat it started in *and* to the reply it is
+        // answering: resolving either at stop time would misdeliver if the
+        // user switches chats meanwhile — which also cancels the draft, so
+        // the note arrived in the right conversation with its quote gone.
+        self.recording_target = self.selected_chat.clone().map(|jid| RecordingTarget {
+            jid,
+            reply: self.reply_to.clone(),
+        });
         self.update_input_recording(cx);
         self.ensure_recording_tick(cx);
         info!("PTT recording started");
@@ -104,26 +109,15 @@ impl WhatsAppApp {
             return;
         }
 
-        let jid = match self.recording_chat.take() {
-            Some(jid) => jid,
-            None => {
-                warn!("No recording chat, cancelling recording");
-                self.cancel_recording(cx);
-                return;
-            }
+        let Some(RecordingTarget { jid, reply }) = self.recording_target.take() else {
+            warn!("No recording chat, cancelling recording");
+            self.cancel_recording(cx);
+            return;
         };
 
         self.recording_state = RecordingState::Processing;
         self.update_input_recording(cx);
         cx.notify();
-
-        // The reply this recording is answering, captured *now* rather than
-        // read at send time: encoding runs on a background thread, and a
-        // reply begun while it ran would otherwise attach itself to a voice
-        // note recorded before it existed. Copied rather than taken, so the
-        // paths below that give up on this recording leave the composer's
-        // draft where the user put it.
-        let reply = self.reply_to.clone();
 
         // Stop recording and get audio data
         let recorded = match self.audio_recorder.stop() {
@@ -205,12 +199,12 @@ impl WhatsAppApp {
             return;
         };
         let _ = client;
-        // Recording is a way of answering, so the draft that was open when
-        // the microphone stopped belongs to *this* send — and leaving it
-        // armed made it attach itself to whatever was typed next, which is
-        // the half of the bug nobody would connect to having pressed the
-        // microphone. Cleared only if it is still that draft: one begun
-        // while the encoder ran is answering something else.
+        // Recording is a way of answering, so the draft the note was bound to
+        // belongs to *this* send — and leaving it armed made it attach itself
+        // to whatever was typed next, which is the half of the bug nobody
+        // would connect to having pressed the microphone. Cleared only if it
+        // is still that draft: one picked while the note was being recorded
+        // or encoded is answering something else.
         let quoted = reply.map(|draft| {
             if self
                 .reply_to
@@ -293,7 +287,7 @@ impl WhatsAppApp {
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
         self.audio_recorder.cancel();
         self.recording_state = RecordingState::Idle;
-        self.recording_chat = None;
+        self.recording_target = None;
         self.update_input_recording(cx);
         info!("PTT recording cancelled");
         cx.notify();

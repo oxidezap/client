@@ -287,16 +287,21 @@ fn render_frame(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    if let Some(image) = image {
-        return img(ImageSource::Image(image))
+    // The decoded frame first. A video's own bytes decode to its poster
+    // image, so asking the still first would draw a frozen picture over a
+    // player that is running — the same ordering mistake the status reader
+    // made. The viewer only opens pictures today, which is what keeps this
+    // from being visible rather than what makes it right.
+    if let Some(frame) = frame {
+        return img(ImageSource::Render(frame))
             .max_w_full()
             .max_h_full()
             .object_fit(gpui::ObjectFit::Contain)
             .rounded(metrics.radius_md())
             .into_any_element();
     }
-    if let Some(frame) = frame {
-        return img(ImageSource::Render(frame))
+    if let Some(image) = image {
+        return img(ImageSource::Image(image))
             .max_w_full()
             .max_h_full()
             .object_fit(gpui::ObjectFit::Contain)

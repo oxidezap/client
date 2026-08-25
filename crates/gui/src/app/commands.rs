@@ -68,9 +68,10 @@ impl WhatsAppApp {
         // A photo and a voice note both want the speakers; opening one stops
         // the other rather than talking over it.
         self.stop_current_media();
-        // Take focus so the arrow keys walk pictures rather than moving the
-        // composer's caret behind the scrim.
-        window.focus(&self.viewer_focus, cx);
+        // The arrow keys follow in `sync_overlay_focus`, on this same frame —
+        // and, unlike focusing here, they are handed back when the viewer
+        // goes away, however it goes away.
+        let _ = window;
         cx.notify();
     }
 

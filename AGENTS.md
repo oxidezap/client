@@ -115,12 +115,22 @@ profile here repeats it deliberately.
   `CallState::promote_waiting` is one method that `take`, `end` and
   `fail_outgoing_to` all go through, and why `take_incoming`/`take_outgoing`
   deliberately do not: those hand the stage to what replaces it.
-- **A ringing call owns the keyboard; an answered one gives it back.** The
-  card's Enter and Escape are scoped to its key context, so they do nothing
-  unless something focuses it — `sync_call_focus`, from the render pass,
-  because focusing needs a `Window` and the state it follows comes from the
-  daemon. Only while ringing: an answered call is one people type through, so
-  mute is a window-wide chord rather than a card binding.
+- **A transient surface that takes the keyboard has to give it back, and to
+  one place.** The call card's Enter and Escape and the viewer's arrow keys
+  are scoped to their key contexts, so they do nothing unless something
+  focuses them — and a teardown that merely blurs leaves the window with no
+  keyboard target at all. `KeyboardOwner` names who should have it and
+  `sync_overlay_focus` hands it over, from the render pass, because focusing
+  needs a `Window` and the state it follows comes from the daemon. A ringing
+  call outranks the viewer; an *answered* call owns nothing, because a call
+  people talk through is one they type through — which is why mute is a
+  window-wide chord rather than a card binding.
+- **What a recording will be sent as is bound when the microphone opens.**
+  Not read when it closes: the destination *and* the reply it answers are one
+  answer to "where is this note going", and resolving either at the end sent
+  it to whichever chat was on screen by then, or quoted whichever message had
+  been picked since. `RecordingTarget` is that pair, and the draft is cleared
+  at send only if it is still the one the note was bound to.
 - **An overlay that names a row is reconciled where rows change.** The media
   viewer holds a message id and resolves it every frame, so a revoke behind
   it left a modal that drew nothing and still swallowed the Escape meant to

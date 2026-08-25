@@ -177,9 +177,9 @@ pub fn render_connected_view(
         .is_some_and(|chat| app.is_own_number(&chat.jid));
     let can_send = app.can_send();
 
-    // Before the card is built, so the frame that first draws a ringing call
-    // is the frame its shortcuts start working on.
-    app.sync_call_focus(window, cx);
+    // Before the overlays are built, so the frame that first draws a ringing
+    // call — or the viewer — is the frame its shortcuts start working on.
+    app.sync_overlay_focus(window, cx);
     let call_card = render_call_card(
         app.call_state(),
         app.call_card(),

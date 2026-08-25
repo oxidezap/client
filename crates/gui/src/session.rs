@@ -591,6 +591,19 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
                 Some(waiting) => waiting.failed("unexpected storage answer", Some(events)),
                 None => debug!("a storage answer arrived for {id}, which nobody is waiting on"),
             },
+            // The account, once the daemon knows it. A window attached
+            // during pairing had nothing in its snapshot to know it from.
+            Ok(DaemonMessage::Update {
+                event: DaemonEvent::AccountChanged(account),
+                ..
+            }) => {
+                if events
+                    .blocking_send(FromDaemon::Account(Some(account)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Ok(DaemonMessage::Update {
                 event: DaemonEvent::CallsChanged(calls),
                 ..

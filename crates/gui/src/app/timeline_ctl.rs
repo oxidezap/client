@@ -129,6 +129,14 @@ impl WhatsAppApp {
     /// failed state and its place in the timeline, because that is what
     /// happened. Re-sending the text is the recovery the user asked for.
     pub fn retry_send(&mut self, message_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Same rule as the composer: in the offline state the history is
+        // readable and nothing else. The timeline is still drawn there, so
+        // the retry under a failed bubble was a live send out of a window
+        // that says it is not connected.
+        if !self.can_send() {
+            warn!("Cannot send again: this window is offline");
+            return;
+        }
         let Some(chat) = self.selected_chat_data() else {
             return;
         };

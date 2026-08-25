@@ -52,6 +52,12 @@ impl WhatsAppApp {
         }
 
         self.active_media = ActiveMedia::None;
+        // Whatever was playing is over, so any completion still in flight for
+        // it describes a playback that no longer exists. Bumped here rather
+        // than where each playback starts, because every start goes through
+        // this and "stopped" is exactly when an outstanding completion stops
+        // meaning anything.
+        self.playback_epoch = self.playback_epoch.wrapping_add(1);
     }
     /// Get the currently playing audio message ID (if audio is playing)
     pub fn playing_message_id(&self) -> Option<&str> {
@@ -215,6 +221,12 @@ impl WhatsAppApp {
 
                 // Wait for completion event (no polling needed)
                 let completed_id = message_id;
+                // Which playback this belongs to. The id alone is not enough:
+                // replaying the *same* note — scrubbing one that ran to its
+                // end does exactly that — drops the first playback's sender
+                // while the id still matches, so the old wakeup would clear
+                // the new playback's state with the audio still running.
+                let epoch = self.playback_epoch;
                 cx.spawn(async move |entity: WeakEntity<Self>, cx| {
                     let _ = completion_rx.await;
 
@@ -222,7 +234,8 @@ impl WhatsAppApp {
                         // Id check, not just is_audio: switching A -> B drops
                         // A's completion sender after B is active, and A's
                         // stale wakeup must not clear B's state.
-                        if app.active_media.is_playing(&completed_id) {
+                        if app.playback_epoch == epoch && app.active_media.is_playing(&completed_id)
+                        {
                             app.active_media = ActiveMedia::None;
                             info!("Audio playback completed");
                             cx.notify();

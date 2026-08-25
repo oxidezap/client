@@ -249,15 +249,21 @@ impl StateHub {
         }
     }
 
-    /// Record who this device is linked as. Returns whether it changed, so a
-    /// re-announcement of the same identity buys no update.
-    pub fn set_account(&self, account: oxidezap_ipc::AccountIdentity) -> bool {
-        let mut inner = self.lock();
-        if inner.account.as_ref() == Some(&account) {
-            return false;
+    /// Record who this device is linked as, and tell everyone.
+    ///
+    /// Through [`Self::apply`] like any other state, because it *is* state:
+    /// held here, carried in the snapshot, and recoverable from it. Written
+    /// without an event it reached only clients that attached afterwards, so
+    /// a window open through pairing kept an unlinked account row for the rest
+    /// of its life.
+    ///
+    /// A re-announcement of the same identity is not news and consumes no
+    /// version.
+    pub fn set_account(&self, account: oxidezap_ipc::AccountIdentity) {
+        if self.lock().account.as_ref() == Some(&account) {
+            return;
         }
-        inner.account = Some(account);
-        true
+        self.apply(Change::live(DaemonEvent::AccountChanged(account)));
     }
 
     /// Change what is happening on the call front, and tell everyone.
@@ -410,6 +416,9 @@ impl StateHub {
                 // it names is the state this holds, so applying it here keeps
                 // one field with one writer.
                 DaemonEvent::CallsChanged(calls) => inner.calls = calls.clone(),
+                DaemonEvent::AccountChanged(account) => {
+                    inner.account = Some(account.clone());
+                }
             }
 
             (inner.version, inner.tray_state())
@@ -535,6 +544,38 @@ mod tests {
                 group_jid: None,
             })
             .build()
+    }
+
+    /// A window can attach before there is an account to name: during
+    /// pairing there is not one yet, and the snapshot it got said so. The
+    /// answer has to reach it when it arrives.
+    #[tokio::test]
+    async fn an_account_learned_after_a_window_attached_reaches_it() {
+        let hub = StateHub::new();
+        let mut window = hub.subscribe();
+        let account = oxidezap_ipc::AccountIdentity {
+            name: Some("Ana".to_string()),
+            jid: Some("a@s.whatsapp.net".to_string()),
+            lid: None,
+        };
+
+        hub.set_account(account.clone());
+        // The same identity again is not news.
+        hub.set_account(account.clone());
+
+        let frame: DaemonMessage = serde_json::from_str(&window.recv().await.unwrap()).unwrap();
+        assert!(matches!(
+            &frame,
+            DaemonMessage::Update {
+                event: DaemonEvent::AccountChanged(sent),
+                ..
+            } if *sent == account
+        ));
+        assert!(
+            window.try_recv().is_err(),
+            "the second announcement said nothing new"
+        );
+        assert_eq!(hub.snapshot().account, Some(account));
     }
 
     /// Two windows, and only one of them pressed Accept. The daemon is what

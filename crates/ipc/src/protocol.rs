@@ -205,6 +205,14 @@ pub enum DaemonEvent {
     /// to replay, so a second window would otherwise keep ringing an offer
     /// that the first one answered.
     CallsChanged(CallState),
+    /// Who this device is linked as.
+    ///
+    /// It reaches a client in the [`DaemonMessage::Hello`] snapshot too, but
+    /// the snapshot is only what was known when that client attached: a window
+    /// opened during pairing attaches before there is an account at all, and
+    /// nothing replayed the answer when it arrived. This is what "(You)" and
+    /// the read ticks in your own chat compare against.
+    AccountChanged(AccountIdentity),
 }
 
 /// A daemon-to-client frame.

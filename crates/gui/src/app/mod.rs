@@ -75,6 +75,37 @@ impl AudioHolder {
     }
 }
 
+/// What a recording in progress will be sent as.
+///
+/// Bound when the microphone opens, not read when it closes: the user can
+/// switch chats or pick a different message to answer while it runs, and both
+/// would otherwise be resolved against whatever the window looks like at the
+/// end. One value rather than two fields, because the destination and the
+/// reply are one answer to "where is this note going" and drifting apart is
+/// exactly how a note reaches chat A quoting chat B.
+struct RecordingTarget {
+    jid: String,
+    reply: Option<ReplyDraft>,
+}
+
+/// Which surface the keyboard belongs to.
+///
+/// A transient surface that takes focus has to give it back, and to exactly
+/// one place: a blurred handle leaves the window with no keyboard target at
+/// all, which reads as a window that has stopped listening. Naming the owner
+/// is what makes "give it back" a single rule rather than something every
+/// teardown path has to remember.
+#[derive(Clone, PartialEq, Eq)]
+enum KeyboardOwner {
+    /// Where typing goes, and where focus returns.
+    Composer,
+    /// A call that is ringing — not one that has been answered, which is a
+    /// call people type through.
+    RingingCall(String),
+    /// The fullscreen viewer, which owns the arrow keys while it is up.
+    Viewer,
+}
+
 struct TimelineAnchor {
     jid: String,
     count: usize,
@@ -441,9 +472,12 @@ pub struct WhatsAppApp {
     /// Focus target for the call card, so its actions are reachable from
     /// the keyboard while it floats over the app.
     call_focus: FocusHandle,
-    /// The ringing call the keyboard was handed to, so it is handed over
-    /// once and given back once. See `sync_call_focus`.
-    call_keyboard: Option<String>,
+    /// Which overlay the keyboard was handed to, so it is handed over once
+    /// and given back once. See `sync_overlay_focus`.
+    keyboard_owner: KeyboardOwner,
+    /// Which playback the completion still in flight belongs to. See
+    /// `stop_current_media`.
+    playback_epoch: usize,
     /// Focus target for the fullscreen viewer, which owns the arrow keys
     /// only while it is up.
     viewer_focus: FocusHandle,
@@ -493,7 +527,7 @@ pub struct WhatsAppApp {
     recording_state: RecordingState,
     /// Chat the current PTT recording started in; the note is sent there even
     /// if the user switches chats before stopping
-    recording_chat: Option<String>,
+    recording_target: Option<RecordingTarget>,
     /// Audio player for voice message and video audio playback
     audio_player: AudioPlayer,
     /// Playback speed for voice notes, shared across clips: someone who
@@ -672,7 +706,8 @@ impl WhatsAppApp {
             chat_list_scroll: VirtualListScrollHandle::new(),
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
-            call_keyboard: None,
+            keyboard_owner: KeyboardOwner::Composer,
+            playback_epoch: 0,
             viewer_focus: cx.focus_handle(),
             chat_search_input: None, // Created lazily when window is available
             media_viewer: None,
@@ -689,7 +724,7 @@ impl WhatsAppApp {
             reconnect_task: None,
             audio_recorder: AudioRecorder::new(),
             recording_state: RecordingState::default(),
-            recording_chat: None,
+            recording_target: None,
             audio_player: AudioPlayer::new(),
             playback_speed: 1.0,
             playback_tick: None,
@@ -779,6 +814,10 @@ impl WhatsAppApp {
         // Leaving the panel means leaving what was in it: a status left open
         // would put the window straight back into it on the next layout,
         // since the panel is derived from whether there is anything to show.
+        // Stopped before it is closed, and in that order — afterwards there
+        // is no way to ask which update was on screen, so a video went on
+        // decoding and playing behind the chat list.
+        self.leave_shown_status();
         self.status_pane.close();
         cx.notify();
     }
@@ -2149,10 +2188,17 @@ impl WhatsAppApp {
                 // A `stat` unless the stamp moved, which is why polling a
                 // file a person edits by hand is affordable.
                 let (theme_changed, watching) = cx.update(|cx| {
-                    (
-                        crate::theme::reload_if_changed(cx),
-                        crate::theme::watches_a_file(cx),
-                    )
+                    let changed = crate::theme::reload_if_changed(cx);
+                    // The base font is the window's rem reference, so a
+                    // reload that moves it leaves every frame already laid
+                    // out measured against the old scale — tokens reporting
+                    // one size into a layout built for another. Both
+                    // interactive paths call `window.refresh()` for this;
+                    // editing the file by hand deserves the same.
+                    if changed {
+                        cx.refresh_windows();
+                    }
+                    (changed, crate::theme::watches_a_file(cx))
                 });
 
                 let alive = entity.update(cx, |app, cx| {

@@ -5,6 +5,10 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 11: `DaemonEvent::AccountChanged`. The linked identity was daemon state
+/// with no event, so it travelled only in the hello snapshot — and a window
+/// attached before pairing finished never learned whose account it was.
+///
 /// 10: the call state remembers the last call another of this account's
 /// devices handled. A front end writes a conversation's call record off the
 /// stage that disappeared, and "answered on the phone" and "nobody picked
@@ -52,7 +56,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

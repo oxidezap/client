@@ -176,6 +176,14 @@ impl WhatsAppApp {
 
     /// Start a call to the specified JID.
     pub fn start_call(&mut self, recipient_jid: String, is_video: bool, cx: &mut Context<Self>) {
+        // Offline is a read-only state, and the socket outlives it: the
+        // "call back" under a missed call reached the daemon from a window
+        // that had stopped waiting for a connection, and drew an outgoing
+        // call in a UI that says it is not connected.
+        if !self.can_send() {
+            warn!("Cannot start call: this window is offline");
+            return;
+        }
         let Some(client) = &self.client else {
             warn!("Cannot start call: client is unavailable");
             return;
@@ -271,34 +279,43 @@ impl WhatsAppApp {
         cx.notify();
     }
 
-    /// Hand the keyboard to a ringing call, and hand it back afterwards.
+    /// Hand the keyboard to whichever overlay should have it, and hand it
+    /// back when none should.
     ///
-    /// The card's Enter and Escape are scoped to its key context, so they
-    /// only fire while it holds focus — and nothing ever focused it, which
-    /// made "enter accepts · esc declines" a promise the window did not keep.
-    /// Only while it is *ringing*, though: an answered call is one people
-    /// type through, and a card that kept the caret would have taken the
-    /// composer away for the length of the conversation. That is also why
+    /// The card's Enter and Escape are scoped to its key context, and the
+    /// viewer's arrow keys to its own, so they only fire while something
+    /// focuses them — and nothing did, which made "enter accepts · esc
+    /// declines" a promise the window did not keep and left the viewer's
+    /// focus on a control that had stopped being rendered.
+    ///
+    /// A ringing call outranks the viewer: it is the more urgent of the two
+    /// and the shorter-lived. An *answered* call owns nothing, because a call
+    /// people talk through is a call they type through — which is also why
     /// mute is a window-wide chord rather than a card binding.
     ///
     /// Driven from the render pass because focusing needs a `Window` and the
     /// state it follows arrives from the daemon, which has none. It acts only
     /// on a change, so clicking into the composer while a phone rings does not
-    /// fight for the caret.
-    pub fn sync_call_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ringing = self
+    /// start a fight for the caret.
+    pub fn sync_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted = match self
             .call_state
             .stage()
             .filter(|stage| !matches!(stage, Stage::Active(_)))
-            .map(|stage| stage.call_id().to_string());
-        if ringing == self.call_keyboard {
+        {
+            Some(stage) => KeyboardOwner::RingingCall(stage.call_id().to_string()),
+            None if self.media_viewer.is_some() => KeyboardOwner::Viewer,
+            None => KeyboardOwner::Composer,
+        };
+        if wanted == self.keyboard_owner {
             return;
         }
-        match ringing {
-            Some(_) => window.focus(&self.call_focus, cx),
-            None => self.focus_composer(window, cx),
+        match &wanted {
+            KeyboardOwner::RingingCall(_) => window.focus(&self.call_focus, cx),
+            KeyboardOwner::Viewer => window.focus(&self.viewer_focus, cx),
+            KeyboardOwner::Composer => self.focus_composer(window, cx),
         }
-        self.call_keyboard = ringing;
+        self.keyboard_owner = wanted;
     }
 
     /// Put the names this window knows onto the calls the daemon sent.

@@ -41,12 +41,19 @@ impl ConversationSearch {
     }
 
     /// "3 of 12", or what to say instead.
+    ///
+    /// The empty answer names its horizon. A conversation holds the messages
+    /// this window has loaded — one page, unless the reader has asked for
+    /// more — while the store behind the daemon holds the rest and an FTS
+    /// index over it. "No matches" is a claim about the whole history that
+    /// this search is in no position to make; "in the loaded messages" is
+    /// what it actually looked at.
     pub fn status(&self) -> Option<String> {
         if self.query.is_empty() {
             return None;
         }
         if self.matches.is_empty() {
-            return Some("No matches".to_string());
+            return Some("No matches in the loaded messages".to_string());
         }
         Some(format!("{} of {}", self.current + 1, self.matches.len()))
     }
@@ -187,6 +194,9 @@ mod tests {
     fn a_query_nothing_answers_says_so() {
         let mut search = ConversationSearch::new("chat".into());
         search.refresh("receipt", &history());
-        assert_eq!(search.status().as_deref(), Some("No matches"));
+        assert_eq!(
+            search.status().as_deref(),
+            Some("No matches in the loaded messages")
+        );
     }
 }
