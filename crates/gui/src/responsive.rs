@@ -85,8 +85,8 @@ impl ResponsiveLayout {
     const MAX_MEDIA_SIZE_TABLET: f32 = 280.0;
     const MAX_MEDIA_SIZE_MOBILE_RATIO: f32 = 0.75;
 
-    /// Below this the header cannot hold its action row, so `Call` moves into
-    /// the overflow menu rather than disappearing.
+    /// Below this the header has no room for its action row, so the actions
+    /// move into the overflow menu rather than disappearing.
     const CALL_BUTTON_MIN_WIDTH: f32 = 400.0;
 
     pub fn new(viewport: Size<Pixels>, mobile_panel: MobilePanel, metrics: Metrics) -> Self {
@@ -147,8 +147,10 @@ impl ResponsiveLayout {
         self.is_mobile() && self.mobile_panel.is_chat()
     }
 
-    /// Whether the header has room for its call action as a button. Below
-    /// this it moves into the overflow menu — it is never simply dropped.
+    /// Whether the header has room to show its actions as buttons.
+    ///
+    /// Below this they are still reachable — the overflow menu carries every
+    /// one of them — so this decides presentation, never availability.
     pub fn show_call_buttons(&self) -> bool {
         self.viewport_width >= Self::CALL_BUTTON_MIN_WIDTH
     }

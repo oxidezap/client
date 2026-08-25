@@ -5,6 +5,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Disableable as _, Icon, IconName};
 
 use crate::app::WhatsAppApp;
@@ -169,7 +170,9 @@ fn render_actions(
     // alone would still offer calls to status/broadcast and newsletter rows.
     let callable = is_callable_user(&chat.jid);
     let call_jid = chat.jid.clone();
+    let overflow_jid = chat.jid.clone();
     let call_entity = entity.clone();
+    let overflow_entity = entity.clone();
     let search_entity = entity;
 
     let action = |id: &'static str, icon: Icon, tip: &'static str| {
@@ -186,16 +189,18 @@ fn render_actions(
         .flex_shrink_0()
         .items_center()
         .gap(metrics.space_xxs())
-        .child(
-            action(
-                "search-in-chat",
-                Icon::new(IconName::Search),
-                "Search in conversation",
+        .when(layout.show_call_buttons(), |el| {
+            el.child(
+                action(
+                    "search-in-chat",
+                    Icon::new(IconName::Search),
+                    "Search in conversation",
+                )
+                .on_click(move |_, window, cx| {
+                    search_entity.update(cx, |app, cx| app.focus_search(window, cx));
+                }),
             )
-            .on_click(move |_, window, cx| {
-                search_entity.update(cx, |app, cx| app.focus_search(window, cx));
-            }),
-        )
+        })
         .when(callable && layout.show_call_buttons(), |el| {
             el.child(
                 action("voice-call", ProductIcon::Phone.into(), "Voice call").on_click(
@@ -218,11 +223,68 @@ fn render_actions(
                 .disabled(true),
             )
         })
-        .child(action(
-            "chat-menu",
-            Icon::new(IconName::EllipsisVertical),
-            "More",
+        .child(render_overflow_menu(
+            callable,
+            overflow_jid,
+            overflow_entity,
+            layout,
         ))
+}
+
+/// Everything the header can do, whether or not it has room to show it.
+///
+/// The menu is not a leftovers drawer: it carries every action the toolbar
+/// does, so narrowing the window changes where a command lives and never
+/// whether it exists. Below the breakpoint this is the only route to them,
+/// which is exactly why it cannot be a subset.
+fn render_overflow_menu(
+    callable: bool,
+    jid: String,
+    entity: Entity<WhatsAppApp>,
+    layout: ResponsiveLayout,
+) -> impl IntoElement + use<> {
+    let search_entity = entity.clone();
+    let call_entity = entity;
+
+    Button::new("chat-menu")
+        .icon(Icon::new(IconName::EllipsisVertical))
+        .ghost()
+        .tooltip("More")
+        .w(layout.icon_button_size())
+        .h(layout.icon_button_size())
+        .dropdown_menu(move |menu, _window, _cx| {
+            let search_entity = search_entity.clone();
+            let call_entity = call_entity.clone();
+            let jid = jid.clone();
+
+            let menu = menu.item(
+                PopupMenuItem::new("Search in conversation")
+                    .icon(IconName::Search)
+                    .on_click(move |_, window, cx| {
+                        search_entity.update(cx, |app, cx| app.focus_search(window, cx));
+                    }),
+            );
+
+            if !callable {
+                return menu;
+            }
+            menu.separator()
+                .item(
+                    PopupMenuItem::new("Voice call")
+                        .icon(Icon::from(ProductIcon::Phone))
+                        .on_click(move |_, _window, cx| {
+                            call_entity
+                                .update(cx, |app, cx| app.start_call(jid.clone(), false, cx));
+                        }),
+                )
+                // Present and disabled for the same reason as in the toolbar:
+                // the shape of the menu should not change the day video lands.
+                .item(
+                    PopupMenuItem::new("Video call")
+                        .icon(Icon::from(ProductIcon::Video))
+                        .disabled(true),
+                )
+        })
 }
 
 #[cfg(test)]

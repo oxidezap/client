@@ -213,52 +213,47 @@ fn render_rows(
             .collect(),
     );
 
-    div()
-        .flex_1()
-        .min_h_0()
-        .overflow_hidden()
-        .relative()
-        .map(|el| {
-            if rows.is_empty() {
-                el.child(render_empty(props, entity, metrics, cx))
-            } else {
-                let entity_for_rows = entity.clone();
-                el.child(
-                    v_virtual_list(entity, "chat-list", item_sizes, {
-                        move |_view, visible_range, _scroll_handle, cx| {
-                            visible_range
-                                .map(|ix| {
-                                    let row = rows[ix].clone();
-                                    let is_selected = selected.as_deref() == Some(row.jid.as_str());
-                                    div()
-                                        .pb(metrics.chat_row_gap())
-                                        .px(metrics.space_md())
-                                        .child(render_chat_item(
-                                            row,
-                                            is_selected,
-                                            entity_for_rows.clone(),
-                                            layout,
-                                            cx,
-                                        ))
-                                })
-                                .collect()
-                        }
-                    })
-                    .track_scroll(scroll_handle)
-                    .size_full(),
-                )
-                // The scrollbar belongs to the region that scrolls and sits at
-                // its trailing edge, not inside the rows' padding.
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
-                        .child(Scrollbar::vertical(scroll_handle)),
-                )
-            }
-        })
+    div().size_full().overflow_hidden().relative().map(|el| {
+        if rows.is_empty() {
+            el.child(render_empty(props, entity, metrics, cx))
+        } else {
+            let entity_for_rows = entity.clone();
+            el.child(
+                v_virtual_list(entity, "chat-list", item_sizes, {
+                    move |_view, visible_range, _scroll_handle, cx| {
+                        visible_range
+                            .map(|ix| {
+                                let row = rows[ix].clone();
+                                let is_selected = selected.as_deref() == Some(row.jid.as_str());
+                                div()
+                                    .pb(metrics.chat_row_gap())
+                                    .px(metrics.space_md())
+                                    .child(render_chat_item(
+                                        row,
+                                        is_selected,
+                                        entity_for_rows.clone(),
+                                        layout,
+                                        cx,
+                                    ))
+                            })
+                            .collect()
+                    }
+                })
+                .track_scroll(scroll_handle)
+                .size_full(),
+            )
+            // The scrollbar belongs to the region that scrolls and sits at
+            // its trailing edge, not inside the rows' padding.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .child(Scrollbar::vertical(scroll_handle)),
+            )
+        }
+    })
 }
 
 /// An empty list means different things depending on why it is empty, and the
