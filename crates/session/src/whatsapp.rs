@@ -25,6 +25,7 @@ use oxidezap_core::{
     MediaType, MessageStatus, SystemNotice, UiEvent, fallback_chat_name,
 };
 
+use crate::names::NameBook;
 use crate::quoting::quoted_from;
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
@@ -408,9 +409,15 @@ impl WhatsAppClient {
         }
         info!("SQLite backend + chat store initialized.");
 
+        // One book for the whole session, so a live bubble, the row it lands
+        // in and the typing line above it are all naming the same person from
+        // the same answer.
+        let names = Arc::new(NameBook::new(chat_store_handle.clone()));
+
         let ui_tx_clone = ui_tx.clone();
         let calls_clone = calls.clone();
         let ui_sender_clone = ui_sender.clone();
+        let names_clone = names.clone();
 
         // Transport, HTTP client and runtime come from the default cargo
         // features (Tokio WebSocket, ureq, Tokio).
@@ -420,8 +427,9 @@ impl WhatsAppClient {
                 let ui_tx = ui_tx_clone.clone();
                 let calls = calls_clone.clone();
                 let ui_sender = ui_sender_clone.clone();
+                let names = names_clone.clone();
                 async move {
-                    Self::handle_event(event, client, ui_tx, calls, ui_sender).await;
+                    Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
                 }
             })
             .build()
@@ -438,7 +446,7 @@ impl WhatsAppClient {
         // Hydrate the UI from durable history before the network is even up
         // (bot.run() is what connects). The client is needed here so hydrated
         // JIDs normalize through the same PN->LID mapping live events use.
-        match Self::load_history(&chat_store, &bot.client()).await {
+        match Self::load_history(&chat_store, &bot.client(), &names).await {
             Ok((chats, complete)) if !chats.is_empty() => {
                 // The one hydration worth an info line: the reloads that
                 // follow are routine and say so at debug.
@@ -467,6 +475,7 @@ impl WhatsAppClient {
             &bot,
             &ui_tx,
             reload,
+            names,
         );
 
         // Store client reference for UI to use
@@ -501,6 +510,7 @@ impl WhatsAppClient {
         ui_tx: mpsc::UnboundedSender<UiEvent>,
         calls: CallRegistry,
         ui_sender: UiEventSender,
+        names: Arc<NameBook>,
     ) {
         match &*event {
             Event::PairingQrCode(qr) => {
@@ -607,8 +617,14 @@ impl WhatsAppClient {
             }
             Event::Messages(batch) => {
                 for inbound in batch.iter() {
-                    Self::handle_inbound_message(&inbound.message, &inbound.info, &client, &ui_tx)
-                        .await;
+                    Self::handle_inbound_message(
+                        &inbound.message,
+                        &inbound.info,
+                        &client,
+                        &ui_tx,
+                        &names,
+                    )
+                    .await;
                 }
             }
             Event::Receipt(receipt) => {
@@ -655,10 +671,19 @@ impl WhatsAppClient {
                     WaChatPresence::Paused => None,
                 };
                 let chat_jid = normalize_chat_jid(&client, &update.source.chat.to_string()).await;
+                let sender = update.source.sender.clone();
+                // Named here rather than left to the front end: the typing
+                // line sits directly under this person's bubbles, and a name
+                // picked by a different rule is the same person twice.
+                let sender_name = match composing {
+                    Some(_) => names.known(&client, &sender, None).await,
+                    // Nobody draws the name of someone who stopped.
+                    None => None,
+                };
                 let _ = ui_tx.send(UiEvent::ChatPresence {
                     chat_jid,
-                    sender_jid: update.source.sender.to_string(),
-                    sender_name: None,
+                    sender_jid: sender.to_string(),
+                    sender_name,
                     composing,
                 });
             }
@@ -720,6 +745,7 @@ impl WhatsAppClient {
         info: &whatsapp_rust::wacore::types::message::MessageInfo,
         client: &Arc<Client>,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
+        names: &NameBook,
     ) {
         // Use MessageExt to unwrap ephemeral/device_sent/view_once wrappers
         let base_msg = msg.get_base_message();
@@ -807,7 +833,22 @@ impl WhatsAppClient {
         // appear as two chats when messages come from PN vs LID.
         let normalized_chat_jid = normalize_chat_jid(client, &info.source.chat.to_string()).await;
 
-        let sender_name = (!info.push_name.is_empty()).then(|| info.push_name.clone());
+        // The push name is what the sender calls themselves; the address
+        // book is what this account's owner calls them, and that is the one
+        // the phone shows. Resolving here rather than shipping the raw push
+        // name is what stops one person appearing as two — the reloaded
+        // bubble under the name you saved, the live one under theirs.
+        let sender_name = if info.source.is_from_me {
+            None
+        } else {
+            names
+                .known(
+                    client,
+                    &info.source.sender,
+                    Some(info.push_name.as_str()).filter(|name| !name.is_empty()),
+                )
+                .await
+        };
 
         let _ = ui_tx.send(UiEvent::MessageReceived {
             chat_jid: normalized_chat_jid,
@@ -1823,6 +1864,7 @@ impl WhatsAppClient {
         bot: &Bot,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
         reload: Arc<tokio::sync::Notify>,
+        names: Arc<NameBook>,
     ) {
         use tokio::sync::broadcast::error::RecvError;
 
@@ -1867,7 +1909,7 @@ impl WhatsAppClient {
                 // elsewhere must clear the list here too. An empty narrowed
                 // one names nothing the list shows (an archived chat, or one
                 // past the window) and has nothing to say.
-                match Self::load_history_scoped(&chat_store, &client, scope.chats()).await {
+                match Self::load_history_scoped(&chat_store, &client, scope.chats(), &names).await {
                     Ok((chats, complete)) if chats.is_empty() && !complete => {}
                     Ok((chats, complete)) => {
                         if ui_tx
@@ -1892,8 +1934,9 @@ impl WhatsAppClient {
     async fn load_history(
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
+        names: &NameBook,
     ) -> Result<(Vec<oxidezap_core::Chat>, bool), oxidezap_chat_store::ChatStoreError> {
-        Self::load_history_scoped(chat_store, client, None).await
+        Self::load_history_scoped(chat_store, client, None, names).await
     }
 
     /// [`load_history`](Self::load_history), restricted to the chats `only`
@@ -1909,36 +1952,35 @@ impl WhatsAppClient {
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
         only: Option<&HashSet<String>>,
+        names: &NameBook,
     ) -> Result<(Vec<oxidezap_core::Chat>, bool), oxidezap_chat_store::ChatStoreError> {
+        // A whole-list load is the pass that re-reads the address book, so it
+        // is the one that drops what the book remembers: a contact renamed on
+        // the phone appears under its new name without a restart, and the
+        // scoped loads in between — which run per receipt — still pay nothing.
+        if only.is_none() {
+            names.forget();
+        }
         let mut entries = chat_store.chats(false, Self::HISTORY_CHAT_LIMIT).await?;
         // A narrowed load says nothing about the chats it left out, so it is
         // never the whole display list and must never drive the UI's prune.
         let complete = only.is_none() && (entries.len() as i64) < Self::HISTORY_CHAT_LIMIT;
         if let Some(only) = only {
-            let wanted = Self::alias_closure(client, &entries, only).await;
+            let wanted = Self::alias_closure(client, &entries, only, names).await;
             entries.retain(|entry| wanted.contains(&entry.jid.to_non_ad_string()));
         }
         let mut chats: Vec<oxidezap_core::Chat> = Vec::with_capacity(entries.len());
-        let mut contact_names: HashMap<String, Option<String>> = HashMap::new();
-        // Sender-name lookups memoized across the whole load: group pages
-        // repeat the same handful of senders many times over.
-        let mut sender_names: HashMap<String, Option<String>> = HashMap::new();
         for entry in entries {
             // Same PN->LID mapping live events go through, or the restored
             // chat and the next live message split into two conversations.
             // A PN/LID pair of stored rows collapses into one chat: the most
             // recently active row (entries arrive in display order) keeps the
             // metadata, the older row's messages merge in.
-            let identity = history_chat_identity(client, &entry.jid).await;
-            let (name, name_priority) = resolve_history_chat_name(
-                chat_store,
-                &entry.jid,
-                entry.name.as_deref(),
-                &identity,
-                &mut contact_names,
-            )
-            .await;
-            let jid_str = identity.canonical_jid;
+            let identity = names.identity(client, &entry.jid).await;
+            let (name, name_priority) = names
+                .resolve(chat_store, &entry.jid, entry.name.as_deref(), &identity)
+                .await;
+            let jid_str = identity.canonical_jid.clone();
             if let Some(existing) = chats.iter_mut().find(|c| c.jid == jid_str) {
                 let mut page = chat_store
                     .messages(&entry.jid, None, Self::HISTORY_MESSAGES_PER_CHAT)
@@ -1950,8 +1992,7 @@ impl WhatsAppClient {
                 // Groups *and* the status broadcast: both carry rows written
                 // by many people, and a hydrated row has no push name on it.
                 if existing.is_group || existing.is_status {
-                    Self::hydrate_sender_names(chat_store, client, &mut msgs, &mut sender_names)
-                        .await;
+                    Self::hydrate_sender_names(chat_store, client, &mut msgs, names).await;
                 }
                 // Each alias still needs its unread tail marked for receipts,
                 // but PN/LID counters describe the same logical chat.
@@ -1986,13 +2027,7 @@ impl WhatsAppClient {
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_reactions(chat_store, &entry.jid, &mut chat.messages).await;
             if chat.is_group || chat.is_status {
-                Self::hydrate_sender_names(
-                    chat_store,
-                    client,
-                    &mut chat.messages,
-                    &mut sender_names,
-                )
-                .await;
+                Self::hydrate_sender_names(chat_store, client, &mut chat.messages, names).await;
             }
             // The newest `unread_count` incoming messages are the unread ones;
             // select_chat only sends read receipts for !is_read, so hydrated
@@ -2025,14 +2060,15 @@ impl WhatsAppClient {
         client: &Arc<Client>,
         entries: &[ChatEntry],
         only: &HashSet<String>,
+        names: &NameBook,
     ) -> HashSet<String> {
         let mut wanted = only.clone();
         for entry in entries {
             if !only.contains(&entry.jid.to_non_ad_string()) {
                 continue;
             }
-            let identity = history_chat_identity(client, &entry.jid).await;
-            wanted.insert(identity.canonical_jid);
+            let identity = names.identity(client, &entry.jid).await;
+            wanted.insert(identity.canonical_jid.clone());
             wanted.extend(identity.contact_jids.iter().map(Jid::to_string));
         }
         wanted
@@ -2066,36 +2102,28 @@ impl WhatsAppClient {
         }
     }
 
-    /// Group bubbles label their sender, but hydrated rows don't carry the
-    /// push name the live path attaches; resolve it from the contacts table.
-    /// `cache` memoizes per sender JID (misses included) so a page never pays
-    /// more than one query per unique sender. Best-effort like reactions: a
-    /// failed lookup logs and the bubble falls back to the JID label.
+    /// Group bubbles label their sender, but a hydrated row carries no push
+    /// name; the book answers from the same order the live path uses, so a
+    /// reloaded bubble and the one that arrived a moment ago agree.
+    ///
+    /// A group page names the same handful of people over and over and the
+    /// book memoizes per JID, so a page costs one lookup per unique sender
+    /// rather than one per row.
     async fn hydrate_sender_names(
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
         msgs: &mut [ChatMessage],
-        cache: &mut HashMap<String, Option<String>>,
+        names: &NameBook,
     ) {
         for msg in msgs.iter_mut() {
             if msg.is_from_me || msg.sender_name.is_some() {
                 continue;
             }
-            if !cache.contains_key(&msg.sender) {
-                let name = match msg.sender.parse::<Jid>() {
-                    Ok(jid) => {
-                        let identity = history_chat_identity(client, &jid).await;
-                        Some(
-                            resolve_history_chat_name(chat_store, &jid, None, &identity, cache)
-                                .await
-                                .0,
-                        )
-                    }
-                    Err(_) => None,
-                };
-                cache.insert(msg.sender.clone(), name);
-            }
-            msg.sender_name = cache.get(&msg.sender).cloned().flatten();
+            let Ok(jid) = msg.sender.parse::<Jid>() else {
+                continue;
+            };
+            let identity = names.identity(client, &jid).await;
+            msg.sender_name = Some(names.resolve(chat_store, &jid, None, &identity).await.0);
         }
     }
 }
@@ -2533,90 +2561,6 @@ impl ReloadScope {
     }
 }
 
-struct HistoryChatIdentity {
-    canonical_jid: String,
-    contact_jids: Vec<Jid>,
-    fallback_name: String,
-    has_phone: bool,
-}
-
-async fn history_chat_identity(client: &Client, jid: &Jid) -> HistoryChatIdentity {
-    let source = jid.to_non_ad();
-    let mut canonical = source.clone();
-    let mut contact_jids = vec![source.clone()];
-    let mut fallback_jid = source.clone();
-    let mut has_phone = source.is_pn();
-
-    if let Ok(Some(mapping)) = client.get_lid_pn_entry(&source).await {
-        let pn = Jid::pn(mapping.phone_number.as_ref());
-        let lid = Jid::lid(mapping.lid.as_ref());
-        canonical = lid.clone();
-        fallback_jid = pn.clone();
-        has_phone = true;
-        // Address-book names are normally PN-keyed; push names may be LID-keyed.
-        contact_jids = vec![pn, lid];
-    }
-
-    HistoryChatIdentity {
-        canonical_jid: canonical.to_string(),
-        contact_jids,
-        fallback_name: fallback_chat_name(&fallback_jid),
-        has_phone,
-    }
-}
-
-fn is_masked_phone_label(name: &str) -> bool {
-    name.starts_with('+')
-        && name
-            .chars()
-            .filter(|c| matches!(c, '\u{00b7}' | '\u{2022}' | '\u{2219}'))
-            .count()
-            >= 2
-}
-
-async fn resolve_history_chat_name(
-    chat_store: &ChatStore,
-    source_jid: &Jid,
-    history_name: Option<&str>,
-    identity: &HistoryChatIdentity,
-    cache: &mut HashMap<String, Option<String>>,
-) -> (String, u8) {
-    let usable_name = |name: &&str| {
-        !(name.trim().is_empty() || identity.has_phone && is_masked_phone_label(name))
-    };
-    let history_name = history_name.filter(usable_name);
-
-    if source_jid.is_pn() || source_jid.is_lid() {
-        for candidate in &identity.contact_jids {
-            let key = candidate.to_string();
-            let cached = if let Some(name) = cache.get(&key) {
-                name.clone()
-            } else {
-                let name = chat_store
-                    .contact(candidate)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|contact| contact.display_name().map(str::to_owned));
-                cache.insert(key, name.clone());
-                name
-            };
-            if let Some(name) = cached
-                .filter(|name| !name.trim().is_empty())
-                .filter(|name| !(identity.has_phone && is_masked_phone_label(name)))
-            {
-                return (name, 3);
-            }
-        }
-    }
-
-    if let Some(name) = history_name {
-        return (name.to_string(), 1);
-    }
-
-    (identity.fallback_name.clone(), 0)
-}
-
 /// Map a PN chat JID to its LID form when a mapping is known, so the same user
 /// doesn't split into two chats (PN vs LID addressing).
 async fn normalize_chat_jid(client: &Client, jid_str: &str) -> String {
@@ -2645,8 +2589,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ChatStore, Client, ReadBoundary, ReloadScope, SqliteStore, StoreChange, WhatsAppClient,
-        is_masked_phone_label, media_metadata, merge_alias_history_messages, read_message_range,
+        ChatStore, Client, NameBook, ReadBoundary, ReloadScope, SqliteStore, StoreChange,
+        WhatsAppClient, media_metadata, merge_alias_history_messages, read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
     use std::sync::Arc;
@@ -2654,6 +2598,12 @@ mod tests {
     use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
     use whatsapp_rust::wacore_binary::Jid;
     use whatsapp_rust::waproto::whatsapp as wa;
+
+    /// A name book with nothing behind its handle: the history paths hand the
+    /// store in with every call, and only the live paths read it from there.
+    fn book() -> NameBook {
+        NameBook::new(Arc::new(super::Mutex::new(None)))
+    }
 
     /// A store-hydrated chat list must label a photo the way the live path
     /// does. The store's preview column holds the newest message's TEXT, and a
@@ -2673,7 +2623,7 @@ mod tests {
         };
         feed(&chat_store, incoming(photo, "MSG-IMG", 1_700_000_000)).await;
 
-        let (chats, complete) = WhatsAppClient::load_history(&chat_store, &client)
+        let (chats, complete) = WhatsAppClient::load_history(&chat_store, &client, &book())
             .await
             .expect("history loads");
         assert!(complete);
@@ -2704,7 +2654,7 @@ mod tests {
         };
         feed(&chat_store, incoming(revoke, "MSG-R2", 1_700_000_010)).await;
 
-        let (chats, _) = WhatsAppClient::load_history(&chat_store, &client)
+        let (chats, _) = WhatsAppClient::load_history(&chat_store, &client, &book())
             .await
             .expect("history loads");
         assert_eq!(chats[0].last_message.as_deref(), Some("[Message deleted]"));
@@ -2720,7 +2670,7 @@ mod tests {
         )
         .await;
 
-        let (chats, _) = WhatsAppClient::load_history(&chat_store, &client)
+        let (chats, _) = WhatsAppClient::load_history(&chat_store, &client, &book())
             .await
             .expect("history loads");
         assert_eq!(chats[0].last_message.as_deref(), Some("bom dia"));
@@ -2837,14 +2787,6 @@ mod tests {
         assert_eq!(fallback_chat_name(&lid), "Unknown contact");
         assert_eq!(fallback_chat_name(&pn), "+12025550143");
         assert_eq!(fallback_chat_name(&group), "Unnamed group");
-    }
-
-    #[test]
-    fn detects_server_masked_phone_labels() {
-        assert!(is_masked_phone_label("+55\u{2219}\u{2219}\u{2219}00"));
-        assert!(is_masked_phone_label("+234\u{2022}\u{2022}\u{2022}64"));
-        assert!(!is_masked_phone_label("+12025550143"));
-        assert!(!is_masked_phone_label("Fictitious Contact"));
     }
 
     #[test]

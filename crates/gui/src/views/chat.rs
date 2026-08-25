@@ -105,15 +105,13 @@ pub fn render_connected_view(
         let author = if message.is_from_me {
             SharedString::from("You")
         } else {
-            message
-                .sender_name
-                .clone()
-                .or_else(|| {
-                    selected_chat
-                        .as_ref()
-                        .and_then(|chat| chat.participants.get(&message.sender).cloned())
+            selected_chat
+                .as_ref()
+                .and_then(|chat| {
+                    chat.author_name(&message)
+                        .map(str::to_owned)
+                        .or_else(|| Some(chat.name.clone()))
                 })
-                .or_else(|| selected_chat.as_ref().map(|chat| chat.name.clone()))
                 .unwrap_or_else(|| "Unknown contact".to_string())
                 .into()
         };

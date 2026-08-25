@@ -4,6 +4,7 @@
 //! keeping the async/network logic separate from the UI.
 
 mod group_notice;
+mod names;
 mod quoting;
 mod whatsapp;
 

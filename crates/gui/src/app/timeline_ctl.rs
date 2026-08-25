@@ -50,10 +50,8 @@ impl WhatsAppApp {
         let sender_name = if message.is_from_me {
             "You".to_string()
         } else {
-            message
-                .sender_name
-                .clone()
-                .or_else(|| chat.participants.get(&message.sender).cloned())
+            chat.author_name(message)
+                .map(str::to_owned)
                 .unwrap_or_else(|| chat.name.clone())
         };
         let preview = if message.content.is_empty() {

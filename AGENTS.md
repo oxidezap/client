@@ -120,6 +120,17 @@ profile here repeats it deliberately.
   received two messages in one second — permanently, since asking again
   produced the same id. Membership in the boundary second is the test, and
   either half of a burst is an honest claim to have seen it.
+- **A person has one name, and one place decides it.** WhatsApp answers "who
+  is this" three ways — the synced address book, the push name the sender
+  chose, the number — and the live path used to ship the push name while a
+  hydrated row resolved the address book, so the same participant was one
+  name on their bubbles and another on the typing line above them.
+  `session/names.rs` is that choice made once, in one order, for live
+  messages, chat presence and hydration alike; `Chat::update_participant` is
+  the one place a name enters a conversation and writes it onto the rows that
+  were waiting for it, and `Chat::author_name` is what every surface asks. A
+  full history load is what re-reads the address book, so it is also what
+  clears the book's memo.
 - **The chat store's writer queue is ordered on purpose.** Anything that
   targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row

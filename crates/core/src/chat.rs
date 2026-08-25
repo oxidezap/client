@@ -608,12 +608,16 @@ impl Chat {
         }
     }
 
-    /// Update a participant's display name (for group chats)
+    /// Learn what to call a participant, and say it everywhere this chat
+    /// already names them.
     ///
-    /// Back-fills the quotes that named this participant and had nobody to
-    /// name: a reply can arrive before the push name that explains who it is
-    /// answering, and the quote bar would otherwise keep saying "Message"
-    /// for the rest of the session.
+    /// The one place a name enters a conversation, which is what keeps the
+    /// bubble, the quote bar above it and the row in the list from drifting
+    /// apart: a name that arrives late is written onto the rows that were
+    /// waiting for it rather than left to whichever surface happens to
+    /// consult the participant map. Both back-fills only fill blanks — a row
+    /// that already carries a name was named by the same resolver and is not
+    /// improved by a second answer.
     pub fn update_participant(&mut self, jid: String, name: String) {
         for message in &mut self.messages {
             if let Some(quoted) = message.quoted.as_mut()
@@ -622,8 +626,30 @@ impl Chat {
             {
                 quoted.sender_name.clone_from(&name);
             }
+            if message.sender_name.is_none() && !message.is_from_me && message.sender == jid {
+                message.sender_name = Some(name.clone());
+            }
         }
         self.participants.insert(jid, name);
+    }
+
+    /// What to call whoever wrote `message`, in this chat.
+    ///
+    /// Every surface that names an author asks this, so a bubble, the list's
+    /// preview prefix and a reply bar cannot answer differently: the name the
+    /// message arrived under, then the participant map, and `None` when
+    /// nobody here knows. What to draw instead of `None` is the caller's —
+    /// the list says nothing, the reply bar names the chat.
+    pub fn author_name<'a>(&'a self, message: &'a ChatMessage) -> Option<&'a str> {
+        message
+            .sender_name
+            .as_deref()
+            .or_else(|| self.participant_name(&message.sender))
+    }
+
+    /// What this chat calls whoever is at `jid`, if it knows.
+    pub fn participant_name(&self, jid: &str) -> Option<&str> {
+        self.participants.get(jid).map(String::as_str)
     }
 
     /// Give a reply's quote bar the name of whoever it is answering.
@@ -663,8 +689,8 @@ impl Chat {
         if quoted.sender.is_empty() {
             return;
         }
-        if let Some(name) = self.participants.get(&quoted.sender) {
-            quoted.sender_name.clone_from(name);
+        if let Some(name) = self.participant_name(&quoted.sender) {
+            quoted.sender_name = name.to_string();
         } else if !self.is_group {
             quoted.sender_name = self.name.clone();
         } else if let Ok(jid) = quoted.sender.parse::<Jid>() {
@@ -672,16 +698,6 @@ impl Chat {
             // real name replaces it as soon as a push name arrives.
             quoted.sender_name = fallback_chat_name(&jid);
         }
-    }
-
-    /// Get a participant's display name, with fallback to JID prefix
-    #[allow(dead_code)]
-    pub fn get_participant_name(&self, jid: &str) -> String {
-        self.participants.get(jid).cloned().unwrap_or_else(|| {
-            jid.parse::<Jid>()
-                .map(|jid| fallback_chat_name(&jid))
-                .unwrap_or_else(|_| "Unknown contact".to_string())
-        })
     }
 
     /// Add a message to the chat, maintaining chronological order by timestamp.
@@ -969,6 +985,57 @@ mod tests {
             message.status = status;
             assert_eq!(message.delivery_in(true), Some(status), "for {status:?}");
         }
+    }
+
+    /// One person, one name. The bug: the same participant was "Eu" on their
+    /// bubbles and "jlucaso" in the typing line, because the two surfaces
+    /// asked different sources. Everything that names an author asks here.
+    #[test]
+    fn every_surface_names_an_author_the_same_way() {
+        let mut chat = Chat::new("120363000000000001@g.us".to_string());
+        chat.is_group = true;
+
+        let mut named = ChatMessage::new_incoming("m1".into(), "a@lid".into(), "ping".into());
+        named.sender_name = Some("Eu".into());
+        let anonymous = ChatMessage::new_incoming("m2".into(), "a@lid".into(), "pong".into());
+
+        assert_eq!(chat.author_name(&named), Some("Eu"));
+        assert_eq!(chat.author_name(&anonymous), None, "nobody here knows yet");
+
+        chat.update_participant("a@lid".into(), "Eu".into());
+        assert_eq!(chat.author_name(&anonymous), Some("Eu"));
+        assert_eq!(chat.participant_name("a@lid"), Some("Eu"));
+        assert_eq!(chat.participant_name("b@lid"), None);
+    }
+
+    /// A name that arrives after the rows it belongs to is written onto them,
+    /// so a bubble and the list row above it cannot disagree about who spoke.
+    #[test]
+    fn a_name_learned_late_reaches_the_rows_that_were_waiting() {
+        let mut chat = Chat::new("120363000000000001@g.us".to_string());
+        chat.is_group = true;
+        chat.add_message(ChatMessage::new_incoming(
+            "m1".into(),
+            "a@lid".into(),
+            "ping".into(),
+        ));
+        let mut theirs = ChatMessage::new_incoming("m2".into(), "b@lid".into(), "pong".into());
+        theirs.sender_name = Some("Ana".into());
+        chat.add_message(theirs);
+        chat.add_message(ChatMessage::new_outgoing("m3".into(), "ok".into()));
+
+        chat.update_participant("a@lid".into(), "Eu".into());
+
+        assert_eq!(chat.messages[0].sender_name.as_deref(), Some("Eu"));
+        assert_eq!(
+            chat.messages[1].sender_name.as_deref(),
+            Some("Ana"),
+            "somebody else's row is not touched"
+        );
+        assert_eq!(
+            chat.messages[2].sender_name, None,
+            "your own row is named by the reader, not by the map"
+        );
     }
 
     /// Their message in your own chat is not yours to have ticks on at all.

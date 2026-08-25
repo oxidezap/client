@@ -1798,13 +1798,16 @@ impl WhatsAppApp {
     ) {
         match composing {
             Some(kind) => {
-                // The push name is the best label, but a group's participant
-                // map usually knows the person better, and the JID is the
+                // The session resolved this name the same way it resolves the
+                // one on their bubbles, so the typing line under them says
+                // the same thing. The rest is memory of earlier answers, for
+                // an event that arrived without one, and the JID is the
                 // honest last resort.
                 let name = sender_name
                     .or_else(|| {
                         self.find_chat(&chat_jid)
-                            .and_then(|chat| chat.participants.get(&sender_jid).cloned())
+                            .and_then(|chat| chat.participant_name(&sender_jid))
+                            .map(str::to_owned)
                     })
                     .or_else(|| self.name_cache.get(&sender_jid).cloned())
                     .unwrap_or_else(|| sender_jid.clone());

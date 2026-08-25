@@ -172,10 +172,7 @@ fn prefix_for(chat: &Chat, last: &ChatMessage) -> Option<String> {
     if !chat.is_group {
         return None;
     }
-    last.sender_name
-        .clone()
-        .or_else(|| chat.participants.get(&last.sender).cloned())
-        .map(|name| single_line(&name))
+    chat.author_name(last).map(single_line)
 }
 
 /// The preview text: a caption if there is one, otherwise the media's name.
