@@ -157,6 +157,12 @@ impl WaitingCall {
     pub fn call_mut(&mut self) -> &mut IncomingCall {
         &mut self.call
     }
+
+    /// The offer, for a caller that is done with the wrapper — writing the
+    /// refusal down needs the whole thing, not a name and an id.
+    pub fn into_call(self) -> IncomingCall {
+        self.call
+    }
 }
 
 /// What became of an offer handed to [`CallState::set_incoming`].

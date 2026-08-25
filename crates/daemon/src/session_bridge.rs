@@ -801,12 +801,26 @@ impl Bridge {
                 if !message.is_from_me && !message.is_read {
                     summary.unread = summary.unread.saturating_add(1);
                 }
-                summary.last_message = Some(MessagePreview {
-                    id: Some(message.id.clone()),
-                    text: message.content.clone(),
-                    from_me: message.is_from_me,
-                    timestamp_ms: message.timestamp.timestamp_millis(),
+                // Only when it really is the newest. Live messages are not
+                // ordered: history decryption and offline catch-up deliver
+                // out of order, and moving the preview *backwards* onto an
+                // older message put the daemon's boundary behind what every
+                // client holds — after which a bounded read named a message
+                // outside it and was refused until a store reload repaired
+                // the summary. Ties by id, so a same-second sibling is
+                // settled the same way on both sides.
+                let arrival = (message.timestamp.timestamp_millis(), message.id.as_str());
+                let newer = summary.last_message.as_ref().is_none_or(|current| {
+                    arrival >= (current.timestamp_ms, current.id.as_deref().unwrap_or(""))
                 });
+                if newer {
+                    summary.last_message = Some(MessagePreview {
+                        id: Some(message.id.clone()),
+                        text: message.content.clone(),
+                        from_me: message.is_from_me,
+                        timestamp_ms: message.timestamp.timestamp_millis(),
+                    });
+                }
                 // Live, not from the store: a chat first seen here has no row
                 // yet, and a complete reload that omits it is not evidence it
                 // was deleted. See `StateHub::store_backed_chat_jids`.
@@ -1598,6 +1612,33 @@ mod tests {
         assert!(bridge.hub.call_state().incoming().is_none());
     }
 
+    /// Live messages are not ordered: history decryption and offline catch-up
+    /// deliver out of order. Moving the preview backwards onto an older
+    /// message put the daemon's boundary behind what every client held, and
+    /// the bounded read was refused until a store reload repaired it.
+    #[test]
+    fn an_out_of_order_arrival_does_not_move_the_preview_backwards() {
+        let mut bridge = bridge();
+        bridge.observe(received(
+            "1@s.whatsapp.net",
+            message("newest", "1@s.whatsapp.net", 30, false, false),
+            None,
+        ));
+        bridge.observe(received(
+            "1@s.whatsapp.net",
+            message("late", "1@s.whatsapp.net", 10, false, false),
+            None,
+        ));
+
+        let summary = bridge.hub.chat("1@s.whatsapp.net").unwrap();
+        assert_eq!(
+            summary.last_message.and_then(|m| m.id).as_deref(),
+            Some("newest"),
+            "an older arrival is still news, but it is not the preview"
+        );
+        assert_eq!(summary.unread, 2, "both are unread all the same");
+    }
+
     /// There is one waiting slot. A third offer has nowhere to go, and no
     /// front end can be asked to refuse a caller it was never told about — so
     /// the daemon, which owns the session, answers the session itself.
@@ -1792,15 +1833,16 @@ mod tests {
                 None,
             ));
         }
-        // Arrival order put `ping` last; `(timestamp, id)` order puts `pong`
-        // there. Neither side is behind the other.
+        // Both are at the same second, so the preview keeps whichever the
+        // tie-break puts last — and a front end sorting its own messages can
+        // land on either. Neither side is behind the other.
         let daemon_newest = bridge
             .hub
             .chat("1@s.whatsapp.net")
             .unwrap()
             .last_message
             .and_then(|m| m.id);
-        assert_eq!(daemon_newest.as_deref(), Some("ping"));
+        assert_eq!(daemon_newest.as_deref(), Some("pong"));
 
         assert!(
             bridge.read_plan("1@s.whatsapp.net", Some("pong")).is_ok(),

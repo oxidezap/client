@@ -1294,7 +1294,7 @@ impl WhatsAppApp {
             .filter(|c| c.unread_count > 0 || c.manually_unread)
         {
             info!("Marking {} read", observe_str(&jid));
-            let newest = chat.messages.last().map(|m| m.id.clone());
+            let newest = newest_shared_message(chat);
             if let Some(client) = &self.client {
                 client.mark_chat_read(&jid, newest);
             }
@@ -1722,9 +1722,7 @@ impl WhatsAppApp {
         }
 
         if read_now {
-            let newest = self
-                .find_chat(&chat_jid)
-                .and_then(|chat| chat.messages.last().map(|m| m.id.clone()));
+            let newest = self.find_chat(&chat_jid).and_then(newest_shared_message);
             if let Some(client) = &self.client {
                 // Receipt and the persisted read in one: see `select_chat`.
                 client.mark_chat_read(&chat_jid, newest);
@@ -1893,6 +1891,23 @@ impl WhatsAppApp {
             }
         }
     }
+}
+
+/// The newest message in `chat` that the daemon can also name.
+///
+/// `MarkRead` is a claim about what the requester saw, and the daemon checks it
+/// against the second its read would clear. A call record and a group notice
+/// are written *here* — the daemon holds no messages and never put them in a
+/// summary — so bounding the request with one names a message that is in no
+/// boundary anywhere, and the read is refused. The chat is cleared locally all
+/// the same, so no receipt goes out, nothing is persisted, and the next
+/// hydration puts the badge back.
+fn newest_shared_message(chat: &Chat) -> Option<String> {
+    chat.messages
+        .iter()
+        .rev()
+        .find(|message| message.system.is_none())
+        .map(|message| message.id.clone())
 }
 
 impl Focusable for WhatsAppApp {

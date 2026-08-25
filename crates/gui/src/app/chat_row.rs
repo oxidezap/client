@@ -7,6 +7,7 @@
 use chrono::{DateTime, Utc};
 use oxidezap_core::{
     Chat, ChatMessage, MediaType, MessageStatus, SystemNotice, TypingSummary, format_duration,
+    plain_message_text,
 };
 
 /// The badge at the end of a row.
@@ -189,7 +190,11 @@ fn body_for(last: &ChatMessage) -> String {
         };
     }
     if !last.content.is_empty() {
-        return single_line(&last.content);
+        // The markers come out here too. A preview is one unstyled line with
+        // nowhere to put emphasis, and the bubble beside it already renders
+        // the effect — a row still showing `*bold*` is the only place the
+        // markup leaks.
+        return single_line(&plain_message_text(&last.content));
     }
     match last.media.as_ref() {
         Some(media) => {
@@ -214,7 +219,7 @@ fn body_for(last: &ChatMessage) -> String {
 /// the one row where the name alone is ambiguous: a second number of yours is
 /// saved under a person's name like any other contact, so without the suffix
 /// it reads as somebody else.
-fn display_name(name: &str, is_own_number: bool) -> String {
+pub fn display_name(name: &str, is_own_number: bool) -> String {
     let name = single_line(name);
     if is_own_number {
         format!("{name} (You)")

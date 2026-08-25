@@ -209,29 +209,21 @@ fn render_density(
         div()
             .flex()
             .gap(metrics.space_md())
+            // `Button`s, because picking a density changes application
+            // state: a styled `div` carries no focus handle and no keyboard
+            // activation, and this pane is where someone adjusting the
+            // interface to suit them is most likely to be doing it without a
+            // pointer.
             .children(Density::ALL.into_iter().map(|density| {
                 let entity = entity.clone();
-                div()
-                    .id(SharedString::from(format!("density-{}", density.id())))
+                Button::new(SharedString::from(format!("density-{}", density.id())))
+                    .label(density.label())
+                    .outline()
+                    .selected(density == active)
                     .px(metrics.space_xl())
                     .py(metrics.space_md())
                     .rounded(metrics.radius_md())
-                    .border_1()
-                    .cursor_pointer()
                     .text_size(metrics.text_small())
-                    .map(|el| {
-                        if density == active {
-                            el.border_color(cx.theme().primary)
-                                .bg(cx.theme().list_active)
-                                .text_color(cx.theme().foreground)
-                        } else {
-                            let hover = cx.theme().list_hover;
-                            el.border_color(cx.theme().border)
-                                .text_color(cx.theme().muted_foreground)
-                                .hover(move |s| s.bg(hover))
-                        }
-                    })
-                    .child(density.label())
                     .on_click(move |_, window, cx| {
                         entity.update(cx, |app, cx| app.set_theme_density(density, window, cx));
                     })

@@ -71,11 +71,11 @@ pub fn render_chat_header(
     cx: &App,
 ) -> impl IntoElement {
     let metrics = *layout.metrics();
-    let name: SharedString = if is_own_number {
-        format!("{} (You)", chat.name).into()
-    } else {
-        chat.name.clone().into()
-    };
+    // One definition of the marker, shared with the list row. Two copies had
+    // already drifted — that one collapses whitespace in the name first, this
+    // one did not — and a user-visible label with two implementations drifts
+    // again.
+    let name: SharedString = crate::app::chat_row::display_name(&chat.name, is_own_number).into();
     let subtitle = subtitle(chat, typing, availability);
     // No badge until presence actually arrives. A contact who has told us
     // nothing is not "away": most contacts are in that state before the first

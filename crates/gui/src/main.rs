@@ -29,17 +29,26 @@ fn main() {
     // an unusual script produces a dozen. Turning `RUST_LOG=debug` on to look
     // at *our* logs should not bury them. An explicit `RUST_LOG` still wins:
     // these are floors for modules the user did not ask about.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .filter_module("blade_graphics", log::LevelFilter::Warn)
-        .filter_module("naga", log::LevelFilter::Warn)
-        .filter_module("zbus", log::LevelFilter::Warn)
-        .filter_module("tracing", log::LevelFilter::Warn)
-        .filter_module("gpui", log::LevelFilter::Warn)
-        .filter_module("cosmic_text", log::LevelFilter::Warn)
-        .filter_module("wgpu_core", log::LevelFilter::Warn)
-        .filter_module("wgpu_hal", log::LevelFilter::Warn)
-        .filter_module("font_kit", log::LevelFilter::Warn)
-        .init();
+    let mut logger = env_logger::Builder::new();
+    // Floors first, environment second. A later directive replaces an earlier
+    // one for the same target, so parsing `RUST_LOG` before these turned
+    // `RUST_LOG=cosmic_text=debug` back into `warn` — the one request that
+    // could only have been deliberate was the one that was ignored.
+    for quiet in [
+        "blade_graphics",
+        "naga",
+        "zbus",
+        "tracing",
+        "gpui",
+        "cosmic_text",
+        "wgpu_core",
+        "wgpu_hal",
+        "font_kit",
+    ] {
+        logger.filter_module(quiet, log::LevelFilter::Warn);
+    }
+    logger.parse_env(env_logger::Env::default().default_filter_or("info"));
+    logger.init();
 
     gpui_platform::application()
         .with_assets(assets::Assets)

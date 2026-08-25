@@ -24,6 +24,16 @@ pub struct CallRecord {
 }
 
 impl CallRecord {
+    /// Whether this is a call that rang here and nobody answered.
+    ///
+    /// The one call worth a badge. Everything else in this enum is an event
+    /// the user was party to — they took it, placed it, or refused it — and a
+    /// chat that badges itself for those is claiming there is something to
+    /// catch up on when there is not.
+    pub fn is_missed_inbound(&self) -> bool {
+        !self.is_outgoing && matches!(self.outcome, CallOutcome::Missed)
+    }
+
     /// The line describing what happened.
     pub fn title(&self) -> String {
         let kind = if self.is_video {
@@ -40,7 +50,6 @@ impl CallRecord {
         }
     }
 
-    /// The second line: how long, or how to try again.
     /// One line for a chat row, where there is no room for two.
     ///
     /// The direction is dropped: the list is scanned rather than read, and
@@ -54,6 +63,7 @@ impl CallRecord {
         }
     }
 
+    /// The second line: how long, or how to try again.
     pub fn detail(&self) -> String {
         let direction = if self.is_outgoing {
             "outgoing"
@@ -96,6 +106,34 @@ pub fn format_duration(total_secs: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A call you took, placed, or refused is not something to catch up on.
+    /// It is written into the conversation as an incoming row all the same,
+    /// which is what used to badge the chat for an event the user was in.
+    #[test]
+    fn only_a_call_that_rang_unanswered_is_worth_a_badge() {
+        let call = |is_outgoing, outcome| CallRecord {
+            is_video: false,
+            is_outgoing,
+            outcome,
+        };
+
+        assert!(call(false, CallOutcome::Missed).is_missed_inbound());
+
+        for record in [
+            call(false, CallOutcome::Completed(12)),
+            call(false, CallOutcome::Declined),
+            call(true, CallOutcome::Missed),
+            call(true, CallOutcome::Completed(12)),
+            call(true, CallOutcome::Declined),
+        ] {
+            assert!(
+                !record.is_missed_inbound(),
+                "{:?} is not a missed inbound call",
+                record.outcome
+            );
+        }
+    }
     use super::*;
 
     fn record(is_outgoing: bool, outcome: CallOutcome) -> CallRecord {

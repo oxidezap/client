@@ -721,7 +721,15 @@ impl Chat {
         // blocks redelivery recounts, so every incoming message that reaches
         // this point is new even when it lands behind the newest bubble
         // (offline catch-up, out-of-order decryption).
-        if !message.is_from_me {
+        //
+        // It *is* gated on `is_read`, the same way the daemon gates it. A row
+        // that arrives already read is not unread, and the case that made this
+        // matter is the call record: a call you just finished, placed, or
+        // declined is written into the conversation as an incoming row, and
+        // badging the chat for an event the user was party to is nonsense. A
+        // missed call still arrives unread, which is the one that earns a
+        // badge.
+        if !message.is_from_me && !message.is_read {
             self.unread_count += 1;
         }
 
@@ -917,6 +925,26 @@ impl Chat {
 
 #[cfg(test)]
 mod tests {
+
+    /// A row that arrives already read is not unread. The case that made this
+    /// matter is the call record: it is written as an incoming message, so a
+    /// call the user had just finished raised a badge for itself.
+    #[test]
+    fn a_row_that_arrives_read_raises_no_badge() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+
+        let mut seen = ChatMessage::new_incoming("call-1".into(), "a".into(), String::new());
+        seen.is_read = true;
+        chat.add_message(seen);
+        assert_eq!(chat.unread_count, 0);
+
+        chat.add_message(ChatMessage::new_incoming(
+            "m1".into(),
+            "a".into(),
+            "hi".into(),
+        ));
+        assert_eq!(chat.unread_count, 1, "a real arrival still counts");
+    }
 
     /// A message to your own number has been read by the only person who could
     /// read it, and no receipt will ever say so — the peer that would send one

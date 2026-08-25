@@ -181,6 +181,16 @@ pub fn parse(source: &str) -> RichText {
 
             if usable && let Some(depth) = closing {
                 if fenced || closes(bytes, at) {
+                    // Nothing between the two delimiters. That was never a
+                    // run, and consuming the closer anyway deleted characters
+                    // the sender typed: `*_*` came out as `_`. The opener
+                    // stays on the stack, where the unclosed pass puts it
+                    // back, and this one is text.
+                    if open[depth].from == out.text.len() {
+                        out.text.push_str(open[depth].literal());
+                        at += width;
+                        continue;
+                    }
                     let from = open.remove(depth).from;
                     // The newline that put the closing fence on its own line
                     // belongs to the delimiter, not to the code. Left in, every
@@ -489,6 +499,23 @@ mod tests {
         assert_eq!(text, "let x = *y * z*;");
         assert_eq!(spans.len(), 1);
         assert!(spans[0].1.code && !spans[0].1.bold);
+    }
+
+    /// A closer that immediately follows its opener closes nothing. Consuming
+    /// it anyway deleted characters the sender typed, and the reader saw text
+    /// that was never written.
+    #[test]
+    fn an_empty_run_is_two_literal_markers() {
+        for (source, expected) in [
+            ("*_*", "*_*"),
+            ("hi ** there", "hi ** there"),
+            ("``", "``"),
+            ("``````", "``````"),
+        ] {
+            let rich = parse(source);
+            assert_eq!(rich.text, expected, "for {source:?}");
+            assert!(rich.is_plain(), "for {source:?}: {:?}", rich.spans);
+        }
     }
 
     #[test]

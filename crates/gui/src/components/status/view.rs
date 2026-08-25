@@ -126,8 +126,8 @@ fn render_segments(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let spent = cx.product().hsla(cx.product().palette.faint_foreground);
-    let lit = cx.theme().primary;
+    let remaining = cx.product().hsla(cx.product().palette.faint_foreground);
+    let watched = cx.theme().primary;
 
     div()
         .flex_shrink_0()
@@ -140,7 +140,7 @@ fn render_segments(
                 .flex_1()
                 .h(metrics.selection_bar_width())
                 .rounded_full()
-                .bg(if at <= index { lit } else { spent })
+                .bg(if at <= index { watched } else { remaining })
         }))
 }
 

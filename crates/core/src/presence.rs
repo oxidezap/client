@@ -87,6 +87,14 @@ impl ChatTyping {
         self.participants.is_empty()
     }
 
+    /// Whether anybody here is still within their deadline.
+    ///
+    /// The question [`Presence::has_typing`] actually asks, without building
+    /// the answer to a different one.
+    fn has_live(&self, now: DateTime<Utc>) -> bool {
+        self.participants.values().any(|c| c.expires_at > now)
+    }
+
     /// Who is currently typing, in a stable order.
     ///
     /// Sorted by name so a re-render cannot reshuffle the avatars while the
@@ -264,11 +272,13 @@ impl PresenceRegistry {
     }
 
     /// Whether anyone at all is typing, so a render pass can skip the work.
+    ///
+    /// Answered from the deadlines rather than by building the summaries and
+    /// throwing them away: this exists to *avoid* work, and `summary` allocates
+    /// a vector and clones a JID and a name for every chat it is asked about.
     pub fn has_typing(&self) -> bool {
         let now = wacore::time::now_utc();
-        self.typing
-            .values()
-            .any(|entry| entry.summary(now).is_some())
+        self.typing.values().any(|entry| entry.has_live(now))
     }
 
     /// Drop entries whose deadline has passed.

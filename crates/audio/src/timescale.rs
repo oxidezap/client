@@ -58,6 +58,9 @@ pub fn stretch(samples: Vec<f32>, channels: usize, speed: f32) -> Vec<f32> {
     // feeding the chosen offset back in accumulates its error, and a clip a
     // minute long drifts far enough off the requested speed to be wrong.
     let mut read = hop_in;
+    // How far into the input the loop has actually consumed. The read cursor
+    // is nominal and the chosen frame is not, so neither of them answers this.
+    let mut consumed_to = frame.min(samples.len());
 
     while read + frame + search < samples.len() {
         // Where the tail of what has been written already sits, so the next
@@ -75,7 +78,18 @@ pub fn stretch(samples: Vec<f32>, channels: usize, speed: f32) -> Vec<f32> {
         }
         out.extend_from_slice(&take[hop_out..]);
 
+        consumed_to = best + frame;
         read += hop_in;
+    }
+
+    // Whatever the last frame did not reach is still speech, and it was being
+    // thrown away: the loop stops `hop_in + frame + search` short of the end,
+    // which at 2× is about 85ms — the last syllable of a voice note, gone
+    // whenever the speed was not 1×. It goes in unstretched, because a few
+    // tens of milliseconds off the requested ratio is not a thing anyone can
+    // hear and a cut word is.
+    if consumed_to < samples.len() {
+        out.extend_from_slice(&samples[consumed_to..]);
     }
 
     out
@@ -188,6 +202,33 @@ mod tests {
     /// The point of all of it: half as long, same pitch. A player that simply
     /// read faster would come out with the same *number* of crossings as the
     /// original, over half the time — an octave up.
+    /// The loop stops short of the end by design, and what it leaves was
+    /// being discarded — about 85ms at 2×, which is the last syllable of a
+    /// voice note. The length tests cannot see it: 85ms of a one-second clip
+    /// fits inside their tolerance.
+    #[test]
+    fn the_end_of_the_clip_survives_being_re_timed() {
+        let channels = 1;
+        let samples = tone(2.0, channels);
+        // A marker no cross-fade can invent: the tone is periodic, so the
+        // check is that the *count* of input consumed reaches the end.
+        let sped = stretch(samples.clone(), channels, 2.0);
+
+        // At 2× the output is about half the input. What it must not be is
+        // half minus the tail the loop never reached.
+        let expected = samples.len() / 2;
+        let shortfall = expected.saturating_sub(sped.len());
+        assert!(
+            shortfall * 100 / expected < 2,
+            "lost {shortfall} of {expected} samples off the end"
+        );
+
+        // And the very end of the input is present: the last frame of the
+        // source appears verbatim, because the tail is copied unstretched.
+        let tail = &samples[samples.len() - 64..];
+        assert_eq!(&sped[sped.len() - 64..], tail, "the last frame was cut");
+    }
+
     #[test]
     fn speeding_up_does_not_raise_the_pitch() {
         let samples = tone(1.0, 1);

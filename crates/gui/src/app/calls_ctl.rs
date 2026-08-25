@@ -63,6 +63,15 @@ impl WhatsAppApp {
         if let Some(client) = &self.client {
             client.decline_call(waiting.call_id().as_str());
         }
+        // Written down like any other refusal. Left out, a caller the user
+        // saw and refused left no trace anywhere: the strip is gone, the
+        // daemon only sends the network decline, and the conversation has no
+        // row saying they rang.
+        self.record_call_as(
+            &Stage::Incoming(waiting.into_call()),
+            Some(CallOutcome::Declined),
+            cx,
+        );
         cx.notify();
     }
 
@@ -316,6 +325,11 @@ impl WhatsAppApp {
             peer_jid.clone(),
             String::new(),
         );
+        // Written as an incoming row because that is what a system notice is,
+        // but the user was there: they took the call, placed it, or refused it.
+        // Only a call that rang unanswered is news, and only that one earns a
+        // badge.
+        message.is_read = !record.is_missed_inbound();
         message.system = Some(SystemNotice::Call(record));
 
         if self.add_message_to_chat(&peer_jid, message) {

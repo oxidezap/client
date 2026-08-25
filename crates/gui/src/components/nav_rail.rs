@@ -73,9 +73,9 @@ pub fn render_nav_rail(
     }))
 }
 
-/// One destination. A clickable `div` rather than a `Button`: it selects where
-/// the window is, the way a chat row selects a conversation, and the selected
-/// one has to stay visibly selected — which is state a button does not carry.
+/// One destination. It selects where the window is, the way a chat row selects
+/// a conversation, and the selected one stays visibly selected — which is what
+/// `Button::selected` carries.
 fn render_destination(
     destination: Destination,
     is_current: bool,
