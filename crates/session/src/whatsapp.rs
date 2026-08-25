@@ -1789,7 +1789,6 @@ impl WhatsAppClient {
             // -1 = manually marked unread (WA Web convention); .max(0) above
             // must not silently eat the flag.
             chat.manually_unread = entry.unread_count < 0;
-            chat.last_message = entry.last_message_preview.clone();
             chat.last_message_time = entry.last_message_at;
 
             let mut page = chat_store
@@ -1820,6 +1819,8 @@ impl WhatsAppClient {
                     remaining -= 1;
                 }
             }
+            chat.last_message =
+                history_preview(entry.last_message_preview.clone(), chat.messages.last());
             chats.push(chat);
         }
         Ok((chats, complete))
@@ -1909,6 +1910,18 @@ impl WhatsAppClient {
             msg.sender_name = cache.get(&msg.sender).cloned().flatten();
         }
     }
+}
+
+/// The chat-list preview for a hydrated chat.
+///
+/// The store's `last_message_preview` is the newest message's TEXT, and plenty
+/// of messages have none: a photo or a voice note without a caption, a revoked
+/// message whose content was tombstoned. The bubble still has a label — the
+/// same one the live path puts in the list — so it answers where the column
+/// cannot, and a chat that plainly has messages stops rendering as "No
+/// messages".
+fn history_preview(stored: Option<String>, newest: Option<&ChatMessage>) -> Option<String> {
+    stored.or_else(|| newest.map(ChatMessage::preview_text))
 }
 
 /// Convert a durable store row into the UI message model. Media stays
@@ -2367,13 +2380,142 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ReadBoundary, ReloadScope, StoreChange, is_masked_phone_label, media_metadata,
-        merge_alias_history_messages, read_message_range,
+        ChatStore, Client, ReadBoundary, ReloadScope, SqliteStore, StoreChange, WhatsAppClient,
+        is_masked_phone_label, media_metadata, merge_alias_history_messages, read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, fallback_chat_name};
+    use std::sync::Arc;
     use whatsapp_rust::buffa::MessageField;
+    use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
     use whatsapp_rust::wacore_binary::Jid;
     use whatsapp_rust::waproto::whatsapp as wa;
+
+    /// A store-hydrated chat list must label a photo the way the live path
+    /// does. The store's preview column holds the newest message's TEXT, and a
+    /// photo with no caption has none — the bubble does, and a row rendered
+    /// from the empty column reads as "No messages" over a chat that plainly
+    /// has one.
+    #[tokio::test]
+    async fn hydrated_preview_labels_a_captionless_photo() {
+        let (chat_store, client) = test_session("preview-photo").await;
+        let photo = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                mimetype: Some("image/jpeg".into()),
+                jpeg_thumbnail: Some(vec![1, 2, 3]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        feed(&chat_store, incoming(photo, "MSG-IMG", 1_700_000_000)).await;
+
+        let (chats, complete) = WhatsAppClient::load_history(&chat_store, &client)
+            .await
+            .expect("history loads");
+        assert!(complete);
+        assert_eq!(chats[0].last_message.as_deref(), Some("📷 Photo"));
+    }
+
+    /// Same gap at the other end: a revoked newest message clears the store's
+    /// preview, and the thread shows a tombstone bubble. The list has to agree
+    /// with it rather than claim the chat is empty.
+    #[tokio::test]
+    async fn hydrated_preview_labels_a_revoked_newest_message() {
+        let (chat_store, client) = test_session("preview-revoked").await;
+        feed(
+            &chat_store,
+            incoming(wa::Message::text("oops"), "MSG-R", 1_700_000_000),
+        )
+        .await;
+        let revoke = wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("MSG-R".into()),
+                    ..Default::default()
+                }),
+                r#type: Some(wa::message::protocol_message::Type::REVOKE),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        feed(&chat_store, incoming(revoke, "MSG-R2", 1_700_000_010)).await;
+
+        let (chats, _) = WhatsAppClient::load_history(&chat_store, &client)
+            .await
+            .expect("history loads");
+        assert_eq!(chats[0].last_message.as_deref(), Some("[Message deleted]"));
+    }
+
+    /// The store's own text still wins where it has one.
+    #[tokio::test]
+    async fn hydrated_preview_prefers_the_stored_text() {
+        let (chat_store, client) = test_session("preview-text").await;
+        feed(
+            &chat_store,
+            incoming(wa::Message::text("bom dia"), "MSG-T", 1_700_000_000),
+        )
+        .await;
+
+        let (chats, _) = WhatsAppClient::load_history(&chat_store, &client)
+            .await
+            .expect("history loads");
+        assert_eq!(chats[0].last_message.as_deref(), Some("bom dia"));
+    }
+
+    const TEST_PEER: &str = "559900000001@s.whatsapp.net";
+
+    /// A chat store and a client over one in-memory database, with no network:
+    /// `Bot::build` only opens the store, and `load_history` needs the client
+    /// solely for the PN/LID mapping lookups that resolve chat identity.
+    async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
+        let store = SqliteStore::new(&format!(
+            "file:oxidezap-session-{name}?mode=memory&cache=shared"
+        ))
+        .await
+        .expect("in-memory store");
+        let chat_store = ChatStore::new(&store).await.expect("chat store");
+        let bot = whatsapp_rust::bot::Bot::builder()
+            .with_backend(store)
+            .build()
+            .await
+            .expect("offline bot");
+        (chat_store, bot.client())
+    }
+
+    fn incoming(
+        message: wa::Message,
+        id: &str,
+        ts_secs: i64,
+    ) -> whatsapp_rust::wacore::types::events::Event {
+        use whatsapp_rust::wacore::types::events::{
+            BatchOrigin, Event, InboundMessage, MessageBatch,
+        };
+        use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+        let info = MessageInfo {
+            source: MessageSource {
+                chat: TEST_PEER.parse().expect("test JID"),
+                sender: TEST_PEER.parse().expect("test JID"),
+                ..Default::default()
+            },
+            id: id.to_string(),
+            timestamp: whatsapp_rust::wacore::time::from_secs(ts_secs).expect("test timestamp"),
+            ..Default::default()
+        };
+        Event::Messages(
+            MessageBatch::builder()
+                .messages(Arc::from([InboundMessage::builder()
+                    .message(Arc::new(message))
+                    .info(Arc::new(info))
+                    .build()]))
+                .origin(BatchOrigin::Live)
+                .build(),
+        )
+    }
+
+    async fn feed(chat_store: &Arc<ChatStore>, event: whatsapp_rust::wacore::types::events::Event) {
+        chat_store.handler().handle_event(Arc::new(event));
+        chat_store.flush().await.expect("flush");
+    }
 
     fn messages_change(chat: &str) -> StoreChange {
         StoreChange::Messages {

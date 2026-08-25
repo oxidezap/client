@@ -492,13 +492,27 @@ impl Chat {
         // store owns it from here on.
         self.from_store |= hydrated.from_store;
         self.set_name_if_not_worse(hydrated.name, hydrated.name_priority);
+        // Read before the messages are moved out: it decides what an absent
+        // preview below means.
+        let hydrated_has_messages = !hydrated.messages.is_empty();
         for msg in hydrated.messages {
             self.insert_history_message(msg);
         }
         self.unread_count = hydrated.unread_count;
         self.manually_unread = hydrated.manually_unread;
         if hydrated.last_message_time >= self.last_message_time {
-            self.last_message = hydrated.last_message;
+            // What an absent preview means depends on whether the load
+            // brought messages. With messages, the store simply has no TEXT
+            // for the newest one (a photo with no caption, a tombstone) while
+            // the live label describes that same message — taking the `None`
+            // would render the row as "No messages" over a chat that plainly
+            // has one. With no messages, the chat really was emptied (cleared,
+            // or its last message deleted, here or on another device) and the
+            // live label is the stale one. The timestamp moves either way: a
+            // cleared chat keeps its activity time on purpose.
+            if hydrated.last_message.is_some() || !hydrated_has_messages {
+                self.last_message = hydrated.last_message;
+            }
             self.last_message_time = hydrated.last_message_time;
         }
     }
@@ -684,6 +698,78 @@ mod tests {
             1,
         ));
         assert_eq!(chat.name, "Renamed Fictitious Contact");
+    }
+
+    /// The store keeps no preview text for a message that has none (a photo
+    /// with no caption), so hydration used to blank the label the live path
+    /// had already derived — and the chat list renders an absent preview as
+    /// "No messages".
+    #[test]
+    fn hydration_without_a_preview_keeps_the_live_label() {
+        let jid = "12025550143@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        let mut photo = make_message("M1", 1000);
+        photo.content = String::new();
+        photo.media = Some(make_media(vec![1, 2, 3], false));
+        chat.add_message(photo);
+        assert_eq!(chat.last_message.as_deref(), Some("📷 Photo"));
+
+        // What the store hands back: the message row is there (with its media
+        // envelope and no text), the preview column is not.
+        let mut hydrated = Chat::new(jid);
+        hydrated.from_store = true;
+        let mut stored_photo = make_message("M1", 1000);
+        stored_photo.content = String::new();
+        stored_photo.media = Some(make_media(Vec::new(), false));
+        hydrated.insert_history_message(stored_photo);
+        hydrated.last_message_time = chat.last_message_time;
+        hydrated.last_message = None;
+        chat.merge_history(hydrated);
+
+        assert_eq!(chat.last_message.as_deref(), Some("📷 Photo"));
+        assert!(chat.last_message_time.is_some());
+    }
+
+    /// Clearing a chat (or deleting its last message) elsewhere leaves the
+    /// store with an activity time and nothing to show. Keeping the live label
+    /// there would leave the deleted message on the row for good.
+    #[test]
+    fn hydration_with_no_messages_clears_a_stale_preview() {
+        let jid = "12025550143@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        chat.add_message(make_message("M1", 1000));
+        assert!(chat.last_message.is_some());
+
+        let mut hydrated = Chat::new(jid);
+        hydrated.from_store = true;
+        // The chat row survives the clear and keeps its activity time; the
+        // messages are gone, so the preview column is NULL and the page empty.
+        hydrated.last_message_time = chat.last_message_time;
+        hydrated.last_message = None;
+        chat.merge_history(hydrated);
+
+        assert_eq!(chat.last_message, None);
+    }
+
+    /// A preview the store does have still wins: it is the newer truth, and an
+    /// edit or a newly arrived message is exactly how it changes.
+    #[test]
+    fn hydration_with_a_preview_replaces_the_live_one() {
+        let jid = "12025550143@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        chat.add_message(make_message("M1", 1000));
+
+        let mut hydrated = Chat::new(jid);
+        hydrated.from_store = true;
+        hydrated.last_message_time = Some(Utc.timestamp_opt(2000, 0).unwrap());
+        hydrated.last_message = Some("edited".to_string());
+        chat.merge_history(hydrated);
+
+        assert_eq!(chat.last_message.as_deref(), Some("edited"));
+        assert_eq!(
+            chat.last_message_time,
+            Some(Utc.timestamp_opt(2000, 0).unwrap())
+        );
     }
 
     #[test]
