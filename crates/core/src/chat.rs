@@ -223,7 +223,45 @@ pub struct ChatMessage {
     pub system: Option<SystemNotice>,
 }
 
+impl MediaContent {
+    /// The full media has arrived: take the bytes, and the metadata that
+    /// describes *them*.
+    ///
+    /// A row can carry a poster frame or a thumbnail until the real file is
+    /// fetched, and the fields beside it describe that stand-in — a sticker's
+    /// PNG preview says `image/png` where the sticker itself is an animated
+    /// WebP. Swapping only the bytes left every later reader decoding the new
+    /// file under the old file's type. One place does both, because doing one
+    /// without the other is the bug.
+    pub fn adopt_full_bytes(&mut self, bytes: Arc<Vec<u8>>) {
+        self.data = bytes;
+        self.data_is_preview = false;
+        if let Some(downloadable) = &self.downloadable {
+            self.mime_type = downloadable.mime_type.clone();
+        }
+    }
+}
+
 impl ChatMessage {
+    /// What to draw for whoever wrote this: the name somebody has for them,
+    /// or the number if nobody has one yet.
+    ///
+    /// The number is produced here rather than stored in `sender_name`,
+    /// because that field only ever gains a value —
+    /// [`Chat::update_participant`] fills blanks. A row stamped with a number
+    /// could never take the push name that arrives a second later, so the
+    /// same person would read as a number on their reloaded bubbles and by
+    /// name on their new ones.
+    pub fn author_label(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(name) = &self.sender_name {
+            return std::borrow::Cow::Borrowed(name);
+        }
+        match self.sender.parse::<Jid>() {
+            Ok(jid) => std::borrow::Cow::Owned(fallback_chat_name(&jid)),
+            Err(_) => std::borrow::Cow::Borrowed(&self.sender),
+        }
+    }
+
     /// Create a new outgoing message
     pub fn new_outgoing(id: String, content: String) -> Self {
         Self {
@@ -665,6 +703,43 @@ impl Chat {
         if !quoted.sender_name.is_empty() {
             return;
         }
+        if let Some(name) = self.quoted_author(quoted) {
+            quoted.sender_name = name;
+        }
+    }
+
+    /// Give every loaded reply the name of whoever it is answering.
+    ///
+    /// A page of hydrated history is assigned wholesale rather than added a
+    /// row at a time, so the naming [`add_message`](Self::add_message) does
+    /// per row has to be run over the page afterwards — without it every
+    /// reloaded reply drew the generic "Message" where an author belonged.
+    pub fn name_quoted_authors(&mut self) {
+        // Resolved against the whole page first: the answer for one row can
+        // come from another row, and both borrows cannot be held at once.
+        let resolved: Vec<Option<String>> = self
+            .messages
+            .iter()
+            .map(|message| {
+                let quoted = message.quoted.as_ref()?;
+                quoted
+                    .sender_name
+                    .is_empty()
+                    .then(|| self.quoted_author(quoted))
+                    .flatten()
+            })
+            .collect();
+        for (message, name) in self.messages.iter_mut().zip(resolved) {
+            if let Some(quoted) = message.quoted.as_mut()
+                && let Some(name) = name
+            {
+                quoted.sender_name = name;
+            }
+        }
+    }
+
+    /// Who wrote the message a quote is quoting, as far as this chat knows.
+    fn quoted_author(&self, quoted: &QuotedMessage) -> Option<String> {
         // The original is often still loaded, and it is the better answer:
         // it knows whether the reader wrote it, and carries the name it was
         // received under.
@@ -674,12 +749,10 @@ impl Chat {
             .find(|message| message.id == quoted.message_id)
         {
             if original.is_from_me {
-                quoted.sender_name = "You".to_string();
-                return;
+                return Some("You".to_string());
             }
             if let Some(name) = &original.sender_name {
-                quoted.sender_name.clone_from(name);
-                return;
+                return Some(name.clone());
             }
         }
         // No participant on the envelope and no loaded original: nobody here
@@ -687,16 +760,20 @@ impl Chat {
         // it is wrong exactly when the reader quoted themselves — the quote
         // bar falls back to its own generic label instead.
         if quoted.sender.is_empty() {
-            return;
+            return None;
         }
         if let Some(name) = self.participant_name(&quoted.sender) {
-            quoted.sender_name = name.to_string();
+            Some(name.to_string())
         } else if !self.is_group {
-            quoted.sender_name = self.name.clone();
-        } else if let Ok(jid) = quoted.sender.parse::<Jid>() {
+            Some(self.name.clone())
+        } else {
             // Better than "Message": a number is at least *someone*, and the
             // real name replaces it as soon as a push name arrives.
-            quoted.sender_name = fallback_chat_name(&jid);
+            quoted
+                .sender
+                .parse::<Jid>()
+                .ok()
+                .map(|jid| fallback_chat_name(&jid))
         }
     }
 
@@ -1036,6 +1113,44 @@ mod tests {
             chat.messages[2].sender_name, None,
             "your own row is named by the reader, not by the map"
         );
+    }
+
+    /// A page of history is assigned wholesale, not added a row at a time, so
+    /// the per-row naming has to be run over it afterwards. Without it every
+    /// reloaded reply drew the generic label where an author belonged.
+    #[test]
+    fn a_reloaded_reply_still_names_who_it_answers() {
+        let mut chat = Chat::new("120363000000000001@g.us".to_string());
+        chat.is_group = true;
+
+        let mut original = ChatMessage::new_incoming("m1".into(), "a@lid".into(), "ping".into());
+        original.sender_name = Some("Ana".into());
+        let mut reply = ChatMessage::new_incoming("m2".into(), "b@lid".into(), "pong".into());
+        reply.quoted = Some(crate::QuotedMessage {
+            message_id: "m1".into(),
+            sender: "a@lid".into(),
+            sender_name: String::new(),
+            preview: "ping".into(),
+            kind: None,
+        });
+        // Assigned the way hydration assigns a page.
+        chat.messages = vec![original, reply];
+
+        chat.name_quoted_authors();
+        assert_eq!(chat.messages[1].quoted.as_ref().unwrap().sender_name, "Ana");
+    }
+
+    /// A person nobody has named is still somebody. The number is drawn, not
+    /// stored: the stored field only ever gains a value, so a row stamped
+    /// with a number could never take the name that arrives after it.
+    #[test]
+    fn an_unnamed_author_is_drawn_as_their_number() {
+        let mut message =
+            ChatMessage::new_incoming("m".into(), "12025550143@s.whatsapp.net".into(), "hi".into());
+        assert_eq!(message.author_label(), "+12025550143");
+
+        message.sender_name = Some("Ana".into());
+        assert_eq!(message.author_label(), "Ana");
     }
 
     /// Their message in your own chat is not yours to have ticks on at all.

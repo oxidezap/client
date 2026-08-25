@@ -13,14 +13,10 @@ impl WhatsAppApp {
         for chat in &mut self.chats {
             if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id) {
                 if let Some(ref mut media) = msg.media {
-                    media.data = Arc::new(data);
-                    // Full bytes landed; the data no longer needs a re-download
-                    media.data_is_preview = false;
-                    // Decode with the real media's MIME, not the preview
-                    // thumbnail's (a WebP sticker would fail as image/jpeg)
-                    if let Some(ref dl) = media.downloadable {
-                        media.mime_type = dl.mime_type.clone();
-                    }
+                    // Bytes and the metadata that describes them, together:
+                    // decoding a WebP sticker as the `image/jpeg` its poster
+                    // frame claimed fails every time.
+                    media.adopt_full_bytes(Arc::new(data));
                     // Drop any render-cached image built from the old bytes
                     self.decoded_images.borrow_mut().shift_remove(message_id);
                     info!("Cached media data for message {}", message_id);
@@ -41,7 +37,9 @@ impl WhatsAppApp {
     /// Stop any currently playing media. Does NOT call cx.notify().
     pub(super) fn stop_current_media(&mut self) {
         self.audio_player.stop();
-        self.audio_owner = None;
+        // Name and bytes together, always: this is the whole reason they are
+        // one field.
+        self.audio = AudioHolder::None;
         // An in-flight lazy download for the stopped media must not autoplay
         // when it completes; user-initiated requests re-set this after the stop.
         self.pending_media_request = None;
@@ -70,7 +68,7 @@ impl WhatsAppApp {
     /// stream: progress belongs to whichever note is *loaded*, so a paused
     /// bubble keeps its position instead of snapping back to zero.
     pub fn audio_owner(&self) -> Option<&str> {
-        self.audio_owner.as_deref()
+        self.audio.message_id()
     }
 
     /// How far through the loaded voice note playback is, in `0.0..=1.0`.
@@ -91,7 +89,7 @@ impl WhatsAppApp {
         // Named, not merely "something is loaded": every downloaded voice note
         // draws a scrubbable waveform, and an unnamed seek let a click on one
         // row move the position of whichever clip happened to be loaded.
-        if self.audio_owner.as_deref() != Some(message_id) {
+        if self.audio.message_id() != Some(message_id) {
             return;
         }
         // A clip that ran to its end still owns an open stream, so rewinding
@@ -99,7 +97,7 @@ impl WhatsAppApp {
         // nothing is playing and no completion left to fire. Scrubbing a
         // finished note means playing it again from the bytes still held.
         if self.audio_player.is_finished()
-            && let Some(bytes) = self.audio_source.clone()
+            && let Some(bytes) = self.audio.note_source(message_id)
         {
             self.play_audio(message_id.to_string(), (*bytes).clone(), cx);
         }
@@ -135,8 +133,14 @@ impl WhatsAppApp {
         // afterwards ran at the old rate while the chip and the clock had
         // already moved to the new one. What matters is whether a clip is
         // loaded — and one that was paused is put back paused.
-        if let (Some(message_id), Some(bytes)) =
-            (self.audio_owner.clone(), self.audio_source.clone())
+        if let Some((message_id, bytes)) =
+            self.audio
+                .message_id()
+                .map(str::to_owned)
+                .and_then(|message_id| {
+                    let source = self.audio.note_source(&message_id)?;
+                    Some((message_id, source))
+                })
         {
             let at = self.audio_player.progress();
             let was_playing = self.audio_player.is_playing();
@@ -198,8 +202,10 @@ impl WhatsAppApp {
 
         match self.audio_player.play((*source).clone()) {
             Ok(()) => {
-                self.audio_owner = Some(message_id.clone());
-                self.audio_source = Some(source);
+                self.audio = AudioHolder::Note {
+                    message_id: message_id.clone(),
+                    source,
+                };
                 self.active_media = ActiveMedia::Audio {
                     message_id: message_id.clone(),
                 };
@@ -235,6 +241,9 @@ impl WhatsAppApp {
     pub fn stop_audio(&mut self, cx: &mut Context<Self>) {
         if self.active_media.is_audio() {
             self.audio_player.stop();
+            // The clip goes with the stream. Left behind, a speed change
+            // would prepare bytes the sink no longer has anything to do with.
+            self.audio = AudioHolder::None;
             self.active_media = ActiveMedia::None;
             cx.notify();
         }
@@ -539,7 +548,7 @@ impl WhatsAppApp {
                 // tell "nothing else started" from "another media is live";
                 // audio ownership does. Stopping here on resume would drop
                 // this video's own paused audio and it would come back mute.
-                let owns_audio = self.audio_owner.as_deref() == Some(message_id.as_str());
+                let owns_audio = self.audio.message_id() == Some(message_id.as_str());
                 if !self.active_media.is_playing(&message_id) && !owns_audio {
                     self.stop_current_media();
                 }
@@ -589,9 +598,11 @@ impl WhatsAppApp {
                         // Ownership only on success: recording it for a dead
                         // sink would turn every later resume into a silent
                         // no-op resume().
-                        self.audio_owner = Some(message_id.clone());
+                        self.audio = AudioHolder::VideoTrack {
+                            message_id: message_id.clone(),
+                        };
                     }
-                } else if !needs_audio && self.audio_owner.as_ref() == Some(&message_id) {
+                } else if !needs_audio && self.audio.message_id() == Some(message_id.as_str()) {
                     // Only resume if audio belongs to this video
                     self.audio_player.resume();
                 }
@@ -730,7 +741,9 @@ impl WhatsAppApp {
                                                 {
                                                     warn!("Failed to play video audio: {}", e);
                                                 } else {
-                                                    app.audio_owner = Some(msg_id_for_play.clone());
+                                                    app.audio = AudioHolder::VideoTrack {
+                                                        message_id: msg_id_for_play.clone(),
+                                                    };
                                                 }
                                             }
                                         }

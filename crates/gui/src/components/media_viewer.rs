@@ -91,10 +91,15 @@ pub fn render_media_viewer(
             props.author,
             when,
             position,
-            // Nothing decoded is nothing to write: the screen below is about
-            // to say the file cannot be shown, and a Save beside that sentence
-            // offers to put bytes on disk that this side does not have.
-            props.image.is_some() || props.frame.is_some(),
+            // The bytes, not the picture. `save_media` writes `media.data`
+            // and never asks the decoder anything, so gating on a decoded
+            // image refused to save exactly the file worth saving elsewhere:
+            // one this build cannot display but another program can.
+            props
+                .message
+                .media
+                .as_ref()
+                .is_some_and(|media| !media.data.is_empty() && !media.data_is_preview),
             close_entity,
             save_entity,
             message_id,

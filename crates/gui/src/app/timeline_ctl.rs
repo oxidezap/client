@@ -121,16 +121,38 @@ impl WhatsAppApp {
         let Some(message) = chat.messages.iter().find(|m| m.id == message_id) else {
             return;
         };
-        if !message.is_failed() || message.content.is_empty() {
+        if !message.is_failed() {
             return;
         }
-        let content = message.content.clone();
         // A reply that failed is retried as a reply. The draft that produced
         // it was consumed by the first send, so the quote has to come from
         // the message itself.
         let quoted = message.quoted.clone();
+        let content = message.content.clone();
+        // A voice note has no text and is not therefore beyond recovery: the
+        // failed bubble still holds the encoded opus, its length and its
+        // waveform, which is everything the send needs. Refusing here made
+        // the retry button under one a control that answered a click with
+        // nothing.
+        let voice = message
+            .media
+            .clone()
+            .filter(|media| media.media_type == MediaType::Audio && !media.data.is_empty());
+        let jid = chat.jid.clone();
         let _ = window;
-        self.send_quoted(&content, quoted, cx);
+
+        if !content.is_empty() {
+            self.send_quoted(&content, quoted, cx);
+        } else if let Some(media) = voice {
+            self.send_voice_note(
+                &jid,
+                (*media.data).clone(),
+                media.waveform.as_deref().cloned().unwrap_or_default(),
+                media.duration_secs.unwrap_or(0),
+                quoted,
+            );
+            cx.notify();
+        }
     }
 
     /// Offer the emoji picker for a message.

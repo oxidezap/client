@@ -106,11 +106,12 @@ pub fn render_message_bubble(
     let is_playing = props.playing_message_id.as_deref() == Some(message_id.as_str());
     let has_reactions = !message.reactions.is_empty();
 
-    let sender_name: Option<SharedString> = if props.is_group && !is_from_me && props.starts_run {
-        message.sender_name.clone().map(Into::into)
-    } else {
-        None
-    };
+    // A name if anyone has one, and the number if nobody does. The number is
+    // drawn rather than stored: `sender_name` only ever gains a value, so a
+    // row stamped with a number could never take the push name that arrives
+    // after it, and everyone unknown would stay a number for the session.
+    let sender_name: Option<SharedString> = (props.is_group && !is_from_me && props.starts_run)
+        .then(|| SharedString::from(message.author_label().into_owned()));
     // The sender's own hue, so a group reads as a conversation between people
     // rather than a wall of one colour.
     let sender_hue = cx.product().speaker(&message.sender);

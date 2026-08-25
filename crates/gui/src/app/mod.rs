@@ -30,6 +30,51 @@ pub use media::RecordingState;
 pub use messages::{MessageListCache, TimelineItem};
 
 /// What the conversation list was last told about.
+/// What the audio sink is holding, and where it came from.
+///
+/// A voice note keeps its encoded bytes: re-timing for a speed change, and
+/// replaying after the clip has run out, both prepare the samples again from
+/// the source rather than asking for the download twice. A video's
+/// soundtrack has no source to keep — it is fed from the decoder — which is
+/// exactly why the two cannot be one `Option<String>` with a loose
+/// `Option<bytes>` beside it.
+#[derive(Default)]
+enum AudioHolder {
+    #[default]
+    None,
+    Note {
+        message_id: String,
+        source: Arc<Vec<u8>>,
+    },
+    VideoTrack {
+        message_id: String,
+    },
+}
+
+impl AudioHolder {
+    /// Whose sound this is, whatever kind it is.
+    fn message_id(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Note { message_id, .. } | Self::VideoTrack { message_id } => Some(message_id),
+        }
+    }
+
+    /// The bytes to prepare again, if this is `message_id`'s voice note.
+    ///
+    /// `None` for a video's track on purpose: there is nothing to re-time,
+    /// and asking would be asking to play a soundtrack as a voice note.
+    fn note_source(&self, message_id: &str) -> Option<Arc<Vec<u8>>> {
+        match self {
+            Self::Note {
+                message_id: id,
+                source,
+            } if id == message_id => Some(Arc::clone(source)),
+            _ => None,
+        }
+    }
+}
+
 struct TimelineAnchor {
     jid: String,
     count: usize,
@@ -447,13 +492,14 @@ pub struct WhatsAppApp {
     /// Repaints the playhead while audio plays. Only alive while it does.
     #[allow(dead_code)]
     playback_tick: Option<Task<()>>,
-    /// Message ID of the audio currently loaded in audio_player (for ownership tracking)
-    /// This ensures we don't resume audio from a different video when switching
-    audio_owner: Option<String>,
-    /// The encoded bytes of that clip, kept so a speed change can re-time it
-    /// from the source rather than asking for the download again. A voice note
-    /// is tens of kilobytes and only one is ever held.
-    audio_source: Option<Arc<Vec<u8>>>,
+    /// What the one audio sink is holding.
+    ///
+    /// One field, because the name and the bytes are one fact. As two, a stop
+    /// cleared the name and left the bytes behind, and the next thing to read
+    /// the pair — a speed change, a scrub past the end — took a video's
+    /// message id and a voice note's samples and played the wrong sound
+    /// against the wrong row.
+    audio: AudioHolder,
     /// Currently active media (mutual exclusion: only one audio or video at a time)
     active_media: ActiveMedia,
     /// Message id of the most recent user-requested playback; download/decode
@@ -629,8 +675,7 @@ impl WhatsAppApp {
             audio_player: AudioPlayer::new(),
             playback_speed: 1.0,
             playback_tick: None,
-            audio_owner: None,
-            audio_source: None,
+            audio: AudioHolder::None,
             active_media: ActiveMedia::None,
             pending_media_request: None,
             retry_at: None,
@@ -1602,7 +1647,7 @@ impl WhatsAppApp {
                                 // owner reads to the resume path as proof the
                                 // audio can be resumed, replaying the video
                                 // silently.
-                                app.audio_owner = None;
+                                app.audio = AudioHolder::None;
                                 cx.notify();
                             });
                             break;
@@ -1643,7 +1688,7 @@ impl WhatsAppApp {
                         app.active_media = ActiveMedia::None;
                         app.video_update_task = None;
                         app.audio_player.stop();
-                        app.audio_owner = None;
+                        app.audio = AudioHolder::None;
                         cx.notify();
                     });
                     break;

@@ -7,8 +7,32 @@
 //! bookkeeping, membership-request plumbing) happens *to* the group without
 //! being news in it, and a row for each would bury the conversation.
 
+use std::collections::HashMap;
+
 use whatsapp_rust::wacore::stanza::groups::{GroupNotificationAction, GroupParticipantInfo};
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _};
+
+/// Names the address book had for the people this notification mentions,
+/// keyed by JID.
+///
+/// A notice is a sentence about people who also have bubbles and typing lines
+/// on the same screen, and those are named by `session/names.rs`. Resolving is
+/// async and this module is not, so the answers are looked up first and handed
+/// in — the alternative is a group change naming somebody by the push name
+/// they chose while every other surface calls them what the reader saved them
+/// as.
+pub type ResolvedNames = HashMap<String, String>;
+
+/// Everyone `action` names, so they can be resolved before it is described.
+pub fn participants_of(action: &GroupNotificationAction) -> &[GroupParticipantInfo] {
+    match action {
+        GroupNotificationAction::Add { participants, .. }
+        | GroupNotificationAction::Remove { participants, .. }
+        | GroupNotificationAction::Promote { participants }
+        | GroupNotificationAction::Demote { participants } => participants,
+        _ => &[],
+    }
+}
 
 /// What to say about `action`, or `None` when it is not worth a row.
 ///
@@ -18,11 +42,12 @@ pub fn describe(
     action: &GroupNotificationAction,
     actor: Option<&str>,
     actor_jid: Option<&Jid>,
+    named: &ResolvedNames,
 ) -> Option<String> {
     let who = actor.unwrap_or("Someone");
     Some(match action {
         GroupNotificationAction::Add { participants, .. } => {
-            format!("{who} added {}", names(participants))
+            format!("{who} added {}", names(participants, named))
         }
         // Leaving and being removed read very differently, and the difference
         // is whether the actor is the only participant named.
@@ -34,14 +59,14 @@ pub fn describe(
             {
                 format!("{who} left")
             } else {
-                format!("{who} removed {}", names(participants))
+                format!("{who} removed {}", names(participants, named))
             }
         }
         GroupNotificationAction::Promote { participants } => {
-            format!("{who} made {} an admin", names(participants))
+            format!("{who} made {} an admin", names(participants, named))
         }
         GroupNotificationAction::Demote { participants } => {
-            format!("{who} removed {} as admin", names(participants))
+            format!("{who} removed {} as admin", names(participants, named))
         }
         GroupNotificationAction::Subject { subject, .. } => {
             format!("{who} changed the group name to \"{subject}\"")
@@ -75,22 +100,28 @@ pub fn describe(
 }
 
 /// A participant list as a reader would say it.
-fn names(participants: &[GroupParticipantInfo]) -> String {
+fn names(participants: &[GroupParticipantInfo], named: &ResolvedNames) -> String {
     match participants {
         [] => "someone".to_string(),
-        [one] => name_of(one).to_string(),
-        [first, second] => format!("{} and {}", name_of(first), name_of(second)),
+        [one] => name_of(one, named).to_string(),
+        [first, second] => format!("{} and {}", name_of(first, named), name_of(second, named)),
         // Past two, counting is more use than reciting.
-        [first, rest @ ..] => format!("{} and {} others", name_of(first), rest.len()),
+        [first, rest @ ..] => format!("{} and {} others", name_of(first, named), rest.len()),
     }
 }
 
-/// A participant's display name, falling back to their number.
-fn name_of(participant: &GroupParticipantInfo) -> &str {
-    participant
-        .display_name
-        .as_deref()
-        .filter(|name| !name.is_empty())
+/// A participant's name: the one every other surface uses, then the label the
+/// server attached, then their number.
+fn name_of<'a>(participant: &'a GroupParticipantInfo, named: &'a ResolvedNames) -> &'a str {
+    named
+        .get(&participant.jid.to_string())
+        .map(String::as_str)
+        .or_else(|| {
+            participant
+                .display_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+        })
         .unwrap_or(participant.jid.user.as_str())
 }
 
@@ -100,11 +131,20 @@ fn name_of(participant: &GroupParticipantInfo) -> &str {
 /// own changes: nothing in this process knows which account is linked — the
 /// device identity lives behind the daemon — and guessing at it would be
 /// worse than naming everyone the same way.
-pub fn actor_name(participant: Option<&Jid>, participant_username: Option<&str>) -> Option<String> {
+pub fn actor_name(
+    participant: Option<&Jid>,
+    participant_username: Option<&str>,
+    named: &ResolvedNames,
+) -> Option<String> {
     let participant = participant?;
-    participant_username
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
+    named
+        .get(&participant.to_string())
+        .cloned()
+        .or_else(|| {
+            participant_username
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
         .or_else(|| Some(participant.user.to_string()))
 }
 
@@ -152,7 +192,7 @@ mod tests {
             subject_time: None,
         };
         assert_eq!(
-            describe(&action, Some("Ana"), None).as_deref(),
+            describe(&action, Some("Ana"), None, &ResolvedNames::new()).as_deref(),
             Some("Ana changed the group name to \"Trip\"")
         );
     }
@@ -168,7 +208,7 @@ mod tests {
             reason: None,
         };
         assert_eq!(
-            describe(&action, Some("Ana"), Some(&jid("1"))).as_deref(),
+            describe(&action, Some("Ana"), Some(&jid("1")), &ResolvedNames::new()).as_deref(),
             Some("Ana left")
         );
     }
@@ -180,7 +220,7 @@ mod tests {
             reason: None,
         };
         assert_eq!(
-            describe(&action, Some("Ana"), Some(&jid("1"))).as_deref(),
+            describe(&action, Some("Ana"), Some(&jid("1")), &ResolvedNames::new()).as_deref(),
             Some("Ana removed Bruno")
         );
     }
@@ -194,7 +234,7 @@ mod tests {
             reason: None,
         };
         assert_eq!(
-            describe(&action, Some("Ana"), Some(&jid("1"))).as_deref(),
+            describe(&action, Some("Ana"), Some(&jid("1")), &ResolvedNames::new()).as_deref(),
             Some("Ana removed Ana")
         );
     }
@@ -210,7 +250,7 @@ mod tests {
             reason: None,
         };
         assert_eq!(
-            describe(&action, Some("You"), None).as_deref(),
+            describe(&action, Some("You"), None, &ResolvedNames::new()).as_deref(),
             Some("You added Ana and 2 others")
         );
     }
@@ -222,7 +262,7 @@ mod tests {
             reason: None,
         };
         assert_eq!(
-            describe(&action, None, None).as_deref(),
+            describe(&action, None, None, &ResolvedNames::new()).as_deref(),
             Some("Someone added 5511999")
         );
     }
@@ -230,7 +270,7 @@ mod tests {
     #[test]
     fn bookkeeping_gets_no_row() {
         let action = GroupNotificationAction::RevokeInvite;
-        assert!(describe(&action, Some("Ana"), None).is_none());
+        assert!(describe(&action, Some("Ana"), None, &ResolvedNames::new()).is_none());
     }
 
     #[test]
@@ -245,14 +285,14 @@ mod tests {
     fn an_actor_is_named_by_the_server_label_or_their_number() {
         let actor: Jid = "5511999@s.whatsapp.net".parse().unwrap();
         assert_eq!(
-            actor_name(Some(&actor), Some("ana")).as_deref(),
+            actor_name(Some(&actor), Some("ana"), &ResolvedNames::new()).as_deref(),
             Some("ana")
         );
         assert_eq!(
-            actor_name(Some(&actor), None).as_deref(),
+            actor_name(Some(&actor), None, &ResolvedNames::new()).as_deref(),
             Some("5511999"),
             "no label is still someone"
         );
-        assert!(actor_name(None, Some("ana")).is_none());
+        assert!(actor_name(None, Some("ana"), &ResolvedNames::new()).is_none());
     }
 }

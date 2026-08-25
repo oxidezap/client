@@ -195,7 +195,7 @@ impl WhatsAppApp {
             cx.notify();
             return;
         };
-        let local_id = Self::next_local_id("local_audio");
+        let _ = client;
         // Taken, not read. Recording is a way of answering, so an open reply
         // draft belongs to *this* send — and leaving it armed made it attach
         // itself to whatever was typed next, which is the half of the bug
@@ -207,11 +207,40 @@ impl WhatsAppApp {
             preview: draft.preview,
             kind: None,
         });
+        self.send_voice_note(&jid, ogg_data, waveform, duration_secs, quoted);
+        // The draft is gone from the input as well as from the model.
+        if let Some(input) = &self.input_area {
+            input.update(cx, |view, cx| view.set_reply(None, cx));
+        }
+        self.recording_state = RecordingState::Idle;
+        self.update_input_recording(cx);
+        info!("PTT audio sent successfully");
+        cx.notify();
+    }
+
+    /// Send encoded opus into a chat and draw the bubble for it.
+    ///
+    /// Shared with the retry path, because a voice note that failed still
+    /// holds everything it needs to go again — the encoded bytes, its length
+    /// and its waveform — and re-encoding is not something a retry can do.
+    pub(super) fn send_voice_note(
+        &mut self,
+        jid: &str,
+        ogg_data: Vec<u8>,
+        waveform: Vec<u8>,
+        duration_secs: u32,
+        quoted: Option<QuotedMessage>,
+    ) {
+        let Some(client) = &self.client else {
+            warn!("Cannot send audio: client is unavailable");
+            return;
+        };
+        let local_id = Self::next_local_id("local_audio");
         // Shared with the bubble below rather than moved: our own voice note
         // should draw the same shape the recipient sees, not a flat bar.
         let envelope = Arc::new(waveform.clone());
         client.send_audio_message(
-            &jid,
+            jid,
             ogg_data.clone(),
             duration_secs,
             waveform,
@@ -243,17 +272,9 @@ impl WhatsAppApp {
         // where the recipient sees a reply.
         msg.quoted = quoted;
 
-        if self.add_message_to_chat(&jid, msg) {
+        if self.add_message_to_chat(jid, msg) {
             self.scroll_to_last_message();
         }
-        // The draft is gone from the input as well as from the model.
-        if let Some(input) = &self.input_area {
-            input.update(cx, |view, cx| view.set_reply(None, cx));
-        }
-        self.recording_state = RecordingState::Idle;
-        self.update_input_recording(cx);
-        info!("PTT audio sent successfully");
-        cx.notify();
     }
     /// Cancel recording without sending
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {

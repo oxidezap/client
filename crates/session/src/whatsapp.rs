@@ -706,14 +706,40 @@ impl WhatsAppClient {
             // would notice become a row; the rest is bookkeeping, and a line
             // for each would bury the conversation.
             Event::GroupUpdate(update) => {
+                // A notice is a sentence about people who also have bubbles
+                // and a typing line on the same screen. Naming them from the
+                // stanza alone gave one person two names on one conversation:
+                // the push name here, the address-book name everywhere else.
+                let mut named = crate::group_notice::ResolvedNames::new();
+                let mentioned = update
+                    .participant
+                    .iter()
+                    .cloned()
+                    .chain(
+                        crate::group_notice::participants_of(&update.action)
+                            .iter()
+                            .map(|participant| participant.jid.clone()),
+                    )
+                    .collect::<Vec<_>>();
+                for jid in mentioned {
+                    let key = jid.to_string();
+                    if named.contains_key(&key) {
+                        continue;
+                    }
+                    if let Some(name) = names.known(&client, &jid, None).await {
+                        named.insert(key, name);
+                    }
+                }
                 let actor = crate::group_notice::actor_name(
                     update.participant.as_ref(),
                     update.participant_username.as_deref(),
+                    &named,
                 );
                 if let Some(text) = crate::group_notice::describe(
                     &update.action,
                     actor.as_deref(),
                     update.participant.as_ref(),
+                    &named,
                 ) {
                     let _ = ui_tx.send(UiEvent::SystemNotice {
                         chat_jid: update.group_jid.to_string(),
@@ -2007,6 +2033,9 @@ impl WhatsAppClient {
                     }
                 }
                 merge_alias_history_messages(existing, msgs, entry.unread_count.max(0) as u32);
+                // A page is assigned rather than added a row at a time, so
+                // the naming `add_message` does per row has to be run over it.
+                existing.name_quoted_authors();
                 existing.manually_unread |= entry.unread_count < 0;
                 existing.set_name_if_better(name, name_priority);
                 continue;
@@ -2042,6 +2071,10 @@ impl WhatsAppClient {
                     remaining -= 1;
                 }
             }
+            // After the sender names, because the best answer for "who wrote
+            // the message this is replying to" is usually the reply's own
+            // neighbour, and it has only just been named.
+            chat.name_quoted_authors();
             chat.last_message =
                 history_preview(entry.last_message_preview.clone(), chat.messages.last());
             chats.push(chat);
@@ -2123,7 +2156,17 @@ impl WhatsAppClient {
                 continue;
             };
             let identity = names.identity(client, &jid).await;
-            msg.sender_name = Some(names.resolve(chat_store, &jid, None, &identity).await.0);
+            // The same answer the live path gives, and for the same reason a
+            // number is not one: this field only ever gains a value, because
+            // `Chat::update_participant` fills blanks. A row stamped with a
+            // phone number could never be renamed by the push name that
+            // arrives a second later, and the same person would read as a
+            // number on their reloaded bubbles and by name on their new ones.
+            // Drawing a number where nothing is known is the *renderer's* job.
+            msg.sender_name = match names.resolve(chat_store, &jid, None, &identity).await {
+                (_, crate::names::priority::NONE) => None,
+                (name, _) => Some(name),
+            };
         }
     }
 }
@@ -2187,7 +2230,11 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             data_is_preview: has_preview && downloadable.is_some(),
             waveform: None,
             downloadable,
-            is_animated: !has_preview && sticker.is_animated.unwrap_or(false),
+            // What the sticker *is*, not what the stand-in bytes are: the
+            // preview is a still, but the flag describes the file that
+            // replaces it, and `data_is_preview` beside it already says which
+            // of the two is in hand.
+            is_animated: sticker.is_animated.unwrap_or(false),
             duration_secs: None,
         });
     }

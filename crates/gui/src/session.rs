@@ -683,13 +683,11 @@ fn fill(media: &mut Option<MediaContent>) {
         return;
     };
     match media_path(&key).map(std::fs::read) {
-        Some(Ok(bytes)) => {
-            media.data = Arc::new(bytes);
-            // The daemon only caches the real thing, so whatever came out of
-            // the cache is it — including when the row arrived carrying a
-            // fallback thumbnail, which is the shape a reload takes.
-            media.data_is_preview = false;
-        }
+        // The daemon only caches the real thing, so whatever came out of the
+        // cache is it — including when the row arrived carrying a fallback
+        // thumbnail, which is the shape a reload takes. The metadata beside
+        // the bytes described that thumbnail, and has to move with them.
+        Some(Ok(bytes)) => media.adopt_full_bytes(Arc::new(bytes)),
         // The renderer falls back to offering the download, which is the same
         // thing it does for media that was never cached.
         Some(Err(e)) => debug!("media {key} is not in the cache: {e}"),
