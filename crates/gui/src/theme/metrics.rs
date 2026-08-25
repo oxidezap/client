@@ -395,7 +395,25 @@ impl Metrics {
     /// no reason to be related, and tying them made the call card's width a
     /// remote control for a settings pane.
     pub fn preset_card_width(&self) -> Pixels {
-        self.dense(150.0)
+        self.dense(184.0)
+    }
+
+    /// The miniature window inside a preset card.
+    ///
+    /// Its own token rather than an avatar size: the preview is a picture of
+    /// a layout, and it wants the shape of a window — wider than tall — not
+    /// the shape of a face.
+    pub fn preset_preview_height(&self) -> Pixels {
+        self.dense(84.0)
+    }
+
+    /// The Settings side navigation.
+    ///
+    /// Not the call card's width. The two were the same number and neither
+    /// was chosen for the other, so widening a floating card over a video
+    /// call would have moved a settings column.
+    pub fn settings_nav_width(&self) -> Pixels {
+        self.dense(248.0)
     }
 
     // ---- call card ----------------------------------------------------

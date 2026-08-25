@@ -84,14 +84,17 @@ fn render_preset_card(
     // A card, but a command: choosing a preset applies it. As a `div` these
     // were the one settings control a keyboard could not reach, which is a
     // poor showing for the accessibility pane's neighbour.
+    //
+    // The whole card is one child, and the column lives inside it. A
+    // `Button` lays its children out in a centred row of its own — styling
+    // the button as a column styles the frame and not the content — so a
+    // preview with a relative width had nothing to be relative to and
+    // collapsed into a strip beside its own label.
     Button::new(SharedString::from(format!("preset-{}", preset.id())))
         .ghost()
         .selected(is_selected)
         .w(metrics.preset_card_width())
         .h_auto()
-        .flex()
-        .flex_col()
-        .gap(metrics.space_md())
         .p(metrics.space_md())
         .rounded(metrics.radius_lg())
         .border_1()
@@ -103,23 +106,31 @@ fn render_preset_card(
                 el.border_color(cx.theme().border)
             }
         })
-        .child(render_swatch(&palette, metrics, cx))
         .child(
             div()
+                .w_full()
                 .flex()
-                .items_center()
-                .justify_between()
+                .flex_col()
                 .gap(metrics.space_md())
-                .text_size(metrics.text_small())
-                .text_color(cx.theme().foreground)
-                .child(preset.label())
-                .when(is_selected, |el| {
-                    el.child(
-                        Icon::new(IconName::Check)
-                            .size(metrics.icon_small())
-                            .text_color(cx.theme().primary),
-                    )
-                }),
+                .child(render_swatch(&palette, metrics, cx))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(metrics.space_md())
+                        .text_size(metrics.text_small())
+                        .text_color(cx.theme().foreground)
+                        .child(preset.label())
+                        .when(is_selected, |el| {
+                            el.child(
+                                Icon::new(IconName::Check)
+                                    .size(metrics.icon_small())
+                                    .text_color(cx.theme().primary),
+                            )
+                        }),
+                ),
         )
         .on_click(move |_, window, cx| {
             entity.update(cx, |app, cx| app.set_theme_preset(preset, window, cx));
@@ -139,10 +150,13 @@ fn render_swatch(palette: &Palette, metrics: Metrics, cx: &App) -> impl IntoElem
     };
 
     div()
-        .h(metrics.avatar_call())
+        .w_full()
+        .h(metrics.preset_preview_height())
         .rounded(metrics.radius_md())
         .overflow_hidden()
         .flex()
+        .border_1()
+        .border_color(hsla(palette.border))
         .bg(hsla(palette.background))
         .child(
             div()
@@ -170,13 +184,16 @@ fn render_swatch(palette: &Palette, metrics: Metrics, cx: &App) -> impl IntoElem
         )
 }
 
+/// Where the row says the file has gone its own way.
+///
+/// Not a command — there is nothing to switch *to* — so it is a card and not
+/// a button, but it is the same card: same width, same preview height, so
+/// the row does not change shape the moment a hand-edit lands.
 fn render_custom_card(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     div()
         .w(metrics.preset_card_width())
         .flex()
         .flex_col()
-        .items_center()
-        .justify_center()
         .gap(metrics.space_md())
         .p(metrics.space_md())
         .rounded(metrics.radius_lg())
@@ -184,12 +201,34 @@ fn render_custom_card(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
         .border_color(cx.theme().primary)
         .bg(cx.theme().list_active)
         .child(
-            Icon::new(IconName::Palette)
-                .size(metrics.icon())
-                .text_color(cx.theme().primary),
+            div()
+                .w_full()
+                .h(metrics.preset_preview_height())
+                .rounded(metrics.radius_md())
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(metrics.space_xs())
+                .bg(cx.theme().background)
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(
+                    Icon::new(IconName::Palette)
+                        .size(metrics.icon())
+                        .text_color(cx.theme().primary),
+                )
+                .child(
+                    div()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_size(metrics.text_micro())
+                        .text_color(cx.theme().muted_foreground)
+                        .child("edited by hand"),
+                ),
         )
         .child(
             div()
+                .w_full()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().foreground)
                 .child("Custom"),

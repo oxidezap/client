@@ -38,7 +38,7 @@ pub fn render_settings_view(
         return div().into_any_element();
     };
     let section = settings.section;
-    // A 340px column beside a pane needs a window with 340px to spare. On a
+    // A fixed column beside a pane needs a window with room to spare. On a
     // phone it left the Appearance previews a few characters wide, so the
     // sections become a strip above the pane instead and the screen is one
     // column all the way down.
@@ -94,7 +94,7 @@ fn render_nav(
     let close_entity = entity.clone();
 
     div()
-        .w(metrics.call_card_width())
+        .w(metrics.settings_nav_width())
         .flex_shrink_0()
         .flex()
         .flex_col()
@@ -151,6 +151,11 @@ fn render_nav(
 /// `Button`s, was reachable from the keyboard. The selection bar is drawn as a
 /// child rather than through a variant, because it is the same bar the
 /// conversation list uses and "where am I" should read the same way in both.
+///
+/// The row is one child rather than two, because a `Button` centres its own
+/// content: `justify_start` on the frame left seven destinations reading down
+/// the middle of a column, which is neither where a list of places starts nor
+/// where the eye looks for the next one.
 fn render_nav_item(
     section: SettingsSection,
     is_selected: bool,
@@ -163,9 +168,7 @@ fn render_nav_item(
         .selected(is_selected)
         .w_full()
         .h(metrics.avatar_header())
-        .justify_start()
         .relative()
-        .gap(metrics.space_lg())
         .px(metrics.space_lg())
         .rounded(metrics.radius_md())
         .text_size(metrics.text_secondary())
@@ -182,11 +185,19 @@ fn render_nav_item(
             )
         })
         .child(
-            Icon::new(icon_for(section))
-                .size(metrics.icon_small())
-                .flex_shrink_0(),
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_start()
+                .gap(metrics.space_lg())
+                .child(
+                    Icon::new(icon_for(section))
+                        .size(metrics.icon_small())
+                        .flex_shrink_0(),
+                )
+                .child(section.label()),
         )
-        .child(section.label())
         .on_click(move |_, _window, cx| {
             entity.update(cx, |app, cx| app.set_settings_section(section, cx));
         })
