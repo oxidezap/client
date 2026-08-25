@@ -478,6 +478,13 @@ pub struct WhatsAppApp {
     /// Which playback the completion still in flight belongs to. See
     /// `stop_current_media`.
     playback_epoch: usize,
+    /// The deadline `status_tick` is waiting on, so an earlier one that
+    /// arrives later can replace it rather than queue behind it.
+    status_tick_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Status updates watched in this window. Local by design — there is no
+    /// receipt to send — and therefore this window's job to remember across a
+    /// hydration merge, which replaces those rows from the store.
+    watched_status: std::collections::HashSet<String>,
     /// Focus target for the fullscreen viewer, which owns the arrow keys
     /// only while it is up.
     viewer_focus: FocusHandle,
@@ -708,6 +715,8 @@ impl WhatsAppApp {
             call_focus: cx.focus_handle(),
             keyboard_owner: KeyboardOwner::Composer,
             playback_epoch: 0,
+            status_tick_at: None,
+            watched_status: std::collections::HashSet::new(),
             viewer_focus: cx.focus_handle(),
             chat_search_input: None, // Created lazily when window is available
             media_viewer: None,
@@ -1110,6 +1119,24 @@ impl WhatsAppApp {
         if Self::is_status_jid(chat_jid) {
             *self.status_feed_cache.borrow_mut() = None;
         }
+    }
+
+    /// Everything that has to stop when the connected view goes away.
+    ///
+    /// The controls that stop them are drawn by that view, so anything still
+    /// running when it is replaced has no way to be stopped: a recording
+    /// holds the microphone open, ticks every 100ms and grows a buffer, and
+    /// a voice note plays on over a screen that is now an error message.
+    /// Three transitions leave that view — a disconnect, an error and a
+    /// logout — which is three chances to forget, so it is one method.
+    ///
+    /// Not [`AppState::Offline`]: that keeps the conversation on screen and
+    /// only refuses to send.
+    fn leave_connected_view(&mut self, cx: &mut Context<Self>) {
+        if self.recording_state != RecordingState::Idle {
+            self.cancel_recording(cx);
+        }
+        self.stop_current_media();
     }
 
     /// Put the caret where typing goes.
@@ -2178,6 +2205,14 @@ impl WhatsAppApp {
     /// One task rather than two, and it only runs while there is something to
     /// watch: it stops as soon as pairing ends, unless a theme file exists to
     /// keep watching.
+    /// Start polling `theme.json`, whatever the connection is doing.
+    ///
+    /// The same heartbeat drives the pairing countdown, which is why it is
+    /// armed from there too; this is the other reason it has to run.
+    pub fn watch_theme_file(&mut self, cx: &mut Context<Self>) {
+        self.ensure_heartbeat(cx);
+    }
+
     fn ensure_heartbeat(&mut self, cx: &mut Context<Self>) {
         if self.heartbeat.is_some() {
             return;

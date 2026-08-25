@@ -153,12 +153,19 @@ impl WhatsAppApp {
     /// had already gone. One timer for the earliest of them, re-armed on each
     /// firing rather than one per update.
     pub(super) fn ensure_status_tick(&mut self, cx: &mut Context<Self>) {
-        if self.status_tick.is_some() {
-            return;
-        }
         let Some(when) = self.status_feed().next_expiry() else {
             return;
         };
+        // An armed timer is not necessarily the right one. An update that
+        // arrives out of order, or a history load that brings an older run in
+        // behind a newer one, can put the *earliest* deadline behind the one
+        // already waited on — and the timer that fires late leaves the lapsed
+        // update in the list, in the ring and in the badge until the later
+        // one expires. Re-armed only when the answer moved earlier, so the
+        // ordinary case still costs one comparison.
+        if self.status_tick.is_some() && self.status_tick_at.is_some_and(|armed| armed <= when) {
+            return;
+        }
         // Saturating, and never zero: a lapse already past still needs one
         // turn of the loop to be noticed, and a negative duration would make
         // the timer fire in a tight loop.
@@ -167,10 +174,12 @@ impl WhatsAppApp {
             .unwrap_or(std::time::Duration::ZERO)
             .max(std::time::Duration::from_secs(1));
 
+        self.status_tick_at = Some(when);
         self.status_tick = Some(cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
             smol::Timer::after(wait).await;
             let _ = entity.update(cx, |app, cx| {
                 app.status_tick = None;
+                app.status_tick_at = None;
                 // Read before the feed is dropped: afterwards there is no
                 // way to ask what was on screen.
                 let shown = app.shown_status_message_id();
@@ -265,16 +274,28 @@ impl WhatsAppApp {
         self.stop_status_media(shown);
     }
 
-    /// Stop playback if it belongs to `message_id`.
+    /// Stop playback if it belongs to `message_id`, and drop a fetch that was
+    /// going to start it.
     ///
     /// Scoped rather than a bare `stop_current_media`: a voice note started in
     /// a conversation keeps playing while its listener browses, and leaving a
     /// status is no reason to cut it off.
+    ///
+    /// The pending request is the other half. A status video that is still
+    /// downloading owns nothing yet — no player, no `active_media` — and its
+    /// completion autoplays on the strength of `pending_media_request` alone,
+    /// so leaving during the download started a video behind whatever the
+    /// window showed next. Both halves are the same act of leaving, so they
+    /// are the same method.
     fn stop_status_media(&mut self, message_id: Option<String>) {
-        if let Some(id) = message_id
-            && self.active_media.message_id() == Some(id.as_str())
-        {
+        let Some(id) = message_id else {
+            return;
+        };
+        if self.active_media.message_id() == Some(id.as_str()) {
             self.stop_current_media();
+        }
+        if self.pending_media_request.as_deref() == Some(id.as_str()) {
+            self.pending_media_request = None;
         }
     }
 
@@ -321,7 +342,33 @@ impl WhatsAppApp {
             return;
         }
         message.is_read = true;
+        // Remembered as well as set. Watching a status is local by design —
+        // there is no receipt to send — but the *store* is what a hydration
+        // merge replaces these rows from, and it has never been told, so the
+        // ring and the badge came back on the next reload. The store cannot
+        // know about a view it was never told about; this window can.
+        self.watched_status.insert(message_id);
         self.invalidate_chat_cache();
+    }
+
+    /// Put the locally watched updates back after a hydration merge.
+    ///
+    /// The store's copy of a status row is honest — it says unread, because
+    /// nothing ever told it otherwise — so re-applying is what keeps
+    /// "watched" from being undone by a reload or a reconnect.
+    pub(super) fn restore_watched_status(&mut self) {
+        if self.watched_status.is_empty() {
+            return;
+        }
+        let watched = &self.watched_status;
+        let Some(chat) = self.chats.iter_mut().find(|chat| chat.is_status) else {
+            return;
+        };
+        for message in &mut chat.messages {
+            if !message.is_read && watched.contains(&message.id) {
+                message.is_read = true;
+            }
+        }
     }
 
     /// Fetch the update on screen, if its bytes are not here.

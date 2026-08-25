@@ -73,6 +73,14 @@ fn main() {
                 },
                 |window, cx| {
                     let view = cx.new(WhatsAppApp::new);
+                    // The theme file is watched for the window's whole life,
+                    // not for the part of it that is pairing. Armed from the
+                    // pairing screen alone, a window that opened onto an
+                    // already-linked daemon — the ordinary case, since the
+                    // daemon outlives the window — never polled it at all,
+                    // and edits to an existing `theme.json` did nothing until
+                    // the next restart.
+                    view.update(cx, |app, cx| app.watch_theme_file(cx));
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             ) {

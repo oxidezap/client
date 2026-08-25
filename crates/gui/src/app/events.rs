@@ -77,6 +77,9 @@ impl WhatsAppApp {
                 }
                 self.chats
                     .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
+                // The merge above took the store's word for every row, and
+                // the store was never told which updates have been watched.
+                self.restore_watched_status();
                 // Count-based cache guards can't see reordering/merges.
                 self.invalidate_chat_cache();
                 // Whatever arrived before its conversation did. A group
@@ -136,10 +139,12 @@ impl WhatsAppApp {
                 cx.notify();
             }
             UiEvent::LoggedOut(message) => {
+                self.leave_connected_view(cx);
                 self.app_state = AppState::LoggedOut { message };
                 cx.notify();
             }
             UiEvent::Disconnected(reason) => {
+                self.leave_connected_view(cx);
                 self.app_state = AppState::Error(reason);
                 // The screen offers a retry; arming it is what makes the
                 // countdown on that button mean something.
@@ -147,6 +152,7 @@ impl WhatsAppApp {
                 cx.notify();
             }
             UiEvent::Error(msg) => {
+                self.leave_connected_view(cx);
                 self.app_state = AppState::Error(msg);
                 self.schedule_retry(cx);
                 cx.notify();

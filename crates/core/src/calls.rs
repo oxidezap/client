@@ -544,6 +544,29 @@ impl CallState {
         false
     }
 
+    /// Whether `stage` is still the call this state describes.
+    ///
+    /// Not the same question as [`holds`](Self::holds), because a call this
+    /// device placed is drawn before it exists on the wire: it is given a
+    /// local id, and the server's answer renames it. By id alone that rename
+    /// reads as the call ending — so a front end wrote down an unanswered
+    /// outgoing call for a call that was at that moment ringing, and wrote a
+    /// second record when it really ended.
+    ///
+    /// An outgoing call is therefore matched by who it is *to*, which is the
+    /// one thing the rename cannot change and the one thing a placed call has
+    /// from the start.
+    pub fn still_holds(&self, stage: &Stage) -> bool {
+        if self.holds(stage.call_id()) {
+            return true;
+        }
+        matches!(
+            (stage, &self.stage),
+            (Stage::Outgoing(mine), Some(Stage::Outgoing(theirs)))
+                if mine.recipient_jid == theirs.recipient_jid
+        )
+    }
+
     /// Whether this state names `call_id` anywhere — as the stage or parked
     /// behind it.
     pub fn holds(&self, call_id: &str) -> bool {
@@ -831,6 +854,38 @@ mod tests {
 
         assert!(state.fail_outgoing_to("c@s.whatsapp.net").is_none());
         assert_eq!(state.outgoing().map(|c| c.call_id.as_str()), Some("MINE"));
+    }
+
+    /// The window draws the call it placed before the server has answered,
+    /// under a local id. The answer renames it — and by id alone that read as
+    /// the call ending, so the conversation got "outgoing, not answered" for
+    /// a call that was ringing at that moment.
+    #[test]
+    fn a_call_being_given_its_real_id_has_not_ended() {
+        let mut drawn = CallState::default();
+        drawn.set_outgoing(outgoing("ui-call-1"));
+        let stage = drawn.stage().expect("the call this window drew").clone();
+
+        let mut named = CallState::default();
+        named.set_outgoing(outgoing("REAL"));
+
+        assert!(!named.holds(stage.call_id()), "the id really did change");
+        assert!(
+            named.still_holds(&stage),
+            "but it is the same call to the same person"
+        );
+
+        let mut elsewhere = CallState::default();
+        elsewhere.set_outgoing(OutgoingCall::new(
+            "REAL".to_string(),
+            "c@s.whatsapp.net".to_string(),
+            "Carla".to_string(),
+            false,
+        ));
+        assert!(
+            !elsewhere.still_holds(&stage),
+            "a call to someone else is a different call"
+        );
     }
 
     #[test]

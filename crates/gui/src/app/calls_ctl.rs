@@ -251,7 +251,7 @@ impl WhatsAppApp {
         let ended = self
             .call_state
             .stage()
-            .filter(|stage| !calls.holds(stage.call_id()))
+            .filter(|stage| !calls.still_holds(stage))
             .cloned();
         if let Some(stage) = ended {
             // Unless the daemon says there is nothing to write down: another
