@@ -349,7 +349,15 @@ fn render_chat_area(
                     render_return_banner(name, elapsed, entity.clone(), metrics, cx)
                 }))
                 .children(message_cache.map(|cache| {
-                    render_message_list(cache, message_list, entity.clone(), is_group, layout, cx)
+                    render_message_list(
+                        cache,
+                        message_list,
+                        entity.clone(),
+                        is_group,
+                        is_own_number,
+                        layout,
+                        cx,
+                    )
                 }))
                 .map(|el| {
                     if is_offline {

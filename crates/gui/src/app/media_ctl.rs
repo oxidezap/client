@@ -130,13 +130,21 @@ impl WhatsAppApp {
         self.playback_speed = SPEEDS[next];
         self.audio_player.set_speed(self.playback_speed);
 
-        if self.audio_player.is_playing()
-            && let (Some(message_id), Some(bytes)) =
-                (self.audio_owner.clone(), self.audio_source.clone())
+        // Whether it is *playing* is not the question: `set_speed` only takes
+        // effect the next time a clip is prepared, so a paused note resumed
+        // afterwards ran at the old rate while the chip and the clock had
+        // already moved to the new one. What matters is whether a clip is
+        // loaded — and one that was paused is put back paused.
+        if let (Some(message_id), Some(bytes)) =
+            (self.audio_owner.clone(), self.audio_source.clone())
         {
             let at = self.audio_player.progress();
+            let was_playing = self.audio_player.is_playing();
             self.play_audio(message_id, (*bytes).clone(), cx);
             self.audio_player.seek(at);
+            if !was_playing {
+                self.audio_player.pause();
+            }
         }
         cx.notify();
     }

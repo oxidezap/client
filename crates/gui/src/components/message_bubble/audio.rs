@@ -10,12 +10,11 @@ use std::rc::Rc;
 
 use gpui::{
     App, Bounds, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, canvas, div,
-    prelude::FluentBuilder as _, px,
+    ParentElement, Pixels, SharedString, Styled, canvas, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon};
+use gpui_component::{Disableable as _, Icon, Sizable as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::ProductIcon;
@@ -213,6 +212,10 @@ fn render_waveform(
 }
 
 /// 1× / 1.5× / 2×, cycled by clicking.
+///
+/// A `Button`, because changing playback speed is a command: a styled `div`
+/// carries no focus handle and no keyboard activation, so the control was
+/// reachable with a pointer and by nothing else.
 fn render_speed_chip(
     message_id: &str,
     speed: f32,
@@ -222,30 +225,30 @@ fn render_speed_chip(
 ) -> impl IntoElement + use<> {
     let is_default = (speed - 1.0).abs() < f32::EPSILON;
 
-    div()
+    Button::new(
         // Per message: a GPUI id is scoped to its first identified ancestor,
         // and every voice note in a conversation is a sibling of the rest, so
         // one constant made them all the same element.
-        .id(SharedString::from(format!("playback-speed-{message_id}")))
-        .flex_shrink_0()
-        .px(metrics.space_sm())
-        .rounded_full()
-        .border_1()
-        .border_color(cx.theme().border)
-        .font_family(cx.theme().mono_font_family.clone())
-        .text_size(metrics.text_micro())
-        // Quiet at 1×, lit once it departs from it: the chip only needs to
-        // draw attention when it is doing something.
-        .text_color(if is_default {
-            cx.theme().muted_foreground
-        } else {
-            cx.theme().primary
-        })
-        .cursor_pointer()
-        .child(format_speed(speed))
-        .on_click(move |_, _window, cx| {
-            entity.update(cx, |app, cx| app.cycle_playback_speed(cx));
-        })
+        SharedString::from(format!("playback-speed-{message_id}")),
+    )
+    .label(format_speed(speed))
+    .outline()
+    .xsmall()
+    .rounded_full()
+    .flex_shrink_0()
+    .font_family(cx.theme().mono_font_family.clone())
+    .text_size(metrics.text_micro())
+    // Quiet at 1×, lit once it departs from it: the chip only needs to draw
+    // attention when it is doing something.
+    .text_color(if is_default {
+        cx.theme().muted_foreground
+    } else {
+        cx.theme().primary
+    })
+    .tooltip("Playback speed")
+    .on_click(move |_, _window, cx| {
+        entity.update(cx, |app, cx| app.cycle_playback_speed(cx));
+    })
 }
 
 /// Where a click at `x` falls along `bounds`, as `0.0..=1.0`.

@@ -43,6 +43,9 @@ pub struct BubbleProps {
     pub message: ChatMessage,
     pub playing_message_id: Option<String>,
     pub is_group: bool,
+    /// Whether the conversation is with your own number, which is what makes
+    /// a sent message read the moment it lands.
+    pub is_own_number: bool,
     /// First message of a run by this author, which is what earns the sender
     /// name and the wider gap above.
     pub starts_run: bool,
@@ -99,7 +102,7 @@ pub fn render_message_bubble(
     let bubble_id: SharedString = format!("msg-{message_id}").into();
     let content: SharedString = message.content.clone().into();
     let time: SharedString = format_time_local(&message.timestamp).into();
-    let status = message.delivery();
+    let status = message.delivery_in(props.is_own_number);
     let is_playing = props.playing_message_id.as_deref() == Some(message_id.as_str());
     let has_reactions = !message.reactions.is_empty();
 

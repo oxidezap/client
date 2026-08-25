@@ -70,9 +70,23 @@ impl WhatsAppApp {
             message.content.clone()
         };
 
+        // `sender` is sent as the quote's participant, so it has to be a JID.
+        // A message this window composed carries the literal `"Me"` — that is
+        // what `ChatMessage::new_outgoing` writes, and the optimistic row
+        // survives the rename its id gets — so replying to something you had
+        // only just sent quoted an author no group has.
+        let sender = if message.is_from_me {
+            self.account_jid
+                .clone()
+                .or_else(|| self.account_lid.clone())
+                .unwrap_or_else(|| message.sender.clone())
+        } else {
+            message.sender.clone()
+        };
+
         let draft = ReplyDraft {
             message_id: message_id.to_string(),
-            sender: message.sender.clone(),
+            sender,
             sender_name,
             preview,
         };

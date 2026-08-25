@@ -143,6 +143,14 @@ fn render_nav(
         .child(render_versions(metrics, cx))
 }
 
+/// One destination in the side nav.
+///
+/// A `Button`, because picking a section is a command and a styled `div`
+/// carries neither focus nor keyboard activation — which left the whole
+/// desktop navigation pointer-only while the phone strip beside it, built from
+/// `Button`s, was reachable from the keyboard. The selection bar is drawn as a
+/// child rather than through a variant, because it is the same bar the
+/// conversation list uses and "where am I" should read the same way in both.
 fn render_nav_item(
     section: SettingsSection,
     is_selected: bool,
@@ -150,38 +158,28 @@ fn render_nav_item(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    div()
-        .id(SharedString::from(format!("settings-nav-{}", section.id())))
-        .relative()
+    Button::new(SharedString::from(format!("settings-nav-{}", section.id())))
+        .ghost()
+        .selected(is_selected)
+        .w_full()
         .h(metrics.avatar_header())
-        .flex()
-        .items_center()
+        .justify_start()
+        .relative()
         .gap(metrics.space_lg())
         .px(metrics.space_lg())
         .rounded(metrics.radius_md())
-        .cursor_pointer()
         .text_size(metrics.text_secondary())
-        // Selection is the same bar-plus-fill the conversation list uses, so
-        // "where am I" reads the same way in both places.
-        .map(|el| {
-            if is_selected {
-                el.bg(cx.theme().list_active)
-                    .text_color(cx.theme().foreground)
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top(metrics.space_md())
-                            .bottom(metrics.space_md())
-                            .w(metrics.selection_bar_width())
-                            .rounded_r(metrics.selection_bar_width())
-                            .bg(cx.theme().primary),
-                    )
-            } else {
-                let hover = cx.theme().list_hover;
-                el.text_color(cx.theme().muted_foreground)
-                    .hover(move |s| s.bg(hover))
-            }
+        .when(is_selected, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(metrics.space_md())
+                    .bottom(metrics.space_md())
+                    .w(metrics.selection_bar_width())
+                    .rounded_r(metrics.selection_bar_width())
+                    .bg(cx.theme().primary),
+            )
         })
         .child(
             Icon::new(icon_for(section))

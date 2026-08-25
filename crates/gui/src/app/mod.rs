@@ -523,6 +523,10 @@ pub struct WhatsAppApp {
     /// the microphone is.
     #[allow(dead_code)]
     recording_tick: Option<Task<()>>,
+    /// Redraws the status feed when its next update lapses. A status is the
+    /// one thing that changes with nothing happening.
+    #[allow(dead_code)]
+    status_tick: Option<Task<()>>,
 }
 
 impl WhatsAppApp {
@@ -645,6 +649,7 @@ impl WhatsAppApp {
             account_lid: None,
             settings: None,
             tick_task: None,
+            status_tick: None,
             recording_tick: None,
         }
     }

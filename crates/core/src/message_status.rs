@@ -32,6 +32,15 @@ pub enum MessageStatus {
 }
 
 impl MessageStatus {
+    /// Whether the server has the message.
+    ///
+    /// The line a self-chat's read promotion must not cross: a pending or
+    /// failed send says something true about *this device*, and calling it
+    /// read would claim a message was seen that never left.
+    pub fn has_left_this_device(self) -> bool {
+        matches!(self, Self::Sent | Self::Delivered | Self::Read)
+    }
+
     /// Move to `next` unless that would undo progress.
     ///
     /// [`Self::Failed`] is deliberately outside the ordering's meaning: it

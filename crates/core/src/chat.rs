@@ -284,6 +284,27 @@ impl ChatMessage {
         self.is_from_me.then_some(self.status)
     }
 
+    /// The ticks to draw, given whether this conversation is with your own
+    /// number.
+    ///
+    /// A message to yourself has been read by the only person who could read
+    /// it, and every WhatsApp client shows it as read the moment it lands. No
+    /// receipt ever arrives to say so — the peer that would send one is this
+    /// account — so a status derived from receipts alone sits on one grey tick
+    /// for good. The rule lives here rather than in a renderer because the
+    /// timeline and the chat list both draw those ticks and would otherwise
+    /// have to agree by hand.
+    pub fn delivery_in(&self, is_self_chat: bool) -> Option<MessageStatus> {
+        let status = self.delivery()?;
+        // Not a blanket promotion: a send that is still pending or has failed
+        // says something true about this device, and claiming it was read
+        // would be a lie about a message that never left.
+        if is_self_chat && status.has_left_this_device() {
+            return Some(MessageStatus::Read);
+        }
+        Some(status)
+    }
+
     /// Whether the bubble should offer a retry.
     pub fn is_failed(&self) -> bool {
         self.is_from_me && self.status.is_failed()
@@ -896,6 +917,39 @@ impl Chat {
 
 #[cfg(test)]
 mod tests {
+
+    /// A message to your own number has been read by the only person who could
+    /// read it, and no receipt will ever say so — the peer that would send one
+    /// is this account. Left to receipts alone the bubble sat on one grey tick
+    /// for good.
+    #[test]
+    fn a_message_to_yourself_is_read_the_moment_it_lands() {
+        let mut message = ChatMessage::new_outgoing("m".into(), "hi".into());
+        message.status = MessageStatus::Sent;
+
+        assert_eq!(message.delivery_in(false), Some(MessageStatus::Sent));
+        assert_eq!(message.delivery_in(true), Some(MessageStatus::Read));
+    }
+
+    /// Not a blanket promotion: a send still queued, or one that failed, says
+    /// something true about this device. Calling it read would claim a message
+    /// was seen that never left.
+    #[test]
+    fn a_send_that_never_left_is_not_read_even_in_your_own_chat() {
+        for status in [MessageStatus::Pending, MessageStatus::Failed] {
+            let mut message = ChatMessage::new_outgoing("m".into(), "hi".into());
+            message.status = status;
+            assert_eq!(message.delivery_in(true), Some(status), "for {status:?}");
+        }
+    }
+
+    /// Their message in your own chat is not yours to have ticks on at all.
+    #[test]
+    fn an_incoming_message_has_no_ticks_in_any_chat() {
+        let mut message = ChatMessage::new_outgoing("m".into(), "hi".into());
+        message.is_from_me = false;
+        assert_eq!(message.delivery_in(true), None);
+    }
     use super::*;
     use chrono::TimeZone;
 

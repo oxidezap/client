@@ -45,6 +45,7 @@ pub fn render_message_list(
     state: &ListState,
     entity: Entity<WhatsAppApp>,
     is_group: bool,
+    is_own_number: bool,
     layout: ResponsiveLayout,
     _cx: &App,
 ) -> impl IntoElement {
@@ -81,7 +82,15 @@ pub fn render_message_list(
         .child(
             list(state.clone(), move |ix, _window, cx| {
                 render_row(
-                    &items, &messages, ix, &entity, is_group, layout, metrics, cx,
+                    &items,
+                    &messages,
+                    ix,
+                    &entity,
+                    is_group,
+                    is_own_number,
+                    layout,
+                    metrics,
+                    cx,
                 )
             })
             .size_full()
@@ -102,6 +111,7 @@ fn render_row(
     ix: usize,
     entity: &Entity<WhatsAppApp>,
     is_group: bool,
+    is_own_number: bool,
     layout: ResponsiveLayout,
     metrics: Metrics,
     cx: &mut App,
@@ -148,6 +158,7 @@ fn render_row(
                 message: msg.clone(),
                 playing_message_id: app.playing_message_id().map(|s| s.to_string()),
                 is_group,
+                is_own_number,
                 starts_run: *starts_run,
                 video_player_state: app.video_player_state(message_id),
                 video_frame: app.video_current_frame(message_id),

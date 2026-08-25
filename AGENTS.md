@@ -110,11 +110,16 @@ profile here repeats it deliberately.
   the store agrees — otherwise a deliberate unread from another device would
   be papered over too.
 - **A read is bounded by what the *requester* saw**, not by what the daemon
-  knows: `MarkRead` names the preview's message id, and anything else is
-  refused. Not a timestamp — WhatsApp stamps to the second, so two arrivals in
-  one burst compare equal and a client that saw only the first would slip
-  through. A read action clears whole seconds, so an unchecked request from a
-  stale client consumes arrivals nobody ever laid eyes on.
+  knows: `MarkRead` names a message id, and one from an older second is
+  refused. A read action clears whole seconds, so an unchecked request from a
+  stale client consumes arrivals nobody ever laid eyes on. What it may *not*
+  demand is that the id be the daemon's own newest: WhatsApp stamps to the
+  second, the store returns a burst in arrival order and a front end sorts it
+  by `(timestamp, id)`, so `messages.last()` names a different message on each
+  side. Requiring them to match refused every read of a chat that had ever
+  received two messages in one second — permanently, since asking again
+  produced the same id. Membership in the boundary second is the test, and
+  either half of a burst is an honest claim to have seen it.
 - **The chat store's writer queue is ordered on purpose.** Anything that
   targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row

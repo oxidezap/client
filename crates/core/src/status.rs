@@ -55,14 +55,45 @@ pub struct StatusFeed {
     authors: Vec<StatusAuthor>,
 }
 
+/// How long an update is watchable for.
+///
+/// WhatsApp's own rule, and the reason a status is not a message: it is not
+/// kept, it lapses. The rows are stored like any other history, so without
+/// this a feed reloaded the next morning showed yesterday's updates as if they
+/// were still there to watch.
+pub const STATUS_LIFETIME: chrono::Duration = chrono::Duration::hours(24);
+
 impl StatusFeed {
-    /// Group `chat`'s messages by author. Cheap enough to run per rebuild: one
-    /// pass, one small vector per author, and no message is copied.
+    /// Group `chat`'s live messages by author. Cheap enough to run per
+    /// rebuild: one pass, one small vector per author, and no message is
+    /// copied.
     pub fn from_chat(chat: &Chat) -> Self {
-        Self::from_messages(&chat.messages, chat)
+        Self::from_chat_at(chat, wacore::time::now_utc())
     }
 
-    fn from_messages(messages: &[ChatMessage], chat: &Chat) -> Self {
+    /// The feed as it stood at `now`.
+    ///
+    /// The clock is a parameter so expiry is something a test can state rather
+    /// than something it has to wait for.
+    pub fn from_chat_at(chat: &Chat, now: DateTime<Utc>) -> Self {
+        Self::from_messages(&chat.messages, chat, now)
+    }
+
+    /// When the next update on screen lapses, so a caller can arrange to
+    /// redraw then rather than leaving a ring standing over nothing.
+    ///
+    /// `None` when the feed is empty — there is nothing to wait for.
+    pub fn next_expiry(&self) -> Option<DateTime<Utc>> {
+        self.mine
+            .iter()
+            .chain(&self.authors)
+            .flat_map(|author| author.updates.iter())
+            .filter_map(|&at| self.messages.get(at))
+            .map(|message| message.timestamp + STATUS_LIFETIME)
+            .min()
+    }
+
+    fn from_messages(messages: &[ChatMessage], chat: &Chat, now: DateTime<Utc>) -> Self {
         let mut mine: Option<StatusAuthor> = None;
         // A handful of contacts post on a given day, so a linear scan over the
         // authors found so far beats a map: no hashing, no allocation per
@@ -73,6 +104,12 @@ impl StatusFeed {
             // A call record or a group notice cannot be a status update, and
             // neither can an empty row.
             if message.system.is_some() {
+                continue;
+            }
+            // An update older than its lifetime is not there any more. The row
+            // is, because the store keeps what it was told; the feed is what
+            // says whether it can still be watched.
+            if now - message.timestamp >= STATUS_LIFETIME {
                 continue;
             }
 
@@ -199,7 +236,7 @@ fn author_name(message: &ChatMessage, chat: &Chat) -> String {
 mod tests {
     use super::*;
     use crate::chat::STATUS_BROADCAST_JID;
-    use chrono::TimeZone as _;
+    use chrono::{Duration, TimeZone as _};
 
     fn at(minute: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 25, 12, minute, 0).unwrap()
@@ -221,6 +258,13 @@ mod tests {
         chat
     }
 
+    /// The feed a minute after the last update these tests write, so nothing
+    /// they set up has lapsed. The clock is stated rather than read: with a
+    /// real one these tests would start failing a day after they were written.
+    fn feed_of(messages: Vec<ChatMessage>) -> StatusFeed {
+        StatusFeed::from_chat_at(&broadcast(messages), at(59))
+    }
+
     #[test]
     fn the_broadcast_is_not_a_conversation() {
         let chat = Chat::new(STATUS_BROADCAST_JID.to_string());
@@ -231,11 +275,11 @@ mod tests {
 
     #[test]
     fn each_contact_appears_once_however_often_they_post() {
-        let feed = StatusFeed::from_chat(&broadcast(vec![
+        let feed = feed_of(vec![
             update("1", "a@s.whatsapp.net", Some("Ana"), 1, true),
             update("2", "a@s.whatsapp.net", Some("Ana"), 5, true),
             update("3", "m@s.whatsapp.net", Some("Marcos"), 3, true),
-        ]));
+        ]);
 
         assert_eq!(feed.authors().len(), 2);
         let ana = feed.author("a@s.whatsapp.net").unwrap();
@@ -245,10 +289,10 @@ mod tests {
 
     #[test]
     fn unwatched_contacts_come_first_then_the_most_recent() {
-        let feed = StatusFeed::from_chat(&broadcast(vec![
+        let feed = feed_of(vec![
             update("1", "a@s.whatsapp.net", Some("Ana"), 9, true),
             update("2", "m@s.whatsapp.net", Some("Marcos"), 1, false),
-        ]));
+        ]);
 
         let names: Vec<&str> = feed
             .authors()
@@ -263,10 +307,10 @@ mod tests {
     fn our_own_updates_are_kept_out_of_the_contact_list() {
         let mut ours = update("1", "me", None, 2, true);
         ours.is_from_me = true;
-        let feed = StatusFeed::from_chat(&broadcast(vec![
+        let feed = feed_of(vec![
             ours,
             update("2", "a@s.whatsapp.net", Some("Ana"), 4, true),
-        ]));
+        ]);
 
         assert_eq!(feed.authors().len(), 1);
         assert_eq!(feed.mine().unwrap().count(), 1);
@@ -276,32 +320,26 @@ mod tests {
 
     #[test]
     fn a_contact_who_never_sent_a_push_name_is_still_addressable() {
-        let feed = StatusFeed::from_chat(&broadcast(vec![update(
+        let feed = feed_of(vec![update(
             "1",
             "5511999999999@s.whatsapp.net",
             None,
             1,
             true,
-        )]));
+        )]);
         assert_eq!(feed.authors()[0].name, "+5511999999999");
 
         // A LID is not a phone number and must not be printed as one.
-        let lid = StatusFeed::from_chat(&broadcast(vec![update(
-            "2",
-            "39492358562039@lid",
-            None,
-            1,
-            true,
-        )]));
+        let lid = feed_of(vec![update("2", "39492358562039@lid", None, 1, true)]);
         assert_eq!(lid.authors()[0].name, "Unknown contact");
     }
 
     #[test]
     fn updates_play_back_oldest_first() {
-        let feed = StatusFeed::from_chat(&broadcast(vec![
+        let feed = feed_of(vec![
             update("1", "a@s.whatsapp.net", Some("Ana"), 1, true),
             update("2", "a@s.whatsapp.net", Some("Ana"), 7, true),
-        ]));
+        ]);
         let ana = feed.author("a@s.whatsapp.net").unwrap();
         let ids: Vec<&str> = feed
             .updates_of(ana)
@@ -310,11 +348,49 @@ mod tests {
         assert_eq!(ids, vec!["1", "2"]);
     }
 
+    /// A status lapses; it is not kept. The rows are stored like any other
+    /// history, so a feed reloaded the next morning was offering yesterday's
+    /// updates as if they were still there to watch.
+    #[test]
+    fn an_update_past_its_lifetime_is_not_in_the_feed() {
+        let chat = broadcast(vec![
+            update("old", "a@s.whatsapp.net", Some("Ana"), 1, true),
+            update("new", "m@s.whatsapp.net", Some("Marcos"), 30, true),
+        ]);
+
+        // A minute after Ana's lapses and long before Marcos's does.
+        let feed = StatusFeed::from_chat_at(&chat, at(1) + STATUS_LIFETIME + Duration::minutes(1));
+        assert_eq!(feed.authors().len(), 1);
+        assert_eq!(feed.authors()[0].name, "Marcos");
+
+        // On the boundary itself it is already gone: a status is watchable
+        // *for* 24 hours, not through the instant it runs out.
+        let feed = StatusFeed::from_chat_at(&chat, at(1) + STATUS_LIFETIME);
+        assert!(feed.author("a@s.whatsapp.net").is_none());
+    }
+
+    /// Nothing repaints on its own, so the feed has to say when it will next
+    /// be wrong.
+    #[test]
+    fn the_feed_says_when_its_next_update_lapses() {
+        let feed = feed_of(vec![
+            update("1", "a@s.whatsapp.net", Some("Ana"), 5, true),
+            update("2", "m@s.whatsapp.net", Some("Marcos"), 30, true),
+        ]);
+        assert_eq!(feed.next_expiry(), Some(at(5) + STATUS_LIFETIME));
+
+        assert_eq!(
+            StatusFeed::default().next_expiry(),
+            None,
+            "nothing to wait for"
+        );
+    }
+
     #[test]
     fn a_call_record_is_not_an_update() {
         let mut notice = update("1", "a@s.whatsapp.net", Some("Ana"), 1, true);
         notice.system = Some(crate::SystemNotice::GroupChanged("changed".to_string()));
-        let feed = StatusFeed::from_chat(&broadcast(vec![notice]));
+        let feed = feed_of(vec![notice]);
         assert!(feed.is_empty());
     }
 }

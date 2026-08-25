@@ -120,16 +120,58 @@ impl WhatsAppApp {
         let chat = self.chats.iter().find(|chat| chat.is_status);
         let count = chat.map_or(0, |chat| chat.messages.len());
 
+        let now = wacore::time::now_utc();
         let mut cache = self.status_feed_cache.borrow_mut();
+        // Count alone cannot see an update lapsing: nothing was added or
+        // removed, the clock simply passed it.
         if let Some((cached_count, feed)) = cache.as_ref()
             && *cached_count == count
+            && feed.next_expiry().is_none_or(|when| now < when)
         {
             return feed.clone();
         }
 
-        let feed = chat.map(StatusFeed::from_chat).unwrap_or_default();
+        let feed = chat
+            .map(|chat| StatusFeed::from_chat_at(chat, now))
+            .unwrap_or_default();
         *cache = Some((count, feed.clone()));
         feed
+    }
+
+    /// Redraw when the next update on screen lapses.
+    ///
+    /// A status is the one thing in the window that changes with nothing
+    /// happening: no message arrives to mark a ring watched-out, so without
+    /// this the rail kept a badge and the list kept a row for updates that
+    /// had already gone. One timer for the earliest of them, re-armed on each
+    /// firing rather than one per update.
+    pub(super) fn ensure_status_tick(&mut self, cx: &mut Context<Self>) {
+        if self.status_tick.is_some() {
+            return;
+        }
+        let Some(when) = self.status_feed().next_expiry() else {
+            return;
+        };
+        // Saturating, and never zero: a lapse already past still needs one
+        // turn of the loop to be noticed, and a negative duration would make
+        // the timer fire in a tight loop.
+        let wait = (when - wacore::time::now_utc())
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO)
+            .max(std::time::Duration::from_secs(1));
+
+        self.status_tick = Some(cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
+            smol::Timer::after(wait).await;
+            let _ = entity.update(cx, |app, cx| {
+                app.status_tick = None;
+                // The feed rebuilds itself off the clock; this is what makes
+                // anything ask it again.
+                app.status_feed_cache.borrow_mut().take();
+                app.invalidate_chat_cache();
+                app.ensure_status_tick(cx);
+                cx.notify();
+            });
+        }));
     }
 
     pub fn status_pane(&self) -> &StatusPane {
@@ -153,6 +195,7 @@ impl WhatsAppApp {
         if !self.status_pane.is_open() {
             return;
         }
+        self.leave_shown_status();
         self.status_pane.close();
         cx.notify();
     }
@@ -166,11 +209,49 @@ impl WhatsAppApp {
         let Some(author) = feed.author(&author) else {
             return;
         };
+        // Read before the index moves: what has to be stopped is the update
+        // being left, not the one arriving.
+        let leaving = self.shown_status_message_id();
         if self.status_pane.step(forward, author.count()) {
+            self.stop_status_media(leaving);
             self.mark_shown_status_seen();
             self.fetch_shown_status(cx);
             cx.notify();
         }
+    }
+
+    /// Stop the update on screen, because the reader is about to stop showing
+    /// it.
+    ///
+    /// Opening someone's status starts its video decoding and playing, and
+    /// nothing else ever stops it: closing the reader only cleared the
+    /// selection, so the frame task kept running and the audio kept going over
+    /// whatever the window showed next.
+    fn leave_shown_status(&mut self) {
+        let shown = self.shown_status_message_id();
+        self.stop_status_media(shown);
+    }
+
+    /// Stop playback if it belongs to `message_id`.
+    ///
+    /// Scoped rather than a bare `stop_current_media`: a voice note started in
+    /// a conversation keeps playing while its listener browses, and leaving a
+    /// status is no reason to cut it off.
+    fn stop_status_media(&mut self, message_id: Option<String>) {
+        if let Some(id) = message_id
+            && self.active_media.message_id() == Some(id.as_str())
+        {
+            self.stop_current_media();
+        }
+    }
+
+    /// Which update the reader is showing, whether or not it needs fetching.
+    fn shown_status_message_id(&self) -> Option<String> {
+        let author_jid = self.status_pane.author()?.to_string();
+        let feed = self.status_feed();
+        let author = feed.author(&author_jid)?;
+        let at = self.status_pane.index_in(author.count());
+        feed.updates_of(author).nth(at).map(|m| m.id.clone())
     }
 
     /// Mark the update currently on screen as watched.

@@ -677,31 +677,31 @@ impl Bridge {
             return Err(format!("no such chat: {}", observe_str(jid)));
         };
 
-        // What the requester says it is looking at against what a snapshot
-        // would hand it right now. A read is irreversible, so a client that
-        // has fallen behind — because a message arrived, or because another
-        // client is further along — must catch up rather than have the daemon
-        // guess on its behalf. By id, not by time: WhatsApp stamps to the
-        // second, so a second arrival within the same second would compare
-        // equal and slip through.
-        let preview = summary.last_message.as_ref().and_then(|m| m.id.as_deref());
-        if through_message_id != preview {
-            return Err(format!(
-                "{} has moved on since you last saw it; take a snapshot and ask again",
-                observe_str(jid)
-            ));
-        }
-
         match self.reads.boundary(jid) {
             Some((secs, ids)) => {
-                // A read action clears whole seconds, so this covers every
-                // message at `secs` — which is right only if the one the
-                // client is looking at is among them. When it is not, the
-                // daemon holds messages the client has never seen (its
-                // hydrated messages and the store's preview columns can
-                // drift), and marking those read is the thing this guard
-                // exists to prevent.
-                if !preview.is_some_and(|id| ids.iter().any(|(known, ..)| known == id)) {
+                // What the requester says it is looking at, against the second
+                // this read would clear. A read is irreversible and clears
+                // *whole seconds*, so a client that has fallen behind — because
+                // a message arrived, or because another client is further along
+                // — must catch up rather than have the daemon consume arrivals
+                // on its behalf. Naming a message from an older second fails
+                // here, which is the guard.
+                //
+                // Membership, not equality with the daemon's own newest.
+                // WhatsApp stamps to the second, so a burst arrives with
+                // identical timestamps and the two sides order those siblings
+                // by whatever their storage did — the store's row order here,
+                // `(timestamp, id)` in a front end. Demanding the *same* last
+                // message meant a chat that had ever received two messages in
+                // one second could never be marked read again by anyone: every
+                // request was refused, the badge came back on the next
+                // hydration, and the advice in the refusal ("take a snapshot
+                // and ask again") could not be followed, because asking again
+                // produced the same id. Every id at `secs` is one this read
+                // covers, so any of them is an honest claim to have seen it.
+                let seen =
+                    through_message_id.is_some_and(|id| ids.iter().any(|(known, ..)| known == id));
+                if !seen {
                     return Err(format!(
                         "{} holds messages the preview you saw does not cover; \
                          take a snapshot and ask again",
@@ -1761,40 +1761,52 @@ mod tests {
         let refusal = bridge
             .read_plan("1@s.whatsapp.net", Some("seen"))
             .expect_err("must not mark read what nobody has seen");
-        assert!(refusal.contains("moved on"), "{refusal}");
+        assert!(refusal.contains("does not cover"), "{refusal}");
 
         // Caught up, and it goes through.
         assert!(bridge.read_plan("1@s.whatsapp.net", Some("unseen")).is_ok());
     }
 
-    /// The reason the request names a message rather than a time: WhatsApp
-    /// stamps to the second, so a burst of two arrivals is a single timestamp
-    /// and a client that saw only the first would compare equal.
+    /// The two sides of a burst do not agree on which of it came last, and
+    /// they are both right.
+    ///
+    /// WhatsApp stamps to the second, so a ping and its pong are one
+    /// timestamp. The store returns them in arrival order and a front end
+    /// sorts them by `(timestamp, id)`, so `messages.last()` names a different
+    /// message on each side whenever id order and arrival order disagree.
+    /// Requiring the request to echo *the daemon's* last message therefore
+    /// refused every read of such a chat, for good: the receipt never went
+    /// out, the read was never persisted, and the badge came back on the next
+    /// hydration. The advice in the refusal could not even be followed —
+    /// asking again produced the same id.
+    ///
+    /// A read clears whole seconds, so naming either sibling has exactly the
+    /// same effect. Both are honest claims to have seen the burst.
     #[test]
-    fn a_same_second_arrival_is_not_mistaken_for_what_the_client_saw() {
+    fn either_half_of_a_one_second_burst_is_a_read_of_the_burst() {
         let mut bridge = bridge();
-        bridge.observe(received(
-            "1@s.whatsapp.net",
-            message("first", "1@s.whatsapp.net", 20, false, false),
-            None,
-        ));
-        let seen = bridge.hub.chat("1@s.whatsapp.net").unwrap().last_message;
-        bridge.observe(received(
-            "1@s.whatsapp.net",
-            message("second", "1@s.whatsapp.net", 20, false, false),
-            None,
-        ));
-        let now = bridge.hub.chat("1@s.whatsapp.net").unwrap().last_message;
-        assert_eq!(
-            seen.as_ref().unwrap().timestamp_ms,
-            now.as_ref().unwrap().timestamp_ms,
-            "the timestamps are identical, which is the whole problem"
-        );
+        for id in ["pong", "ping"] {
+            bridge.observe(received(
+                "1@s.whatsapp.net",
+                message(id, "1@s.whatsapp.net", 20, false, false),
+                None,
+            ));
+        }
+        // Arrival order put `ping` last; `(timestamp, id)` order puts `pong`
+        // there. Neither side is behind the other.
+        let daemon_newest = bridge
+            .hub
+            .chat("1@s.whatsapp.net")
+            .unwrap()
+            .last_message
+            .and_then(|m| m.id);
+        assert_eq!(daemon_newest.as_deref(), Some("ping"));
 
-        let refusal = bridge
-            .read_plan("1@s.whatsapp.net", Some("first"))
-            .expect_err("the client never saw `second`");
-        assert!(refusal.contains("moved on"), "{refusal}");
+        assert!(
+            bridge.read_plan("1@s.whatsapp.net", Some("pong")).is_ok(),
+            "the id a front end would echo has to be accepted"
+        );
+        assert!(bridge.read_plan("1@s.whatsapp.net", Some("ping")).is_ok());
     }
 
     /// The daemon's hydrated messages and the store's preview columns are

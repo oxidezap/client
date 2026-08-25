@@ -102,7 +102,12 @@ impl WhatsAppApp {
         let call_id = stage.call_id().to_string();
         info!("Ending call {call_id}");
         self.call_card.call_ended();
-        self.record_call(&stage, cx);
+        // A ringing offer ended by this button was refused, not missed — the
+        // same thing `decline_call` writes down, and the phone viewport routes
+        // its Decline through here. Deriving the outcome from the stage alone
+        // gave the two buttons two different histories for one gesture.
+        let outcome = matches!(stage, Stage::Incoming(_)).then_some(CallOutcome::Declined);
+        self.record_call_as(&stage, outcome, cx);
         if let Some(client) = &self.client {
             match &stage {
                 // A ringing offer has to be rejected rather than hung up:

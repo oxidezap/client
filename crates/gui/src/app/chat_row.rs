@@ -108,7 +108,7 @@ impl ChatRow {
             } else {
                 Unread::None
             },
-            preview: preview_for(chat, typing, draft),
+            preview: preview_for(chat, typing, draft, is_own_number),
         }
     }
 
@@ -119,7 +119,12 @@ impl ChatRow {
     }
 }
 
-fn preview_for(chat: &Chat, typing: Option<TypingSummary>, draft: Option<&str>) -> Preview {
+fn preview_for(
+    chat: &Chat,
+    typing: Option<TypingSummary>,
+    draft: Option<&str>,
+    is_own_number: bool,
+) -> Preview {
     // Ordered by which fact is most worth the one line available: someone
     // typing now, then something the user started writing, then history.
     if let Some(summary) = typing {
@@ -147,7 +152,7 @@ fn preview_for(chat: &Chat, typing: Option<TypingSummary>, draft: Option<&str>) 
         prefix: prefix_for(chat, last),
         glyph: last.media.as_ref().map(|m| PreviewGlyph::of(&m.media_type)),
         text: body_for(last),
-        status: last.delivery(),
+        status: last.delivery_in(is_own_number),
     }
 }
 
