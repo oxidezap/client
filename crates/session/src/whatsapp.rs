@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::store::SqliteStore;
-use whatsapp_rust::voip::CallHandle;
+use whatsapp_rust::voip::{CallHandle, CallTermination};
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
 use whatsapp_rust::wacore::types::events::Event;
@@ -206,6 +206,38 @@ pub struct CallRegistry {
     /// Ids cancelled before any handle existed (the UI's placeholder id while
     /// start_call is still connecting); start_call hangs these up on arrival.
     cancelled: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// One mute lane per live call. Pruned against `active` where it grows,
+    /// so a call that ends takes its lane with it without every teardown
+    /// path having to remember.
+    mute: Arc<std::sync::Mutex<HashMap<String, Arc<MuteLane>>>>,
+}
+
+/// What keeps a call's mute requests in the order the daemon took them.
+///
+/// Spawning is not sequencing: two requests spawned in order can start in
+/// either one, and the last to reach the wire wins. That is how a rapid
+/// unmute-then-mute could leave the microphone open under a state — and every
+/// window — showing it muted, with both tasks finding the device in the state
+/// they themselves had asked for and so correcting nothing.
+#[derive(Default)]
+struct MuteLane {
+    /// The newest request, stamped on the caller's thread *before* its task
+    /// exists. That is the only place the order still exists.
+    ///
+    /// A `std` lock on purpose: it is taken from a synchronous method and
+    /// never held across an await.
+    intent: std::sync::Mutex<MuteIntent>,
+    /// One announcement in flight per call. The library serializes its own
+    /// transitions, but it serializes them in arrival order, which is the
+    /// order this exists to stop trusting.
+    lane: Mutex<()>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct MuteIntent {
+    /// Bumped per request, so a task can ask whether it is still the newest.
+    seq: u64,
+    muted: bool,
 }
 
 /// WhatsApp client wrapper that manages the connection and provides
@@ -595,7 +627,12 @@ impl WhatsAppClient {
                     info!("Call {} terminated by peer", call_id);
                     calls.pending.lock().await.remove(call_id);
                     if let Some(handle) = calls.active.lock().await.remove(call_id) {
-                        tokio::spawn(async move { handle.hangup().await });
+                        // `hangup_local`, not `terminate`: the peer is the
+                        // side that ended this, and answering their
+                        // `<terminate>` with one of our own says nothing they
+                        // do not already know. Only the local media task and
+                        // the registry entry are left to drop.
+                        tokio::spawn(async move { handle.hangup_local().await });
                     }
                     let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                 }
@@ -1755,7 +1792,12 @@ impl WhatsAppClient {
                     // the placeholder id, so honor it here.
                     if calls.cancelled.lock().await.remove(&placeholder_id) {
                         info!("Outgoing call {} cancelled before start", call_id);
-                        handle.hangup().await;
+                        // The offer is already out: every device it rang is
+                        // ringing, and dropping our side silently would leave
+                        // them at it until their own transport gave up.
+                        // `terminate` is what tells them, and it tears this
+                        // side down whether or not the stanzas landed.
+                        log_termination(&call_id, handle.terminate().await);
                         return;
                     }
                     info!(
@@ -1793,8 +1835,7 @@ impl WhatsAppClient {
             // Still ringing and never answered: nothing live to hang up.
             calls.pending.lock().await.remove(&call_id);
             if let Some(handle) = calls.active.lock().await.remove(&call_id) {
-                handle.hangup().await;
-                info!("Call {} hung up", call_id);
+                log_termination(&call_id, handle.terminate().await);
             } else {
                 // No handle yet (start_call still connecting under a UI
                 // placeholder id): remember the cancel so it lands.
@@ -1804,15 +1845,108 @@ impl WhatsAppClient {
         });
     }
 
-    /// Mute or unmute the microphone of a live call.
-    #[allow(dead_code)]
+    /// Mute or unmute the microphone of a live call, and tell the peer.
+    ///
+    /// The library commits the two directions around the `<mute_v2>` rather
+    /// than at one point — a mute applies before the announcement, an unmute
+    /// only once it is out — so whichever half is lost, the microphone is
+    /// never live while the peer is being shown a muted one. What that costs
+    /// is that a failed announcement leaves the device in a state nobody
+    /// asked for, and the front end has already drawn the state it asked for.
+    /// So the handle is asked what it really holds and the answer is
+    /// published — always, not only when it differs: what makes the state
+    /// trustworthy is that the *last* request to reach the device is the one
+    /// that speaks last, and a task that only spoke on disagreement would
+    /// leave a failed announcement's answer standing over a later success.
+    /// It costs nothing, because a call state that does not change sends no
+    /// frame.
+    ///
+    /// The request is stamped here, on the caller's thread, and the work is
+    /// what gets spawned — see [`MuteLane`]. A task compares the device
+    /// against the *newest* request rather than its own, because its own is
+    /// exactly what a superseded task must not restore.
+    ///
+    /// A call still ringing has nowhere to publish the state, and answering
+    /// does not replay it. That is not a gap here: mute is offered on an
+    /// active call only ([`oxidezap_core::CallState::set_muted`] matches the
+    /// live stage), so nothing can be chosen while it rings.
     pub fn set_call_muted(&self, call_id: &str, muted: bool) {
         let calls = self.calls.clone();
+        let ui_sender = self.ui_sender.clone();
         let call_id = call_id.to_string();
         let runtime = self.runtime.clone();
+
+        // Before the spawn, because after it the order is gone.
+        let (lane, seq) = {
+            let mut lanes = calls.mute.lock().expect("mute lanes poisoned");
+            let lane = lanes.entry(call_id.clone()).or_default().clone();
+            let mut intent = lane.intent.lock().expect("mute intent poisoned");
+            intent.seq += 1;
+            intent.muted = muted;
+            let seq = intent.seq;
+            drop(intent);
+            (lane, seq)
+        };
+
         runtime.spawn(async move {
-            if let Some(handle) = calls.active.lock().await.get(&call_id) {
-                handle.set_muted(muted);
+            // Cloned out from under the lock: `set_muted` waits on the call's
+            // answer-transition lane, and holding the registry across that
+            // would stall every other call's bookkeeping behind one peer.
+            let handle = {
+                let active = calls.active.lock().await;
+                let handle = active.get(&call_id).cloned();
+                // Where the lane map grows is where it is swept.
+                calls
+                    .mute
+                    .lock()
+                    .expect("mute lanes poisoned")
+                    .retain(|id, _| active.contains_key(id));
+                handle
+            };
+            let Some(handle) = handle else {
+                debug!("set_call_muted: no live handle for {}", call_id);
+                return;
+            };
+
+            let _serialized = lane.lane.lock().await;
+            // A newer request either has already run or is blocked on the
+            // lane behind us; either way it, and not this one, is what the
+            // device should end up saying.
+            let want = *lane.intent.lock().expect("mute intent poisoned");
+            if want.seq != seq {
+                return;
+            }
+            if let Err(e) = handle.set_muted(want.muted).await {
+                warn!(
+                    "Failed to announce {} on call {}: {}",
+                    if want.muted { "mute" } else { "unmute" },
+                    call_id,
+                    e
+                );
+            }
+            // Superseded while announcing: the request behind us is about to
+            // set the state anyway, and a word from here would describe a
+            // device that is already on its way somewhere else. It speaks
+            // after it has arrived, which is what makes it the last word.
+            if lane.intent.lock().expect("mute intent poisoned").seq != seq {
+                return;
+            }
+            // Said whether or not it is news, and this is why. A correction
+            // sent only on disagreement is unversioned, and the daemon writes
+            // a request's optimistic state before that request is even
+            // stamped here — so a *failed* announcement could publish its
+            // truth into the window belonging to the retry queued behind it,
+            // and the retry, succeeding, would find agreement and say
+            // nothing. The state would then hold the failure's answer over
+            // the success's device. Speaking unconditionally makes the newest
+            // request the one that closes the exchange, and costs nothing:
+            // the daemon publishes no frame for a state that did not change.
+            let settled = handle.is_muted();
+            if let Some(tx) = ui_sender.lock().await.as_ref() {
+                let _ = tx.send(UiEvent::CallMuteChanged {
+                    call_id,
+                    muted: settled,
+                });
             }
         });
     }
@@ -1824,6 +1958,17 @@ impl WhatsAppClient {
             handle.wait_ended().await;
             let call_id = handle.call_id().to_string();
             calls.active.lock().await.remove(&call_id);
+            // Every call that ever had a handle drains through here, whatever
+            // ended it, so this is where a lane is paid for. The sweep in
+            // `set_call_muted` is not made redundant by it: a window that fell
+            // behind can stamp a request against a call this watcher has
+            // already run for, and that lane has no second ending to be
+            // removed on.
+            calls
+                .mute
+                .lock()
+                .expect("mute lanes poisoned")
+                .remove(&call_id);
             Self::notify_call_ended(&ui_sender, &call_id).await;
         });
     }
@@ -1832,6 +1977,34 @@ impl WhatsAppClient {
         if let Some(tx) = ui_sender.lock().await.as_ref() {
             let _ = tx.send(UiEvent::CallEnded(call_id.to_string()));
         }
+    }
+}
+
+/// Say what a hangup achieved.
+///
+/// The local side is down in every case, so this reports rather than fails: a
+/// call the peer was never told about is still over here, and the difference
+/// is only how long they keep ringing. A still-ringing call is addressed per
+/// device, which is why "some, not all" is one of the answers.
+fn log_termination(call_id: &str, outcome: CallTermination) {
+    match outcome {
+        CallTermination::PeerNotified => info!("Call {} hung up", call_id),
+        CallTermination::PartlyNotified {
+            notified,
+            unconfirmed,
+        } => warn!(
+            "Call {} hung up; {} device(s) told, {} unconfirmed",
+            call_id, notified, unconfirmed
+        ),
+        CallTermination::LocalOnly(error) => warn!(
+            "Call {} hung up locally; the peer was not told: {}",
+            call_id, error
+        ),
+        CallTermination::AlreadyEnded => debug!("Call {} was already over", call_id),
+        // `CallTermination` is `#[non_exhaustive]`: a variant added upstream
+        // is still an ended call here, and the local side is down in every
+        // one of them.
+        other => info!("Call {} hung up: {:?}", call_id, other),
     }
 }
 
@@ -2751,7 +2924,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ChatStore, Client, NameBook, ReadBoundary, ReloadScope, SqliteStore, StoreChange,
+        ChatStore, Client, MuteLane, NameBook, ReadBoundary, ReloadScope, SqliteStore, StoreChange,
         WhatsAppClient, media_metadata, merge_alias_history_messages, read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
@@ -2760,6 +2933,51 @@ mod tests {
     use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
     use whatsapp_rust::wacore_binary::Jid;
     use whatsapp_rust::waproto::whatsapp as wa;
+
+    /// Stamp a request the way `set_call_muted` does, on the caller's thread.
+    fn request(lane: &MuteLane, muted: bool) -> u64 {
+        let mut intent = lane.intent.lock().unwrap();
+        intent.seq += 1;
+        intent.muted = muted;
+        intent.seq
+    }
+
+    /// Two toggles in quick succession are spawned as two tasks, and spawn
+    /// order is not run order. Run the wrong way round, each task saw the
+    /// device holding the value it had itself asked for and corrected
+    /// nothing — so an unmute that executed last left the microphone open
+    /// under a state, and every window, still showing it muted.
+    ///
+    /// The order survives because it is stamped before the tasks exist, and a
+    /// task that is no longer the newest does nothing at all.
+    #[test]
+    fn only_the_newest_mute_request_reaches_the_device() {
+        let lane = MuteLane::default();
+        // Muted, and the user changes their mind twice.
+        let unmute = request(&lane, false);
+        let remute = request(&lane, true);
+
+        // Whichever task wins the lane, the gate answers the same way.
+        let newest = *lane.intent.lock().unwrap();
+        assert_ne!(unmute, remute);
+        assert_eq!(newest.seq, remute, "the last request is the live one");
+        assert!(newest.muted, "and it is the one the device must end on");
+        assert_ne!(
+            newest.seq, unmute,
+            "the superseded task yields instead of restoring its own value"
+        );
+    }
+
+    /// A lone request is nobody's stale task: it applies, and it is the one
+    /// that answers for what the device really did.
+    #[test]
+    fn a_single_mute_request_is_the_newest_one() {
+        let lane = MuteLane::default();
+        let seq = request(&lane, true);
+        let newest = *lane.intent.lock().unwrap();
+        assert_eq!(newest.seq, seq);
+        assert!(newest.muted);
+    }
 
     /// A name book with nothing behind its handle: the history paths hand the
     /// store in with every call, and only the live paths read it from there.

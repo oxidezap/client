@@ -81,6 +81,27 @@ profile here repeats it deliberately.
   speaker, so the process that owns the session owns the audio device. That
   follows from the split rather than being chosen, and it is why a call still
   works with the window closed.
+- **Ending a call is something you say, and muting is something you may fail
+  to say.** A hangup is `CallHandle::terminate`, which sends `<terminate>` to
+  every device a still-ringing call rang and then tears the local side down
+  whatever the stanzas did — `hangup_local` is for the one case where the peer
+  already knows, their own `<terminate>` arriving. Getting that backwards is
+  what left a cancelled outgoing call ringing at the far end until its
+  transport gave up. Mute is the mirror image: the library commits the two
+  directions *around* the `<mute_v2>` — a mute applies before it, an unmute
+  only once it is out — so the microphone is never live while the peer is
+  shown a muted one, and the price is that a failed announcement leaves the
+  device in a state the front end did not ask for and has already drawn.
+  `set_call_muted` asks the handle what it really holds and publishes it as
+  `UiEvent::CallMuteChanged` — always, not only when it differs from what was
+  asked. Two things make the state honest and neither is the comparison: the
+  request is stamped on the caller's thread before its task exists, because
+  spawning is not sequencing and the superseded half of a rapid toggle must
+  stay silent rather than restore its own value; and the newest request
+  speaks after it has reached the device, so it is the last word. A word said
+  only on disagreement is unversioned, and would let a failed announcement's
+  answer stand over the success that came after it. Agreement costs nothing,
+  because a call state that does not change sends no frame.
 - **Logout is not a disconnect.** A server 401 means the stored credentials are
   dead; reconnecting with them loops forever. `AppState::LoggedOut` exists to
   force the only real recovery: wipe local state, pair again.

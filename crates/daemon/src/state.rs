@@ -578,6 +578,59 @@ mod tests {
         assert_eq!(hub.snapshot().account, Some(account));
     }
 
+    /// The session says what the microphone is really doing after every
+    /// request that reaches the device, not only when it disagrees with what
+    /// was asked — that is what keeps the newest request the last one heard,
+    /// instead of a failed announcement's answer standing over the retry that
+    /// succeeded behind it. It is only affordable because the ordinary case,
+    /// where the device did exactly what was asked, is not news.
+    #[tokio::test]
+    async fn a_mute_that_did_what_was_asked_sends_no_frame() {
+        let hub = StateHub::new();
+        let mut window = hub.subscribe();
+
+        let call_id: oxidezap_core::CallId = "call-1".to_string();
+        let call = oxidezap_core::IncomingCall::new(
+            call_id.clone(),
+            "Ana".to_string(),
+            "a@s.whatsapp.net".to_string(),
+            false,
+            &offer("call-1"),
+        );
+        hub.calls(|calls| {
+            calls.set_incoming(call);
+        });
+        hub.calls(|calls| {
+            calls.connect(&call_id);
+        });
+        // What the front end asked for, taken optimistically.
+        hub.calls(|calls| {
+            calls.set_muted(&call_id, true);
+        });
+        for _ in 0..3 {
+            window.recv().await.unwrap();
+        }
+        let settled = hub.snapshot().version;
+
+        // The announcement went through, so the session's word for what the
+        // device holds is the state's own.
+        hub.calls(|calls| {
+            calls.set_muted(&call_id, true);
+        });
+        assert!(
+            window.try_recv().is_err(),
+            "agreement is not news, so speaking every time costs nothing"
+        );
+        assert_eq!(hub.snapshot().version, settled, "and spends no version");
+
+        // A device that did something else does spend one.
+        hub.calls(|calls| {
+            calls.set_muted(&call_id, false);
+        });
+        window.recv().await.unwrap();
+        assert_ne!(hub.snapshot().version, settled);
+    }
+
     /// Two windows, and only one of them pressed Accept. The daemon is what
     /// answered — it owns the microphone — so the other window learns about it
     /// here or not at all.

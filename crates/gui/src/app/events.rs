@@ -306,6 +306,16 @@ impl WhatsAppApp {
             UiEvent::CallEndedElsewhere(call_id) => {
                 info!("Call {call_id} was handled on another device");
             }
+            // The correction, not the request: the state it names is what the
+            // session found on the handle after an announcement that did not
+            // go out as asked. What the window draws comes from the daemon's
+            // call state, which has already been given the same value.
+            UiEvent::CallMuteChanged { call_id, muted } => {
+                info!(
+                    "Call {call_id} microphone is {}",
+                    if muted { "muted" } else { "open" }
+                );
+            }
             UiEvent::OutgoingCallStarted {
                 call_id,
                 recipient_jid,

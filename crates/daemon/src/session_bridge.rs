@@ -425,6 +425,13 @@ impl Bridge {
             UiEvent::CallEnded(id) => self.hub.calls(|s| {
                 s.end(id);
             }),
+            // The session correcting a mute the peer was never told about.
+            // The front end drew what it asked for; this is what the device
+            // is actually doing. Nothing is published when the two agree, so
+            // the ordinary mute costs no frame.
+            UiEvent::CallMuteChanged { call_id, muted } => self.hub.calls(|s| {
+                s.set_muted(call_id, *muted);
+            }),
             // The same removal, and one more thing said about it: the front
             // end writes the conversation's call record off the stage it was
             // holding, and an incoming stage that simply vanishes reads as
@@ -1746,6 +1753,46 @@ mod tests {
         // Answered or hung up, it is no longer something to attach to.
         bridge.observe(UiEvent::CallEnded("call-1".into()));
         assert!(bridge.hub.call_state().incoming().is_none());
+    }
+
+    /// The request is optimistic and the announcement can fail, so the state
+    /// a front end drew is a claim, not a fact. The library keeps the
+    /// microphone from being live while the peer is shown a muted one, which
+    /// means an unmute that could not be announced leaves the device muted —
+    /// and the window drawing an open mic over it.
+    #[test]
+    fn a_mute_the_peer_was_never_told_about_is_corrected_in_the_state() {
+        let mut bridge = bridge();
+        let call = oxidezap_core::IncomingCall {
+            call_id: "call-1".into(),
+            caller_name: "Alice".into(),
+            caller_jid: "1@s.whatsapp.net".into(),
+            is_video: false,
+            is_offline: false,
+            received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        bridge.observe(UiEvent::IncomingCall(call));
+        bridge.hub.calls(|s| {
+            s.connect(&"call-1".to_string());
+            s.set_muted(&"call-1".to_string(), true);
+        });
+        assert!(bridge.hub.call_state().active().unwrap().muted);
+
+        // The unmute went nowhere, so the microphone is still muted.
+        bridge.observe(UiEvent::CallMuteChanged {
+            call_id: "call-1".into(),
+            muted: true,
+        });
+        assert!(
+            bridge.hub.call_state().active().unwrap().muted,
+            "the state says what the device is doing, not what was asked"
+        );
+
+        bridge.observe(UiEvent::CallMuteChanged {
+            call_id: "call-1".into(),
+            muted: false,
+        });
+        assert!(!bridge.hub.call_state().active().unwrap().muted);
     }
 
     /// A call the phone answered is not a call this window missed. The
