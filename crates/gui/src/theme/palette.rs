@@ -287,9 +287,9 @@ pub const TOKYO_NIGHT: Palette = Palette {
     elevated: rgb(0x24283b),
 
     foreground: rgb(0xc0caf5),
-    muted_foreground: rgb(0x7f87ac),
-    subtle_foreground: rgb(0x565f89),
-    faint_foreground: rgb(0x414868),
+    muted_foreground: rgb(0xa0a6c1),
+    subtle_foreground: rgb(0x868eb3),
+    faint_foreground: rgb(0x656f9f),
 
     border: rgb(0x2f334d),
     list_hover: rgb(0x232741),
@@ -324,9 +324,9 @@ pub const TOKYO_NIGHT_STORM: Palette = Palette {
     elevated: rgb(0x2f344d),
 
     foreground: rgb(0xc0caf5),
-    muted_foreground: rgb(0x8b93b8),
-    subtle_foreground: rgb(0x636da3),
-    faint_foreground: rgb(0x4a5279),
+    muted_foreground: rgb(0xafb5ce),
+    subtle_foreground: rgb(0x959cc0),
+    faint_foreground: rgb(0x727ca9),
 
     border: rgb(0x3b4261),
     list_hover: rgb(0x2c3149),
@@ -342,21 +342,21 @@ pub const TOKYO_NIGHT_LIGHT: Palette = Palette {
     secondary: rgb(0xe9e9ec),
     elevated: rgb(0xf2f3f7),
 
-    foreground: rgb(0x3760bf),
-    muted_foreground: rgb(0x6172b0),
-    subtle_foreground: rgb(0x848cb5),
-    faint_foreground: rgb(0xa1a6c5),
+    foreground: rgb(0x1e3669),
+    muted_foreground: rgb(0x3b4877),
+    subtle_foreground: rgb(0x525a88),
+    faint_foreground: rgb(0x6e75a5),
 
     border: rgb(0xc4c8da),
     list_hover: rgb(0xd6dae6),
     list_active: rgb(0xc8cddd),
 
-    primary: rgb(0x118c74),
+    primary: rgb(0x0d6957),
     ring: rgb(0x2e7de9),
-    danger: rgb(0xc64343),
-    warning: rgb(0x8c6c3e),
-    success: rgb(0x587539),
-    info: rgb(0x07879d),
+    danger: rgb(0xa73333),
+    warning: rgb(0x735833),
+    success: rgb(0x4c6431),
+    info: rgb(0x056677),
 
     message_sent: rgb(0xbfe6dc),
     message_received: rgb(0xf2f3f7),
@@ -375,6 +375,80 @@ pub const TOKYO_NIGHT_LIGHT: Palette = Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The contrast a pair of colours has, per WCAG 2.1.
+    fn contrast(a: Rgb, b: Rgb) -> f32 {
+        let (x, y) = (a.luminance(), b.luminance());
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// Every ink, on every surface it can land on, in every preset.
+    ///
+    /// A contrast pass done once is a contrast pass that lasts until the next
+    /// colour is nudged, so it is a test instead. The thresholds encode what
+    /// each token is *for*:
+    ///
+    /// - `foreground` and `muted_foreground` carry prose, and are held well
+    ///   above AA so there is room for a hierarchy underneath them.
+    /// - `subtle_foreground` is metadata — timestamps, counters — which is
+    ///   still text a person reads, so it meets AA exactly.
+    /// - `faint_foreground` is chrome and disabled glyphs, which WCAG exempts;
+    ///   3:1 is the non-text threshold, and it is what keeps the token from
+    ///   sliding into the background entirely.
+    #[test]
+    fn every_ink_is_legible_on_every_surface() {
+        const AA: f32 = 4.5;
+        for preset in Preset::ALL {
+            let p = preset.palette();
+            let surfaces = [p.background, p.sidebar, p.secondary, p.elevated];
+            let inks = [
+                ("foreground", p.foreground, 7.0),
+                ("muted_foreground", p.muted_foreground, 6.0),
+                ("subtle_foreground", p.subtle_foreground, AA),
+                ("faint_foreground", p.faint_foreground, 3.0),
+                ("primary", p.primary, AA),
+                ("danger", p.danger, AA),
+                ("warning", p.warning, AA),
+                ("success", p.success, AA),
+                ("info", p.info, AA),
+            ];
+            for (name, ink, floor) in inks {
+                for surface in surfaces {
+                    let ratio = contrast(ink, surface);
+                    assert!(
+                        ratio >= floor,
+                        "{}: {name} on {surface} is {ratio:.2}:1, below {floor}:1",
+                        preset.id(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The four inks have to stay four: a legibility fix that flattens them
+    /// into one another buys contrast by losing the hierarchy it was for.
+    #[test]
+    fn the_ink_hierarchy_stays_a_hierarchy() {
+        for preset in Preset::ALL {
+            let p = preset.palette();
+            let steps = [
+                p.foreground,
+                p.muted_foreground,
+                p.subtle_foreground,
+                p.faint_foreground,
+            ];
+            for pair in steps.windows(2) {
+                let apart = contrast(pair[0], p.background) / contrast(pair[1], p.background);
+                assert!(
+                    apart >= 1.2,
+                    "{}: {} and {} are the same step",
+                    preset.id(),
+                    pair[0],
+                    pair[1],
+                );
+            }
+        }
+    }
 
     #[test]
     fn parses_both_hex_forms() {

@@ -11,7 +11,8 @@
 use gpui::prelude::*;
 use gpui::{App, Entity, IntoElement, ParentElement, Styled, div};
 use gpui_component::ActiveTheme as _;
-use gpui_component::Icon;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Icon, Selectable as _};
 
 use crate::app::{Destination, WhatsAppApp};
 use crate::responsive::ResponsiveLayout;
@@ -88,23 +89,21 @@ fn render_destination(
         Destination::Status => crate::components::ProductIcon::CircleDashed.into(),
     };
 
-    div()
-        .id(destination.id())
+    // A `Button`, not a styled `div`: this is the only route to Status, so a
+    // pointer-only rail would put a whole destination out of reach of the
+    // keyboard — and the focus ring the theme defines is drawn by the
+    // library's controls, not by anything hand-rolled.
+    Button::new(destination.id())
+        .ghost()
+        .selected(is_current)
         .relative()
         .size(metrics.touch_target())
         .flex()
         .items_center()
         .justify_center()
         .rounded(metrics.radius_md())
-        .cursor_pointer()
-        .tooltip(move |window, cx| {
-            gpui_component::tooltip::Tooltip::new(destination.label()).build(window, cx)
-        })
+        .tooltip(destination.label())
         .when(is_current, |el| el.bg(cx.theme().list_active))
-        .when(!is_current, |el| {
-            let hover = cx.theme().list_hover;
-            el.hover(move |s| s.bg(hover))
-        })
         .on_click(move |_, _window, cx| {
             entity.update(cx, |app, cx| app.set_destination(destination, cx));
         })

@@ -10,7 +10,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
+use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::status::status_ring;
@@ -196,21 +196,21 @@ fn render_author_row(
     // itself takes, so a Status row is the same height as a chat row.
     let avatar = layout.avatar_size() - metrics.space_sm();
 
-    div()
-        .id(SharedString::from(format!("status-{jid}")))
+    // A `Button` rather than a row-shaped `div`: opening someone's status is
+    // the only thing this screen does, and a chat row at least has ↑↓ and the
+    // list's own selection behind it. This has nothing else.
+    Button::new(SharedString::from(format!("status-{jid}")))
+        .ghost()
+        .selected(is_selected)
         .w_full()
         .h(layout.chat_item_height())
         .flex()
         .items_center()
+        .justify_start()
         .gap(metrics.space_lg())
         .px(metrics.chat_row_padding_x())
         .rounded(metrics.radius_lg())
-        .cursor_pointer()
         .when(is_selected, |el| el.bg(cx.theme().list_active))
-        .when(!is_selected, |el| {
-            let hover = cx.theme().list_hover;
-            el.hover(move |s| s.bg(hover))
-        })
         .on_click(move |_, _window, cx| {
             entity.update(cx, |app, cx| app.open_status(jid.clone(), cx));
         })
