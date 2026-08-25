@@ -27,7 +27,7 @@ pub use calls::CallCard;
 pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
 pub use chats::{ChatFilter, ChatListCache};
 pub use media::RecordingState;
-pub use messages::{MessageListCache, TimelineItem};
+pub use messages::{MessageListCache, RowId, TimelineItem};
 
 /// What the conversation list was last told about.
 /// What the audio sink is holding, and where it came from.
@@ -80,9 +80,11 @@ struct TimelineAnchor {
     count: usize,
     /// The build of the rows the list last measured.
     build: usize,
-    /// The message the timeline started on, so rows added at the *front* are
-    /// not mistaken for rows added at the end.
-    head: Option<String>,
+    /// The row at `count - 1`: the last one whose measurement the list is
+    /// keeping. Anything that moves it — a backfill before the head, a
+    /// notice stamped in the past, a removal — moved everything the list
+    /// measured, and only an append leaves it alone.
+    boundary: Option<RowId>,
 }
 pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
@@ -170,8 +172,8 @@ use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_wa
 use oxidezap_core::{
     ActiveCall, AppState, Availability, CachedQrCode, CallOutcome, CallRecord, CallState, Chat,
     ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, Issued, MediaContent, MediaType,
-    MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Stage, SystemNotice,
-    TypingSummary, UiEvent,
+    MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Resend, Stage,
+    SystemNotice, TypingSummary, UiEvent,
 };
 
 // ChatListCache is now in chats.rs and re-exported above
@@ -998,23 +1000,33 @@ impl WhatsAppApp {
     /// most.
     ///
     /// The list keeps one measured height per row index, so what it is told
-    /// has to match what actually changed. A count on its own cannot say:
-    /// a history backfill inserts older messages *before* the head and raises
-    /// the count doing it, which read as an append and spliced the new rows in
-    /// at the wrong end; and a row that changes height without the count
-    /// moving — an image arriving, a reaction, a revoke, a failed send growing
-    /// its retry button — read as nothing having happened at all, leaving
-    /// bubbles measured at a size they no longer are.
+    /// has to match what actually changed. A count on its own cannot say: a
+    /// history backfill inserts older messages *before* the head and raises
+    /// the count doing it, which read as an append and spliced the new rows
+    /// in at the wrong end; and a row that changes height without the count
+    /// moving — an image arriving, a reaction, a revoke, a failed send
+    /// growing its retry button — read as nothing having happened at all,
+    /// leaving bubbles measured at a size they no longer are.
+    ///
+    /// So the question is asked of the rows: are the ones the list measured
+    /// still those rows? The last of them is what answers it. An append
+    /// leaves that row where it was; a prepend, a removal, and a row landing
+    /// in the *middle* — a system notice stamped in the past, a backfilled
+    /// message newer than the head but older than the tail — all push it
+    /// along, and all of those raise the count exactly as an arrival does.
+    /// Comparing the first row instead saw none of the middle three.
     fn sync_timeline(&mut self, chat_jid: &str, rows: &MessageListCache) {
         let count = rows.items.len();
-        let head = rows.head().map(str::to_owned);
+        let boundary = rows.row_id(count.saturating_sub(1));
         let previous = self.timeline_anchor.take();
 
-        // Same conversation, same first row: whatever changed, it did not
-        // change where the timeline begins.
-        let continued = previous
-            .as_ref()
-            .filter(|anchor| anchor.jid == chat_jid && anchor.head.as_deref() == rows.head());
+        // Same conversation, and the prefix the list measured is still that
+        // prefix: whatever changed happened after it.
+        let continued = previous.as_ref().filter(|anchor| {
+            anchor.jid == chat_jid
+                && count >= anchor.count
+                && rows.row_id(anchor.count.saturating_sub(1)) == anchor.boundary
+        });
 
         match continued {
             // Rows arrived at the end: keep the measurements taken for
@@ -1023,24 +1035,24 @@ impl WhatsAppApp {
                 self.message_list
                     .splice(anchor.count..anchor.count, count - anchor.count);
             }
-            Some(anchor) if count == anchor.count => {
-                // The same rows, rebuilt. Something inside one of them is a
-                // different size now; remeasure rather than reset, which
-                // keeps the reader where they were reading.
+            // The same rows, rebuilt. Something inside one of them is a
+            // different size now; remeasure rather than reset, which keeps
+            // the reader where they were reading.
+            Some(anchor) => {
                 if anchor.build != rows.build {
                     self.message_list.remeasure();
                 }
             }
-            // A different conversation, rows added at the front, or rows
-            // taken away.
-            _ => self.message_list.reset(count),
+            // A different conversation, or rows that moved under the ones
+            // already measured.
+            None => self.message_list.reset(count),
         }
 
         self.timeline_anchor = Some(TimelineAnchor {
             jid: chat_jid.to_string(),
             count,
             build: rows.build,
-            head,
+            boundary,
         });
     }
 

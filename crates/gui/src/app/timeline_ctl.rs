@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// [`Resend`] with the message let go of.
+///
+/// The answer borrows the chat and sending needs `self` mutably, so this is
+/// the same two cases holding what they name.
+enum Retry {
+    Text(String),
+    /// Boxed: a `MediaContent` is ten times the size of a `String`, and this
+    /// value exists for one statement.
+    VoiceNote(Box<MediaContent>),
+}
+
 impl WhatsAppApp {
     /// Focus target for the call card, so its actions are reachable from the
     /// keyboard while it floats.
@@ -124,37 +135,35 @@ impl WhatsAppApp {
         let Some(message) = chat.messages.iter().find(|m| m.id == message_id) else {
             return;
         };
-        if !message.is_failed() {
+        // What the bubble asked before drawing the button, asked again here
+        // so the two cannot disagree about what a retry can do.
+        let Some(again) = message.resend() else {
             return;
-        }
+        };
         // A reply that failed is retried as a reply. The draft that produced
         // it was consumed by the first send, so the quote has to come from
         // the message itself.
         let quoted = message.quoted.clone();
-        let content = message.content.clone();
-        // A voice note has no text and is not therefore beyond recovery: the
-        // failed bubble still holds the encoded opus, its length and its
-        // waveform, which is everything the send needs. Refusing here made
-        // the retry button under one a control that answered a click with
-        // nothing.
-        let voice = message
-            .media
-            .clone()
-            .filter(|media| media.media_type == MediaType::Audio && !media.data.is_empty());
+        // Lifted off the chat before sending, which needs `self` mutably.
+        let again = match again {
+            Resend::Text(text) => Retry::Text(text.to_owned()),
+            Resend::VoiceNote(media) => Retry::VoiceNote(Box::new(media.clone())),
+        };
         let jid = chat.jid.clone();
         let _ = window;
 
-        if !content.is_empty() {
-            self.send_quoted(&content, quoted, cx);
-        } else if let Some(media) = voice {
-            self.send_voice_note(
-                &jid,
-                (*media.data).clone(),
-                media.waveform.as_deref().cloned().unwrap_or_default(),
-                media.duration_secs.unwrap_or(0),
-                quoted,
-            );
-            cx.notify();
+        match again {
+            Retry::Text(content) => self.send_quoted(&content, quoted, cx),
+            Retry::VoiceNote(media) => {
+                self.send_voice_note(
+                    &jid,
+                    (*media.data).clone(),
+                    media.waveform.as_deref().cloned().unwrap_or_default(),
+                    media.duration_secs.unwrap_or(0),
+                    quoted,
+                );
+                cx.notify();
+            }
         }
     }
 

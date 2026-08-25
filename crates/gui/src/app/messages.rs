@@ -72,15 +72,33 @@ pub struct MessageListCache {
     pub messages: Arc<[ChatMessage]>,
 }
 
+/// What names one row, so it can be recognised at an index later.
+///
+/// Enough to say "this is still that row", which is all the timeline anchor
+/// asks. Not enough to say the row is unchanged — a bubble grows a reaction
+/// or a retry button without becoming a different row, and the build number
+/// is what answers that.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RowId {
+    Divider(DateTime<Utc>),
+    Message(String),
+    Typing,
+    Encryption,
+}
+
 impl MessageListCache {
-    /// The message the timeline starts on, which is what says whether rows
-    /// were added to the *front*.
+    /// Which row sits at `ix`, if anything does.
     ///
-    /// A history backfill inserts older messages before the head and raises
-    /// the count doing it, which is indistinguishable from an append if the
-    /// count is all anyone looks at.
-    pub fn head(&self) -> Option<&str> {
-        self.messages.first().map(|message| message.id.as_str())
+    /// The anchor asks this about one index — the last row whose measurement
+    /// the list is keeping — because a prepend, a middle insertion and a
+    /// removal all move that row and an append does not.
+    pub fn row_id(&self, ix: usize) -> Option<RowId> {
+        Some(match self.items.get(ix)? {
+            TimelineItem::DateDivider(day) => RowId::Divider(*day),
+            TimelineItem::Message { ix, .. } => RowId::Message(self.messages.get(*ix)?.id.clone()),
+            TimelineItem::Typing(_) => RowId::Typing,
+            TimelineItem::Encryption => RowId::Encryption,
+        })
     }
 }
 
@@ -192,20 +210,39 @@ mod tests {
             .collect()
     }
 
-    /// What the timeline anchor compares. A backfill puts older messages
-    /// before the head and raises the count doing it, which is the same
-    /// count change an arrival makes and the opposite end of the list.
+    /// What the timeline anchor compares: the row at the end of the prefix
+    /// the list has measured. An append leaves it where it was; a backfill
+    /// before the head, and a row inserted in the middle, both push it along
+    /// — and both raise the count exactly as an arrival does.
     #[test]
-    fn the_head_is_the_message_the_timeline_starts_on() {
-        let newer = message("a", false, at(14, 9));
-        let older = message("a", false, at(13, 9));
+    fn the_last_measured_row_is_what_says_the_rest_did_not_move() {
+        let first = message("a", false, at(13, 9));
+        let last = message("a", false, at(14, 9));
 
-        let live = MessageListCache::new(std::slice::from_ref(&newer), false, None);
-        assert_eq!(live.head(), Some(newer.id.as_str()));
+        let before = MessageListCache::new(&[first.clone(), last.clone()], false, None);
+        let boundary = before.row_id(before.items.len() - 1);
+        assert_eq!(boundary, Some(RowId::Message(last.id.clone())));
 
-        let backfilled = MessageListCache::new(&[older.clone(), newer], false, None);
-        assert_eq!(backfilled.head(), Some(older.id.as_str()));
-        assert_ne!(live.head(), backfilled.head());
+        let appended = MessageListCache::new(
+            &[first.clone(), last.clone(), message("a", false, at(15, 9))],
+            false,
+            None,
+        );
+        assert_eq!(
+            appended.row_id(before.items.len() - 1),
+            boundary,
+            "an append leaves every earlier row where it was"
+        );
+
+        // Inserted between the two, the way a system notice stamped in the
+        // past joins a conversation.
+        let inserted =
+            MessageListCache::new(&[first, message("a", false, at(13, 18)), last], false, None);
+        assert_ne!(
+            inserted.row_id(before.items.len() - 1),
+            boundary,
+            "a row in the middle moves the one the list measured last"
+        );
     }
 
     /// A rebuild is the signal that something inside a row changed, and it is

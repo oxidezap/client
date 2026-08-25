@@ -117,6 +117,14 @@ impl WhatsAppApp {
         self.update_input_recording(cx);
         cx.notify();
 
+        // The reply this recording is answering, captured *now* rather than
+        // read at send time: encoding runs on a background thread, and a
+        // reply begun while it ran would otherwise attach itself to a voice
+        // note recorded before it existed. Copied rather than taken, so the
+        // paths below that give up on this recording leave the composer's
+        // draft where the user put it.
+        let reply = self.reply_to.clone();
+
         // Stop recording and get audio data
         let recorded = match self.audio_recorder.stop() {
             Ok(audio) => audio,
@@ -166,7 +174,7 @@ impl WhatsAppApp {
                 })
                 .await;
             let _ = entity.update(cx, |app, cx| {
-                app.finish_recording_send(jid, encoded, cx);
+                app.finish_recording_send(jid, reply, encoded, cx);
             });
         })
         .detach();
@@ -174,6 +182,7 @@ impl WhatsAppApp {
     fn finish_recording_send(
         &mut self,
         jid: String,
+        reply: Option<ReplyDraft>,
         encoded: Result<(Vec<u8>, Vec<u8>, u32), String>,
         cx: &mut Context<Self>,
     ) {
@@ -196,16 +205,26 @@ impl WhatsAppApp {
             return;
         };
         let _ = client;
-        // Taken, not read. Recording is a way of answering, so an open reply
-        // draft belongs to *this* send — and leaving it armed made it attach
-        // itself to whatever was typed next, which is the half of the bug
-        // nobody would connect to having pressed the microphone.
-        let quoted = self.reply_to.take().map(QuotedMessage::from);
+        // Recording is a way of answering, so the draft that was open when
+        // the microphone stopped belongs to *this* send — and leaving it
+        // armed made it attach itself to whatever was typed next, which is
+        // the half of the bug nobody would connect to having pressed the
+        // microphone. Cleared only if it is still that draft: one begun
+        // while the encoder ran is answering something else.
+        let quoted = reply.map(|draft| {
+            if self
+                .reply_to
+                .as_ref()
+                .is_some_and(|current| current.message_id == draft.message_id)
+            {
+                self.reply_to = None;
+                if let Some(input) = &self.input_area {
+                    input.update(cx, |view, cx| view.set_reply(None, cx));
+                }
+            }
+            QuotedMessage::from(draft)
+        });
         self.send_voice_note(&jid, ogg_data, waveform, duration_secs, quoted);
-        // The draft is gone from the input as well as from the model.
-        if let Some(input) = &self.input_area {
-            input.update(cx, |view, cx| view.set_reply(None, cx));
-        }
         self.recording_state = RecordingState::Idle;
         self.update_input_recording(cx);
         info!("PTT audio sent successfully");

@@ -480,13 +480,31 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
             // account row read as unlinked and the own-number checks that
             // depend on it — "(You)", the read ticks in your own chat — had
             // nothing to compare against.
-            Ok(DaemonMessage::Hello { snapshot, .. }) => {
+            Ok(DaemonMessage::Hello { protocol, snapshot }) if protocol == PROTOCOL_VERSION => {
                 if catch_up(&snapshot)
                     .into_iter()
                     .any(|event| events.blocking_send(event).is_err())
                 {
                     break;
                 }
+            }
+            // Both ends check, because both ends act on what the other says.
+            // The daemon refuses a hello it cannot read; this is the same
+            // refusal from the other side, and it matters more here — the
+            // snapshot is a whole state to adopt, and a frame that merely
+            // *deserializes* is not a frame that means what this build
+            // thinks it means.
+            Ok(DaemonMessage::Hello { protocol, .. }) => {
+                error!(
+                    "the daemon speaks protocol {protocol}, this build speaks {PROTOCOL_VERSION}"
+                );
+                reason = Some(format!(
+                    "This window and the background service are different \
+                     versions (protocol {protocol} against \
+                     {PROTOCOL_VERSION}). Quit oxidezap completely and start \
+                     it again."
+                ));
+                break;
             }
             Ok(DaemonMessage::Session { event }) => {
                 let mut event = *event;

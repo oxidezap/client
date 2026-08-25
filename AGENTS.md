@@ -131,13 +131,17 @@ profile here repeats it deliberately.
   The publish thread externalizes media behind an unbounded queue, so an
   event accepted before `ForgetSession` can still be in it. `stop_publishing`
   closes the queue and hands back the thread to join, before the wipe.
-- **The timeline anchor describes the rows, not how many there are.** A
-  history backfill inserts older messages *before* the head and raises the
-  count doing it, which is the same count change an arrival makes and the
-  opposite end of the list; and a row can change height with the count
-  standing still — an image arrives, a reaction lands, a send fails and grows
-  a retry button. `MessageListCache::head` answers the first, its `build`
-  number the second, and the three outcomes are splice, remeasure and reset.
+- **The timeline anchor describes the rows, not how many there are.** The
+  list keeps a measured height per index, so the only question worth asking
+  is whether the rows it measured are still those rows. A count cannot say:
+  a backfill before the head, a notice stamped in the past and a message
+  landing mid-history all raise it exactly as an arrival does, and only an
+  arrival leaves the earlier rows alone. The row at the end of the measured
+  prefix is what answers it (`MessageListCache::row_id`), because that is the
+  row every one of those moves and an append does not. A row can also change
+  height with the count standing still — an image arrives, a reaction lands,
+  a send fails and grows a retry button — which the `build` number answers.
+  The three outcomes are splice, remeasure and reset.
 - **A daemon frame is either state or news, and they use different channels.**
   State carries a version and is recoverable from a snapshot; a window request
   or a failed send is neither, so it must not ride a channel a client stops

@@ -126,13 +126,17 @@ pub fn render_message_bubble(
     let retry_entity = entity.clone();
     let retry_id = message_id.clone();
     let failed = message.is_failed();
+    // Whether there is anything to send again — which is not the same
+    // question as whether the send failed, and drawing the button off the
+    // latter offered a retry that had nothing to put on the wire.
+    let can_retry = message.resend().is_some();
 
     // Right-click anywhere on the row, which is what a desktop reader reaches
     // for and the only route to these commands that does not require finding a
     // control that is invisible until the pointer is already over it.
     let menu_id = message_id.clone();
     let menu_text = message.content.clone();
-    let menu_failed = failed;
+    let menu_failed = can_retry;
 
     div()
         .id(SharedString::from(format!("row-{message_id}")))
@@ -270,7 +274,7 @@ pub fn render_message_bubble(
                                 ),
                         ),
                 )
-                .when(failed, |el| {
+                .when(can_retry, |el| {
                     // Sending again is a command, not a surface: a styled div
                     // has no keyboard activation, so a failed message would
                     // only be recoverable with a pointer.

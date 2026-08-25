@@ -179,14 +179,13 @@ impl WhatsAppApp {
                 app.status_feed_cache.borrow_mut().take();
                 app.invalidate_chat_cache();
                 // An update that lapses while it is being watched takes its
-                // decoder and its audio with it. Every other way out of the
-                // reader stops the media; this one did not, so a video that
-                // expired mid-play went on playing behind whatever the window
-                // showed next.
+                // decoder and its audio with it, and hands the reader over to
+                // whatever is behind it — which is a change of what is on
+                // screen like any other, not merely a stop.
                 if let Some(id) = shown
                     && app.shown_status_message_id().as_deref() != Some(id.as_str())
                 {
-                    app.stop_status_media(Some(id));
+                    app.shown_status_changed(Some(id), cx);
                 }
                 app.ensure_status_tick(cx);
                 cx.notify();
@@ -204,14 +203,13 @@ impl WhatsAppApp {
     }
 
     pub fn open_status(&mut self, author: String, cx: &mut Context<Self>) {
-        // Before the selection moves, because afterwards there is no way to
-        // ask what was on screen. Opening an image or a text update does not
-        // touch the player, so a video left this way went on playing.
-        self.leave_shown_status();
+        // Read before the selection moves, because afterwards there is no way
+        // to ask what was on screen. Opening an image or a text update does
+        // not touch the player, so a video left this way went on playing.
+        let leaving = self.shown_status_message_id();
         self.status_pane.open(author);
         self.navigate_to_chat();
-        self.mark_shown_status_seen();
-        self.fetch_shown_status(cx);
+        self.shown_status_changed(leaving, cx);
         cx.notify();
     }
 
@@ -237,11 +235,22 @@ impl WhatsAppApp {
         // being left, not the one arriving.
         let leaving = self.shown_status_message_id();
         if self.status_pane.step(forward, author.count()) {
-            self.stop_status_media(leaving);
-            self.mark_shown_status_seen();
-            self.fetch_shown_status(cx);
+            self.shown_status_changed(leaving, cx);
             cx.notify();
         }
+    }
+
+    /// The reader is showing a different update than it was.
+    ///
+    /// Three things that only ever happen together: stop what is being left,
+    /// mark what has arrived as watched, and fetch its bytes. Every way the
+    /// shown update changes goes through here — which is what expiry did not,
+    /// so an update that lapsed under the reader handed its place to the next
+    /// one and left it unfetched and still ringed as new.
+    fn shown_status_changed(&mut self, leaving: Option<String>, cx: &mut Context<Self>) {
+        self.stop_status_media(leaving);
+        self.mark_shown_status_seen();
+        self.fetch_shown_status(cx);
     }
 
     /// Stop the update on screen, because the reader is about to stop showing

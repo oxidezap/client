@@ -242,6 +242,15 @@ impl MediaContent {
     }
 }
 
+/// What a failed message can be sent again as.
+///
+/// Borrowed from the message, because the common caller only wants to know
+/// whether there is anything here at all.
+pub enum Resend<'a> {
+    Text(&'a str),
+    VoiceNote(&'a MediaContent),
+}
+
 impl ChatMessage {
     /// What to draw for whoever wrote this: the name somebody has for them,
     /// or the number if nobody has one yet.
@@ -343,9 +352,33 @@ impl ChatMessage {
         Some(status)
     }
 
-    /// Whether the bubble should offer a retry.
+    /// Whether the send failed, which is what the bubble draws in red.
     pub fn is_failed(&self) -> bool {
         self.is_from_me && self.status.is_failed()
+    }
+
+    /// What sending this again would put on the wire, if anything.
+    ///
+    /// One question with one answer, asked by the bubble to decide whether to
+    /// offer a retry and by the retry to decide what to send. They were two
+    /// separate conditions — "did it fail" and "is there text or opus here" —
+    /// so a failed message with neither drew a control that answered a click
+    /// with nothing. Text and voice notes are what this client composes, and
+    /// therefore what it can compose a second time.
+    pub fn resend(&self) -> Option<Resend<'_>> {
+        if !self.is_failed() {
+            return None;
+        }
+        if !self.content.is_empty() {
+            return Some(Resend::Text(&self.content));
+        }
+        // A voice note has no text and is not therefore beyond recovery: the
+        // failed bubble still holds the encoded opus, its length and its
+        // waveform, which is everything the send needs.
+        self.media
+            .as_ref()
+            .filter(|media| media.media_type == MediaType::Audio && !media.data.is_empty())
+            .map(Resend::VoiceNote)
     }
 
     /// Add or update a reaction to this message from a sender.
