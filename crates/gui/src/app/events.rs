@@ -185,6 +185,14 @@ impl WhatsAppApp {
             } => {
                 self.handle_chat_presence(chat_jid, sender_jid, sender_name, composing, cx);
             }
+            UiEvent::AccountUpdated { name, jid } => {
+                if self.account_name != name || self.account_jid != jid {
+                    self.account_name = name;
+                    self.account_jid = jid;
+                    self.invalidate_chat_cache();
+                    cx.notify();
+                }
+            }
             UiEvent::SystemNotice {
                 chat_jid,
                 notice_id,

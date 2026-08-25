@@ -118,6 +118,11 @@ struct Inner {
     /// events that would not reconstruct it: a call this account placed was
     /// never an event at all.
     calls: oxidezap_core::CallState,
+    /// Who this device is linked as, once the session has said.
+    ///
+    /// State for the same reason the calls are: announced on connect, once,
+    /// and a client attaching afterwards never saw it.
+    account: Option<oxidezap_ipc::AccountIdentity>,
     /// Chats keyed by JID. A map, not a Vec: every update is a lookup by JID,
     /// and a Vec would make a rename or a receipt O(n) over every chat.
     chats: std::collections::HashMap<String, ChatEntry>,
@@ -161,6 +166,7 @@ impl StateHub {
                 version: StateVersion::INITIAL,
                 connection: ConnectionState::Connecting,
                 calls: oxidezap_core::CallState::default(),
+                account: None,
                 chats: std::collections::HashMap::new(),
             }),
             updates,
@@ -239,7 +245,19 @@ impl StateHub {
             connection: inner.connection.clone(),
             chats,
             calls: inner.calls.clone(),
+            account: inner.account.clone(),
         }
+    }
+
+    /// Record who this device is linked as. Returns whether it changed, so a
+    /// re-announcement of the same identity buys no update.
+    pub fn set_account(&self, account: oxidezap_ipc::AccountIdentity) -> bool {
+        let mut inner = self.lock();
+        if inner.account.as_ref() == Some(&account) {
+            return false;
+        }
+        inner.account = Some(account);
+        true
     }
 
     /// Change what is happening on the call front.

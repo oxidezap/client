@@ -145,6 +145,23 @@ pub struct StateSnapshot {
     /// both sides already share [`CallState`], so the snapshot hands it over.
     #[serde(default)]
     pub calls: CallState,
+    /// Who this device is linked as, when the session has said.
+    ///
+    /// State for the same reason the calls are: it is announced on connect,
+    /// once, and a client attaching after that never saw it. Without it the
+    /// account row claimed "not linked" over a live session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountIdentity>,
+}
+
+/// The account this device is linked to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountIdentity {
+    /// The push name, absent until the profile has synced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jid: Option<String>,
 }
 
 impl StateSnapshot {
@@ -495,6 +512,7 @@ mod tests {
             connection: ConnectionState::Connected,
             chats: vec![chat(u32::MAX), chat(5)],
             calls: CallState::default(),
+            account: None,
         };
         assert_eq!(snapshot.total_unread(), u32::MAX);
     }
@@ -518,6 +536,7 @@ mod tests {
             connection: ConnectionState::Connected,
             chats: vec![chat.clone()],
             calls: CallState::default(),
+            account: None,
         };
         assert_eq!(
             snapshot.total_unread(),

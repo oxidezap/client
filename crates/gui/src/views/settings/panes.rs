@@ -69,6 +69,7 @@ pub fn label(text: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement
 /// One label/value line.
 fn row(key: String, value: String, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     div()
+        .w_full()
         .flex()
         .items_center()
         .justify_between()
@@ -78,15 +79,24 @@ fn row(key: String, value: String, metrics: Metrics, cx: &App) -> impl IntoEleme
         .border_color(cx.theme().border)
         .child(
             div()
+                .flex_shrink_0()
                 .text_size(metrics.text_secondary())
                 .text_color(cx.theme().muted_foreground)
                 .child(key),
         )
         .child(
+            // The value is the side that gives: a long push name or a path
+            // should end in an ellipsis rather than push the label off screen.
             div()
+                .flex_1()
+                .min_w_0()
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_size(metrics.text_meta())
                 .text_color(cx.theme().foreground)
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_right()
                 .child(value),
         )
 }
@@ -94,8 +104,11 @@ fn row(key: String, value: String, metrics: Metrics, cx: &App) -> impl IntoEleme
 /// What a section is waiting on, stated plainly.
 fn pending(text: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     div()
+        .w_full()
         .flex()
-        .items_center()
+        // Top, not centre: these run to two or three lines, and an icon
+        // floating in the middle of a paragraph reads as unattached to it.
+        .items_start()
         .gap(metrics.space_lg())
         .p(metrics.space_lg())
         .rounded(metrics.radius_md())
@@ -109,7 +122,11 @@ fn pending(text: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement +
                 .text_color(cx.theme().muted_foreground),
         )
         .child(
+            // Without a shrinkable flex child the sentence lays out to its
+            // natural width and runs off the pane; this is what makes it wrap.
             div()
+                .flex_1()
+                .min_w_0()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().muted_foreground)
                 .child(text),
@@ -133,6 +150,16 @@ fn account(app: &WhatsAppApp, metrics: Metrics, cx: &App) -> AnyElement {
                 metrics,
                 cx,
             ))
+            .children(app.account_jid().map(|jid| {
+                row(
+                    "Number".to_string(),
+                    // The user part alone: the server suffix is noise to a
+                    // reader checking which account this is.
+                    jid.split('@').next().unwrap_or(jid).to_string(),
+                    metrics,
+                    cx,
+                )
+            }))
             .child(row(
                 "Status".to_string(),
                 account
@@ -198,8 +225,9 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
         .child(group(
             label("ENCRYPTION", metrics, cx),
             div()
+                .w_full()
                 .flex()
-                .items_center()
+                .items_start()
                 .gap(metrics.space_lg())
                 .p(metrics.space_lg())
                 .rounded(metrics.radius_md())
@@ -214,6 +242,8 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .text_size(metrics.text_small())
                         .text_color(cx.theme().muted_foreground)
                         .child(

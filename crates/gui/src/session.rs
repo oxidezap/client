@@ -51,6 +51,8 @@ pub enum FromDaemon {
     /// event — the front end that dialled built it locally — so there is
     /// nothing to replay it from.
     Calls(Box<CallState>),
+    /// Who this device is linked as, at the moment this client attached.
+    Account(Option<oxidezap_ipc::AccountIdentity>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
 }
@@ -527,6 +529,7 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     // ringing call went out before this window existed, and a call this
     // account placed was never an event at all.
     events.push(FromDaemon::Calls(Box::new(snapshot.calls.clone())));
+    events.push(FromDaemon::Account(snapshot.account.clone()));
     events
 }
 
@@ -569,7 +572,13 @@ fn fill(media: &mut Option<MediaContent>) {
         return;
     };
     match media_path(&key).map(std::fs::read) {
-        Some(Ok(bytes)) => media.data = Arc::new(bytes),
+        Some(Ok(bytes)) => {
+            media.data = Arc::new(bytes);
+            // The daemon only caches the real thing, so whatever came out of
+            // the cache is it — including when the row arrived carrying a
+            // fallback thumbnail, which is the shape a reload takes.
+            media.data_is_preview = false;
+        }
         // The renderer falls back to offering the download, which is the same
         // thing it does for media that was never cached.
         Some(Err(e)) => debug!("media {key} is not in the cache: {e}"),

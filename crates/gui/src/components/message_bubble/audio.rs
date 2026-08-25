@@ -35,6 +35,13 @@ pub(super) fn render_audio_player(
     media_content: MediaContent,
     message_id: String,
     is_playing: bool,
+    // Progress only means anything for the clip that is actually loaded; a
+    // second voice note in the same conversation must not borrow its
+    // position, so the list hands this row `None` unless it is the one
+    // playing. Read out there rather than here: the app is already leased to
+    // build this row, and reading it again panics.
+    audio: Option<super::AudioProgress>,
+    speed: f32,
     entity: Entity<WhatsAppApp>,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -43,22 +50,10 @@ pub(super) fn render_audio_player(
     let can_download = media_content.can_download();
     let can_play = has_data || can_download;
 
-    let app = entity.read(cx);
-    // Progress only means anything for the clip that is actually loaded; a
-    // second voice note in the same conversation must not borrow its position.
-    let is_current = app.audio_owner() == Some(message_id.as_str());
-    let progress = if is_current {
-        app.audio_progress()
-    } else {
-        0.0
-    };
-    let speed = app.playback_speed();
-
-    let elapsed = if is_current && progress > 0.0 {
-        Some(app.audio_elapsed_secs() as u32)
-    } else {
-        None
-    };
+    let progress = audio.map_or(0.0, |audio| audio.fraction);
+    let elapsed = audio
+        .filter(|audio| audio.fraction > 0.0)
+        .map(|audio| audio.elapsed_secs as u32);
     let duration = media_content.duration_secs;
     let bars = resample(media_content.waveform.as_ref().map(|w| w.as_slice()), BARS);
 

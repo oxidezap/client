@@ -19,18 +19,39 @@ use crate::utils::{mime_to_image_format, scale_media_dimensions};
 use crate::video::VideoPlayerState;
 use oxidezap_core::{DownloadableMedia, MediaType};
 
+/// What a media bubble needs from the app, read out before the row is built.
+///
+/// The virtual list has already leased the app to build this row, so reading
+/// that entity again inside it panics; everything the app knows arrives here
+/// instead.
+pub(super) struct MediaProps {
+    pub video_player_state: Option<VideoPlayerState>,
+    pub video_frame: Option<Arc<RenderImage>>,
+    pub sticker_image: Option<Arc<Image>>,
+    pub audio: Option<super::AudioProgress>,
+    pub playback_speed: f32,
+    pub is_downloading: bool,
+    pub max_media_size: f32,
+}
+
 pub(super) fn render_media_content(
     el: gpui::Div,
     media_content: oxidezap_core::MediaContent,
     message_id: String,
     is_playing: bool,
     entity: Entity<WhatsAppApp>,
-    video_player_state: Option<VideoPlayerState>,
-    video_frame: Option<Arc<RenderImage>>,
-    sticker_image: Option<Arc<Image>>,
-    max_media_size: f32,
+    props: MediaProps,
     cx: &App,
 ) -> gpui::Div {
+    let MediaProps {
+        video_player_state,
+        video_frame,
+        sticker_image,
+        audio,
+        playback_speed,
+        is_downloading,
+        max_media_size,
+    } = props;
     match media_content.media_type {
         MediaType::Image => {
             let (display_w, display_h) = scale_media_dimensions(
@@ -102,6 +123,7 @@ pub(super) fn render_media_content(
                     message_id,
                     dl,
                     entity,
+                    is_downloading,
                     display_w,
                     display_h,
                     cx,
@@ -174,6 +196,7 @@ pub(super) fn render_media_content(
                     message_id,
                     dl,
                     entity,
+                    is_downloading,
                     display_w,
                     display_h,
                     cx,
@@ -200,6 +223,8 @@ pub(super) fn render_media_content(
             media_content,
             message_id,
             is_playing,
+            audio,
+            playback_speed,
             entity,
             cx,
         )),
@@ -207,6 +232,7 @@ pub(super) fn render_media_content(
             media_content,
             message_id,
             entity,
+            is_downloading,
             cx,
         )),
     }
@@ -216,19 +242,20 @@ pub(super) fn render_media_content(
 /// Sized like the real thing so the virtual list's row height does not jump
 /// when it arrives, and labelled with what it will cost to fetch — "Tap to
 /// download" tells you nothing about whether to do it on a phone tether.
+#[allow(clippy::too_many_arguments)]
 fn render_download_placeholder(
     id_prefix: &str,
     label: &'static str,
     message_id: String,
     dl: DownloadableMedia,
     entity: Entity<WhatsAppApp>,
+    is_downloading: bool,
     width: f32,
     height: f32,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
     let placeholder_id: SharedString = format!("{id_prefix}-{message_id}").into();
-    let is_downloading = entity.read(cx).is_downloading(&message_id);
     let size = dl.file_length;
 
     div()
@@ -352,6 +379,7 @@ fn render_document_placeholder(
     media_content: oxidezap_core::MediaContent,
     message_id: String,
     entity: Entity<WhatsAppApp>,
+    is_downloading: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
@@ -364,8 +392,6 @@ fn render_document_placeholder(
         .downloadable
         .as_ref()
         .and_then(|dl| format_bytes(dl.file_length));
-    let is_downloading = entity.read(cx).is_downloading(&message_id);
-
     let detail = match (&extension, &size) {
         (Some(ext), Some(size)) => format!("{ext} · {size}"),
         (Some(ext), None) => ext.clone(),

@@ -517,13 +517,23 @@ impl WhatsAppClient {
                     timeout_secs: pair.timeout.as_secs(),
                 });
             }
+            Event::SelfPushNameUpdated(update) => {
+                info!("Push name is now {:?}", update.new_name);
+                let _ = ui_tx.send(account_event(&client));
+            }
             Event::PairSuccess(_) => {
                 info!("Pairing successful, syncing...");
                 let _ = ui_tx.send(UiEvent::PairSuccess);
+                let _ = ui_tx.send(account_event(&client));
             }
             Event::Connected(_) => {
                 info!("Connected to WhatsApp!");
                 let _ = ui_tx.send(UiEvent::Connected);
+                // Who this device is linked as. Read from the device store
+                // rather than remembered from pairing: a client attaching
+                // after a restart never saw that, and the account row was
+                // claiming "not linked" over a live session.
+                let _ = ui_tx.send(account_event(&client));
             }
             Event::LoggedOut(logged_out) => {
                 info!("Logged out from WhatsApp: {:?}", logged_out.reason);
@@ -2322,6 +2332,19 @@ fn store_status(status: oxidezap_chat_store::MessageStatus) -> MessageStatus {
         Stored::Delivered => MessageStatus::Delivered,
         // Played is Read plus "and listened to it"; the ticks are the same.
         Stored::Read | Stored::Played => MessageStatus::Read,
+    }
+}
+
+/// Who this device is linked as, off the device store.
+///
+/// Both fields are optional because both can genuinely be unknown: a device
+/// that has paired but never synced its profile has no push name, and the
+/// account row says so rather than inventing one.
+fn account_event(client: &Arc<Client>) -> UiEvent {
+    let device = client.persistence_manager().get_device_snapshot();
+    UiEvent::AccountUpdated {
+        name: Some(device.push_name.clone()).filter(|name| !name.is_empty()),
+        jid: device.pn.as_ref().map(ToString::to_string),
     }
 }
 

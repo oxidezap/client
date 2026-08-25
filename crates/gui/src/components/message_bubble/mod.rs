@@ -25,7 +25,7 @@ use gpui_component::{Sizable as _, h_flex, v_flex};
 pub use audio::SPEEDS;
 pub use system::render_encryption_notice;
 
-use media::render_media_content;
+use media::{MediaProps, render_media_content};
 use quote::render_quote;
 use reactions::{render_hover_actions, render_reactions};
 
@@ -48,6 +48,24 @@ pub struct BubbleProps {
     pub video_player_state: Option<VideoPlayerState>,
     pub video_frame: Option<Arc<RenderImage>>,
     pub sticker_image: Option<Arc<Image>>,
+    /// Where this clip's playback is, when this clip is the one playing.
+    ///
+    /// Read out by the list rather than looked up here: the virtual list has
+    /// already leased the app to build this row, and reading that entity a
+    /// second time inside the row panics. Every value a bubble needs from the
+    /// app comes through this struct for that reason.
+    pub audio: Option<AudioProgress>,
+    pub playback_speed: f32,
+    /// Whether this message's media is being fetched right now.
+    pub is_downloading: bool,
+}
+
+/// How far into the voice note the player is.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioProgress {
+    /// 0..=1 through the clip.
+    pub fraction: f32,
+    pub elapsed_secs: f32,
 }
 
 pub fn render_message_bubble(
@@ -184,10 +202,15 @@ pub fn render_message_bubble(
                                         message_id.clone(),
                                         is_playing,
                                         entity.clone(),
-                                        props.video_player_state,
-                                        props.video_frame.clone(),
-                                        props.sticker_image.clone(),
-                                        layout.max_media_size(),
+                                        MediaProps {
+                                            video_player_state: props.video_player_state,
+                                            video_frame: props.video_frame.clone(),
+                                            sticker_image: props.sticker_image.clone(),
+                                            audio: props.audio,
+                                            playback_speed: props.playback_speed,
+                                            is_downloading: props.is_downloading,
+                                            max_media_size: layout.max_media_size(),
+                                        },
                                         cx,
                                     )
                                 })

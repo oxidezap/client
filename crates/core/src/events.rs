@@ -104,6 +104,19 @@ pub enum UiEvent {
     #[allow(dead_code)]
     CallAccepted(CallId),
     CallEnded(CallId),
+    /// Who this device is linked as.
+    ///
+    /// Sent on connect and whenever the push name changes, rather than only
+    /// at pairing: the name lives in the device store, and a client attaching
+    /// after a restart never saw the pairing that set it. Without it the
+    /// account row had nothing to show and claimed "not linked" over a linked
+    /// session.
+    AccountUpdated {
+        /// The push name, when the account has one.
+        name: Option<String>,
+        /// The account's own JID, for the number under the name.
+        jid: Option<String>,
+    },
     /// Something happened *to* a chat rather than in it: a group renamed, a
     /// member added, the settings changed.
     ///

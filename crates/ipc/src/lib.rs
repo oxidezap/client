@@ -24,7 +24,8 @@ pub mod windows_user;
 
 pub use endpoint::Endpoint;
 pub use protocol::{
-    CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage,
-    MessagePreview, PairingCode, ProtocolError, Request, RequestId, StateSnapshot, StateVersion,
+    AccountIdentity, CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent,
+    DaemonMessage, MessagePreview, PairingCode, ProtocolError, Request, RequestId, StateSnapshot,
+    StateVersion,
 };
 pub use transport::{PROTOCOL_VERSION, endpoint_path, lock_path, media_dir, media_path, state_dir};

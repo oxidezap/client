@@ -451,6 +451,8 @@ pub struct WhatsAppApp {
     presence: PresenceRegistry,
     /// Display name of the linked account, for the sidebar footer.
     account_name: Option<String>,
+    /// The account's own JID, for the number under the name.
+    account_jid: Option<String>,
     /// The Settings screen, when it is open. `None` is the conversation view.
     settings: Option<SettingsState>,
     /// Repaints the call duration, and expires stale typing notices. Only
@@ -477,6 +479,15 @@ impl WhatsAppApp {
                     FromDaemon::Calls(calls) => entity.update(cx, |app, cx| {
                         app.call_state = *calls;
                         cx.notify();
+                    }),
+                    // Announced on connect, before this window existed, so it
+                    // arrives with the snapshot rather than as an event.
+                    FromDaemon::Account(account) => entity.update(cx, |app, cx| {
+                        if let Some(account) = account {
+                            app.account_name = account.name;
+                            app.account_jid = account.jid;
+                            cx.notify();
+                        }
                     }),
                     // The tray's "Open", or another front end asking on a
                     // user's behalf. One window, so there is one to raise.
@@ -560,6 +571,7 @@ impl WhatsAppApp {
             reply_to: None,
             presence: PresenceRegistry::new(),
             account_name: None,
+            account_jid: None,
             settings: None,
             tick_task: None,
         }
@@ -684,10 +696,21 @@ impl WhatsAppApp {
     }
 
     /// The linked-device row at the foot of the sidebar.
+    ///
+    /// Present whenever this device is linked, whether or not the account has
+    /// a push name: gating the whole row on the name is what made a live
+    /// session read as "not linked".
     pub fn account_summary(&self) -> Option<AccountSummary> {
+        if !self.is_linked() {
+            return None;
+        }
         let connected = matches!(self.app_state, AppState::Connected);
         Some(AccountSummary {
-            name: self.account_name.clone()?,
+            name: self
+                .account_name
+                .clone()
+                .or_else(|| self.account_jid.clone())
+                .unwrap_or_else(|| "This device".to_string()),
             status: if connected {
                 "linked device · synced".to_string()
             } else {
@@ -695,6 +718,23 @@ impl WhatsAppApp {
             },
             is_healthy: connected,
         })
+    }
+
+    /// The account's own number, when the session has said.
+    pub fn account_jid(&self) -> Option<&str> {
+        self.account_jid.as_deref()
+    }
+
+    /// Whether this device is paired at all.
+    ///
+    /// The states that mean "there is no account yet" are the ones that show
+    /// a QR code or an ended session; everything else is a linked device,
+    /// including one that is reconnecting or still syncing.
+    fn is_linked(&self) -> bool {
+        !matches!(
+            self.app_state,
+            AppState::WaitingForPairing { .. } | AppState::LoggedOut { .. }
+        )
     }
 
     /// Invalidate chat list cache (call when chats change or search changes)

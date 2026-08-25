@@ -303,6 +303,12 @@ impl Bridge {
             UiEvent::CallEnded(id) => self.hub.calls(|s| {
                 s.end(id);
             }),
+            UiEvent::AccountUpdated { name, jid } => {
+                self.hub.set_account(oxidezap_ipc::AccountIdentity {
+                    name: name.clone(),
+                    jid: jid.clone(),
+                });
+            }
             UiEvent::OutgoingCallFailed { recipient_jid, .. } => self.hub.calls(|s| {
                 if s.outgoing()
                     .is_some_and(|c| c.recipient_jid == *recipient_jid)
@@ -805,10 +811,23 @@ fn externalize_media(event: &mut UiEvent) {
 
 fn cache_media(message_id: &str, media: &mut Option<MediaContent>) {
     let Some(media) = media else { return };
-    if media.data.is_empty() {
+    let key = crate::media::message_key(message_id);
+
+    // Only the real thing is cached. A fallback thumbnail written under the
+    // message's key would take the place of the full image already there —
+    // and a hydrated row carries a thumbnail every time, so the cache would
+    // lose a photo to a blur on the first reload after seeing it.
+    let is_cacheable = !media.data.is_empty() && !media.data_is_preview;
+    if !is_cacheable {
+        // Nothing to write, but the bytes may already be here: the store
+        // never holds media, so this is what makes a photo survive a restart
+        // instead of being downloaded again.
+        if crate::media::has(&key) {
+            media.cache_key = Some(key);
+        }
         return;
     }
-    let key = crate::media::message_key(message_id);
+
     match crate::media::put(&key, &media.data) {
         Ok(key) => media.cache_key = Some(key),
         // The front end still gets the message; the media renders as the

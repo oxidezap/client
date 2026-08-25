@@ -10,8 +10,8 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::{VirtualListScrollHandle, scroll::Scrollbar, v_virtual_list};
 
 use crate::app::{MessageListCache, TimelineItem, WhatsAppApp};
-use crate::components::message_bubble::BubbleProps;
 use crate::components::message_bubble::render_encryption_notice;
+use crate::components::message_bubble::{AudioProgress, BubbleProps};
 use crate::components::{Avatar, EmptyState, ProductIcon, render_message_bubble};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
@@ -58,7 +58,16 @@ pub fn render_message_list(
                         // Read fresh from the app rather than from a value
                         // captured when the closure was built: the list is
                         // rebuilt on scroll, not on state change.
+                        //
+                        // And read *here*, once: the list has leased the app
+                        // to hand this closure `app`, so a bubble that reads
+                        // the same entity again panics. Everything a row
+                        // needs from the app is gathered in this scope.
                         let playing = app.playing_message_id().map(|s| s.to_string());
+                        let audio_owner = app.audio_owner().map(|s| s.to_string());
+                        let audio_fraction = app.audio_progress();
+                        let audio_elapsed = app.audio_elapsed_secs();
+                        let playback_speed = app.playback_speed();
 
                         visible_range
                             .map(|ix| match &items[ix] {
@@ -92,6 +101,17 @@ pub fn render_message_list(
                                         })
                                     });
 
+                                    // Progress belongs to the one clip that is
+                                    // loaded; a second voice note in the same
+                                    // conversation must not borrow its
+                                    // position.
+                                    let audio = (audio_owner.as_deref()
+                                        == Some(message_id.as_str()))
+                                    .then_some(AudioProgress {
+                                        fraction: audio_fraction,
+                                        elapsed_secs: audio_elapsed,
+                                    });
+
                                     render_message_bubble(
                                         BubbleProps {
                                             message: msg.clone(),
@@ -101,6 +121,9 @@ pub fn render_message_list(
                                             video_player_state: app.video_player_state(message_id),
                                             video_frame: app.video_current_frame(message_id),
                                             sticker_image,
+                                            audio,
+                                            playback_speed,
+                                            is_downloading: app.is_downloading(message_id),
                                         },
                                         entity_for_render.clone(),
                                         layout,
