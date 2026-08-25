@@ -149,6 +149,7 @@ pub fn render_connected_view(
             .as_ref()
             .filter(|media| !media.data.is_empty())
             .map(|media| app.get_decoded_image(&message.id, &media.data, &media.mime_type));
+        let is_loading_update = image.is_none() && app.is_downloading(&message.id);
         Some(StatusViewProps {
             author_jid: author.jid.clone(),
             author_name: author.name.clone().into(),
@@ -156,6 +157,7 @@ pub fn render_connected_view(
             image,
             index: at,
             count: author.count(),
+            is_loading: is_loading_update,
         })
     });
     let status_list = status_feed.map(|feed| StatusListProps {

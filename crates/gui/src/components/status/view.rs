@@ -19,7 +19,7 @@ use crate::app::WhatsAppApp;
 use crate::components::{Avatar, EmptyState, ProductIcon};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
-use crate::utils::format_list_time;
+use crate::utils::format_status_time;
 
 use oxidezap_core::ChatMessage;
 
@@ -34,6 +34,8 @@ pub struct StatusViewProps {
     /// Which of the run is on screen, and how many there are.
     pub index: usize,
     pub count: usize,
+    /// Whether the bytes for this update are on their way.
+    pub is_loading: bool,
 }
 
 pub fn render_status_view(
@@ -147,7 +149,7 @@ fn render_header(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let when = format_list_time(&props.message.timestamp);
+    let when = format_status_time(&props.message.timestamp);
 
     div()
         .flex_shrink_0()
@@ -235,11 +237,15 @@ fn render_update(props: &StatusViewProps, metrics: Metrics, cx: &App) -> impl In
                 .bg(cx.theme().secondary)
                 .text_size(metrics.text_heading())
                 .text_color(cx.theme().foreground)
-                .child(
-                    caption
-                        .clone()
-                        .unwrap_or_else(|| "This update cannot be shown here.".to_string()),
-                )
+                .child(caption.clone().unwrap_or_else(|| {
+                    if props.is_loading {
+                        "Loading this update…".to_string()
+                    } else {
+                        // Video, or bytes that would not come. Text updates
+                        // land here too, and they *are* their caption.
+                        "This update cannot be shown here.".to_string()
+                    }
+                }))
                 .into_any_element(),
         })
         .children(

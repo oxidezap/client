@@ -17,7 +17,7 @@ use crate::components::status::status_ring;
 use crate::components::{EmptyState, ProductIcon};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
-use crate::utils::format_list_time;
+use crate::utils::format_status_time;
 
 use oxidezap_core::{StatusAuthor, StatusFeed};
 
@@ -100,7 +100,7 @@ fn render_mine(
         Some(author) => format!(
             "{} · {}",
             update_count(author.count()),
-            format_list_time(&author.latest)
+            format_status_time(&author.latest)
         )
         .into(),
         None => "Posting is not available yet".into(),
@@ -183,7 +183,7 @@ fn render_author_row(
         format!(
             "{} · {}",
             update_count(author.count()),
-            format_list_time(&author.latest)
+            format_status_time(&author.latest)
         )
         .into()
     });

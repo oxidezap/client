@@ -1,11 +1,14 @@
 //! A connected audio call — the state the product did not have.
 //!
-//! Duration, voice level, mute and hang up. The library is audio-only 1:1, so
+//! Duration, microphone state, mute and hang up. The library is audio-only 1:1, so
 //! the camera and add-participant controls are drawn in place and disabled:
 //! the layout is what a call *is*, and it should not rearrange itself the day
 //! video lands.
 
-use gpui::{App, Entity, IntoElement, ParentElement, Pixels, Styled, div, px};
+use gpui::{
+    App, Entity, InteractiveElement as _, IntoElement, ParentElement, Pixels,
+    StatefulInteractiveElement as _, Styled, div, px,
+};
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _};
@@ -127,16 +130,33 @@ pub fn active_audio(
                                 .child(call.elapsed_label()),
                         ),
                 )
-                .child(voice_level(call.muted, metrics, cx))
+                .child(
+                    div()
+                        .id("call-mic-state")
+                        .tooltip({
+                            let label = if call.muted {
+                                "Your microphone is muted"
+                            } else {
+                                "Your microphone is on"
+                            };
+                            move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(label).build(window, cx)
+                            }
+                        })
+                        .child(mic_state(call.muted, metrics, cx)),
+                )
                 .child(controls(call, entity, metrics)),
         )
 }
 
-/// A row of bars standing in for the peer's voice level.
+/// A row of bars for the *microphone*, not for the peer's voice.
 ///
-/// Muted collapses it rather than hiding it: the row keeps its height so the
-/// controls below do not jump when the microphone is toggled.
-fn voice_level(muted: bool, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+/// It once claimed to be a level meter while being fed nothing but the mute
+/// flag, which made a silent line look like a talking one. Nothing in the
+/// library reports a peer's level, so this says only what is actually known:
+/// standing bars while the microphone is open, flat while it is muted. The
+/// row keeps its height either way, so the controls below do not jump.
+fn mic_state(muted: bool, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     // A fixed pattern, not a random one: it must be identical between frames
     // or the bars flicker on every repaint of the duration.
     const LEVELS: [f32; 8] = [0.35, 0.7, 1.0, 0.5, 0.85, 0.4, 0.95, 0.6];

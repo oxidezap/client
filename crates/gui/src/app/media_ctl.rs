@@ -100,6 +100,10 @@ impl WhatsAppApp {
     ///
     /// The chosen speed outlives the clip: someone who listens at 1.5× means
     /// it for the next note too.
+    ///
+    /// The samples are re-timed when a clip is prepared, so a change while one
+    /// is playing has to prepare it again — from the bytes kept for exactly
+    /// this, and resumed where the listener was rather than from the top.
     pub fn cycle_playback_speed(&mut self, cx: &mut Context<Self>) {
         use crate::components::message_bubble::SPEEDS;
         let next = SPEEDS
@@ -107,6 +111,16 @@ impl WhatsAppApp {
             .position(|s| (s - self.playback_speed).abs() < f32::EPSILON)
             .map_or(0, |ix| (ix + 1) % SPEEDS.len());
         self.playback_speed = SPEEDS[next];
+        self.audio_player.set_speed(self.playback_speed);
+
+        if self.audio_player.is_playing()
+            && let (Some(message_id), Some(bytes)) =
+                (self.audio_owner.clone(), self.audio_source.clone())
+        {
+            let at = self.audio_player.progress();
+            self.play_audio(message_id, (*bytes).clone(), cx);
+            self.audio_player.seek(at);
+        }
         cx.notify();
     }
 
@@ -150,12 +164,17 @@ impl WhatsAppApp {
     pub fn play_audio(&mut self, message_id: String, audio_data: Vec<u8>, cx: &mut Context<Self>) {
         self.stop_current_media();
         self.pending_media_request = Some(message_id.clone());
+        // Whatever the chip says, applied before the clip is prepared: the
+        // re-timing happens once, on these samples.
+        self.audio_player.set_speed(self.playback_speed);
 
         let completion_rx = self.audio_player.on_complete();
+        let source = Arc::new(audio_data);
 
-        match self.audio_player.play(audio_data) {
+        match self.audio_player.play((*source).clone()) {
             Ok(()) => {
                 self.audio_owner = Some(message_id.clone());
+                self.audio_source = Some(source);
                 self.active_media = ActiveMedia::Audio {
                     message_id: message_id.clone(),
                 };

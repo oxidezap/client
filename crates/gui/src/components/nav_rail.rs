@@ -33,15 +33,27 @@ pub fn render_nav_rail(
         .flex_shrink_0()
         .flex()
         .items_center()
-        .justify_center()
         .gap(metrics.space_sm())
         .bg(cx.theme().sidebar)
         .border_color(cx.theme().border);
 
     let base = if is_mobile {
-        base.w_full().h(thickness).flex_row().border_t_1()
+        // A phone's tab bar spans the foot, so its items spread across it.
+        base.w_full()
+            .h(thickness)
+            .flex_row()
+            .justify_center()
+            .border_t_1()
     } else {
-        base.h_full().w(thickness).flex_col().border_r_1()
+        // A strip beside a list starts where the list starts. Centred down the
+        // window, two icons float in the middle of nothing and line up with
+        // no part of what they switch between.
+        base.h_full()
+            .w(thickness)
+            .flex_col()
+            .justify_start()
+            .pt(metrics.space_lg())
+            .border_r_1()
     };
 
     base.children(Destination::ALL.into_iter().map(|destination| {

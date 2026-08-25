@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 #[derive(Debug, Clone)]
 pub struct CachedQrCode {
     pub data: String,
@@ -21,7 +23,14 @@ pub enum AppState {
     WaitingForPairing {
         qr_code: Option<CachedQrCode>,
         pair_code: Option<String>,
+        /// How long *this* code is good for. Not a constant: the library
+        /// issues the first QR with a long life and every rotation after it
+        /// with a short one, so a fixed denominator drew a bar that started
+        /// a third full and never moved.
         timeout_secs: u64,
+        /// When it was issued, so the time left is the clock's answer rather
+        /// than a number nobody decrements.
+        issued_at: DateTime<Utc>,
     },
     Syncing,
     Connected,

@@ -27,6 +27,12 @@ pub struct AudioPlayer {
     /// `sample_rate`s worth of them. Without this the clock ran at double
     /// speed on any stereo device and passed the clip's stated length.
     channels: usize,
+    /// How fast the next clip is played, pitch preserved.
+    ///
+    /// Applied when the samples are prepared rather than by reading the stream
+    /// faster: doubling the read rate doubles every frequency with it, and a
+    /// voice note at 2× is meant to be the same voice, sooner.
+    speed: f32,
     completion_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -45,8 +51,25 @@ impl AudioPlayer {
             channels: 1,
             total_samples: 0,
             sample_rate: 48000,
+            speed: 1.0,
             completion_tx: None,
         }
+    }
+
+    /// Choose the speed for the next clip.
+    ///
+    /// Takes effect at the next [`play`](Self::play): the samples are re-timed
+    /// once, up front, so nothing on the audio thread has to know about it.
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = if speed.is_finite() && speed > 0.0 {
+            speed.clamp(0.25, 4.0)
+        } else {
+            1.0
+        };
+    }
+
+    pub fn speed(&self) -> f32 {
+        self.speed
     }
 
     /// Returns a receiver that fires when playback completes.
@@ -97,13 +120,16 @@ impl AudioPlayer {
         self.sample_rate as usize * self.channels.max(1)
     }
 
-    /// Seconds of audio played so far.
+    /// Seconds of audio played so far, on the *clip's* clock.
+    ///
+    /// Scaled by the speed, so a note played at 2× still counts up to the
+    /// duration printed beside it rather than to half of it.
     pub fn elapsed_secs(&self) -> f32 {
         let per_sec = self.samples_per_sec();
         if per_sec == 0 {
             return 0.0;
         }
-        self.position.load(Ordering::Relaxed) as f32 / per_sec as f32
+        self.position.load(Ordering::Relaxed) as f32 / per_sec as f32 * self.speed
     }
 
     /// Total length in seconds, or zero when nothing is loaded.
@@ -112,7 +138,7 @@ impl AudioPlayer {
         if per_sec == 0 {
             return 0.0;
         }
-        self.total_samples as f32 / per_sec as f32
+        self.total_samples as f32 / per_sec as f32 * self.speed
     }
 
     pub fn play(&mut self, ogg_data: Vec<u8>) -> Result<(), PlayerError> {
@@ -198,6 +224,7 @@ impl AudioPlayer {
 
         let resampled =
             resample_audio(&samples, src_sample_rate, self.sample_rate, output_channels);
+        let resampled = crate::timescale::stretch(resampled, output_channels, self.speed);
         self.total_samples = resampled.len() as u64;
 
         let is_playing = self.is_playing.clone();

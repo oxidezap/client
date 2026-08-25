@@ -419,6 +419,10 @@ pub struct WhatsAppApp {
     /// Message ID of the audio currently loaded in audio_player (for ownership tracking)
     /// This ensures we don't resume audio from a different video when switching
     audio_owner: Option<String>,
+    /// The encoded bytes of that clip, kept so a speed change can re-time it
+    /// from the source rather than asking for the download again. A voice note
+    /// is tens of kilobytes and only one is ever held.
+    audio_source: Option<Arc<Vec<u8>>>,
     /// Currently active media (mutual exclusion: only one audio or video at a time)
     active_media: ActiveMedia,
     /// Message id of the most recent user-requested playback; download/decode
@@ -578,6 +582,7 @@ impl WhatsAppApp {
             playback_speed: 1.0,
             playback_tick: None,
             audio_owner: None,
+            audio_source: None,
             active_media: ActiveMedia::None,
             pending_media_request: None,
             retry_at: None,
@@ -1744,8 +1749,15 @@ impl Render for WhatsAppApp {
                 qr_code,
                 pair_code,
                 timeout_secs,
-            } => render_pairing_view(qr_code.as_ref(), pair_code.clone(), *timeout_secs, cx)
-                .into_any_element(),
+                issued_at,
+            } => render_pairing_view(
+                qr_code.as_ref(),
+                pair_code.clone(),
+                *timeout_secs,
+                *issued_at,
+                cx,
+            )
+            .into_any_element(),
             AppState::Syncing => render_syncing_view(cx).into_any_element(),
             // Settings is a screen over the conversation view, so it takes
             // the whole frame while it is open rather than floating.

@@ -21,6 +21,14 @@ use gpui::{Pixels, px};
 /// The base font the design was measured against.
 const REFERENCE_REM: f32 = 16.0;
 
+/// The narrowest and widest base font the layout stays usable at.
+///
+/// Both ends matter: below the floor every dimension collapses, and above the
+/// ceiling the window outgrows the controls that would let anyone put it back
+/// — including the field the number was typed into.
+const REM_MIN: f32 = 10.0;
+const REM_MAX: f32 = 32.0;
+
 /// How much room the interface spends per unit of content.
 ///
 /// A tier changes vertical rhythm and control frames together — never one
@@ -106,10 +114,18 @@ impl Default for Metrics {
 impl Metrics {
     pub fn new(rem_size: f32, density: Density) -> Self {
         Self {
-            // A zero or negative base would collapse every dimension to
-            // nothing; clamp rather than trust a value that reached us from a
-            // hand-edited file.
-            rem_size: rem_size.max(1.0),
+            // A range, not a floor. The value reaches here from a hand-edited
+            // file that is hot-reloaded, so both ends have to hold: zero
+            // collapses every dimension to nothing, and a large one scales the
+            // whole window past the controls that would let anyone undo it —
+            // including the field the number was typed into. NaN compares
+            // false against everything, so `clamp` would panic on it: it is
+            // caught first and falls back to the reference size.
+            rem_size: if rem_size.is_finite() {
+                rem_size.clamp(REM_MIN, REM_MAX)
+            } else {
+                REFERENCE_REM
+            },
             density,
         }
     }

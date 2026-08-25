@@ -91,6 +91,7 @@ impl WhatsAppApp {
                     qr_code: cached_qr,
                     pair_code,
                     timeout_secs,
+                    issued_at: wacore::time::now_utc(),
                 };
                 cx.notify();
             }
@@ -103,6 +104,7 @@ impl WhatsAppApp {
                     qr_code,
                     pair_code: Some(code),
                     timeout_secs,
+                    issued_at: wacore::time::now_utc(),
                 };
                 cx.notify();
             }

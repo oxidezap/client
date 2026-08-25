@@ -12,7 +12,7 @@ use gpui::{
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
-use gpui_component::{Icon, IconName, Sizable as _, VirtualListScrollHandle};
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _, VirtualListScrollHandle};
 use gpui_component::{scroll::Scrollbar, v_virtual_list};
 
 use crate::app::{ChatFilter, ChatListCache, SelectDown, SelectUp, WhatsAppApp};
@@ -137,11 +137,14 @@ fn render_title_bar(
                 .flex()
                 .gap(metrics.space_xxs())
                 .child(
+                    // No flow behind it yet, and a button that answers a
+                    // click with nothing is a bug report waiting to be filed.
                     Button::new("new-chat")
                         .icon(IconName::Plus)
                         .ghost()
                         .small()
-                        .tooltip("New conversation"),
+                        .disabled(true)
+                        .tooltip("Starting a new conversation is not available yet"),
                 )
                 .child(
                     Button::new("open-settings")

@@ -9,7 +9,7 @@ use whatsapp_rust::wacore::time::Instant;
 
 use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, div, prelude::*};
 use gpui_component::{
-    ActiveTheme, IconName, Sizable as _,
+    ActiveTheme, Disableable as _, IconName, Sizable as _,
     button::{Button, ButtonVariants},
     input::{InputEvent, Textarea, TextareaState},
 };
@@ -380,10 +380,15 @@ impl InputAreaView {
             .items_center()
             .gap(metrics.space_md())
             .child(
+                // Drawn, disabled, and saying so. The slot is part of what a
+                // composer *is* and should not appear the day sending files
+                // lands; a control that looks live and does nothing is worse
+                // than one that admits it.
                 Button::new("attach")
                     .icon(ProductIcon::Paperclip)
                     .ghost()
-                    .tooltip("Attach a file")
+                    .disabled(true)
+                    .tooltip("Attaching files is not available yet")
                     .w(control)
                     .h(control),
             )
@@ -397,7 +402,8 @@ impl InputAreaView {
                 Button::new("emoji")
                     .icon(ProductIcon::Smile)
                     .ghost()
-                    .tooltip("Emoji")
+                    .disabled(true)
+                    .tooltip("The emoji picker is not available yet")
                     .w(control)
                     .h(control),
             )

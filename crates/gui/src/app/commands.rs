@@ -150,20 +150,22 @@ impl WhatsAppApp {
     }
 
     /// Re-run the query, and follow it to its match.
+    ///
+    /// The search is lifted out of `self` for the duration rather than
+    /// borrowed in place: refreshing it needs the chat's messages, and holding
+    /// a mutable borrow of one field while reading another is what previously
+    /// forced a clone of the entire message vector — on every keystroke, in
+    /// the longest conversation the user has.
     pub fn set_conversation_search(&mut self, query: String, cx: &mut Context<Self>) {
-        let Some(messages) = self
-            .conversation_search
-            .as_ref()
-            .and_then(|search| self.find_chat(&search.jid))
-            .map(|chat| chat.messages.clone())
-        else {
+        let Some(mut search) = self.conversation_search.take() else {
             return;
         };
-        let Some(search) = &mut self.conversation_search else {
-            return;
-        };
-        search.refresh(&query, &messages);
+        if let Some(chat) = self.find_chat(&search.jid) {
+            search.refresh(&query, &chat.messages);
+        }
         let target = search.current_match().map(str::to_string);
+        self.conversation_search = Some(search);
+
         if let Some(target) = target {
             self.jump_to_message(&target, cx);
         }

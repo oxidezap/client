@@ -56,6 +56,25 @@ pub fn format_list_time(timestamp: &DateTime<Utc>) -> String {
     }
 }
 
+/// When a status update was posted.
+///
+/// Always with a clock time, unlike a chat row: a status lives 24 hours, so
+/// every one of them is either today or yesterday and "Yesterday" on its own
+/// narrows it to nothing. The one that matters is how long is left, and that
+/// is what the hour tells you.
+pub fn format_status_time(timestamp: &DateTime<Utc>) -> String {
+    let local: DateTime<Local> = timestamp.with_timezone(&Local);
+    let today = whatsapp_rust::wacore::time::now_utc()
+        .with_timezone(&Local)
+        .date_naive();
+
+    match (today - local.date_naive()).num_days() {
+        0 => local.format("Today at %H:%M").to_string(),
+        1 => local.format("Yesterday at %H:%M").to_string(),
+        _ => local.format("%d/%m/%Y at %H:%M").to_string(),
+    }
+}
+
 /// The heading over a group of messages sent on the same day.
 pub fn format_date_divider(timestamp: &DateTime<Utc>) -> String {
     let local: DateTime<Local> = timestamp.with_timezone(&Local);

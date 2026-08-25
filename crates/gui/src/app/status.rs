@@ -145,6 +145,7 @@ impl WhatsAppApp {
         self.status_pane.open(author);
         self.navigate_to_chat();
         self.mark_shown_status_seen();
+        self.fetch_shown_status(cx);
         cx.notify();
     }
 
@@ -167,8 +168,46 @@ impl WhatsAppApp {
         };
         if self.status_pane.step(forward, author.count()) {
             self.mark_shown_status_seen();
+            self.fetch_shown_status(cx);
             cx.notify();
         }
+    }
+
+    /// Fetch the update on screen, if its bytes are not here.
+    ///
+    /// A status arrives as a thumbnail at most, and unlike a conversation
+    /// there is no bubble to tap: opening someone's status *is* the request to
+    /// see it. One at a time — the one being looked at — rather than the
+    /// whole run, because a run is watched one update at a time and the rest
+    /// may never be reached.
+    fn fetch_shown_status(&mut self, cx: &mut Context<Self>) {
+        let Some(author_jid) = self.status_pane.author().map(str::to_string) else {
+            return;
+        };
+        let feed = self.status_feed();
+        let Some(author) = feed.author(&author_jid) else {
+            return;
+        };
+        let at = self.status_pane.index_in(author.count());
+        let Some(message) = feed.updates_of(author).nth(at) else {
+            return;
+        };
+        let Some(media) = message.media.as_ref() else {
+            return;
+        };
+        // Only what the pane can actually draw: a video would download and
+        // still show the placeholder.
+        if media.media_type != oxidezap_core::MediaType::Image || !media.data.is_empty() {
+            return;
+        }
+        let Some(downloadable) = media.downloadable.clone() else {
+            return;
+        };
+        let message_id = message.id.clone();
+        if self.is_downloading(&message_id) {
+            return;
+        }
+        self.download_image(message_id, downloadable, cx);
     }
 
     /// Mark the update currently on screen as watched.
