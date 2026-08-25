@@ -113,6 +113,20 @@ pub enum UiEvent {
     #[allow(dead_code)]
     CallAccepted(CallId),
     CallEnded(CallId),
+    /// What the microphone really is, when it is not what was asked for.
+    ///
+    /// A front end asks to mute and draws it at once, but the announcement to
+    /// the peer can fail, and the library commits the two directions around
+    /// that announcement rather than at one point — a mute applies before it,
+    /// an unmute only once it is out — precisely so the microphone is never
+    /// live while the peer is shown a muted one. The side that pays is the
+    /// front end, which is now drawing a state the device is not in. This is
+    /// the session correcting it from the handle, and it is sent only on a
+    /// disagreement: the ordinary case says nothing.
+    CallMuteChanged {
+        call_id: CallId,
+        muted: bool,
+    },
     /// The call is over here because another of this account's devices
     /// answered or refused it. Not a missed call: the device that took it has
     /// the entry, and this one has nothing true to write down.

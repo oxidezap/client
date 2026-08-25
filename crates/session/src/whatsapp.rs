@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::store::SqliteStore;
-use whatsapp_rust::voip::CallHandle;
+use whatsapp_rust::voip::{CallHandle, CallTermination};
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
 use whatsapp_rust::wacore::types::events::Event;
@@ -595,7 +595,12 @@ impl WhatsAppClient {
                     info!("Call {} terminated by peer", call_id);
                     calls.pending.lock().await.remove(call_id);
                     if let Some(handle) = calls.active.lock().await.remove(call_id) {
-                        tokio::spawn(async move { handle.hangup().await });
+                        // `hangup_local`, not `terminate`: the peer is the
+                        // side that ended this, and answering their
+                        // `<terminate>` with one of our own says nothing they
+                        // do not already know. Only the local media task and
+                        // the registry entry are left to drop.
+                        tokio::spawn(async move { handle.hangup_local().await });
                     }
                     let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                 }
@@ -1755,7 +1760,12 @@ impl WhatsAppClient {
                     // the placeholder id, so honor it here.
                     if calls.cancelled.lock().await.remove(&placeholder_id) {
                         info!("Outgoing call {} cancelled before start", call_id);
-                        handle.hangup().await;
+                        // The offer is already out: every device it rang is
+                        // ringing, and dropping our side silently would leave
+                        // them at it until their own transport gave up.
+                        // `terminate` is what tells them, and it tears this
+                        // side down whether or not the stanzas landed.
+                        log_termination(&call_id, handle.terminate().await);
                         return;
                     }
                     info!(
@@ -1793,8 +1803,7 @@ impl WhatsAppClient {
             // Still ringing and never answered: nothing live to hang up.
             calls.pending.lock().await.remove(&call_id);
             if let Some(handle) = calls.active.lock().await.remove(&call_id) {
-                handle.hangup().await;
-                info!("Call {} hung up", call_id);
+                log_termination(&call_id, handle.terminate().await);
             } else {
                 // No handle yet (start_call still connecting under a UI
                 // placeholder id): remember the cancel so it lands.
@@ -1804,15 +1813,51 @@ impl WhatsAppClient {
         });
     }
 
-    /// Mute or unmute the microphone of a live call.
-    #[allow(dead_code)]
+    /// Mute or unmute the microphone of a live call, and tell the peer.
+    ///
+    /// The library commits the two directions around the `<mute_v2>` rather
+    /// than at one point — a mute applies before the announcement, an unmute
+    /// only once it is out — so whichever half is lost, the microphone is
+    /// never live while the peer is being shown a muted one. What that costs
+    /// is that a failed announcement leaves the device in a state nobody
+    /// asked for, and the front end has already drawn the state it asked for.
+    /// So the handle is asked what it really holds and the difference is
+    /// published; an announcement that went through changes nothing, and a
+    /// call state that does not change sends no frame.
+    ///
+    /// A call still ringing has nowhere to publish the state, and answering
+    /// does not replay it. That is not a gap here: mute is offered on an
+    /// active call only ([`oxidezap_core::CallState::set_muted`] matches the
+    /// live stage), so nothing can be chosen while it rings.
     pub fn set_call_muted(&self, call_id: &str, muted: bool) {
         let calls = self.calls.clone();
+        let ui_sender = self.ui_sender.clone();
         let call_id = call_id.to_string();
         let runtime = self.runtime.clone();
         runtime.spawn(async move {
-            if let Some(handle) = calls.active.lock().await.get(&call_id) {
-                handle.set_muted(muted);
+            // Cloned out from under the lock: `set_muted` waits on the call's
+            // answer-transition lane, and holding the registry across that
+            // would stall every other call's bookkeeping behind one peer.
+            let Some(handle) = calls.active.lock().await.get(&call_id).cloned() else {
+                debug!("set_call_muted: no live handle for {}", call_id);
+                return;
+            };
+            if let Err(e) = handle.set_muted(muted).await {
+                warn!(
+                    "Failed to announce {} on call {}: {}",
+                    if muted { "mute" } else { "unmute" },
+                    call_id,
+                    e
+                );
+            }
+            let settled = handle.is_muted();
+            if settled != muted
+                && let Some(tx) = ui_sender.lock().await.as_ref()
+            {
+                let _ = tx.send(UiEvent::CallMuteChanged {
+                    call_id,
+                    muted: settled,
+                });
             }
         });
     }
@@ -1832,6 +1877,34 @@ impl WhatsAppClient {
         if let Some(tx) = ui_sender.lock().await.as_ref() {
             let _ = tx.send(UiEvent::CallEnded(call_id.to_string()));
         }
+    }
+}
+
+/// Say what a hangup achieved.
+///
+/// The local side is down in every case, so this reports rather than fails: a
+/// call the peer was never told about is still over here, and the difference
+/// is only how long they keep ringing. A still-ringing call is addressed per
+/// device, which is why "some, not all" is one of the answers.
+fn log_termination(call_id: &str, outcome: CallTermination) {
+    match outcome {
+        CallTermination::PeerNotified => info!("Call {} hung up", call_id),
+        CallTermination::PartlyNotified {
+            notified,
+            unconfirmed,
+        } => warn!(
+            "Call {} hung up; {} device(s) told, {} unconfirmed",
+            call_id, notified, unconfirmed
+        ),
+        CallTermination::LocalOnly(error) => warn!(
+            "Call {} hung up locally; the peer was not told: {}",
+            call_id, error
+        ),
+        CallTermination::AlreadyEnded => debug!("Call {} was already over", call_id),
+        // `CallTermination` is `#[non_exhaustive]`: a variant added upstream
+        // is still an ended call here, and the local side is down in every
+        // one of them.
+        other => info!("Call {} hung up: {:?}", call_id, other),
     }
 }
 
