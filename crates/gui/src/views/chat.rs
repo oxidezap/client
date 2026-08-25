@@ -1,8 +1,8 @@
 //! The connected view: sidebar, conversation, and whatever floats over them.
 
 use gpui::{
-    App, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Window, div,
-    prelude::FluentBuilder as _,
+    AnyElement, App, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Window,
+    div, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -61,7 +61,6 @@ pub fn render_connected_view(
         .flatten(),
     );
 
-    let call_focus = app.call_focus().clone();
     let viewer_focus = app.viewer_focus().clone();
 
     let list_props = ChatListProps {
@@ -199,18 +198,6 @@ pub fn render_connected_view(
         .is_some_and(|chat| app.is_own_number(&chat.jid));
     let can_send = app.can_send();
 
-    // Before the overlays are built, so the frame that first draws a ringing
-    // call — or the viewer — is the frame its shortcuts start working on.
-    app.sync_overlay_focus(window, cx);
-    let call_card = render_call_card(
-        app.call_state(),
-        app.call_card(),
-        entity.clone(),
-        &call_focus,
-        layout,
-        cx,
-    );
-
     let rail = render_nav_rail(
         destination,
         unread_chats,
@@ -277,14 +264,34 @@ pub fn render_connected_view(
         div().flex().size_full().child(rail).child(panes)
     };
 
-    div()
-        .relative()
-        .size_full()
-        .child(shell)
-        .children(viewer)
-        // The card floats: it does not take the app's input, so the
-        // conversation underneath stays usable for the whole call.
-        .children(call_card)
+    div().relative().size_full().child(shell).children(viewer)
+}
+
+/// The floating call card, for whichever screen the window is on.
+///
+/// Drawn by the root rather than by the conversation view, because a call is
+/// not a thing about conversations: one arriving while Settings is open used
+/// to ring at the far end with no card, no Accept and no Decline anywhere in
+/// the window. It floats and takes no input of its own, so the screen
+/// underneath stays usable for the whole call.
+pub fn render_call_overlay(
+    app: &mut WhatsAppApp,
+    window: &mut Window,
+    cx: &mut Context<WhatsAppApp>,
+) -> Option<AnyElement> {
+    // Before the card is built, so the frame that first draws a ringing call
+    // — or the viewer — is the frame its shortcuts start working on.
+    app.sync_overlay_focus(window, cx);
+    let layout = app.responsive_layout(window, cx);
+    let call_focus = app.call_focus().clone();
+    render_call_card(
+        app.call_state(),
+        app.call_card(),
+        cx.entity().clone(),
+        &call_focus,
+        layout,
+        cx,
+    )
 }
 
 /// Everything the conversation pane draws, gathered by the caller so this

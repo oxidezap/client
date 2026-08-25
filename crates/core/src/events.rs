@@ -96,6 +96,15 @@ pub enum UiEvent {
     OutgoingCallStarted {
         call_id: CallId,
         recipient_jid: String,
+        /// The id the front end invented for this placement, before the
+        /// server had one.
+        ///
+        /// What makes the rename land on the attempt it belongs to. Matching
+        /// on the recipient instead let a late answer for an abandoned call
+        /// rename a *second* call to the same person — which then held an id
+        /// nobody was ringing under, while the abandoned one rang on with
+        /// nothing on this side holding it.
+        placeholder_id: CallId,
     },
     OutgoingCallFailed {
         recipient_jid: String,

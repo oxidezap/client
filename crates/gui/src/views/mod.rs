@@ -10,7 +10,7 @@ mod logged_out;
 pub mod pairing;
 mod settings;
 
-pub use chat::render_connected_view;
+pub use chat::{render_call_overlay, render_connected_view};
 pub use error::render_error_view;
 pub use loading::{render_connecting_view, render_loading_view, render_syncing_view};
 pub use logged_out::render_logged_out_view;

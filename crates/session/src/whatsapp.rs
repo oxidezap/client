@@ -672,6 +672,13 @@ impl WhatsAppClient {
                 };
                 let chat_jid = normalize_chat_jid(&client, &update.source.chat.to_string()).await;
                 let sender = update.source.sender.clone();
+                // Keyed by the same JID whichever alias the event arrived
+                // under. The registry is a map, and `clear_composing` looks
+                // the entry up by this key: a composing under the PN with the
+                // paused under the LID left one nobody could find, so the line
+                // said they were typing until the TTL ran out — and alternating
+                // events listed the same person twice.
+                let identity = names.identity(&client, &sender).await;
                 // Named here rather than left to the front end: the typing
                 // line sits directly under this person's bubbles, and a name
                 // picked by a different rule is the same person twice.
@@ -682,7 +689,7 @@ impl WhatsAppClient {
                 };
                 let _ = ui_tx.send(UiEvent::ChatPresence {
                     chat_jid,
-                    sender_jid: sender.to_string(),
+                    sender_jid: identity.canonical_jid.clone(),
                     sender_name,
                     composing,
                 });
@@ -1758,6 +1765,7 @@ impl WhatsAppClient {
                         let _ = tx.send(UiEvent::OutgoingCallStarted {
                             call_id,
                             recipient_jid,
+                            placeholder_id,
                         });
                     }
                 }

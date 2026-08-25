@@ -294,11 +294,14 @@ impl WhatsAppApp {
         msg.quoted = quoted;
 
         // Following the note down is only what the sender expects if they are
-        // looking at where it landed. There is one timeline, bound to the
-        // selected chat, so a note that finished encoding after the user moved
-        // on would otherwise yank *that* conversation to its newest message —
-        // out from under someone reading its history.
-        if self.add_message_to_chat(jid, msg) && self.selected_chat.as_deref() == Some(jid) {
+        // looking at where it landed. There is one timeline, so a note that
+        // finished encoding after the user moved on would otherwise yank
+        // whatever is on screen to its newest message — out from under someone
+        // reading its history. Against `visible_chat` and not the selection,
+        // because the selection is deliberately *kept* while the reader is in
+        // Status or, on a phone, walking the chat list: coming back to a
+        // conversation should land where they left it.
+        if self.add_message_to_chat(jid, msg) && self.visible_chat.as_deref() == Some(jid) {
             self.scroll_to_last_message();
         }
     }

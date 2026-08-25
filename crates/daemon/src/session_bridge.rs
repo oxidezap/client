@@ -395,16 +395,20 @@ impl Bridge {
             }
             UiEvent::OutgoingCallStarted {
                 call_id,
-                recipient_jid,
+                recipient_jid: _,
+                placeholder_id,
             } => {
                 // Renamed *and* advanced: the placeholder id was ours, and the
                 // server answering with the real one is also what says the
                 // call has started ringing at the far end. Leaving the state
                 // to say "calling…" for the rest of the call was a difference
                 // between the daemon and a front end that applied both.
+                //
+                // Matched on the placeholder, not the recipient: see
+                // `CallState::update_outgoing_call_id`.
                 let mut adopted = false;
                 self.hub.calls(|s| {
-                    adopted = s.update_outgoing_call_id(recipient_jid, call_id.clone());
+                    adopted = s.update_outgoing_call_id(placeholder_id, call_id.clone());
                     if adopted {
                         s.set_outgoing_ringing(call_id);
                     }
@@ -1842,6 +1846,7 @@ mod tests {
         bridge.observe(UiEvent::OutgoingCallStarted {
             call_id: "call-1".into(),
             recipient_jid: "1@s.whatsapp.net".into(),
+            placeholder_id: "ui-call-1".into(),
         });
         bridge.observe(UiEvent::CallAccepted("call-1".into()));
 
@@ -1852,6 +1857,41 @@ mod tests {
 
         bridge.observe(UiEvent::CallEnded("call-1".into()));
         assert!(!bridge.hub.call_state().is_busy());
+    }
+
+    /// Give up on a call before the server has named it, dial the same person
+    /// again, and the first attempt's answer arrives while the second is on
+    /// the stage. Matched by recipient it renamed the redial, so the daemon
+    /// published an id nobody was ringing under — and the window, seeing the
+    /// state hold it, skipped cancelling the call that really was ringing.
+    #[test]
+    fn a_late_answer_does_not_rename_the_redial_that_replaced_it() {
+        let mut bridge = bridge();
+        bridge.hub.calls(|s| {
+            s.set_outgoing(oxidezap_core::OutgoingCall::new(
+                "ui-call-2",
+                "1@s.whatsapp.net".into(),
+                "Alice".into(),
+                false,
+            ));
+        });
+
+        bridge.observe(UiEvent::OutgoingCallStarted {
+            call_id: "call-1".into(),
+            recipient_jid: "1@s.whatsapp.net".into(),
+            placeholder_id: "ui-call-1".into(),
+        });
+
+        let calls = bridge.hub.call_state();
+        assert_eq!(
+            calls.outgoing().map(|c| c.call_id.as_str()),
+            Some("ui-call-2"),
+            "the redial keeps its own placeholder"
+        );
+        assert!(
+            !calls.holds("call-1"),
+            "so the abandoned call is an orphan the window will cancel"
+        );
     }
 
     /// A failed send changes no state, so no snapshot can carry it: without

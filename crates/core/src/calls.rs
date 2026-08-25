@@ -648,9 +648,17 @@ impl CallState {
     }
 
     /// The placeholder id we invented is replaced by the server's real one.
-    pub fn update_outgoing_call_id(&mut self, recipient_jid: &str, new_call_id: CallId) -> bool {
+    ///
+    /// Matched on the placeholder rather than on the recipient: a call
+    /// cancelled before the server answered, followed by a redial to the same
+    /// person, leaves a late answer for the *first* attempt with a stage that
+    /// looks like a match by recipient alone. Renaming the second call to the
+    /// first one's id made the state hold an id nobody was ringing under, so
+    /// the front end's orphan-cancellation path let the abandoned call go on
+    /// ringing at the far end.
+    pub fn update_outgoing_call_id(&mut self, placeholder_id: &str, new_call_id: CallId) -> bool {
         match &mut self.stage {
-            Some(Stage::Outgoing(call)) if call.recipient_jid == recipient_jid => {
+            Some(Stage::Outgoing(call)) if call.call_id == placeholder_id => {
                 call.call_id = new_call_id;
                 true
             }
@@ -960,6 +968,43 @@ mod tests {
 
         assert!(state.fail_outgoing_to("c@s.whatsapp.net").is_none());
         assert_eq!(state.outgoing().map(|c| c.call_id.as_str()), Some("MINE"));
+    }
+
+    #[test]
+    fn a_real_id_lands_on_the_attempt_that_asked_for_it() {
+        let mut state = CallState::default();
+        state.set_outgoing(outgoing("ui-call-1"));
+
+        assert!(state.update_outgoing_call_id("ui-call-1", "REAL".to_string()));
+        assert_eq!(state.outgoing().map(|c| c.call_id.as_str()), Some("REAL"));
+    }
+
+    /// Cancel a call before the server has answered, redial the same person,
+    /// and the first attempt's answer arrives against the second attempt's
+    /// stage. By recipient it looked like a match, so the redial was renamed
+    /// to the abandoned call's id — which made the state *hold* an id nobody
+    /// was ringing under, and the front end's orphan-cancellation path then
+    /// left the abandoned call ringing with nothing on this side holding it.
+    #[test]
+    fn a_redial_is_not_renamed_by_the_attempt_it_replaced() {
+        let mut state = CallState::default();
+        state.set_outgoing(outgoing("ui-call-1"));
+        state.end(&"ui-call-1".to_string());
+        state.set_outgoing(outgoing("ui-call-2"));
+
+        assert!(
+            !state.update_outgoing_call_id("ui-call-1", "REAL-1".to_string()),
+            "the first attempt's answer belongs to a call that is gone"
+        );
+        assert_eq!(
+            state.outgoing().map(|c| c.call_id.as_str()),
+            Some("ui-call-2"),
+            "the redial keeps its own placeholder until its own answer"
+        );
+        assert!(
+            !state.holds("REAL-1"),
+            "so the abandoned call reads as an orphan, and is cancelled"
+        );
     }
 
     /// The window draws the call it placed before the server has answered,

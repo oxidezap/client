@@ -196,8 +196,9 @@ use crate::utils::mime_to_image_format;
 use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
 use crate::views::pairing::generate_qr_png;
 use crate::views::{
-    render_connected_view, render_connecting_view, render_error_view, render_loading_view,
-    render_logged_out_view, render_pairing_view, render_settings_view, render_syncing_view,
+    render_call_overlay, render_connected_view, render_connecting_view, render_error_view,
+    render_loading_view, render_logged_out_view, render_pairing_view, render_settings_view,
+    render_syncing_view,
 };
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
@@ -1166,6 +1167,19 @@ impl WhatsAppApp {
     /// reappearing in the composer of the new one, ready to be sent to
     /// someone it was never written for.
     fn forget_account_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The microphone and the speaker belong to the account too. This is
+        // the same departure a disconnect or a logout makes — the connected
+        // view is going away — and skipping it left capture running with no
+        // controls to stop it, and an encode that could still finish, pass an
+        // epoch nothing had bumped, and send the old account's note from the
+        // newly paired one.
+        self.leave_connected_view(cx);
+        // A call is account state as much as a chat is. Left standing, the
+        // next daemon's first (empty) snapshot reads as this stage ending, and
+        // the record is written into the account that has just been paired —
+        // recreating a chat for the old account's peer to hold it.
+        self.call_state = CallState::new();
+        self.call_card.call_ended();
         self.chats.clear();
         self.selected_chat = None;
         self.visible_chat = None;
@@ -1197,7 +1211,7 @@ impl WhatsAppApp {
         self.pending_notices.clear();
         self.presence = PresenceRegistry::new();
         // Anything mid-flight against a message id that is about to be gone.
-        self.stop_current_media();
+        // Playback itself is already stopped, above.
         self.video_players.clear();
         self.downloads_in_flight.clear();
         self.media_viewer = None;
@@ -2434,6 +2448,10 @@ impl Render for WhatsAppApp {
         // happens to be, which is the point of a window-level command.
         let root = div()
             .size_full()
+            // The call overlay is positioned against this box, because it
+            // outlives the branch below: a phone ringing while Settings is
+            // open is still a phone ringing.
+            .relative()
             .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
                 app.focus_search(window, cx);
             }))
@@ -2459,6 +2477,10 @@ impl Render for WhatsAppApp {
             .on_action(|copy: &CopyMessage, _window, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.text.to_string()));
             });
+
+        // Whether this frame draws the app rather than a screen on the way to
+        // it, computed before the borrow below.
+        let connected = matches!(self.app_state, AppState::Connected | AppState::Offline);
 
         let body = match &self.app_state {
             AppState::Loading => render_loading_view(cx).into_any_element(),
@@ -2488,6 +2510,15 @@ impl Render for WhatsAppApp {
             }
         };
 
-        root.child(body)
+        // Outside the Settings-versus-conversation branch on purpose. The
+        // card and the focus it takes were built by the conversation view
+        // alone, so a call arriving while Settings was open rang at the far
+        // end with nothing on screen to answer or refuse it — and no working
+        // shortcut either — until the user happened to close Settings.
+        let call_overlay = connected
+            .then(|| render_call_overlay(self, window, cx))
+            .flatten();
+
+        root.child(body).children(call_overlay)
     }
 }

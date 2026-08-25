@@ -109,6 +109,25 @@ profile here repeats it deliberately.
   record, `Ending::As` for an outcome only the acting side knew. It travels in
   the same frame as the removal, because an explanation sent beside it rides a
   different channel and can arrive after the record it was meant to change.
+- **An outgoing call is named twice, and the second name lands by the first.**
+  The window draws the call it placed before the server has answered, under a
+  placeholder id of its own; `OutgoingCallStarted` carries both, and the rename
+  is matched on the placeholder. Matching on the recipient instead was right
+  until someone gave up and dialled again: the abandoned attempt's answer then
+  renamed the *redial*, so the state held an id nobody was ringing under and
+  the window's orphan-cancellation path let the abandoned call ring on.
+- **An account reset is a departure, not just a clear.** Everything a
+  disconnect stops has to stop here too — `forget_account_state` goes through
+  `leave_connected_view` — and everything keyed to the account has to go,
+  including the two selections that are JIDs themselves (the status reader and
+  the destination) and the call state. A stage left standing is read as ending
+  by the *next* account's first snapshot, which writes the old peer's call into
+  the new account's history.
+- **The call card belongs to the window, not to the conversation.** It is
+  drawn by the root, above whichever screen is up, because a call arriving
+  while Settings was open rang at the far end with no card, no Accept and no
+  Decline anywhere — the card and `sync_overlay_focus` were both built by the
+  conversation view alone.
 - **Whenever the stage empties, the parked caller comes forward.** A second
   offer during a call waits behind the one on screen, and nothing draws a
   waiting call on its own — so a stage cleared without promoting it leaves
@@ -185,7 +204,11 @@ profile here repeats it deliberately.
   the one place a name enters a conversation and writes it onto the rows that
   were waiting for it, and `Chat::author_name` is what every surface asks. A
   full history load is what re-reads the address book, so it is also what
-  clears the book's memo.
+  clears the book's memo. It decides the *key* as well as the label:
+  `ChatIdentity::canonical_jid` is what a person is filed under, so a
+  composing arriving as a phone number and its paused as a LID do not become
+  two entries — one of which nobody can clear, leaving the typing line up
+  until its TTL runs out.
 - **The chat store's writer queue is ordered on purpose.** Anything that
   targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row

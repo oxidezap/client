@@ -302,6 +302,7 @@ impl WhatsAppApp {
             UiEvent::OutgoingCallStarted {
                 call_id,
                 recipient_jid,
+                placeholder_id: _,
             } => {
                 info!(
                     "Outgoing call started: {} to {}",
