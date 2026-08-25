@@ -262,6 +262,11 @@ fn render_download_placeholder(
         .id(placeholder_id)
         .w(px(width))
         .h(px(height))
+        // The box is the size the media will be, and its label has to live
+        // inside it: an unclipped row ran the download prompt out past both
+        // edges of the bubble and over the message beside it.
+        .overflow_hidden()
+        .px(metrics.space_md())
         .bg(cx.theme().secondary)
         .border_1()
         .border_color(cx.theme().border)
@@ -296,11 +301,15 @@ fn render_download_placeholder(
                 )
                 .child(
                     div()
+                        .max_w_full()
                         .flex()
                         .items_center()
+                        .justify_center()
                         .gap(metrics.space_sm())
                         .text_size(metrics.text_small())
                         .text_color(cx.theme().muted_foreground)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
                         .child(label)
                         .children(format_bytes(size).map(|size| {
                             div()

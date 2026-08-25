@@ -14,7 +14,7 @@ mod ringing;
 mod video;
 
 use gpui::{
-    AnyElement, App, DragMoveEvent, Entity, InteractiveElement, IntoElement, ParentElement, Point,
+    AnyElement, App, DragMoveEvent, Entity, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::ActiveTheme as _;
@@ -78,7 +78,13 @@ pub fn render_call_card(
         );
     }
 
-    let offset = card.offset();
+    // Clamped for drawing without disturbing what was stored: a window that
+    // shrinks and grows again puts the card back where it was put.
+    let inset = metrics.space_xxl();
+    let offset = card.drawn_offset(layout.viewport(), inset);
+    // Filled in as the card is painted, and read on the next drag. One frame
+    // behind only on the very first paint, when nothing is being dragged yet.
+    let measurement = card.measurement();
     let body = if card.is_minimized() {
         minimized_pill(stage, entity.clone(), metrics, cx).into_any_element()
     } else {
@@ -97,8 +103,8 @@ pub fn render_call_card(
             .key_context(CALL_CONTEXT)
             .track_focus(focus_handle)
             .absolute()
-            .top(metrics.space_xxl() + offset.y)
-            .right(metrics.space_xxl() - offset.x)
+            .top(inset + offset.y)
+            .right(inset - offset.x)
             .on_action({
                 let entity = entity.clone();
                 move |_: &AcceptCall, _window, cx| {
@@ -121,6 +127,16 @@ pub fn render_call_card(
             .flex_col()
             .gap(metrics.space_sm())
             .items_end()
+            // Reports what the card laid out to, so the drag bounds are the
+            // card's real size rather than a number kept in step by hand.
+            .child(
+                gpui::canvas(
+                    move |bounds, _window, _cx| measurement.set(bounds.size),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(body)
             .children(waiting)
             .into_any_element(),
@@ -237,11 +253,12 @@ fn drag_handle(
     let move_entity = entity.clone();
     let down_entity = entity.clone();
     let up_entity = entity;
-    // How far the card may travel before it would leave the window.
-    let limit = Point {
-        x: px(layout.chat_area_width()).max(px(0.0)),
-        y: px(0.0).max(px(400.0)),
-    };
+    // The bounds are worked out from the window and the card's own measured
+    // size, in `CallCard`. Nothing here knows how big the card is, which is
+    // the point: it is one size ringing, another connected, wider for video
+    // and a pill when minimised.
+    let viewport = layout.viewport();
+    let inset = metrics.space_xxl();
     let dot = cx.product().hsla(cx.product().palette.faint_foreground);
 
     div()
@@ -265,7 +282,7 @@ fn drag_handle(
         .on_drag(CallCardDrag, |_, _, _window, cx| cx.new(|_| DragPreview))
         .on_drag_move(move |event: &DragMoveEvent<CallCardDrag>, _window, cx| {
             move_entity.update(cx, |app, cx| {
-                app.drag_call_card(event.event.position, limit, cx)
+                app.drag_call_card(event.event.position, viewport, inset, cx)
             });
         })
         .on_mouse_up(gpui::MouseButton::Left, move |_, _window, cx| {

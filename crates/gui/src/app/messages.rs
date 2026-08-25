@@ -1,22 +1,22 @@
 //! The timeline as one frame will draw it.
 //!
-//! The virtual list has to size a row before it renders it, so every height
-//! here is a prediction of what the bubble will lay out to. That makes this
-//! file and `message_bubble` two halves of one contract: a padding changed in
-//! one without the other shows up as overlapping or gapped rows.
+//! Structure only: which rows exist and in what order. Nothing here knows how
+//! tall anything is, and that is the point — the rows are measured as they
+//! are laid out (see `components/message_list`), so a padding changed in a
+//! bubble cannot disagree with a number kept over here.
 //!
-//! Heights are resolved geometry, so the cache keys on the metrics that
-//! produced them — base font and density included.
+//! This file used to predict every row's height so a virtual list could size
+//! it in advance, which made it and `message_bubble` two halves of one
+//! contract kept in step by hand. Every drift showed up as bubbles overlapping
+//! or floating apart, and the wrapping guess — characters per line, with no
+//! idea of the font or the width — could never have been right.
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use gpui::{Pixels, Size, size};
 
-use crate::theme::Metrics;
-use crate::utils::{crosses_day, scale_media_dimensions};
-use oxidezap_core::{ChatMessage, MediaType, TypingSummary};
+use crate::utils::crosses_day;
+use oxidezap_core::{ChatMessage, TypingSummary};
 
 /// One row of the timeline.
 ///
@@ -42,73 +42,35 @@ pub enum TimelineItem {
     Encryption,
 }
 
-/// Cached data for message list rendering to avoid recomputing on every frame.
+/// The timeline's rows, as one frame will draw them.
+///
+/// Cheap to rebuild — it walks the messages once — but rebuilt only when
+/// something structural changed, because the identity of this value is what
+/// tells the list whether its measurements still apply.
 #[derive(Clone)]
 pub struct MessageListCache {
-    /// Message count when cache was created (invalidation check)
+    /// Message count when the rows were built (invalidation check).
     pub message_count: usize,
-    /// Group flag the sizes were computed with (invalidation check)
+    /// Group flag, which decides sender names and therefore run breaks.
     pub is_group: bool,
-    /// Media size cap the sizes were computed with (invalidation check)
-    pub max_media_size: f32,
-    /// The scale the heights were measured against. A base-font or density
-    /// change moves every row, and a stale measurement clips content.
-    pub metrics: Metrics,
     /// The typing row that was included, so its arrival — or a change of who
-    /// is typing — rebuilds the list. Not a bare flag: the row carries the
-    /// names, and in a group it grows an avatar per typist, so a summary that
-    /// changed while staying `Some` moves geometry as well as text.
+    /// is typing — rebuilds the rows.
     pub typing: Option<TypingSummary>,
     /// The rows, dividers and typing indicator included.
     pub items: Arc<[TimelineItem]>,
-    /// Pre-computed item sizes for virtual list
-    pub item_sizes: Rc<Vec<Size<Pixels>>>,
-    /// Shared messages reference
+    /// The messages the rows index into.
     pub messages: Arc<[ChatMessage]>,
 }
 
 impl MessageListCache {
     /// Build the timeline for `messages`.
-    pub fn new(
-        messages: &[ChatMessage],
-        is_group: bool,
-        max_media_size: f32,
-        metrics: Metrics,
-        typing: Option<TypingSummary>,
-    ) -> Self {
-        let messages_arc: Arc<[ChatMessage]> = Arc::from(messages);
-        let items = build_items(messages, typing.clone());
-
-        let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
-            items
-                .iter()
-                .map(|item| {
-                    let height = match item {
-                        TimelineItem::DateDivider(_) => metrics.date_divider_height(),
-                        TimelineItem::Typing(_) => metrics.typing_row_height(),
-                        TimelineItem::Encryption => metrics.typing_row_height(),
-                        TimelineItem::Message { ix, starts_run } => calculate_message_height(
-                            &messages[*ix],
-                            *starts_run,
-                            is_group,
-                            max_media_size,
-                            metrics,
-                        ),
-                    };
-                    size(gpui::px(600.), height)
-                })
-                .collect(),
-        );
-
+    pub fn new(messages: &[ChatMessage], is_group: bool, typing: Option<TypingSummary>) -> Self {
         Self {
             message_count: messages.len(),
             is_group,
-            max_media_size,
-            metrics,
+            items: build_items(messages, typing.clone()).into(),
             typing,
-            items: items.into(),
-            item_sizes,
-            messages: messages_arc,
+            messages: Arc::from(messages),
         }
     }
 
@@ -117,14 +79,10 @@ impl MessageListCache {
         &self,
         message_count: usize,
         is_group: bool,
-        max_media_size: f32,
-        metrics: Metrics,
         typing: Option<&TypingSummary>,
     ) -> bool {
         self.message_count == message_count
             && self.is_group == is_group
-            && self.max_media_size == max_media_size
-            && self.metrics == metrics
             && self.typing.as_ref() == typing
     }
 }
@@ -175,99 +133,6 @@ pub fn should_show_sender(messages: &[ChatMessage], index: usize) -> bool {
     let current = &messages[index];
     let previous = &messages[index - 1];
     current.sender != previous.sender || current.is_from_me != previous.is_from_me
-}
-
-/// Predict the height of a message bubble.
-///
-/// `starts_run` must be the same flag the bubble renders with: it drives the
-/// outer padding in every chat, while the sender-name line only exists in
-/// groups.
-pub fn calculate_message_height(
-    msg: &ChatMessage,
-    starts_run: bool,
-    is_group: bool,
-    max_media_size: f32,
-    metrics: Metrics,
-) -> Pixels {
-    let gap = if starts_run {
-        metrics.bubble_gap_authored()
-    } else {
-        metrics.bubble_gap_grouped()
-    };
-    // The time and ticks moved inside the bubble's last line, so there is no
-    // longer a row of their own to budget for.
-    let mut height = gap + metrics.bubble_padding_y() * 2.0;
-    let mut content_items = 0;
-
-    if is_group && starts_run && msg.sender_name.is_some() && !msg.is_from_me {
-        height += metrics.line_height();
-        content_items += 1;
-    }
-
-    // A system row is its own shape: one icon, two short lines, no bubble.
-    if msg.system.is_some() {
-        return gap + metrics.avatar_header() + metrics.space_md();
-    }
-
-    if msg.quoted.is_some() {
-        // Name line plus preview line, inside the quote's own padding.
-        height += metrics.line_height() * 2.0;
-        content_items += 1;
-    }
-
-    if let Some(media) = &msg.media {
-        height += match media.media_type {
-            MediaType::Image | MediaType::Sticker | MediaType::Video => {
-                let (_, h) = scale_media_dimensions(
-                    media.width.unwrap_or(300),
-                    media.height.unwrap_or(300),
-                    max_media_size,
-                );
-                gpui::px(h)
-            }
-            // The voice player is a control row: play button, waveform, time.
-            MediaType::Audio => metrics.waveform_height() + metrics.space_xl(),
-            MediaType::Document => metrics.avatar_row() + metrics.space_md(),
-        };
-        content_items += 1;
-    }
-
-    if !msg.content.is_empty() {
-        height += metrics.line_height() * wrapped_lines(&msg.content) as f32;
-        content_items += 1;
-    } else if msg.media.is_none() {
-        // An empty bubble still has one line of chrome in it (the time), and
-        // sizing it to nothing would overlap its neighbour.
-        height += metrics.line_height();
-    }
-
-    if content_items > 1 {
-        height += metrics.space_md() * (content_items - 1) as f32;
-    }
-
-    if !msg.reactions.is_empty() {
-        // Reactions overlap the bubble's lower edge, so only the part that
-        // hangs below it costs height.
-        height += metrics.reaction_height() - metrics.reaction_overlap();
-    }
-
-    height
-}
-
-/// Roughly how many lines `content` will wrap to.
-///
-/// An estimate, deliberately: measuring shaped text for every message in a
-/// conversation to size rows the reader may never scroll to is far more
-/// expensive than being a line out on a long paragraph.
-fn wrapped_lines(content: &str) -> usize {
-    /// Characters per line at the design's bubble width and body size.
-    const CHARS_PER_LINE: usize = 42;
-
-    content
-        .lines()
-        .map(|line| line.chars().count().div_ceil(CHARS_PER_LINE).max(1))
-        .sum::<usize>()
-        .max(1)
 }
 
 #[cfg(test)]
@@ -389,58 +254,35 @@ mod tests {
     }
 
     #[test]
-    fn every_item_gets_a_size() {
-        let messages = vec![
-            message("a", false, at(14, 9)),
-            message("b", false, at(15, 9)),
-        ];
-        let cache = MessageListCache::new(&messages, true, 300.0, Metrics::default(), None);
-        assert_eq!(cache.item_sizes.len(), cache.items.len());
-        assert!(cache.item_sizes.iter().all(|s| s.height > gpui::px(0.0)));
-    }
-
-    #[test]
-    fn a_zoom_change_invalidates_the_measured_rows() {
+    fn the_rows_survive_a_reason_to_rebuild() {
         let messages = vec![message("a", false, at(14, 9))];
-        let cache = MessageListCache::new(&messages, false, 300.0, Metrics::default(), None);
-        let zoomed = Metrics::new(20.0, crate::theme::metrics::Density::Comfortable);
+        let cache = MessageListCache::new(&messages, false, None);
+        assert!(cache.is_valid_for(1, false, None));
         assert!(
-            !cache.is_valid_for(1, false, 300.0, zoomed, None),
-            "rows measured at one base font cannot be reused at another"
+            !cache.is_valid_for(2, false, None),
+            "a new message is a new row"
         );
-        assert!(cache.is_valid_for(1, false, 300.0, Metrics::default(), None));
+        assert!(
+            !cache.is_valid_for(1, true, None),
+            "grouping decides sender names, so it decides run breaks"
+        );
     }
 
     #[test]
-    fn typing_arriving_invalidates_the_list() {
+    fn typing_arriving_rebuilds_the_rows() {
         let messages = vec![message("a", false, at(14, 9))];
-        let cache = MessageListCache::new(&messages, false, 300.0, Metrics::default(), None);
-        assert!(!cache.is_valid_for(1, false, 300.0, Metrics::default(), Some(&typing(&["Ana"]))));
+        let cache = MessageListCache::new(&messages, false, None);
+        assert!(!cache.is_valid_for(1, false, Some(&typing(&["Ana"]))));
     }
 
     /// A second typist in a group adds an avatar to the row, so a summary
     /// that changed while staying `Some` is a different timeline.
     #[test]
-    fn a_changed_typing_summary_invalidates_the_list() {
+    fn a_changed_typing_summary_rebuilds_the_rows() {
         let messages = vec![message("a", false, at(14, 9))];
-        let cache = MessageListCache::new(
-            &messages,
-            true,
-            300.0,
-            Metrics::default(),
-            Some(typing(&["Ana"])),
-        );
-        assert!(cache.is_valid_for(1, true, 300.0, Metrics::default(), Some(&typing(&["Ana"]))));
-        assert!(
-            !cache.is_valid_for(
-                1,
-                true,
-                300.0,
-                Metrics::default(),
-                Some(&typing(&["Ana", "Marcos"]))
-            ),
-            "the row grew an avatar"
-        );
+        let cache = MessageListCache::new(&messages, true, Some(typing(&["Ana"])));
+        assert!(cache.is_valid_for(1, true, Some(&typing(&["Ana"]))));
+        assert!(!cache.is_valid_for(1, true, Some(&typing(&["Ana", "Marcos"]))));
     }
 
     fn typing(names: &[&str]) -> TypingSummary {
@@ -449,22 +291,5 @@ mod tests {
             total: names.len(),
             kind: oxidezap_core::ComposingKind::Text,
         }
-    }
-
-    #[test]
-    fn line_estimates_count_hard_breaks_and_wrapping() {
-        assert_eq!(wrapped_lines(""), 1);
-        assert_eq!(wrapped_lines("short"), 1);
-        assert_eq!(wrapped_lines("a\nb\nc"), 3);
-        assert_eq!(wrapped_lines(&"x".repeat(84)), 2);
-        assert_eq!(wrapped_lines(&"x".repeat(85)), 3);
-    }
-
-    #[test]
-    fn an_empty_bubble_still_reserves_a_line() {
-        let mut msg = message("a", false, at(14, 9));
-        msg.content.clear();
-        let height = calculate_message_height(&msg, true, false, 300.0, Metrics::default());
-        assert!(height > gpui::px(0.0));
     }
 }

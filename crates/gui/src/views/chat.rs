@@ -5,7 +5,6 @@ use gpui::{
     prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
-use gpui_component::VirtualListScrollHandle;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Icon, IconName};
 
@@ -31,10 +30,13 @@ pub fn render_connected_view(
     let layout = app.responsive_layout(window, cx);
     let entity = cx.entity().clone();
     let selected_jid = app.selected_chat_jid();
-    let chat_list_scroll = app.chat_list_scroll();
-    let chat_list_focus = app.chat_list_focus();
+    // Cloned rather than borrowed: building the timeline's rows below needs
+    // the app mutably, and these are handles — a clone is a refcount.
+    let chat_list_scroll = app.chat_list_scroll().clone();
+    let chat_list_focus = app.chat_list_focus().clone();
     let chat_search_input = app.chat_search_input().cloned();
-    let message_list_scroll = app.message_list_scroll();
+
+    let message_list = app.message_list().clone();
     let input_area = app.input_area();
     // The composer draws itself into the slot the layout gave it, and only
     // this side knows what that is: left to its own defaults it used the
@@ -68,14 +70,7 @@ pub fn render_connected_view(
         .and_then(|chat| app.availability_of(&chat.jid))
         .cloned();
     let message_cache = selected_chat.as_ref().map(|chat| {
-        app.get_message_list_cache(
-            &chat.jid,
-            &chat.messages,
-            chat.is_group,
-            layout.max_media_size(),
-            *layout.metrics(),
-            typing.clone(),
-        )
+        app.get_message_list_cache(&chat.jid, &chat.messages, chat.is_group, typing.clone())
     });
     // A call in a chat other than the one on screen is what the return banner
     // is for; a call in *this* chat is already obvious from the card.
@@ -158,8 +153,8 @@ pub fn render_connected_view(
                 .when(layout.show_sidebar(), |el| {
                     el.child(render_chat_list(
                         list_props,
-                        chat_list_scroll,
-                        chat_list_focus,
+                        &chat_list_scroll,
+                        &chat_list_focus,
                         entity.clone(),
                         layout,
                         cx,
@@ -173,7 +168,7 @@ pub fn render_connected_view(
                         typing.as_ref(),
                         availability.as_ref(),
                         search_bar,
-                        message_list_scroll,
+                        &message_list,
                         input_area,
                         entity.clone(),
                         layout,
@@ -195,7 +190,7 @@ fn render_chat_area(
     typing: Option<&oxidezap_core::TypingSummary>,
     availability: Option<&oxidezap_core::Availability>,
     search_bar: Option<gpui::AnyElement>,
-    message_scroll: &VirtualListScrollHandle,
+    message_list: &gpui::ListState,
     input_area: Option<Entity<InputAreaView>>,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
@@ -248,7 +243,7 @@ fn render_chat_area(
                     render_return_banner(name, elapsed, entity.clone(), metrics, cx)
                 }))
                 .children(message_cache.map(|cache| {
-                    render_message_list(cache, message_scroll, entity.clone(), is_group, layout, cx)
+                    render_message_list(cache, message_list, entity.clone(), is_group, layout, cx)
                 }))
                 .children(input_area)
             }

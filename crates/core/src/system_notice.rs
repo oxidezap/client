@@ -41,6 +41,19 @@ impl CallRecord {
     }
 
     /// The second line: how long, or how to try again.
+    /// One line for a chat row, where there is no room for two.
+    ///
+    /// The direction is dropped: the list is scanned rather than read, and
+    /// "missed" or "no answer" already carries the part worth acting on.
+    pub fn summary(&self) -> String {
+        match self.outcome {
+            CallOutcome::Completed(secs) => {
+                format!("{} · {}", self.title(), format_duration(secs))
+            }
+            _ => self.title(),
+        }
+    }
+
     pub fn detail(&self) -> String {
         let direction = if self.is_outgoing {
             "outgoing"

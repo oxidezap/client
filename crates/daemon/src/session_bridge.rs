@@ -33,6 +33,8 @@ pub enum Action {
         jid: String,
         text: String,
         local_id: Option<String>,
+        /// The message being replied to, when this is a reply.
+        quoted: Option<oxidezap_core::QuotedMessage>,
     },
     SendAudio {
         jid: String,
@@ -369,6 +371,7 @@ impl Bridge {
                 jid,
                 text,
                 local_id,
+                quoted,
             } => {
                 let Some(permit) = self.permit() else {
                     return too_busy();
@@ -380,7 +383,12 @@ impl Bridge {
                 // wrong send.
                 hold(
                     permit,
-                    [client.send_message(&jid, &text, local_id.unwrap_or_else(next_local_id))],
+                    [client.send_message(
+                        &jid,
+                        &text,
+                        local_id.unwrap_or_else(next_local_id),
+                        quoted,
+                    )],
                 );
                 CommandOutcome::Accepted
             }
@@ -458,20 +466,37 @@ impl Bridge {
                         });
                         client.start_call(&jid, video, placeholder_id);
                     }
-                    CallAction::Accept { call_id } => client.accept_call(&call_id),
+                    // Answering brings the media up here, so the call is live
+                    // from this moment: waiting for an event that only fires
+                    // for the *other* direction left the daemon publishing a
+                    // ringing offer over a connected call.
+                    CallAction::Accept { call_id } => {
+                        self.hub.calls(|calls| {
+                            calls.connect(&call_id);
+                        });
+                        client.accept_call(&call_id);
+                    }
                     CallAction::Decline { call_id } => {
                         self.hub.calls(|calls| {
-                            calls.dismiss_incoming(&call_id);
+                            calls.end(&call_id);
                         });
                         client.decline_call(&call_id);
                     }
+                    // `end`, not `dismiss_outgoing`: hanging up is the same
+                    // gesture whatever stage the call is in, and matching only
+                    // the outgoing stage left a *connected* call in the
+                    // daemon's state — which it then published straight back
+                    // to the front end that had just ended it.
                     CallAction::Cancel { call_id } => {
                         self.hub.calls(|calls| {
-                            calls.dismiss_outgoing(&call_id);
+                            calls.end(&call_id);
                         });
                         client.cancel_call(&call_id);
                     }
                     CallAction::SetMuted { call_id, muted } => {
+                        self.hub.calls(|calls| {
+                            calls.set_muted(muted);
+                        });
                         client.set_call_muted(&call_id, muted);
                     }
                 }

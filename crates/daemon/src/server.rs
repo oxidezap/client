@@ -700,6 +700,7 @@ async fn handle_request(
             jid,
             text,
             local_id,
+            quoted,
         } => acted(
             dispatch(
                 hub,
@@ -708,6 +709,7 @@ async fn handle_request(
                     jid,
                     text,
                     local_id,
+                    quoted,
                 },
             )
             .await,
@@ -988,6 +990,7 @@ mod tests {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
             local_id: None,
+            quoted: None,
         });
         let answer = handle_request(request, &hub, &commands, &outbox()).await;
         assert!(matches!(
@@ -1038,6 +1041,7 @@ mod tests {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
             local_id: None,
+            quoted: None,
         });
         let answer = handle_request(request, &hub, &commands, &outbox()).await;
         assert!(matches!(
@@ -1062,6 +1066,7 @@ mod tests {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
             local_id: None,
+            quoted: None,
         });
         let answer = handle_request(request, &hub, &commands, &outbox()).await;
         assert!(matches!(
@@ -1413,6 +1418,7 @@ mod tests {
                 jid: "a@s.whatsapp.net".into(),
                 text: "hi".into(),
                 local_id: None,
+                quoted: None,
             }
             .needs_network()
         );
@@ -1433,6 +1439,7 @@ mod tests {
                 jid: "a@s.whatsapp.net".into(),
                 text: "hi".into(),
                 local_id: Some("local_1".into()),
+                quoted: None,
             },
         };
         let answer = handle_request(request, &hub, &commands, &outbox()).await;

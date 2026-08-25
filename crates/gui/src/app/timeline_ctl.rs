@@ -33,8 +33,7 @@ impl WhatsAppApp {
         drop(cache);
 
         if let Some(item_ix) = item_ix {
-            self.message_list_scroll
-                .scroll_to_item(item_ix, ScrollStrategy::Center);
+            self.message_list.scroll_to_reveal_item(item_ix);
             cx.notify();
         }
     }

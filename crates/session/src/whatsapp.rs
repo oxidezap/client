@@ -670,10 +670,12 @@ impl WhatsAppClient {
                 } else {
                     Availability::Online
                 };
-                let _ = ui_tx.send(UiEvent::PresenceUpdated {
-                    jid: update.from.to_string(),
-                    availability,
-                });
+                // Normalized like the receipt and chat-presence branches
+                // beside it: a chat whose JID was migrated from a phone
+                // number to a LID is keyed by the LID, so presence published
+                // under the PN alias would never reach it.
+                let jid = normalize_chat_jid(&client, &update.from.to_string()).await;
+                let _ = ui_tx.send(UiEvent::PresenceUpdated { jid, availability });
             }
             // Something happened *to* the group. Only the changes a member
             // would notice become a row; the rest is bookkeeping, and a line
@@ -1090,6 +1092,7 @@ impl WhatsAppClient {
         jid_str: &str,
         content: &str,
         local_id: String,
+        quoted: Option<oxidezap_core::QuotedMessage>,
     ) -> tokio::task::JoinHandle<()> {
         let client_handle = self.client_handle.clone();
         let chat_store = self.chat_store.clone();
@@ -1114,9 +1117,26 @@ impl WhatsAppClient {
             // here must not queue every other client action behind it.
             let client = client_handle.lock().await.clone();
             if let Some(client) = client {
-                let message = wa::Message {
-                    conversation: Some(content.clone()),
-                    ..Default::default()
+                // A reply is the same send with a quote attached, which the
+                // wire carries as an extended text message: a bare
+                // `conversation` has nowhere to put the context.
+                let message = match &quoted {
+                    Some(quoted) => wa::Message {
+                        extended_text_message: whatsapp_rust::buffa::MessageField::some(
+                            wa::message::ExtendedTextMessage {
+                                text: Some(content.clone()),
+                                context_info: whatsapp_rust::buffa::MessageField::some(
+                                    quote_context(quoted),
+                                ),
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    },
+                    None => wa::Message {
+                        conversation: Some(content.clone()),
+                        ..Default::default()
+                    },
                 };
 
                 // Record BEFORE sending: the server ack event fires during
@@ -2223,7 +2243,14 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             is_animated: false,
             duration_secs: audio.seconds,
             data_is_preview: false,
-            waveform: None,
+            // The same field the live path reads. Dropping it here made every
+            // voice note flatten to a placeholder shape the moment history
+            // was reloaded — which is most of the time.
+            waveform: audio
+                .waveform
+                .as_deref()
+                .filter(|w| !w.is_empty())
+                .map(|w| Arc::new(w.to_vec())),
         });
     }
     if let Some(doc) = msg.document_message.as_option() {
@@ -2333,6 +2360,24 @@ fn store_status(status: oxidezap_chat_store::MessageStatus) -> MessageStatus {
         // Played is Read plus "and listened to it"; the ticks are the same.
         Stored::Read | Stored::Played => MessageStatus::Read,
     }
+}
+
+/// The reply context for a quote the front end composed.
+///
+/// The quoted copy is rebuilt from the preview rather than kept: nothing
+/// stores the original protobuf, and the preview is what the quote bar shows
+/// on both sides. Its id and its author are what actually thread the reply,
+/// and those are exact.
+fn quote_context(quoted: &oxidezap_core::QuotedMessage) -> wa::ContextInfo {
+    let original = wa::Message {
+        conversation: Some(quoted.preview.clone()),
+        ..Default::default()
+    };
+    whatsapp_rust::wacore::proto_helpers::build_quote_context(
+        quoted.message_id.clone(),
+        quoted.sender.clone(),
+        &original,
+    )
 }
 
 /// Who this device is linked as, off the device store.

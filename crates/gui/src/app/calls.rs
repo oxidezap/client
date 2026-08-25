@@ -7,7 +7,10 @@
 //! it, so its position and minimised flag outlive any single call — put it in
 //! a corner once and it stays there.
 
-use gpui::{Pixels, Point, px};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use gpui::{Pixels, Point, Size, px};
 
 /// One window's presentation of whatever call is up.
 #[derive(Debug, Clone, Default)]
@@ -23,6 +26,18 @@ pub struct CallCard {
     /// or coalesced move event costs one frame of lag instead of snapping the
     /// card to the pointer.
     drag_anchor: Option<Point<Pixels>>,
+    /// What the card actually laid out to, reported by the card itself as it
+    /// is painted.
+    ///
+    /// Measured rather than assumed: the card is a different size ringing
+    /// than connected, wider for video, and a pill when minimised, and every
+    /// one of those changes with the density and the base font. Bounding a
+    /// drag by anything *but* the real size is how a card ends up half off
+    /// the window on one side and short of the edge on the other.
+    ///
+    /// A shared cell because the reporter is a paint callback, which outlives
+    /// any borrow of this struct.
+    measured: Rc<Cell<Size<Pixels>>>,
 }
 
 impl CallCard {
@@ -82,11 +97,48 @@ impl CallCard {
         self.drag_anchor.is_some()
     }
 
-    /// Keep the card reachable after the window is resized smaller than the
-    /// offset it was dragged to.
-    pub fn clamp_offset(&mut self, limit: Point<Pixels>) {
-        self.offset.x = self.offset.x.clamp(-limit.x, px(0.0));
-        self.offset.y = self.offset.y.clamp(px(0.0), limit.y);
+    /// Where the card should report what it laid out to.
+    pub fn measurement(&self) -> Rc<Cell<Size<Pixels>>> {
+        Rc::clone(&self.measured)
+    }
+
+    /// How far the card may travel from its corner, in this window.
+    ///
+    /// The card is pinned to the top-right and offset from there, so the
+    /// travel available is the window minus the card itself minus the inset
+    /// it sits at — on both axes. Zero until the card has been painted once,
+    /// which is correct: nothing can be dragged before it exists.
+    fn travel(&self, viewport: Size<Pixels>, inset: Pixels) -> Point<Pixels> {
+        let card = self.measured.get();
+        Point {
+            x: (viewport.width - card.width - inset - inset).max(px(0.0)),
+            y: (viewport.height - card.height - inset - inset).max(px(0.0)),
+        }
+    }
+
+    /// Keep the card inside the window.
+    ///
+    /// Applied on every drag sample *and* on every frame: a window resized
+    /// smaller than the offset the card was dragged to would otherwise leave
+    /// it — and its hang-up control — off screen.
+    pub fn clamp_to(&mut self, viewport: Size<Pixels>, inset: Pixels) {
+        let travel = self.travel(viewport, inset);
+        // Left and down from the top-right corner, so x is negative travel
+        // and y is positive.
+        self.offset.x = self.offset.x.clamp(-travel.x, px(0.0));
+        self.offset.y = self.offset.y.clamp(px(0.0), travel.y);
+    }
+
+    /// The offset to draw at, clamped without disturbing the stored one.
+    ///
+    /// A window that shrinks and grows again should put the card back where
+    /// it was rather than leaving it where the smaller window forced it.
+    pub fn drawn_offset(&self, viewport: Size<Pixels>, inset: Pixels) -> Point<Pixels> {
+        let travel = self.travel(viewport, inset);
+        Point {
+            x: self.offset.x.clamp(-travel.x, px(0.0)),
+            y: self.offset.y.clamp(px(0.0), travel.y),
+        }
     }
 }
 
@@ -107,7 +159,7 @@ mod tests {
 
     #[test]
     fn the_dragged_position_outlives_the_call() {
-        let mut card = CallCard::default();
+        let mut card = measured_card();
         card.drag_by(Point {
             x: px(-40.0),
             y: px(60.0),
@@ -117,19 +169,86 @@ mod tests {
         assert_eq!(card.offset().y, px(60.0));
     }
 
+    /// The card is 340x400 in a 1000x700 window with a 20px inset, so it may
+    /// travel 1000-340-40 = 620 left and 700-400-40 = 260 down.
+    fn measured_card() -> CallCard {
+        let card = CallCard::default();
+        card.measurement().set(Size {
+            width: px(340.0),
+            height: px(400.0),
+        });
+        card
+    }
+
+    fn window() -> Size<Pixels> {
+        Size {
+            width: px(1000.0),
+            height: px(700.0),
+        }
+    }
+
     #[test]
-    fn a_shrinking_window_pulls_the_card_back_into_view() {
+    fn a_card_may_travel_the_window_less_its_own_size() {
+        let mut card = measured_card();
+        card.drag_by(Point {
+            x: px(-9000.0),
+            y: px(9000.0),
+        });
+        card.clamp_to(window(), px(20.0));
+        assert_eq!(
+            card.offset().x,
+            px(-620.0),
+            "its left edge stops at the inset"
+        );
+        assert_eq!(card.offset().y, px(260.0), "so does its bottom edge");
+    }
+
+    #[test]
+    fn a_card_cannot_be_pushed_past_the_corner_it_starts_in() {
+        let mut card = measured_card();
+        card.drag_by(Point {
+            x: px(200.0),
+            y: px(-200.0),
+        });
+        card.clamp_to(window(), px(20.0));
+        assert_eq!(card.offset(), Point::default());
+    }
+
+    /// A window that shrinks and grows again should put the card back rather
+    /// than leaving it where the smaller window forced it.
+    #[test]
+    fn a_shrinking_window_does_not_consume_the_dragged_position() {
+        let mut card = measured_card();
+        card.drag_by(Point {
+            x: px(-600.0),
+            y: px(0.0),
+        });
+        let cramped = Size {
+            width: px(500.0),
+            height: px(700.0),
+        };
+        assert_eq!(
+            card.drawn_offset(cramped, px(20.0)).x,
+            px(-120.0),
+            "drawn where it fits"
+        );
+        assert_eq!(card.offset().x, px(-600.0), "remembered where it was put");
+        assert_eq!(card.drawn_offset(window(), px(20.0)).x, px(-600.0));
+    }
+
+    #[test]
+    fn an_unmeasured_card_does_not_move() {
         let mut card = CallCard::default();
         card.drag_by(Point {
-            x: px(-900.0),
-            y: px(900.0),
+            x: px(-100.0),
+            y: px(100.0),
         });
-        card.clamp_offset(Point {
-            x: px(300.0),
-            y: px(200.0),
-        });
-        assert_eq!(card.offset().x, px(-300.0));
-        assert_eq!(card.offset().y, px(200.0));
+        card.clamp_to(window(), px(20.0));
+        assert_eq!(
+            card.offset(),
+            Point::default(),
+            "nothing can be dragged before it has been drawn"
+        );
     }
 
     #[test]

@@ -4,11 +4,12 @@
 //! than to either person in it. No ticks, no avatar, no author colour.
 
 use gpui::{
-    App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _,
+    App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div,
+    prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
-use gpui_component::Icon;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Icon, Sizable as _};
 use oxidezap_core::{CallRecord, SystemNotice};
 
 use crate::app::WhatsAppApp;
@@ -44,10 +45,6 @@ pub fn render_call_record(
         .bg(cx.theme().secondary)
         .border_1()
         .border_color(cx.theme().border)
-        .when(is_missed, |el| {
-            let hover = cx.theme().list_hover;
-            el.cursor_pointer().hover(move |s| s.bg(hover))
-        })
         .child(
             Icon::new(if record.is_video {
                 ProductIcon::Video
@@ -76,10 +73,20 @@ pub fn render_call_record(
                         .child(record.detail()),
                 ),
         )
+        // Calling back is a command, so it is a Button rather than a click on
+        // the whole row: that is what carries keyboard activation, and a row
+        // that dials when you click anywhere on it is easy to hit by accident.
         .when(is_missed, |el| {
-            el.on_click(move |_, _window, cx| {
-                entity.update(cx, |app, cx| app.start_call(peer_jid.clone(), false, cx));
-            })
+            el.child(
+                Button::new(SharedString::from(format!("call-back-{message_id}")))
+                    .icon(Icon::new(ProductIcon::Phone))
+                    .ghost()
+                    .small()
+                    .tooltip("Call back")
+                    .on_click(move |_, _window, cx| {
+                        entity.update(cx, |app, cx| app.start_call(peer_jid.clone(), false, cx));
+                    }),
+            )
         })
 }
 

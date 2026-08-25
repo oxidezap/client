@@ -64,7 +64,9 @@ impl MobilePanel {
 pub struct ResponsiveLayout {
     breakpoint: Breakpoint,
     mobile_panel: MobilePanel,
-    viewport_width: f32,
+    /// The whole window, not just its width: anything positioned against the
+    /// window's edges — a card floating over the conversation — needs both.
+    viewport: Size<Pixels>,
     metrics: Metrics,
 }
 
@@ -95,9 +97,14 @@ impl ResponsiveLayout {
         Self {
             breakpoint: Breakpoint::from_width(width),
             mobile_panel,
-            viewport_width: width,
+            viewport,
             metrics,
         }
+    }
+
+    /// The window this layout describes.
+    pub fn viewport(&self) -> Size<Pixels> {
+        self.viewport
     }
 
     /// The active design scale: spacing, radii, type steps and control frames.
@@ -152,17 +159,17 @@ impl ResponsiveLayout {
     /// Below this they are still reachable — the overflow menu carries every
     /// one of them — so this decides presentation, never availability.
     pub fn show_call_buttons(&self) -> bool {
-        self.viewport_width >= Self::CALL_BUTTON_MIN_WIDTH
+        f32::from(self.viewport.width) >= Self::CALL_BUTTON_MIN_WIDTH
     }
 
     pub fn sidebar_width(&self) -> Pixels {
         px(match self.breakpoint {
             Breakpoint::Desktop => Self::SIDEBAR_WIDTH_DESKTOP,
             Breakpoint::Tablet => {
-                let proportional = self.viewport_width * 0.35;
+                let proportional = f32::from(self.viewport.width) * 0.35;
                 proportional.clamp(Self::SIDEBAR_WIDTH_MIN, Self::SIDEBAR_WIDTH_TABLET)
             }
-            Breakpoint::Mobile => self.viewport_width,
+            Breakpoint::Mobile => f32::from(self.viewport.width),
         })
     }
 
@@ -202,7 +209,7 @@ impl ResponsiveLayout {
             Breakpoint::Desktop => Self::MAX_BUBBLE_WIDTH_DESKTOP,
             Breakpoint::Tablet => Self::MAX_BUBBLE_WIDTH_TABLET,
             Breakpoint::Mobile => {
-                (self.viewport_width * Self::MAX_BUBBLE_WIDTH_MOBILE_RATIO).min(350.0)
+                (f32::from(self.viewport.width) * Self::MAX_BUBBLE_WIDTH_MOBILE_RATIO).min(350.0)
             }
         })
     }
@@ -212,7 +219,7 @@ impl ResponsiveLayout {
             Breakpoint::Desktop => Self::MAX_MEDIA_SIZE_DESKTOP,
             Breakpoint::Tablet => Self::MAX_MEDIA_SIZE_TABLET,
             Breakpoint::Mobile => {
-                (self.viewport_width * Self::MAX_MEDIA_SIZE_MOBILE_RATIO).min(280.0)
+                (f32::from(self.viewport.width) * Self::MAX_MEDIA_SIZE_MOBILE_RATIO).min(280.0)
             }
         }
     }
@@ -220,9 +227,9 @@ impl ResponsiveLayout {
     pub fn chat_area_width(&self) -> f32 {
         match self.breakpoint {
             Breakpoint::Desktop | Breakpoint::Tablet => {
-                self.viewport_width - f32::from(self.sidebar_width())
+                f32::from(self.viewport.width) - f32::from(self.sidebar_width())
             }
-            Breakpoint::Mobile => self.viewport_width,
+            Breakpoint::Mobile => f32::from(self.viewport.width),
         }
     }
 

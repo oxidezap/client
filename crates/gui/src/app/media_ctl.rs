@@ -285,16 +285,20 @@ impl WhatsAppApp {
         // A second tap while the first is still in flight would download the
         // same bytes twice; the marker is also what the bubble reads to show
         // that something is happening.
+        // The slot is claimed *before* the request goes out. Asking first and
+        // checking afterwards meant a double tap issued two daemon downloads
+        // and then abandoned the second receiver.
+        if !self.begin_download(&message_id, cx) {
+            return;
+        }
         let download_rx = {
             let Some(client) = &self.client else {
                 warn!("Cannot download image: client is unavailable");
+                self.finish_download(&message_id);
                 return;
             };
             client.download_downloadable_media(downloadable)
         };
-        if !self.begin_download(&message_id, cx) {
-            return;
-        }
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let result = download_with_timeout(download_rx).await;

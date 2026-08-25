@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use log::{debug, error, info, warn};
-use oxidezap_core::{CallState, DownloadableMedia, MediaContent, UiEvent};
+use oxidezap_core::{CallState, DownloadableMedia, MediaContent, QuotedMessage, UiEvent};
 use oxidezap_ipc::{
     CallAction, ClientRequest, ConnectionState, DaemonMessage, Endpoint, PROTOCOL_VERSION, Request,
     RequestId, StateSnapshot, endpoint_path, media_path,
@@ -204,12 +204,19 @@ impl Session {
         id
     }
 
-    pub fn send_message(&self, jid: &str, text: &str, local_id: String) {
+    pub fn send_message(
+        &self,
+        jid: &str,
+        text: &str,
+        local_id: String,
+        quoted: Option<QuotedMessage>,
+    ) {
         self.ask(
             ClientRequest::SendText {
                 jid: jid.to_string(),
                 text: text.to_string(),
                 local_id: Some(local_id.clone()),
+                quoted,
             },
             Awaiting::Send {
                 chat_jid: jid.to_string(),

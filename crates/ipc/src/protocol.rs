@@ -1,6 +1,6 @@
 //! Messages exchanged over the socket.
 
-use oxidezap_core::{CallState, DownloadableMedia, UiEvent};
+use oxidezap_core::{CallState, DownloadableMedia, QuotedMessage, UiEvent};
 use serde::{Deserialize, Serialize};
 
 /// Monotonic counter over daemon state.
@@ -339,6 +339,14 @@ pub enum ClientRequest {
         /// the daemon makes one up.
         #[serde(default)]
         local_id: Option<String>,
+        /// The message being replied to, when this is a reply.
+        ///
+        /// Carried on the request rather than set up beforehand, because a
+        /// reply is one send: the quote is part of the message, and a client
+        /// that composed one has everything the wire needs — the original's
+        /// id, who wrote it, and the line to show in the quote bar.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quoted: Option<QuotedMessage>,
     },
     /// Send a recorded voice note.
     ///

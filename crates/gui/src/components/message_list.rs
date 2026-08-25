@@ -1,13 +1,22 @@
 //! The timeline: dividers, bubbles, and the typing indicator.
+//!
+//! Every row measures itself. That is the whole design: `gpui::list` lays a
+//! row out and asks how tall it turned out, so nothing anywhere has to
+//! predict what a bubble will become. The list this replaced needed each
+//! height up front, which meant a table of guesses in `app/messages.rs` and a
+//! renderer here that had to agree with it — and when they disagreed, which
+//! was often, bubbles overlapped or drifted apart.
+//!
+//! Anchored at the bottom, because a conversation is read from its end: that
+//! is also what opens a chat on its newest message rather than its oldest.
 
 use std::sync::Arc;
 
 use gpui::{
-    App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div,
-    prelude::FluentBuilder as _,
+    AnyElement, App, Entity, IntoElement, ListAlignment, ListState, ParentElement, Styled, div,
+    list, prelude::FluentBuilder as _, px,
 };
 use gpui_component::ActiveTheme as _;
-use gpui_component::{VirtualListScrollHandle, scroll::Scrollbar, v_virtual_list};
 
 use crate::app::{MessageListCache, TimelineItem, WhatsAppApp};
 use crate::components::message_bubble::render_encryption_notice;
@@ -19,134 +28,134 @@ use crate::utils::format_date_divider;
 
 use oxidezap_core::{MediaType, TypingSummary};
 
+/// How far beyond the viewport to keep rows laid out.
+///
+/// A screen either way: enough that a flick does not land on blank space
+/// while the rows under it are measured, and bounded so a long conversation
+/// is still only laying out what is near the reader.
+pub const TIMELINE_OVERDRAW: f32 = 800.0;
+
+/// A list state for a conversation, anchored at its newest row.
+pub fn new_timeline_state(item_count: usize) -> ListState {
+    ListState::new(item_count, ListAlignment::Bottom, px(TIMELINE_OVERDRAW))
+}
+
 pub fn render_message_list(
     cache: MessageListCache,
-    scroll_handle: &VirtualListScrollHandle,
+    state: &ListState,
     entity: Entity<WhatsAppApp>,
     is_group: bool,
     layout: ResponsiveLayout,
     _cx: &App,
 ) -> impl IntoElement {
     let metrics = *layout.metrics();
+    let padding = layout.padding();
+
+    if cache.messages.is_empty() {
+        return div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .justify_center()
+            .items_center()
+            .p(metrics.space_xxxl())
+            .child(
+                EmptyState::new("No messages yet")
+                    .icon(ProductIcon::MessageSquare)
+                    .description("Say something to start this conversation."),
+            )
+            .into_any_element();
+    }
+
     let messages = Arc::clone(&cache.messages);
     let items = Arc::clone(&cache.items);
-    let item_sizes = cache.item_sizes.clone();
-    let is_empty = messages.is_empty();
-    let padding = layout.padding();
 
     div()
         .flex_1()
         .min_h_0()
         .overflow_hidden()
-        .relative()
-        .when(is_empty, |el| {
-            el.flex()
-                .justify_center()
-                .items_center()
-                .p(metrics.space_xxxl())
-                .child(
-                    EmptyState::new("No messages yet")
-                        .icon(ProductIcon::MessageSquare)
-                        .description("Say something to start this conversation."),
+        .child(
+            list(state.clone(), move |ix, _window, cx| {
+                render_row(
+                    &items, &messages, ix, &entity, is_group, layout, metrics, cx,
                 )
-        })
-        .when(!is_empty, |el| {
-            let entity_for_render = entity.clone();
-            el.child(
-                v_virtual_list(entity.clone(), "message-list", item_sizes, {
-                    move |app, visible_range, _scroll_handle, cx| {
-                        // Read fresh from the app rather than from a value
-                        // captured when the closure was built: the list is
-                        // rebuilt on scroll, not on state change.
-                        //
-                        // And read *here*, once: the list has leased the app
-                        // to hand this closure `app`, so a bubble that reads
-                        // the same entity again panics. Everything a row
-                        // needs from the app is gathered in this scope.
-                        let playing = app.playing_message_id().map(|s| s.to_string());
-                        let audio_owner = app.audio_owner().map(|s| s.to_string());
-                        let audio_fraction = app.audio_progress();
-                        let audio_elapsed = app.audio_elapsed_secs();
-                        let playback_speed = app.playback_speed();
+            })
+            .size_full()
+            .px(padding),
+        )
+        .into_any_element()
+}
 
-                        visible_range
-                            .map(|ix| match &items[ix] {
-                                TimelineItem::DateDivider(at) => {
-                                    render_date_divider(*at, metrics, cx).into_any_element()
-                                }
-                                TimelineItem::Typing(summary) => {
-                                    render_typing(summary, is_group, metrics, cx).into_any_element()
-                                }
-                                TimelineItem::Encryption => div()
-                                    .w_full()
-                                    .flex()
-                                    .justify_center()
-                                    .py(metrics.space_md())
-                                    .child(render_encryption_notice(metrics, cx))
-                                    .into_any_element(),
-                                TimelineItem::Message { ix, starts_run } => {
-                                    let msg = &messages[*ix];
-                                    let message_id = &msg.id;
+/// One row, whatever kind it is.
+///
+/// Reads what it needs from the app *here*, once. The list has the app
+/// checked out to call this, so a bubble that reached back for the same
+/// entity would panic — everything they need travels in through props.
+#[allow(clippy::too_many_arguments)]
+fn render_row(
+    items: &[TimelineItem],
+    messages: &[oxidezap_core::ChatMessage],
+    ix: usize,
+    entity: &Entity<WhatsAppApp>,
+    is_group: bool,
+    layout: ResponsiveLayout,
+    metrics: Metrics,
+    cx: &mut App,
+) -> AnyElement {
+    let Some(item) = items.get(ix) else {
+        // The list asked for a row that is no longer there. Only reachable
+        // for a frame after a splice, and an empty row is the honest answer.
+        return div().into_any_element();
+    };
 
-                                    // Decoded once and reused: stickers
-                                    // additionally need the stable Arc for
-                                    // animation state.
-                                    let sticker_image = msg.media.as_ref().and_then(|m| {
-                                        (matches!(
-                                            m.media_type,
-                                            MediaType::Sticker | MediaType::Image
-                                        ) && !m.data.is_empty())
-                                        .then(|| {
-                                            app.get_decoded_image(message_id, &m.data, &m.mime_type)
-                                        })
-                                    });
+    match item {
+        TimelineItem::DateDivider(at) => render_date_divider(*at, metrics, cx).into_any_element(),
+        TimelineItem::Typing(summary) => {
+            render_typing(summary, is_group, metrics, cx).into_any_element()
+        }
+        TimelineItem::Encryption => div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .py(metrics.space_md())
+            .child(render_encryption_notice(metrics, cx))
+            .into_any_element(),
+        TimelineItem::Message { ix, starts_run } => {
+            let Some(msg) = messages.get(*ix) else {
+                return div().into_any_element();
+            };
+            let message_id = &msg.id;
 
-                                    // Progress belongs to the one clip that is
-                                    // loaded; a second voice note in the same
-                                    // conversation must not borrow its
-                                    // position.
-                                    let audio = (audio_owner.as_deref()
-                                        == Some(message_id.as_str()))
-                                    .then_some(AudioProgress {
-                                        fraction: audio_fraction,
-                                        elapsed_secs: audio_elapsed,
-                                    });
+            let app = entity.read(cx);
+            // Decoded once and reused: stickers additionally need the stable
+            // Arc for animation state.
+            let sticker_image = msg.media.as_ref().and_then(|m| {
+                (matches!(m.media_type, MediaType::Sticker | MediaType::Image)
+                    && !m.data.is_empty())
+                .then(|| app.get_decoded_image(message_id, &m.data, &m.mime_type))
+            });
+            // Progress belongs to the one clip that is loaded; a second voice
+            // note in the same conversation must not borrow its position.
+            let audio = (app.audio_owner() == Some(message_id.as_str())).then(|| AudioProgress {
+                fraction: app.audio_progress(),
+                elapsed_secs: app.audio_elapsed_secs(),
+            });
+            let props = BubbleProps {
+                message: msg.clone(),
+                playing_message_id: app.playing_message_id().map(|s| s.to_string()),
+                is_group,
+                starts_run: *starts_run,
+                video_player_state: app.video_player_state(message_id),
+                video_frame: app.video_current_frame(message_id),
+                sticker_image,
+                audio,
+                playback_speed: app.playback_speed(),
+                is_downloading: app.is_downloading(message_id),
+            };
 
-                                    render_message_bubble(
-                                        BubbleProps {
-                                            message: msg.clone(),
-                                            playing_message_id: playing.clone(),
-                                            is_group,
-                                            starts_run: *starts_run,
-                                            video_player_state: app.video_player_state(message_id),
-                                            video_frame: app.video_current_frame(message_id),
-                                            sticker_image,
-                                            audio,
-                                            playback_speed,
-                                            is_downloading: app.is_downloading(message_id),
-                                        },
-                                        entity_for_render.clone(),
-                                        layout,
-                                        cx,
-                                    )
-                                }
-                            })
-                            .collect()
-                    }
-                })
-                .track_scroll(scroll_handle)
-                .size_full()
-                .px(padding),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .child(Scrollbar::vertical(scroll_handle)),
-            )
-        })
+            render_message_bubble(props, entity.clone(), layout, cx)
+        }
+    }
 }
 
 /// A day's heading, pinned into the flow as its own row.
@@ -159,10 +168,10 @@ fn render_date_divider(
 
     div()
         .w_full()
-        .h(metrics.date_divider_height())
         .flex()
         .items_center()
         .justify_center()
+        .py(metrics.space_lg())
         .child(
             div()
                 .px(metrics.space_lg())
@@ -203,10 +212,10 @@ fn render_typing(
 
     div()
         .w_full()
-        .h(metrics.typing_row_height())
         .flex()
         .items_end()
         .gap(metrics.space_md())
+        .py(metrics.space_sm())
         .when(is_group, |el| {
             el.child(
                 div()
@@ -259,7 +268,6 @@ fn render_typing(
                 })
                 .child(
                     div()
-                        .id(SharedString::from("typing-bubble"))
                         .flex()
                         .items_center()
                         .gap(metrics.space_xs())

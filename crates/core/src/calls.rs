@@ -32,6 +32,12 @@ pub struct ActiveCall {
     /// this shapes the card and nothing else; the video controls it reveals
     /// are drawn disabled.
     pub is_video: bool,
+    /// Whether this account placed the call.
+    ///
+    /// Carried through connecting rather than derived afterwards: once the
+    /// stage becomes `Active` the direction is gone, and every completed call
+    /// was recorded in the conversation as one we received.
+    pub is_outgoing: bool,
     pub started_at: DateTime<Utc>,
     pub muted: bool,
 }
@@ -294,6 +300,7 @@ impl CallState {
             peer_jid: stage.peer_jid().to_string(),
             peer_name: stage.peer_name().to_string(),
             is_video: stage.is_video(),
+            is_outgoing: matches!(stage, Stage::Outgoing(_)),
             started_at: wacore::time::now_utc(),
             muted: false,
         };
@@ -308,6 +315,8 @@ impl CallState {
             peer_jid: call.caller_jid.clone(),
             peer_name: call.caller_name.clone(),
             is_video: call.is_video,
+            // Answering an offer: they called us.
+            is_outgoing: false,
             started_at: wacore::time::now_utc(),
             muted: false,
         }));
@@ -485,6 +494,20 @@ mod tests {
         state.set_outgoing(outgoing("CALL"));
         assert!(!state.connect(&"OTHER".to_string()));
         assert!(state.outgoing().is_some(), "the real call is untouched");
+    }
+
+    #[test]
+    fn a_connected_call_remembers_who_placed_it() {
+        let mut state = CallState::new();
+        state.set_outgoing(outgoing("CALL"));
+        state.connect(&"CALL".to_string());
+        assert!(state.active().unwrap().is_outgoing, "we dialled");
+
+        let mut state = CallState::new();
+        state.set_incoming(incoming("CALL"));
+        let taken = state.take_incoming().unwrap();
+        state.connect_accepted(&taken);
+        assert!(!state.active().unwrap().is_outgoing, "they called us");
     }
 
     #[test]

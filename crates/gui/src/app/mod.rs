@@ -27,6 +27,12 @@ pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
 pub use chats::{ChatFilter, ChatListCache};
 pub use media::RecordingState;
 pub use messages::{MessageListCache, TimelineItem};
+
+/// What the conversation list was last told about.
+struct TimelineAnchor {
+    jid: String,
+    count: usize,
+}
 pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
 pub use viewer::MediaViewer;
@@ -38,8 +44,8 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, Image, KeyBinding, ScrollStrategy, Task,
-    WeakEntity, Window, actions, div, prelude::*,
+    App, Context, Entity, FocusHandle, Focusable, Image, KeyBinding, ListState, ScrollStrategy,
+    Task, WeakEntity, Window, actions, div, prelude::*,
 };
 use gpui_component::VirtualListScrollHandle;
 use gpui_component::input::InputState;
@@ -66,7 +72,9 @@ actions!(
     ]
 );
 
-use crate::components::{AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft};
+use crate::components::{
+    AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft, new_timeline_state,
+};
 use log::{debug, error, info, warn};
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 
@@ -84,8 +92,8 @@ use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_wa
 use oxidezap_core::{
     ActiveCall, AppState, Availability, CachedQrCode, CallOutcome, CallRecord, CallState, Chat,
     ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, MediaContent, MediaType,
-    MessageStatus, OutgoingCall, PresenceRegistry, ReceiptType, Stage, SystemNotice, TypingSummary,
-    UiEvent,
+    MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Stage, SystemNotice,
+    TypingSummary, UiEvent,
 };
 
 // ChatListCache is now in chats.rs and re-exported above
@@ -366,7 +374,15 @@ pub struct WhatsAppApp {
     #[allow(dead_code)]
     chat_search_task: Option<Task<()>>,
     /// Scroll handle for message list
-    message_list_scroll: VirtualListScrollHandle,
+    /// The conversation's list, which measures its own rows.
+    ///
+    /// One state rather than one per chat: it holds measurements and a scroll
+    /// position, both of which belong to what is on screen. Switching chats
+    /// resets it, which is also what puts the reader at the newest message.
+    message_list: ListState,
+    /// What `message_list` was last reset or spliced for, so a new message
+    /// extends it and a new conversation replaces it.
+    timeline_anchor: Option<TimelineAnchor>,
     /// Isolated input area view (has its own render cycle for performance)
     input_area: Option<Entity<InputAreaView>>,
     /// Chat a composing indicator was last sent to: paused must go back to
@@ -539,7 +555,8 @@ impl WhatsAppApp {
             conversation_search_input: None,
             chat_search_query: String::new(),
             chat_search_task: None,
-            message_list_scroll: VirtualListScrollHandle::new(),
+            message_list: new_timeline_state(0),
+            timeline_anchor: None,
             input_area: None,
             composing_chat: None,
             drafts: HashMap::new(),
@@ -744,39 +761,63 @@ impl WhatsAppApp {
 
     // ========== Message List Cache ==========
 
-    /// Get or compute the message list cache for a chat.
-    /// This avoids expensive recomputation of message heights on every render.
-    /// Uses interior mutability so it can be called during immutable render.
-    /// `max_media_size` should come from ResponsiveLayout for correct sizing.
+    /// The timeline's rows for a chat, rebuilt only when they changed.
+    ///
+    /// Also keeps `message_list` pointing at them: the list holds one row
+    /// count and one set of measurements, so it has to learn about a row
+    /// appearing at the same moment the rows do. Appending splices — which
+    /// keeps the reader where they were — and anything else resets, which
+    /// lands them at the newest message.
     pub fn get_message_list_cache(
-        &self,
+        &mut self,
         chat_jid: &str,
         messages: &[ChatMessage],
         is_group: bool,
-        max_media_size: f32,
-        metrics: crate::theme::Metrics,
         typing: Option<TypingSummary>,
     ) -> MessageListCache {
-        let mut cache = self.message_list_cache.borrow_mut();
+        let cached = {
+            let cache = self.message_list_cache.borrow();
+            cache
+                .get(chat_jid)
+                .filter(|cached| cached.is_valid_for(messages.len(), is_group, typing.as_ref()))
+                .cloned()
+        };
+        let rows = cached.unwrap_or_else(|| {
+            let built = MessageListCache::new(messages, is_group, typing);
+            self.message_list_cache
+                .borrow_mut()
+                .insert(chat_jid.to_string(), built.clone());
+            built
+        });
 
-        // Heights are resolved geometry, so every input that moves them —
-        // the viewport, the group flag, the base font, the density, and
-        // whether a typing row is present — is part of the key.
-        if let Some(cached) = cache.get(chat_jid)
-            && cached.is_valid_for(
-                messages.len(),
-                is_group,
-                max_media_size,
-                metrics,
-                typing.as_ref(),
-            )
-        {
-            return cached.clone();
+        self.sync_timeline(chat_jid, rows.items.len());
+        rows
+    }
+
+    /// Tell the list how many rows there are now, in the way that preserves
+    /// the most: an append is a splice, everything else is a reset.
+    fn sync_timeline(&mut self, chat_jid: &str, count: usize) {
+        let previous = self.timeline_anchor.take();
+        let appended = previous.as_ref().and_then(|anchor| {
+            (anchor.jid == chat_jid && count > anchor.count).then_some(anchor.count)
+        });
+
+        match appended {
+            // Rows only arrived at the end: keep the measurements taken for
+            // everything before them, and the reader's place with them.
+            Some(old) => self.message_list.splice(old..old, count - old),
+            None if previous
+                .as_ref()
+                .is_some_and(|anchor| anchor.jid == chat_jid && anchor.count == count) => {}
+            // A different conversation, or rows that changed shape rather
+            // than merely grew.
+            None => self.message_list.reset(count),
         }
 
-        let new_cache = MessageListCache::new(messages, is_group, max_media_size, metrics, typing);
-        cache.insert(chat_jid.to_string(), new_cache.clone());
-        new_cache
+        self.timeline_anchor = Some(TimelineAnchor {
+            jid: chat_jid.to_string(),
+            count,
+        });
     }
 
     /// Invalidate message list cache for a chat (call when messages change)
@@ -848,34 +889,22 @@ impl WhatsAppApp {
         &self.chat_list_scroll
     }
 
-    /// Get the message list scroll handle
-    pub fn message_list_scroll(&self) -> &VirtualListScrollHandle {
-        &self.message_list_scroll
+    /// The conversation's list state.
+    pub fn message_list(&self) -> &ListState {
+        &self.message_list
     }
 
-    /// Scroll to the foot of the currently selected chat.
+    /// Put the reader at the foot of the conversation.
     ///
-    /// Timeline coordinates, not message coordinates: dividers, the
-    /// encryption notice and the typing row are items too, so the message
-    /// count stopped naming the last bubble the moment the list grew rows
-    /// nobody typed. `scroll_to_bottom` is not the answer either — it reads
-    /// internal state that is stale before paint — so this asks the cache
-    /// which item the last row actually is.
+    /// Rarely needed: the list is anchored at the bottom, so it is already
+    /// there unless the reader scrolled away. This is for after *they* did
+    /// something — sending, or finishing a recording — where following the
+    /// message down is what they expect.
     fn scroll_to_last_message(&self) {
-        let Some(jid) = self.selected_chat.as_ref() else {
-            return;
-        };
-        let last = {
-            let cache = self.message_list_cache.borrow();
-            cache.get(jid).map(|cache| cache.items.len())
-        };
-        // No cache yet means nothing has been laid out to scroll to; the
-        // first paint starts at the foot anyway.
-        let Some(count) = last.filter(|count| *count > 0) else {
-            return;
-        };
-        self.message_list_scroll
-            .scroll_to_item(count - 1, ScrollStrategy::Top);
+        let count = self.message_list.item_count();
+        if count > 0 {
+            self.message_list.scroll_to_reveal_item(count - 1);
+        }
     }
 
     /// Get the isolated input area view entity
@@ -1266,17 +1295,33 @@ impl WhatsAppApp {
         };
 
         let local_id = Self::next_local_id("local");
+        // Taken, not read: a reply is answered once. Leaving the draft in
+        // place quoted the same message from every message that followed.
+        let quoted = self.reply_to.take().map(|draft| QuotedMessage {
+            message_id: draft.message_id,
+            sender: draft.sender,
+            sender_name: draft.sender_name,
+            preview: draft.preview,
+            kind: None,
+        });
         let Some(client) = &self.client else {
             warn!("Cannot send message: client is unavailable");
             return;
         };
-        client.send_message(&jid, text, local_id.clone());
+        client.send_message(&jid, text, local_id.clone(), quoted.clone());
 
         // Add to local chat immediately for responsiveness; the client renames
         // it to the real id via MessageIdAssigned.
-        let msg = ChatMessage::new_outgoing(local_id, text.to_string());
+        let mut msg = ChatMessage::new_outgoing(local_id, text.to_string());
+        // The bubble shows its own quote from the moment it is drawn, the way
+        // the reply will look once it comes back from the store.
+        msg.quoted = quoted;
         if self.add_message_to_chat(&jid, msg) {
             self.scroll_to_last_message();
+        }
+        // The reply bar goes with the reply it composed.
+        if let Some(input) = &self.input_area {
+            input.update(cx, |view, cx| view.set_reply(None, cx));
         }
 
         cx.notify();

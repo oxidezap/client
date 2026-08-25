@@ -5,7 +5,7 @@
 //! badge is a count or a dot — can be tested without a window.
 
 use chrono::{DateTime, Utc};
-use oxidezap_core::{Chat, ChatMessage, MediaType, MessageStatus, TypingSummary};
+use oxidezap_core::{Chat, ChatMessage, MediaType, MessageStatus, SystemNotice, TypingSummary};
 
 /// The badge at the end of a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +146,11 @@ fn preview_for(chat: &Chat, typing: Option<TypingSummary>, draft: Option<&str>) 
 
 /// Who wrote the last message, when that is not obvious from the row itself.
 fn prefix_for(chat: &Chat, last: &ChatMessage) -> Option<String> {
+    // A call record and a group notice belong to the conversation rather than
+    // to a side of it, so neither takes a "You:" or a sender name.
+    if last.system.is_some() {
+        return None;
+    }
     if last.is_from_me {
         // The tick already says it is ours in a 1:1 chat; in a group the name
         // column is the group's, so the sender still needs saying.
@@ -162,6 +167,15 @@ fn prefix_for(chat: &Chat, last: &ChatMessage) -> Option<String> {
 
 /// The preview text: a caption if there is one, otherwise the media's name.
 fn body_for(last: &ChatMessage) -> String {
+    // A row nobody typed still happened, and a call is exactly the thing a
+    // reader scans the list for. Its own sentence rather than the empty
+    // string a message with no content would otherwise leave behind.
+    if let Some(notice) = &last.system {
+        return match notice {
+            SystemNotice::Call(record) => record.summary(),
+            SystemNotice::GroupChanged(text) => single_line(text),
+        };
+    }
     if !last.content.is_empty() {
         return single_line(&last.content);
     }

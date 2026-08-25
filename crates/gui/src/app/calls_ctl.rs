@@ -132,14 +132,20 @@ impl WhatsAppApp {
         self.call_card.begin_drag(at);
     }
 
+    /// The pointer moved while dragging the card.
+    ///
+    /// The bounds come from the window and the card's own measured size, so
+    /// they follow a resize, a density change, and the card changing shape
+    /// mid-call without anything here knowing how big it is.
     pub fn drag_call_card(
         &mut self,
         at: Point<Pixels>,
-        limit: Point<Pixels>,
+        viewport: gpui::Size<Pixels>,
+        inset: Pixels,
         cx: &mut Context<Self>,
     ) {
         if self.call_card.drag_to(at) {
-            self.call_card.clamp_offset(limit);
+            self.call_card.clamp_to(viewport, inset);
             cx.notify();
         }
     }
@@ -206,7 +212,7 @@ impl WhatsAppApp {
                 call.peer_jid.clone(),
                 call.is_video,
                 CallOutcome::Completed(call.elapsed().num_seconds().max(0) as u32),
-                false,
+                call.is_outgoing,
             ),
             // Never answered, from either side.
             Stage::Incoming(call) => (

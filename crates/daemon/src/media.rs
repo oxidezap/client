@@ -35,8 +35,15 @@ const SWEEP_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
 /// The message id is already unique and already stable across restarts, so it
 /// is the address. Prefixed to keep it from colliding with a download's key,
 /// which is addressed by content rather than by message.
+///
+/// The prefix also says *what* is under it: only full media is cached, so a
+/// hit is the real thing. It reads `f-` rather than `m-` because an earlier
+/// build wrote fallback thumbnails under the message key too, and a viewer
+/// that opened one of those showed a blur at full size. Changing the prefix
+/// orphans those files rather than trusting them; the budget sweep clears
+/// them in its own time.
 pub fn message_key(message_id: &str) -> String {
-    format!("m-{}", sanitize(message_id))
+    format!("f-{}", sanitize(message_id))
 }
 
 /// The key under which a downloadable's bytes are cached.
