@@ -1,6 +1,12 @@
 //! Voice message / audio attachment player inside a bubble.
 
-use super::*;
+use gpui::{App, Entity, IntoElement, ParentElement, SharedString, Styled, div, px};
+use gpui_component::ActiveTheme as _;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Disableable as _, Icon};
+
+use crate::app::WhatsAppApp;
+use crate::theme::ActiveProductTheme as _;
 
 pub(super) fn render_audio_player(
     media_content: oxidezap_core::MediaContent,
@@ -26,7 +32,7 @@ pub(super) fn render_audio_player(
         .w(px(220.))
         .h(px(44.))
         .bg(cx.theme().list_active)
-        .rounded(px(layout::RADIUS_LARGE))
+        .rounded(cx.product().metrics.radius_lg())
         .flex()
         .items_center()
         .px_2()

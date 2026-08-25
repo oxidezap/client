@@ -7,16 +7,15 @@ use std::time::Duration;
 
 use whatsapp_rust::wacore::time::Instant;
 
-use gpui::{
-    App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, div, prelude::*, px,
-};
+use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, div, prelude::*};
 use gpui_component::{
-    ActiveTheme, Icon, IconName,
+    ActiveTheme, IconName, Sizable as _,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
 
-use crate::layout;
+use crate::components::ProductIcon;
+use crate::theme::{ActiveProductTheme as _, Metrics};
 
 /// Events emitted by the input area to communicate with the parent app.
 #[derive(Clone, Debug)]
@@ -31,6 +30,10 @@ pub enum InputAreaEvent {
     StartedTyping,
     /// Typing indicator: user stopped typing (timeout)
     StoppedTyping,
+    /// User discarded the recording instead of sending it.
+    CancelRecording,
+    /// User dropped the reply they were composing.
+    CancelReply,
 }
 
 /// Typing indicator state with debouncing.
@@ -47,6 +50,15 @@ const TYPING_PAUSED_TIMEOUT: Duration = Duration::from_millis(2500);
 /// How often the typing monitor checks for timeout
 const TYPING_MONITOR_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The message being replied to, while it is being composed.
+#[derive(Clone, Debug)]
+pub struct ReplyDraft {
+    pub message_id: String,
+    pub sender: String,
+    pub sender_name: String,
+    pub preview: String,
+}
+
 /// Isolated input area view with its own render cycle.
 /// When the user types, only this component re-renders.
 pub struct InputAreaView {
@@ -54,6 +66,17 @@ pub struct InputAreaView {
     input: Entity<InputState>,
     /// Whether PTT recording is active
     is_recording: bool,
+    /// When the current recording started, for the elapsed counter.
+    recording_started_at: Option<Instant>,
+    /// Most recent input level, 0..=1, for the live meter.
+    level: f32,
+    /// The message being replied to, if any.
+    reply: Option<ReplyDraft>,
+    /// The slot height the layout allotted. `None` before the first layout
+    /// pass, where the metrics' default is the right answer.
+    height: Option<gpui::Pixels>,
+    /// Pointer target size for this breakpoint — bigger on touch.
+    touch_target: Option<gpui::Pixels>,
     /// Typing indicator state
     typing_state: TypingState,
     /// Task that monitors typing state
@@ -75,6 +98,11 @@ impl InputAreaView {
         Self {
             input,
             is_recording: false,
+            recording_started_at: None,
+            level: 0.0,
+            reply: None,
+            height: None,
+            touch_target: None,
             typing_state: TypingState::default(),
             typing_monitor_task: None,
         }
@@ -177,10 +205,6 @@ impl InputAreaView {
     }
 
     /// Set recording state (called by parent)
-    pub fn set_recording(&mut self, is_recording: bool, cx: &mut Context<Self>) {
-        self.is_recording = is_recording;
-        cx.notify();
-    }
 
     /// Swap the composed text on chat switch: install the target chat's draft
     /// and hand the outgoing chat's draft back to the parent, so unsent text
@@ -220,61 +244,320 @@ impl InputAreaView {
             cx.emit(InputAreaEvent::StartRecording);
         }
     }
+
+    /// Abandon the recording without sending it.
+    fn cancel_recording(&mut self, cx: &mut Context<Self>) {
+        self.recording_started_at = None;
+        self.level = 0.0;
+        cx.emit(InputAreaEvent::CancelRecording);
+    }
+
+    /// Tell the composer the layout's slot height, so it stops guessing.
+    pub fn set_layout(
+        &mut self,
+        height: gpui::Pixels,
+        touch_target: gpui::Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        if self.height != Some(height) || self.touch_target != Some(touch_target) {
+            self.height = Some(height);
+            self.touch_target = Some(touch_target);
+            cx.notify();
+        }
+    }
+
+    pub fn set_recording(&mut self, is_recording: bool, cx: &mut Context<Self>) {
+        if self.is_recording == is_recording {
+            return;
+        }
+        self.is_recording = is_recording;
+        self.recording_started_at = is_recording.then(Instant::now);
+        if !is_recording {
+            self.level = 0.0;
+        }
+        cx.notify();
+    }
+
+    /// The live input level, 0..=1.
+    pub fn set_level(&mut self, level: f32, cx: &mut Context<Self>) {
+        self.level = level.clamp(0.0, 1.0);
+        cx.notify();
+    }
+
+    pub fn set_reply(&mut self, reply: Option<ReplyDraft>, cx: &mut Context<Self>) {
+        self.reply = reply;
+        cx.notify();
+    }
+
+    pub fn reply(&self) -> Option<&ReplyDraft> {
+        self.reply.as_ref()
+    }
+
+    fn clear_reply(&mut self, cx: &mut Context<Self>) {
+        self.reply = None;
+        cx.emit(InputAreaEvent::CancelReply);
+        cx.notify();
+    }
+
+    /// `m:ss` since recording started.
+    fn recording_elapsed(&self) -> String {
+        let secs = self
+            .recording_started_at
+            .map(|start| start.elapsed().as_secs())
+            .unwrap_or(0);
+        format!("{}:{:02}", secs / 60, secs % 60)
+    }
 }
 
 impl Render for InputAreaView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_recording = self.is_recording;
         let entity = cx.entity().clone();
-
-        let muted_fg = cx.theme().muted_foreground;
+        // The composer draws itself into the slot the layout gave it. Owning
+        // a height constant of its own is what used to clip it by 6px on
+        // mobile, where the layout said 56 and this said 62.
+        let metrics = cx.product().metrics;
+        let height = self.height.unwrap_or_else(|| metrics.composer_height());
+        let control = self.touch_target.unwrap_or_else(|| metrics.icon_button());
 
         div()
-            .h(px(layout::INPUT_AREA_HEIGHT))
+            .h(height)
             .flex()
-            .items_center()
-            .px_4()
-            .gap_3()
+            .flex_col()
+            .justify_center()
+            .px(metrics.space_xl())
             .bg(cx.theme().background)
             .border_t_1()
             .border_color(cx.theme().border)
-            .child(div().flex_1().child(Input::new(&self.input).w_full()))
+            .children(
+                self.reply
+                    .clone()
+                    .map(|reply| render_reply_bar(reply, entity.clone(), metrics, cx)),
+            )
+            .child(if is_recording {
+                self.render_recording(control, metrics, cx)
+                    .into_any_element()
+            } else {
+                self.render_composer(control, metrics, cx)
+                    .into_any_element()
+            })
+    }
+}
+
+impl InputAreaView {
+    /// The ordinary state: attach, field, emoji, and either record or send.
+    fn render_composer(
+        &self,
+        control: gpui::Pixels,
+        metrics: Metrics,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let record_entity = entity.clone();
+        let has_text = !self.input.read(cx).text().to_string().trim().is_empty();
+
+        div()
+            .flex()
+            .items_center()
+            .gap(metrics.space_md())
+            .child(
+                Button::new("attach")
+                    .icon(ProductIcon::Paperclip)
+                    .ghost()
+                    .tooltip("Attach a file")
+                    .w(control)
+                    .h(control),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.input).w_full()),
+            )
+            .child(
+                Button::new("emoji")
+                    .icon(ProductIcon::Smile)
+                    .ghost()
+                    .tooltip("Emoji")
+                    .w(control)
+                    .h(control),
+            )
+            // Record or send, never both: which one is available follows
+            // whether there is anything to send, the way every messaging
+            // client behaves.
+            .child(if has_text {
+                Button::new("send")
+                    .icon(IconName::ArrowRight)
+                    .primary()
+                    .tooltip("Send")
+                    .w(control)
+                    .h(control)
+                    .on_click(move |_, window, cx| {
+                        entity.update(cx, |view, cx| view.submit_input(window, cx));
+                    })
+                    .into_any_element()
+            } else {
+                Button::new("ptt")
+                    .icon(ProductIcon::Mic)
+                    .ghost()
+                    .tooltip("Hold to record a voice message")
+                    .w(control)
+                    .h(control)
+                    .on_click(move |_, _window, cx| {
+                        record_entity.update(cx, |view, cx| view.toggle_recording(cx));
+                    })
+                    .into_any_element()
+            })
+    }
+
+    /// Recording: elapsed time, a live level, and the two ways out.
+    ///
+    /// The old UI turned the microphone button red and said nothing else — no
+    /// duration, no level, and no way to abandon a recording without sending
+    /// it.
+    fn render_recording(
+        &self,
+        control: gpui::Pixels,
+        metrics: Metrics,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let cancel_entity = entity.clone();
+        let product = cx.product();
+
+        div()
+            .flex()
+            .items_center()
+            .gap(metrics.space_lg())
+            .child(
+                Button::new("cancel-recording")
+                    .icon(ProductIcon::Trash)
+                    .ghost()
+                    .tooltip("Discard recording")
+                    .w(control)
+                    .h(control)
+                    .on_click(move |_, _window, cx| {
+                        cancel_entity.update(cx, |view, cx| view.cancel_recording(cx));
+                    }),
+            )
             .child(
                 div()
                     .flex()
-                    .gap_2()
+                    .items_center()
+                    .gap(metrics.space_md())
                     .child(
-                        Button::new("ptt")
-                            .icon(if is_recording {
-                                Icon::default()
-                                    .path("icons/stop.svg")
-                                    .text_color(cx.theme().primary_foreground)
-                            } else {
-                                Icon::default().path("icons/mic.svg").text_color(muted_fg)
-                            })
-                            .when(is_recording, |btn| btn.danger())
-                            .when(!is_recording, |btn| btn.ghost())
-                            .on_click({
-                                let entity = entity.clone();
-                                move |_, _window, cx| {
-                                    entity.update(cx, |view, cx| {
-                                        view.toggle_recording(cx);
-                                    });
-                                }
-                            }),
+                        div()
+                            .size(metrics.space_md())
+                            .rounded_full()
+                            .bg(cx.theme().danger),
                     )
                     .child(
-                        Button::new("send")
-                            .icon(IconName::ArrowRight)
-                            .primary()
-                            .on_click({
-                                move |_, window, cx| {
-                                    entity.update(cx, |view, cx| {
-                                        view.submit_input(window, cx);
-                                    });
-                                }
-                            }),
+                        div()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(metrics.text_meta())
+                            .text_color(cx.theme().foreground)
+                            .child(self.recording_elapsed()),
                     ),
             )
+            .child(render_level(self.level, metrics, cx))
+            .child(
+                div()
+                    .text_size(metrics.text_small())
+                    .text_color(product.hsla(product.palette.subtle_foreground))
+                    .child("Recording"),
+            )
+            .child(
+                Button::new("send-recording")
+                    .icon(IconName::ArrowRight)
+                    .primary()
+                    .tooltip("Send voice message")
+                    .w(control)
+                    .h(control)
+                    .on_click(move |_, _window, cx| {
+                        entity.update(cx, |view, cx| view.toggle_recording(cx));
+                    }),
+            )
     }
+}
+
+/// The live input level while recording.
+fn render_level(level: f32, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+    const BARS: usize = 16;
+    let full = metrics.waveform_height();
+    let level = level.clamp(0.0, 1.0);
+
+    div()
+        .flex_1()
+        .h(full)
+        .flex()
+        .items_center()
+        .gap(metrics.waveform_bar_gap())
+        .children((0..BARS).map(move |ix| {
+            // A fixed envelope scaled by the live level, so the bars move with
+            // the voice without flickering randomly between frames.
+            let position = (ix as f32 + 0.5) / BARS as f32;
+            let envelope = 0.35 + 0.65 * (position * std::f32::consts::PI).sin();
+            div()
+                .w(metrics.waveform_bar_width())
+                .h((full * envelope * level).max(gpui::px(2.0)))
+                .rounded_full()
+                .bg(cx.theme().primary)
+        }))
+}
+
+/// The message being replied to, above the field, with a way to drop it.
+fn render_reply_bar(
+    reply: ReplyDraft,
+    entity: Entity<InputAreaView>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let hue = cx.product().speaker(&reply.sender);
+
+    div()
+        .flex()
+        .items_center()
+        .gap(metrics.space_md())
+        .pb(metrics.space_md())
+        .child(
+            div()
+                .w(metrics.selection_bar_width())
+                .h(metrics.avatar_inline())
+                .rounded_full()
+                .flex_shrink_0()
+                .bg(hue),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(metrics.text_small())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(hue)
+                        .child(format!("Replying to {}", reply.sender_name)),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_secondary())
+                        .text_color(cx.theme().muted_foreground)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(reply.preview),
+                ),
+        )
+        .child(
+            Button::new("cancel-reply")
+                .icon(IconName::Close)
+                .ghost()
+                .xsmall()
+                .tooltip("Cancel reply")
+                .on_click(move |_, _window, cx| {
+                    entity.update(cx, |view, cx| view.clear_reply(cx));
+                }),
+        )
 }

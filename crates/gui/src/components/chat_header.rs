@@ -1,17 +1,19 @@
-//! Chat header with back button (mobile) and call buttons.
+//! The bar above a conversation: who it is, and what can be done with them.
 
-use gpui::{App, Entity, SharedString, div, prelude::*, px};
+use gpui::{
+    App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder as _,
+};
 use gpui_component::ActiveTheme as _;
-use gpui_component::IconName;
-use gpui_component::Sizable;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Disableable as _, Icon, IconName};
 
 use crate::app::WhatsAppApp;
+use crate::components::avatar::Presence;
 use crate::responsive::ResponsiveLayout;
+use crate::theme::Metrics;
+use oxidezap_core::{Availability, Chat, TypingSummary};
 
-use oxidezap_core::Chat;
-
-use super::Avatar;
+use super::{Avatar, ProductIcon};
 
 /// Only plain PN/LID user JIDs can receive a call (not groups, broadcast
 /// lists, status or newsletters).
@@ -21,83 +23,277 @@ fn is_callable_user(jid: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// What the header says under the name.
+///
+/// Ordered by which fact is most current: someone typing now beats a presence
+/// reading, which beats the static member count.
+fn subtitle(
+    chat: &Chat,
+    typing: Option<&TypingSummary>,
+    availability: Option<&Availability>,
+) -> Option<(String, bool)> {
+    if let Some(summary) = typing {
+        return Some((summary.compact_label(chat.is_group), true));
+    }
+    if chat.is_group {
+        let members = chat.participants.len();
+        return (members > 0).then(|| (format!("{members} members"), false));
+    }
+    match availability {
+        Some(Availability::Online) => Some(("online".to_string(), false)),
+        Some(Availability::LastSeen(at)) => Some((
+            format!("last seen {}", crate::utils::format_list_time(at)),
+            false,
+        )),
+        Some(Availability::Unknown) | None => None,
+    }
+}
+
 pub fn render_chat_header(
     chat: &Chat,
+    typing: Option<&TypingSummary>,
+    availability: Option<&Availability>,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     cx: &App,
 ) -> impl IntoElement {
-    let initial = chat.name.chars().next().unwrap_or('?');
+    let metrics = *layout.metrics();
     let name: SharedString = chat.name.clone().into();
-    let audio_jid = chat.jid.clone();
-
-    let back_entity = entity.clone();
-    let audio_call_entity = entity;
+    let subtitle = subtitle(chat, typing, availability);
+    let is_online = matches!(availability, Some(Availability::Online));
 
     div()
-        .h(px(layout.header_height()))
+        .h(layout.header_height())
+        .flex_shrink_0()
         .flex()
         .items_center()
         .justify_between()
-        .px(px(layout.padding()))
-        .gap(px(layout.gap()))
-        .bg(cx.theme().secondary)
+        .gap(metrics.space_lg())
+        .pl(layout.padding())
+        .pr(metrics.space_lg())
+        .bg(cx.theme().sidebar)
         .border_b_1()
         .border_color(cx.theme().border)
+        .child(render_identity(
+            chat, name, subtitle, is_online, &entity, layout, metrics, cx,
+        ))
+        .child(render_actions(chat, entity, layout, metrics, cx))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_identity(
+    chat: &Chat,
+    name: SharedString,
+    subtitle: Option<(String, bool)>,
+    is_online: bool,
+    entity: &Entity<WhatsAppApp>,
+    layout: ResponsiveLayout,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let back_entity = entity.clone();
+    let presence = (!chat.is_group).then_some(if is_online {
+        Presence::Online
+    } else {
+        Presence::Away
+    });
+
+    div()
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .items_center()
+        .gap(metrics.space_lg())
+        .overflow_hidden()
+        .when(layout.show_back_button(), |el| {
+            // Back is a command, so it is a Button: that is what carries
+            // focus, keyboard activation and the theme's button states,
+            // none of which a styled div gets.
+            el.child(
+                Button::new("back")
+                    .icon(IconName::ArrowLeft)
+                    .ghost()
+                    .tooltip("Back to chats")
+                    .on_click(move |_, _window, cx| {
+                        back_entity.update(cx, |app, cx| app.navigate_back(cx));
+                    }),
+            )
+        })
+        .child(
+            Avatar::new(chat.jid.clone(), &chat.name, metrics.avatar_header())
+                .group(chat.is_group)
+                .presence(presence)
+                .on(cx.theme().sidebar),
+        )
         .child(
             div()
-                .flex()
                 .flex_1()
                 .min_w_0()
-                .items_center()
-                .gap(px(layout.gap()))
-                .overflow_hidden()
-                .when(layout.show_back_button(), |el| {
-                    // Back is a command, so it is a Button: that is what carries
-                    // focus, keyboard activation and the theme's button states,
-                    // none of which a styled div gets.
-                    el.child(
-                        Button::new("back-button")
-                            .icon(IconName::ArrowLeft)
-                            .ghost()
-                            .on_click(move |_, _window, cx| {
-                                back_entity.update(cx, |app, cx| app.navigate_back(cx));
-                            }),
-                    )
-                })
-                .child(Avatar::from_initial(initial, layout.avatar_size()))
+                .flex()
+                .flex_col()
+                .gap(metrics.space_xxs())
                 .child(
                     div()
-                        .flex_1()
-                        .min_w_0()
+                        .text_size(metrics.text_strong())
                         .text_color(cx.theme().foreground)
-                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
                         .child(name),
-                ),
-        )
-        // Calls are 1:1 only: gate on a parsed PN/LID user JID, since
-        // !is_group alone would still offer calls to status/broadcast and
-        // newsletter rows. No video button: the VoIP facade only does audio,
-        // and offering "video" while placing a voice call misleads both sides.
-        .when(
-            layout.show_call_buttons() && is_callable_user(&chat.jid),
-            |el| {
-                el.child(
-                    div().flex().flex_shrink_0().items_center().gap_2().child(
-                        Button::new("audio-call")
-                            .label("Call")
-                            .outline()
-                            .small()
-                            .on_click(move |_, _window, cx| {
-                                audio_call_entity.update(cx, |app, cx| {
-                                    app.start_call(audio_jid.clone(), false, cx)
-                                });
-                            }),
-                    ),
                 )
-            },
+                .children(subtitle.map(|(text, is_typing)| {
+                    div()
+                        .text_size(metrics.text_small())
+                        .text_color(if is_typing {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(text)
+                })),
         )
+}
+
+fn render_actions(
+    chat: &Chat,
+    entity: Entity<WhatsAppApp>,
+    layout: ResponsiveLayout,
+    metrics: Metrics,
+    _cx: &App,
+) -> impl IntoElement + use<> {
+    // Calls are 1:1 only: gate on a parsed PN/LID user JID, since !is_group
+    // alone would still offer calls to status/broadcast and newsletter rows.
+    let callable = is_callable_user(&chat.jid);
+    let call_jid = chat.jid.clone();
+    let call_entity = entity.clone();
+    let search_entity = entity;
+
+    let action = |id: &'static str, icon: Icon, tip: &'static str| {
+        Button::new(id)
+            .icon(icon)
+            .ghost()
+            .tooltip(tip)
+            .w(layout.icon_button_size())
+            .h(layout.icon_button_size())
+    };
+
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap(metrics.space_xxs())
+        .child(
+            action(
+                "search-in-chat",
+                Icon::new(IconName::Search),
+                "Search in conversation",
+            )
+            .on_click(move |_, window, cx| {
+                search_entity.update(cx, |app, cx| app.focus_search(window, cx));
+            }),
+        )
+        .when(callable && layout.show_call_buttons(), |el| {
+            el.child(
+                action("voice-call", ProductIcon::Phone.into(), "Voice call").on_click(
+                    move |_, _window, cx| {
+                        call_entity
+                            .update(cx, |app, cx| app.start_call(call_jid.clone(), false, cx));
+                    },
+                ),
+            )
+            // Drawn but inert: the VoIP facade is audio-only, and an enabled
+            // camera button that silently places a voice call would misdescribe
+            // itself to both sides. The tooltip says why rather than leaving
+            // the reader to guess.
+            .child(
+                action(
+                    "video-call",
+                    ProductIcon::Video.into(),
+                    "Video calls are not supported yet",
+                )
+                .disabled(true),
+            )
+        })
+        .child(action(
+            "chat-menu",
+            Icon::new(IconName::EllipsisVertical),
+            "More",
+        ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxidezap_core::ComposingKind;
+
+    fn group_with(members: usize) -> Chat {
+        let mut chat = Chat::new("group@g.us".to_string());
+        for i in 0..members {
+            chat.participants
+                .insert(format!("{i}@s.whatsapp.net"), format!("Member {i}"));
+        }
+        chat
+    }
+
+    fn direct() -> Chat {
+        Chat::new("5521999999999@s.whatsapp.net".to_string())
+    }
+
+    fn typing(name: &str) -> TypingSummary {
+        TypingSummary {
+            names: vec![name.to_string()],
+            total: 1,
+            kind: ComposingKind::Text,
+        }
+    }
+
+    #[test]
+    fn typing_outranks_every_other_subtitle() {
+        let summary = typing("Ana");
+        let (text, is_typing) = subtitle(&group_with(4), Some(&summary), None).unwrap();
+        assert_eq!(text, "Ana typing…");
+        assert!(is_typing);
+
+        let (text, is_typing) =
+            subtitle(&direct(), Some(&summary), Some(&Availability::Online)).unwrap();
+        assert_eq!(text, "typing…", "a direct chat needs no name");
+        assert!(is_typing);
+    }
+
+    #[test]
+    fn a_group_counts_its_members() {
+        assert_eq!(subtitle(&group_with(4), None, None).unwrap().0, "4 members");
+    }
+
+    #[test]
+    fn a_group_with_no_known_members_says_nothing_rather_than_zero() {
+        assert!(subtitle(&group_with(0), None, None).is_none());
+    }
+
+    #[test]
+    fn a_contact_reports_presence_only_when_it_is_shared() {
+        assert_eq!(
+            subtitle(&direct(), None, Some(&Availability::Online))
+                .unwrap()
+                .0,
+            "online"
+        );
+        assert!(
+            subtitle(&direct(), None, Some(&Availability::Unknown)).is_none(),
+            "a contact who hides last-seen gets no subtitle, not a guess"
+        );
+        assert!(subtitle(&direct(), None, None).is_none());
+    }
+
+    #[test]
+    fn only_a_real_user_jid_can_be_called() {
+        assert!(is_callable_user("5521999999999@s.whatsapp.net"));
+        assert!(!is_callable_user("group@g.us"));
+        assert!(!is_callable_user("status@broadcast"));
+        assert!(!is_callable_user("not a jid"));
+    }
 }

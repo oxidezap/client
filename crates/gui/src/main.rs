@@ -9,7 +9,6 @@
 mod app;
 mod assets;
 mod components;
-mod layout;
 mod responsive;
 mod theme;
 mod utils;
@@ -18,9 +17,8 @@ mod views;
 
 use gpui::{App, AppContext, Bounds, SharedString, WindowBounds, WindowOptions, px, size};
 use gpui_component::Root;
-use gpui_component::theme::{Theme, ThemeMode};
 
-use crate::app::{WhatsAppApp, init_chat_list_bindings};
+use crate::app::{WhatsAppApp, init_app_bindings};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -35,9 +33,11 @@ fn main() {
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
-            Theme::change(ThemeMode::Dark, None, cx);
-            theme::apply_brand_palette(cx);
-            init_chat_list_bindings(cx);
+            // Reads ~/.config/oxidezap/theme.json over a preset. Cannot fail: a
+            // missing or malformed file resolves to the product default and
+            // reports what it could not honour in Settings.
+            theme::init(cx);
+            init_app_bindings(cx);
 
             let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
 

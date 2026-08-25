@@ -8,16 +8,23 @@
 
 mod calls;
 mod calls_ctl;
+mod chat_row;
 mod chats;
+mod commands;
 mod events;
 mod media;
 mod media_ctl;
 mod messages;
 mod recording;
+mod settings;
+mod timeline_ctl;
 
-pub use chats::ChatListCache;
+pub use calls::{ActiveCall, CallState as CallStateMachine, Stage};
+pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
+pub use chats::{ChatFilter, ChatListCache};
 pub use media::RecordingState;
-pub use messages::MessageListCache;
+pub use messages::{MessageListCache, TimelineItem};
+pub use settings::{SettingsSection, SettingsState};
 
 use calls::CallState;
 
@@ -36,12 +43,28 @@ use gpui_component::input::InputState;
 
 // Define our own actions since gpui-component's actions module is private
 actions!(chat_list, [SelectUp, SelectDown]);
+actions!(
+    oxidezap,
+    [
+        /// Move focus to the conversation search field.
+        FocusSearch,
+        /// Open the Settings screen.
+        OpenSettings,
+        /// Dismiss the topmost overlay: Settings, the media viewer, a reply.
+        CloseOverlay,
+        /// Mute or unmute the microphone of the live call.
+        ToggleMute,
+        /// Bring a minimised call card back to full size.
+        ReturnToCall,
+    ]
+);
 
-use crate::components::{InputAreaEvent, InputAreaView};
+use crate::components::{AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft};
 use log::{debug, error, info, warn};
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 
 use crate::responsive::{MobilePanel, ResponsiveLayout};
+use crate::theme::ActiveProductTheme as _;
 use crate::utils::mime_to_image_format;
 use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
 use crate::views::pairing::generate_qr_png;
@@ -51,8 +74,9 @@ use crate::views::{
 };
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
-    AppState, CachedQrCode, Chat, ChatMessage, DownloadableMedia, IncomingCall, MediaContent,
-    MediaType, OutgoingCall, ReceiptType, UiEvent,
+    AppState, Availability, CachedQrCode, Chat, ChatMessage, ComposingKind, DownloadableMedia,
+    IncomingCall, MediaContent, MediaType, MessageStatus, OutgoingCall, PresenceRegistry,
+    ReceiptType, TypingSummary, UiEvent,
 };
 use oxidezap_session::{ReadBoundary, WhatsAppClient};
 
@@ -63,9 +87,9 @@ use oxidezap_session::{ReadBoundary, WhatsAppClient};
 /// Key context for chat list keyboard navigation
 const CHAT_LIST_CONTEXT: &str = "ChatList";
 
-/// Key context for the incoming-call popup. Scoped rather than global so
-/// Enter/Escape keep their meaning in the composer while no call is ringing.
-pub const CALL_POPUP_CONTEXT: &str = "CallPopup";
+/// Key context for the call card. Scoped rather than global so Enter/Escape
+/// keep their meaning in the composer while no call is up.
+pub const CALL_CONTEXT: &str = "Call";
 
 /// Search debounce delay in milliseconds
 const SEARCH_DEBOUNCE_MS: u64 = 150;
@@ -227,12 +251,25 @@ impl ActiveMedia {
 actions!(calls, [AcceptCall, DeclineCall]);
 
 /// Initialize chat list and call popup key bindings
-pub fn init_chat_list_bindings(cx: &mut gpui::App) {
+pub fn init_app_bindings(cx: &mut gpui::App) {
+    // `secondary` is Command on macOS and Control elsewhere, which is what
+    // makes one binding table correct on every platform.
     cx.bind_keys([
         KeyBinding::new("up", SelectUp, Some(CHAT_LIST_CONTEXT)),
         KeyBinding::new("down", SelectDown, Some(CHAT_LIST_CONTEXT)),
-        KeyBinding::new("enter", AcceptCall, Some(CALL_POPUP_CONTEXT)),
-        KeyBinding::new("escape", DeclineCall, Some(CALL_POPUP_CONTEXT)),
+        // Window-wide: reachable whatever owns focus, because both are ways
+        // *out* of wherever the user currently is.
+        KeyBinding::new("secondary-k", FocusSearch, None),
+        KeyBinding::new("secondary-,", OpenSettings, None),
+        // Scoped to the call so Enter and Escape keep their composer meaning
+        // while nothing is ringing.
+        KeyBinding::new("enter", AcceptCall, Some(CALL_CONTEXT)),
+        KeyBinding::new("escape", DeclineCall, Some(CALL_CONTEXT)),
+        KeyBinding::new("secondary-shift-m", ToggleMute, Some(CALL_CONTEXT)),
+        KeyBinding::new("secondary-shift-c", ReturnToCall, None),
+        // Dismissing the topmost surface is a window-level command; each
+        // overlay decides in turn whether it is the one that closes.
+        KeyBinding::new("escape", CloseOverlay, None),
     ]);
 }
 
@@ -265,9 +302,9 @@ pub struct WhatsAppApp {
     chat_list_scroll: VirtualListScrollHandle,
     /// Focus handle for chat list keyboard navigation
     chat_list_focus: FocusHandle,
-    /// Focus target for the incoming-call popup, so its actions are reachable
-    /// from the keyboard.
-    call_popup_focus: FocusHandle,
+    /// Focus target for the call card, so its actions are reachable from
+    /// the keyboard while it floats over the app.
+    call_focus: FocusHandle,
     /// Search input state for chat list (created lazily when window is available)
     chat_search_input: Option<Entity<InputState>>,
     /// Current search query (lowercase, trimmed)
@@ -327,6 +364,22 @@ pub struct WhatsAppApp {
     chat_list_cache: RefCell<Option<ChatListCache>>,
     /// Mobile navigation state - which panel to show on mobile devices
     mobile_panel: MobilePanel,
+    /// Which conversations the sidebar is showing.
+    chat_filter: ChatFilter,
+    /// The message being replied to, mirrored here so the send path can
+    /// attach it and the composer can show it.
+    reply_to: Option<ReplyDraft>,
+    /// Who is typing and who is around. Expires on its own, so it is view
+    /// state rather than anything the store carries.
+    presence: PresenceRegistry,
+    /// Display name of the linked account, for the sidebar footer.
+    account_name: Option<String>,
+    /// The Settings screen, when it is open. `None` is the conversation view.
+    settings: Option<SettingsState>,
+    /// Repaints the call duration, and expires stale typing notices. Only
+    /// alive while there is something to tick.
+    #[allow(dead_code)]
+    tick_task: Option<Task<()>>,
 }
 
 impl WhatsAppApp {
@@ -374,7 +427,7 @@ impl WhatsAppApp {
             client,
             chat_list_scroll: VirtualListScrollHandle::new(),
             chat_list_focus: cx.focus_handle(),
-            call_popup_focus: cx.focus_handle(),
+            call_focus: cx.focus_handle(),
             chat_search_input: None, // Created lazily when window is available
             chat_search_query: String::new(),
             chat_search_task: None,
@@ -398,15 +451,28 @@ impl WhatsAppApp {
             message_list_cache: RefCell::new(HashMap::new()),
             chat_list_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
+            chat_filter: ChatFilter::default(),
+            reply_to: None,
+            presence: PresenceRegistry::new(),
+            account_name: None,
+            settings: None,
+            tick_task: None,
         }
     }
 
     // ========== Responsive Layout ==========
 
-    /// Create a ResponsiveLayout from the current window viewport.
-    /// This should be called at the start of render to get all layout dimensions.
-    pub fn responsive_layout(&self, window: &Window) -> ResponsiveLayout {
-        ResponsiveLayout::new(window.viewport_size(), self.mobile_panel)
+    /// The layout facts for this frame: the viewport, the mobile panel, and
+    /// the active design scale.
+    ///
+    /// Read once at the top of render and threaded down, so every component in
+    /// a frame agrees on the same breakpoint and the same metrics.
+    pub fn responsive_layout(&self, window: &Window, cx: &App) -> ResponsiveLayout {
+        ResponsiveLayout::new(
+            window.viewport_size(),
+            self.mobile_panel,
+            cx.product().metrics,
+        )
     }
 
     /// Get the current mobile panel state
@@ -434,36 +500,96 @@ impl WhatsAppApp {
     pub fn get_chat_list_cache(&self) -> ChatListCache {
         let mut cache = self.chat_list_cache.borrow_mut();
 
-        // Filter chats by search query
-        let filtered_chats: Vec<&Chat> = if self.chat_search_query.is_empty() {
-            self.chats.iter().collect()
-        } else {
-            self.chats
-                .iter()
-                .filter(|chat| {
-                    chat.name.to_lowercase().contains(&self.chat_search_query)
-                        || chat.jid.to_lowercase().contains(&self.chat_search_query)
-                })
-                .collect()
-        };
+        let query = &self.chat_search_query;
+        let filtered: Vec<&Chat> = self
+            .chats
+            .iter()
+            .filter(|chat| self.chat_filter.matches(chat))
+            .filter(|chat| {
+                query.is_empty()
+                    || chat.name.to_lowercase().contains(query)
+                    || chat.jid.to_lowercase().contains(query)
+            })
+            .collect();
 
-        // Check if we have a valid cache entry
-        if let Some(ref cached) = *cache
-            && cached.chat_count == filtered_chats.len()
+        // The count alone cannot see a preview change — a receipt, a draft, a
+        // typing notice — so every path that changes one invalidates the cache
+        // explicitly. This guard only skips the rebuild when nothing was
+        // added or removed *and* nothing claimed a change.
+        if let Some(cached) = cache.as_ref()
+            && cached.chat_count == filtered.len()
         {
             return cached.clone();
         }
 
-        // Compute new cache entry (item sizes computed at render time)
-        let chats_arc: Arc<[Chat]> = filtered_chats.into_iter().cloned().collect();
+        let rows: Arc<[ChatRow]> = filtered
+            .into_iter()
+            .map(|chat| {
+                ChatRow::new(
+                    chat,
+                    self.presence.typing(&chat.jid),
+                    // The open chat's text lives in the composer, not the
+                    // draft map, so it would otherwise show as a stale draft.
+                    (self.selected_chat.as_deref() != Some(chat.jid.as_str()))
+                        .then(|| self.drafts.get(&chat.jid).map(String::as_str))
+                        .flatten(),
+                )
+            })
+            .collect();
 
         let new_cache = ChatListCache {
-            chat_count: chats_arc.len(),
-            chats: chats_arc,
+            chat_count: rows.len(),
+            rows,
         };
 
         *cache = Some(new_cache.clone());
         new_cache
+    }
+
+    /// How many conversations carry unread state, for the filter chip.
+    ///
+    /// Counted over every chat rather than the filtered view: the number has
+    /// to say what pressing `Unread` would reveal.
+    pub fn unread_chat_count(&self) -> usize {
+        self.chats
+            .iter()
+            .filter(|chat| ChatFilter::Unread.matches(chat))
+            .count()
+    }
+
+    pub fn chat_filter(&self) -> ChatFilter {
+        self.chat_filter
+    }
+
+    /// Narrow the list. Changing the filter re-derives the rows, so the cache
+    /// has to go with it.
+    pub fn set_chat_filter(&mut self, filter: ChatFilter, cx: &mut Context<Self>) {
+        if self.chat_filter == filter {
+            return;
+        }
+        self.chat_filter = filter;
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
+    /// Whether a search is currently narrowing the list, which is what makes
+    /// an empty list mean "no matches" rather than "no chats".
+    pub fn is_searching(&self) -> bool {
+        !self.chat_search_query.is_empty()
+    }
+
+    /// The linked-device row at the foot of the sidebar.
+    pub fn account_summary(&self) -> Option<AccountSummary> {
+        let connected = matches!(self.app_state, AppState::Connected);
+        Some(AccountSummary {
+            name: self.account_name.clone()?,
+            status: if connected {
+                "linked device · synced".to_string()
+            } else {
+                "linked device · reconnecting".to_string()
+            },
+            is_healthy: connected,
+        })
     }
 
     /// Invalidate chat list cache (call when chats change or search changes)
@@ -483,21 +609,27 @@ impl WhatsAppApp {
         messages: &[ChatMessage],
         is_group: bool,
         max_media_size: f32,
+        metrics: crate::theme::Metrics,
+        typing: Option<TypingSummary>,
     ) -> MessageListCache {
         let mut cache = self.message_list_cache.borrow_mut();
 
-        // Check if we have a valid cache entry; heights depend on the layout
-        // inputs too, so a resize or group-flag change must recompute.
+        // Heights are resolved geometry, so every input that moves them —
+        // the viewport, the group flag, the base font, the density, and
+        // whether a typing row is present — is part of the key.
         if let Some(cached) = cache.get(chat_jid)
-            && cached.message_count == messages.len()
-            && cached.is_group == is_group
-            && cached.max_media_size == max_media_size
+            && cached.is_valid_for(
+                messages.len(),
+                is_group,
+                max_media_size,
+                metrics,
+                typing.is_some(),
+            )
         {
             return cached.clone();
         }
 
-        // Compute new cache entry using the messages module
-        let new_cache = MessageListCache::new(messages, is_group, max_media_size);
+        let new_cache = MessageListCache::new(messages, is_group, max_media_size, metrics, typing);
         cache.insert(chat_jid.to_string(), new_cache.clone());
         new_cache
     }
@@ -615,7 +747,7 @@ impl WhatsAppApp {
 
     /// Get the chat list focus handle
     pub fn call_popup_focus(&self) -> &FocusHandle {
-        &self.call_popup_focus
+        &self.call_focus
     }
 
     pub fn chat_list_focus(&self) -> &FocusHandle {
@@ -654,22 +786,22 @@ impl WhatsAppApp {
     /// Select the next chat in the list (keyboard navigation)
     pub fn select_next_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cache = self.get_chat_list_cache();
-        if cache.chats.is_empty() {
+        if cache.rows.is_empty() {
             return;
         }
 
         let current_index = self
             .selected_chat
             .as_ref()
-            .and_then(|jid| cache.chats.iter().position(|c| &c.jid == jid));
+            .and_then(|jid| cache.rows.iter().position(|row| &row.jid == jid));
 
         let next_index = match current_index {
-            Some(idx) if idx + 1 < cache.chats.len() => idx + 1,
+            Some(idx) if idx + 1 < cache.rows.len() => idx + 1,
             None => 0,
             _ => return, // Already at the end
         };
 
-        let next_jid = cache.chats[next_index].jid.clone();
+        let next_jid = cache.rows[next_index].jid.clone();
         self.select_chat(next_jid, ChatOpen::ToPreview, window, cx);
         self.chat_list_scroll
             .scroll_to_item(next_index, ScrollStrategy::Top);
@@ -678,22 +810,22 @@ impl WhatsAppApp {
     /// Select the previous chat in the list (keyboard navigation)
     pub fn select_previous_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cache = self.get_chat_list_cache();
-        if cache.chats.is_empty() {
+        if cache.rows.is_empty() {
             return;
         }
 
         let current_index = self
             .selected_chat
             .as_ref()
-            .and_then(|jid| cache.chats.iter().position(|c| &c.jid == jid));
+            .and_then(|jid| cache.rows.iter().position(|row| &row.jid == jid));
 
         let prev_index = match current_index {
             Some(idx) if idx > 0 => idx - 1,
-            None => cache.chats.len() - 1,
+            None => cache.rows.len() - 1,
             _ => return, // Already at the beginning
         };
 
-        let prev_jid = cache.chats[prev_index].jid.clone();
+        let prev_jid = cache.rows[prev_index].jid.clone();
         self.select_chat(prev_jid, ChatOpen::ToPreview, window, cx);
         self.chat_list_scroll
             .scroll_to_item(prev_index, ScrollStrategy::Top);
@@ -925,6 +1057,12 @@ impl WhatsAppApp {
             }
             InputAreaEvent::StopRecording => {
                 self.stop_recording_and_send(cx);
+            }
+            InputAreaEvent::CancelRecording => {
+                self.cancel_recording(cx);
+            }
+            InputAreaEvent::CancelReply => {
+                self.cancel_reply(cx);
             }
             InputAreaEvent::StartedTyping => {
                 // Send "composing" presence
@@ -1196,27 +1334,93 @@ impl WhatsAppApp {
     }
 
     /// Handle a receipt event (read/played status update)
+    /// A receipt about our own messages: advance their ticks.
+    ///
+    /// Only ever moves forward. Receipts arrive out of order and another of
+    /// the peer's devices can repeat a delivery ack after the read one, so a
+    /// naive assignment makes bubbles flicker from ✓✓ back to ✓.
     fn handle_receipt_received(
         &mut self,
         chat_jid: String,
         message_ids: Vec<String>,
         receipt_type: ReceiptType,
     ) {
-        if let Some(chat) = self.find_chat_mut(&chat_jid) {
-            let count = chat.mark_messages_as_read(&message_ids);
-            if count > 0 {
-                info!(
-                    "Marked {} message(s) as {:?} in {}",
-                    count,
-                    receipt_type,
-                    observe_str(&chat_jid)
-                );
-                // Ticks and the unread badge changed; count-based cache
-                // guards can't see either.
-                self.invalidate_message_cache(&chat_jid);
-                self.invalidate_chat_cache();
-            }
+        let status = match receipt_type {
+            ReceiptType::Delivered => MessageStatus::Delivered,
+            // Played is Read plus "and listened to it"; the ticks are the same.
+            ReceiptType::Read | ReceiptType::ReadSelf => MessageStatus::Read,
+            ReceiptType::Played | ReceiptType::PlayedSelf => MessageStatus::Read,
+            // Retries, errors and sender echoes say nothing about delivery.
+            _ => return,
+        };
+
+        let Some(chat) = self.find_chat_mut(&chat_jid) else {
+            return;
+        };
+        let advanced = chat.advance_status(&message_ids, status);
+        // A read receipt is also the peer telling us they opened the chat,
+        // which clears our own unread state for the messages named.
+        let read = if status == MessageStatus::Read {
+            chat.mark_messages_as_read(&message_ids)
+        } else {
+            0
+        };
+
+        if advanced + read > 0 {
+            debug!(
+                "{:?} for {} message(s) in {}",
+                receipt_type,
+                advanced + read,
+                observe_str(&chat_jid)
+            );
+            // Ticks and the unread badge changed; count-based cache guards
+            // can't see either.
+            self.invalidate_message_cache(&chat_jid);
+            self.invalidate_chat_cache();
         }
+    }
+
+    /// Someone started or stopped typing.
+    fn handle_chat_presence(
+        &mut self,
+        chat_jid: String,
+        sender_jid: String,
+        sender_name: Option<String>,
+        composing: Option<ComposingKind>,
+        cx: &mut Context<Self>,
+    ) {
+        match composing {
+            Some(kind) => {
+                // The push name is the best label, but a group's participant
+                // map usually knows the person better, and the JID is the
+                // honest last resort.
+                let name = sender_name
+                    .or_else(|| {
+                        self.find_chat(&chat_jid)
+                            .and_then(|chat| chat.participants.get(&sender_jid).cloned())
+                    })
+                    .or_else(|| self.name_cache.get(&sender_jid).cloned())
+                    .unwrap_or_else(|| sender_jid.clone());
+                self.presence
+                    .set_composing(chat_jid, sender_jid, name, kind);
+                // Nothing is ticking unless something needs expiring, and a
+                // `composing` with no matching `paused` is exactly that.
+                self.ensure_tick(cx);
+            }
+            None => self.presence.clear_composing(&chat_jid, &sender_jid),
+        }
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
+    /// Who is typing in a conversation, for the header and the timeline.
+    pub fn typing_in(&self, chat_jid: &str) -> Option<TypingSummary> {
+        self.presence.typing(chat_jid)
+    }
+
+    /// Where a contact is, for the header subtitle.
+    pub fn availability_of(&self, jid: &str) -> Option<&Availability> {
+        self.presence.availability(jid)
     }
 
     /// Handle a reaction event

@@ -40,6 +40,9 @@ oxidezap-session = { workspace = true }
 portable-atomic = { workspace = true }
 qrcode = "0.14"
 rust-embed = "8"
+# theme.json: the palette is data, so it needs a schema and a parser.
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
 smallvec = "1"
 # Async utilities (GPUI-compatible timers)
 smol = "2"

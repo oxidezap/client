@@ -5762,6 +5762,8 @@ dependencies = [
  "portable-atomic",
  "qrcode",
  "rust-embed",
+ "serde",
+ "serde_json",
  "smallvec",
  "smol",
  "symphonia",

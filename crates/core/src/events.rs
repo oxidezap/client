@@ -2,6 +2,7 @@
 
 use super::call::{CallId, IncomingCall};
 use super::chat::ChatMessage;
+use super::presence::{Availability, ComposingKind};
 
 pub use wacore::types::presence::ReceiptType;
 
@@ -61,6 +62,24 @@ pub enum UiEvent {
         message_id: String,
         sender: String,
         emoji: String,
+    },
+    /// Someone started or stopped composing in a chat.
+    ///
+    /// The notice expires on its own (see [`crate::PresenceRegistry`]): the
+    /// matching stop is not guaranteed to arrive, so the UI must not wait for
+    /// one before it stops claiming somebody is typing.
+    ChatPresence {
+        chat_jid: String,
+        sender_jid: String,
+        /// The sender's push name, when the server offered one.
+        sender_name: Option<String>,
+        /// `None` means they stopped.
+        composing: Option<ComposingKind>,
+    },
+    /// A contact came online, or went away.
+    PresenceUpdated {
+        jid: String,
+        availability: Availability,
     },
     IncomingCall(IncomingCall),
     OutgoingCallStarted {

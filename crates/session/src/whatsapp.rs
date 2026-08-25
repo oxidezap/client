@@ -13,15 +13,19 @@ use whatsapp_rust::voip::CallHandle;
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
 use whatsapp_rust::wacore::types::events::Event;
-use whatsapp_rust::wacore::types::presence::ReceiptType;
+use whatsapp_rust::wacore::types::presence::{
+    ChatPresence as WaChatPresence, ChatPresenceMedia, ReceiptType,
+};
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 use whatsapp_rust::waproto::whatsapp as wa;
 
 use oxidezap_audio::{spawn_mic, spawn_speaker};
 use oxidezap_core::{
-    Chat, ChatMessage, DownloadableMedia, IncomingCall, MediaContent, MediaType, UiEvent,
-    fallback_chat_name,
+    Availability, Chat, ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, MediaContent,
+    MediaType, MessageStatus, UiEvent, fallback_chat_name,
 };
+
+use crate::quoting::quoted_from;
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
 /// Resolve a stable per-user path for the SQLite database. A CWD-relative
@@ -581,7 +585,11 @@ impl WhatsAppClient {
                 }
             }
             Event::Receipt(receipt) => {
+                // Delivered used to be dropped here, which is why the
+                // second tick never appeared: only Read and Played reached
+                // the UI, so a message went from one tick straight to blue.
                 let Some(dominated_type) = (match &receipt.r#type {
+                    ReceiptType::Delivered => Some(ReceiptType::Delivered),
                     ReceiptType::Read | ReceiptType::ReadSelf => Some(ReceiptType::Read),
                     ReceiptType::Played | ReceiptType::PlayedSelf => Some(ReceiptType::Played),
                     _ => None,
@@ -604,6 +612,40 @@ impl WhatsAppClient {
                     chat_jid: normalized_chat_jid,
                     message_ids: receipt.message_ids.clone(),
                     receipt_type: dominated_type,
+                });
+            }
+            Event::ChatPresence(update) => {
+                // Our own composing state, echoed back from another of our
+                // devices, is not somebody typing *at* us.
+                if update.source.is_from_me {
+                    return;
+                }
+                let composing = match update.state {
+                    WaChatPresence::Composing => Some(match update.media {
+                        ChatPresenceMedia::Audio => ComposingKind::Audio,
+                        ChatPresenceMedia::Text => ComposingKind::Text,
+                    }),
+                    WaChatPresence::Paused => None,
+                };
+                let chat_jid = normalize_chat_jid(&client, &update.source.chat.to_string()).await;
+                let _ = ui_tx.send(UiEvent::ChatPresence {
+                    chat_jid,
+                    sender_jid: update.source.sender.to_string(),
+                    sender_name: None,
+                    composing,
+                });
+            }
+            Event::Presence(update) => {
+                let availability = if update.unavailable {
+                    update
+                        .last_seen
+                        .map_or(Availability::Unknown, Availability::LastSeen)
+                } else {
+                    Availability::Online
+                };
+                let _ = ui_tx.send(UiEvent::PresenceUpdated {
+                    jid: update.from.to_string(),
+                    availability,
                 });
             }
             _ => {
@@ -686,7 +728,14 @@ impl WhatsAppClient {
             is_read: false,
             media: None,
             reactions: std::collections::HashMap::new(),
-            failed: false,
+            // Our own message echoed back has by definition reached the
+            // server; someone else's carries no send state of ours.
+            status: if info.source.is_from_me {
+                MessageStatus::Sent
+            } else {
+                MessageStatus::default()
+            },
+            quoted: quoted_from(base_msg),
         };
 
         if let Some(media) = media_result {
@@ -2130,6 +2179,10 @@ fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage) -> ChatMes
     } else {
         true
     };
+    let quoted = (!stored.revoked)
+        .then_some(stored.message.as_deref())
+        .flatten()
+        .and_then(|m| quoted_from(m.get_base_message()));
     ChatMessage {
         id: stored.id,
         sender: stored.sender_jid.to_string(),
@@ -2140,9 +2193,30 @@ fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage) -> ChatMes
         is_read,
         media,
         reactions: std::collections::HashMap::new(),
-        // Error is terminal for from_me rows (nack or local send failure), so
-        // hydration restores the failure indicator instead of grey ticks.
-        failed: stored.from_me && stored.status == oxidezap_chat_store::MessageStatus::Error,
+        // The store has tracked the real delivery state all along; the UI used
+        // to flatten it to a bool and lose the delivered/read distinction that
+        // the second tick exists to show.
+        status: if stored.from_me {
+            store_status(stored.status)
+        } else {
+            MessageStatus::default()
+        },
+        quoted,
+    }
+}
+
+/// Map the store's durable delivery state onto the one the UI draws.
+fn store_status(status: oxidezap_chat_store::MessageStatus) -> MessageStatus {
+    use oxidezap_chat_store::MessageStatus as Stored;
+    match status {
+        // Error is terminal for from_me rows (a nack or a local send failure),
+        // so hydration restores the failure indicator rather than grey ticks.
+        Stored::Error => MessageStatus::Failed,
+        Stored::Pending => MessageStatus::Pending,
+        Stored::ServerAck => MessageStatus::Sent,
+        Stored::Delivered => MessageStatus::Delivered,
+        // Played is Read plus "and listened to it"; the ticks are the same.
+        Stored::Read | Stored::Played => MessageStatus::Read,
     }
 }
 

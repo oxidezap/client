@@ -1,6 +1,22 @@
 //! Media attachments inside a message bubble: images, video, documents.
 
-use super::*;
+use std::sync::Arc;
+
+use gpui::StyledImage as _;
+use gpui::{
+    App, Entity, Image, ImageSource, InteractiveElement, IntoElement, ObjectFit, ParentElement,
+    RenderImage, SharedString, StatefulInteractiveElement, Styled, div, img,
+    prelude::FluentBuilder as _, px,
+};
+use gpui_component::ActiveTheme as _;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Disableable as _, Icon, IconName};
+
+use crate::app::WhatsAppApp;
+use crate::theme::ActiveProductTheme as _;
+use crate::utils::{mime_to_image_format, scale_media_dimensions};
+use crate::video::VideoPlayerState;
+use oxidezap_core::{DownloadableMedia, MediaType};
 
 pub(super) fn render_media_content(
     el: gpui::Div,
@@ -30,12 +46,13 @@ pub(super) fn render_media_content(
                         .w(px(display_w))
                         .h(px(display_h))
                         .object_fit(gpui::ObjectFit::Contain)
-                        .rounded(px(layout::RADIUS_SMALL)),
+                        .rounded(cx.product().metrics.radius_sm()),
                     None => render_image_from_bytes(
                         media_content.data,
                         &media_content.mime_type,
                         display_w,
                         display_h,
+                        cx.product().metrics.radius_lg(),
                         true,
                     ),
                 };
@@ -98,6 +115,7 @@ pub(super) fn render_media_content(
                     &media_content.mime_type,
                     display_w,
                     display_h,
+                    cx.product().metrics.radius_lg(),
                     false,
                 );
                 let preview_id: SharedString = format!("sticker-preview-{}", message_id).into();
@@ -129,6 +147,7 @@ pub(super) fn render_media_content(
                     &media_content.mime_type,
                     display_w,
                     display_h,
+                    cx.product().metrics.radius_lg(),
                     false,
                 ))
             } else if let Some(dl) = media_content.downloadable.clone() {
@@ -162,7 +181,7 @@ pub(super) fn render_media_content(
             max_media_size,
             cx,
         )),
-        MediaType::Audio => el.child(render_audio_player(
+        MediaType::Audio => el.child(super::audio::render_audio_player(
             media_content,
             message_id,
             is_playing,
@@ -195,7 +214,7 @@ fn render_download_placeholder(
         .w(px(width))
         .h(px(height))
         .bg(cx.theme().list_active)
-        .rounded(px(layout::RADIUS_SMALL))
+        .rounded(cx.product().metrics.radius_sm())
         .cursor_pointer()
         .flex()
         .justify_center()
@@ -219,7 +238,7 @@ fn render_media_placeholder(
         .w(px(width))
         .h(px(height))
         .bg(cx.theme().list_active)
-        .rounded(px(layout::RADIUS_SMALL))
+        .rounded(cx.product().metrics.radius_sm())
         .flex()
         .justify_center()
         .items_center()
@@ -230,6 +249,7 @@ fn render_image_from_bytes(
     mime_type: &str,
     width: f32,
     height: f32,
+    radius: gpui::Pixels,
     rounded: bool,
 ) -> gpui::Img {
     let format = mime_to_image_format(mime_type);
@@ -242,7 +262,7 @@ fn render_image_from_bytes(
         .object_fit(gpui::ObjectFit::Contain);
 
     if rounded {
-        img_el.rounded(px(layout::RADIUS_SMALL))
+        img_el.rounded(radius)
     } else {
         img_el
     }
@@ -262,7 +282,7 @@ fn render_document_placeholder(
         .w(px(200.))
         .h(px(50.))
         .bg(cx.theme().list_active)
-        .rounded(px(layout::RADIUS_MEDIUM))
+        .rounded(cx.product().metrics.radius_md())
         .flex()
         .items_center()
         .px_3()
@@ -328,7 +348,7 @@ fn render_video_player(
         .relative()
         .w(px(display_w))
         .h(px(display_h))
-        .rounded(px(layout::RADIUS_SMALL))
+        .rounded(cx.product().metrics.radius_sm())
         .overflow_hidden()
         .child(
             if let Some(frame) = video_frame.filter(|_| is_playing || is_paused) {
@@ -354,6 +374,7 @@ fn render_video_player(
                         &media_content.mime_type,
                         display_w,
                         display_h,
+                        cx.product().metrics.radius_lg(),
                         false,
                     ))
                     .into_any_element()

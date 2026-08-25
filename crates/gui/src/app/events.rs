@@ -144,8 +144,12 @@ impl WhatsAppApp {
                     // (timestamp, id) and the rename can reorder same-second
                     // siblings.
                     chat.rename_message(&local_id, &message_id);
+                    // Being given a real id *is* the server's acknowledgement,
+                    // so this is where the first tick comes from.
+                    chat.advance_status(std::slice::from_ref(&message_id), MessageStatus::Sent);
                 }
                 self.invalidate_message_cache(&chat_jid);
+                self.invalidate_chat_cache();
                 cx.notify();
             }
             UiEvent::SendFailed {
@@ -160,12 +164,24 @@ impl WhatsAppApp {
                     reason
                 );
                 if let Some(chat) = self.find_chat_mut(&chat_jid)
-                    && let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id)
+                    && chat.mark_send_failed(&message_id)
                 {
-                    msg.failed = true;
                     self.invalidate_message_cache(&chat_jid);
+                    self.invalidate_chat_cache();
                     cx.notify();
                 }
+            }
+            UiEvent::ChatPresence {
+                chat_jid,
+                sender_jid,
+                sender_name,
+                composing,
+            } => {
+                self.handle_chat_presence(chat_jid, sender_jid, sender_name, composing, cx);
+            }
+            UiEvent::PresenceUpdated { jid, availability } => {
+                self.presence.set_availability(jid, availability);
+                cx.notify();
             }
             UiEvent::ReceiptReceived {
                 chat_jid,
@@ -196,29 +212,23 @@ impl WhatsAppApp {
                     if call.is_video { "video" } else { "audio" },
                     observe_str(&call.caller_jid)
                 );
-                self.call_state.set_incoming(call);
+                if !self.call_state.set_incoming(call) {
+                    warn!("a second call arrived while one was already up");
+                }
                 cx.notify();
             }
             UiEvent::CallAccepted(call_id) => {
                 info!("Call {} accepted by peer", call_id);
-                // Dismiss the incoming call popup if it matches
-                let incoming_dismissed = self.call_state.dismiss_incoming(&call_id);
-                // For outgoing calls, transition to Connected state
-                let outgoing_connected = self.call_state.set_outgoing_connected(&call_id);
-                if outgoing_connected {
-                    info!("Outgoing call {} is now connected", call_id);
-                }
-                if incoming_dismissed || outgoing_connected {
+                // The peer answered: the call becomes active, which is the
+                // state that used to be missing entirely.
+                if self.call_state.connect(&call_id) {
+                    self.ensure_tick(cx);
                     cx.notify();
                 }
             }
             UiEvent::CallEnded(call_id) => {
                 info!("Call {} ended", call_id);
-                // Dismiss the incoming call popup if it matches
-                let incoming_dismissed = self.call_state.dismiss_incoming(&call_id);
-                // Also dismiss outgoing call if it matches
-                let outgoing_dismissed = self.call_state.dismiss_outgoing(&call_id);
-                if incoming_dismissed || outgoing_dismissed {
+                if self.call_state.end(&call_id) {
                     cx.notify();
                 }
             }
@@ -231,15 +241,16 @@ impl WhatsAppApp {
                     call_id,
                     observe_str(&recipient_jid)
                 );
-                // Update the outgoing call with the actual call ID from CallManager
+                // Swap in the real id for the placeholder we invented.
                 if self
                     .call_state
                     .update_outgoing_call_id(&recipient_jid, call_id.clone())
                 {
+                    self.call_state.set_outgoing_ringing(&call_id);
                     cx.notify();
                 } else {
-                    // Popup already dismissed: the user cancelled while the
-                    // call was connecting; hang up the now-real call.
+                    // The card is already gone: the user cancelled while the
+                    // call was connecting, so hang up the now-real call.
                     if let Some(client) = &self.client {
                         client.cancel_call(&call_id);
                     }
@@ -254,7 +265,6 @@ impl WhatsAppApp {
                     observe_str(&recipient_jid),
                     error
                 );
-                // Dismiss the outgoing call popup
                 if self
                     .call_state
                     .dismiss_outgoing_for_recipient(&recipient_jid)

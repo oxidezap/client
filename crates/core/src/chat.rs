@@ -7,6 +7,9 @@ use std::sync::Arc;
 use wacore::download::{Downloadable, MediaType as DownloadMediaType};
 use wacore_binary::jid::{Jid, JidExt, Server};
 
+use crate::message_status::MessageStatus;
+use crate::quoted::QuotedMessage;
+
 /// Maximum number of unique emoji reactions per message to prevent spam
 const MAX_REACTIONS_PER_MESSAGE: usize = 50;
 
@@ -173,8 +176,12 @@ pub struct ChatMessage {
     pub media: Option<MediaContent>,
     /// Reactions on this message (emoji -> list of sender JIDs)
     pub reactions: HashMap<String, Vec<String>>,
-    /// Whether an outgoing send attempt for this message failed
-    pub failed: bool,
+    /// How far an outgoing message got. Meaningless for an incoming one:
+    /// read it through [`Self::delivery`], which returns `None` there rather
+    /// than reporting our own send state for someone else's message.
+    pub status: MessageStatus,
+    /// The message this one replies to, if any.
+    pub quoted: Option<QuotedMessage>,
 }
 
 impl ChatMessage {
@@ -190,7 +197,8 @@ impl ChatMessage {
             is_read: false,
             media: None,
             reactions: HashMap::new(),
-            failed: false,
+            status: MessageStatus::Pending,
+            quoted: None,
         }
     }
 
@@ -206,7 +214,8 @@ impl ChatMessage {
             is_read: false,
             media: Some(media),
             reactions: HashMap::new(),
-            failed: false,
+            status: MessageStatus::Pending,
+            quoted: None,
         }
     }
 
@@ -223,8 +232,19 @@ impl ChatMessage {
             is_read: false,
             media: None,
             reactions: HashMap::new(),
-            failed: false,
+            status: MessageStatus::default(),
+            quoted: None,
         }
+    }
+
+    /// How far this message got, or `None` when it is not ours to report.
+    pub fn delivery(&self) -> Option<MessageStatus> {
+        self.is_from_me.then_some(self.status)
+    }
+
+    /// Whether the bubble should offer a retry.
+    pub fn is_failed(&self) -> bool {
+        self.is_from_me && self.status.is_failed()
     }
 
     /// Add or update a reaction to this message from a sender.
@@ -542,8 +562,12 @@ impl Chat {
                 new_media.data_is_preview = old_media.data_is_preview;
             }
             // Live-only state the store doesn't carry must also survive the
-            // replace: the SendFailed flag and the push name on group bubbles.
-            message.failed |= existing.failed;
+            // replace: a delivery state the hydrated row has not caught up
+            // with, and the push name on group bubbles. `advance` is what
+            // makes this safe in both directions — whichever side is further
+            // along wins, so a reload can neither un-fail a send nor pull a
+            // read bubble back to delivered.
+            message.status.advance(existing.status);
             if message.sender_name.is_none() {
                 message.sender_name = existing.sender_name;
             }
@@ -572,22 +596,52 @@ impl Chat {
         }
     }
 
-    /// Mark specific messages as read by their IDs
+    /// Mark specific messages as read by their IDs.
+    ///
+    /// Only touches incoming messages: an outgoing bubble's ticks say what the
+    /// *peer* did, which a local read cannot speak for. Receipts about our own
+    /// messages go through [`Self::advance_status`] instead.
     ///
     /// Returns the number of messages that were actually updated.
     pub fn mark_messages_as_read(&mut self, message_ids: &[String]) -> usize {
         let mut count = 0;
         for msg in &mut self.messages {
-            if message_ids.contains(&msg.id) && !msg.is_read {
+            if !msg.is_from_me && message_ids.contains(&msg.id) && !msg.is_read {
                 msg.is_read = true;
                 count += 1;
-                // Decrement unread count for incoming messages
-                if !msg.is_from_me && self.unread_count > 0 {
+                if self.unread_count > 0 {
                     self.unread_count -= 1;
                 }
             }
         }
         count
+    }
+
+    /// Advance the delivery state of our own messages, never regressing one.
+    ///
+    /// Returns how many bubbles actually changed, so a receipt that tells us
+    /// nothing new does not buy a re-render.
+    pub fn advance_status(&mut self, message_ids: &[String], status: MessageStatus) -> usize {
+        let mut count = 0;
+        for msg in &mut self.messages {
+            if msg.is_from_me && message_ids.contains(&msg.id) {
+                let before = msg.status;
+                msg.status.advance(status);
+                if msg.status != before {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Mark one of our messages failed, for a send that never landed.
+    pub fn mark_send_failed(&mut self, message_id: &str) -> bool {
+        self.messages
+            .iter_mut()
+            .find(|m| m.id == message_id && m.is_from_me)
+            .map(|m| m.status.advance(MessageStatus::Failed))
+            .is_some()
     }
 
     /// Get the initial letter for avatar display
@@ -625,7 +679,8 @@ mod tests {
             is_read: false,
             media: None,
             reactions: HashMap::new(),
-            failed: false,
+            status: MessageStatus::default(),
+            quoted: None,
         }
     }
 
