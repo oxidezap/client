@@ -2,13 +2,12 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use gpui::{App, Image, ImageFormat, ImageSource, IntoElement, ParentElement, Styled, div, img};
 use gpui_component::ActiveTheme as _;
 
 use super::centered_view;
 use crate::theme::{ActiveProductTheme as _, Metrics};
-use oxidezap_core::CachedQrCode;
+use oxidezap_core::{CachedQrCode, Issued, Lifetime};
 
 /// Generate QR code as PNG bytes (called once when QR data changes)
 pub fn generate_qr_png(data: &str) -> Option<Vec<u8>> {
@@ -33,10 +32,8 @@ pub fn generate_qr_png(data: &str) -> Option<Vec<u8>> {
 }
 
 pub fn render_pairing_view(
-    qr_code: Option<&CachedQrCode>,
-    pair_code: Option<String>,
-    timeout_secs: u64,
-    issued_at: DateTime<Utc>,
+    qr_code: Option<&Issued<CachedQrCode>>,
+    pair_code: Option<Issued<String>>,
     cx: &App,
 ) -> impl IntoElement {
     let metrics = cx.product().metrics;
@@ -63,9 +60,30 @@ pub fn render_pairing_view(
                 ),
         )
         .child(render_steps(metrics, cx))
-        .child(render_qr(qr_code, metrics, cx))
-        .children(pair_code.map(|code| render_pair_code(code, metrics, cx)))
-        .child(render_expiry(timeout_secs, issued_at, metrics, cx))
+        .child(render_qr(qr_code.map(|qr| &qr.value), metrics, cx))
+        // Each bar under the credential it describes. Drawn once at the foot
+        // of the screen it could only ever have described one of them, and
+        // the other was left claiming its neighbour's remaining life.
+        .child(render_expiry(
+            qr_code.map(|qr| qr.life),
+            "code refreshes in",
+            metrics,
+            cx,
+        ))
+        .children(pair_code.map(|code| {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(metrics.space_md())
+                .child(render_pair_code(code.value, metrics, cx))
+                .child(render_expiry(
+                    Some(code.life),
+                    "code expires in",
+                    metrics,
+                    cx,
+                ))
+        }))
 }
 
 /// What to do on the phone, in order.
@@ -185,14 +203,14 @@ fn render_pair_code(code: String, metrics: Metrics, cx: &App) -> impl IntoElemen
 /// "Expires in 48 seconds" is a number that has to be re-read to mean
 /// anything; a bar draining is legible without reading it at all.
 fn render_expiry(
-    timeout_secs: u64,
-    issued_at: DateTime<Utc>,
+    life: Option<Lifetime>,
+    verb: &'static str,
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let (left, fraction) = time_left(timeout_secs, issued_at, wacore::time::now_utc());
-    let remaining = fraction;
-    let timeout_secs = left;
+    let (left, remaining) = life
+        .map(|life| life.left_at(wacore::time::now_utc()))
+        .unwrap_or((0, 0.0));
     let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
     // Running out is worth noticing before it happens.
     let colour = if remaining < 0.25 {
@@ -226,60 +244,10 @@ fn render_expiry(
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_size(metrics.text_micro())
                 .text_color(subtle)
-                .child(if timeout_secs > 0 {
-                    format!("code refreshes in {timeout_secs}s")
+                .child(if left > 0 {
+                    format!("{verb} {left}s")
                 } else {
                     "refreshing…".to_string()
                 }),
         )
-}
-
-/// Seconds left on this code, and how much of its life that is.
-///
-/// The denominator is the code's own timeout: the library issues the first QR
-/// with a long life and each rotation with a short one, so a fixed 60 drew a
-/// bar that began a third full. Split out so it can be tested without a
-/// window.
-fn time_left(timeout_secs: u64, issued_at: DateTime<Utc>, now: DateTime<Utc>) -> (u64, f32) {
-    if timeout_secs == 0 {
-        return (0, 0.0);
-    }
-    let elapsed = (now - issued_at).num_seconds().max(0) as u64;
-    let left = timeout_secs.saturating_sub(elapsed);
-    (left, (left as f32 / timeout_secs as f32).clamp(0.0, 1.0))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone as _;
-
-    fn at(secs: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, secs).unwrap()
-    }
-
-    #[test]
-    fn a_fresh_code_fills_the_bar_whatever_its_lifetime() {
-        assert_eq!(time_left(60, at(0), at(0)), (60, 1.0));
-        assert_eq!(time_left(20, at(0), at(0)), (20, 1.0));
-    }
-
-    #[test]
-    fn the_bar_drains_against_this_codes_own_lifetime() {
-        let (left, fraction) = time_left(20, at(0), at(10));
-        assert_eq!(left, 10);
-        assert!((fraction - 0.5).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn an_expired_code_reads_as_empty_rather_than_negative() {
-        assert_eq!(time_left(20, at(0), at(45)), (0, 0.0));
-    }
-
-    #[test]
-    fn a_clock_that_went_backwards_does_not_overfill_it() {
-        let (left, fraction) = time_left(20, at(30), at(0));
-        assert_eq!(left, 20);
-        assert!(fraction <= 1.0);
-    }
 }

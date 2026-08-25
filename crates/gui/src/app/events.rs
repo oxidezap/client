@@ -79,9 +79,20 @@ impl WhatsAppApp {
                     .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
                 // Count-based cache guards can't see reordering/merges.
                 self.invalidate_chat_cache();
+                // A status update expires on the clock with nothing arriving
+                // to say so, and this is where the feed that holds one is
+                // installed. Without arming it here nothing ever did: the
+                // timer only re-armed itself, so the first one was never set
+                // and a lapsed update kept its row, its ring and its badge
+                // until some unrelated change happened to rebuild the list.
+                self.ensure_status_tick(cx);
                 cx.notify();
             }
             UiEvent::QrCode { code, timeout_secs } => {
+                // The phone code keeps the deadline it was issued with. A
+                // QR rotates every few seconds and a phone code lives for
+                // minutes; one shared clock made each refresh of one restate
+                // the other's remaining life as its own.
                 let pair_code = match &self.app_state {
                     AppState::WaitingForPairing { pair_code, .. } => pair_code.clone(),
                     _ => None,
@@ -91,10 +102,9 @@ impl WhatsAppApp {
                     png_bytes: Arc::new(png_bytes),
                 });
                 self.app_state = AppState::WaitingForPairing {
-                    qr_code: cached_qr,
+                    qr_code: cached_qr
+                        .map(|qr| Issued::new(qr, timeout_secs, wacore::time::now_utc())),
                     pair_code,
-                    timeout_secs,
-                    issued_at: wacore::time::now_utc(),
                 };
                 // The countdown on that screen is read off the clock during
                 // render, and nothing else repaints while it is up.
@@ -108,9 +118,7 @@ impl WhatsAppApp {
                 };
                 self.app_state = AppState::WaitingForPairing {
                     qr_code,
-                    pair_code: Some(code),
-                    timeout_secs,
-                    issued_at: wacore::time::now_utc(),
+                    pair_code: Some(Issued::new(code, timeout_secs, wacore::time::now_utc())),
                 };
                 self.ensure_heartbeat(cx);
                 cx.notify();
@@ -145,6 +153,9 @@ impl WhatsAppApp {
                 sender_name,
             } => {
                 self.handle_message_received(chat_jid, *message, sender_name);
+                // A live status update brings its own 24-hour deadline with
+                // it, and it can be the earliest one on screen.
+                self.ensure_status_tick(cx);
                 cx.notify();
             }
             UiEvent::MessageIdAssigned {
@@ -254,6 +265,9 @@ impl WhatsAppApp {
             }
             UiEvent::CallEnded(call_id) => {
                 info!("Call {call_id} ended");
+            }
+            UiEvent::CallEndedElsewhere(call_id) => {
+                info!("Call {call_id} was handled on another device");
             }
             UiEvent::OutgoingCallStarted {
                 call_id,

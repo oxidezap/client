@@ -49,6 +49,16 @@ pub enum TimelineItem {
 /// tells the list whether its measurements still apply.
 #[derive(Clone)]
 pub struct MessageListCache {
+    /// Which build of the rows this is.
+    ///
+    /// The virtual list caches a measured height per row index, and a row can
+    /// change height without the count moving at all — an image arrives, a
+    /// reaction lands, a message is revoked or a send fails and grows a retry
+    /// button. Every one of those goes through the invalidation that rebuilds
+    /// this, so a build number that differs from the one the list measured is
+    /// exactly the signal that its measurements have stopped describing the
+    /// rows.
+    pub build: usize,
     /// Message count when the rows were built (invalidation check).
     pub message_count: usize,
     /// Group flag, which decides sender names and therefore run breaks.
@@ -63,9 +73,23 @@ pub struct MessageListCache {
 }
 
 impl MessageListCache {
+    /// The message the timeline starts on, which is what says whether rows
+    /// were added to the *front*.
+    ///
+    /// A history backfill inserts older messages before the head and raises
+    /// the count doing it, which is indistinguishable from an append if the
+    /// count is all anyone looks at.
+    pub fn head(&self) -> Option<&str> {
+        self.messages.first().map(|message| message.id.as_str())
+    }
+}
+
+impl MessageListCache {
     /// Build the timeline for `messages`.
     pub fn new(messages: &[ChatMessage], is_group: bool, typing: Option<TypingSummary>) -> Self {
+        static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         Self {
+            build: BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             message_count: messages.len(),
             is_group,
             items: build_items(messages, typing.clone()).into(),
@@ -166,6 +190,33 @@ mod tests {
                 TimelineItem::Encryption => "encryption",
             })
             .collect()
+    }
+
+    /// What the timeline anchor compares. A backfill puts older messages
+    /// before the head and raises the count doing it, which is the same
+    /// count change an arrival makes and the opposite end of the list.
+    #[test]
+    fn the_head_is_the_message_the_timeline_starts_on() {
+        let newer = message("a", false, at(14, 9));
+        let older = message("a", false, at(13, 9));
+
+        let live = MessageListCache::new(std::slice::from_ref(&newer), false, None);
+        assert_eq!(live.head(), Some(newer.id.as_str()));
+
+        let backfilled = MessageListCache::new(&[older.clone(), newer], false, None);
+        assert_eq!(backfilled.head(), Some(older.id.as_str()));
+        assert_ne!(live.head(), backfilled.head());
+    }
+
+    /// A rebuild is the signal that something inside a row changed, and it is
+    /// the only one when the count did not move.
+    #[test]
+    fn every_build_of_the_rows_is_its_own() {
+        let messages = [message("a", false, at(14, 9))];
+        let first = MessageListCache::new(&messages, false, None);
+        let second = MessageListCache::new(&messages, false, None);
+        assert_ne!(first.build, second.build);
+        assert_eq!(first.message_count, second.message_count);
     }
 
     #[test]

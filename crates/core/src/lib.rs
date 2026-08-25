@@ -20,7 +20,7 @@ mod rich_text;
 mod status;
 mod system_notice;
 
-pub use app_state::{AppState, CachedQrCode};
+pub use app_state::{AppState, CachedQrCode, Issued, Lifetime};
 pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
 pub use calls::{ActiveCall, Admission, CallState, Stage, WaitingCall};
 pub use chat::STATUS_BROADCAST_JID;

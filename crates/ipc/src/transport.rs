@@ -5,6 +5,11 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 10: the call state remembers the last call another of this account's
+/// devices handled. A front end writes a conversation's call record off the
+/// stage that disappeared, and "answered on the phone" and "nobody picked
+/// up" are the same disappearance without it.
+///
 /// 9: `SendAudio` carries what it quotes, the same way `SendText` does.
 /// Recording is a way of answering, and a reply draft open when the
 /// microphone was pressed had nowhere to go.
@@ -47,7 +52,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

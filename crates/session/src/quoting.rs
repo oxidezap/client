@@ -63,6 +63,11 @@ fn context_info(message: &wa::Message) -> Option<&wa::ContextInfo> {
         extended_text_message,
         image_message,
         video_message,
+        // A video note is a `VideoMessage` under its own field, and it is a
+        // body a reply is really sent as. Left out, a reply recorded as one
+        // lost its quote bar and its jump target while the same message's
+        // *kind* was already read from here.
+        ptv_message,
         audio_message,
         document_message,
         sticker_message,
@@ -144,6 +149,27 @@ mod tests {
             ..Default::default()
         });
         assert!(quoted_from(&message).is_none());
+    }
+
+    /// A video note is a reply body like any other. `quoted_kind` already
+    /// named it; the context lookup did not look at it.
+    #[test]
+    fn reads_a_reply_sent_as_a_video_note() {
+        let message = wa::Message {
+            ptv_message: buffa::MessageField::some(message::VideoMessage {
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    stanza_id: Some("ORIGINAL".to_string()),
+                    participant: Some("a@s.whatsapp.net".to_string()),
+                    quoted_message: quoted_text("ping"),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let quoted = quoted_from(&message).expect("a video note can be a reply");
+        assert_eq!(quoted.message_id, "ORIGINAL");
+        assert_eq!(quoted.preview, "ping");
     }
 
     #[test]

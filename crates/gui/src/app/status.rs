@@ -164,10 +164,23 @@ impl WhatsAppApp {
             smol::Timer::after(wait).await;
             let _ = entity.update(cx, |app, cx| {
                 app.status_tick = None;
+                // Read before the feed is dropped: afterwards there is no
+                // way to ask what was on screen.
+                let shown = app.shown_status_message_id();
                 // The feed rebuilds itself off the clock; this is what makes
                 // anything ask it again.
                 app.status_feed_cache.borrow_mut().take();
                 app.invalidate_chat_cache();
+                // An update that lapses while it is being watched takes its
+                // decoder and its audio with it. Every other way out of the
+                // reader stops the media; this one did not, so a video that
+                // expired mid-play went on playing behind whatever the window
+                // showed next.
+                if let Some(id) = shown
+                    && app.shown_status_message_id().as_deref() != Some(id.as_str())
+                {
+                    app.stop_status_media(Some(id));
+                }
                 app.ensure_status_tick(cx);
                 cx.notify();
             });

@@ -210,6 +210,16 @@ pub async fn run(
         log::error!("session teardown did not complete: {e}");
     }
 
+    // Before anything is deleted, and on a blocking thread because joining
+    // one is: the publisher writes this account's media, and a wipe that
+    // starts while it is still draining its queue deletes a directory that
+    // is about to be written into again.
+    if let Some(publisher) = bridge.stop_publishing()
+        && let Err(e) = tokio::task::spawn_blocking(move || publisher.join()).await
+    {
+        log::error!("the publish thread did not finish: {e}");
+    }
+
     // After the teardown, never before: the store is one file and the session
     // was holding it open. Unlinking it first leaves the closing session free
     // to write a fresh WAL beside a database that is already gone.
@@ -253,7 +263,14 @@ struct Bridge {
     /// loop, every connection task and the shutdown branch for its duration.
     /// One thread, and a queue, so the order the daemon publishes in is still
     /// the order things happened.
-    publish: tokio::sync::mpsc::UnboundedSender<UiEvent>,
+    ///
+    /// `None` once the publisher has been asked to stop, which is the state
+    /// that closes the channel: the thread ends when its last sender is gone.
+    publish: Option<tokio::sync::mpsc::UnboundedSender<UiEvent>>,
+    /// The publisher, kept joinable rather than detached. It writes the media
+    /// a session event carries, and forgetting the session deletes exactly
+    /// the directory it writes into.
+    publisher: Option<std::thread::JoinHandle<()>>,
     reads: ReadTracker,
     in_flight: Arc<Semaphore>,
     /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
@@ -268,8 +285,8 @@ impl Bridge {
         // limit here could only stall the loop this exists to unblock or drop
         // events no client could then recover.
         let (publish, mut queue) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
-        let publisher = Arc::clone(&hub);
-        std::thread::Builder::new()
+        let hub_for_publisher = Arc::clone(&hub);
+        let publisher = std::thread::Builder::new()
             .name("oxidezap-publish".to_string())
             .spawn(move || {
                 while let Some(mut event) = queue.blocking_recv() {
@@ -277,7 +294,7 @@ impl Bridge {
                     match serde_json::to_string(&DaemonMessage::Session {
                         event: Box::new(event),
                     }) {
-                        Ok(frame) => publisher.publish_session(frame),
+                        Ok(frame) => hub_for_publisher.publish_session(frame),
                         Err(e) => log::error!("dropping unserializable session event: {e}"),
                     }
                 }
@@ -288,11 +305,26 @@ impl Bridge {
 
         Self {
             hub,
-            publish,
+            publish: Some(publish),
+            publisher: Some(publisher),
             reads: ReadTracker::default(),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             forget: false,
         }
+    }
+
+    /// Close the publish queue and hand back the thread to wait on.
+    ///
+    /// Not a tidy-up. The publisher externalizes media — it writes this
+    /// account's photos into the cache directory — and it runs behind an
+    /// unbounded queue, so an event accepted before `ForgetSession` can still
+    /// be in there. Deleting the directory while that thread is working
+    /// through the backlog recreates the very bytes the wipe exists to
+    /// remove, moments after it finishes.
+    fn stop_publishing(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        // The thread ends when its last sender is gone, and this is it.
+        self.publish = None;
+        self.publisher.take()
     }
 
     /// Fold one session event into daemon state, and say what the session has
@@ -352,6 +384,13 @@ impl Bridge {
             UiEvent::CallEnded(id) => self.hub.calls(|s| {
                 s.end(id);
             }),
+            // The same removal, and one more thing said about it: the front
+            // end writes the conversation's call record off the stage it was
+            // holding, and an incoming stage that simply vanishes reads as
+            // missed.
+            UiEvent::CallEndedElsewhere(id) => self.hub.calls(|s| {
+                s.end_elsewhere(id);
+            }),
             UiEvent::AccountUpdated { name, jid, lid } => {
                 self.hub.set_account(oxidezap_ipc::AccountIdentity {
                     name: name.clone(),
@@ -391,7 +430,9 @@ impl Bridge {
         if let Some(event) = pending {
             // The receiver lives as long as the thread, which lives as long as
             // the daemon.
-            let _ = self.publish.send(event);
+            if let Some(publish) = &self.publish {
+                let _ = publish.send(event);
+            }
         }
 
         answer
@@ -510,6 +551,18 @@ impl Bridge {
                         // hang it up. The daemon owns the session and the
                         // audio devices, so its state is the one that decides.
                         if self.hub.call_state().is_busy() {
+                            // Refusing is not enough on its own. The window
+                            // that asked drew its own outgoing call before
+                            // asking — it passed its copy of the state before
+                            // this one moved — and the refusal rides no
+                            // request id, so nothing on that side connects it
+                            // back to the stage it drew. Marking the call
+                            // unrecorded stops it being written into the
+                            // conversation as an attempt that was never made,
+                            // and republishing is what clears it from screen.
+                            self.hub
+                                .calls(|calls| calls.mark_unrecorded(&placeholder_id));
+                            self.hub.republish_calls();
                             return CommandOutcome::Refused(
                                 "a call is already up; end it before placing another".to_string(),
                             );
@@ -1613,6 +1666,36 @@ mod tests {
         // Answered or hung up, it is no longer something to attach to.
         bridge.observe(UiEvent::CallEnded("call-1".into()));
         assert!(bridge.hub.call_state().incoming().is_none());
+    }
+
+    /// A call the phone answered is not a call this window missed. The
+    /// removal is identical either way, so the reason has to ride the same
+    /// frame — a front end writes the conversation's record off the stage
+    /// that disappeared.
+    #[test]
+    fn a_call_answered_on_another_device_says_so_in_the_state() {
+        let mut taken = bridge();
+        let call = oxidezap_core::IncomingCall {
+            call_id: "call-1".into(),
+            caller_name: "Alice".into(),
+            caller_jid: "1@s.whatsapp.net".into(),
+            is_video: false,
+            is_offline: false,
+            received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        taken.observe(UiEvent::IncomingCall(call.clone()));
+        taken.observe(UiEvent::CallEndedElsewhere("call-1".into()));
+
+        let state = taken.hub.call_state();
+        assert!(state.incoming().is_none(), "the offer is gone either way");
+        assert!(state.is_unrecorded("call-1"));
+
+        // The ordinary ending says nothing of the sort, and that is what
+        // makes a genuine missed call still count as one.
+        let mut missed = bridge();
+        missed.observe(UiEvent::IncomingCall(call));
+        missed.observe(UiEvent::CallEnded("call-1".into()));
+        assert!(!missed.hub.call_state().is_unrecorded("call-1"));
     }
 
     /// Live messages are not ordered: history decryption and offline catch-up

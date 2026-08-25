@@ -613,7 +613,7 @@ impl WhatsAppClient {
             Event::CallEndedElsewhere(ended) => {
                 info!("Call {} handled on another device", ended.call_id);
                 calls.pending.lock().await.remove(&ended.call_id);
-                let _ = ui_tx.send(UiEvent::CallEnded(ended.call_id.clone()));
+                let _ = ui_tx.send(UiEvent::CallEndedElsewhere(ended.call_id.clone()));
             }
             Event::Messages(batch) => {
                 for inbound in batch.iter() {

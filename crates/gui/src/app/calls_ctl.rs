@@ -246,7 +246,15 @@ impl WhatsAppApp {
             .filter(|stage| !calls.holds(stage.call_id()))
             .cloned();
         if let Some(stage) = ended {
-            self.record_call(&stage, cx);
+            // Unless the daemon says there is nothing to write down: another
+            // of this account's devices took it, or it was never placed at
+            // all. A stage that merely disappears reads as missed when it was
+            // incoming and as an attempt when it was outgoing, and a call
+            // answered on the phone is the opposite of missed — the badge and
+            // the "call back" prompt were for something already dealt with.
+            if !calls.is_unrecorded(stage.call_id()) {
+                self.record_call(&stage, cx);
+            }
             // A card minimised for that call must not swallow the next ring.
             self.call_card.call_ended();
         }

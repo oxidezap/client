@@ -33,6 +33,11 @@ pub use messages::{MessageListCache, TimelineItem};
 struct TimelineAnchor {
     jid: String,
     count: usize,
+    /// The build of the rows the list last measured.
+    build: usize,
+    /// The message the timeline started on, so rows added at the *front* are
+    /// not mistaken for rows added at the end.
+    head: Option<String>,
 }
 pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
@@ -119,7 +124,7 @@ use crate::views::{
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
     ActiveCall, AppState, Availability, CachedQrCode, CallOutcome, CallRecord, CallState, Chat,
-    ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, MediaContent, MediaType,
+    ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, Issued, MediaContent, MediaType,
     MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Stage, SystemNotice,
     TypingSummary, UiEvent,
 };
@@ -923,33 +928,57 @@ impl WhatsAppApp {
             built
         });
 
-        self.sync_timeline(chat_jid, rows.items.len());
+        self.sync_timeline(chat_jid, &rows);
         rows
     }
 
-    /// Tell the list how many rows there are now, in the way that preserves
-    /// the most: an append is a splice, everything else is a reset.
-    fn sync_timeline(&mut self, chat_jid: &str, count: usize) {
+    /// Tell the list what its rows are now, in the way that preserves the
+    /// most.
+    ///
+    /// The list keeps one measured height per row index, so what it is told
+    /// has to match what actually changed. A count on its own cannot say:
+    /// a history backfill inserts older messages *before* the head and raises
+    /// the count doing it, which read as an append and spliced the new rows in
+    /// at the wrong end; and a row that changes height without the count
+    /// moving — an image arriving, a reaction, a revoke, a failed send growing
+    /// its retry button — read as nothing having happened at all, leaving
+    /// bubbles measured at a size they no longer are.
+    fn sync_timeline(&mut self, chat_jid: &str, rows: &MessageListCache) {
+        let count = rows.items.len();
+        let head = rows.head().map(str::to_owned);
         let previous = self.timeline_anchor.take();
-        let appended = previous.as_ref().and_then(|anchor| {
-            (anchor.jid == chat_jid && count > anchor.count).then_some(anchor.count)
-        });
 
-        match appended {
-            // Rows only arrived at the end: keep the measurements taken for
+        // Same conversation, same first row: whatever changed, it did not
+        // change where the timeline begins.
+        let continued = previous
+            .as_ref()
+            .filter(|anchor| anchor.jid == chat_jid && anchor.head.as_deref() == rows.head());
+
+        match continued {
+            // Rows arrived at the end: keep the measurements taken for
             // everything before them, and the reader's place with them.
-            Some(old) => self.message_list.splice(old..old, count - old),
-            None if previous
-                .as_ref()
-                .is_some_and(|anchor| anchor.jid == chat_jid && anchor.count == count) => {}
-            // A different conversation, or rows that changed shape rather
-            // than merely grew.
-            None => self.message_list.reset(count),
+            Some(anchor) if count > anchor.count => {
+                self.message_list
+                    .splice(anchor.count..anchor.count, count - anchor.count);
+            }
+            Some(anchor) if count == anchor.count => {
+                // The same rows, rebuilt. Something inside one of them is a
+                // different size now; remeasure rather than reset, which
+                // keeps the reader where they were reading.
+                if anchor.build != rows.build {
+                    self.message_list.remeasure();
+                }
+            }
+            // A different conversation, rows added at the front, or rows
+            // taken away.
+            _ => self.message_list.reset(count),
         }
 
         self.timeline_anchor = Some(TimelineAnchor {
             jid: chat_jid.to_string(),
             count,
+            build: rows.build,
+            head,
         });
     }
 
@@ -2009,19 +2038,9 @@ impl Render for WhatsAppApp {
         let body = match &self.app_state {
             AppState::Loading => render_loading_view(cx).into_any_element(),
             AppState::Connecting => render_connecting_view(cx).into_any_element(),
-            AppState::WaitingForPairing {
-                qr_code,
-                pair_code,
-                timeout_secs,
-                issued_at,
-            } => render_pairing_view(
-                qr_code.as_ref(),
-                pair_code.clone(),
-                *timeout_secs,
-                *issued_at,
-                cx,
-            )
-            .into_any_element(),
+            AppState::WaitingForPairing { qr_code, pair_code } => {
+                render_pairing_view(qr_code.as_ref(), pair_code.clone(), cx).into_any_element()
+            }
             AppState::Syncing => render_syncing_view(cx).into_any_element(),
             // Settings is a screen over the conversation view, so it takes
             // the whole frame while it is open rather than floating.

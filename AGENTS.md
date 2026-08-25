@@ -99,6 +99,25 @@ profile here repeats it deliberately.
   store reload is the store's whole truth *about rows it has*, and during
   pairing it has none while live messages already exist. Only store-backed
   chats are diffed against a reload; see `StateHub::store_backed_chat_jids`.
+- **A call that ends with nothing to write down says so in the state.** A
+  front end learns a call is over by watching the stage disappear, and it
+  writes the conversation's record from the stage it was holding — so a call
+  answered on another device reads as missed, and one the daemon refused to
+  place reads as an attempt that was never made. `CallState::unrecorded`
+  travels in the same frame as the removal, because an explanation sent
+  beside it rides a different channel and can arrive after the record it was
+  meant to prevent.
+- **Nothing may still be writing this account's media when it is deleted.**
+  The publish thread externalizes media behind an unbounded queue, so an
+  event accepted before `ForgetSession` can still be in it. `stop_publishing`
+  closes the queue and hands back the thread to join, before the wipe.
+- **The timeline anchor describes the rows, not how many there are.** A
+  history backfill inserts older messages *before* the head and raises the
+  count doing it, which is the same count change an arrival makes and the
+  opposite end of the list; and a row can change height with the count
+  standing still — an image arrives, a reaction lands, a send fails and grows
+  a retry button. `MessageListCache::head` answers the first, its `build`
+  number the second, and the three outcomes are splice, remeasure and reset.
 - **A daemon frame is either state or news, and they use different channels.**
   State carries a version and is recoverable from a snapshot; a window request
   or a failed send is neither, so it must not ride a channel a client stops

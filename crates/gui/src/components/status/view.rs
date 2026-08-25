@@ -222,15 +222,19 @@ fn render_update(props: &StatusViewProps, metrics: Metrics, cx: &App) -> impl In
         .items_center()
         .justify_center()
         .gap(metrics.space_lg())
-        .child(match (props.image.clone(), props.frame.clone()) {
-            (Some(image), _) => img(ImageSource::Image(image))
+        // The frame first, the way the timeline does it. A video update keeps
+        // its poster frame in `media.data` for as long as it exists, so
+        // drawing the picture before the frame left every video status
+        // showing a still of itself while the decoder ran behind it.
+        .child(match (props.frame.clone(), props.image.clone()) {
+            // A video update, decoding. The same frames the timeline draws.
+            (Some(frame), _) => img(ImageSource::Render(frame))
                 .max_w_full()
                 .max_h_full()
                 .object_fit(gpui::ObjectFit::Contain)
                 .rounded(metrics.radius_lg())
                 .into_any_element(),
-            // A video update, decoding. The same frames the timeline draws.
-            (None, Some(frame)) => img(ImageSource::Render(frame))
+            (None, Some(image)) => img(ImageSource::Image(image))
                 .max_w_full()
                 .max_h_full()
                 .object_fit(gpui::ObjectFit::Contain)

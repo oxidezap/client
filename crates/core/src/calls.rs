@@ -186,6 +186,20 @@ pub enum Admission {
 pub struct CallState {
     stage: Option<Stage>,
     waiting: Option<WaitingCall>,
+    /// The last call this device has nothing truthful to write down about.
+    ///
+    /// Two things end that way: another of the account's devices took it —
+    /// answered there or refused there — and a call the daemon would not
+    /// place because one was already up, which a window had already drawn
+    /// optimistically before it asked.
+    ///
+    /// Part of the state rather than an event beside it. A front end learns
+    /// a call is over by watching the stage disappear, and it writes the
+    /// conversation's record from the stage it last held; state and news
+    /// travel on different channels, so an explanation sent alongside can
+    /// arrive after the record it was meant to change. In the same frame as
+    /// the removal it cannot.
+    unrecorded: Option<CallId>,
 }
 
 impl CallState {
@@ -434,6 +448,34 @@ impl CallState {
     ///
     /// Returns whether anything changed, so an ack for a call already gone
     /// does not buy a redraw.
+    /// [`end`](Self::end), for a call another of this account's devices
+    /// answered or refused.
+    ///
+    /// The distinction is the whole point: nothing here was missed. The
+    /// device that took the call has the real entry, and this one has no
+    /// truthful record to write.
+    pub fn end_elsewhere(&mut self, call_id: &CallId) -> bool {
+        let ended = self.end(call_id);
+        if ended {
+            self.unrecorded = Some(call_id.clone());
+        }
+        ended
+    }
+
+    /// Say that `call_id` never happened, without ending anything.
+    ///
+    /// For a call a front end drew before asking and the daemon then refused:
+    /// the stage it drew is not in this state and never was, so there is
+    /// nothing to remove — only something to stop it writing down.
+    pub fn mark_unrecorded(&mut self, call_id: &CallId) {
+        self.unrecorded = Some(call_id.clone());
+    }
+
+    /// Whether `call_id` is one this device has no record to write.
+    pub fn is_unrecorded(&self, call_id: &str) -> bool {
+        self.unrecorded.as_deref() == Some(call_id)
+    }
+
     pub fn end(&mut self, call_id: &CallId) -> bool {
         if self
             .waiting
@@ -543,6 +585,34 @@ mod tests {
                 group_jid: None,
             })
             .build()
+    }
+
+    /// The two ways a call leaves without leaving a record. A front end
+    /// writes the conversation's entry off the stage that disappeared, and
+    /// disappearing is all it can see: a call answered on the phone would be
+    /// written down as missed, and one the daemon refused to place as an
+    /// attempt that was never made.
+    #[test]
+    fn a_call_can_end_with_nothing_to_write_down() {
+        let mut state = CallState::new();
+        state.set_incoming(incoming("call-1"));
+
+        assert!(!state.is_unrecorded("call-1"), "nothing said yet");
+        assert!(state.end_elsewhere(&"call-1".to_string()));
+        assert!(state.is_unrecorded("call-1"));
+        assert!(state.stage().is_none());
+
+        // A refusal ends nothing here: the stage it is about was drawn in a
+        // window and never reached this state at all.
+        state.mark_unrecorded(&"ui-call-9".to_string());
+        assert!(state.is_unrecorded("ui-call-9"));
+
+        // And an ordinary ending still says nothing of the sort, which is
+        // what keeps a genuine missed call counting as one.
+        let mut missed = CallState::new();
+        missed.set_incoming(incoming("call-2"));
+        assert!(missed.end(&"call-2".to_string()));
+        assert!(!missed.is_unrecorded("call-2"));
     }
 
     fn incoming(id: &str) -> IncomingCall {

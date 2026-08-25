@@ -104,6 +104,10 @@ pub enum UiEvent {
     #[allow(dead_code)]
     CallAccepted(CallId),
     CallEnded(CallId),
+    /// The call is over here because another of this account's devices
+    /// answered or refused it. Not a missed call: the device that took it has
+    /// the entry, and this one has nothing true to write down.
+    CallEndedElsewhere(CallId),
     /// Who this device is linked as.
     ///
     /// Sent on connect and whenever the push name changes, rather than only

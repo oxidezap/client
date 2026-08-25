@@ -230,15 +230,35 @@ pub fn parse(source: &str) -> RichText {
 
         // Anything else — including a marker that opened nothing — is text.
         let ch = source[at..].chars().next().expect("in bounds");
+        // Where the one-line rule is enforced. A `*` that never met its
+        // closer on its own line is a character somebody typed, not the
+        // start of a run: without this, a marker in a paragraph further down
+        // reached back and emphasised everything in between. A fence is the
+        // exception it exists for — it is the one form that spans lines — so
+        // while one is open the newline is nothing but text.
+        if ch == '\n' && !open.iter().any(|run| run.fenced) {
+            restore_unclosed(&mut out, &mut open);
+        }
         out.text.push(ch);
         at += ch.len_utf8();
     }
 
-    // Runs that never closed were never formatting. Their delimiters are
-    // already gone from `out.text`, so put them back where they stood — all
-    // of a fence's three characters, not one of them, or the text loses two
-    // and every span after the hole describes the wrong letters.
-    for run in open.into_iter().rev() {
+    restore_unclosed(&mut out, &mut open);
+
+    // Innermost first is the order a renderer wants to apply them in, and the
+    // parser produces them by closing order, which is the same thing.
+    out.spans.retain(|span| !span.emphasis.is_plain());
+    out
+}
+
+/// Put back the delimiters of runs that never closed.
+///
+/// They were never formatting, and their markers are already gone from the
+/// text, so they go back where they stood — all of a fence's three
+/// characters, not one of them, or the text loses two and every span after
+/// the hole describes the wrong letters.
+fn restore_unclosed(out: &mut RichText, open: &mut Vec<Open>) {
+    for run in open.drain(..).rev() {
         let literal = run.literal();
         out.text.insert_str(run.from, literal);
         let shift = literal.len();
@@ -251,11 +271,6 @@ pub fn parse(source: &str) -> RichText {
             }
         }
     }
-
-    // Innermost first is the order a renderer wants to apply them in, and the
-    // parser produces them by closing order, which is the same thing.
-    out.spans.retain(|span| !span.emphasis.is_plain());
-    out
 }
 
 /// A run whose opening delimiter has been seen and whose closer has not.
@@ -464,6 +479,32 @@ mod tests {
             text, "fn main() {}",
             "the fence's own newlines are not code"
         );
+        assert_eq!(spans.len(), 1, "one code run: {spans:?}");
+        assert!(spans[0].1.code);
+    }
+
+    /// The one-line rule, which the module has always documented and the
+    /// parser did not enforce: a `*` that finds no closer before the end of
+    /// its line is a character somebody typed. Without this a marker in a
+    /// later paragraph reached back and emphasised everything between them.
+    #[test]
+    fn an_ordinary_run_closes_on_its_own_line() {
+        let rich = parse("*first\nsecond*");
+        assert_eq!(rich.text, "*first\nsecond*");
+        assert!(rich.is_plain(), "{:?}", rich.spans);
+
+        // Two lines, each closing its own run, is still two runs.
+        let (text, spans) = only("*first*\n*second*");
+        assert_eq!(text, "first\nsecond");
+        assert_eq!(spans, vec![(0..5, bold()), (6..12, bold())]);
+    }
+
+    /// The exception the fence exists for: inside one, a newline is text and
+    /// the run stays open across it.
+    #[test]
+    fn a_newline_does_not_close_a_fence() {
+        let (text, spans) = only("```\nfirst\nsecond\n```");
+        assert_eq!(text, "first\nsecond");
         assert_eq!(spans.len(), 1, "one code run: {spans:?}");
         assert!(spans[0].1.code);
     }

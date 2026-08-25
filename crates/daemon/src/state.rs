@@ -289,6 +289,22 @@ impl StateHub {
         }
     }
 
+    /// Send the call state again, unchanged.
+    ///
+    /// For a front end that drew a call this daemon then refused. Nothing
+    /// here moved, so [`calls`](Self::calls) would publish nothing, and a
+    /// refusal carries no request id for the window to answer against — it
+    /// is logged and the phantom outgoing call stays on screen with no way
+    /// to end it. Saying the state again is what takes it back.
+    pub fn republish_calls(&self) {
+        let (version, calls) = {
+            let mut inner = self.lock();
+            inner.version = inner.version.next();
+            (inner.version, inner.calls.clone())
+        };
+        self.broadcast(version, DaemonEvent::CallsChanged(calls));
+    }
+
     /// What is happening on the call front right now.
     ///
     /// The snapshot reads the field directly; this is for a caller that wants
