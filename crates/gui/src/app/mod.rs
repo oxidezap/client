@@ -1622,6 +1622,13 @@ impl WhatsAppApp {
                     }
                     Err(e) => {
                         app.app_state = AppState::Error(format!("Failed to reach the daemon: {e}"));
+                        // The error screen says "we'll keep trying", and this
+                        // is the attempt that was doing the trying: the timer
+                        // that fired it has already ended. Without arming the
+                        // next one the promise stops being true after exactly
+                        // one automatic retry, with the sentence still on
+                        // screen.
+                        app.schedule_retry(cx);
                     }
                 }
                 cx.notify();
@@ -2139,6 +2146,10 @@ impl WhatsAppApp {
         chat.insert_history_message(message);
 
         self.invalidate_message_cache(&chat_jid);
+        // And the sidebar, when the notice is now the last thing in the
+        // conversation: the list's preview is drawn from that row, while its
+        // cache guard counts chats and cannot see one gaining a message.
+        self.invalidate_chat_cache();
         cx.notify();
     }
 

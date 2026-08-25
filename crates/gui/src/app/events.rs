@@ -63,11 +63,16 @@ impl WhatsAppApp {
                         Some(existing) => {
                             let jid = chat.jid.clone();
                             existing.merge_history(chat);
-                            // The open chat was read locally the moment the
-                            // message arrived; the store row commits with the
-                            // unread bump before our receipt lands, so the
-                            // hydrated counter must not resurrect the badge.
-                            if self.selected_chat.as_deref() == Some(jid.as_str()) {
+                            // The chat *on screen* was read locally the
+                            // moment the message arrived; the store row
+                            // commits with the unread bump before our receipt
+                            // lands, so the hydrated counter must not
+                            // resurrect the badge. On screen, not selected —
+                            // the same distinction the live arrival makes, and
+                            // for the same reason: a reload while the reader
+                            // is in Status would otherwise clear the badge of
+                            // a conversation nobody was looking at.
+                            if self.visible_chat.as_deref() == Some(jid.as_str()) {
                                 existing.mark_as_read();
                             }
                             self.invalidate_message_cache(&jid);

@@ -1041,6 +1041,16 @@ fn apply_event(
             let chat =
                 crate::lid::route_chat_key(conn, device_id, &update.group_jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
+            // Only when it is news. The server redelivers notifications, and
+            // an invalidation is a claim that something changed: setting the
+            // flag for a subject the row already holds buys a whole chat-list
+            // reload for nothing.
+            let stored: Option<String> = chat_row(device_id, &chat)
+                .select(schema::chats::name)
+                .first::<Option<String>>(conn)?;
+            if stored.as_deref() == Some(subject.as_str()) {
+                return Ok(());
+            }
             diesel::update(chat_row(device_id, &chat))
                 .set(schema::chats::name.eq(subject))
                 .execute(conn)?;

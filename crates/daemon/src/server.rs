@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use oxidezap_ipc::{
-    ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, Request, RequestId,
+    CallAction, ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, Request, RequestId,
     endpoint_path, lock_path, state_dir,
 };
 use tokio::io::{
@@ -866,6 +866,17 @@ async fn dispatch(
     // [`Action::needs_network`].
     let connection = hub.connection();
     if action.needs_network() && !connection.is_connected() {
+        // A call the asking window already drew has to be un-drawn. It
+        // passed its own connection check before this one moved, the refusal
+        // rides no request id, and nothing on that side connects the error
+        // back to the stage it is holding — so the stage would sit there
+        // until the next snapshot dropped it, and disappearing is what a
+        // front end writes down as an attempt that was never answered. The
+        // bridge's busy refusal says the same thing one layer down.
+        if let Action::Call(CallAction::Start { placeholder_id, .. }) = &action {
+            hub.calls(|calls| calls.mark_unrecorded(placeholder_id));
+            hub.republish_calls();
+        }
         return Err(no_session(format!("not connected: {connection:?}")));
     }
 

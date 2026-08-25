@@ -162,8 +162,16 @@ pub fn render_connected_view(
             .filter(|media| !media.data.is_empty())
             .map(|media| app.get_decoded_image(&message.id, &media.data, &media.mime_type));
         let frame = app.video_current_frame(&message.id);
-        let is_loading_update =
-            image.is_none() && frame.is_none() && app.is_downloading(&message.id);
+        // A video says it is loading in its *player*, not in the download
+        // table: `start_video_download` records progress there and nowhere
+        // else, so asking only the table left a video status reading "cannot
+        // be shown here" for the whole download.
+        let is_loading_update = image.is_none()
+            && frame.is_none()
+            && (app.is_downloading(&message.id)
+                || app
+                    .video_player_state(&message.id)
+                    .is_some_and(|state| state.is_loading()));
         Some(StatusViewProps {
             author_jid: author.jid.clone(),
             author_name: author.name.clone().into(),
