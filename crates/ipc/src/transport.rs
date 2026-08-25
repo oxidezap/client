@@ -151,6 +151,8 @@ fn user_suffix() -> String {
 mod tests {
     use super::*;
 
+    /// `XDG_RUNTIME_DIR` is a Unix idea, and so is the shape it produces.
+    #[cfg(unix)]
     #[test]
     fn runtime_dir_wins_when_set() {
         // Not using the process environment: these tests run in parallel and
@@ -186,14 +188,38 @@ mod tests {
         assert!(path.starts_with(dir));
     }
 
+    /// The endpoint is always derivable, and always says which user it
+    /// belongs to — the shape differs by platform, the property does not.
     #[test]
-    fn a_path_is_always_produced() {
-        let path = endpoint_path().expect("a path is always derivable");
-        assert_eq!(path.file_name().unwrap(), SOCKET_NAME);
-        assert!(
-            path.parent()
-                .is_some_and(|p| p.to_string_lossy().contains(DIR_NAME)),
-            "socket sits in its own directory so its permissions are ours to set"
-        );
+    fn an_endpoint_is_always_produced() {
+        let path = endpoint_path().expect("an endpoint is always derivable");
+
+        #[cfg(unix)]
+        {
+            assert_eq!(path.file_name().unwrap(), SOCKET_NAME);
+            assert!(
+                path.parent()
+                    .is_some_and(|p| p.to_string_lossy().contains(DIR_NAME)),
+                "the socket sits in its own directory so its permissions are ours to set"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let name = path.to_string_lossy();
+            assert!(name.starts_with(r"\\.\pipe\"), "not a pipe name: {name}");
+            assert!(
+                name.contains(DIR_NAME),
+                "a pipe name is machine-wide, so it has to say whose it is: {name}"
+            );
+        }
+    }
+
+    /// Both live under the same per-user directory, so whatever protects one
+    /// protects the other.
+    #[test]
+    fn the_cache_sits_with_the_daemon_s_other_state() {
+        let state = state_dir().expect("a state directory is always derivable");
+        assert!(media_dir().is_some_and(|dir| dir.starts_with(&state)));
+        assert!(lock_path().is_some_and(|path| path.starts_with(&state)));
     }
 }
