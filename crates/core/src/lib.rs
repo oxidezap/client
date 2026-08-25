@@ -27,7 +27,9 @@ pub use chat::fallback_chat_name;
 pub use chat::{Chat, ChatMessage, DownloadableMedia, MediaContent, MediaType};
 pub use events::{ReceiptType, UiEvent};
 pub use message_status::MessageStatus;
-pub use presence::{Availability, ChatTyping, ComposingKind, PresenceRegistry, TypingSummary};
+pub use presence::{
+    Availability, ChatTyping, ComposingKind, PresenceRegistry, TypingSummary, Typist,
+};
 pub use quoted::{QuotedKind, QuotedMessage};
 pub use status::{StatusAuthor, StatusFeed};
 pub use system_notice::{CallOutcome, CallRecord, SystemNotice, format_duration};

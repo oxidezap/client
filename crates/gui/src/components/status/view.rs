@@ -31,6 +31,8 @@ pub struct StatusViewProps {
     pub author_name: SharedString,
     pub message: ChatMessage,
     pub image: Option<Arc<Image>>,
+    /// A video update's current decoded frame, when one has been produced.
+    pub frame: Option<Arc<gpui::RenderImage>>,
     /// Which of the run is on screen, and how many there are.
     pub index: usize,
     pub count: usize,
@@ -220,16 +222,23 @@ fn render_update(props: &StatusViewProps, metrics: Metrics, cx: &App) -> impl In
         .items_center()
         .justify_center()
         .gap(metrics.space_lg())
-        .child(match props.image.clone() {
-            Some(image) => img(ImageSource::Image(image))
+        .child(match (props.image.clone(), props.frame.clone()) {
+            (Some(image), _) => img(ImageSource::Image(image))
                 .max_w_full()
                 .max_h_full()
                 .object_fit(gpui::ObjectFit::Contain)
                 .rounded(metrics.radius_lg())
                 .into_any_element(),
-            // A text status, or a picture whose bytes are not here yet. Both
-            // are the caption drawn large rather than an empty frame.
-            None => div()
+            // A video update, decoding. The same frames the timeline draws.
+            (None, Some(frame)) => img(ImageSource::Render(frame))
+                .max_w_full()
+                .max_h_full()
+                .object_fit(gpui::ObjectFit::Contain)
+                .rounded(metrics.radius_lg())
+                .into_any_element(),
+            // A text status, or media whose bytes are not here yet. Both are
+            // the caption drawn large rather than an empty frame.
+            (None, None) => div()
                 .max_w(metrics.reading_width())
                 .px(metrics.space_xxl())
                 .py(metrics.space_xxxl())
@@ -249,9 +258,7 @@ fn render_update(props: &StatusViewProps, metrics: Metrics, cx: &App) -> impl In
                 .into_any_element(),
         })
         .children(
-            props
-                .image
-                .is_some()
+            (props.image.is_some() || props.frame.is_some())
                 .then_some(caption)
                 .flatten()
                 .map(|caption| {

@@ -139,6 +139,7 @@ pub fn should_show_sender(messages: &[ChatMessage], index: usize) -> bool {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use oxidezap_core::Typist;
 
     fn at(day: u32, hour: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 3, day, hour, 0, 0).unwrap()
@@ -242,7 +243,10 @@ mod tests {
     #[test]
     fn typing_is_the_last_row() {
         let summary = TypingSummary {
-            names: vec!["Ana".to_string()],
+            typists: vec![Typist {
+                jid: "a@s.whatsapp.net".to_string(),
+                name: "Ana".to_string(),
+            }],
             total: 1,
             kind: oxidezap_core::ComposingKind::Text,
         };
@@ -287,7 +291,13 @@ mod tests {
 
     fn typing(names: &[&str]) -> TypingSummary {
         TypingSummary {
-            names: names.iter().map(|n| (*n).to_string()).collect(),
+            typists: names
+                .iter()
+                .map(|n| Typist {
+                    jid: format!("{n}@s.whatsapp.net"),
+                    name: (*n).to_string(),
+                })
+                .collect(),
             total: names.len(),
             kind: oxidezap_core::ComposingKind::Text,
         }

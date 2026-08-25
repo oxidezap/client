@@ -9,6 +9,7 @@ impl WhatsAppApp {
     /// Update a message's media data (used to cache downloaded media)
     fn update_message_media_data(&mut self, message_id: &str, data: Vec<u8>) {
         // Find the message in any chat and update its media data
+        let mut touched: Option<String> = None;
         for chat in &mut self.chats {
             if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id) {
                 if let Some(ref mut media) = msg.media {
@@ -23,11 +24,18 @@ impl WhatsAppApp {
                     // Drop any render-cached image built from the old bytes
                     self.decoded_images.borrow_mut().shift_remove(message_id);
                     info!("Cached media data for message {}", message_id);
-                    // Invalidate message cache since we modified the message
-                    self.message_list_cache.borrow_mut().remove(&chat.jid);
+                    touched = Some(chat.jid.clone());
                 }
-                return;
+                break;
             }
+        }
+
+        // Through the shared invalidation rather than by poking one cache:
+        // the message list is not the only thing derived from these messages,
+        // and the status feed — which is — went on serving the version with no
+        // bytes in it, so a downloaded update stayed "cannot be shown".
+        if let Some(jid) = touched {
+            self.invalidate_message_cache(&jid);
         }
     }
     /// Stop any currently playing media. Does NOT call cx.notify().
@@ -676,8 +684,8 @@ impl WhatsAppApp {
                                 }
 
                                 // Invalidate message cache to force virtual list re-render
-                                if let Some(ref jid) = app.selected_chat {
-                                    app.invalidate_message_cache(jid);
+                                if let Some(jid) = app.selected_chat.clone() {
+                                    app.invalidate_message_cache(&jid);
                                 }
 
                                 // Schedule play() for the next frame to allow GPUI to decode the image

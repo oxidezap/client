@@ -857,8 +857,46 @@ impl WhatsAppApp {
     }
 
     /// Invalidate message list cache for a chat (call when messages change)
-    fn invalidate_message_cache(&self, chat_jid: &str) {
+    /// Drop a chat's rendered timeline, and anything derived from it.
+    ///
+    /// `&mut self` because an open conversation search is derived from those
+    /// same messages: every caller here is announcing that the chat's history
+    /// changed, which is exactly when the search's matches stop describing it.
+    fn invalidate_message_cache(&mut self, chat_jid: &str) {
         self.message_list_cache.borrow_mut().remove(chat_jid);
+        self.refresh_conversation_search(chat_jid);
+        // The status feed is a second view of one chat's messages, and its
+        // own guard — the message count — cannot see a message *changing*.
+        if Self::is_status_jid(chat_jid) {
+            *self.status_feed_cache.borrow_mut() = None;
+        }
+    }
+
+    /// Re-run an open conversation search over the chat's current messages.
+    ///
+    /// The matches were rebuilt only when the *query* changed, so a message
+    /// arriving, a history merge, an edit or a revoke left the count and the
+    /// navigation describing a conversation that had moved on — with no way
+    /// to correct it but to retype the query. Called from every path that
+    /// invalidates a chat's timeline, which is the same set of changes.
+    fn refresh_conversation_search(&mut self, chat_jid: &str) {
+        if self
+            .conversation_search
+            .as_ref()
+            .is_none_or(|search| search.jid != chat_jid || search.query.is_empty())
+        {
+            return;
+        }
+        // Lifted out for the same reason as in `set_conversation_search`:
+        // reading the messages needs `self` while the search is being written.
+        let Some(mut search) = self.conversation_search.take() else {
+            return;
+        };
+        let query = search.query.clone();
+        if let Some(chat) = self.find_chat(&search.jid) {
+            search.refresh(&query, &chat.messages);
+        }
+        self.conversation_search = Some(search);
     }
 
     // ========== Accessors ==========

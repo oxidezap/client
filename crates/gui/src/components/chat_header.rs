@@ -312,7 +312,7 @@ fn render_overflow_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxidezap_core::ComposingKind;
+    use oxidezap_core::{ComposingKind, Typist};
 
     fn group_with(members: usize) -> Chat {
         let mut chat = Chat::new("group@g.us".to_string());
@@ -329,7 +329,10 @@ mod tests {
 
     fn typing(name: &str) -> TypingSummary {
         TypingSummary {
-            names: vec![name.to_string()],
+            typists: vec![Typist {
+                jid: format!("{name}@s.whatsapp.net"),
+                name: name.to_string(),
+            }],
             total: 1,
             kind: ComposingKind::Text,
         }
@@ -361,7 +364,10 @@ mod tests {
     #[test]
     fn a_group_still_reports_who_is_typing() {
         let summary = TypingSummary {
-            names: vec!["Ana".to_string()],
+            typists: vec![Typist {
+                jid: "a@s.whatsapp.net".to_string(),
+                name: "Ana".to_string(),
+            }],
             total: 1,
             kind: ComposingKind::Text,
         };

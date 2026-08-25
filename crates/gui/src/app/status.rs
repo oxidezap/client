@@ -10,7 +10,7 @@
 //! with the first.
 
 use gpui::Context;
-use oxidezap_core::{STATUS_BROADCAST_JID, StatusFeed};
+use oxidezap_core::{MediaType, STATUS_BROADCAST_JID, StatusFeed};
 
 use super::WhatsAppApp;
 
@@ -173,43 +173,6 @@ impl WhatsAppApp {
         }
     }
 
-    /// Fetch the update on screen, if its bytes are not here.
-    ///
-    /// A status arrives as a thumbnail at most, and unlike a conversation
-    /// there is no bubble to tap: opening someone's status *is* the request to
-    /// see it. One at a time — the one being looked at — rather than the
-    /// whole run, because a run is watched one update at a time and the rest
-    /// may never be reached.
-    fn fetch_shown_status(&mut self, cx: &mut Context<Self>) {
-        let Some(author_jid) = self.status_pane.author().map(str::to_string) else {
-            return;
-        };
-        let feed = self.status_feed();
-        let Some(author) = feed.author(&author_jid) else {
-            return;
-        };
-        let at = self.status_pane.index_in(author.count());
-        let Some(message) = feed.updates_of(author).nth(at) else {
-            return;
-        };
-        let Some(media) = message.media.as_ref() else {
-            return;
-        };
-        // Only what the pane can actually draw: a video would download and
-        // still show the placeholder.
-        if media.media_type != oxidezap_core::MediaType::Image || !media.data.is_empty() {
-            return;
-        }
-        let Some(downloadable) = media.downloadable.clone() else {
-            return;
-        };
-        let message_id = message.id.clone();
-        if self.is_downloading(&message_id) {
-            return;
-        }
-        self.download_image(message_id, downloadable, cx);
-    }
-
     /// Mark the update currently on screen as watched.
     ///
     /// Locally, and only the one being looked at. WhatsApp's own read receipt
@@ -245,6 +208,54 @@ impl WhatsAppApp {
         }
         message.is_read = true;
         self.invalidate_chat_cache();
+    }
+
+    /// Fetch the update on screen, if its bytes are not here.
+    ///
+    /// A status arrives as a thumbnail at most, and unlike a conversation
+    /// there is no bubble to tap: opening someone's status *is* the request to
+    /// see it. One at a time — the one being looked at — rather than the whole
+    /// run, because a run is watched one update at a time and the rest may
+    /// never be reached.
+    ///
+    /// Video is fetched the same way. It used to be skipped here, which is why
+    /// a video status sat on "cannot be shown" having never asked for the
+    /// bytes that would show it.
+    fn fetch_shown_status(&mut self, cx: &mut Context<Self>) {
+        let Some((message_id, downloadable, kind)) = self.shown_status_media() else {
+            return;
+        };
+        if self.is_downloading(&message_id) {
+            return;
+        }
+        match kind {
+            MediaType::Image => self.download_image(message_id, downloadable, cx),
+            // The video path downloads *and* starts decoding, which is what
+            // produces the frame the pane draws.
+            MediaType::Video => self.toggle_video(message_id, downloadable, cx),
+            other => log::debug!("a status update of type {other:?} has nothing to show"),
+        }
+    }
+
+    /// The update on screen, when it has bytes worth fetching.
+    ///
+    /// `None` once they are here, or when there is nothing to fetch: a text
+    /// status, or media the server gave no way to download.
+    fn shown_status_media(&self) -> Option<(String, oxidezap_core::DownloadableMedia, MediaType)> {
+        let author_jid = self.status_pane.author()?.to_string();
+        let feed = self.status_feed();
+        let author = feed.author(&author_jid)?;
+        let at = self.status_pane.index_in(author.count());
+        let message = feed.updates_of(author).nth(at)?;
+        let media = message.media.as_ref()?;
+        if !media.data.is_empty() && !media.data_is_preview {
+            return None;
+        }
+        Some((
+            message.id.clone(),
+            media.downloadable.clone()?,
+            media.media_type.clone(),
+        ))
     }
 
     /// Whether the broadcast is the chat with this JID, so the parts of the

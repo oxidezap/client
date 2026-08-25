@@ -201,14 +201,17 @@ fn render_typing(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let names = summary.names.clone();
+    let typists = summary.typists.clone();
     let overflow = summary.overflow();
     let label = summary.label();
     // A single typist in a group gets their own colour on the dots; a crowd
     // stays neutral, because no one hue would be honest.
     let dot_colour = if is_group && summary.total == 1 {
+        // Keyed on the JID, like every other colour derived from an identity:
+        // a contact known by a push name in one place and a number in another
+        // has to come out the same colour in both.
         cx.product()
-            .speaker(names.first().map(String::as_str).unwrap_or_default())
+            .speaker(typists.first().map(|t| t.jid.as_str()).unwrap_or_default())
     } else {
         cx.theme().muted_foreground
     };
@@ -226,14 +229,18 @@ fn render_typing(
                     .flex()
                     .items_center()
                     .flex_shrink_0()
-                    .children(names.iter().enumerate().map(|(ix, name)| {
+                    .children(typists.iter().enumerate().map(|(ix, typist)| {
                         div()
                             // Overlapped on purpose: a stack reads as "these
                             // people", where a row reads as a list.
                             .when(ix > 0, |el| el.ml(-metrics.space_lg()))
                             .child(
-                                Avatar::new(name.clone(), name, metrics.avatar_inline())
-                                    .on(cx.theme().background),
+                                Avatar::new(
+                                    typist.jid.clone(),
+                                    &typist.name,
+                                    metrics.avatar_inline(),
+                                )
+                                .on(cx.theme().background),
                             )
                     }))
                     .when(overflow > 0, |el| {

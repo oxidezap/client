@@ -206,7 +206,7 @@ fn single_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxidezap_core::{ComposingKind, MediaContent};
+    use oxidezap_core::{ComposingKind, MediaContent, Typist};
     use std::sync::Arc;
 
     fn chat(is_group: bool) -> Chat {
@@ -249,7 +249,10 @@ mod tests {
 
     fn typing(name: &str) -> TypingSummary {
         TypingSummary {
-            names: vec![name.to_string()],
+            typists: vec![Typist {
+                jid: format!("{name}@s.whatsapp.net"),
+                name: name.to_string(),
+            }],
             total: 1,
             kind: ComposingKind::Text,
         }

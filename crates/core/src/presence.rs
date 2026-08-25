@@ -44,6 +44,7 @@ impl ComposingKind {
 
 #[derive(Debug, Clone)]
 struct Composing {
+    jid: String,
     name: String,
     kind: ComposingKind,
     expires_at: DateTime<Utc>,
@@ -60,8 +61,9 @@ pub struct ChatTyping {
 impl ChatTyping {
     fn set(&mut self, sender: String, name: String, kind: ComposingKind, now: DateTime<Utc>) {
         self.participants.insert(
-            sender,
+            sender.clone(),
             Composing {
+                jid: sender,
                 name,
                 kind,
                 expires_at: now + Duration::seconds(COMPOSING_TTL_SECS),
@@ -108,21 +110,36 @@ impl ChatTyping {
             } else {
                 ComposingKind::Text
             },
-            names: live
+            typists: live
                 .iter()
                 .take(MAX_NAMED_TYPISTS)
-                .map(|c| c.name.clone())
+                .map(|c| Typist {
+                    jid: c.jid.clone(),
+                    name: c.name.clone(),
+                })
                 .collect(),
             total: live.len(),
         })
     }
 }
 
+/// One person who is typing.
+///
+/// Both halves, because they answer different questions: the name is what the
+/// sentence says, and the JID is the identity every avatar and every quote bar
+/// in the app derives its colour from. Keyed on the name alone, the typing
+/// dots could take a different colour from the same person's bubbles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Typist {
+    pub jid: String,
+    pub name: String,
+}
+
 /// A rendered-ready view of who is typing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypingSummary {
-    /// Up to [`MAX_NAMED_TYPISTS`] names, alphabetical.
-    pub names: Vec<String>,
+    /// Up to [`MAX_NAMED_TYPISTS`] of them, alphabetical by name.
+    pub typists: Vec<Typist>,
     /// How many are typing in total, including the unnamed remainder.
     pub total: usize,
     pub kind: ComposingKind,
@@ -131,7 +148,16 @@ pub struct TypingSummary {
 impl TypingSummary {
     /// How many typists are not spelled out by name.
     pub fn overflow(&self) -> usize {
-        self.total.saturating_sub(self.names.len())
+        self.total.saturating_sub(self.typists.len())
+    }
+
+    /// The names, in the order they are shown.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.typists.iter().map(|t| t.name.as_str())
+    }
+
+    fn named(&self) -> String {
+        self.names().collect::<Vec<_>>().join(", ")
     }
 
     /// The sentence shown beside the avatars in a group: `Ana is typing`,
@@ -140,7 +166,7 @@ impl TypingSummary {
     /// A 1:1 chat does not use this — there is only one person it could be, so
     /// the bubble alone says it.
     pub fn label(&self) -> String {
-        let mut names = self.names.join(", ");
+        let mut names = self.named();
         if self.overflow() > 0 {
             names.push_str(&format!(" +{}", self.overflow()));
         }
@@ -158,7 +184,7 @@ impl TypingSummary {
         if !is_group {
             return format!("{}…", self.kind.verb());
         }
-        let mut names = self.names.join(", ");
+        let mut names = self.named();
         if self.overflow() > 0 {
             names.push_str(&format!(" +{}", self.overflow()));
         }
@@ -368,7 +394,8 @@ mod tests {
         ]);
         let first = registry.typing(CHAT).unwrap();
         let second = registry.typing(CHAT).unwrap();
-        assert_eq!(first.names, vec!["Ana", "Marcos"]);
+        assert_eq!(first.names().collect::<Vec<_>>(), vec!["Ana", "Marcos"]);
+        assert_eq!(first.typists[0].jid, "a@s.whatsapp.net");
         assert_eq!(first, second);
     }
 
