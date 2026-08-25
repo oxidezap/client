@@ -64,6 +64,45 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
 
+  # Compilation on the platforms the release ships to, without paying for a
+  # release build of each. The Linux job above is the one that lints and runs
+  # tests; this one only answers "does it still compile there", which is the
+  # question a change to the IPC transport or anything behind a `cfg` can
+  # silently get wrong — and which, before this job existed, was first asked
+  # by the nightly build after main had already moved.
+  #
+  # Native runners rather than cross-compiling: `x86_64-pc-windows-msvc` needs
+  # the MSVC libraries, and the point is to compile the way the release does.
+  cross:
+    name: Check (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not hide the answer for the other.
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            os: macos-14
+          - name: windows-x86_64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-${{ matrix.name }}
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # --all-targets so tests and benches are compiled too: a `cfg`-gated
+      # test that no longer builds is the same break as a `cfg`-gated module
+      # that no longer builds.
+      - run: cargo check --workspace --all-targets --all-features
+
   # The library crates an embedder can depend on: the chat store, which lost
   # the MSRV job it had in whatsapp-rust when it moved here, and the IPC
   # protocol, which a front end outside this workspace compiles against. The

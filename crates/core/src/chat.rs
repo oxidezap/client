@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wacore::download::{Downloadable, MediaType as DownloadMediaType};
@@ -34,7 +35,7 @@ pub fn fallback_chat_name(jid: &Jid) -> String {
 }
 
 /// Type of media content
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaType {
     /// Image (JPEG, PNG, WebP)
     Image,
@@ -63,7 +64,7 @@ impl MediaType {
 
 /// Information needed to download encrypted media from WhatsApp servers.
 /// This is stored separately from the thumbnail/preview data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadableMedia {
     /// Direct path for CDN URL construction
     pub direct_path: String,
@@ -78,6 +79,7 @@ pub struct DownloadableMedia {
     /// Duration in seconds (for video/audio)
     pub duration_secs: Option<u32>,
     /// Download media type (for key derivation)
+    #[serde(with = "download_type")]
     pub download_type: DownloadMediaType,
 }
 
@@ -110,12 +112,25 @@ impl Downloadable for DownloadableMedia {
 }
 
 /// Media content attached to a message
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaContent {
     /// Type of media
     pub media_type: MediaType,
     /// Raw data for display (thumbnail for video, full data for images/stickers)
+    ///
+    /// Never serialized. For an image this is the whole photo, and a megabyte
+    /// of it has no business inside a newline-delimited JSON frame; a front
+    /// end in another process reads it out of the daemon's media cache under
+    /// [`cache_key`](Self::cache_key) instead. Skipping it here rather than
+    /// remembering not to send it is what makes that mechanical.
+    #[serde(skip)]
     pub data: Arc<Vec<u8>>,
+    /// Where the daemon's media cache holds [`data`](Self::data).
+    ///
+    /// Set by the daemon as it hands the message to another process, and
+    /// `None` in the process that already has the bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
     /// MIME type of the display data (may differ from downloadable media)
     pub mime_type: String,
     /// Width in pixels (if known)
@@ -164,7 +179,7 @@ impl MediaContent {
 }
 
 /// A chat message
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// Unique message ID
     pub id: String,
@@ -327,8 +342,101 @@ impl ChatMessage {
     }
 }
 
+/// `wacore`'s download [`MediaType`](DownloadMediaType) on the wire.
+///
+/// It is `#[non_exhaustive]` and carries no serde of its own, so this maps it
+/// to a stable name rather than to a variant index that a new variant
+/// upstream would silently shift. An unknown name is an error rather than a
+/// guess: picking the wrong key derivation would decrypt to noise.
+mod download_type {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use wacore::download::MediaType;
+
+    fn name(value: MediaType) -> Option<&'static str> {
+        Some(match value {
+            MediaType::Image => "image",
+            MediaType::Video => "video",
+            MediaType::Audio => "audio",
+            MediaType::Document => "document",
+            MediaType::History => "history",
+            MediaType::AppState => "app_state",
+            MediaType::Sticker => "sticker",
+            MediaType::StickerPack => "sticker_pack",
+            MediaType::StickerPackThumbnail => "sticker_pack_thumbnail",
+            MediaType::LinkThumbnail => "link_thumbnail",
+            MediaType::ProductCatalogImage => "product_catalog_image",
+            _ => return None,
+        })
+    }
+
+    fn parse(name: &str) -> Option<MediaType> {
+        Some(match name {
+            "image" => MediaType::Image,
+            "video" => MediaType::Video,
+            "audio" => MediaType::Audio,
+            "document" => MediaType::Document,
+            "history" => MediaType::History,
+            "app_state" => MediaType::AppState,
+            "sticker" => MediaType::Sticker,
+            "sticker_pack" => MediaType::StickerPack,
+            "sticker_pack_thumbnail" => MediaType::StickerPackThumbnail,
+            "link_thumbnail" => MediaType::LinkThumbnail,
+            "product_catalog_image" => MediaType::ProductCatalogImage,
+            _ => return None,
+        })
+    }
+
+    pub fn serialize<S: Serializer>(value: &MediaType, s: S) -> Result<S::Ok, S::Error> {
+        match name(*value) {
+            Some(name) => name.serialize(s),
+            None => Err(serde::ser::Error::custom(format!(
+                "unnameable download media type {value:?}"
+            ))),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MediaType, D::Error> {
+        let name = String::deserialize(d)?;
+        parse(&name).ok_or_else(|| serde::de::Error::custom(format!("unknown media type {name}")))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Both directions from one list, so a variant added to one and not
+        /// the other cannot pass unnoticed.
+        #[test]
+        fn every_name_round_trips() {
+            for value in [
+                MediaType::Image,
+                MediaType::Video,
+                MediaType::Audio,
+                MediaType::Document,
+                MediaType::History,
+                MediaType::AppState,
+                MediaType::Sticker,
+                MediaType::StickerPack,
+                MediaType::StickerPackThumbnail,
+                MediaType::LinkThumbnail,
+                MediaType::ProductCatalogImage,
+            ] {
+                let name = name(value).expect("every variant is nameable");
+                assert_eq!(parse(name), Some(value), "{name}");
+            }
+        }
+
+        /// An unknown name must not fall back to a variant: the wrong media
+        /// type derives the wrong key and decrypts to noise.
+        #[test]
+        fn an_unknown_name_is_refused() {
+            assert_eq!(parse("something_new"), None);
+        }
+    }
+}
+
 /// A chat/conversation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chat {
     /// JID (Jabber ID) - unique identifier
     pub jid: String,
@@ -520,13 +628,27 @@ impl Chat {
         // store owns it from here on.
         self.from_store |= hydrated.from_store;
         self.set_name_if_not_worse(hydrated.name, hydrated.name_priority);
+        // Read before the messages are moved out: it decides what an absent
+        // preview below means.
+        let hydrated_has_messages = !hydrated.messages.is_empty();
         for msg in hydrated.messages {
             self.insert_history_message(msg);
         }
         self.unread_count = hydrated.unread_count;
         self.manually_unread = hydrated.manually_unread;
         if hydrated.last_message_time >= self.last_message_time {
-            self.last_message = hydrated.last_message;
+            // What an absent preview means depends on whether the load
+            // brought messages. With messages, the store simply has no TEXT
+            // for the newest one (a photo with no caption, a tombstone) while
+            // the live label describes that same message — taking the `None`
+            // would render the row as "No messages" over a chat that plainly
+            // has one. With no messages, the chat really was emptied (cleared,
+            // or its last message deleted, here or on another device) and the
+            // live label is the stale one. The timestamp moves either way: a
+            // cleared chat keeps its activity time on purpose.
+            if hydrated.last_message.is_some() || !hydrated_has_messages {
+                self.last_message = hydrated.last_message;
+            }
             self.last_message_time = hydrated.last_message_time;
         }
     }
@@ -696,6 +818,7 @@ mod tests {
         MediaContent {
             media_type: MediaType::Image,
             data: Arc::new(data),
+            cache_key: None,
             mime_type: "image/jpeg".to_string(),
             width: None,
             height: None,
@@ -748,6 +871,78 @@ mod tests {
             1,
         ));
         assert_eq!(chat.name, "Renamed Fictitious Contact");
+    }
+
+    /// The store keeps no preview text for a message that has none (a photo
+    /// with no caption), so hydration used to blank the label the live path
+    /// had already derived — and the chat list renders an absent preview as
+    /// "No messages".
+    #[test]
+    fn hydration_without_a_preview_keeps_the_live_label() {
+        let jid = "12025550143@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        let mut photo = make_message("M1", 1000);
+        photo.content = String::new();
+        photo.media = Some(make_media(vec![1, 2, 3], false));
+        chat.add_message(photo);
+        assert_eq!(chat.last_message.as_deref(), Some("📷 Photo"));
+
+        // What the store hands back: the message row is there (with its media
+        // envelope and no text), the preview column is not.
+        let mut hydrated = Chat::new(jid);
+        hydrated.from_store = true;
+        let mut stored_photo = make_message("M1", 1000);
+        stored_photo.content = String::new();
+        stored_photo.media = Some(make_media(Vec::new(), false));
+        hydrated.insert_history_message(stored_photo);
+        hydrated.last_message_time = chat.last_message_time;
+        hydrated.last_message = None;
+        chat.merge_history(hydrated);
+
+        assert_eq!(chat.last_message.as_deref(), Some("📷 Photo"));
+        assert!(chat.last_message_time.is_some());
+    }
+
+    /// Clearing a chat (or deleting its last message) elsewhere leaves the
+    /// store with an activity time and nothing to show. Keeping the live label
+    /// there would leave the deleted message on the row for good.
+    #[test]
+    fn hydration_with_no_messages_clears_a_stale_preview() {
+        let jid = "12025550143@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        chat.add_message(make_message("M1", 1000));
+        assert!(chat.last_message.is_some());
+
+        let mut hydrated = Chat::new(jid);
+        hydrated.from_store = true;
+        // The chat row survives the clear and keeps its activity time; the
+        // messages are gone, so the preview column is NULL and the page empty.
+        hydrated.last_message_time = chat.last_message_time;
+        hydrated.last_message = None;
+        chat.merge_history(hydrated);
+
+        assert_eq!(chat.last_message, None);
+    }
+
+    /// A preview the store does have still wins: it is the newer truth, and an
+    /// edit or a newly arrived message is exactly how it changes.
+    #[test]
+    fn hydration_with_a_preview_replaces_the_live_one() {
+        let jid = "12025550143@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        chat.add_message(make_message("M1", 1000));
+
+        let mut hydrated = Chat::new(jid);
+        hydrated.from_store = true;
+        hydrated.last_message_time = Some(Utc.timestamp_opt(2000, 0).unwrap());
+        hydrated.last_message = Some("edited".to_string());
+        chat.merge_history(hydrated);
+
+        assert_eq!(chat.last_message.as_deref(), Some("edited"));
+        assert_eq!(
+            chat.last_message_time,
+            Some(Utc.timestamp_opt(2000, 0).unwrap())
+        );
     }
 
     #[test]

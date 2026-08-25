@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 
 /// How many names a summary spells out before collapsing the rest into a
 /// count. Three is where the line stops fitting a sidebar row.
@@ -21,7 +22,8 @@ const MAX_NAMED_TYPISTS: usize = 2;
 const COMPOSING_TTL_SECS: i64 = 10;
 
 /// What the peer is composing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ComposingKind {
     #[default]
     Text,
@@ -161,7 +163,8 @@ impl TypingSummary {
 }
 
 /// Where a contact is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Availability {
     Online,
     /// Last seen at this moment, when the contact shares it.

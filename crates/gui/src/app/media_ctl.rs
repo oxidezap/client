@@ -347,16 +347,13 @@ impl WhatsAppApp {
             return;
         };
         let download_rx = client.download_downloadable_media(downloadable);
-        let runtime = client.runtime();
 
-        cx.spawn(async move |_entity: WeakEntity<Self>, _cx| {
+        cx.spawn(async move |_entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
                 Ok(data) => {
-                    let saved = runtime
-                        .spawn_blocking(move || save_to_downloads(&file_name, &data))
-                        .await
-                        .map_err(|error| std::io::Error::other(error.to_string()))
-                        .and_then(|result| result);
+                    let saved = cx
+                        .background_spawn(async move { save_to_downloads(&file_name, &data) })
+                        .await;
                     match saved {
                         Ok(_) => info!("Document {} saved", message_id),
                         Err(e) => warn!("Failed to save document {}: {}", message_id, e),
@@ -517,7 +514,6 @@ impl WhatsAppApp {
             return;
         };
         let download_rx = client.download_downloadable_media(downloadable);
-        let runtime = client.runtime();
 
         // Stop any currently playing media (mutual exclusion)
         self.stop_current_media();
@@ -559,13 +555,9 @@ impl WhatsAppApp {
                         cx.notify();
                     });
 
-                    let decode_result = match runtime
-                        .spawn_blocking(move || StreamingVideoDecoder::new(&data))
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(error) => Err(anyhow::anyhow!("video decoder task failed: {error}")),
-                    };
+                    let decode_result = cx
+                        .background_spawn(async move { StreamingVideoDecoder::new(&data) })
+                        .await;
 
                     // Update UI with decode results
                     let _ = entity.update(cx, |app, cx| {

@@ -14,9 +14,16 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 
-# `socket_path` needs the uid for its TMPDIR fallback.
+# The uid for the `TMPDIR` fallback, and the peer's uid to check that the
+# daemon answering is ours.
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
+
+# `getpeereid`, which is how every Unix but Linux answers "who is on the other
+# end of this socket". Linux answers `SO_PEERCRED`, which rustix already has —
+# and which is why `libc` is not needed there.
+[target.'cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

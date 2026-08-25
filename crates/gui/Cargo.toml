@@ -36,7 +36,9 @@ openh264 = "0.9" # H.264 software decoder
 
 oxidezap-audio = { workspace = true }
 oxidezap-core = { workspace = true }
-oxidezap-session = { workspace = true }
+# The daemon's protocol, not the session itself: this front end has not owned
+# a WhatsApp connection since the daemon took it over.
+oxidezap-ipc = { workspace = true }
 portable-atomic = { workspace = true }
 qrcode = "0.14"
 rust-embed = "8"
@@ -51,8 +53,12 @@ smol = "2"
 # only the AAC codec and the ISO-MP4 reader are reachable from here. Every
 # other format symphonia can register is dead weight in the probe tables.
 symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+# Channels only. The session runs in another process now, so nothing here
+# needs a runtime to drive it.
+tokio = { workspace = true, features = ["sync"] }
 
+# `wacore::time` rather than std clocks, which /clippy.toml disallows.
+wacore = { workspace = true }
 whatsapp-rust = { workspace = true }
 
 [lints]

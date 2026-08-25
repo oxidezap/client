@@ -16,11 +16,13 @@
 //! subscribe first and snapshot second, which loses nothing, and the duplicate
 //! window resolves on the client with a comparison rather than a lock.
 
+mod endpoint;
 mod protocol;
 mod transport;
 
+pub use endpoint::Endpoint;
 pub use protocol::{
-    ChatSummary, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview,
-    PairingCode, ProtocolError, StateSnapshot, StateVersion,
+    CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage,
+    MessagePreview, PairingCode, ProtocolError, RequestId, StateSnapshot, StateVersion,
 };
-pub use transport::{PROTOCOL_VERSION, socket_path};
+pub use transport::{PROTOCOL_VERSION, endpoint_path, lock_path, media_dir, media_path, state_dir};

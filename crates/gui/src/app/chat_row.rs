@@ -227,6 +227,7 @@ mod tests {
         MediaContent {
             media_type: MediaType::Audio,
             data: Arc::new(Vec::new()),
+            cache_key: None,
             mime_type: "audio/ogg".to_string(),
             width: None,
             height: None,

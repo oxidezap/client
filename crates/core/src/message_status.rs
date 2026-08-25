@@ -1,5 +1,7 @@
 //! Delivery state of an outgoing message.
 
+use serde::{Deserialize, Serialize};
+
 /// How far an outgoing message has travelled.
 ///
 /// Only meaningful for a message we sent: an incoming one has no delivery
@@ -12,7 +14,8 @@
 /// arrive out of order, another of the peer's devices can repeat a delivery
 /// ack after the read receipt, and a bubble that flickers from ✓✓ back to ✓
 /// reads as a bug in the product rather than in the transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MessageStatus {
     /// Composed locally; the server has not acknowledged it yet.
     #[default]

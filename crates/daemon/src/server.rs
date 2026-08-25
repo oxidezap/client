@@ -9,26 +9,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use oxidezap_ipc::{ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, socket_path};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use oxidezap_ipc::{
+    ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, endpoint_path, lock_path,
+    state_dir,
+};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf,
+    WriteHalf,
+};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::session_bridge::{Action, CommandOutcome, Commands, SessionCommand};
+use crate::listener::Listener;
+use crate::session_bridge::{Action, CommandOutcome, Commands, Outbox, SessionCommand};
 use crate::state::StateHub;
-
-/// Owns the listening socket and removes it on drop.
-pub struct Server {
-    path: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        // Best effort: a leftover socket file makes the next start fail to
-        // bind, and there is nothing useful to do if removal fails.
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 /// This process's claim on being *the* daemon for this user.
 ///
@@ -54,10 +47,10 @@ pub struct Claim {
 ///   store and connected before discovering the lock was taken would have
 ///   already broken it.
 pub fn claim() -> Result<Claim> {
-    let path = socket_path().context("no runtime directory to place the socket in")?;
-    let dir = path.parent().context("socket path has no parent")?;
-    prepare_socket_dir(dir)?;
-    let lock = acquire_startup_lock(&path)?;
+    let path = endpoint_path().context("no per-user directory to place the endpoint in")?;
+    let dir = state_dir().context("no per-user directory for the daemon's own state")?;
+    prepare_state_dir(&dir)?;
+    let lock = acquire_startup_lock(&lock_path().context("no per-user directory for the lock")?)?;
     Ok(Claim { path, _lock: lock })
 }
 
@@ -77,6 +70,14 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// silently dropped connection, so the client can tell why.
 pub const MAX_CLIENTS: usize = 32;
 
+/// How many frames may queue for one connection's own answers.
+///
+/// Only downloads land here, and a front end asks for as many as it has
+/// visible media. Past this the answer is dropped rather than parking the
+/// download task, and the client retries — which costs nothing, because the
+/// bytes are already in the cache.
+const OUTBOX_CAPACITY: usize = 64;
+
 /// Serve until the future is dropped.
 ///
 /// Borrows the claim rather than taking it: this future is a `select!` branch
@@ -85,15 +86,14 @@ pub const MAX_CLIENTS: usize = 32;
 /// which is exactly the window a second daemon must not find open.
 pub async fn run(claim: &Claim, hub: Arc<StateHub>, commands: Commands) -> Result<()> {
     let path = claim.path.clone();
-    let listener = bind(&path)?;
-    let _guard = Server { path: path.clone() };
+    let mut listener = Listener::bind(&path)?;
     log::info!("listening on {}", path.display());
 
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
 
     loop {
         let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
+            Ok(stream) => stream,
             // Per-connection failures, not listener failures: the peer went
             // away between the SYN and the accept, or the process is briefly
             // out of descriptors. Tearing down the WhatsApp session over one
@@ -150,39 +150,14 @@ const ENFILE: i32 = 23;
 /// peer. The task is still bounded — one small frame into a socket nobody has
 /// had a chance to fill, then done — so a refused client costs a write, not a
 /// slot.
-async fn reject(stream: UnixStream) {
+async fn reject<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
     log::warn!("refusing a client: already serving {MAX_CLIENTS}");
-    let (_, mut writer) = stream.into_split();
+    let (_, mut writer) = tokio::io::split(stream);
     if let Ok(frame) = serde_json::to_string(&DaemonMessage::Error(ProtocolError::TooManyClients {
         limit: MAX_CLIENTS,
     })) {
         let _ = write_line(&mut writer, &frame).await;
     }
-}
-
-/// Bind the socket, reclaiming a stale one from a crashed daemon.
-///
-/// The directory is already prepared and the startup lock already held: see
-/// [`claim`], which is why this can treat the path as ours alone.
-fn bind(path: &Path) -> Result<UnixListener> {
-    // Bind first, and only treat the address as stale after proving nothing
-    // answers on it. Unlinking first would let a second daemon steal the path
-    // from a running one: the first keeps its already-connected clients while
-    // every new client reaches the second, and two sessions then drive the
-    // same account with neither aware of the other.
-    match UnixListener::bind(path) {
-        Ok(listener) => return Ok(listener),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
-        Err(e) => return Err(e).with_context(|| format!("binding {}", path.display())),
-    }
-
-    if socket_is_live(path) {
-        anyhow::bail!("another daemon is already listening on {}", path.display());
-    }
-
-    log::warn!("removing a stale socket at {}", path.display());
-    std::fs::remove_file(path).context("removing a stale socket")?;
-    UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
 }
 
 /// An exclusive lock on this user's daemon, released when the file closes.
@@ -196,13 +171,12 @@ struct StartupLock {
 /// dies however it dies, so a crashed daemon leaves nothing to clean up and
 /// no stale pid to misread.
 #[cfg(unix)]
-fn acquire_startup_lock(socket: &Path) -> Result<StartupLock> {
-    let path = socket.with_extension("lock");
+fn acquire_startup_lock(path: &Path) -> Result<StartupLock> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
 
     // rustix rather than a hand-rolled `extern "C"`: the same syscall,
@@ -218,25 +192,34 @@ fn acquire_startup_lock(socket: &Path) -> Result<StartupLock> {
     Ok(StartupLock { _file: file })
 }
 
-#[cfg(not(unix))]
-fn acquire_startup_lock(_socket: &Path) -> Result<StartupLock> {
-    Ok(StartupLock {
-        _file: std::fs::File::open(std::env::temp_dir()).context("opening a placeholder handle")?,
-    })
+/// The same exclusion without `flock`, which Windows does not have.
+///
+/// Opening with no sharing is the platform's own way to say "only me": a
+/// second daemon's open fails while the first holds the handle, and the
+/// kernel closes it however the first dies — which is the property the lock
+/// was chosen for.
+#[cfg(windows)]
+fn acquire_startup_lock(path: &Path) -> Result<StartupLock> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .share_mode(0)
+        .open(path)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "another daemon holds {} ({e}); refusing to start a second session",
+                path.display()
+            )
+        })?;
+    Ok(StartupLock { _file: file })
 }
 
-/// Whether something is accepting connections on `path`.
-///
-/// A blocking connect, deliberately: it runs once at startup before the
-/// runtime has any work, and `ECONNREFUSED` is the answer that matters.
-/// Anything else (a permission error, a path that is no longer a socket) is
-/// treated as live, because refusing to start is recoverable while stealing a
-/// live daemon's socket is not.
-fn socket_is_live(path: &Path) -> bool {
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::ConnectionRefused,
-    }
+#[cfg(not(any(unix, windows)))]
+fn acquire_startup_lock(_path: &Path) -> Result<StartupLock> {
+    anyhow::bail!("no way to take a startup lock on this platform")
 }
 
 /// Create the socket directory, or verify an existing one is safe to use.
@@ -252,7 +235,7 @@ fn socket_is_live(path: &Path) -> bool {
 /// anyone else. Refusing to start is a bad outcome; putting a socket that
 /// controls the account somewhere another user can reach is a worse one.
 #[cfg(unix)]
-fn prepare_socket_dir(dir: &Path) -> Result<()> {
+fn prepare_state_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -299,7 +282,7 @@ fn current_uid() -> u32 {
 }
 
 #[cfg(not(unix))]
-fn prepare_socket_dir(dir: &Path) -> Result<()> {
+fn prepare_state_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
 }
 
@@ -328,16 +311,7 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// shape — would silently eat the head of every request that happened to be
 /// in flight when a chat update landed, and the client would see its command
 /// answered with a parse error it did not cause.
-async fn read_frame(
-    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-    buf: &mut Vec<u8>,
-) -> Result<Option<FrameRead>> {
-    read_frame_generic(reader, buf).await
-}
-
-/// The body of [`read_frame`], over any reader, so the framing rules can be
-/// tested without a socket.
-async fn read_frame_generic<R: tokio::io::AsyncRead + Unpin>(
+async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     buf: &mut Vec<u8>,
 ) -> Result<Option<FrameRead>> {
@@ -400,8 +374,11 @@ enum FrameRead {
     TooLong,
 }
 
-async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+async fn serve_client<S>(stream: S, hub: Arc<StateHub>, commands: Commands) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::with_capacity(1024);
 
@@ -413,17 +390,16 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
     // a task and a descriptor and given nothing back. A peer that connects
     // and says nothing would otherwise sit here for as long as it liked, and
     // a reconnect loop doing it would take the listener down with it.
-    match tokio::time::timeout(
+    let attached = match tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         handshake(&mut reader, &mut writer, &mut buf),
     )
     .await
     {
-        Ok(result) => {
-            if !result? {
-                return Ok(());
-            }
-        }
+        Ok(result) => match result? {
+            Some(attached) => attached,
+            None => return Ok(()),
+        },
         Err(_) => {
             log::debug!("client never completed its handshake within {HANDSHAKE_TIMEOUT:?}");
             let frame = malformed("no hello within the handshake window")?;
@@ -431,7 +407,7 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
             let _ = write_line(&mut writer, &frame).await;
             return Ok(());
         }
-    }
+    };
 
     // Subscribe BEFORE snapshotting. Anything published in the window between
     // the two arrives on `updates` and is also in the snapshot; the version on
@@ -442,8 +418,32 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
     // dropped here is gone for good, since it carries no version and no
     // snapshot contains it.
     let mut signals = hub.subscribe_signals();
+    // Subscribed before the reload is asked for, and for the same reason the
+    // snapshot is taken after subscribing: the load must not land in the
+    // window between the two.
+    // Only for a client that asked. The count of these receivers is what
+    // tells the bridge whether to prepare session events at all — writing
+    // every photo in the account to the cache and serializing its whole
+    // traffic — so a tray holding one it never reads would make it do all of
+    // that for nobody. An `Option` rather than a receiver whose sender is
+    // already gone, because that looks exactly like a closed channel and the
+    // branch below ends the connection on one.
+    let mut sessions = attached.session_events.then(|| hub.subscribe_sessions());
+
+    // Frames addressed to this connection alone: a download's answer belongs
+    // to whoever asked, and the ids are client-chosen.
+    let (outbox, mut inbox) = tokio::sync::mpsc::channel::<String>(OUTBOX_CAPACITY);
+
     let hello = hub.hello_frame().context("serializing the snapshot")?;
     write_line(&mut writer, &hello).await?;
+
+    if attached.session_events {
+        // Nothing in the store has changed, so the session's invalidation
+        // stream has nothing to say and this client would sit empty until the
+        // next message arrived. Asked for after the subscription so the load
+        // it produces cannot be missed.
+        let _ = dispatch(&hub, &commands, Action::ReloadHistory).await;
+    }
 
     // Set once the client has been told to resync. Until it asks for a
     // snapshot its view is known-stale, so further updates are worthless to it
@@ -473,6 +473,28 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
                 Err(RecvError::Closed) => return Ok(()),
             },
 
+            // Neither of these is gated on `awaiting_resync`: a session
+            // event is not a summary, and a download this client asked for is
+            // its own answer. Both are lost for good if dropped.
+            // The guard is what makes the `expect` safe: `select!` evaluates
+            // it before the future.
+            session = async { sessions.as_mut().expect("guarded").recv().await },
+                if sessions.is_some() => match session {
+                Ok(frame) => write_line(&mut writer, &frame).await?,
+                // A front end that overruns cannot patch the gap from a
+                // snapshot: it holds messages, not summaries. Telling it to
+                // resync is the only answer, and it reloads history when it
+                // reattaches.
+                Err(RecvError::Lagged(missed)) => {
+                    log::debug!("front end fell {missed} session events behind");
+                    let frame = serde_json::to_string(&DaemonMessage::Resync)?;
+                    write_line(&mut writer, &frame).await?;
+                }
+                Err(RecvError::Closed) => return Ok(()),
+            },
+
+            Some(frame) = inbox.recv() => write_line(&mut writer, &frame).await?,
+
             // Not gated on `awaiting_resync`. A client recovering its state
             // is exactly when the tray's Open item is most likely to be
             // clicked, and there is nothing here for a snapshot to restore.
@@ -501,7 +523,7 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
                         updates = hub.subscribe();
                         awaiting_resync = false;
                     }
-                    let answer = handle_request(&line, &hub, &commands).await;
+                    let answer = handle_request(&line, &hub, &commands, &outbox).await;
                     if let Some(frame) = answer.frame {
                         write_line(&mut writer, &frame).await?;
                     }
@@ -540,27 +562,29 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
 /// rejected hello from a dead socket. The caller bounds the whole thing in
 /// time, which is what stops that leniency from being a way to hold a slot
 /// open forever.
-async fn handshake(
-    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+async fn handshake<S: AsyncRead + AsyncWrite>(
+    reader: &mut BufReader<ReadHalf<S>>,
+    writer: &mut WriteHalf<S>,
     buf: &mut Vec<u8>,
-) -> Result<bool> {
+) -> Result<Option<Attached>> {
     loop {
         match read_frame(reader, buf).await? {
             Some(FrameRead::Line(line)) => match check_hello(&line) {
-                Some(rejection) => {
-                    write_line(writer, &rejection).await?;
-                    return Ok(false);
+                Ok(attached) => return Ok(Some(attached)),
+                Err(rejection) => {
+                    if let Some(rejection) = rejection {
+                        write_line(writer, &rejection).await?;
+                    }
+                    return Ok(None);
                 }
-                None => return Ok(true),
             },
             Some(FrameRead::NotUtf8) => write_line(writer, &not_utf8()?).await?,
             Some(FrameRead::TooLong) => {
                 let frame = malformed(&format!("frame exceeded {MAX_REQUEST_BYTES} bytes"))?;
                 write_line(writer, &frame).await?;
-                return Ok(false);
+                return Ok(None);
             }
-            None => return Ok(false),
+            None => return Ok(None),
         }
     }
 }
@@ -586,26 +610,37 @@ fn is_snapshot_request(line: &str) -> bool {
     )
 }
 
-/// Validate the client's opening frame, returning a rejection to send when it
-/// is not acceptable.
-fn check_hello(line: &str) -> Option<String> {
+/// What an accepted hello asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attached {
+    /// Whether this client wants the session's own events as well as
+    /// summaries. See [`ClientRequest::Hello`].
+    session_events: bool,
+}
+
+/// Validate the client's opening frame.
+///
+/// `Err` carries the rejection to send; `Ok` carries what the client asked to
+/// be served.
+fn check_hello(line: &str) -> Result<Attached, Option<String>> {
     let request: ClientRequest = match serde_json::from_str(line) {
         Ok(r) => r,
-        Err(e) => {
-            return malformed(&e.to_string()).ok();
-        }
+        Err(e) => return Err(malformed(&e.to_string()).ok()),
     };
 
     match request {
-        ClientRequest::Hello { protocol } if protocol == PROTOCOL_VERSION => None,
-        ClientRequest::Hello { protocol } => {
-            serde_json::to_string(&DaemonMessage::Error(ProtocolError::VersionMismatch {
+        ClientRequest::Hello {
+            protocol,
+            session_events,
+        } if protocol == PROTOCOL_VERSION => Ok(Attached { session_events }),
+        ClientRequest::Hello { protocol, .. } => Err(serde_json::to_string(&DaemonMessage::Error(
+            ProtocolError::VersionMismatch {
                 client: protocol,
                 daemon: PROTOCOL_VERSION,
-            }))
-            .ok()
-        }
-        _ => malformed("first frame must be a hello").ok(),
+            },
+        ))
+        .ok()),
+        _ => Err(malformed("first frame must be a hello").ok()),
     }
 }
 
@@ -633,7 +668,12 @@ impl Answer {
 /// Every request gets exactly one answer, including the ones that fail: a
 /// client waiting on a reply that was never going to arrive is worse than a
 /// client told no.
-async fn handle_request(line: &str, hub: &StateHub, commands: &Commands) -> Answer {
+async fn handle_request(
+    line: &str,
+    hub: &StateHub,
+    commands: &Commands,
+    outbox: &Outbox,
+) -> Answer {
     let request: ClientRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -648,13 +688,86 @@ async fn handle_request(line: &str, hub: &StateHub, commands: &Commands) -> Answ
         // A second hello is harmless but says nothing; acknowledging keeps the
         // rule that every request gets exactly one answer.
         ClientRequest::Hello { .. } => Answer::frame(accepted()),
-        ClientRequest::SendText { jid, text } => {
-            Answer::frame(dispatch(hub, commands, Action::SendText { jid, text }).await)
+        ClientRequest::SendText {
+            jid,
+            text,
+            local_id,
+        } => {
+            let result = dispatch(
+                hub,
+                commands,
+                Action::SendText {
+                    jid: jid.clone(),
+                    text,
+                    local_id: local_id.clone(),
+                },
+            )
+            .await;
+            if let Err(e) = &result {
+                note_send_failure(outbox, &jid, local_id.as_deref(), e);
+            }
+            Answer::frame(answer(result))
+        }
+        ClientRequest::SendAudio {
+            jid,
+            upload,
+            duration_secs,
+            waveform,
+            local_id,
+        } => {
+            let result = dispatch(
+                hub,
+                commands,
+                Action::SendAudio {
+                    jid: jid.clone(),
+                    upload,
+                    duration_secs,
+                    waveform,
+                    local_id: local_id.clone(),
+                },
+            )
+            .await;
+            if let Err(e) = &result {
+                note_send_failure(outbox, &jid, local_id.as_deref(), e);
+            }
+            Answer::frame(answer(result))
+        }
+        ClientRequest::Typing { jid, composing } => Answer::frame(answer(
+            dispatch(hub, commands, Action::Typing { jid, composing }).await,
+        )),
+        ClientRequest::Call(action) => {
+            Answer::frame(answer(dispatch(hub, commands, Action::Call(action)).await))
+        }
+        ClientRequest::Download { id, media } => {
+            let result = dispatch(
+                hub,
+                commands,
+                Action::Download {
+                    id,
+                    media,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await;
+            if let Err(e) = &result {
+                // The request carries an id so its answer can be found. A
+                // refusal that arrives as a bare error is one the client
+                // cannot match to anything, so it waits out its own timeout
+                // and keeps the entry until the connection closes.
+                let _ = outbox.try_send(download_failed(id, e));
+            }
+            Answer::frame(answer(result))
+        }
+        ClientRequest::ReloadHistory => {
+            Answer::frame(answer(dispatch(hub, commands, Action::ReloadHistory).await))
+        }
+        ClientRequest::ForgetSession => {
+            Answer::frame(answer(dispatch(hub, commands, Action::ForgetSession).await))
         }
         ClientRequest::MarkRead {
             jid,
             through_message_id,
-        } => Answer::frame(
+        } => Answer::frame(answer(
             dispatch(
                 hub,
                 commands,
@@ -664,7 +777,7 @@ async fn handle_request(line: &str, hub: &StateHub, commands: &Commands) -> Answ
                 },
             )
             .await,
-        ),
+        )),
         // The daemon has no window of its own, so this is relayed rather than
         // acted on: whoever owns a window is the only one that can raise it.
         // Published to every client, including the one that asked, because a
@@ -690,13 +803,18 @@ async fn handle_request(line: &str, hub: &StateHub, commands: &Commands) -> Answ
 /// admission would never learn its message went nowhere. It is also the
 /// backpressure — a connection has one command outstanding at a time, so the
 /// client cap is also the cap on queued work.
-async fn dispatch(hub: &StateHub, commands: &Commands, action: Action) -> Option<String> {
+async fn dispatch(
+    hub: &StateHub,
+    commands: &Commands,
+    action: Action,
+) -> Result<(), ProtocolError> {
     // Refused early as well as late: a client that is watching the connection
     // state should get the answer it can already predict, without the round
-    // trip.
+    // trip. Only for what actually needs the network — see
+    // [`Action::needs_network`].
     let connection = hub.connection();
-    if !connection.is_connected() {
-        return no_session(&format!("not connected: {connection:?}"));
+    if action.needs_network() && !connection.is_connected() {
+        return Err(no_session(format!("not connected: {connection:?}")));
     }
 
     let (reply, answer) = tokio::sync::oneshot::channel();
@@ -706,37 +824,70 @@ async fn dispatch(hub: &StateHub, commands: &Commands, action: Action) -> Option
         .is_err()
     {
         // The bridge is gone: the daemon is on its way down.
-        return no_session("the session is shutting down");
+        return Err(no_session("the session is shutting down"));
     }
 
     match answer.await {
-        Ok(CommandOutcome::Accepted) => accepted(),
-        Ok(CommandOutcome::NoSession(detail)) => no_session(&detail),
-        Ok(CommandOutcome::Refused(detail)) => refused(&detail),
+        Ok(CommandOutcome::Accepted) => Ok(()),
+        Ok(CommandOutcome::NoSession(detail)) => Err(no_session(detail)),
+        Ok(CommandOutcome::Refused(detail)) => Err(ProtocolError::Refused { detail }),
         // The bridge took the command and died before answering.
-        Err(_) => no_session("the session stopped before it answered"),
+        Err(_) => Err(no_session("the session stopped before it answered")),
     }
+}
+
+/// The frame that answers a command, whichever way it went.
+fn answer(result: Result<(), ProtocolError>) -> Option<String> {
+    match result {
+        Ok(()) => accepted(),
+        Err(e) => serde_json::to_string(&DaemonMessage::Error(e)).ok(),
+    }
+}
+
+/// Tell a client its send never happened, in the terms it already renders.
+///
+/// A front end draws the message the moment it asks, and an error frame it can
+/// only log leaves that bubble pending forever. `local_id` is the correlation
+/// this protocol already has — the client chose it precisely so it could match
+/// the rename — so a refusal comes back as the `SendFailed` the client already
+/// handles rather than as anything new.
+fn note_send_failure(outbox: &Outbox, jid: &str, local_id: Option<&str>, error: &ProtocolError) {
+    // Nothing was drawn, so there is nothing to correct.
+    let Some(message_id) = local_id else { return };
+    let event = oxidezap_core::UiEvent::SendFailed {
+        chat_jid: jid.to_string(),
+        message_id: message_id.to_string(),
+        reason: error.to_string(),
+    };
+    if let Ok(frame) = serde_json::to_string(&DaemonMessage::Session {
+        event: Box::new(event),
+    }) {
+        let _ = outbox.try_send(frame);
+    }
+}
+
+/// A download that never started, under the id it was asked for.
+fn download_failed(id: oxidezap_ipc::RequestId, error: &ProtocolError) -> String {
+    serde_json::to_string(&DaemonMessage::Downloaded {
+        id,
+        result: Err(error.to_string()),
+    })
+    // A `Result<String, String>` cannot fail to serialize; spelling the
+    // fallback out beats an unwrap on a path that answers an error.
+    .unwrap_or_else(|e| format!(r#"{{"type":"error","error":"malformed","detail":"{e}"}}"#))
 }
 
 fn accepted() -> Option<String> {
     serde_json::to_string(&DaemonMessage::Accepted).ok()
 }
 
-fn no_session(detail: &str) -> Option<String> {
-    serde_json::to_string(&DaemonMessage::Error(ProtocolError::NoSession {
+fn no_session(detail: impl Into<String>) -> ProtocolError {
+    ProtocolError::NoSession {
         detail: detail.into(),
-    }))
-    .ok()
+    }
 }
 
-fn refused(detail: &str) -> Option<String> {
-    serde_json::to_string(&DaemonMessage::Error(ProtocolError::Refused {
-        detail: detail.into(),
-    }))
-    .ok()
-}
-
-async fn write_line(writer: &mut tokio::net::unix::OwnedWriteHalf, line: &str) -> Result<()> {
+async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> Result<()> {
     writer.write_all(line.as_bytes()).await?;
     // Newline-delimited framing: the reader above splits on it, so a frame
     // containing one would desynchronize the stream. serde_json never emits a
@@ -749,13 +900,43 @@ async fn write_line(writer: &mut tokio::net::unix::OwnedWriteHalf, line: &str) -
 mod tests {
     use super::*;
 
+    fn hello(protocol: u32, session_events: bool) -> String {
+        serde_json::to_string(&ClientRequest::Hello {
+            protocol,
+            session_events,
+        })
+        .unwrap()
+    }
+
     #[test]
     fn a_matching_hello_is_accepted() {
-        let line = serde_json::to_string(&ClientRequest::Hello {
-            protocol: PROTOCOL_VERSION,
-        })
-        .unwrap();
-        assert!(check_hello(&line).is_none(), "no rejection frame");
+        assert_eq!(
+            check_hello(&hello(PROTOCOL_VERSION, false)),
+            Ok(Attached {
+                session_events: false
+            })
+        );
+    }
+
+    /// The session stream is opt-in: a tray that never asked must not be sent
+    /// every message in the account.
+    #[test]
+    fn the_session_stream_is_only_served_when_asked_for() {
+        assert_eq!(
+            check_hello(&hello(PROTOCOL_VERSION, true)),
+            Ok(Attached {
+                session_events: true
+            })
+        );
+        // An older client that does not know the field at all still connects,
+        // and gets summaries.
+        let line = format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION}}}"#);
+        assert_eq!(
+            check_hello(&line),
+            Ok(Attached {
+                session_events: false
+            })
+        );
     }
 
     /// A client speaking another version must be turned away before it is
@@ -763,11 +944,9 @@ mod tests {
     /// commands it may be misreading.
     #[test]
     fn a_mismatched_hello_is_rejected_with_both_versions() {
-        let line = serde_json::to_string(&ClientRequest::Hello {
-            protocol: PROTOCOL_VERSION + 1,
-        })
-        .unwrap();
-        let reply: DaemonMessage = serde_json::from_str(&check_hello(&line).unwrap()).unwrap();
+        let rejection = check_hello(&hello(PROTOCOL_VERSION + 1, false))
+            .expect_err("a mismatch is turned away");
+        let reply: DaemonMessage = serde_json::from_str(&rejection.unwrap()).unwrap();
         match reply {
             DaemonMessage::Error(ProtocolError::VersionMismatch { client, daemon }) => {
                 assert_eq!(client, PROTOCOL_VERSION + 1);
@@ -780,7 +959,8 @@ mod tests {
     #[test]
     fn state_is_not_served_before_a_hello() {
         let line = serde_json::to_string(&ClientRequest::Snapshot).unwrap();
-        let reply: DaemonMessage = serde_json::from_str(&check_hello(&line).unwrap()).unwrap();
+        let rejection = check_hello(&line).expect_err("anything else is turned away");
+        let reply: DaemonMessage = serde_json::from_str(&rejection.unwrap()).unwrap();
         assert!(matches!(
             reply,
             DaemonMessage::Error(ProtocolError::Malformed { .. })
@@ -798,6 +978,12 @@ mod tests {
 
     fn request_line(request: &ClientRequest) -> String {
         serde_json::to_string(request).unwrap()
+    }
+
+    /// A connection's own answer channel. Tests that do not read it only
+    /// need it to exist.
+    fn outbox() -> Outbox {
+        tokio::sync::mpsc::channel(OUTBOX_CAPACITY).0
     }
 
     fn parse(frame: Option<String>) -> DaemonMessage {
@@ -826,13 +1012,14 @@ mod tests {
         let line = request_line(&ClientRequest::SendText {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
+            local_id: None,
         });
-        let answer = handle_request(&line, &hub, &commands).await;
+        let answer = handle_request(&line, &hub, &commands, &outbox()).await;
         assert_eq!(parse(answer.frame), DaemonMessage::Accepted);
         assert!(!answer.shutdown);
         assert!(matches!(
             taken.await.unwrap(),
-            Some(Action::SendText { jid, text }) if jid == "a@s.whatsapp.net" && text == "hi"
+            Some(Action::SendText { jid, text, .. }) if jid == "a@s.whatsapp.net" && text == "hi"
         ));
     }
 
@@ -851,7 +1038,7 @@ mod tests {
             jid: "a@s.whatsapp.net".into(),
             through_message_id: None,
         });
-        let answer = handle_request(&line, &hub, &commands).await;
+        let answer = handle_request(&line, &hub, &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error(ProtocolError::Refused { ref detail })
@@ -870,8 +1057,9 @@ mod tests {
         let line = request_line(&ClientRequest::SendText {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
+            local_id: None,
         });
-        let answer = handle_request(&line, &hub, &commands).await;
+        let answer = handle_request(&line, &hub, &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error(ProtocolError::NoSession { .. })
@@ -890,8 +1078,9 @@ mod tests {
         let line = request_line(&ClientRequest::SendText {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
+            local_id: None,
         });
-        let answer = handle_request(&line, &hub, &commands).await;
+        let answer = handle_request(&line, &hub, &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error(ProtocolError::NoSession { .. })
@@ -913,7 +1102,13 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
-        let answer = handle_request(&request_line(&ClientRequest::Shutdown), &hub, &commands).await;
+        let answer = handle_request(
+            &request_line(&ClientRequest::Shutdown),
+            &hub,
+            &commands,
+            &outbox(),
+        )
+        .await;
         assert_eq!(parse(answer.frame), DaemonMessage::Accepted);
         assert!(answer.shutdown, "and only then is the daemon asked to stop");
     }
@@ -924,7 +1119,7 @@ mod tests {
     async fn a_malformed_frame_is_answered_and_does_not_end_the_connection() {
         let hub = StateHub::new();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
-        let answer = handle_request("not json at all", &hub, &commands).await;
+        let answer = handle_request("not json at all", &hub, &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error(ProtocolError::Malformed { .. })
@@ -941,7 +1136,7 @@ mod tests {
         let mut signals = hub.subscribe_signals();
 
         let line = request_line(&ClientRequest::ShowWindow);
-        let answer = handle_request(&line, &hub, &commands).await;
+        let answer = handle_request(&line, &hub, &commands, &outbox()).await;
         assert_eq!(parse(answer.frame), DaemonMessage::Accepted);
 
         let frame: DaemonMessage = serde_json::from_str(&signals.recv().await.unwrap()).unwrap();
@@ -975,7 +1170,7 @@ mod tests {
         });
 
         for i in 0..frames {
-            match read_frame_generic(&mut reader, &mut buf).await {
+            match read_frame(&mut reader, &mut buf).await {
                 Ok(Some(FrameRead::Line(line))) => assert_eq!(line.len(), 1000),
                 other => panic!("frame {i} of {frames} was cut short: {other:?}"),
             }
@@ -998,12 +1193,12 @@ mod tests {
         });
 
         assert!(matches!(
-            read_frame_generic(&mut reader, &mut buf).await,
+            read_frame(&mut reader, &mut buf).await,
             Ok(Some(FrameRead::NotUtf8))
         ));
         // The stream survives it.
         assert!(matches!(
-            read_frame_generic(&mut reader, &mut buf).await,
+            read_frame(&mut reader, &mut buf).await,
             Ok(Some(FrameRead::Line(_)))
         ));
     }
@@ -1024,7 +1219,7 @@ mod tests {
         // because the frame is not finished; the ready branch wins.
         tokio::select! {
             biased;
-            frame = read_frame_generic(&mut reader, &mut buf) => {
+            frame = read_frame(&mut reader, &mut buf) => {
                 panic!("an unterminated frame must not complete: {frame:?}");
             }
             () = std::future::ready(()) => {}
@@ -1032,7 +1227,7 @@ mod tests {
         assert!(!buf.is_empty(), "the prefix was consumed and kept");
 
         client.write_all(b"shot\"}\n").await.unwrap();
-        match read_frame_generic(&mut reader, &mut buf).await {
+        match read_frame(&mut reader, &mut buf).await {
             Ok(Some(FrameRead::Line(line))) => {
                 assert!(
                     matches!(
@@ -1057,7 +1252,7 @@ mod tests {
         let mut buf = vec![b'x'; MAX_REQUEST_BYTES];
 
         assert!(matches!(
-            read_frame_generic(&mut reader, &mut buf).await,
+            read_frame(&mut reader, &mut buf).await,
             Ok(Some(FrameRead::TooLong))
         ));
         assert!(buf.is_empty(), "a refused frame leaves nothing behind");
@@ -1069,21 +1264,21 @@ mod tests {
     /// hello from a dead socket.
     #[tokio::test]
     async fn a_hello_that_is_not_text_is_answered_rather_than_dropped() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let (reader, mut writer) = server.into_split();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (reader, mut writer) = tokio::io::split(server);
         let mut reader = BufReader::new(reader);
         let mut buf = Vec::new();
 
-        let hello = serde_json::to_string(&ClientRequest::Hello {
-            protocol: PROTOCOL_VERSION,
-        })
-        .unwrap();
+        let hello = hello(PROTOCOL_VERSION, false);
         client.write_all(&[0xff, 0xfe, b'\n']).await.unwrap();
         client.write_all(hello.as_bytes()).await.unwrap();
         client.write_all(b"\n").await.unwrap();
 
         assert!(
-            handshake(&mut reader, &mut writer, &mut buf).await.unwrap(),
+            handshake(&mut reader, &mut writer, &mut buf)
+                .await
+                .unwrap()
+                .is_some(),
             "the client recovered and was let in"
         );
 
@@ -1095,12 +1290,141 @@ mod tests {
         ));
     }
 
+    /// The regression this replaced: a summary-only client was handed its
+    /// snapshot and then dropped, because the branch serving session events
+    /// ended the connection on a closed channel and opting out produced one.
+    #[tokio::test]
+    async fn a_client_that_wants_only_summaries_stays_connected() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let hub = connected_hub();
+        let (commands, _taken) = bridge(CommandOutcome::Accepted);
+
+        let served = tokio::spawn(serve_client(server, Arc::clone(&hub), commands));
+        client
+            .write_all(format!("{}\n", hello(PROTOCOL_VERSION, false)).as_bytes())
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+                DaemonMessage::Hello { .. }
+            ),
+            "expected a snapshot, got {line}"
+        );
+
+        // Still there: a summary reaches it rather than an EOF.
+        hub.apply(crate::state::Change::live(
+            oxidezap_ipc::DaemonEvent::ChatRemoved {
+                jid: "a@s.whatsapp.net".into(),
+            },
+        ));
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+                DaemonMessage::Update { .. }
+            ),
+            "the connection was dropped instead: {line}"
+        );
+        served.abort();
+    }
+
+    /// The other half: a client that asked for events gets them, and the
+    /// summary stream keeps working alongside.
+    #[tokio::test]
+    async fn a_client_that_asked_for_events_receives_them() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let hub = connected_hub();
+        let (commands, _taken) = bridge(CommandOutcome::Accepted);
+
+        let served = tokio::spawn(serve_client(server, Arc::clone(&hub), commands));
+        client
+            .write_all(format!("{}\n", hello(PROTOCOL_VERSION, true)).as_bytes())
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap(); // the hello
+
+        hub.publish_session(
+            serde_json::to_string(&DaemonMessage::Session {
+                event: Box::new(oxidezap_core::UiEvent::Connected),
+            })
+            .unwrap(),
+        );
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+                DaemonMessage::Session { .. }
+            ),
+            "expected a session event, got {line}"
+        );
+        served.abort();
+    }
+
+    /// Forgetting the session is the only way out of dead credentials, and
+    /// dead credentials are a state the account is unreachable in. Gating it
+    /// on a connection refuses it exactly when it is wanted.
+    #[test]
+    fn the_local_actions_do_not_need_a_connection() {
+        assert!(!Action::ForgetSession.needs_network());
+        assert!(!Action::ReloadHistory.needs_network());
+        assert!(
+            Action::SendText {
+                jid: "a@s.whatsapp.net".into(),
+                text: "hi".into(),
+                local_id: None,
+            }
+            .needs_network()
+        );
+    }
+
+    /// A refused send leaves a message the client has already drawn. It comes
+    /// back as the failure the client already renders, keyed by the local id
+    /// it chose for exactly this.
+    #[tokio::test]
+    async fn a_refused_send_is_reported_against_the_message_it_drew() {
+        // Not connected, so the send is refused at the door.
+        let hub = StateHub::new();
+        let (commands, _taken) = bridge(CommandOutcome::Accepted);
+        let (outbox, mut inbox) = tokio::sync::mpsc::channel(OUTBOX_CAPACITY);
+
+        let line = request_line(&ClientRequest::SendText {
+            jid: "a@s.whatsapp.net".into(),
+            text: "hi".into(),
+            local_id: Some("local_1".into()),
+        });
+        let answer = handle_request(&line, &hub, &commands, &outbox).await;
+        assert!(matches!(
+            parse(answer.frame),
+            DaemonMessage::Error(ProtocolError::NoSession { .. })
+        ));
+
+        let frame: DaemonMessage = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+        match frame {
+            DaemonMessage::Session { event } => assert!(
+                matches!(*event, oxidezap_core::UiEvent::SendFailed { ref message_id, .. }
+                    if message_id == "local_1"),
+                "expected the bubble to be failed, got {event:?}"
+            ),
+            other => panic!("expected a session event, got {other:?}"),
+        }
+    }
+
     /// A peer that connects and says nothing costs a task and a descriptor
     /// for as long as it likes. A reconnect loop doing it takes the listener
     /// down, and the daemon treats a dead listener as fatal.
     #[tokio::test(start_paused = true)]
     async fn a_client_that_never_speaks_does_not_hold_its_slot_forever() {
-        let (client, server) = UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(64 * 1024);
         let hub = StateHub::new();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
@@ -1123,7 +1447,7 @@ mod tests {
     /// it retries against a daemon that will keep refusing it.
     #[tokio::test]
     async fn a_refused_client_is_told_the_daemon_is_full() {
-        let (client, server) = UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(64 * 1024);
         reject(server).await;
 
         let mut answer = String::new();
@@ -1161,6 +1485,12 @@ mod tests {
 
     /// The fallback directory sits at a predictable path in a world-writable
     /// place, so a symlink planted there must not be followed.
+    ///
+    /// Unix only, and not for want of porting: on Windows the state directory
+    /// is under the user's own profile, so there is no world-writable parent
+    /// for anyone to plant anything in, and `prepare_state_dir` has nothing
+    /// to check.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_socket_dir_is_refused() {
         let base = std::env::temp_dir().join(format!("oxidezap-symlink-{}", std::process::id()));
@@ -1172,7 +1502,7 @@ mod tests {
         let link = base.join("sockdir");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let err = prepare_socket_dir(&link).expect_err("a symlink must be refused");
+        let err = prepare_state_dir(&link).expect_err("a symlink must be refused");
         assert!(
             err.to_string().contains("not a directory"),
             "unexpected reason: {err}"
@@ -1182,6 +1512,9 @@ mod tests {
     }
 
     /// A directory we already own is reused, and tightened if it is loose.
+    ///
+    /// Unix only, for the same reason as the symlink check above.
+    #[cfg(unix)]
     #[test]
     fn a_loose_but_owned_dir_is_tightened_rather_than_refused() {
         use std::os::unix::fs::PermissionsExt;
@@ -1191,33 +1524,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        prepare_socket_dir(&dir).expect("our own directory is usable");
+        prepare_state_dir(&dir).expect("our own directory is usable");
 
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "left readable by other users");
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The bug this replaced: unlinking before binding let a second daemon
-    /// steal a live one's path, leaving two sessions on one account.
-    // tokio's UnixListener registers with the reactor, so binding needs a
-    // runtime even though the rest of this check is synchronous.
-    #[tokio::test]
-    async fn binding_over_a_live_socket_fails_instead_of_stealing_it() {
-        let dir = std::env::temp_dir().join(format!("oxidezap-bind-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("daemon.sock");
-        let _ = std::fs::remove_file(&path);
-
-        let first = bind(&path).expect("first bind succeeds");
-        let second = bind(&path);
-        assert!(second.is_err(), "a live socket must not be taken over");
-
-        drop(first);
-        // With the listener gone the path is stale, and reclaiming it is
-        // exactly what lets a daemon restart after a crash.
-        assert!(bind(&path).is_ok(), "a stale socket is reclaimed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

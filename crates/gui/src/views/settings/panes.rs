@@ -26,7 +26,7 @@ pub fn render(
         SettingsSection::Notifications => notifications(metrics, cx),
         SettingsSection::AudioVideo => audio_video(metrics, cx),
         SettingsSection::Privacy => privacy(entity, metrics, cx),
-        SettingsSection::Storage => storage(app, metrics, cx),
+        SettingsSection::Storage => storage(metrics, cx),
         SettingsSection::Advanced => advanced(metrics, cx),
         // Rendered by its own module.
         SettingsSection::Appearance => div().into_any_element(),
@@ -258,28 +258,20 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
         .into_any_element()
 }
 
-fn storage(app: &WhatsAppApp, metrics: Metrics, cx: &App) -> AnyElement {
-    let database = app
-        .database_size()
-        .map(format_size)
-        .unwrap_or_else(|| "—".to_string());
-
+fn storage(metrics: Metrics, cx: &App) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(metrics.space_xxl())
         .child(group(
             label("ON DISK", metrics, cx),
-            div()
-                .flex()
-                .flex_col()
-                .child(row("Message store".to_string(), database, metrics, cx))
-                .child(row(
-                    "Media cache".to_string(),
-                    "not cached".to_string(),
-                    metrics,
-                    cx,
-                )),
+            pending(
+                "The message store belongs to the daemon, which is the only \
+                 process that opens it. Reporting its size — and clearing it — \
+                 needs a request this protocol version does not have yet.",
+                metrics,
+                cx,
+            ),
             metrics,
         ))
         .child(group(

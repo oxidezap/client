@@ -5715,6 +5715,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "serde",
  "wacore",
  "wacore-binary",
 ]
@@ -5738,6 +5739,7 @@ dependencies = [
  "tokio",
  "wacore",
  "wacore-binary",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5758,7 +5760,7 @@ dependencies = [
  "openh264",
  "oxidezap-audio",
  "oxidezap-core",
- "oxidezap-session",
+ "oxidezap-ipc",
  "portable-atomic",
  "qrcode",
  "rust-embed",
@@ -5768,6 +5770,7 @@ dependencies = [
  "smol",
  "symphonia",
  "tokio",
+ "wacore",
  "whatsapp-rust",
 ]
 
@@ -5775,6 +5778,7 @@ dependencies = [
 name = "oxidezap-ipc"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "oxidezap-core",
  "rustix 1.1.4",
  "serde",

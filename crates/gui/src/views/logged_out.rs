@@ -20,7 +20,6 @@ pub fn render_logged_out_view(
     cx: &App,
 ) -> impl IntoElement {
     let metrics = cx.product().metrics;
-    let export_entity = entity.clone();
     let pair_entity = entity;
 
     centered_view(metrics.space_xxl(), cx)
@@ -72,30 +71,16 @@ pub fn render_logged_out_view(
                 ),
         )
         .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(metrics.space_lg())
-                .child(
-                    // Offered before the destructive action, because after it
-                    // there is nothing left to export.
-                    Button::new("export-history")
-                        .label("Export history…")
-                        .outline()
-                        .on_click(move |_, _, cx| {
-                            export_entity.update(cx, |this, cx| this.export_history(cx));
-                        }),
-                )
-                .child(
-                    // Outline, not filled: this is irreversible, and a filled
-                    // primary would make it the obvious thing to click.
-                    Button::new("pair-again")
-                        .label("Clear data and pair again")
-                        .danger()
-                        .outline()
-                        .on_click(move |_, _, cx| {
-                            pair_entity.update(cx, |this, cx| this.reset_and_pair_again(cx));
-                        }),
-                ),
+            div().flex().items_center().gap(metrics.space_lg()).child(
+                // Outline, not filled: this is irreversible, and a filled
+                // primary would make it the obvious thing to click.
+                Button::new("pair-again")
+                    .label("Clear data and pair again")
+                    .danger()
+                    .outline()
+                    .on_click(move |_, _, cx| {
+                        pair_entity.update(cx, |this, cx| this.reset_and_pair_again(cx));
+                    }),
+            ),
         )
 }

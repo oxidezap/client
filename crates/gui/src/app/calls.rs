@@ -379,36 +379,33 @@ impl CallState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
     use whatsapp_rust::wacore_binary::jid::Jid;
 
     /// A minimal library offer.
     ///
-    /// The state machine never reads it — only `client.voip().accept()` does —
-    /// but `IncomingCall` carries it, so the fixture has to produce one. It is
-    /// `#[non_exhaustive]` with a builder, so this is the only way in.
-    fn offer(id: &str) -> Arc<WaIncomingCall> {
+    /// The state machine never reads it — only the daemon's voip facade does —
+    /// but `IncomingCall::new` takes one, so the fixture has to produce it. It
+    /// is `#[non_exhaustive]` with a builder, so this is the only way in.
+    fn offer(id: &str) -> WaIncomingCall {
         let jid: Jid = "a@s.whatsapp.net".parse().expect("valid jid");
-        Arc::new(
-            WaIncomingCall::builder()
-                .from(jid.clone())
-                .stanza_id(id.to_string())
-                .timestamp(whatsapp_rust::wacore::time::now_utc())
-                .offline(false)
-                .action(CallAction::Offer {
-                    call_id: id.to_string(),
-                    call_creator: jid,
-                    caller_pn: None,
-                    caller_country_code: None,
-                    device_class: None,
-                    joinable: true,
-                    is_video: false,
-                    audio: Vec::new(),
-                    group_jid: None,
-                })
-                .build(),
-        )
+        WaIncomingCall::builder()
+            .from(jid.clone())
+            .stanza_id(id.to_string())
+            .timestamp(whatsapp_rust::wacore::time::now_utc())
+            .offline(false)
+            .action(CallAction::Offer {
+                call_id: id.to_string(),
+                call_creator: jid,
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            })
+            .build()
     }
 
     fn incoming(id: &str) -> IncomingCall {
@@ -417,7 +414,7 @@ mod tests {
             "Ana".to_string(),
             "a@s.whatsapp.net".to_string(),
             false,
-            offer(id),
+            &offer(id),
         )
     }
 

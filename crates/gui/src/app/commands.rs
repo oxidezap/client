@@ -136,20 +136,6 @@ impl WhatsAppApp {
         self.apply_theme_draft(window, cx);
     }
 
-    /// Size of the message store on disk, for the Storage section.
-    pub fn database_size(&self) -> Option<u64> {
-        let path = oxidezap_session::resolve_database_path();
-        // The write-ahead log is part of what the store occupies; reporting
-        // only the main file understates it by however much has not merged.
-        let of = |suffix: &str| {
-            std::fs::metadata(format!("{path}{suffix}"))
-                .map(|m| m.len())
-                .unwrap_or(0)
-        };
-        let total = of("") + of("-wal") + of("-shm");
-        (total > 0).then_some(total)
-    }
-
     /// Install the draft theme so the window shows the change while it is
     /// being chosen.
     pub fn apply_theme_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {

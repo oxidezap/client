@@ -1,5 +1,7 @@
 //! The message a reply points back at.
 
+use serde::{Deserialize, Serialize};
+
 /// A one-line summary of the message being replied to.
 ///
 /// Deliberately a snapshot rather than a reference: the original may be
@@ -7,7 +9,7 @@
 /// pruned, and a reply must still render its quote. [`Self::message_id`] is
 /// what lets the UI jump to the original *when* it is present, and the
 /// snapshot is what it falls back to when it is not.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotedMessage {
     /// Id of the original, for the jump-to-original gesture.
     pub message_id: String,
@@ -25,7 +27,8 @@ pub struct QuotedMessage {
 
 /// The non-text shape of a quoted message, so the quote can say `Photo`
 /// rather than nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum QuotedKind {
     Image,
     Video,

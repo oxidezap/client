@@ -88,29 +88,4 @@ impl WhatsAppApp {
             let _ = entity.update(cx, |app, _| app.retry_task = None);
         }));
     }
-
-    /// Write the local history somewhere the user keeps it.
-    ///
-    /// Offered before "clear data and pair again", because afterwards there is
-    /// nothing left to export. The store is one SQLite file, so a copy of it
-    /// is the whole history — no format of our own to go stale.
-    pub fn export_history(&mut self, cx: &mut Context<Self>) {
-        let source = oxidezap_session::resolve_database_path();
-        match copy_database_to_downloads(&source) {
-            Ok(path) => info!("Exported history to {}", path.display()),
-            Err(err) => {
-                error!("Could not export history: {err}");
-                self.app_state = AppState::Error(format!("Could not export history: {err}"));
-                cx.notify();
-            }
-        }
-    }
-}
-
-/// Copy the store beside the user's other downloads.
-fn copy_database_to_downloads(source: &str) -> std::io::Result<std::path::PathBuf> {
-    let bytes = std::fs::read(source)?;
-    // The same sanitising path a received document takes, so the two cannot
-    // disagree about where downloads land.
-    save_to_downloads("oxidezap-history.db", &bytes)
 }

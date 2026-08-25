@@ -1,5 +1,6 @@
 //! Messages exchanged over the socket.
 
+use oxidezap_core::{DownloadableMedia, IncomingCall, UiEvent};
 use serde::{Deserialize, Serialize};
 
 /// Monotonic counter over daemon state.
@@ -135,6 +136,14 @@ pub struct StateSnapshot {
     pub version: StateVersion,
     pub connection: ConnectionState,
     pub chats: Vec<ChatSummary>,
+    /// Calls ringing right now.
+    ///
+    /// State rather than an event, because a front end that opens while the
+    /// phone is ringing has no way back to the offer: it went out once,
+    /// before this client existed, and no history contains it. Without this a
+    /// call rings on in the daemon with nothing anywhere to answer it.
+    #[serde(default)]
+    pub ringing: Vec<IncomingCall>,
 }
 
 impl StateSnapshot {
@@ -183,6 +192,32 @@ pub enum DaemonMessage {
         version: StateVersion,
         event: DaemonEvent,
     },
+    /// One event straight from the session, for a client that asked for them.
+    ///
+    /// The session's own type rather than a protocol mirror of it: a front end
+    /// that owns chats and messages needs everything the session says, and a
+    /// parallel set of structs would be one more thing to keep in step for no
+    /// gain. Boxed because a history load carries every chat, which would
+    /// otherwise set the size of every frame in this enum.
+    ///
+    /// Media bytes are the exception that does not travel: see
+    /// [`oxidezap_core::MediaContent::cache_key`].
+    ///
+    /// A named field rather than a newtype: this enum is internally tagged, so
+    /// a newtype variant is flattened into the same map as `type` — which
+    /// happens to round-trip today and would stop the day an event named a
+    /// field `type`. Nesting it under a key of its own cannot collide.
+    Session {
+        event: Box<UiEvent>,
+    },
+    /// The answer to a [`ClientRequest::Download`], by its id.
+    ///
+    /// A cache key rather than bytes, for the same reason: the client reads
+    /// the file at [`crate::media_path`].
+    Downloaded {
+        id: RequestId,
+        result: Result<String, String>,
+    },
     /// A command reached the session. Carries no result beyond that: what the
     /// network makes of it arrives as [`DaemonMessage::Update`], or as
     /// [`DaemonMessage::SendFailed`] when it makes nothing of it at all.
@@ -229,6 +264,15 @@ pub enum ClientRequest {
     /// commands should not act on them.
     Hello {
         protocol: u32,
+        /// Whether to stream [`DaemonMessage::Session`] as well as summaries.
+        ///
+        /// Opt-in, because it is the whole traffic of the account: a tray or a
+        /// notifier wants the summaries it can render and nothing else, while
+        /// a full front end wants every message. Asking for it also makes the
+        /// daemon reload history, so a client that has just attached gets the
+        /// chats before the next thing that happens to change.
+        #[serde(default)]
+        session_events: bool,
     },
     /// Ask for a fresh snapshot, after a [`DaemonMessage::Resync`] or on
     /// reconnect.
@@ -236,7 +280,57 @@ pub enum ClientRequest {
     SendText {
         jid: String,
         text: String,
+        /// The id to give the message until the server assigns a real one.
+        ///
+        /// A client that draws the message before it is sent needs to know
+        /// this, or it cannot match the [`UiEvent::MessageIdAssigned`] that
+        /// renames it. `None` for a client that does not draw anything, and
+        /// the daemon makes one up.
+        #[serde(default)]
+        local_id: Option<String>,
     },
+    /// Send a recorded voice note.
+    ///
+    /// The audio arrives through the media cache rather than the socket: it
+    /// is the one client-to-daemon payload big enough to matter, and the cache
+    /// is a per-user directory both processes can already reach.
+    SendAudio {
+        jid: String,
+        /// Cache key the client wrote the encoded audio under.
+        upload: String,
+        duration_secs: u32,
+        waveform: Vec<u8>,
+        local_id: Option<String>,
+    },
+    /// Tell the peer whether we are typing. One request rather than two,
+    /// because it is one piece of state with two values.
+    Typing {
+        jid: String,
+        composing: bool,
+    },
+    Call(CallAction),
+    /// Fetch media the daemon has not cached yet.
+    ///
+    /// The only request whose answer is neither a state change nor an
+    /// acknowledgement, which is why it carries an id: several downloads are
+    /// normally in flight and their answers arrive out of order.
+    Download {
+        id: RequestId,
+        media: Box<DownloadableMedia>,
+    },
+    /// Ask for the whole history again.
+    ///
+    /// What a client does after [`DaemonMessage::Resync`]: a front end that
+    /// holds messages cannot patch a gap from a snapshot the way a summary
+    /// client can, so it starts over. Sent for it automatically when it
+    /// attaches, which is the same situation.
+    ReloadHistory,
+    /// Wipe local state and pair again.
+    ///
+    /// A server 401 means the stored credentials are dead and reconnecting
+    /// with them loops forever, so the only recovery is to delete the store.
+    /// The daemon owns that file, so it is the only process that may.
+    ForgetSession,
     /// Mark a chat read, up to the point the client has actually seen.
     ///
     /// `through_message_id` is the [`MessagePreview::id`] the client holds for
@@ -260,6 +354,39 @@ pub enum ClientRequest {
     ShowWindow,
     /// Stop the daemon: disconnect the session, close the store, exit.
     Shutdown,
+}
+
+/// Correlates a request with the answer it gets back.
+///
+/// Opaque and client-chosen: the daemon only echoes it.
+pub type RequestId = u64;
+
+/// Something to do with a call. Grouped rather than flattened into
+/// [`ClientRequest`] because they share a lifecycle and a call id, and a front
+/// end handling one handles all of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "call", rename_all = "snake_case")]
+pub enum CallAction {
+    /// Place one. `placeholder_id` plays the part `local_id` does for a
+    /// message: it names the call before the server does.
+    Start {
+        jid: String,
+        video: bool,
+        placeholder_id: String,
+    },
+    Accept {
+        call_id: String,
+    },
+    Decline {
+        call_id: String,
+    },
+    Cancel {
+        call_id: String,
+    },
+    SetMuted {
+        call_id: String,
+        muted: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -334,6 +461,7 @@ mod tests {
             version: StateVersion::INITIAL,
             connection: ConnectionState::Connected,
             chats: vec![chat(u32::MAX), chat(5)],
+            ringing: Vec::new(),
         };
         assert_eq!(snapshot.total_unread(), u32::MAX);
     }
@@ -356,6 +484,7 @@ mod tests {
             version: StateVersion::INITIAL,
             connection: ConnectionState::Connected,
             chats: vec![chat.clone()],
+            ringing: Vec::new(),
         };
         assert_eq!(
             snapshot.total_unread(),
