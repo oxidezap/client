@@ -152,33 +152,45 @@ pub fn parse(source: &str) -> RichText {
         text: String::with_capacity(source.len()),
         spans: Vec::new(),
     };
-    // Open runs, innermost last: (marker, index into `out.text` where it began).
-    let mut open: Vec<(char, usize)> = Vec::new();
+    let mut open: Vec<Open> = Vec::new();
     let bytes = source.as_bytes();
     let mut at = 0;
 
     while at < source.len() {
-        // A fence is three backticks and behaves like one code marker.
-        let (marker, width) = if source[at..].starts_with(FENCE) {
-            ('`', FENCE.len())
+        // A fence is three backticks and means the same thing as one, but it
+        // is not delimited the same way — see `Open::fenced`.
+        let (marker, fenced, width) = if source[at..].starts_with(FENCE) {
+            ('`', true, FENCE.len())
         } else {
             let ch = source[at..].chars().next().expect("in bounds");
-            (ch, ch.len_utf8())
+            (ch, false, ch.len_utf8())
         };
 
         if MARKERS.contains(&marker) {
             // Inside a code run only a code marker can do anything: that is
             // what makes `*not bold*` inside backticks come out literal.
-            let in_code = open.iter().any(|(m, _)| *m == '`');
+            let in_code = open.iter().any(|o| o.marker == '`');
             let usable = !in_code || marker == '`';
 
-            if usable && let Some(depth) = open.iter().rposition(|(m, _)| *m == marker) {
-                // A closer needs a non-space before it, or it is text.
-                if closes(bytes, at) {
-                    let (_, from) = open.remove(depth);
+            // A fence closes a fence and a bare backtick closes a bare one.
+            // Matching them to each other would let the first backtick of a
+            // closing fence end the run and leave two behind as text.
+            let closing = open
+                .iter()
+                .rposition(|o| o.marker == marker && o.fenced == fenced);
+
+            if usable && let Some(depth) = closing {
+                if fenced || closes(bytes, at) {
+                    let from = open.remove(depth).from;
+                    // The newline that put the closing fence on its own line
+                    // belongs to the delimiter, not to the code. Left in, every
+                    // block ended on a blank line the sender never typed.
+                    if fenced && out.text.len() > from && out.text.ends_with('\n') {
+                        out.text.pop();
+                    }
                     let emphasis = open
                         .iter()
-                        .fold(Emphasis::default(), |e, (m, _)| e.with(*m))
+                        .fold(Emphasis::default(), |e, o| e.with(o.marker))
                         .with(marker);
                     if from < out.text.len() {
                         out.spans.push(Span {
@@ -189,9 +201,19 @@ pub fn parse(source: &str) -> RichText {
                     at += width;
                     continue;
                 }
-            } else if usable && opens(bytes, at + width) {
-                open.push((marker, out.text.len()));
+            } else if usable && (fenced || opens(bytes, at + width)) {
+                open.push(Open {
+                    marker,
+                    fenced,
+                    from: out.text.len(),
+                });
                 at += width;
+                // Symmetrically: the newline that ends the opening fence's
+                // line is part of writing a fence, not the first character of
+                // the snippet. Only one, so a deliberate blank line survives.
+                if fenced && bytes.get(at) == Some(&b'\n') {
+                    at += 1;
+                }
                 continue;
             }
         }
@@ -202,16 +224,20 @@ pub fn parse(source: &str) -> RichText {
         at += ch.len_utf8();
     }
 
-    // Runs that never closed were never formatting. Their markers are already
-    // gone from `out.text`, so put them back where they stood.
-    for (marker, from) in open.into_iter().rev() {
-        out.text.insert(from, marker);
+    // Runs that never closed were never formatting. Their delimiters are
+    // already gone from `out.text`, so put them back where they stood — all
+    // of a fence's three characters, not one of them, or the text loses two
+    // and every span after the hole describes the wrong letters.
+    for run in open.into_iter().rev() {
+        let literal = run.literal();
+        out.text.insert_str(run.from, literal);
+        let shift = literal.len();
         for span in &mut out.spans {
-            if span.range.start >= from {
-                span.range.start += marker.len_utf8();
-                span.range.end += marker.len_utf8();
-            } else if span.range.end > from {
-                span.range.end += marker.len_utf8();
+            if span.range.start >= run.from {
+                span.range.start += shift;
+                span.range.end += shift;
+            } else if span.range.end > run.from {
+                span.range.end += shift;
             }
         }
     }
@@ -220,6 +246,41 @@ pub fn parse(source: &str) -> RichText {
     // parser produces them by closing order, which is the same thing.
     out.spans.retain(|span| !span.emphasis.is_plain());
     out
+}
+
+/// A run whose opening delimiter has been seen and whose closer has not.
+struct Open {
+    marker: char,
+    /// Whether the delimiter was ```` ``` ````.
+    ///
+    /// Which is not a detail of how it was written. A one-character marker is
+    /// delimited by word adjacency — `*` only opens before a non-space and
+    /// only closes after one, which is what keeps `2 * 3 * 4` arithmetic. A
+    /// fence carries no such ambiguity: it is three characters nothing types
+    /// by accident, and a fenced block is normally opened at the end of a line
+    /// and closed at the start of one. Holding it to the adjacency rule meant
+    /// the newline on either side stopped it from ever opening or ever
+    /// closing, so the one form WhatsApp exists to show code in was the one
+    /// form that came out as literal backticks.
+    fenced: bool,
+    /// Where the run began, as an index into the parsed text.
+    from: usize,
+}
+
+impl Open {
+    /// What this delimiter was written as, for putting back.
+    fn literal(&self) -> &'static str {
+        if self.fenced {
+            FENCE
+        } else {
+            match self.marker {
+                '*' => "*",
+                '_' => "_",
+                '~' => "~",
+                _ => "`",
+            }
+        }
+    }
 }
 
 /// The same text with its markup removed and nothing recorded.
@@ -382,6 +443,54 @@ mod tests {
         assert_eq!(&text[0..4], "bold");
     }
 
+    /// The form WhatsApp exists to show code in, and the one that was broken:
+    /// a fenced block is opened at the end of a line and closed at the start
+    /// of one, so the newline on either side is exactly where the adjacency
+    /// rule for one-character markers would refuse it.
+    #[test]
+    fn a_fenced_block_spans_lines() {
+        let (text, spans) = only("```\nfn main() {}\n```");
+        assert_eq!(
+            text, "fn main() {}",
+            "the fence's own newlines are not code"
+        );
+        assert_eq!(spans.len(), 1, "one code run: {spans:?}");
+        assert!(spans[0].1.code);
+    }
+
+    /// A fence that never closes is text, and it is three characters of text.
+    /// Putting one back lost two and slid every span after the hole onto the
+    /// wrong letters.
+    #[test]
+    fn an_unclosed_fence_comes_back_whole() {
+        let rich = parse("```fn main()");
+        assert_eq!(rich.text, "```fn main()");
+        assert!(rich.is_plain());
+
+        let (text, spans) = only("*bold* then ```dangling");
+        assert_eq!(text, "bold then ```dangling");
+        assert_eq!(spans, vec![(0..4, bold())]);
+        assert_eq!(&text[0..4], "bold");
+    }
+
+    /// The closing fence is three characters. Letting its first backtick end
+    /// the run left the other two sitting in the text as literal noise.
+    #[test]
+    fn a_fence_is_not_closed_by_a_bare_backtick() {
+        let (text, _) = only("```code```");
+        assert_eq!(text, "code");
+    }
+
+    /// Nothing inside a fence is markup either — that is what a code block is
+    /// for, and the reason a snippet was worth parsing in the first place.
+    #[test]
+    fn nothing_inside_a_fence_is_markup() {
+        let (text, spans) = only("```let x = *y * z*;```");
+        assert_eq!(text, "let x = *y * z*;");
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].1.code && !spans[0].1.bold);
+    }
+
     #[test]
     fn no_characters_are_ever_lost() {
         for source in [
@@ -389,16 +498,27 @@ mod tests {
             "*",
             "``",
             "```",
+            "````",
+            "```\n",
             "*_~`",
             "a*b_c~d`e",
             "*a* _b_ ~c~ `d`",
+            "```\ncode\n```",
             "emoji 🎉 *bold 🎉* end",
         ] {
             let rich = parse(source);
-            let markers: usize = source.matches(['*', '_', '~', '`']).count();
-            assert!(
-                rich.text.chars().count() + markers >= source.chars().count(),
-                "lost text from {source:?}: {:?}",
+            // Delimiters are consumed on purpose — the markers themselves, and
+            // the newline that puts a fence on its own line. Everything else a
+            // sender typed has to come out the other side, in order.
+            let kept = |text: &str| -> String {
+                text.chars()
+                    .filter(|c| !matches!(c, '*' | '_' | '~' | '`' | '\n'))
+                    .collect()
+            };
+            assert_eq!(
+                kept(&rich.text),
+                kept(source),
+                "characters went missing from {source:?}: {:?}",
                 rich.text
             );
         }

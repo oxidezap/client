@@ -226,47 +226,27 @@ impl WhatsAppApp {
                 self.handle_reaction_received(chat_jid, message_id, sender, emoji);
                 cx.notify();
             }
-            UiEvent::IncomingCall(mut call) => {
-                if let Some(name) = self
-                    .find_chat(&call.caller_jid)
-                    .map(|chat| chat.name.clone())
-                {
-                    call.caller_name = name;
-                }
+            // A call is state, and the daemon is the only thing that writes
+            // it. Every transition below was already folded into the shared
+            // `CallState` and published as `CallsChanged`, which arrives on
+            // the state channel *before* this event — so applying it a second
+            // time here is not a redundancy, it is a different answer. It read
+            // its own work as a fresh offer and parked the live call's id in
+            // `waiting`, drawing a strip for a caller who did not exist whose
+            // Decline hung up on the one who did. These arms observe; only
+            // `adopt_calls` writes.
+            UiEvent::IncomingCall(call) => {
                 info!(
                     "Incoming {} call from {}",
                     if call.is_video { "video" } else { "audio" },
                     observe_str(&call.caller_jid)
                 );
-                if !self.call_state.set_incoming(call) {
-                    warn!("a second call arrived while one was already up");
-                }
-                cx.notify();
             }
             UiEvent::CallAccepted(call_id) => {
-                info!("Call {} accepted by peer", call_id);
-                // The peer answered: the call becomes active, which is the
-                // state that used to be missing entirely.
-                if self.call_state.connect(&call_id) {
-                    self.ensure_tick(cx);
-                    cx.notify();
-                }
+                info!("Call {call_id} accepted by peer");
             }
             UiEvent::CallEnded(call_id) => {
-                info!("Call {} ended", call_id);
-                // Record before clearing: the stage is where the duration and
-                // the direction live, and `end` drops it.
-                if let Some(stage) = self.call_state.stage().cloned()
-                    && stage.call_id() == call_id
-                {
-                    self.record_call(&stage, cx);
-                }
-                if self.call_state.end(&call_id) {
-                    // A card minimised for this call must not swallow the
-                    // next one's ring.
-                    self.call_card.call_ended();
-                    cx.notify();
-                }
+                info!("Call {call_id} ended");
             }
             UiEvent::OutgoingCallStarted {
                 call_id,
@@ -277,19 +257,16 @@ impl WhatsAppApp {
                     call_id,
                     observe_str(&recipient_jid)
                 );
-                // Swap in the real id for the placeholder we invented.
-                if self
-                    .call_state
-                    .update_outgoing_call_id(&recipient_jid, call_id.clone())
+                // The one thing that is not state: a *command*. The id we
+                // cancelled with was the placeholder we invented, which the
+                // session never knew, so a call the user gave up on while it
+                // was still connecting is ringing at the far end with nothing
+                // holding it. The daemon not tracking it is what says so.
+                if !self.call_state.holds(&call_id)
+                    && let Some(client) = &self.client
                 {
-                    self.call_state.set_outgoing_ringing(&call_id);
-                    cx.notify();
-                } else {
-                    // The card is already gone: the user cancelled while the
-                    // call was connecting, so hang up the now-real call.
-                    if let Some(client) = &self.client {
-                        client.cancel_call(&call_id);
-                    }
+                    info!("cancelling {call_id}, which nobody is waiting for");
+                    client.cancel_call(&call_id);
                 }
             }
             UiEvent::OutgoingCallFailed {
@@ -301,12 +278,6 @@ impl WhatsAppApp {
                     observe_str(&recipient_jid),
                     error
                 );
-                if self
-                    .call_state
-                    .dismiss_outgoing_for_recipient(&recipient_jid)
-                {
-                    cx.notify();
-                }
             }
         }
     }

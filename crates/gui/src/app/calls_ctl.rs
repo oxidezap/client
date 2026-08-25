@@ -225,7 +225,7 @@ impl WhatsAppApp {
     /// duration and the direction live. It is recorded here, on the way out.
     /// Recording it twice is harmless: a record is keyed by the call id and
     /// `Chat::add_message` refuses a duplicate.
-    pub(super) fn adopt_calls(&mut self, calls: CallState, cx: &mut Context<Self>) {
+    pub(super) fn adopt_calls(&mut self, mut calls: CallState, cx: &mut Context<Self>) {
         let ended = self
             .call_state
             .stage()
@@ -236,8 +236,37 @@ impl WhatsAppApp {
             // A card minimised for that call must not swallow the next ring.
             self.call_card.call_ended();
         }
+        self.name_callers(&mut calls);
+        let live = calls.active().is_some();
         self.call_state = calls;
+        // The duration on the card is a clock, and a clock nobody winds shows
+        // the second it started at. Armed here rather than off `CallAccepted`,
+        // because a call this window did not answer — the daemon accepted it,
+        // or another front end did — never produces that event here.
+        if live {
+            self.ensure_tick(cx);
+        }
         cx.notify();
+    }
+
+    /// Put the names this window knows onto the calls the daemon sent.
+    ///
+    /// The daemon names a caller from its own chat list, which is the same
+    /// list — but a chat renamed by a push name this window has already folded
+    /// in would otherwise show the older name until the daemon reloads. Two
+    /// lookups at most, and only while a call is up.
+    fn name_callers(&self, calls: &mut CallState) {
+        let named = |jid: &str| self.find_chat(jid).map(|chat| chat.name.clone());
+        if let Some(call) = calls.incoming_mut()
+            && let Some(name) = named(&call.caller_jid)
+        {
+            call.caller_name = name;
+        }
+        if let Some(call) = calls.waiting_mut()
+            && let Some(name) = named(&call.caller_jid)
+        {
+            call.caller_name = name;
+        }
     }
 
     /// Write a call down, with `outcome` when the caller knows better than the

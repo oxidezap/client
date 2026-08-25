@@ -151,6 +151,28 @@ impl WaitingCall {
     pub fn caller_name(&self) -> &str {
         &self.call.caller_name
     }
+
+    /// The parked offer itself, for a front end that wants to name its caller
+    /// the way it names everyone else.
+    pub fn call_mut(&mut self) -> &mut IncomingCall {
+        &mut self.call
+    }
+}
+
+/// What became of an offer handed to [`CallState::set_incoming`].
+///
+/// Three outcomes and not a `bool`, because the third one obliges the caller
+/// to do something: an offer that was neither taken nor parked is ringing at
+/// somebody with nothing on this side holding its id, and the only honest
+/// answer is to refuse it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// It became the call on screen.
+    Ringing,
+    /// One call was already up, so it is parked behind it.
+    Parked,
+    /// A call was up and one was already parked. Nothing changed.
+    Refused,
 }
 
 /// The one call, and whatever is queued behind it.
@@ -187,6 +209,17 @@ impl CallState {
         }
     }
 
+    pub fn incoming_mut(&mut self) -> Option<&mut IncomingCall> {
+        match &mut self.stage {
+            Some(Stage::Incoming(call)) => Some(call),
+            _ => None,
+        }
+    }
+
+    pub fn waiting_mut(&mut self) -> Option<&mut IncomingCall> {
+        self.waiting.as_mut().map(WaitingCall::call_mut)
+    }
+
     pub fn outgoing_mut(&mut self) -> Option<&mut OutgoingCall> {
         match &mut self.stage {
             Some(Stage::Outgoing(call)) => Some(call),
@@ -213,21 +246,36 @@ impl CallState {
 
     /// An offer arrived.
     ///
-    /// Returns whether it became the current call. A second offer during a
-    /// live call is parked in [`Self::waiting`] instead of clobbering the
-    /// first, which would desync the UI from the call registry.
-    pub fn set_incoming(&mut self, call: IncomingCall) -> bool {
-        if self.stage.is_some() {
+    /// A second offer during a live call is parked in [`Self::waiting`]
+    /// instead of clobbering the first, which would desync the UI from the
+    /// call registry. A *third* is refused rather than displacing the parked
+    /// one: there is exactly one waiting slot and exactly one strip drawing
+    /// it, so overwriting left the displaced caller ringing in the session
+    /// with no id anywhere on this side and no control to refuse them.
+    ///
+    /// The first offer wins the slot rather than the last, because that is the
+    /// one the user has already been shown.
+    pub fn set_incoming(&mut self, call: IncomingCall) -> Admission {
+        let Some(stage) = &self.stage else {
+            self.stage = Some(Stage::Incoming(call));
+            return Admission::Ringing;
+        };
+        if let Some(parked) = &self.waiting {
             log::warn!(
-                "parking incoming call {} behind {}",
+                "refusing incoming call {}: {} is up and {} is already waiting",
                 call.call_id,
-                self.stage.as_ref().map_or("?", Stage::call_id)
+                stage.call_id(),
+                parked.call_id()
             );
-            self.waiting = Some(WaitingCall { call });
-            return false;
+            return Admission::Refused;
         }
-        self.stage = Some(Stage::Incoming(call));
-        true
+        log::warn!(
+            "parking incoming call {} behind {}",
+            call.call_id,
+            stage.call_id()
+        );
+        self.waiting = Some(WaitingCall { call });
+        Admission::Parked
     }
 
     /// We placed a call.
@@ -570,10 +618,34 @@ mod tests {
     fn a_second_offer_waits_instead_of_replacing_the_live_call() {
         let mut state = CallState::new();
         state.set_incoming(incoming("FIRST"));
-        assert!(!state.set_incoming(incoming("SECOND")));
+        assert_eq!(
+            state.set_incoming(incoming("SECOND")),
+            Admission::Parked,
+            "the live call keeps the stage"
+        );
 
         assert_eq!(state.stage().unwrap().call_id(), "FIRST");
         assert_eq!(state.waiting().unwrap().call_id(), "SECOND");
+    }
+
+    /// There is one waiting slot and one strip drawing it. Overwriting left
+    /// the displaced caller ringing in the session with no id anywhere on this
+    /// side and no control to refuse them, which is exactly the state the
+    /// waiting slot exists to prevent.
+    #[test]
+    fn a_third_offer_is_refused_rather_than_displacing_the_one_waiting() {
+        let mut state = CallState::default();
+        assert_eq!(state.set_incoming(incoming("FIRST")), Admission::Ringing);
+        state.connect(&"FIRST".to_string());
+        assert_eq!(state.set_incoming(incoming("SECOND")), Admission::Parked);
+
+        assert_eq!(state.set_incoming(incoming("THIRD")), Admission::Refused);
+        assert_eq!(
+            state.waiting().unwrap().call_id(),
+            "SECOND",
+            "the caller the user was already shown keeps the slot"
+        );
+        assert!(!state.holds("THIRD"), "nothing on this side holds it");
     }
 
     /// A stale window can ask to mute a call that has already ended. Applying
@@ -600,7 +672,7 @@ mod tests {
         let mut state = CallState::default();
         state.set_incoming(incoming("FIRST"));
         state.connect(&"FIRST".to_string());
-        assert!(!state.set_incoming(incoming("SECOND")), "parked");
+        assert_eq!(state.set_incoming(incoming("SECOND")), Admission::Parked);
 
         assert!(state.end(&"FIRST".to_string()));
         assert_eq!(state.incoming().map(|c| c.call_id.as_str()), Some("SECOND"));

@@ -133,6 +133,20 @@ pub type Commands = tokio::sync::mpsc::Sender<SessionCommand>;
 /// request is sitting in a queue it cannot see.
 const MAX_IN_FLIGHT: usize = 64;
 
+/// What the session has to be told after an event was folded into daemon
+/// state.
+///
+/// A return value rather than a client call inside [`Bridge::observe`], so
+/// folding stays a pure function of the event and the state — which is what
+/// lets it be tested without opening a store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Answer {
+    Nothing,
+    /// An offer with nowhere to go. Nothing on this side holds its id, so no
+    /// front end can be asked to refuse it.
+    Decline(oxidezap_core::CallId),
+}
+
 /// Run the session until it ends or `shutdown` resolves.
 ///
 /// Shutdown is a parameter rather than something the caller races this future
@@ -160,7 +174,11 @@ pub async fn run(
     loop {
         tokio::select! {
             event = events.recv() => match event {
-                Some(event) => bridge.observe(event),
+                Some(event) => {
+                    if let Answer::Decline(call_id) = bridge.observe(event) {
+                        client.decline_call(&call_id);
+                    }
+                }
                 // The session dropped its sender: the run loop is gone and no
                 // further event can arrive.
                 None => break,
@@ -276,8 +294,13 @@ impl Bridge {
         }
     }
 
-    /// Fold one session event into daemon state.
-    fn observe(&mut self, event: UiEvent) {
+    /// Fold one session event into daemon state, and say what the session has
+    /// to be told back.
+    ///
+    /// Folding does not touch the client, so this stays testable without a
+    /// store: what it cannot do itself it returns, and the run loop performs.
+    fn observe(&mut self, event: UiEvent) -> Answer {
+        let mut answer = Answer::Nothing;
         // Before anything is published, so a `MarkRead` that arrives right
         // behind a message already covers it.
         self.reads.observe(&event);
@@ -290,17 +313,35 @@ impl Bridge {
         // same transitions the front end applies, from the same type, so the
         // two cannot drift.
         match &event {
-            UiEvent::IncomingCall(call) => self.hub.calls(|s| {
+            UiEvent::IncomingCall(call) => {
                 // A second offer during a live call is parked rather than
-                // dropped; the front end draws it as a refusable strip.
-                s.set_incoming(call.clone());
-            }),
+                // dropped; the front end draws it as a refusable strip. A
+                // third has nowhere to go, and a caller nothing on this side
+                // holds an id for would ring until they gave up — so it is
+                // refused here, where the session is.
+                let mut admission = oxidezap_core::Admission::Ringing;
+                self.hub.calls(|s| admission = s.set_incoming(call.clone()));
+                if admission == oxidezap_core::Admission::Refused {
+                    answer = Answer::Decline(call.call_id.clone());
+                }
+            }
             UiEvent::OutgoingCallStarted {
                 call_id,
                 recipient_jid,
-            } => self.hub.calls(|s| {
-                s.update_outgoing_call_id(recipient_jid, call_id.clone());
-            }),
+            } => {
+                // Renamed *and* advanced: the placeholder id was ours, and the
+                // server answering with the real one is also what says the
+                // call has started ringing at the far end. Leaving the state
+                // to say "calling…" for the rest of the call was a difference
+                // between the daemon and a front end that applied both.
+                let mut adopted = false;
+                self.hub.calls(|s| {
+                    adopted = s.update_outgoing_call_id(recipient_jid, call_id.clone());
+                    if adopted {
+                        s.set_outgoing_ringing(call_id);
+                    }
+                });
+            }
             // Answered, from either side: the call becomes live rather than
             // being cleared. A front end attaching now has to find a call in
             // progress, not an empty state over running audio.
@@ -351,6 +392,8 @@ impl Bridge {
             // the daemon.
             let _ = self.publish.send(event);
         }
+
+        answer
     }
 
     /// Act on one client command, and answer the connection that asked.
@@ -1553,6 +1596,40 @@ mod tests {
         // Answered or hung up, it is no longer something to attach to.
         bridge.observe(UiEvent::CallEnded("call-1".into()));
         assert!(bridge.hub.call_state().incoming().is_none());
+    }
+
+    /// There is one waiting slot. A third offer has nowhere to go, and no
+    /// front end can be asked to refuse a caller it was never told about — so
+    /// the daemon, which owns the session, answers the session itself.
+    #[test]
+    fn a_third_offer_is_declined_by_the_daemon() {
+        let mut bridge = bridge();
+        let offer = |id: &str| {
+            UiEvent::IncomingCall(oxidezap_core::IncomingCall {
+                call_id: id.into(),
+                caller_name: "Someone".into(),
+                caller_jid: format!("{id}@s.whatsapp.net"),
+                is_video: false,
+                is_offline: false,
+                received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            })
+        };
+
+        assert_eq!(bridge.observe(offer("one")), Answer::Nothing);
+        bridge.hub.calls(|s| {
+            s.connect(&"one".to_string());
+        });
+        assert_eq!(bridge.observe(offer("two")), Answer::Nothing, "parked");
+
+        assert_eq!(
+            bridge.observe(offer("three")),
+            Answer::Decline("three".into())
+        );
+        assert_eq!(
+            bridge.hub.call_state().waiting().unwrap().call_id(),
+            "two",
+            "the caller already on screen keeps the slot"
+        );
     }
 
     /// A call this account placed was never an event: the front end that
