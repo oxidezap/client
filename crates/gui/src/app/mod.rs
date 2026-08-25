@@ -2679,10 +2679,14 @@ mod tests {
         assert_eq!(slot_newest_first(&rest, at(10)), 2);
     }
 
+    /// `None` is below every `Some`, and the predicate is strict, so an empty
+    /// conversation clears neither the dated chat nor the empty one already
+    /// sitting there: it goes to the very end. That is the tie rule below,
+    /// applied to two chats that are equally undated.
     #[test]
-    fn an_empty_conversation_sorts_behind_every_dated_one() {
+    fn an_empty_conversation_sorts_last_of_all() {
         let rest = [chat("b", Some(30)), chat("c", None)];
-        assert_eq!(slot_newest_first(&rest, None), 1);
+        assert_eq!(slot_newest_first(&rest, None), 2);
     }
 
     #[test]
