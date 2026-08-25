@@ -10,6 +10,7 @@ pub mod audio;
 mod media;
 mod quote;
 mod reactions;
+mod system;
 
 use std::sync::Arc;
 
@@ -21,6 +22,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::{h_flex, v_flex};
 
 pub use audio::SPEEDS;
+pub use system::render_encryption_notice;
 
 use media::render_media_content;
 use quote::render_quote;
@@ -52,9 +54,26 @@ pub fn render_message_bubble(
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     cx: &App,
-) -> impl IntoElement + use<> {
+) -> gpui::AnyElement {
     let metrics = *layout.metrics();
     let message = props.message;
+    // A row nobody typed belongs to the conversation, not to a side of it.
+    if let Some(notice) = &message.system {
+        return div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .pt(metrics.bubble_gap_authored())
+            .child(system::render_system_row(
+                notice,
+                message.sender.clone(),
+                message.id.clone(),
+                entity,
+                metrics,
+                cx,
+            ))
+            .into_any_element();
+    }
     let is_from_me = message.is_from_me;
     let message_id = message.id.clone();
     let bubble_id: SharedString = format!("msg-{message_id}").into();
@@ -232,6 +251,7 @@ pub fn render_message_bubble(
                     )),
             )
         })
+        .into_any_element()
 }
 
 /// The time and, on our own messages, its tick.

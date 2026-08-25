@@ -1132,6 +1132,7 @@ mod tests {
             reactions: Default::default(),
             status: Default::default(),
             quoted: None,
+            system: None,
         }
     }
 

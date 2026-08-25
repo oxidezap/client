@@ -11,6 +11,7 @@ use gpui_component::{VirtualListScrollHandle, scroll::Scrollbar, v_virtual_list}
 
 use crate::app::{MessageListCache, TimelineItem, WhatsAppApp};
 use crate::components::message_bubble::BubbleProps;
+use crate::components::message_bubble::render_encryption_notice;
 use crate::components::{Avatar, EmptyState, ProductIcon, render_message_bubble};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
@@ -67,6 +68,13 @@ pub fn render_message_list(
                                 TimelineItem::Typing(summary) => {
                                     render_typing(summary, is_group, metrics, cx).into_any_element()
                                 }
+                                TimelineItem::Encryption => div()
+                                    .w_full()
+                                    .flex()
+                                    .justify_center()
+                                    .py(metrics.space_md())
+                                    .child(render_encryption_notice(metrics, cx))
+                                    .into_any_element(),
                                 TimelineItem::Message { ix, starts_run } => {
                                     let msg = &messages[*ix];
                                     let message_id = &msg.id;
@@ -98,7 +106,6 @@ pub fn render_message_list(
                                         layout,
                                         cx,
                                     )
-                                    .into_any_element()
                                 }
                             })
                             .collect()

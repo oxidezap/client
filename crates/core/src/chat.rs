@@ -10,6 +10,7 @@ use wacore_binary::jid::{Jid, JidExt, Server};
 
 use crate::message_status::MessageStatus;
 use crate::quoted::QuotedMessage;
+use crate::system_notice::SystemNotice;
 
 /// Maximum number of unique emoji reactions per message to prevent spam
 const MAX_REACTIONS_PER_MESSAGE: usize = 50;
@@ -205,6 +206,9 @@ pub struct ChatMessage {
     pub status: MessageStatus,
     /// The message this one replies to, if any.
     pub quoted: Option<QuotedMessage>,
+    /// Set when nobody typed this: a call record, a group change. Such a row
+    /// has no author and no ticks, and renders centred rather than as a bubble.
+    pub system: Option<SystemNotice>,
 }
 
 impl ChatMessage {
@@ -222,6 +226,7 @@ impl ChatMessage {
             reactions: HashMap::new(),
             status: MessageStatus::Pending,
             quoted: None,
+            system: None,
         }
     }
 
@@ -239,6 +244,7 @@ impl ChatMessage {
             reactions: HashMap::new(),
             status: MessageStatus::Pending,
             quoted: None,
+            system: None,
         }
     }
 
@@ -257,6 +263,7 @@ impl ChatMessage {
             reactions: HashMap::new(),
             status: MessageStatus::default(),
             quoted: None,
+            system: None,
         }
     }
 
@@ -811,6 +818,7 @@ mod tests {
             reactions: HashMap::new(),
             status: MessageStatus::default(),
             quoted: None,
+            system: None,
         }
     }
 

@@ -753,6 +753,7 @@ impl WhatsAppClient {
                 MessageStatus::default()
             },
             quoted: quoted_from(base_msg),
+            system: None,
         };
 
         if let Some(media) = media_result {
@@ -2277,6 +2278,7 @@ fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage) -> ChatMes
             MessageStatus::default()
         },
         quoted,
+        system: None,
     }
 }
 
@@ -2732,6 +2734,7 @@ mod tests {
             reactions: HashMap::new(),
             status: MessageStatus::default(),
             quoted: None,
+            system: None,
         };
         let mut chat = Chat::new("111222333444555@lid".to_string());
         chat.messages = vec![message("MSG-A"), message("MSG-B")];

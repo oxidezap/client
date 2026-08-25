@@ -232,6 +232,13 @@ impl WhatsAppApp {
             }
             UiEvent::CallEnded(call_id) => {
                 info!("Call {} ended", call_id);
+                // Record before clearing: the stage is where the duration and
+                // the direction live, and `end` drops it.
+                if let Some(stage) = self.call_state.stage().cloned()
+                    && stage.call_id() == call_id
+                {
+                    self.record_call(&stage, cx);
+                }
                 if self.call_state.end(&call_id) {
                     cx.notify();
                 }

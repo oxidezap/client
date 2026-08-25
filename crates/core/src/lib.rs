@@ -15,6 +15,7 @@ mod events;
 mod message_status;
 mod presence;
 mod quoted;
+mod system_notice;
 
 pub use app_state::{AppState, CachedQrCode};
 pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
@@ -24,3 +25,4 @@ pub use events::{ReceiptType, UiEvent};
 pub use message_status::MessageStatus;
 pub use presence::{Availability, ChatTyping, ComposingKind, PresenceRegistry, TypingSummary};
 pub use quoted::{QuotedKind, QuotedMessage};
+pub use system_notice::{CallOutcome, CallRecord, SystemNotice};

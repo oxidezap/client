@@ -82,8 +82,9 @@ impl WhatsAppApp {
         };
         let call_id = stage.call_id().to_string();
         info!("Ending call {call_id}");
+        self.record_call(&stage, cx);
         if let Some(client) = &self.client {
-            match stage {
+            match &stage {
                 // A ringing offer has to be rejected rather than hung up:
                 // there is no live handle, and the caller should stop ringing
                 // instead of waiting out the timeout.
@@ -175,6 +176,54 @@ impl WhatsAppApp {
     pub fn return_to_call(&mut self, cx: &mut Context<Self>) {
         if self.call_state.is_busy() {
             self.call_state.set_minimized(false);
+            cx.notify();
+        }
+    }
+
+    /// Leave a record of a call in the conversation it belonged to.
+    ///
+    /// The record is local: the daemon does not persist call history, so this
+    /// survives the session and not a restart. Better than nothing — a missed
+    /// call the user never saw is the case this exists for — and it is why the
+    /// row is built from what the UI watched rather than queried back.
+    pub(super) fn record_call(&mut self, stage: &Stage, cx: &mut Context<Self>) {
+        let (peer_jid, is_video, outcome, is_outgoing) = match stage {
+            Stage::Active(call) => (
+                call.peer_jid.clone(),
+                call.is_video,
+                CallOutcome::Completed(call.elapsed().num_seconds().max(0) as u32),
+                false,
+            ),
+            // Never answered, from either side.
+            Stage::Incoming(call) => (
+                call.caller_jid.clone(),
+                call.is_video,
+                CallOutcome::Missed,
+                false,
+            ),
+            Stage::Outgoing(call) => (
+                call.recipient_jid.clone(),
+                call.is_video,
+                CallOutcome::Missed,
+                true,
+            ),
+        };
+
+        let record = CallRecord {
+            is_video,
+            is_outgoing,
+            outcome,
+        };
+        let mut message = ChatMessage::new_incoming(
+            format!("call-{}", stage.call_id()),
+            peer_jid.clone(),
+            String::new(),
+        );
+        message.system = Some(SystemNotice::Call(record));
+
+        if self.add_message_to_chat(&peer_jid, message) {
+            self.invalidate_message_cache(&peer_jid);
+            self.invalidate_chat_cache();
             cx.notify();
         }
     }

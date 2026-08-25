@@ -36,6 +36,10 @@ pub enum TimelineItem {
     },
     /// Always last, when someone is typing.
     Typing(TypingSummary),
+    /// The standing notice at the head of a conversation. Not a stored
+    /// message: it describes the chat rather than something that happened in
+    /// it, so it is a row rather than a fabricated history entry.
+    Encryption,
 }
 
 /// Cached data for message list rendering to avoid recomputing on every frame.
@@ -80,6 +84,7 @@ impl MessageListCache {
                     let height = match item {
                         TimelineItem::DateDivider(_) => metrics.date_divider_height(),
                         TimelineItem::Typing(_) => metrics.typing_row_height(),
+                        TimelineItem::Encryption => metrics.typing_row_height(),
                         TimelineItem::Message { ix, starts_run } => calculate_message_height(
                             &messages[*ix],
                             *starts_run,
@@ -125,7 +130,12 @@ impl MessageListCache {
 /// Weave dividers and the typing row into the message sequence.
 fn build_items(messages: &[ChatMessage], typing: Option<TypingSummary>) -> Vec<TimelineItem> {
     // One divider per day plus one row per message, plus the typing row.
-    let mut items = Vec::with_capacity(messages.len() + 4);
+    let mut items = Vec::with_capacity(messages.len() + 5);
+    // Only over real history: on an empty chat the pane shows an empty state,
+    // and a lone encryption notice above nothing reads as a broken screen.
+    if !messages.is_empty() {
+        items.push(TimelineItem::Encryption);
+    }
 
     for (ix, message) in messages.iter().enumerate() {
         let previous = ix.checked_sub(1).map(|prev| &messages[prev]);
@@ -190,6 +200,11 @@ pub fn calculate_message_height(
     if is_group && starts_run && msg.sender_name.is_some() && !msg.is_from_me {
         height += metrics.line_height();
         content_items += 1;
+    }
+
+    // A system row is its own shape: one icon, two short lines, no bubble.
+    if msg.system.is_some() {
+        return gap + metrics.avatar_header() + metrics.space_md();
     }
 
     if msg.quoted.is_some() {
@@ -280,6 +295,7 @@ mod tests {
                 TimelineItem::DateDivider(_) => "divider",
                 TimelineItem::Message { .. } => "message",
                 TimelineItem::Typing(_) => "typing",
+                TimelineItem::Encryption => "encryption",
             })
             .collect()
     }
@@ -287,7 +303,7 @@ mod tests {
     #[test]
     fn the_first_message_is_always_dated() {
         let items = build_items(&[message("a", false, at(14, 9))], None);
-        assert_eq!(kinds(&items), vec!["divider", "message"]);
+        assert_eq!(kinds(&items), vec!["encryption", "divider", "message"]);
     }
 
     #[test]
@@ -299,7 +315,14 @@ mod tests {
         ];
         assert_eq!(
             kinds(&build_items(&messages, None)),
-            vec!["divider", "message", "message", "divider", "message"]
+            vec![
+                "encryption",
+                "divider",
+                "message",
+                "message",
+                "divider",
+                "message"
+            ]
         );
     }
 
@@ -330,7 +353,7 @@ mod tests {
             message("a", false, at(15, 8)),
         ];
         let items = build_items(&messages, None);
-        let TimelineItem::Message { starts_run, .. } = items[3] else {
+        let TimelineItem::Message { starts_run, .. } = items[4] else {
             panic!("expected a message after the second divider");
         };
         assert!(starts_run);
@@ -343,7 +366,7 @@ mod tests {
             message("a", true, at(14, 10)),
         ];
         let items = build_items(&messages, None);
-        let TimelineItem::Message { starts_run, .. } = items[2] else {
+        let TimelineItem::Message { starts_run, .. } = items[3] else {
             panic!("expected a second message");
         };
         assert!(starts_run, "our own reply is not a continuation of theirs");
@@ -357,7 +380,10 @@ mod tests {
             kind: oxidezap_core::ComposingKind::Text,
         };
         let items = build_items(&[message("a", false, at(14, 9))], Some(summary));
-        assert_eq!(kinds(&items), vec!["divider", "message", "typing"]);
+        assert_eq!(
+            kinds(&items),
+            vec!["encryption", "divider", "message", "typing"]
+        );
     }
 
     #[test]
