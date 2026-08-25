@@ -50,6 +50,15 @@ pub struct StatusPane {
     /// Position within that author's run. Kept in range by the reader below
     /// rather than trusted: the run grows while it is open.
     index: usize,
+    /// The update that position resolved to, so the reader can be put back
+    /// on it after a rebuild moved it.
+    ///
+    /// A position alone was safe only while a run grew at the end, and it
+    /// does not: a live update and a hydrated one can both be stamped before
+    /// the one being watched, and the same index then silently resolves to a
+    /// different message — never marked watched, never fetched, with the
+    /// previous update's video still playing over it.
+    shown: Option<String>,
 }
 
 impl StatusPane {
@@ -66,11 +75,29 @@ impl StatusPane {
     pub fn open(&mut self, author: String) {
         self.author = Some(author);
         self.index = 0;
+        self.shown = None;
     }
 
     pub fn close(&mut self) {
         self.author = None;
         self.index = 0;
+        self.shown = None;
+    }
+
+    /// The update the reader is anchored to, if it has resolved one.
+    pub fn shown(&self) -> Option<&str> {
+        self.shown.as_deref()
+    }
+
+    /// Record what the current position resolved to.
+    pub fn follow(&mut self, message_id: Option<String>) {
+        self.shown = message_id;
+    }
+
+    /// Put the reader back on the update it was showing, which has moved to
+    /// `index`.
+    pub fn seek(&mut self, index: usize) {
+        self.index = index;
     }
 
     /// Where the reader is, clamped to a run of `len`. A run only ever grows
@@ -279,6 +306,48 @@ impl WhatsAppApp {
         self.stop_status_media(leaving);
         self.mark_shown_status_seen();
         self.fetch_shown_status(cx);
+        // Four things, then: the reader is anchored to the update it arrived
+        // at rather than to the place it sits in the run. See
+        // [`Self::reconcile_status_pane`].
+        let arrived = self.shown_status_message_id();
+        self.status_pane.follow(arrived);
+    }
+
+    /// Keep the reader on the update it is showing, whatever a rebuild did to
+    /// the order.
+    ///
+    /// The pane holds a position, and clamping it was enough only while a run
+    /// grew at the end. It does not: an update delivered live and one brought
+    /// in by a history load can both be stamped before the one being watched,
+    /// and inserting either ahead of it makes the same index a different
+    /// message — with nothing said, so it was neither marked watched nor
+    /// fetched, and the update it replaced went on playing over it.
+    ///
+    /// Driven from the render pass, like the overlay focus it sits beside:
+    /// the feed is derived from messages that arrive from the daemon, and
+    /// this is where the answer is about to be drawn.
+    pub fn reconcile_status_pane(&mut self, cx: &mut Context<Self>) {
+        let Some(anchor) = self.status_pane.shown().map(str::to_string) else {
+            return;
+        };
+        let Some(author_jid) = self.status_pane.author().map(str::to_string) else {
+            return;
+        };
+        let feed = self.status_feed();
+        let Some(author) = feed.author(&author_jid) else {
+            return;
+        };
+        match feed.updates_of(author).position(|m| m.id == anchor) {
+            // Still in the run: follow it, wherever it moved to.
+            Some(at) => self.status_pane.seek(at),
+            // Gone — revoked, or lapsed between one frame and the next. The
+            // position now resolves to a different update, which is a change
+            // like any other and has to be announced as one.
+            None => {
+                self.status_pane.follow(None);
+                self.shown_status_changed(Some(anchor), cx);
+            }
+        }
     }
 
     /// Stop the update on screen, because the reader is about to stop showing
@@ -478,6 +547,38 @@ mod tests {
         assert!(pane.step(false, 3));
         assert!(pane.step(false, 3));
         assert!(!pane.step(false, 3));
+    }
+
+    #[test]
+    fn a_reader_follows_its_update_rather_than_its_place() {
+        let mut pane = StatusPane::default();
+        pane.open("a@s.whatsapp.net".to_string());
+        pane.step(true, 3);
+        pane.follow(Some("second".to_string()));
+        assert_eq!(pane.shown(), Some("second"));
+        assert_eq!(pane.index_in(3), 1);
+
+        // An older update arrives and is spliced in ahead of it: the same
+        // message is now at 2, and that is where the reader belongs.
+        pane.seek(2);
+        assert_eq!(pane.index_in(4), 2);
+        assert_eq!(pane.shown(), Some("second"), "still the same update");
+    }
+
+    #[test]
+    fn opening_an_author_drops_the_previous_anchor() {
+        let mut pane = StatusPane::default();
+        pane.open("a@s.whatsapp.net".to_string());
+        pane.follow(Some("first".to_string()));
+        pane.open("b@s.whatsapp.net".to_string());
+        assert_eq!(
+            pane.shown(),
+            None,
+            "a new author's run has not resolved anything yet"
+        );
+        pane.follow(Some("theirs".to_string()));
+        pane.close();
+        assert_eq!(pane.shown(), None);
     }
 
     #[test]

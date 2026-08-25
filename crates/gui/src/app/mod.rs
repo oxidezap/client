@@ -691,12 +691,16 @@ impl WhatsAppApp {
                     // Announced on connect, before this window existed, so it
                     // arrives with the snapshot rather than as an event.
                     FromDaemon::Account(account) => entity.update(cx, |app, cx| {
-                        if let Some(account) = account {
-                            app.account_name = account.name;
-                            app.account_jid = account.jid;
-                            app.account_lid = account.lid;
-                            cx.notify();
-                        }
+                        // `None` is an answer, not a missing one: a daemon
+                        // with no account paired is saying so. Keeping the
+                        // last identity meant the old account survived a
+                        // re-pair — its name under the sidebar, its number
+                        // beneath, and its JID still reading as "(You)" —
+                        // until some later `AccountUpdated` corrected it.
+                        app.account_name = account.as_ref().and_then(|a| a.name.clone());
+                        app.account_jid = account.as_ref().and_then(|a| a.jid.clone());
+                        app.account_lid = account.and_then(|a| a.lid);
+                        cx.notify();
                     }),
                     // The tray's "Open", or another front end asking on a
                     // user's behalf. One window, so there is one to raise.
@@ -719,25 +723,11 @@ impl WhatsAppApp {
 
     /// Create a new WhatsApp application
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let bootstrap = Session::connect();
-        let (app_state, client, event_task) = match bootstrap {
-            Ok((client, ui_rx)) => (
-                AppState::Loading,
-                Some(client),
-                Some(Self::spawn_event_task(ui_rx, cx)),
-            ),
-            Err(e) => (
-                AppState::Error(format!("Failed to reach the daemon: {e}")),
-                None,
-                None,
-            ),
-        };
-
         Self {
-            app_state,
+            app_state: AppState::Loading,
             chats: Vec::new(),
             selected_chat: None,
-            client,
+            client: None,
             chat_list_scroll: VirtualListScrollHandle::new(),
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
@@ -759,7 +749,7 @@ impl WhatsAppApp {
             input_area: None,
             composing_chat: None,
             drafts: HashMap::new(),
-            event_task,
+            event_task: None,
             reconnect_task: None,
             audio_recorder: AudioRecorder::new(),
             recording_state: RecordingState::default(),
@@ -801,6 +791,18 @@ impl WhatsAppApp {
             heartbeat: None,
             recording_tick: None,
         }
+    }
+
+    /// Reach the daemon, from a window that already exists.
+    ///
+    /// Separate from [`Self::new`] because connecting is not instant on a
+    /// first launch: there is no daemon listening, so `connect_or_start`
+    /// starts one and polls for it, which is up to ten seconds. Done in the
+    /// constructor that was ten seconds with no window on screen at all —
+    /// the loading state cannot be drawn by the entity that is still being
+    /// built. Off the UI thread, exactly like the retry it shares.
+    pub fn start(&mut self, cx: &mut Context<Self>) {
+        self.retry_connection(cx);
     }
 
     // ========== Responsive Layout ==========
@@ -1405,21 +1407,26 @@ impl WhatsAppApp {
         self.invalidate_chat_cache();
     }
 
-    /// Drop the chats a complete load said were gone, now that they are no
-    /// longer being read.
+    /// Drop the chats a complete load said were gone, now that nobody is
+    /// looking at them.
     ///
     /// See [`Self::departed_chats`]. Deferred rather than skipped: the
     /// deletion is a fact from the moment the complete load arrived, and the
-    /// only reason to keep the rows is that someone is looking at them.
-    fn prune_departed_chats(&mut self, cx: &mut Context<Self>) {
+    /// only reason to keep the rows is that someone is reading them.
+    ///
+    /// Called at the top of the render pass, against what the *previous*
+    /// frame drew, because that is the one place every way of looking away —
+    /// Status, Settings, the viewer, another conversation, a phone going back
+    /// to its list — is already accounted for.
+    fn prune_departed_chats(&mut self) {
         if self.departed_chats.is_empty() {
             return;
         }
-        let selected = self.selected_chat.clone();
+        let visible = self.visible_chat.clone();
         let gone: Vec<String> = self
             .departed_chats
             .iter()
-            .filter(|jid| selected.as_deref() != Some(jid.as_str()))
+            .filter(|jid| visible.as_deref() != Some(jid.as_str()))
             .cloned()
             .collect();
         if gone.is_empty() {
@@ -1437,8 +1444,24 @@ impl WhatsAppApp {
                 cache.remove(jid);
             }
         }
+        self.forget_missing_selection();
         self.invalidate_chat_cache();
-        cx.notify();
+    }
+
+    /// Drop a selection that no longer names a chat.
+    ///
+    /// The conversation pane resolves the selection every frame, so one left
+    /// pointing at a deleted chat draws the empty state — and on a phone that
+    /// is the whole screen, with the Back button belonging to a conversation
+    /// that is not there.
+    fn forget_missing_selection(&mut self) {
+        if self
+            .selected_chat
+            .as_deref()
+            .is_some_and(|jid| !self.chats.iter().any(|chat| chat.jid == jid))
+        {
+            self.selected_chat = None;
+        }
     }
 
     /// Move a chat at the given index to the top of the list (index 0).
@@ -1667,9 +1690,6 @@ impl WhatsAppApp {
             self.cancel_reply(cx);
         }
         self.selected_chat = Some(jid.clone());
-        // The conversation just left may have been one a complete load
-        // already reported gone, kept only because it was open.
-        self.prune_departed_chats(cx);
         self.navigate_to_chat();
 
         if open == ChatOpen::ToCompose {
@@ -2439,6 +2459,11 @@ impl Focusable for WhatsAppApp {
 impl Render for WhatsAppApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
+        // Against what the last frame drew, so it has to happen before that
+        // record is cleared: a chat a complete load said was gone is kept
+        // only while it is on screen, and this is where looking away is
+        // noticed. See `prune_departed_chats`.
+        self.prune_departed_chats();
         // Cleared here and set by whichever branch below actually draws a
         // conversation, so it describes this frame rather than an older one:
         // the pairing, error and Settings screens draw none.

@@ -95,10 +95,22 @@ profile here repeats it deliberately.
   server subscribes and then snapshots, so the window between the two is
   delivered twice rather than lost, and the client drops the overlap by
   comparing versions. Reversing the order loses it instead.
+- **The status reader is anchored to an update, not to a place in the run.**
+  A position was safe only while a run grew at the end, and it does not: a
+  live update and a hydrated one can both be stamped before the one being
+  watched, and the same index then silently becomes a different message —
+  never marked watched, never fetched, with the previous one's video still
+  playing over it. `StatusPane::shown` is the anchor and
+  `reconcile_status_pane` puts the index back under it.
 - **A daemon chat that only ever arrived live is not prunable.** A complete
   store reload is the store's whole truth *about rows it has*, and during
   pairing it has none while live messages already exist. Only store-backed
   chats are diffed against a reload; see `StateHub::store_backed_chat_jids`.
+  On the window's side the same diff spares what is *on screen* rather than
+  what is selected — the selection survives a trip to Status, to Settings and
+  under the viewer, so sparing on it kept a deleted chat nobody was looking
+  at. `departed_chats` is the deferral and the render pass spends it, against
+  what the previous frame drew.
 - **How a call ended is said in the state, not derived from its absence.** A
   front end learns a call is over by watching the stage disappear, and it
   writes the conversation's record from the stage it was holding — so a call

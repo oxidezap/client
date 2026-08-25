@@ -40,19 +40,22 @@ impl WhatsAppApp {
                 if complete {
                     let loaded: std::collections::HashSet<&str> =
                         chats.iter().map(|c| c.jid.as_str()).collect();
-                    let selected = self.selected_chat.clone();
+                    // What the last frame drew, not what is selected: see
+                    // `survives_complete_load`.
+                    let visible = self.visible_chat.clone();
                     // Rebuilt from this load rather than added to: a chat that
                     // comes back — unarchived elsewhere — is in `loaded` again
                     // and is no longer owed a removal.
                     let mut departed = std::collections::HashSet::new();
                     let mut cache = self.message_list_cache.borrow_mut();
                     self.chats.retain(|c| {
-                        match survives_complete_load(c, &loaded, selected.as_deref()) {
+                        match survives_complete_load(c, &loaded, visible.as_deref()) {
                             Survival::Keep => true,
-                            // Gone from the store, but on screen. Spared now
-                            // and remembered, so that leaving it finishes the
-                            // removal instead of it lingering until some later
-                            // reload happens to say so again.
+                            // Gone from the store, but on screen. Spared
+                            // now and remembered, so that looking away
+                            // finishes the removal instead of it lingering
+                            // until some later reload happens to say so
+                            // again.
                             Survival::Defer => {
                                 departed.insert(c.jid.clone());
                                 true
@@ -97,6 +100,10 @@ impl WhatsAppApp {
                 }
                 self.chats
                     .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
+                // A selection that no longer names a chat is a selection of
+                // nothing: the conversation pane resolves it every frame and
+                // would draw the empty state with no way back on a phone.
+                self.forget_missing_selection();
                 // The merge above took the store's word for every row, and
                 // the store was never told which updates have been watched.
                 self.restore_watched_status();

@@ -149,6 +149,14 @@ pub fn render_connected_view(
     // reason the viewer is: the picture is the app's to decode, and this is
     // the level that still has it.
     let destination = app.destination();
+    // Before the feed is read, because the reader is anchored to an update
+    // and a rebuild can have moved it. Only where the reader is on screen:
+    // the pane keeps its author while the window is elsewhere, and deriving
+    // the feed for a frame that does not draw it is work for nothing. See
+    // `reconcile_status_pane`.
+    if destination == Destination::Status {
+        app.reconcile_status_pane(cx);
+    }
     let status_feed = (destination == Destination::Status).then(|| app.status_feed());
     let status_view = status_feed.as_ref().and_then(|feed| {
         let selected = app.status_pane().author()?;

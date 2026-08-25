@@ -80,7 +80,14 @@ fn main() {
                     // daemon outlives the window — never polled it at all,
                     // and edits to an existing `theme.json` did nothing until
                     // the next restart.
-                    view.update(cx, |app, cx| app.watch_theme_file(cx));
+                    view.update(cx, |app, cx| {
+                        app.watch_theme_file(cx);
+                        // After the window exists, so the ten seconds a cold
+                        // start can spend waiting for a daemon to come up are
+                        // spent under the loading screen rather than in front
+                        // of nothing.
+                        app.start(cx);
+                    });
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             ) {

@@ -640,7 +640,13 @@ impl WhatsAppApp {
                 self.start_video_download(message_id, downloadable, cx);
             }
             Some(VideoPlayerState::Downloading) | Some(VideoPlayerState::Decoding) => {
-                // Already in progress, do nothing
+                // Already on its way — but say again that it is wanted.
+                // Leaving the video clears `pending_media_request`, and the
+                // completion autoplays on the strength of that alone, so
+                // coming back before it finished used to land on a paused
+                // first frame with no play control anywhere in the status
+                // reader: stuck until the reader was closed and reopened.
+                self.pending_media_request = Some(message_id);
             }
             None => {
                 // No player yet, start downloading

@@ -219,6 +219,12 @@ impl WhatsAppApp {
     /// Open Settings over the conversation view.
     pub fn open_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.is_none() {
+            // Settings replaces the body, so a viewer left open is a surface
+            // that is not drawn and still owns things: `sync_overlay_focus`
+            // keeps handing it the keyboard, and `close_overlay` spends the
+            // first Escape closing it — so Settings appears to ignore Escape
+            // once. A picture and a screen over the same slot is one too many.
+            self.close_media_viewer(cx);
             self.settings = Some(SettingsState::new(cx.product().settings()));
             // Asked on open rather than on reaching the pane: it is two
             // directory reads in another process, and a pane that starts on

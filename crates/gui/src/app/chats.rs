@@ -56,15 +56,21 @@ impl ChatFilter {
 /// being a plain removal, and naming them here is what keeps the rule in one
 /// place: a live-only chat was never in the store to be missing from it (during
 /// pairing the store is empty while live messages already populate the UI),
-/// and the conversation being read is not yanked out from under its reader.
+/// and the conversation being *read* is not yanked out from under its reader.
+///
+/// Read, not merely selected. The selection is deliberately kept while the
+/// window is in Status, in Settings, under the fullscreen viewer or, on a
+/// phone, walking the chat list — so sparing on the selection spared a chat
+/// nobody was looking at, and left it in the sidebar until some other
+/// conversation was picked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Survival {
     /// Still a chat this window should show.
     Keep,
-    /// Gone from the store, but open. Kept for now and owed a removal the
-    /// moment it is no longer the selected chat.
+    /// Gone from the store, but on screen. Kept for now and owed a removal
+    /// the moment it stops being drawn.
     Defer,
-    /// Gone, and nothing is looking at it.
+    /// Gone, and nobody is looking at it.
     Drop,
 }
 
@@ -72,11 +78,11 @@ pub enum Survival {
 pub fn survives_complete_load(
     chat: &Chat,
     loaded: &std::collections::HashSet<&str>,
-    selected: Option<&str>,
+    visible: Option<&str>,
 ) -> Survival {
     if !chat.is_from_store() || loaded.contains(chat.jid.as_str()) {
         Survival::Keep
-    } else if selected == Some(chat.jid.as_str()) {
+    } else if visible == Some(chat.jid.as_str()) {
         Survival::Defer
     } else {
         Survival::Drop
@@ -163,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn the_open_conversation_is_spared_but_owed_a_removal() {
+    fn the_conversation_on_screen_is_spared_but_owed_a_removal() {
         let loaded = std::collections::HashSet::from(["b@s.whatsapp.net"]);
         assert_eq!(
             survives_complete_load(
@@ -173,6 +179,16 @@ mod tests {
             ),
             Survival::Defer,
             "spared only because it is being read — not forgiven"
+        );
+    }
+
+    #[test]
+    fn a_chat_nobody_is_looking_at_goes_even_if_it_is_selected() {
+        let loaded = std::collections::HashSet::from(["b@s.whatsapp.net"]);
+        assert_eq!(
+            survives_complete_load(&from_store("a@s.whatsapp.net"), &loaded, None),
+            Survival::Drop,
+            "the selection survives a trip to Status; being drawn does not"
         );
     }
 
