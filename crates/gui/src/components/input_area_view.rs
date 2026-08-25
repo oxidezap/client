@@ -57,6 +57,29 @@ pub struct ReplyDraft {
     pub sender: String,
     pub sender_name: String,
     pub preview: String,
+    /// What the message being answered *is*, so the quote sent to the other
+    /// side is a photo rather than the word "Photo".
+    ///
+    /// The preview is a label a human reads; this is what the recipient's
+    /// client draws. Dropped here, the kind-aware quote builder in the
+    /// session had nothing to be aware of.
+    pub kind: Option<oxidezap_core::QuotedKind>,
+}
+
+impl From<ReplyDraft> for oxidezap_core::QuotedMessage {
+    /// One conversion, so the two send paths cannot disagree about what a
+    /// reply quotes. They each built this by hand and both hard-coded the
+    /// kind away, which left the kind-aware quote builder in the session
+    /// with nothing to work from.
+    fn from(draft: ReplyDraft) -> Self {
+        Self {
+            message_id: draft.message_id,
+            sender: draft.sender,
+            sender_name: draft.sender_name,
+            preview: draft.preview,
+            kind: draft.kind,
+        }
+    }
 }
 
 /// How far the field grows before it starts scrolling instead.

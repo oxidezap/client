@@ -398,12 +398,11 @@ impl Bridge {
                     lid: lid.clone(),
                 });
             }
+            // The stage empties for good here — nothing is about to replace
+            // a call that never got placed — so a second caller parked behind
+            // it comes forward, the same as when a call ends.
             UiEvent::OutgoingCallFailed { recipient_jid, .. } => self.hub.calls(|s| {
-                if s.outgoing()
-                    .is_some_and(|c| c.recipient_jid == *recipient_jid)
-                {
-                    s.take_outgoing();
-                }
+                s.fail_outgoing_to(recipient_jid);
             }),
             _ => {}
         }

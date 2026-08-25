@@ -290,8 +290,18 @@ impl WhatsAppApp {
             return;
         }
 
+        // A second tap while the first is still in flight downloads the note
+        // twice, and both answers still match `pending_media_request` — so the
+        // later one calls `play_audio` again and restarts the note from the
+        // top under the listener. The image and document paths already claim
+        // this slot; the one that autoplays needed it most.
+        if !self.begin_download(&message_id, cx) {
+            return;
+        }
+
         let Some(client) = &self.client else {
             warn!("Cannot download audio: client is unavailable");
+            self.finish_download(&message_id);
             return;
         };
         let download_rx = client.download_downloadable_media(downloadable);
@@ -313,6 +323,7 @@ impl WhatsAppApp {
 
                     // Cache the downloaded audio and play it
                     let _ = entity.update(cx, |app, cx| {
+                        app.finish_download(&msg_id);
                         // Cache the audio data in the message so we don't need to download again
                         app.update_message_media_data(&msg_id, data.clone());
                         // Autoplay only if the user hasn't started other media
@@ -326,6 +337,10 @@ impl WhatsAppApp {
                 }
                 Err(e) => {
                     error!("Failed to download audio: {}", e);
+                    let _ = entity.update(cx, |app, cx| {
+                        app.finish_download(&msg_id);
+                        cx.notify();
+                    });
                 }
             }
         })

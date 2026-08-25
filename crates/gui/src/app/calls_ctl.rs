@@ -271,6 +271,36 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    /// Hand the keyboard to a ringing call, and hand it back afterwards.
+    ///
+    /// The card's Enter and Escape are scoped to its key context, so they
+    /// only fire while it holds focus — and nothing ever focused it, which
+    /// made "enter accepts · esc declines" a promise the window did not keep.
+    /// Only while it is *ringing*, though: an answered call is one people
+    /// type through, and a card that kept the caret would have taken the
+    /// composer away for the length of the conversation. That is also why
+    /// mute is a window-wide chord rather than a card binding.
+    ///
+    /// Driven from the render pass because focusing needs a `Window` and the
+    /// state it follows arrives from the daemon, which has none. It acts only
+    /// on a change, so clicking into the composer while a phone rings does not
+    /// fight for the caret.
+    pub fn sync_call_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ringing = self
+            .call_state
+            .stage()
+            .filter(|stage| !matches!(stage, Stage::Active(_)))
+            .map(|stage| stage.call_id().to_string());
+        if ringing == self.call_keyboard {
+            return;
+        }
+        match ringing {
+            Some(_) => window.focus(&self.call_focus, cx),
+            None => self.focus_composer(window, cx),
+        }
+        self.call_keyboard = ringing;
+    }
+
     /// Put the names this window knows onto the calls the daemon sent.
     ///
     /// The daemon names a caller from its own chat list, which is the same

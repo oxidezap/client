@@ -38,6 +38,21 @@ pub enum QuotedKind {
 }
 
 impl QuotedKind {
+    /// The kind a quote of this media would carry.
+    ///
+    /// One mapping, so the reply drawn on this side and the quote sent to the
+    /// other are describing the same thing.
+    pub fn of(media_type: &crate::MediaType) -> Option<Self> {
+        use crate::MediaType;
+        match media_type {
+            MediaType::Image => Some(Self::Image),
+            MediaType::Video => Some(Self::Video),
+            MediaType::Audio => Some(Self::Audio),
+            MediaType::Document => Some(Self::Document),
+            MediaType::Sticker => Some(Self::Sticker),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Image => "Photo",

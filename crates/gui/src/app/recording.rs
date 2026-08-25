@@ -200,13 +200,7 @@ impl WhatsAppApp {
         // draft belongs to *this* send — and leaving it armed made it attach
         // itself to whatever was typed next, which is the half of the bug
         // nobody would connect to having pressed the microphone.
-        let quoted = self.reply_to.take().map(|draft| QuotedMessage {
-            message_id: draft.message_id,
-            sender: draft.sender,
-            sender_name: draft.sender_name,
-            preview: draft.preview,
-            kind: None,
-        });
+        let quoted = self.reply_to.take().map(QuotedMessage::from);
         self.send_voice_note(&jid, ogg_data, waveform, duration_secs, quoted);
         // The draft is gone from the input as well as from the model.
         if let Some(input) = &self.input_area {

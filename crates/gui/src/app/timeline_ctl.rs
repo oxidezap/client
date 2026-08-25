@@ -87,16 +87,19 @@ impl WhatsAppApp {
             sender,
             sender_name,
             preview,
+            kind: message
+                .media
+                .as_ref()
+                .and_then(|media| oxidezap_core::QuotedKind::of(&media.media_type)),
         };
 
         self.reply_to = Some(draft.clone());
         if let Some(input) = &self.input_area {
             input.update(cx, |view, cx| view.set_reply(Some(draft), cx));
-            // Replying is a composing gesture: put the caret where the user
-            // is about to type rather than making them click into the field.
-            let handle = input.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
         }
+        // Replying is a composing gesture: put the caret where the user is
+        // about to type rather than making them click into the field.
+        self.focus_composer(window, cx);
         cx.notify();
     }
 

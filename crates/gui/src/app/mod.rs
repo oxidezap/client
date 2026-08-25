@@ -390,7 +390,12 @@ pub fn init_app_bindings(cx: &mut gpui::App) {
         // while nothing is ringing.
         KeyBinding::new("enter", AcceptCall, Some(CALL_CONTEXT)),
         KeyBinding::new("escape", DeclineCall, Some(CALL_CONTEXT)),
-        KeyBinding::new("secondary-shift-m", ToggleMute, Some(CALL_CONTEXT)),
+        // Window-wide, unlike the two above: only a ringing call takes the
+        // keyboard (see `sync_call_focus`), and muting is something you do
+        // *during* a call, with the caret back in the composer where someone
+        // on a call is likely typing. A modifier chord has nothing to
+        // collide with there, and it does nothing when no call is up.
+        KeyBinding::new("secondary-shift-m", ToggleMute, None),
         KeyBinding::new("secondary-shift-c", ReturnToCall, None),
         // Walking pictures, scoped to the viewer for the same reason: the
         // arrow keys belong to the composer's caret everywhere else.
@@ -434,6 +439,9 @@ pub struct WhatsAppApp {
     /// Focus target for the call card, so its actions are reachable from
     /// the keyboard while it floats over the app.
     call_focus: FocusHandle,
+    /// The ringing call the keyboard was handed to, so it is handed over
+    /// once and given back once. See `sync_call_focus`.
+    call_keyboard: Option<String>,
     /// Focus target for the fullscreen viewer, which owns the arrow keys
     /// only while it is up.
     viewer_focus: FocusHandle,
@@ -662,6 +670,7 @@ impl WhatsAppApp {
             chat_list_scroll: VirtualListScrollHandle::new(),
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
+            call_keyboard: None,
             viewer_focus: cx.focus_handle(),
             chat_search_input: None, // Created lazily when window is available
             media_viewer: None,
@@ -1044,10 +1053,63 @@ impl WhatsAppApp {
     fn invalidate_message_cache(&mut self, chat_jid: &str) {
         self.message_list_cache.borrow_mut().remove(chat_jid);
         self.refresh_conversation_search(chat_jid);
+        self.refresh_media_viewer(chat_jid);
         // The status feed is a second view of one chat's messages, and its
         // own guard — the message count — cannot see a message *changing*.
         if Self::is_status_jid(chat_jid) {
             *self.status_feed_cache.borrow_mut() = None;
+        }
+    }
+
+    /// Put the caret where typing goes.
+    ///
+    /// Also the place focus comes back to when a transient surface gives it
+    /// up: a blurred handle leaves the window with no keyboard target at
+    /// all, which reads as a window that stopped listening.
+    pub(super) fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input_area) = self.input_area.clone() {
+            // Read the handle out before focusing: `focus` needs `&mut App`
+            // and `read` holds `cx` borrowed for as long as its result lives.
+            let handle = input_area.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+    }
+
+    /// Re-resolve an open media viewer against the chat's current messages.
+    ///
+    /// The viewer names the picture it is showing and resolves it on every
+    /// frame, so a revoke behind it left a modal that drew nothing and still
+    /// swallowed the Escape meant to close it — a window that had stopped
+    /// responding, as far as anyone looking at it could tell. Reconciled here
+    /// because this is the announcement that a chat's history changed, which
+    /// is the whole set of ways a picture can stop existing.
+    fn refresh_media_viewer(&mut self, chat_jid: &str) {
+        if self
+            .media_viewer
+            .as_ref()
+            .is_none_or(|viewer| viewer.jid != chat_jid)
+        {
+            return;
+        }
+        let Some(mut viewer) = self.media_viewer.take() else {
+            return;
+        };
+        if self.viewer_survives(&mut viewer) {
+            self.media_viewer = Some(viewer);
+        }
+    }
+
+    /// Point `viewer` at what its chat holds now, and say whether anything is
+    /// left to look at.
+    ///
+    /// Takes the viewer rather than reading it out of `self`, so the chat can
+    /// be borrowed where it lies: the alternative is cloning a conversation's
+    /// whole message vector to hand it to a viewer that owns three strings.
+    fn viewer_survives(&self, viewer: &mut MediaViewer) -> bool {
+        match self.find_chat(&viewer.jid) {
+            Some(chat) => viewer.refresh(&chat.messages),
+            // The conversation itself is gone; so is everything it held.
+            None => false,
         }
     }
 
@@ -1374,12 +1436,7 @@ impl WhatsAppApp {
             // After `navigate_to_chat`, so on mobile the composer exists on the
             // panel being switched to rather than the one being left.
             self.ensure_input_area(window, cx);
-            if let Some(input_area) = self.input_area.clone() {
-                // Read the handle out before focusing: `focus` needs `&mut App`
-                // and `read` holds `cx` borrowed for as long as its result lives.
-                let handle = input_area.read(cx).focus_handle(cx);
-                window.focus(&handle, cx);
-            }
+            self.focus_composer(window, cx);
         }
 
         // One request, where this used to send receipts and a bounded chat
@@ -1571,13 +1628,7 @@ impl WhatsAppApp {
     fn send_message(&mut self, text: &str, cx: &mut Context<Self>) {
         // Taken, not read: a reply is answered once. Leaving the draft in
         // place quoted the same message from every message that followed.
-        let quoted = self.reply_to.take().map(|draft| QuotedMessage {
-            message_id: draft.message_id,
-            sender: draft.sender,
-            sender_name: draft.sender_name,
-            preview: draft.preview,
-            kind: None,
-        });
+        let quoted = self.reply_to.take().map(QuotedMessage::from);
         self.send_quoted(text, quoted, cx);
     }
 
@@ -1892,17 +1943,40 @@ impl WhatsAppApp {
             Some(kind) => {
                 // The session resolved this name the same way it resolves the
                 // one on their bubbles, so the typing line under them says
-                // the same thing. The rest is memory of earlier answers, for
-                // an event that arrived without one, and the JID is the
-                // honest last resort.
-                let name = sender_name
-                    .or_else(|| {
-                        self.find_chat(&chat_jid)
+                // the same thing — and the conversation keeps it, rather than
+                // the line above it keeping it alone. A chat whose only word
+                // about someone is that they are typing otherwise draws their
+                // rows under a fallback JID while naming them overhead, which
+                // is the same person under two names one line apart.
+                //
+                // Only when it is news, though: presence arrives on every
+                // burst of keystrokes, and re-writing the participant map
+                // walks the timeline.
+                let name = match sender_name {
+                    Some(name) => {
+                        if self
+                            .find_chat(&chat_jid)
                             .and_then(|chat| chat.participant_name(&sender_jid))
-                            .map(str::to_owned)
-                    })
-                    .or_else(|| self.name_cache.get(&sender_jid).cloned())
-                    .unwrap_or_else(|| sender_jid.clone());
+                            != Some(name.as_str())
+                        {
+                            self.name_cache.insert(sender_jid.clone(), name.clone());
+                            if let Some(chat) = self.find_chat_mut(&chat_jid) {
+                                chat.update_participant(sender_jid.clone(), name.clone());
+                            }
+                            // Rows that were waiting for this name have it now.
+                            self.invalidate_message_cache(&chat_jid);
+                        }
+                        name
+                    }
+                    // No answer in this event: memory of earlier ones, and
+                    // the JID is the honest last resort.
+                    None => self
+                        .find_chat(&chat_jid)
+                        .and_then(|chat| chat.participant_name(&sender_jid))
+                        .map(str::to_owned)
+                        .or_else(|| self.name_cache.get(&sender_jid).cloned())
+                        .unwrap_or_else(|| sender_jid.clone()),
+                };
                 self.presence
                     .set_composing(chat_jid, sender_jid, name, kind);
                 // Nothing is ticking unless something needs expiring, and a

@@ -342,12 +342,45 @@ impl CallState {
     pub fn take(&mut self) -> Option<Stage> {
         let ended = self.stage.take();
         if ended.is_some() {
+            self.promote_waiting();
+        }
+        ended
+    }
+
+    /// Give up on the call this device placed to `recipient_jid`.
+    ///
+    /// Named by recipient rather than by id because that is all a failure to
+    /// place one carries: it never reached the wire, so it never got an id.
+    ///
+    /// Not `take_outgoing`, which hands the stage over to whatever is about
+    /// to replace it. Nothing replaces this one, so it ends the way every
+    /// other final removal does — letting whoever was parked behind it
+    /// through. Without that, ringing someone while a second caller waits and
+    /// failing to reach them left that caller in the state with no stage
+    /// drawing them and no way to answer.
+    pub fn fail_outgoing_to(&mut self, recipient_jid: &str) -> Option<OutgoingCall> {
+        if !matches!(&self.stage, Some(Stage::Outgoing(call)) if call.recipient_jid == recipient_jid)
+        {
+            return None;
+        }
+        let failed = self.take_outgoing();
+        self.promote_waiting();
+        failed
+    }
+
+    /// Let the parked second offer onto the empty stage.
+    ///
+    /// The one place that decides it, because the rule is about the stage
+    /// being empty rather than about how it emptied: with a caller in
+    /// `waiting` and nothing on the stage, `is_busy` says no call is up while
+    /// a phone is still ringing that nothing draws.
+    fn promote_waiting(&mut self) {
+        if self.stage.is_none() {
             self.stage = self
                 .waiting
                 .take()
                 .map(|waiting| Stage::Incoming(waiting.call));
         }
-        ended
     }
 
     /// Drop the ringing offer if it is the one named.
@@ -504,7 +537,8 @@ impl CallState {
             // stage empty nothing draws them — the card returns early with no
             // stage, so the caller would ring on with no way to answer or
             // refuse them. Ending the call in front promotes the one behind.
-            self.stage = self.waiting.take().map(|w| Stage::Incoming(w.call));
+            self.stage = None;
+            self.promote_waiting();
             return true;
         }
         false
@@ -770,6 +804,33 @@ mod tests {
             state.waiting().is_none(),
             "it is the call now, not the queue"
         );
+    }
+
+    /// The same promotion, on the other way a stage can empty for good: a
+    /// call this device never managed to place. `take_outgoing` cleared the
+    /// stage and left the parked caller ringing behind an empty card.
+    #[test]
+    fn a_call_that_could_not_be_placed_promotes_whoever_was_waiting() {
+        let mut state = CallState::default();
+        state.set_outgoing(outgoing("MINE"));
+        assert_eq!(state.set_incoming(incoming("THEIRS")), Admission::Parked);
+
+        let failed = state
+            .fail_outgoing_to("b@s.whatsapp.net")
+            .expect("the call this device placed");
+        assert_eq!(failed.call_id, "MINE");
+        assert_eq!(state.incoming().map(|c| c.call_id.as_str()), Some("THEIRS"));
+        assert!(state.waiting().is_none());
+    }
+
+    /// Named by recipient, and a failure for someone else is not this call's.
+    #[test]
+    fn a_failure_to_a_different_recipient_leaves_the_call_alone() {
+        let mut state = CallState::default();
+        state.set_outgoing(outgoing("MINE"));
+
+        assert!(state.fail_outgoing_to("c@s.whatsapp.net").is_none());
+        assert_eq!(state.outgoing().map(|c| c.call_id.as_str()), Some("MINE"));
     }
 
     #[test]

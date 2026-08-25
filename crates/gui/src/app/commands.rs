@@ -84,25 +84,17 @@ impl WhatsAppApp {
 
     /// Walk to the next picture in the conversation.
     pub fn step_media_viewer(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(messages) = self
-            .media_viewer
-            .as_ref()
-            .and_then(|viewer| self.find_chat(&viewer.jid))
-            .map(|chat| chat.messages.clone())
-        else {
-            return;
-        };
-        let Some(viewer) = &mut self.media_viewer else {
+        let Some(mut viewer) = self.media_viewer.take() else {
             return;
         };
         // Re-resolve first: a download finishing adds a picture either side,
-        // and stepping over a stale list would skip it.
-        if !viewer.refresh(&messages) {
-            self.media_viewer = None;
-            cx.notify();
-            return;
+        // and stepping over a stale list would skip it. Held out of `self`
+        // for the borrow, which is also why the chat is read where it lies
+        // rather than copied.
+        if self.viewer_survives(&mut viewer) {
+            viewer.step(forward);
+            self.media_viewer = Some(viewer);
         }
-        viewer.step(forward);
         cx.notify();
     }
 
