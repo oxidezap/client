@@ -192,6 +192,12 @@ impl Palette {
 }
 
 /// A named starting point a `theme.json` can `extends`.
+///
+/// The shared prefix is the themes' actual published names, not stutter:
+/// shortening them to `Night`/`Storm`/`Light` would go ambiguous the moment a
+/// preset from another family lands, and the strings in `id()` have to stay
+/// `tokyo-night*` regardless because they are what users write in the file.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Preset {

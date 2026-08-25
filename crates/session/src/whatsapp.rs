@@ -836,6 +836,7 @@ impl WhatsAppClient {
                 is_animated,
                 duration_secs: None,
                 data_is_preview,
+                waveform: None,
             });
         }
 
@@ -890,6 +891,7 @@ impl WhatsAppClient {
                 is_animated: false,
                 duration_secs: None,
                 data_is_preview,
+                waveform: None,
             });
         }
 
@@ -935,6 +937,7 @@ impl WhatsAppClient {
                     is_animated: false,
                     duration_secs: video.seconds,
                     data_is_preview: false,
+                    waveform: None,
                 });
             }
         }
@@ -970,6 +973,14 @@ impl WhatsAppClient {
                     is_animated: false,
                     duration_secs: audio.seconds,
                     data_is_preview: false,
+                    // Drawn before a byte of audio is fetched, which is the
+                    // point: the shape of a voice note is most useful while
+                    // deciding whether to play it.
+                    waveform: audio
+                        .waveform
+                        .as_deref()
+                        .filter(|w| !w.is_empty())
+                        .map(|w| Arc::new(w.to_vec())),
                 });
             }
         }
@@ -999,6 +1010,7 @@ impl WhatsAppClient {
                 is_animated: false,
                 duration_secs: None,
                 data_is_preview: false,
+                waveform: None,
             });
         }
 
@@ -2004,6 +2016,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             caption: None,
             file_name: None,
             data_is_preview: has_preview && downloadable.is_some(),
+            waveform: None,
             downloadable,
             is_animated: !has_preview && sticker.is_animated.unwrap_or(false),
             duration_secs: None,
@@ -2044,6 +2057,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             is_animated: false,
             duration_secs: None,
             data_is_preview,
+            waveform: None,
         });
     }
     // PTVs (round video notes) are VideoMessage in a different field.
@@ -2083,6 +2097,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             is_animated: false,
             duration_secs: video.seconds,
             data_is_preview: false,
+            waveform: None,
         });
     }
     if let Some(audio) = msg.audio_message.as_option() {
@@ -2112,6 +2127,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             is_animated: false,
             duration_secs: audio.seconds,
             data_is_preview: false,
+            waveform: None,
         });
     }
     if let Some(doc) = msg.document_message.as_option() {
@@ -2138,6 +2154,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             is_animated: false,
             duration_secs: None,
             data_is_preview: false,
+            waveform: None,
         });
     }
     None
@@ -2378,7 +2395,7 @@ async fn resolve_history_chat_name(
     cache: &mut HashMap<String, Option<String>>,
 ) -> (String, u8) {
     let usable_name = |name: &&str| {
-        !name.trim().is_empty() && !(identity.has_phone && is_masked_phone_label(name))
+        !(name.trim().is_empty() || identity.has_phone && is_masked_phone_label(name))
     };
     let history_name = history_name.filter(usable_name);
 
@@ -2444,7 +2461,7 @@ mod tests {
         ReadBoundary, ReloadScope, StoreChange, is_masked_phone_label, media_metadata,
         merge_alias_history_messages, read_message_range,
     };
-    use oxidezap_core::{Chat, ChatMessage, fallback_chat_name};
+    use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
     use whatsapp_rust::buffa::MessageField;
     use whatsapp_rust::wacore_binary::Jid;
     use whatsapp_rust::waproto::whatsapp as wa;
@@ -2526,7 +2543,8 @@ mod tests {
             is_read: false,
             media: None,
             reactions: HashMap::new(),
-            failed: false,
+            status: MessageStatus::default(),
+            quoted: None,
         };
         let mut chat = Chat::new("111222333444555@lid".to_string());
         chat.messages = vec![message("MSG-A"), message("MSG-B")];

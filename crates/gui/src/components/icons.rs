@@ -125,7 +125,6 @@ impl From<ProductIcon> for Icon {
 mod tests {
     use super::ProductIcon;
     use crate::assets::CustomIcons;
-    use rust_embed::RustEmbed as _;
 
     /// The enum and the asset folder are two halves of one thing; this is what
     /// keeps a renamed file from becoming a blank square in a toolbar.

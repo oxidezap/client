@@ -236,6 +236,7 @@ mod tests {
             is_animated: false,
             duration_secs,
             data_is_preview: false,
+            waveform: None,
         }
     }
 

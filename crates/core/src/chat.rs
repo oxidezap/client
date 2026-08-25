@@ -136,6 +136,14 @@ pub struct MediaContent {
     /// Whether `data` holds only a fallback thumbnail (eager download of the
     /// full media failed), so the renderer keeps offering the real download
     pub data_is_preview: bool,
+    /// Amplitude envelope for a voice note, one byte per bucket in `0..=100`.
+    ///
+    /// WhatsApp ships this on the message itself, so the bars can be drawn
+    /// before a single byte of audio is fetched — which is the point: the
+    /// shape of a voice note is most useful *while deciding* whether to play
+    /// it. Absent for older messages and for senders that omit it; the player
+    /// falls back to a flat bar rather than inventing a shape.
+    pub waveform: Option<Arc<Vec<u8>>>,
 }
 
 impl MediaContent {
@@ -697,6 +705,7 @@ mod tests {
             is_animated: false,
             duration_secs: None,
             data_is_preview,
+            waveform: None,
         }
     }
 
@@ -970,28 +979,28 @@ mod tests {
     }
 
     #[test]
-    fn test_hydration_replacement_keeps_failed_flag_and_sender_name() {
+    fn test_hydration_replacement_keeps_delivery_state_and_sender_name() {
         let mut chat = Chat::new("123456789-group@g.us".to_string());
 
         // Live bubble: an outgoing send that failed, plus an incoming group
         // bubble that carried its sender's push name
         let mut failed_send = make_message("OUT-1", 1000);
         failed_send.is_from_me = true;
-        failed_send.failed = true;
+        failed_send.status = MessageStatus::Failed;
         chat.add_message(failed_send);
         let mut incoming = make_message("IN-1", 2000);
         incoming.sender_name = Some("Alice".to_string());
         chat.add_message(incoming);
 
-        // The hydrated rows carry neither the failure flag nor the push name;
-        // the replace must not lose them
+        // The hydrated rows carry neither the failure state nor the push
+        // name; the replace must not lose either
         let mut hydrated_send = make_message("OUT-1", 1000);
         hydrated_send.is_from_me = true;
         chat.insert_history_message(hydrated_send);
         chat.insert_history_message(make_message("IN-1", 2000));
 
         assert_eq!(chat.messages.len(), 2);
-        assert!(chat.messages[0].failed);
+        assert!(chat.messages[0].is_failed());
         assert_eq!(chat.messages[1].sender_name.as_deref(), Some("Alice"));
 
         // A hydrated name wins over the live one (store is authoritative)

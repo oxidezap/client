@@ -204,8 +204,6 @@ impl InputAreaView {
         self.typing_monitor_task = None;
     }
 
-    /// Set recording state (called by parent)
-
     /// Swap the composed text on chat switch: install the target chat's draft
     /// and hand the outgoing chat's draft back to the parent, so unsent text
     /// never rides along to a different recipient.

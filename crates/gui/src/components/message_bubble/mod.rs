@@ -6,7 +6,7 @@
 //! [`crate::app::messages::calculate_message_height`]; the two have to agree
 //! or rows overlap.
 
-mod audio;
+pub mod audio;
 mod media;
 mod quote;
 mod reactions;
@@ -19,6 +19,8 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::{h_flex, v_flex};
+
+pub use audio::SPEEDS;
 
 use media::render_media_content;
 use quote::render_quote;

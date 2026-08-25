@@ -375,7 +375,7 @@ mod tests {
     fn a_zoom_change_invalidates_the_measured_rows() {
         let messages = vec![message("a", false, at(14, 9))];
         let cache = MessageListCache::new(&messages, false, 300.0, Metrics::default(), None);
-        let zoomed = Metrics::new(20.0, crate::theme::Density::Comfortable);
+        let zoomed = Metrics::new(20.0, crate::theme::metrics::Density::Comfortable);
         assert!(
             !cache.is_valid_for(1, false, 300.0, zoomed, false),
             "rows measured at one base font cannot be reused at another"

@@ -87,10 +87,14 @@ fn quoted_kind(message: &wa::Message) -> Option<QuotedKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Re-exported by waproto because its types permeate the generated API;
+    // depending on it directly would mean version-matching that crate exactly.
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
 
     fn text_reply(context: wa::ContextInfo) -> wa::Message {
         wa::Message {
-            extended_text_message: buffa::MessageField::some(wa::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
                 text: Some("e o áudio?".to_string()),
                 context_info: buffa::MessageField::some(context),
                 ..Default::default()
@@ -147,7 +151,7 @@ mod tests {
             stanza_id: Some("ORIGINAL".to_string()),
             participant: Some("a@s.whatsapp.net".to_string()),
             quoted_message: buffa::MessageField::some(wa::Message {
-                image_message: buffa::MessageField::some(wa::ImageMessage::default()),
+                image_message: buffa::MessageField::some(message::ImageMessage::default()),
                 ..Default::default()
             }),
             ..Default::default()

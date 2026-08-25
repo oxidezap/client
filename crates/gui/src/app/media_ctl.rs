@@ -56,6 +56,87 @@ impl WhatsAppApp {
             _ => None,
         }
     }
+    /// Which clip the player currently holds, playing or paused.
+    ///
+    /// Distinct from [`Self::playing_message_id`], which is gated on the
+    /// stream: progress belongs to whichever note is *loaded*, so a paused
+    /// bubble keeps its position instead of snapping back to zero.
+    pub fn audio_owner(&self) -> Option<&str> {
+        self.audio_owner.as_deref()
+    }
+
+    /// How far through the loaded voice note playback is, in `0.0..=1.0`.
+    pub fn audio_progress(&self) -> f32 {
+        self.audio_player.progress()
+    }
+
+    /// Seconds played of the loaded voice note.
+    pub fn audio_elapsed_secs(&self) -> f32 {
+        self.audio_player.elapsed_secs()
+    }
+
+    /// Jump to `fraction` of the way through the loaded voice note.
+    ///
+    /// Playback continues from there rather than restarting, which is what
+    /// makes the waveform a scrub bar and not a progress read-out.
+    pub fn seek_audio(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        if self.audio_owner.is_none() {
+            return;
+        }
+        self.audio_player.seek(fraction);
+        self.ensure_playback_tick(cx);
+        cx.notify();
+    }
+
+    /// The current playback speed.
+    pub fn playback_speed(&self) -> f32 {
+        self.playback_speed
+    }
+
+    /// Step to the next speed, wrapping at the end.
+    ///
+    /// The chosen speed outlives the clip: someone who listens at 1.5× means
+    /// it for the next note too.
+    pub fn cycle_playback_speed(&mut self, cx: &mut Context<Self>) {
+        use crate::components::message_bubble::SPEEDS;
+        let next = SPEEDS
+            .iter()
+            .position(|s| (s - self.playback_speed).abs() < f32::EPSILON)
+            .map_or(0, |ix| (ix + 1) % SPEEDS.len());
+        self.playback_speed = SPEEDS[next];
+        cx.notify();
+    }
+
+    /// Repaint while audio plays, so the playhead and clock advance.
+    ///
+    /// Position is read from the player rather than counted here, so a late
+    /// or dropped frame costs smoothness and never accuracy. Stops as soon as
+    /// nothing is playing.
+    pub(super) fn ensure_playback_tick(&mut self, cx: &mut Context<Self>) {
+        if self.playback_tick.is_some() {
+            return;
+        }
+        self.playback_tick = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            loop {
+                // ~15fps: the playhead only has to look continuous, and a
+                // voice note is not worth a frame-rate repaint of the list.
+                smol::Timer::after(std::time::Duration::from_millis(66)).await;
+                let playing = entity.update(cx, |app, cx| {
+                    let playing = app.audio_player.is_playing();
+                    if playing {
+                        cx.notify();
+                    }
+                    playing
+                });
+                match playing {
+                    Ok(true) => continue,
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            let _ = entity.update(cx, |app, _| app.playback_tick = None);
+        }));
+    }
+
     /// Get the currently playing video message ID (if video is playing)
     pub fn playing_video_id(&self) -> Option<&str> {
         match &self.active_media {
@@ -76,6 +157,8 @@ impl WhatsAppApp {
                     message_id: message_id.clone(),
                 };
                 info!("Started audio playback for message {}", message_id);
+                // Drives the playhead and the clock while it runs.
+                self.ensure_playback_tick(cx);
 
                 // Wait for completion event (no polling needed)
                 let completed_id = message_id;

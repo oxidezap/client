@@ -8,7 +8,7 @@
 
 mod calls;
 mod calls_ctl;
-mod chat_row;
+pub mod chat_row;
 mod chats;
 mod commands;
 mod events;
@@ -334,6 +334,12 @@ pub struct WhatsAppApp {
     recording_chat: Option<String>,
     /// Audio player for voice message and video audio playback
     audio_player: AudioPlayer,
+    /// Playback speed for voice notes, shared across clips: someone who
+    /// listens at 1.5× means it for the next note too.
+    playback_speed: f32,
+    /// Repaints the playhead while audio plays. Only alive while it does.
+    #[allow(dead_code)]
+    playback_tick: Option<Task<()>>,
     /// Message ID of the audio currently loaded in audio_player (for ownership tracking)
     /// This ensures we don't resume audio from a different video when switching
     audio_owner: Option<String>,
@@ -440,6 +446,8 @@ impl WhatsAppApp {
             recording_state: RecordingState::default(),
             recording_chat: None,
             audio_player: AudioPlayer::new(),
+            playback_speed: 1.0,
+            playback_tick: None,
             audio_owner: None,
             active_media: ActiveMedia::None,
             pending_media_request: None,

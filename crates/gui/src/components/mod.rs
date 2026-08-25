@@ -8,7 +8,7 @@ mod chat_list;
 mod empty_state;
 mod icons;
 mod input_area_view;
-mod message_bubble;
+pub mod message_bubble;
 mod message_list;
 mod status_ticks;
 

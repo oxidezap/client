@@ -97,7 +97,8 @@ impl SettingsState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{Density, Preset};
+    use crate::theme::Preset;
+    use crate::theme::metrics::Density;
 
     #[test]
     fn a_fresh_draft_is_clean() {

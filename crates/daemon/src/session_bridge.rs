@@ -839,7 +839,8 @@ mod tests {
             is_read: read,
             media: None,
             reactions: Default::default(),
-            failed: false,
+            status: Default::default(),
+            quoted: None,
         }
     }
 

@@ -151,6 +151,9 @@ impl WhatsAppApp {
             return;
         };
         let local_id = Self::next_local_id("local_audio");
+        // Shared with the bubble below rather than moved: our own voice note
+        // should draw the same shape the recipient sees, not a flat bar.
+        let envelope = Arc::new(waveform.clone());
         client.send_audio_message(
             &jid,
             ogg_data.clone(),
@@ -174,6 +177,7 @@ impl WhatsAppApp {
                 is_animated: false,
                 duration_secs: Some(duration_secs),
                 data_is_preview: false,
+                waveform: Some(envelope),
             },
         );
 
