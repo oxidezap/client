@@ -11,7 +11,7 @@ use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, 
 use gpui_component::{
     ActiveTheme, IconName, Sizable as _,
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState},
+    input::{InputEvent, Textarea, TextareaState},
 };
 
 use crate::components::ProductIcon;
@@ -59,11 +59,20 @@ pub struct ReplyDraft {
     pub preview: String,
 }
 
+/// How far the field grows before it starts scrolling instead.
+///
+/// Five lines is the design's number, and it is about where a composer stops
+/// being a composer: past that the message wants the whole pane, not a
+/// growing strip pushing the conversation off the top.
+const COMPOSER_MIN_ROWS: usize = 1;
+const COMPOSER_MAX_ROWS: usize = 5;
+
 /// Isolated input area view with its own render cycle.
 /// When the user types, only this component re-renders.
 pub struct InputAreaView {
-    /// The input state entity
-    input: Entity<InputState>,
+    /// The field itself. A textarea rather than a single line: a message is
+    /// not always one, and the design asks it to grow with what is typed.
+    input: Entity<TextareaState>,
     /// Whether PTT recording is active
     is_recording: bool,
     /// When the current recording started, for the elapsed counter.
@@ -89,7 +98,15 @@ impl EventEmitter<InputAreaEvent> for InputAreaView {}
 impl InputAreaView {
     /// Create a new input area view
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Type a message"));
+        // Enter sends and Shift+Enter breaks the line, which is what
+        // `submit_on_enter` means here; the field grows from one line to five
+        // and scrolls past that rather than pushing the timeline off screen.
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS)
+                .submit_on_enter(true)
+                .placeholder("Type a message")
+        });
 
         // Subscribe to input events (for Enter key to send, etc.)
         cx.subscribe_in(&input, window, Self::handle_input_event)
@@ -111,7 +128,7 @@ impl InputAreaView {
     /// Handle input events (Enter, Change, etc.)
     fn handle_input_event(
         &mut self,
-        _input: &Entity<InputState>,
+        _input: &Entity<TextareaState>,
         event: &InputEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -319,10 +336,14 @@ impl Render for InputAreaView {
         let control = self.touch_target.unwrap_or_else(|| metrics.icon_button());
 
         div()
-            .h(height)
+            // A floor, not a ceiling: the layout's slot is what an empty
+            // composer occupies, and the field grows the strip from there.
+            .min_h(height)
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .justify_center()
+            .py(metrics.space_sm())
             .px(metrics.space_xl())
             .bg(cx.theme().background)
             .border_t_1()
@@ -370,7 +391,7 @@ impl InputAreaView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(&self.input).w_full()),
+                    .child(Textarea::new(&self.input).w_full()),
             )
             .child(
                 Button::new("emoji")

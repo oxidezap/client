@@ -3,6 +3,7 @@
 //! This module handles all communication with the WhatsApp service,
 //! keeping the async/network logic separate from the UI.
 
+mod group_notice;
 mod quoting;
 mod whatsapp;
 

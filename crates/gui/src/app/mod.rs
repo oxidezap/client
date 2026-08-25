@@ -17,6 +17,7 @@ mod media_ctl;
 mod messages;
 mod recording;
 mod recovery;
+mod search;
 mod settings;
 mod timeline_ctl;
 
@@ -25,6 +26,7 @@ pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
 pub use chats::{ChatFilter, ChatListCache};
 pub use media::RecordingState;
 pub use messages::{MessageListCache, TimelineItem};
+pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
 
 use std::cell::RefCell;
@@ -307,6 +309,11 @@ pub struct WhatsAppApp {
     call_focus: FocusHandle,
     /// Search input state for chat list (created lazily when window is available)
     chat_search_input: Option<Entity<InputState>>,
+    /// Searching inside the open conversation, when that is open. Separate
+    /// from the list's field, which filters chats by name.
+    conversation_search: Option<ConversationSearch>,
+    /// The field for it, created the first time the search is opened.
+    conversation_search_input: Option<Entity<InputState>>,
     /// Current search query (lowercase, trimmed)
     chat_search_query: String,
     /// Debounced search task
@@ -469,6 +476,8 @@ impl WhatsAppApp {
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
             chat_search_input: None, // Created lazily when window is available
+            conversation_search: None,
+            conversation_search_input: None,
             chat_search_query: String::new(),
             chat_search_task: None,
             message_list_scroll: VirtualListScrollHandle::new(),
@@ -938,6 +947,16 @@ impl WhatsAppApp {
             {
                 self.drafts.insert(prev, old);
             }
+        }
+        // A search belongs to the conversation it was typed for, so leaving
+        // that conversation closes it rather than carrying a query into a
+        // chat it says nothing about.
+        if self
+            .conversation_search
+            .as_ref()
+            .is_some_and(|search| search.jid != jid)
+        {
+            self.conversation_search = None;
         }
         self.selected_chat = Some(jid.clone());
         self.navigate_to_chat();
@@ -1457,6 +1476,44 @@ impl WhatsAppApp {
     /// Where a contact is, for the header subtitle.
     pub fn availability_of(&self, jid: &str) -> Option<&Availability> {
         self.presence.availability(jid)
+    }
+
+    /// A group changed, or something else happened *to* a chat.
+    ///
+    /// Inserted the way hydrated history is, not the way a message is: no
+    /// unread bump, no preview change. Nobody replies to "Ana changed the
+    /// group name", and a badge for one would be a badge for nothing to read.
+    ///
+    /// The row is local to this window's session, like a call record: the
+    /// store does not hold group notifications, so there is nothing to
+    /// reload it from.
+    fn handle_system_notice(
+        &mut self,
+        chat_jid: String,
+        notice_id: String,
+        at: chrono::DateTime<chrono::Utc>,
+        notice: SystemNotice,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(chat) = self.find_chat_mut(&chat_jid) else {
+            // A notification for a chat this window has never loaded. The
+            // history sync that brings the chat will not bring this row, but
+            // fabricating the chat around a notice is worse: it would appear
+            // with no messages and no name.
+            debug!("system notice for unknown chat {}", observe_str(&chat_jid));
+            return;
+        };
+        if chat.messages.iter().any(|message| message.id == notice_id) {
+            return;
+        }
+        let mut message = ChatMessage::new_incoming(notice_id, chat_jid.clone(), String::new());
+        message.timestamp = at;
+        message.is_read = true;
+        message.system = Some(notice);
+        chat.insert_history_message(message);
+
+        self.invalidate_message_cache(&chat_jid);
+        cx.notify();
     }
 
     /// Handle a reaction event

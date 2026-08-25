@@ -25,6 +25,107 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    pub fn conversation_search(&self) -> Option<&ConversationSearch> {
+        self.conversation_search.as_ref()
+    }
+
+    pub fn conversation_search_input(&self) -> Option<&Entity<InputState>> {
+        self.conversation_search_input.as_ref()
+    }
+
+    /// Open — or close — the search over the conversation on screen.
+    ///
+    /// A toggle, because the header's magnifier is the only way in and the
+    /// only way out other than Escape, and a control that can only open is
+    /// half a control.
+    pub fn toggle_conversation_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.conversation_search.is_some() {
+            self.close_conversation_search(cx);
+            return;
+        }
+        let Some(jid) = self.selected_chat.clone() else {
+            // Nothing open to search. The list's own field is the right
+            // answer there, and is what the empty state points at.
+            self.focus_search(window, cx);
+            return;
+        };
+        self.conversation_search = Some(ConversationSearch::new(jid));
+        self.ensure_conversation_search_input(window, cx);
+        if let Some(input) = &self.conversation_search_input {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                state.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn close_conversation_search(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.conversation_search.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Re-run the query, and follow it to its match.
+    pub fn set_conversation_search(&mut self, query: String, cx: &mut Context<Self>) {
+        let Some(messages) = self
+            .conversation_search
+            .as_ref()
+            .and_then(|search| self.find_chat(&search.jid))
+            .map(|chat| chat.messages.clone())
+        else {
+            return;
+        };
+        let Some(search) = &mut self.conversation_search else {
+            return;
+        };
+        search.refresh(&query, &messages);
+        let target = search.current_match().map(str::to_string);
+        if let Some(target) = target {
+            self.jump_to_message(&target, cx);
+        }
+        cx.notify();
+    }
+
+    /// Walk the matches. `forward` is down the timeline, the way reading goes.
+    pub fn step_conversation_search(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(search) = &mut self.conversation_search else {
+            return;
+        };
+        let Some(target) = search.step(forward).map(str::to_string) else {
+            return;
+        };
+        self.jump_to_message(&target, cx);
+        cx.notify();
+    }
+
+    fn ensure_conversation_search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_component::input::InputEvent;
+
+        if self.conversation_search_input.is_some() {
+            return;
+        }
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search in this conversation"));
+        cx.subscribe(&input, |this, input, event: &InputEvent, cx| match event {
+            InputEvent::Change => {
+                let query = input.read(cx).value().to_string();
+                this.set_conversation_search(query, cx);
+            }
+            // Enter walks to the next match rather than submitting anything:
+            // there is nothing to submit, and stepping is what the reader
+            // wants after typing.
+            InputEvent::PressEnter { shift, .. } => {
+                this.step_conversation_search(!shift, cx);
+            }
+            _ => {}
+        })
+        .detach();
+        self.conversation_search_input = Some(input);
+    }
+
     /// Empty the search field and restore the full list.
     pub fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(input) = &self.chat_search_input {
@@ -81,6 +182,9 @@ impl WhatsAppApp {
         }
         if self.settings.is_some() {
             self.close_settings(cx);
+            return;
+        }
+        if self.close_conversation_search(cx) {
             return;
         }
         if self.is_searching() {

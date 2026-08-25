@@ -185,6 +185,14 @@ impl WhatsAppApp {
             } => {
                 self.handle_chat_presence(chat_jid, sender_jid, sender_name, composing, cx);
             }
+            UiEvent::SystemNotice {
+                chat_jid,
+                notice_id,
+                at,
+                notice,
+            } => {
+                self.handle_system_notice(chat_jid, notice_id, at, notice, cx);
+            }
             UiEvent::PresenceUpdated { jid, availability } => {
                 self.presence.set_availability(jid, availability);
                 cx.notify();

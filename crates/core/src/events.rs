@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::call::{CallId, IncomingCall};
 use super::chat::ChatMessage;
 use super::presence::{Availability, ComposingKind};
+use super::system_notice::SystemNotice;
 
 pub use wacore::types::presence::ReceiptType;
 
@@ -103,5 +104,19 @@ pub enum UiEvent {
     #[allow(dead_code)]
     CallAccepted(CallId),
     CallEnded(CallId),
+    /// Something happened *to* a chat rather than in it: a group renamed, a
+    /// member added, the settings changed.
+    ///
+    /// Its own event rather than a `MessageReceived` carrying a system
+    /// notice, because it is not a message: it must not raise an unread
+    /// badge, and nothing ever acknowledges or replies to it.
+    SystemNotice {
+        chat_jid: String,
+        /// Stable within one notification, so a redelivery does not stack a
+        /// second identical row.
+        notice_id: String,
+        at: chrono::DateTime<chrono::Utc>,
+        notice: SystemNotice,
+    },
     Error(String),
 }

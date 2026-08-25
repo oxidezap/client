@@ -22,7 +22,7 @@ use whatsapp_rust::waproto::whatsapp as wa;
 use oxidezap_audio::{spawn_mic, spawn_speaker};
 use oxidezap_core::{
     Availability, Chat, ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, MediaContent,
-    MediaType, MessageStatus, UiEvent, fallback_chat_name,
+    MediaType, MessageStatus, SystemNotice, UiEvent, fallback_chat_name,
 };
 
 use crate::quoting::quoted_from;
@@ -664,6 +664,34 @@ impl WhatsAppClient {
                     jid: update.from.to_string(),
                     availability,
                 });
+            }
+            // Something happened *to* the group. Only the changes a member
+            // would notice become a row; the rest is bookkeeping, and a line
+            // for each would bury the conversation.
+            Event::GroupUpdate(update) => {
+                let actor = crate::group_notice::actor_name(
+                    update.participant.as_ref(),
+                    update.participant_username.as_deref(),
+                );
+                if let Some(text) = crate::group_notice::describe(&update.action, actor.as_deref())
+                {
+                    let _ = ui_tx.send(UiEvent::SystemNotice {
+                        chat_jid: update.group_jid.to_string(),
+                        // The stanza id plus the index within it: one
+                        // notification can carry several actions, and a
+                        // redelivery must not stack a second copy of any.
+                        notice_id: format!(
+                            "group-{}-{}",
+                            update
+                                .notification_id
+                                .clone()
+                                .unwrap_or_else(|| update.timestamp.timestamp_millis().to_string()),
+                            update.action_index
+                        ),
+                        at: update.timestamp,
+                        notice: SystemNotice::GroupChanged(text),
+                    });
+                }
             }
             _ => {
                 let _ = ui_sender; // silences unused when no branch needs it

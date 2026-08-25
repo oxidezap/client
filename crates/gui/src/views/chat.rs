@@ -12,7 +12,7 @@ use gpui_component::{Icon, IconName};
 use crate::app::{MessageListCache, WhatsAppApp};
 use crate::components::{
     ChatListProps, EmptyState, InputAreaView, ProductIcon, render_call_card, render_chat_header,
-    render_chat_list, render_message_list,
+    render_chat_list, render_conversation_search, render_message_list,
 };
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
@@ -83,6 +83,19 @@ pub fn render_connected_view(
             .is_none_or(|chat| chat.jid != call.peer_jid)
     });
     let banner = return_banner.map(|call| (call.peer_name.clone(), call.elapsed_label()));
+    // Rendered as an element here rather than passed down as state: the
+    // search belongs to the conversation pane, and only this level has both
+    // the app and the entity to drive it from.
+    let search_bar = app.conversation_search().map(|search| {
+        render_conversation_search(
+            search,
+            app.conversation_search_input(),
+            entity.clone(),
+            *layout.metrics(),
+            cx,
+        )
+        .into_any_element()
+    });
     let call_card = render_call_card(
         app.call_state(),
         app.call_card(),
@@ -117,6 +130,7 @@ pub fn render_connected_view(
                         banner,
                         typing.as_ref(),
                         availability.as_ref(),
+                        search_bar,
                         message_list_scroll,
                         input_area,
                         entity.clone(),
@@ -137,6 +151,7 @@ fn render_chat_area(
     banner: Option<(String, String)>,
     typing: Option<&oxidezap_core::TypingSummary>,
     availability: Option<&oxidezap_core::Availability>,
+    search_bar: Option<gpui::AnyElement>,
     message_scroll: &VirtualListScrollHandle,
     input_area: Option<Entity<InputAreaView>>,
     entity: Entity<WhatsAppApp>,
@@ -185,6 +200,7 @@ fn render_chat_area(
                     layout,
                     cx,
                 ))
+                .children(search_bar)
                 .children(banner.map(|(name, elapsed)| {
                     render_return_banner(name, elapsed, entity.clone(), metrics, cx)
                 }))

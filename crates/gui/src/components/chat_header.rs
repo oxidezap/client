@@ -203,7 +203,7 @@ fn render_actions(
                     "Search in conversation",
                 )
                 .on_click(move |_, window, cx| {
-                    search_entity.update(cx, |app, cx| app.focus_search(window, cx));
+                    search_entity.update(cx, |app, cx| app.toggle_conversation_search(window, cx));
                 }),
             )
         })
@@ -267,7 +267,8 @@ fn render_overflow_menu(
                 PopupMenuItem::new("Search in conversation")
                     .icon(IconName::Search)
                     .on_click(move |_, window, cx| {
-                        search_entity.update(cx, |app, cx| app.focus_search(window, cx));
+                        search_entity
+                            .update(cx, |app, cx| app.toggle_conversation_search(window, cx));
                     }),
             );
 
