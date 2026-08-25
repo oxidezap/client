@@ -1526,6 +1526,28 @@ impl WhatsAppApp {
         }
     }
 
+    /// Move a chat to where its `last_message_time` belongs, newest first.
+    ///
+    /// [`Self::move_chat_to_top`] is right for live traffic, where whatever
+    /// bumped the chat arrived just now and so is the newest thing the window
+    /// holds. A system notice is not always that: the held ones are replayed
+    /// immediately after a history load, carrying whatever clock they arrived
+    /// with, so one can advance its own conversation and still be older than
+    /// another chat's head. Dropping it at index 0 would stand it above a
+    /// strictly newer row in a list the sidebar draws newest-first.
+    ///
+    /// `None` sorts last, which is where `Reverse(last_message_time)` puts a
+    /// chat with nothing in it.
+    fn reposition_chat_by_time(&mut self, index: usize) {
+        if index >= self.chats.len() {
+            return;
+        }
+        let chat = self.chats.remove(index);
+        let target = slot_newest_first(&self.chats, chat.last_message_time);
+        self.chats.insert(target, chat);
+        // Note: chat cache invalidation is handled by the caller
+    }
+
     /// Get the chat list scroll handle
     pub fn chat_list_scroll(&self) -> &VirtualListScrollHandle {
         &self.chat_list_scroll
@@ -2367,12 +2389,9 @@ impl WhatsAppApp {
         chat.insert_history_message(message);
         // The head metadata, when this is now the newest thing in the
         // conversation. Not the unread count: see above.
-        let leads = chat.last_message_time.is_none_or(|last| at > last);
-        if leads {
+        if chat.last_message_time.is_none_or(|last| at > last) {
             chat.last_message_time = Some(at);
-        }
-        if leads {
-            self.move_chat_to_top(index);
+            self.reposition_chat_by_time(index);
         }
 
         self.invalidate_message_cache(&chat_jid);
@@ -2611,5 +2630,64 @@ impl Render for WhatsAppApp {
             .flatten();
 
         root.child(body).children(call_overlay)
+    }
+}
+
+/// Where a chat whose head is `at` belongs in a newest-first list that does
+/// not contain it: the first slot whose neighbour is strictly older.
+///
+/// `None` is older than any timestamp, so an empty conversation lands at the
+/// end — the same place `Reverse(last_message_time)` puts it.
+fn slot_newest_first(rest: &[Chat], at: Option<chrono::DateTime<chrono::Utc>>) -> usize {
+    rest.iter()
+        .position(|other| other.last_message_time < at)
+        .unwrap_or(rest.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::from_timestamp(secs, 0)
+    }
+
+    fn chat(jid: &str, secs: Option<i64>) -> Chat {
+        let mut chat = Chat::new(jid.to_string());
+        chat.last_message_time = secs.and_then(at);
+        chat
+    }
+
+    #[test]
+    fn the_newest_head_goes_first() {
+        let rest = [chat("b", Some(30)), chat("c", Some(20))];
+        assert_eq!(slot_newest_first(&rest, at(40)), 0);
+    }
+
+    #[test]
+    fn a_head_older_than_another_chat_stays_under_it() {
+        // The case a plain bump to index 0 got wrong: a held notice replayed
+        // after a history load advances its own conversation and is still
+        // older than the chat above it.
+        let rest = [chat("b", Some(30)), chat("c", Some(10))];
+        assert_eq!(slot_newest_first(&rest, at(20)), 1);
+    }
+
+    #[test]
+    fn the_oldest_head_goes_last() {
+        let rest = [chat("b", Some(30)), chat("c", Some(20))];
+        assert_eq!(slot_newest_first(&rest, at(10)), 2);
+    }
+
+    #[test]
+    fn an_empty_conversation_sorts_behind_every_dated_one() {
+        let rest = [chat("b", Some(30)), chat("c", None)];
+        assert_eq!(slot_newest_first(&rest, None), 1);
+    }
+
+    #[test]
+    fn an_equal_head_keeps_the_incumbent_above_it() {
+        let rest = [chat("b", Some(30)), chat("c", Some(10))];
+        assert_eq!(slot_newest_first(&rest, at(30)), 1);
     }
 }
