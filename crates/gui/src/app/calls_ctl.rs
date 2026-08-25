@@ -416,6 +416,10 @@ impl WhatsAppApp {
         message.is_read = !record.is_missed_inbound();
         message.system = Some(SystemNotice::Call(record));
 
+        // A call can be the first thing that ever happens with a peer, and a
+        // record with nowhere to go is a call the user is left with no trace
+        // of. See `ensure_chat`.
+        self.ensure_chat(&peer_jid);
         if self.add_message_to_chat(&peer_jid, message) {
             self.invalidate_message_cache(&peer_jid);
             self.invalidate_chat_cache();

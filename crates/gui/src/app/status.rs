@@ -180,9 +180,20 @@ impl WhatsAppApp {
             let _ = entity.update(cx, |app, cx| {
                 app.status_tick = None;
                 app.status_tick_at = None;
-                // Read before the feed is dropped: afterwards there is no
-                // way to ask what was on screen.
-                let shown = app.shown_status_message_id();
+                // Read out of the feed the reader is actually holding, not
+                // by asking for a fresh one. This fires *because* a deadline
+                // passed, which is exactly when `status_feed` re-derives
+                // against the clock — so asking it here answers with the
+                // successor, or with nothing, and the comparison below then
+                // sees no transition at all: the expiring video went on
+                // playing behind a closed reader, and its successor was
+                // neither marked watched nor fetched.
+                let holding = app
+                    .status_feed_cache
+                    .borrow()
+                    .as_ref()
+                    .map(|(_, feed)| feed.clone());
+                let shown = holding.as_ref().and_then(|feed| app.shown_status_in(feed));
                 // The feed rebuilds itself off the clock; this is what makes
                 // anything ask it again.
                 app.status_feed_cache.borrow_mut().take();
@@ -309,9 +320,16 @@ impl WhatsAppApp {
 
     /// Which update the reader is showing, whether or not it needs fetching.
     fn shown_status_message_id(&self) -> Option<String> {
-        let author_jid = self.status_pane.author()?.to_string();
-        let feed = self.status_feed();
-        let author = feed.author(&author_jid)?;
+        self.shown_status_in(&self.status_feed())
+    }
+
+    /// The same question, asked of a feed the caller already has.
+    ///
+    /// Split out for the expiry tick, which needs the answer as of the feed
+    /// that was on screen — the one this firing is about to invalidate.
+    fn shown_status_in(&self, feed: &StatusFeed) -> Option<String> {
+        let author_jid = self.status_pane.author()?;
+        let author = feed.author(author_jid)?;
         let at = self.status_pane.index_in(author.count());
         feed.updates_of(author).nth(at).map(|m| m.id.clone())
     }

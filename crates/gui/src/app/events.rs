@@ -40,21 +40,36 @@ impl WhatsAppApp {
                 if complete {
                     let loaded: std::collections::HashSet<&str> =
                         chats.iter().map(|c| c.jid.as_str()).collect();
+                    let selected = self.selected_chat.clone();
+                    // Rebuilt from this load rather than added to: a chat that
+                    // comes back — unarchived elsewhere — is in `loaded` again
+                    // and is no longer owed a removal.
+                    let mut departed = std::collections::HashSet::new();
                     let mut cache = self.message_list_cache.borrow_mut();
                     self.chats.retain(|c| {
-                        let keep = !c.is_from_store()
-                            || loaded.contains(c.jid.as_str())
-                            || self.selected_chat.as_deref() == Some(c.jid.as_str());
-                        // The cache is keyed by JID alone, so a dropped chat
-                        // whose JID is later recreated with the same message
-                        // count and layout inputs would render the removed
-                        // chat's messages. Message data must not cross a chat
-                        // lifetime.
-                        if !keep {
-                            cache.remove(&c.jid);
+                        match survives_complete_load(c, &loaded, selected.as_deref()) {
+                            Survival::Keep => true,
+                            // Gone from the store, but on screen. Spared now
+                            // and remembered, so that leaving it finishes the
+                            // removal instead of it lingering until some later
+                            // reload happens to say so again.
+                            Survival::Defer => {
+                                departed.insert(c.jid.clone());
+                                true
+                            }
+                            // The cache is keyed by JID alone, so a dropped
+                            // chat whose JID is later recreated with the same
+                            // message count and layout inputs would render the
+                            // removed chat's messages. Message data must not
+                            // cross a chat lifetime.
+                            Survival::Drop => {
+                                cache.remove(&c.jid);
+                                false
+                            }
                         }
-                        keep
                     });
+                    drop(cache);
+                    self.departed_chats = departed;
                 }
                 for chat in chats {
                     // Later loads (post-HistorySync re-hydration) fold into

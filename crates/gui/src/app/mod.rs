@@ -25,7 +25,7 @@ mod viewer;
 
 pub use calls::CallCard;
 pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
-pub use chats::{ChatFilter, ChatListCache};
+pub use chats::{ChatFilter, ChatListCache, Survival, survives_complete_load};
 pub use media::RecordingState;
 pub use messages::{MessageListCache, RowId, TimelineItem};
 
@@ -491,6 +491,16 @@ pub struct WhatsAppApp {
     /// Written by the render pass, because being on screen is a fact about
     /// what was drawn.
     visible_chat: Option<String>,
+    /// Store-backed chats a complete load said were gone, kept on screen only
+    /// because they are the open conversation.
+    ///
+    /// A complete load is the store's whole truth, so a store-backed chat
+    /// missing from one was archived or deleted — possibly on another device.
+    /// The selected chat is spared so the conversation being read is not
+    /// yanked out from under it, and this is the other half of sparing it:
+    /// without remembering the omission, the chat outlived its deletion until
+    /// some unrelated later reload happened to notice again.
+    departed_chats: std::collections::HashSet<String>,
     /// Status updates watched in this window. Local by design — there is no
     /// receipt to send — and therefore this window's job to remember across a
     /// hydration merge, which replaces those rows from the store.
@@ -545,6 +555,13 @@ pub struct WhatsAppApp {
     /// Chat the current PTT recording started in; the note is sent there even
     /// if the user switches chats before stopping
     recording_target: Option<RecordingTarget>,
+    /// Which recording the encode still in flight belongs to.
+    ///
+    /// Encoding runs detached on the background pool and nothing can stop it,
+    /// so cancelling is not a matter of aborting the work but of disowning
+    /// its result. Bumped by `cancel_recording`; a completion whose epoch no
+    /// longer matches is dropped rather than sent.
+    recording_epoch: usize,
     /// Audio player for voice message and video audio playback
     audio_player: AudioPlayer,
     /// Playback speed for voice notes, shared across clips: someone who
@@ -727,6 +744,7 @@ impl WhatsAppApp {
             playback_epoch: 0,
             status_tick_at: None,
             visible_chat: None,
+            departed_chats: std::collections::HashSet::new(),
             watched_status: std::collections::HashSet::new(),
             viewer_focus: cx.focus_handle(),
             chat_search_input: None, // Created lazily when window is available
@@ -745,6 +763,7 @@ impl WhatsAppApp {
             audio_recorder: AudioRecorder::new(),
             recording_state: RecordingState::default(),
             recording_target: None,
+            recording_epoch: 0,
             audio_player: AudioPlayer::new(),
             playback_speed: 1.0,
             playback_tick: None,
@@ -1150,6 +1169,14 @@ impl WhatsAppApp {
         self.chats.clear();
         self.selected_chat = None;
         self.visible_chat = None;
+        self.departed_chats.clear();
+        // The reader is a selection too, and a JID-keyed one. Left alone, it
+        // pointed the new account at the old account's contact: at their
+        // updates if that contact exists there — watched by nobody in this
+        // account — and otherwise at an empty reader which, on a phone, is
+        // the whole screen with no way back out of it.
+        self.status_pane.close();
+        self.destination = Destination::default();
         self.message_list_cache.borrow_mut().clear();
         self.chat_list_cache.borrow_mut().take();
         *self.status_feed_cache.borrow_mut() = None;
@@ -1337,6 +1364,67 @@ impl WhatsAppApp {
         } else {
             false
         }
+    }
+
+    /// Make sure there is a conversation for `jid` to put a row in.
+    ///
+    /// A call is the one thing that can name a peer this window has never had
+    /// a conversation with — a first-time caller, or a stranger — and
+    /// [`Self::add_message_to_chat`] answers "no such chat" by dropping the
+    /// row. That silently discarded every declined, missed and completed
+    /// record for such a call, badge included, so once the card went away
+    /// nothing said the phone had rung. The inbound-message path already
+    /// creates a chat for a sender it has not seen; this is the same rule for
+    /// the caller.
+    ///
+    /// Live-only, so a later complete store load leaves it alone rather than
+    /// pruning it as a chat that was deleted elsewhere.
+    fn ensure_chat(&mut self, jid: &str) {
+        if self.chats.iter().any(|chat| chat.jid == jid) {
+            return;
+        }
+        let chat = match self.name_cache.get(jid) {
+            Some(name) => Chat::with_name(jid.to_string(), name.clone()),
+            None => Chat::new(jid.to_string()),
+        };
+        self.chats.insert(0, chat);
+        self.invalidate_chat_cache();
+    }
+
+    /// Drop the chats a complete load said were gone, now that they are no
+    /// longer being read.
+    ///
+    /// See [`Self::departed_chats`]. Deferred rather than skipped: the
+    /// deletion is a fact from the moment the complete load arrived, and the
+    /// only reason to keep the rows is that someone is looking at them.
+    fn prune_departed_chats(&mut self, cx: &mut Context<Self>) {
+        if self.departed_chats.is_empty() {
+            return;
+        }
+        let selected = self.selected_chat.clone();
+        let gone: Vec<String> = self
+            .departed_chats
+            .iter()
+            .filter(|jid| selected.as_deref() != Some(jid.as_str()))
+            .cloned()
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for jid in &gone {
+            self.departed_chats.remove(jid);
+        }
+        self.chats.retain(|chat| !gone.contains(&chat.jid));
+        {
+            // Keyed by JID alone, so a recreated chat would otherwise inherit
+            // the removed one's rows. See the same eviction on the load path.
+            let mut cache = self.message_list_cache.borrow_mut();
+            for jid in &gone {
+                cache.remove(jid);
+            }
+        }
+        self.invalidate_chat_cache();
+        cx.notify();
     }
 
     /// Move a chat at the given index to the top of the list (index 0).
@@ -1565,6 +1653,9 @@ impl WhatsAppApp {
             self.cancel_reply(cx);
         }
         self.selected_chat = Some(jid.clone());
+        // The conversation just left may have been one a complete load
+        // already reported gone, kept only because it was open.
+        self.prune_departed_chats(cx);
         self.navigate_to_chat();
 
         if open == ChatOpen::ToCompose {

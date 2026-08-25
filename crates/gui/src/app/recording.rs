@@ -155,6 +155,11 @@ impl WhatsAppApp {
             cx.notify();
             return;
         }
+        // Which recording this encode belongs to. The task below is detached
+        // and cannot be stopped from outside, so the only way a teardown can
+        // disown it is for it to ask on the way back whether the recording it
+        // was started for is still the current one.
+        let epoch = self.recording_epoch;
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             // GPUI's own background pool. This used to borrow the session's
             // tokio runtime, which was only ever within reach because the
@@ -168,6 +173,15 @@ impl WhatsAppApp {
                 })
                 .await;
             let _ = entity.update(cx, |app, cx| {
+                // A disconnect, a logout or a plain cancel while the encoder
+                // ran makes this note something nobody is waiting for. Sending
+                // it anyway delivers a cancelled recording; and setting `Idle`
+                // over a recording that has since started hides its controls
+                // with the microphone still open.
+                if app.recording_epoch != epoch {
+                    info!("Discarding an encode from a recording that was cancelled");
+                    return;
+                }
                 app.finish_recording_send(jid, reply, encoded, cx);
             });
         })
@@ -279,7 +293,12 @@ impl WhatsAppApp {
         // where the recipient sees a reply.
         msg.quoted = quoted;
 
-        if self.add_message_to_chat(jid, msg) {
+        // Following the note down is only what the sender expects if they are
+        // looking at where it landed. There is one timeline, bound to the
+        // selected chat, so a note that finished encoding after the user moved
+        // on would otherwise yank *that* conversation to its newest message —
+        // out from under someone reading its history.
+        if self.add_message_to_chat(jid, msg) && self.selected_chat.as_deref() == Some(jid) {
             self.scroll_to_last_message();
         }
     }
@@ -288,6 +307,10 @@ impl WhatsAppApp {
         self.audio_recorder.cancel();
         self.recording_state = RecordingState::Idle;
         self.recording_target = None;
+        // Disown an encode that is still running. Cancelling is the only way
+        // out of `Processing` other than the completion itself, which is why
+        // this is the one place that has to say so.
+        self.recording_epoch = self.recording_epoch.wrapping_add(1);
         self.update_input_recording(cx);
         info!("PTT recording cancelled");
         cx.notify();

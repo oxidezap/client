@@ -48,6 +48,41 @@ impl ChatFilter {
     }
 }
 
+/// What a complete store load says about a chat already on screen.
+///
+/// A complete load is the store's whole truth about the rows it has, so a
+/// store-backed chat missing from one was archived or deleted — possibly on
+/// another device — and has to leave the window too. Two things stop that
+/// being a plain removal, and naming them here is what keeps the rule in one
+/// place: a live-only chat was never in the store to be missing from it (during
+/// pairing the store is empty while live messages already populate the UI),
+/// and the conversation being read is not yanked out from under its reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Survival {
+    /// Still a chat this window should show.
+    Keep,
+    /// Gone from the store, but open. Kept for now and owed a removal the
+    /// moment it is no longer the selected chat.
+    Defer,
+    /// Gone, and nothing is looking at it.
+    Drop,
+}
+
+/// Apply that rule to one chat.
+pub fn survives_complete_load(
+    chat: &Chat,
+    loaded: &std::collections::HashSet<&str>,
+    selected: Option<&str>,
+) -> Survival {
+    if !chat.is_from_store() || loaded.contains(chat.jid.as_str()) {
+        Survival::Keep
+    } else if selected == Some(chat.jid.as_str()) {
+        Survival::Defer
+    } else {
+        Survival::Drop
+    }
+}
+
 /// The conversation list as one frame will draw it.
 ///
 /// Rows are derived once and shared, rather than recomputed per visible item:
@@ -93,6 +128,52 @@ mod tests {
     fn groups_excludes_direct_chats() {
         assert!(ChatFilter::Groups.matches(&chat("g@g.us", true, 0, false)));
         assert!(!ChatFilter::Groups.matches(&chat("a@s.whatsapp.net", false, 9, false)));
+    }
+
+    fn from_store(jid: &str) -> Chat {
+        Chat::from_store(jid.to_string(), "Someone".to_string(), 0)
+    }
+
+    #[test]
+    fn a_chat_the_store_still_has_stays() {
+        let loaded = std::collections::HashSet::from(["a@s.whatsapp.net"]);
+        assert_eq!(
+            survives_complete_load(&from_store("a@s.whatsapp.net"), &loaded, None),
+            Survival::Keep
+        );
+    }
+
+    #[test]
+    fn a_live_only_chat_is_not_the_stores_to_delete() {
+        let loaded = std::collections::HashSet::new();
+        assert_eq!(
+            survives_complete_load(&chat("a@s.whatsapp.net", false, 0, false), &loaded, None),
+            Survival::Keep,
+            "during pairing the store is empty while live messages already exist"
+        );
+    }
+
+    #[test]
+    fn a_stored_chat_missing_from_a_complete_load_is_gone() {
+        let loaded = std::collections::HashSet::from(["b@s.whatsapp.net"]);
+        assert_eq!(
+            survives_complete_load(&from_store("a@s.whatsapp.net"), &loaded, None),
+            Survival::Drop
+        );
+    }
+
+    #[test]
+    fn the_open_conversation_is_spared_but_owed_a_removal() {
+        let loaded = std::collections::HashSet::from(["b@s.whatsapp.net"]);
+        assert_eq!(
+            survives_complete_load(
+                &from_store("a@s.whatsapp.net"),
+                &loaded,
+                Some("a@s.whatsapp.net")
+            ),
+            Survival::Defer,
+            "spared only because it is being read — not forgiven"
+        );
     }
 
     #[test]
