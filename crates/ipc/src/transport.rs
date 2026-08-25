@@ -5,6 +5,10 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 8: the account identity carries its LID as well as its phone number. A
+/// chat with your own number can be keyed by either alias, and a client
+/// holding only one of them cannot recognise the other.
+///
 /// 7: `StorageUsage` and `ClearMediaCache`, answered by
 /// `DaemonMessage::Storage`. The daemon is the only process that opens the
 /// store or writes the media cache, so it is the only one that can measure
@@ -39,7 +43,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

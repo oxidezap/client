@@ -16,6 +16,7 @@ mod events;
 mod message_status;
 mod presence;
 mod quoted;
+mod rich_text;
 mod status;
 mod system_notice;
 
@@ -31,5 +32,9 @@ pub use presence::{
     Availability, ChatTyping, ComposingKind, PresenceRegistry, TypingSummary, Typist,
 };
 pub use quoted::{QuotedKind, QuotedMessage};
+pub use rich_text::{
+    Emphasis, RichText, Span as TextSpan, parse as parse_rich_text,
+    plain_text as plain_message_text,
+};
 pub use status::{StatusAuthor, StatusFeed};
 pub use system_notice::{CallOutcome, CallRecord, SystemNotice, format_duration};

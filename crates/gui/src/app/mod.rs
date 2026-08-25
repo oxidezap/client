@@ -74,6 +74,32 @@ actions!(
     ]
 );
 
+/// Reply to one message, named by its id.
+///
+/// Carries its subject rather than acting on "the selected message": a
+/// timeline has no selection, and a context menu is opened on a specific
+/// bubble. `no_json` because these are never bound in a keymap file — there is
+/// no message id to write into one.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct ReplyToMessage {
+    pub id: gpui::SharedString,
+}
+
+/// Put one message's text on the clipboard.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct CopyMessage {
+    pub text: gpui::SharedString,
+}
+
+/// Send a message that failed again.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct RetryMessage {
+    pub id: gpui::SharedString,
+}
+
 use crate::components::{
     AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft, new_timeline_state,
 };
@@ -475,6 +501,9 @@ pub struct WhatsAppApp {
     account_name: Option<String>,
     /// The account's own JID, for the number under the name.
     account_jid: Option<String>,
+    /// The same account's LID. A chat with your own number can be keyed by
+    /// either alias, and neither string matches the other.
+    account_lid: Option<String>,
     /// The Settings screen, when it is open. `None` is the conversation view.
     settings: Option<SettingsState>,
     /// What this account occupies on disk, as the daemon last measured it.
@@ -520,6 +549,7 @@ impl WhatsAppApp {
                         if let Some(account) = account {
                             app.account_name = account.name;
                             app.account_jid = account.jid;
+                            app.account_lid = account.lid;
                             cx.notify();
                         }
                     }),
@@ -612,6 +642,7 @@ impl WhatsAppApp {
             presence: PresenceRegistry::new(),
             account_name: None,
             account_jid: None,
+            account_lid: None,
             settings: None,
             tick_task: None,
             recording_tick: None,
@@ -812,15 +843,21 @@ impl WhatsAppApp {
     /// without one, so the two never match outright, and `is_same_user_as` is
     /// the rule that already knows which parts of a JID are its identity.
     pub fn is_own_number(&self, jid: &str) -> bool {
-        let Some(own) = self
-            .account_jid
-            .as_deref()
-            .and_then(|own| own.parse::<Jid>().ok())
-        else {
+        let Ok(other) = jid.parse::<Jid>() else {
             return false;
         };
-        jid.parse::<Jid>()
-            .is_ok_and(|other| own.to_non_ad().is_same_user_as(&other.to_non_ad()))
+        // Against both aliases, and on `user_base`: the account is announced
+        // as a device JID whose user part carries the device after a colon
+        // (`5599…:57`), and `is_same_user_as` compares that field raw — so the
+        // one comparison that had to succeed never did. The LID is here
+        // because the chat with your own number can be keyed by it while the
+        // account announces a phone number, and neither string matches the
+        // other.
+        [self.account_jid.as_deref(), self.account_lid.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|own| own.parse::<Jid>().ok())
+            .any(|own| own.user_base() == other.user_base())
     }
 
     /// Whether this device is paired at all.
@@ -1878,7 +1915,20 @@ impl Render for WhatsAppApp {
             }))
             .on_action(cx.listener(|app, _: &ReturnToCall, _window, cx| {
                 app.return_to_call(cx);
-            }));
+            }))
+            // The message actions land here rather than on the bubble that
+            // raised them: a popup menu dispatches from its own focus, which
+            // is inside the menu and not inside the row, and the root is the
+            // one ancestor both paths share.
+            .on_action(cx.listener(|app, reply: &ReplyToMessage, window, cx| {
+                app.begin_reply(&reply.id, window, cx);
+            }))
+            .on_action(cx.listener(|app, retry: &RetryMessage, window, cx| {
+                app.retry_send(&retry.id, window, cx);
+            }))
+            .on_action(|copy: &CopyMessage, _window, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.text.to_string()));
+            });
 
         let body = match &self.app_state {
             AppState::Loading => render_loading_view(cx).into_any_element(),

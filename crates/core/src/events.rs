@@ -116,6 +116,13 @@ pub enum UiEvent {
         name: Option<String>,
         /// The account's own JID, for the number under the name.
         jid: Option<String>,
+        /// The same account's LID, when it has one.
+        ///
+        /// Both, because a chat is keyed by whichever alias the server used:
+        /// the conversation with your own number can arrive as a LID while
+        /// the account announces a phone number, and neither string matches
+        /// the other.
+        lid: Option<String>,
     },
     /// Something happened *to* a chat rather than in it: a group renamed, a
     /// member added, the settings changed.

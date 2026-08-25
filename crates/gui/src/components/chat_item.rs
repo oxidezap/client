@@ -18,6 +18,7 @@ use crate::components::{ProductIcon, status_ticks};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::ActiveProductTheme as _;
 use crate::utils::format_list_time;
+use oxidezap_core::plain_message_text;
 
 use super::Avatar;
 
@@ -223,7 +224,9 @@ fn render_preview(
                     .flex_shrink_0()
                     .text_color(product.hsla(product.palette.subtle_foreground))
             }))
-            .child(text(body.clone()))
+            // A preview is one unstyled line with nowhere to put emphasis,
+            // so the markers come out rather than being drawn.
+            .child(text(plain_message_text(body).into_owned()))
             .into_any_element(),
     }
 }

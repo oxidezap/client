@@ -310,10 +310,11 @@ impl Bridge {
             UiEvent::CallEnded(id) => self.hub.calls(|s| {
                 s.end(id);
             }),
-            UiEvent::AccountUpdated { name, jid } => {
+            UiEvent::AccountUpdated { name, jid, lid } => {
                 self.hub.set_account(oxidezap_ipc::AccountIdentity {
                     name: name.clone(),
                     jid: jid.clone(),
+                    lid: lid.clone(),
                 });
             }
             UiEvent::OutgoingCallFailed { recipient_jid, .. } => self.hub.calls(|s| {

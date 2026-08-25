@@ -2,9 +2,9 @@
 //!
 //! The time and its tick sit inline at the end of the last line rather than
 //! on a row of their own, which is what lets a one-word message be a
-//! one-word bubble. Its height is predicted by
-//! [`crate::app::messages::calculate_message_height`]; the two have to agree
-//! or rows overlap.
+//! one-word bubble. Nothing here predicts a height: the list measures each row
+//! as it lays it out, so a padding changed in this file cannot drift out of
+//! step with a number kept elsewhere.
 
 pub mod audio;
 mod media;
@@ -20,6 +20,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::{Sizable as _, h_flex, v_flex};
 
 pub use audio::SPEEDS;
@@ -29,8 +30,8 @@ use media::{MediaProps, render_media_content};
 use quote::render_quote;
 use reactions::{render_hover_actions, render_reactions};
 
-use crate::app::WhatsAppApp;
-use crate::components::bubble_status_ticks;
+use crate::app::{CopyMessage, ReplyToMessage, RetryMessage, WhatsAppApp};
+use crate::components::{bubble_status_ticks, render_rich_text};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use crate::utils::format_time_local;
@@ -121,6 +122,13 @@ pub fn render_message_bubble(
     let retry_entity = entity.clone();
     let retry_id = message_id.clone();
     let failed = message.is_failed();
+
+    // Right-click anywhere on the row, which is what a desktop reader reaches
+    // for and the only route to these commands that does not require finding a
+    // control that is invisible until the pointer is already over it.
+    let menu_id = message_id.clone();
+    let menu_text = message.content.clone();
+    let menu_failed = failed;
 
     div()
         .id(SharedString::from(format!("row-{message_id}")))
@@ -251,7 +259,7 @@ pub fn render_message_bubble(
                                                     .min_w_0()
                                                     .text_size(metrics.text_body())
                                                     .text_color(cx.theme().foreground)
-                                                    .child(content),
+                                                    .child(render_rich_text(&content, cx)),
                                             )
                                         })
                                         .child(render_meta(time, status, is_from_me, metrics, cx)),
@@ -303,6 +311,36 @@ pub fn render_message_bubble(
                         cx,
                     )),
             )
+        })
+        // Last in the chain: the wrapper is no longer a `Div`, so anything
+        // styled after this would have nowhere to go.
+        .context_menu(move |menu, _window, _cx| {
+            let menu = menu.menu(
+                "Reply",
+                Box::new(ReplyToMessage {
+                    id: menu_id.clone().into(),
+                }),
+            );
+            let menu = if menu_text.is_empty() {
+                menu
+            } else {
+                menu.menu(
+                    "Copy text",
+                    Box::new(CopyMessage {
+                        text: menu_text.clone().into(),
+                    }),
+                )
+            };
+            if menu_failed {
+                menu.separator().menu(
+                    "Send again",
+                    Box::new(RetryMessage {
+                        id: menu_id.clone().into(),
+                    }),
+                )
+            } else {
+                menu
+            }
         })
         .into_any_element()
 }

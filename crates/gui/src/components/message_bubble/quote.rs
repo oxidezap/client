@@ -3,7 +3,7 @@
 use gpui::{App, Entity, IntoElement, ParentElement, SharedString, Styled, div};
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use oxidezap_core::QuotedMessage;
+use oxidezap_core::{QuotedMessage, plain_message_text};
 
 use crate::app::WhatsAppApp;
 use crate::theme::{ActiveProductTheme as _, Metrics};
@@ -26,7 +26,9 @@ pub fn render_quote(
     } else {
         quoted.sender_name.clone().into()
     };
-    let summary: SharedString = quoted.summary().to_string().into();
+    // One line with nowhere to put emphasis: the markers come out, the same
+    // way they do in a chat row's preview.
+    let summary: SharedString = plain_message_text(quoted.summary()).into_owned().into();
 
     // Jumping to the original is a command, so it is a `Button` — that is
     // what carries focus and keyboard activation. Styled flat and full width,

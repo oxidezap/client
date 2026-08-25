@@ -162,6 +162,10 @@ pub struct AccountIdentity {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jid: Option<String>,
+    /// The same account's LID, when it has one. A chat with your own number
+    /// can be keyed by either alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lid: Option<String>,
 }
 
 impl StateSnapshot {

@@ -187,10 +187,12 @@ impl WhatsAppApp {
             } => {
                 self.handle_chat_presence(chat_jid, sender_jid, sender_name, composing, cx);
             }
-            UiEvent::AccountUpdated { name, jid } => {
-                if self.account_name != name || self.account_jid != jid {
+            UiEvent::AccountUpdated { name, jid, lid } => {
+                if self.account_name != name || self.account_jid != jid || self.account_lid != lid {
                     self.account_name = name;
                     self.account_jid = jid;
+                    self.account_lid = lid;
+                    // The rows say "(You)" off this, so they are stale now.
                     self.invalidate_chat_cache();
                     cx.notify();
                 }

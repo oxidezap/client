@@ -2395,6 +2395,7 @@ fn account_event(client: &Arc<Client>) -> UiEvent {
     UiEvent::AccountUpdated {
         name: Some(device.push_name.clone()).filter(|name| !name.is_empty()),
         jid: device.pn.as_ref().map(ToString::to_string),
+        lid: device.lid.as_ref().map(ToString::to_string),
     }
 }
 
