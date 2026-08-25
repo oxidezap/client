@@ -60,6 +60,9 @@ pub fn render_chat_header(
     chat: &Chat,
     typing: Option<&TypingSummary>,
     availability: Option<&Availability>,
+    // Whether this window can reach the network at all. Offline, a call
+    // button that still looked live would place a call into nothing.
+    can_send: bool,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     cx: &App,
@@ -98,7 +101,7 @@ pub fn render_chat_header(
         .child(render_identity(
             chat, name, subtitle, presence, &entity, layout, metrics, cx,
         ))
-        .child(render_actions(chat, entity, layout, metrics, cx))
+        .child(render_actions(chat, can_send, entity, layout, metrics, cx))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -176,6 +179,7 @@ fn render_identity(
 
 fn render_actions(
     chat: &Chat,
+    can_send: bool,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     metrics: Metrics,
@@ -183,7 +187,9 @@ fn render_actions(
 ) -> impl IntoElement + use<> {
     // Calls are 1:1 only: gate on a parsed PN/LID user JID, since !is_group
     // alone would still offer calls to status/broadcast and newsletter rows.
-    let callable = is_callable_user(&chat.jid);
+    // Offline is as much a reason a call cannot be placed as the JID being a
+    // group: both mean the button would do nothing.
+    let callable = is_callable_user(&chat.jid) && can_send;
     let call_jid = chat.jid.clone();
     let overflow_jid = chat.jid.clone();
     let call_entity = entity.clone();

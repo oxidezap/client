@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// How often the recording panel is repainted while capture runs.
+///
+/// Ten a second: fast enough that the meter follows a voice, slow enough that
+/// it is nothing next to the audio callback already running.
+const RECORDING_TICK_MS: u64 = 100;
+
 impl WhatsAppApp {
     /// Update the recording state in the input area (call only when recording state changes)
     fn update_input_recording(&self, cx: &mut Context<Self>) {
@@ -11,6 +17,42 @@ impl WhatsAppApp {
                 view.set_recording(is_recording, cx);
             });
         }
+    }
+
+    /// Repaint the recording panel while capture is running.
+    ///
+    /// Without it the panel drew once and then sat there: the timer is derived
+    /// from an `Instant`, which is only as current as the last repaint, and
+    /// the meter had no source at all. This is that source — the recorder's
+    /// own buffer, read at a rate a person can follow, and stopped the moment
+    /// recording does so an idle window wakes for nothing.
+    fn ensure_recording_tick(&mut self, cx: &mut Context<Self>) {
+        if self.recording_tick.is_some() || !self.is_recording() {
+            return;
+        }
+        self.recording_tick = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            loop {
+                smol::Timer::after(std::time::Duration::from_millis(RECORDING_TICK_MS)).await;
+                let keep_going = entity.update(cx, |app, cx| {
+                    if !app.is_recording() {
+                        return false;
+                    }
+                    let level = app.audio_recorder.level();
+                    if let Some(ref input_area) = app.input_area {
+                        input_area.update(cx, |view, cx| view.set_level(level, cx));
+                    }
+                    // The clock lives in the view and is read from an
+                    // `Instant`, so the repaint above is what advances it.
+                    cx.notify();
+                    true
+                });
+                match keep_going {
+                    Ok(true) => continue,
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            let _ = entity.update(cx, |app, _| app.recording_tick = None);
+        }));
     }
     /// Check if currently recording
     pub fn is_recording(&self) -> bool {
@@ -44,6 +86,7 @@ impl WhatsAppApp {
         // at stop time would misdeliver if the user switches chats meanwhile.
         self.recording_chat = self.selected_chat.clone();
         self.update_input_recording(cx);
+        self.ensure_recording_tick(cx);
         info!("PTT recording started");
         cx.notify();
     }

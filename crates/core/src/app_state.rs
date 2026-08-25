@@ -34,6 +34,15 @@ pub enum AppState {
     },
     Syncing,
     Connected,
+    /// The user chose to stop waiting for a connection and read what is
+    /// already on this device.
+    ///
+    /// Its own state rather than `Connected`, because the difference is the
+    /// whole point: history is local and stays readable, but nothing can be
+    /// sent, no call can be placed, and a composer that accepted text here
+    /// would draw a bubble the daemon has no session to send — pending for
+    /// ever, with the failure logged where nobody looks.
+    Offline,
     Error(String),
     /// The server ended the session (401 and friends). Distinct from
     /// [`Error`](Self::Error) because retrying is useless: the stored

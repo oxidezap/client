@@ -166,6 +166,11 @@ pub fn render_connected_view(
     });
     let unseen_status = app.status_unseen();
     let unread_chats = app.unread_chat_count();
+    // Read-only: the user stopped waiting for a connection. The composer is
+    // replaced rather than disabled in place, because the interesting part is
+    // the way out, not the field.
+    let is_offline = app.is_offline();
+    let can_send = app.can_send();
 
     let call_card = render_call_card(
         app.call_state(),
@@ -208,14 +213,18 @@ pub fn render_connected_view(
                 el.child(render_status_view(status_view, entity.clone(), layout, cx))
             } else {
                 el.child(render_chat_area(
-                    selected_chat.as_ref(),
-                    message_cache,
-                    banner,
-                    typing.as_ref(),
-                    availability.as_ref(),
-                    search_bar,
+                    ChatAreaProps {
+                        selected_chat: selected_chat.as_ref(),
+                        message_cache,
+                        banner,
+                        typing: typing.as_ref(),
+                        availability: availability.as_ref(),
+                        search_bar,
+                        input_area,
+                        can_send,
+                        is_offline,
+                    },
                     &message_list,
-                    input_area,
                     entity.clone(),
                     layout,
                     cx,
@@ -247,20 +256,39 @@ pub fn render_connected_view(
         .children(call_card)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_chat_area(
-    selected_chat: Option<&Chat>,
+/// Everything the conversation pane draws, gathered by the caller so this
+/// stays a function of one frame's state.
+struct ChatAreaProps<'a> {
+    selected_chat: Option<&'a Chat>,
     message_cache: Option<MessageListCache>,
     banner: Option<(String, String)>,
-    typing: Option<&oxidezap_core::TypingSummary>,
-    availability: Option<&oxidezap_core::Availability>,
+    typing: Option<&'a oxidezap_core::TypingSummary>,
+    availability: Option<&'a oxidezap_core::Availability>,
     search_bar: Option<gpui::AnyElement>,
-    message_list: &gpui::ListState,
     input_area: Option<Entity<InputAreaView>>,
+    /// Whether anything can be sent from here at all.
+    can_send: bool,
+    is_offline: bool,
+}
+
+fn render_chat_area(
+    props: ChatAreaProps<'_>,
+    message_list: &gpui::ListState,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     cx: &App,
 ) -> impl IntoElement {
+    let ChatAreaProps {
+        selected_chat,
+        message_cache,
+        banner,
+        typing,
+        availability,
+        search_bar,
+        input_area,
+        can_send,
+        is_offline,
+    } = props;
     let metrics = *layout.metrics();
     let base = if layout.is_mobile() {
         div().w_full()
@@ -299,6 +327,7 @@ fn render_chat_area(
                     chat,
                     typing,
                     availability,
+                    can_send,
                     entity.clone(),
                     layout,
                     cx,
@@ -310,9 +339,57 @@ fn render_chat_area(
                 .children(message_cache.map(|cache| {
                     render_message_list(cache, message_list, entity.clone(), is_group, layout, cx)
                 }))
-                .children(input_area)
+                .map(|el| {
+                    if is_offline {
+                        el.child(render_offline_strip(entity.clone(), metrics, cx))
+                    } else {
+                        el.children(input_area)
+                    }
+                })
             }
         })
+}
+
+/// What replaces the composer while the app is read-only.
+///
+/// Not a disabled field: a greyed-out composer says "you cannot type here"
+/// and stops. What the reader needs is why, and the way back.
+fn render_offline_strip(
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(metrics.space_lg())
+        .px(metrics.space_xl())
+        .py(metrics.space_lg())
+        .bg(cx.theme().secondary)
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .child(
+            Icon::new(ProductIcon::WifiOff)
+                .size(metrics.icon_small())
+                .text_color(cx.theme().muted_foreground),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(metrics.text_small())
+                .text_color(cx.theme().muted_foreground)
+                .child("Offline. You can read this conversation, but not send in it."),
+        )
+        .child(
+            Button::new("reconnect")
+                .label("Reconnect")
+                .ghost()
+                .on_click(move |_, _window, cx| {
+                    entity.update(cx, |app, cx| app.retry_connection(cx));
+                }),
+        )
 }
 
 /// "On call · 04:12 · Return to call", under the header of some other chat.

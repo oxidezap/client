@@ -34,11 +34,13 @@ impl WhatsAppApp {
     ///
     /// History is local, so a failed connection does not make the app
     /// useless — it makes it read-only. Saying so is what stops the error
-    /// screen from being a dead end.
+    /// screen from being a dead end. [`AppState::Offline`], not `Connected`:
+    /// claiming the connection was restored is what let the composer accept
+    /// a message nothing could carry.
     pub fn work_offline(&mut self, cx: &mut Context<Self>) {
         info!("Working offline; local history stays readable");
         self.retry_at = None;
-        self.app_state = AppState::Connected;
+        self.app_state = AppState::Offline;
         cx.notify();
     }
 

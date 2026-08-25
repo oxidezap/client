@@ -13,7 +13,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Icon, IconName, Sizable as _};
+use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 
 use crate::app::{SettingsSection, WhatsAppApp};
 use crate::components::ProductIcon;
@@ -28,28 +28,45 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn render_settings_view(
     app: &mut WhatsAppApp,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<WhatsAppApp>,
 ) -> impl IntoElement {
-    let metrics = cx.product().metrics;
+    let layout = app.responsive_layout(window, cx);
+    let metrics = *layout.metrics();
     let entity = cx.entity().clone();
     let Some(settings) = app.settings() else {
         return div().into_any_element();
     };
     let section = settings.section;
+    // A 340px column beside a pane needs a window with 340px to spare. On a
+    // phone it left the Appearance previews a few characters wide, so the
+    // sections become a strip above the pane instead and the screen is one
+    // column all the way down.
+    let is_mobile = layout.is_mobile();
 
     div()
         .size_full()
         .flex()
         .bg(cx.theme().background)
-        .child(render_nav(section, entity.clone(), metrics, cx))
+        .when(!is_mobile, |el| {
+            el.child(render_nav(section, entity.clone(), metrics, cx))
+        })
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(render_header(section, entity.clone(), metrics, cx))
+                .child(render_header(
+                    section,
+                    is_mobile,
+                    entity.clone(),
+                    metrics,
+                    cx,
+                ))
+                .when(is_mobile, |el| {
+                    el.child(render_section_strip(section, entity.clone(), metrics, cx))
+                })
                 .child(
                     div()
                         .id("settings-body")
@@ -177,12 +194,46 @@ fn render_nav_item(
         })
 }
 
-fn render_header(
+/// The sections as a scrolling strip, for a window with no room beside the
+/// pane. Same destinations as the side nav, same selection.
+fn render_section_strip(
     section: SettingsSection,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    div()
+        .id("settings-sections")
+        .flex_shrink_0()
+        .flex()
+        .gap(metrics.space_xs())
+        .px(metrics.space_lg())
+        .py(metrics.space_md())
+        .overflow_x_scroll()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .children(SettingsSection::ALL.into_iter().map(|item| {
+            let entity = entity.clone();
+            Button::new(SharedString::from(format!("settings-tab-{}", item.id())))
+                .label(item.label())
+                .ghost()
+                .small()
+                .selected(item == section)
+                .on_click(move |_, _window, cx| {
+                    entity.update(cx, |app, cx| app.set_settings_section(item, cx));
+                })
+        }))
+}
+
+fn render_header(
+    section: SettingsSection,
+    is_mobile: bool,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let back_entity = entity.clone();
+
     div()
         .flex_shrink_0()
         .flex()
@@ -193,6 +244,20 @@ fn render_header(
         .px(metrics.space_xxl())
         .border_b_1()
         .border_color(cx.theme().border)
+        // With no side nav there is no back button in it either, and Escape
+        // is not a key a phone has.
+        .when(is_mobile, |el| {
+            el.child(
+                Button::new("settings-back-mobile")
+                    .icon(IconName::ArrowLeft)
+                    .ghost()
+                    .small()
+                    .tooltip("Back to chats")
+                    .on_click(move |_, _window, cx| {
+                        back_entity.update(cx, |app, cx| app.close_settings(cx));
+                    }),
+            )
+        })
         .child(
             div()
                 .flex()

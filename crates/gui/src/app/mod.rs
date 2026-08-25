@@ -488,6 +488,10 @@ pub struct WhatsAppApp {
     /// alive while there is something to tick.
     #[allow(dead_code)]
     tick_task: Option<Task<()>>,
+    /// Repaints the recording panel's clock and level meter. Only alive while
+    /// the microphone is.
+    #[allow(dead_code)]
+    recording_tick: Option<Task<()>>,
 }
 
 impl WhatsAppApp {
@@ -608,6 +612,7 @@ impl WhatsAppApp {
             account_jid: None,
             settings: None,
             tick_task: None,
+            recording_tick: None,
         }
     }
 
@@ -752,10 +757,12 @@ impl WhatsAppApp {
                 .clone()
                 .or_else(|| self.account_jid.clone())
                 .unwrap_or_else(|| "This device".to_string()),
-            status: if connected {
-                "linked device · synced".to_string()
-            } else {
-                "linked device · reconnecting".to_string()
+            // Offline is a state the user chose, so it is named rather than
+            // described as a connection still being attempted.
+            status: match self.app_state {
+                AppState::Connected => "linked device · synced".to_string(),
+                AppState::Offline => "linked device · offline".to_string(),
+                _ => "linked device · reconnecting".to_string(),
             },
             is_healthy: connected,
         })
@@ -859,6 +866,21 @@ impl WhatsAppApp {
     /// Check if the client is connected
     fn is_connected(&self) -> bool {
         matches!(self.app_state, AppState::Connected)
+    }
+
+    /// Whether this window can send anything at all.
+    ///
+    /// The composer, the call buttons and the recorder all hang off this: in
+    /// [`AppState::Offline`] the history is readable and nothing else, and a
+    /// control that accepted input there would produce a message with nowhere
+    /// to go.
+    pub fn can_send(&self) -> bool {
+        self.is_connected()
+    }
+
+    /// Whether the user chose to stop waiting and read what is here.
+    pub fn is_offline(&self) -> bool {
+        matches!(self.app_state, AppState::Offline)
     }
 
     /// Get the selected chat JID
@@ -1788,10 +1810,12 @@ impl Render for WhatsAppApp {
             AppState::Syncing => render_syncing_view(cx).into_any_element(),
             // Settings is a screen over the conversation view, so it takes
             // the whole frame while it is open rather than floating.
-            AppState::Connected if self.settings.is_some() => {
+            AppState::Connected | AppState::Offline if self.settings.is_some() => {
                 render_settings_view(self, window, cx).into_any_element()
             }
-            AppState::Connected => render_connected_view(self, window, cx).into_any_element(),
+            AppState::Connected | AppState::Offline => {
+                render_connected_view(self, window, cx).into_any_element()
+            }
             AppState::Error(msg) => render_error_view(
                 msg,
                 self.retry_countdown(),
