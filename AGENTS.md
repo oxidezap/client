@@ -107,6 +107,26 @@ profile here repeats it deliberately.
   travels in the same frame as the removal, because an explanation sent
   beside it rides a different channel and can arrive after the record it was
   meant to prevent.
+- **Whenever the stage empties, the parked caller comes forward.** A second
+  offer during a call waits behind the one on screen, and nothing draws a
+  waiting call on its own — so a stage cleared without promoting it leaves
+  someone ringing with no card, no Accept and no Decline. The rule is about
+  the stage being empty rather than about how it emptied, which is why
+  `CallState::promote_waiting` is one method that `take`, `end` and
+  `fail_outgoing_to` all go through, and why `take_incoming`/`take_outgoing`
+  deliberately do not: those hand the stage to what replaces it.
+- **A ringing call owns the keyboard; an answered one gives it back.** The
+  card's Enter and Escape are scoped to its key context, so they do nothing
+  unless something focuses it — `sync_call_focus`, from the render pass,
+  because focusing needs a `Window` and the state it follows comes from the
+  daemon. Only while ringing: an answered call is one people type through, so
+  mute is a window-wide chord rather than a card binding.
+- **An overlay that names a row is reconciled where rows change.** The media
+  viewer holds a message id and resolves it every frame, so a revoke behind
+  it left a modal that drew nothing and still swallowed the Escape meant to
+  close it. `invalidate_message_cache` is the announcement that a chat's
+  history changed, which makes it the whole set of ways the thing being
+  looked at can stop existing.
 - **Nothing may still be writing this account's media when it is deleted.**
   The publish thread externalizes media behind an unbounded queue, so an
   event accepted before `ForgetSession` can still be in it. `stop_publishing`
