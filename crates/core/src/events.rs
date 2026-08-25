@@ -113,16 +113,23 @@ pub enum UiEvent {
     #[allow(dead_code)]
     CallAccepted(CallId),
     CallEnded(CallId),
-    /// What the microphone really is, when it is not what was asked for.
+    /// What the microphone really is, once the newest request has reached it.
     ///
     /// A front end asks to mute and draws it at once, but the announcement to
     /// the peer can fail, and the library commits the two directions around
     /// that announcement rather than at one point — a mute applies before it,
     /// an unmute only once it is out — precisely so the microphone is never
     /// live while the peer is shown a muted one. The side that pays is the
-    /// front end, which is now drawing a state the device is not in. This is
-    /// the session correcting it from the handle, and it is sent only on a
-    /// disagreement: the ordinary case says nothing.
+    /// front end, which is now drawing a state the device is not in.
+    ///
+    /// So the session reads the device and says what it found, whether or not
+    /// that is news. Saying it only on a disagreement would be unversioned:
+    /// a failed request's answer could land after the retry behind it had
+    /// already succeeded and, finding agreement, said nothing — leaving the
+    /// failure's answer standing over the success's device. Speaking every
+    /// time makes the last request to reach the device the last to be heard,
+    /// and the ordinary case is still free, because a call state that does
+    /// not change publishes no frame.
     CallMuteChanged {
         call_id: CallId,
         muted: bool,

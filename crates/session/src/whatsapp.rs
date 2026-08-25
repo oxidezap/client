@@ -1853,9 +1853,13 @@ impl WhatsAppClient {
     /// never live while the peer is being shown a muted one. What that costs
     /// is that a failed announcement leaves the device in a state nobody
     /// asked for, and the front end has already drawn the state it asked for.
-    /// So the handle is asked what it really holds and the difference is
-    /// published; an announcement that went through changes nothing, and a
-    /// call state that does not change sends no frame.
+    /// So the handle is asked what it really holds and the answer is
+    /// published — always, not only when it differs: what makes the state
+    /// trustworthy is that the *last* request to reach the device is the one
+    /// that speaks last, and a task that only spoke on disagreement would
+    /// leave a failed announcement's answer standing over a later success.
+    /// It costs nothing, because a call state that does not change sends no
+    /// frame.
     ///
     /// The request is stamped here, on the caller's thread, and the work is
     /// what gets spawned — see [`MuteLane`]. A task compares the device
@@ -1921,15 +1925,24 @@ impl WhatsAppClient {
                 );
             }
             // Superseded while announcing: the request behind us is about to
-            // set the state anyway, and a correction from here would describe
-            // a device that is already on its way somewhere else.
+            // set the state anyway, and a word from here would describe a
+            // device that is already on its way somewhere else. It speaks
+            // after it has arrived, which is what makes it the last word.
             if lane.intent.lock().expect("mute intent poisoned").seq != seq {
                 return;
             }
+            // Said whether or not it is news, and this is why. A correction
+            // sent only on disagreement is unversioned, and the daemon writes
+            // a request's optimistic state before that request is even
+            // stamped here — so a *failed* announcement could publish its
+            // truth into the window belonging to the retry queued behind it,
+            // and the retry, succeeding, would find agreement and say
+            // nothing. The state would then hold the failure's answer over
+            // the success's device. Speaking unconditionally makes the newest
+            // request the one that closes the exchange, and costs nothing:
+            // the daemon publishes no frame for a state that did not change.
             let settled = handle.is_muted();
-            if settled != want.muted
-                && let Some(tx) = ui_sender.lock().await.as_ref()
-            {
+            if let Some(tx) = ui_sender.lock().await.as_ref() {
                 let _ = tx.send(UiEvent::CallMuteChanged {
                     call_id,
                     muted: settled,
