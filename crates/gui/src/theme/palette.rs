@@ -395,6 +395,10 @@ mod tests {
     /// `on` picks the ink that actually reads, in every preset and on every
     /// surface it is asked about. A threshold on the surface alone put the
     /// light preset's dark navy on its mid-tone green at about 1.8:1.
+    /// WCAG AA for body text. The same number the sweep below uses, named
+    /// once so the two cannot drift.
+    const AA_TEXT: f32 = 4.5;
+
     #[test]
     fn the_chosen_ink_is_always_the_higher_contrast_one() {
         for preset in Preset::ALL {
@@ -421,6 +425,16 @@ mod tests {
                     contrast(chosen, surface),
                     contrast(other, surface),
                 );
+                // The better of two is not the same as readable. A preset
+                // whose inks both fail on an accent would pass the comparison
+                // above and still be text nobody can read — which is the
+                // defect `on` was written for, so it is the one to assert.
+                assert!(
+                    contrast(chosen, surface) >= AA_TEXT,
+                    "{}: the best ink on {surface_name} is only {:.2}:1",
+                    preset.id(),
+                    contrast(chosen, surface),
+                );
             }
         }
     }
@@ -440,7 +454,7 @@ mod tests {
     ///   sliding into the background entirely.
     #[test]
     fn every_ink_is_legible_on_every_surface() {
-        const AA: f32 = 4.5;
+        const AA: f32 = AA_TEXT;
         for preset in Preset::ALL {
             let p = preset.palette();
             let surfaces = [p.background, p.sidebar, p.secondary, p.elevated];

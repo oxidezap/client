@@ -980,6 +980,18 @@ fn cache_media(message_id: &str, media: &mut Option<MediaContent>) {
         // instead of being downloaded again.
         if crate::media::has(&key) {
             media.cache_key = Some(key);
+            return;
+        }
+        // The other key the same bytes can be under. A download is cached by
+        // its content — `d-<hash>` — and only the eager fetch writes the
+        // message's own key, so a photo whose eager fetch failed and was
+        // fetched on demand later is on this disk under a name a hydrated row
+        // never looks for. It was downloaded again on every restart.
+        if let Some(downloadable) = &media.downloadable {
+            let by_content = crate::media::download_key(&downloadable.file_enc_sha256);
+            if crate::media::has(&by_content) {
+                media.cache_key = Some(by_content);
+            }
         }
         return;
     }

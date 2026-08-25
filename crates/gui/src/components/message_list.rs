@@ -168,7 +168,7 @@ fn render_row(
                 is_downloading: app.is_downloading(message_id),
             };
 
-            render_message_bubble(props, entity.clone(), layout, cx)
+            render_message_bubble(props, entity.clone(), layout, cx).into_any_element()
         }
     }
 }

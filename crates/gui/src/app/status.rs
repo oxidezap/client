@@ -107,6 +107,13 @@ impl WhatsAppApp {
         if self.destination == destination {
             return;
         }
+        // Leaving Status is leaving the update that was playing. Every other
+        // way out of the reader stops its media; this one changed which panel
+        // was drawn and left a video decoding and talking underneath the
+        // conversation that replaced it.
+        if self.destination == Destination::Status {
+            self.leave_shown_status();
+        }
         self.destination = destination;
         cx.notify();
     }
@@ -197,6 +204,10 @@ impl WhatsAppApp {
     }
 
     pub fn open_status(&mut self, author: String, cx: &mut Context<Self>) {
+        // Before the selection moves, because afterwards there is no way to
+        // ask what was on screen. Opening an image or a text update does not
+        // touch the player, so a video left this way went on playing.
+        self.leave_shown_status();
         self.status_pane.open(author);
         self.navigate_to_chat();
         self.mark_shown_status_seen();

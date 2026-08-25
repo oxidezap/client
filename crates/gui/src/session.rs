@@ -240,10 +240,18 @@ impl Session {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&id)
             {
-                waiting.failed(
-                    &format!("could not reach the daemon: {e}"),
-                    Some(&self.events),
-                );
+                let detail = format!("could not reach the daemon: {e}");
+                match waiting {
+                    // This runs on the GPUI executor, and that executor is
+                    // what drains this queue. `failed` reports a send with
+                    // `blocking_send`, so a full queue would park the only
+                    // thread that could empty it — the window stops rather
+                    // than saying the message did not go.
+                    Awaiting::Send { chat_jid, local_id } => {
+                        self.report_send_failed(&chat_jid, &local_id, detail);
+                    }
+                    waiting => waiting.failed(&detail, None),
+                }
             }
         }
         id
@@ -464,6 +472,22 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
         }
 
         match serde_json::from_str::<DaemonMessage>(line.trim_end()) {
+            // The first frame, and the only one that describes where things
+            // already stand. A window opened while the daemon was already
+            // linked hears nothing else about the account it is attached to:
+            // `AccountUpdated` is a live event that fired before this
+            // connection existed, and nothing replays it. Without this the
+            // account row read as unlinked and the own-number checks that
+            // depend on it — "(You)", the read ticks in your own chat — had
+            // nothing to compare against.
+            Ok(DaemonMessage::Hello { snapshot, .. }) => {
+                if catch_up(&snapshot)
+                    .into_iter()
+                    .any(|event| events.blocking_send(event).is_err())
+                {
+                    break;
+                }
+            }
             Ok(DaemonMessage::Session { event }) => {
                 let mut event = *event;
                 // On this thread rather than the UI's: a history load names

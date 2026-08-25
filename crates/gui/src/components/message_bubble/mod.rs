@@ -77,7 +77,7 @@ pub fn render_message_bubble(
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     cx: &App,
-) -> gpui::AnyElement {
+) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
     let message = props.message;
     // A row nobody typed belongs to the conversation, not to a side of it.

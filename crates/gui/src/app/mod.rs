@@ -1319,10 +1319,20 @@ impl WhatsAppApp {
         {
             let restored = self.drafts.remove(&jid).unwrap_or_default();
             let old = input_area.update(cx, |view, cx| view.swap_text(&restored, window, cx));
-            if let Some(prev) = self.selected_chat.clone()
-                && !old.trim().is_empty()
-            {
+            let stashed = self
+                .selected_chat
+                .clone()
+                .filter(|_| !old.trim().is_empty());
+            if let Some(prev) = stashed.clone() {
                 self.drafts.insert(prev, old);
+            }
+            // The list draws a "Draft" preview off this map, and its own
+            // guard counts messages — which neither of these changed. Without
+            // saying so, the chat being left showed no draft and the one being
+            // opened kept claiming one while its text was already back in the
+            // composer.
+            if stashed.is_some() || !restored.is_empty() {
+                self.invalidate_chat_cache();
             }
         }
         // A search belongs to the conversation it was typed for, so leaving

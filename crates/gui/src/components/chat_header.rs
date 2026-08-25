@@ -69,7 +69,7 @@ pub fn render_chat_header(
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     cx: &App,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
     // One definition of the marker, shared with the list row. Two copies had
     // already drifted — that one collapses whitespace in the name first, this

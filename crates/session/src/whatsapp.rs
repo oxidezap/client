@@ -2474,9 +2474,48 @@ fn store_status(status: oxidezap_chat_store::MessageStatus) -> MessageStatus {
 /// on both sides. Its id and its author are what actually thread the reply,
 /// and those are exact.
 fn quote_context(quoted: &oxidezap_core::QuotedMessage) -> wa::ContextInfo {
-    let original = wa::Message {
-        conversation: Some(quoted.preview.clone()),
-        ..Default::default()
+    use oxidezap_core::QuotedKind;
+    use whatsapp_rust::buffa::MessageField;
+
+    let caption = (!quoted.preview.is_empty()).then(|| quoted.preview.clone());
+    // The body's *kind*, not a sentence about it. Rebuilding every quote as
+    // plain text sent the recipient the word "Photo" where their client would
+    // have drawn a photo — and `QuotedKind` exists precisely to carry that
+    // distinction across a preview that cannot.
+    let original = match quoted.kind {
+        Some(QuotedKind::Image) => wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                caption,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Some(QuotedKind::Video) => wa::Message {
+            video_message: MessageField::some(wa::message::VideoMessage {
+                caption,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Some(QuotedKind::Audio) => wa::Message {
+            audio_message: MessageField::some(wa::message::AudioMessage::default()),
+            ..Default::default()
+        },
+        Some(QuotedKind::Document) => wa::Message {
+            document_message: MessageField::some(wa::message::DocumentMessage {
+                caption,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Some(QuotedKind::Sticker) => wa::Message {
+            sticker_message: MessageField::some(wa::message::StickerMessage::default()),
+            ..Default::default()
+        },
+        None => wa::Message {
+            conversation: Some(quoted.preview.clone()),
+            ..Default::default()
+        },
     };
     whatsapp_rust::wacore::proto_helpers::build_quote_context(
         quoted.message_id.clone(),

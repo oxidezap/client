@@ -331,9 +331,23 @@ impl CallState {
         }
     }
 
-    /// Take whatever call is up, for hanging up.
+    /// Take whatever call is up, for hanging up, and let whoever was parked
+    /// behind it through.
+    ///
+    /// The promotion is not a nicety: with the stage empty and `waiting`
+    /// still full, `is_busy` says no call is up while a caller is still
+    /// ringing with nothing drawing them and no way to answer. It is also
+    /// what the daemon does on the same gesture, so the optimistic state a
+    /// window paints matches the one it is about to be sent.
     pub fn take(&mut self) -> Option<Stage> {
-        self.stage.take()
+        let ended = self.stage.take();
+        if ended.is_some() {
+            self.stage = self
+                .waiting
+                .take()
+                .map(|waiting| Stage::Incoming(waiting.call));
+        }
+        ended
     }
 
     /// Drop the ringing offer if it is the one named.
