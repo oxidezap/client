@@ -556,6 +556,8 @@ fn render_video_player(
     let is_paused = state.is_paused();
     let is_loading = state.is_loading();
     let is_error = state.is_error();
+    let scrim = cx.product().hsla(cx.product().palette.scrim);
+    let on_scrim = cx.product().hsla(cx.product().palette.on_scrim);
 
     div()
         .relative()
@@ -614,18 +616,24 @@ fn render_video_player(
                 .flex()
                 .justify_center()
                 .items_center()
-                .bg(gpui::rgba(0x00000066))
-                .when(is_playing, |el| el.bg(gpui::rgba(0x00000000)))
+                // The viewer's pair of tokens, not the theme's inks: this is
+                // a dark wash over a picture, so what goes on it is the ink
+                // for a scrim in *either* preset. Drawn with `foreground` it
+                // was near-black on near-black the moment the light preset
+                // existed — and the wash itself was a literal colour, which
+                // is the same mistake one layer down.
+                .bg(scrim.opacity(0.4))
+                .when(is_playing, |el| el.bg(scrim.opacity(0.)))
                 .child(if is_loading {
                     div()
                         .w(px(48.))
                         .h(px(48.))
                         .rounded_full()
-                        .bg(gpui::rgba(0x00000088))
+                        .bg(scrim.opacity(0.55))
                         .flex()
                         .justify_center()
                         .items_center()
-                        .child(div().text_color(cx.theme().foreground).text_sm().child(
+                        .child(div().text_color(on_scrim).text_sm().child(
                             if state == VideoPlayerState::Downloading {
                                 "↓"
                             } else {
@@ -641,15 +649,11 @@ fn render_video_player(
                         .w(px(48.))
                         .h(px(48.))
                         .rounded_full()
-                        .bg(gpui::rgba(0xFF000088))
+                        .bg(cx.theme().danger.opacity(0.65))
                         .flex()
                         .justify_center()
                         .items_center()
-                        .child(
-                            Icon::new(IconName::Redo)
-                                .text_color(cx.theme().foreground)
-                                .size(px(20.)),
-                        )
+                        .child(Icon::new(IconName::Redo).text_color(on_scrim).size(px(20.)))
                         .when_some(downloadable.clone(), |el, dl| {
                             el.cursor_pointer().on_click(move |_, _window, cx| {
                                 let msg_id = message_id.clone();
@@ -665,7 +669,7 @@ fn render_video_player(
                         .icon(
                             Icon::default()
                                 .path("icons/play.svg")
-                                .text_color(cx.theme().foreground)
+                                .text_color(on_scrim)
                                 .size(px(32.)),
                         )
                         .ghost()

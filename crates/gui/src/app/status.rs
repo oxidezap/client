@@ -196,6 +196,14 @@ impl WhatsAppApp {
                 {
                     app.shown_status_changed(Some(id), cx);
                 }
+                // And when the whole run lapses there is nothing to show at
+                // all. The reader draws an empty state with no way out of it
+                // — on a phone the pane *is* the screen and its Back button
+                // belongs to the conversation view — so the pane closes
+                // rather than stranding whoever was watching.
+                if app.status_pane.is_open() && app.shown_status_message_id().is_none() {
+                    app.close_status(cx);
+                }
                 app.ensure_status_tick(cx);
                 cx.notify();
             });

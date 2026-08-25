@@ -481,6 +481,16 @@ pub struct WhatsAppApp {
     /// The deadline `status_tick` is waiting on, so an earlier one that
     /// arrives later can replace it rather than queue behind it.
     status_tick_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The conversation the last frame actually drew, if any.
+    ///
+    /// Not the same as [`Self::selected_chat`], which is *kept* while the
+    /// user reads statuses or, on a phone, walks the chat list — so that
+    /// coming back lands where they were. Treating the selection as
+    /// visibility is what made messages arriving in a hidden conversation
+    /// read themselves, receipt and all, for someone who never saw them.
+    /// Written by the render pass, because being on screen is a fact about
+    /// what was drawn.
+    visible_chat: Option<String>,
     /// Status updates watched in this window. Local by design — there is no
     /// receipt to send — and therefore this window's job to remember across a
     /// hydration merge, which replaces those rows from the store.
@@ -716,6 +726,7 @@ impl WhatsAppApp {
             keyboard_owner: KeyboardOwner::Composer,
             playback_epoch: 0,
             status_tick_at: None,
+            visible_chat: None,
             watched_status: std::collections::HashSet::new(),
             viewer_focus: cx.focus_handle(),
             chat_search_input: None, // Created lazily when window is available
@@ -1119,6 +1130,12 @@ impl WhatsAppApp {
         if Self::is_status_jid(chat_jid) {
             *self.status_feed_cache.borrow_mut() = None;
         }
+    }
+
+    /// Record what this frame draws as the conversation. See
+    /// [`Self::visible_chat`].
+    pub fn note_visible_conversation(&mut self, jid: Option<String>) {
+        self.visible_chat = jid;
     }
 
     /// Everything that has to stop when the connected view goes away.
@@ -1858,10 +1875,14 @@ impl WhatsAppApp {
         let is_group = jid.as_ref().is_some_and(|j| j.is_group());
         let is_status = jid.as_ref().is_some_and(|j| j.is_status_broadcast());
 
-        // A message landing in the currently open chat is read immediately:
-        // receipt out now, no badge (select_chat won't re-run to send it).
+        // A message landing in the conversation *on screen* is read
+        // immediately: receipt out now, no badge (select_chat won't re-run to
+        // send it). On screen, not merely selected — the selection outlives
+        // the pane that shows it, so reading statuses, opening Settings or
+        // walking the chat list on a phone would otherwise send a read
+        // receipt for a message nobody had laid eyes on.
         let read_now =
-            !message.is_from_me && self.selected_chat.as_deref() == Some(chat_jid.as_str());
+            !message.is_from_me && self.visible_chat.as_deref() == Some(chat_jid.as_str());
 
         // Cache the sender's name if provided
         if let Some(ref name) = sender_name {
@@ -2265,6 +2286,10 @@ impl Focusable for WhatsAppApp {
 impl Render for WhatsAppApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
+        // Cleared here and set by whichever branch below actually draws a
+        // conversation, so it describes this frame rather than an older one:
+        // the pairing, error and Settings screens draw none.
+        self.visible_chat = None;
 
         // Window-level commands hang off the root so they work wherever focus
         // happens to be, which is the point of a window-level command.

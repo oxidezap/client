@@ -859,6 +859,21 @@ impl WhatsAppClient {
         // appear as two chats when messages come from PN vs LID.
         let normalized_chat_jid = normalize_chat_jid(client, &info.source.chat.to_string()).await;
 
+        // One person, one row in the status feed. The broadcast is grouped by
+        // sender, and the same contact reaches it under a phone number on
+        // some updates and their LID on others — which splits their ring,
+        // their unseen count and their playback run in two until a reload.
+        // Hydration canonicalizes these (`hydrate_sender_names`); the live
+        // path shipped whatever the envelope said, so the split came back
+        // with every update that arrived under the other alias.
+        if info.source.chat.is_status_broadcast() {
+            chat_message.sender = names
+                .identity(client, &info.source.sender)
+                .await
+                .canonical_jid
+                .clone();
+        }
+
         // The push name is what the sender calls themselves; the address
         // book is what this account's owner calls them, and that is the one
         // the phone shows. Resolving here rather than shipping the raw push

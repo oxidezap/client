@@ -248,6 +248,21 @@ impl WhatsAppApp {
     /// Recording it twice is harmless: a record is keyed by the call id and
     /// `Chat::add_message` refuses a duplicate.
     pub(super) fn adopt_calls(&mut self, mut calls: CallState, cx: &mut Context<Self>) {
+        // A caller parked behind the one on screen can hang up before ever
+        // reaching it. The stage does not move when that happens, so nothing
+        // here saw it and the conversation lost them entirely — no missed
+        // call, no row, nothing. Promotion is not this: a promoted caller is
+        // still held, as the stage.
+        let abandoned = self
+            .call_state
+            .waiting()
+            .filter(|waiting| !calls.holds(waiting.call_id()))
+            .cloned();
+        if let Some(waiting) = abandoned
+            && !calls.is_unrecorded(waiting.call_id())
+        {
+            self.record_call(&Stage::Incoming(waiting.into_call()), cx);
+        }
         let ended = self
             .call_state
             .stage()

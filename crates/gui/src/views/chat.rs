@@ -47,6 +47,15 @@ pub fn render_connected_view(
             view.set_layout(layout.input_area_height(), layout.min_touch_target(), cx);
         });
     }
+    // What this frame draws as the conversation, which is what decides
+    // whether an arriving message has been seen. On a phone the chat list and
+    // the conversation are the same slot, and Status replaces both.
+    app.note_visible_conversation(
+        (app.destination() == Destination::Chats && layout.show_chat_area())
+            .then(|| selected_jid.clone())
+            .flatten(),
+    );
+
     let call_focus = app.call_focus().clone();
     let viewer_focus = app.viewer_focus().clone();
 
