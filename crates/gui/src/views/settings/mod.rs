@@ -156,6 +156,12 @@ fn render_nav(
 /// content: `justify_start` on the frame left seven destinations reading down
 /// the middle of a column, which is neither where a list of places starts nor
 /// where the eye looks for the next one.
+///
+/// And the bar is a sibling of the button rather than a child of it, for the
+/// same reason turned inside out. A button's children go into that content
+/// box, which sits inside the button's own padding — so an absolutely
+/// positioned child pinned to "the left edge" lands at the left edge of the
+/// *text*, drawn straight through the icon it was supposed to sit beside.
 fn render_nav_item(
     section: SettingsSection,
     is_selected: bool,
@@ -163,15 +169,39 @@ fn render_nav_item(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    Button::new(SharedString::from(format!("settings-nav-{}", section.id())))
-        .ghost()
-        .selected(is_selected)
-        .w_full()
-        .h(metrics.avatar_header())
+    div()
         .relative()
-        .px(metrics.space_lg())
-        .rounded(metrics.radius_md())
-        .text_size(metrics.text_secondary())
+        .w_full()
+        .child(
+            Button::new(SharedString::from(format!("settings-nav-{}", section.id())))
+                .ghost()
+                .selected(is_selected)
+                .w_full()
+                .h(metrics.nav_item_height())
+                // Room for the bar, and the same room on every row, so the
+                // labels line up whether or not one is selected.
+                .pl(metrics.space_xl())
+                .pr(metrics.space_lg())
+                .rounded(metrics.radius_md())
+                .text_size(metrics.text_secondary())
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_start()
+                        .gap(metrics.space_lg())
+                        .child(
+                            Icon::new(icon_for(section))
+                                .size(metrics.icon_small())
+                                .flex_shrink_0(),
+                        )
+                        .child(section.label()),
+                )
+                .on_click(move |_, _window, cx| {
+                    entity.update(cx, |app, cx| app.set_settings_section(section, cx));
+                }),
+        )
         .when(is_selected, |el| {
             el.child(
                 div()
@@ -183,23 +213,6 @@ fn render_nav_item(
                     .rounded_r(metrics.selection_bar_width())
                     .bg(cx.theme().primary),
             )
-        })
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_start()
-                .gap(metrics.space_lg())
-                .child(
-                    Icon::new(icon_for(section))
-                        .size(metrics.icon_small())
-                        .flex_shrink_0(),
-                )
-                .child(section.label()),
-        )
-        .on_click(move |_, _window, cx| {
-            entity.update(cx, |app, cx| app.set_settings_section(section, cx));
         })
 }
 

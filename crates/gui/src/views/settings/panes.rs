@@ -5,7 +5,9 @@
 //! a control that quietly does nothing — a switch that does not switch is a
 //! worse answer than an honest note about what is missing.
 
-use gpui::{AnyElement, App, Entity, IntoElement, ParentElement, Styled, div};
+use gpui::{
+    AnyElement, App, Entity, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder as _,
+};
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, IconName};
@@ -66,17 +68,50 @@ pub fn label(text: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement
         .child(text)
 }
 
+/// A block of label/value lines, drawn as one surface.
+///
+/// Bordered rather than a bare list. Three lines on the background with
+/// hairlines under them read as the leftovers of a table someone deleted;
+/// a settings pane is a set of panels, and this is one panel.
+pub fn card(lines: Vec<(String, String)>, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+    let last = lines.len().saturating_sub(1);
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .rounded(metrics.radius_md())
+        .overflow_hidden()
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().border)
+        .children(
+            lines
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (key, value))| row(key, value, ix == last, metrics, cx)),
+        )
+}
+
 /// One label/value line.
-fn row(key: String, value: String, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+fn row(
+    key: String,
+    value: String,
+    is_last: bool,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
     div()
         .w_full()
         .flex()
         .items_center()
         .justify_between()
         .gap(metrics.space_xl())
+        .px(metrics.space_lg())
         .py(metrics.space_lg())
-        .border_b_1()
-        .border_color(cx.theme().border)
+        // The panel's own edge is the last line's rule.
+        .when(!is_last, |el| {
+            el.border_b_1().border_color(cx.theme().border)
+        })
         .child(
             div()
                 .flex_shrink_0()
@@ -136,39 +171,32 @@ fn pending(text: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement +
 fn account(app: &WhatsAppApp, metrics: Metrics, cx: &App) -> AnyElement {
     let account = app.account_summary();
 
+    let mut lines = vec![(
+        "Name".to_string(),
+        account
+            .as_ref()
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "—".to_string()),
+    )];
+    if let Some(jid) = app.account_jid() {
+        lines.push((
+            "Number".to_string(),
+            // The user part alone: the server suffix is noise to a reader
+            // checking which account this is.
+            jid.split('@').next().unwrap_or(jid).to_string(),
+        ));
+    }
+    lines.push((
+        "Status".to_string(),
+        account
+            .as_ref()
+            .map(|a| a.status.clone())
+            .unwrap_or_else(|| "not linked".to_string()),
+    ));
+
     group(
         label("LINKED DEVICE", metrics, cx),
-        div()
-            .flex()
-            .flex_col()
-            .child(row(
-                "Name".to_string(),
-                account
-                    .as_ref()
-                    .map(|a| a.name.clone())
-                    .unwrap_or_else(|| "—".to_string()),
-                metrics,
-                cx,
-            ))
-            .children(app.account_jid().map(|jid| {
-                row(
-                    "Number".to_string(),
-                    // The user part alone: the server suffix is noise to a
-                    // reader checking which account this is.
-                    jid.split('@').next().unwrap_or(jid).to_string(),
-                    metrics,
-                    cx,
-                )
-            }))
-            .child(row(
-                "Status".to_string(),
-                account
-                    .as_ref()
-                    .map(|a| a.status.clone())
-                    .unwrap_or_else(|| "not linked".to_string()),
-                metrics,
-                cx,
-            )),
+        card(lines, metrics, cx),
         metrics,
     )
     .into_any_element()
@@ -303,30 +331,36 @@ fn storage(
         .gap(metrics.space_xxl())
         .child(group(
             label("ON DISK", metrics, cx),
-            div()
-                .flex()
-                .flex_col()
-                .child(row(
-                    "Messages and keys".to_string(),
-                    // Until the first answer arrives. The daemon measures, and
-                    // it is another process: there is a frame or two where the
-                    // honest thing to show is that nobody has counted yet.
-                    usage.map_or_else(
-                        || "measuring…".to_string(),
-                        |u| format_bytes(u.database_bytes),
+            card(
+                vec![
+                    (
+                        "Messages and keys".to_string(),
+                        // Until the first answer arrives. The daemon measures,
+                        // and it is another process: there is a frame or two
+                        // where the honest thing to show is that nobody has
+                        // counted yet.
+                        usage.map_or_else(
+                            || "measuring…".to_string(),
+                            |u| format_bytes(u.database_bytes),
+                        ),
                     ),
-                    metrics,
-                    cx,
-                ))
-                .child(row(
-                    "Downloaded media".to_string(),
-                    usage.map_or_else(
-                        || "measuring…".to_string(),
-                        |u| format!("{} · {}", format_bytes(u.media_bytes), files(u.media_files)),
+                    (
+                        "Downloaded media".to_string(),
+                        usage.map_or_else(
+                            || "measuring…".to_string(),
+                            |u| {
+                                format!(
+                                    "{} · {}",
+                                    format_bytes(u.media_bytes),
+                                    files(u.media_files)
+                                )
+                            },
+                        ),
                     ),
-                    metrics,
-                    cx,
-                )),
+                ],
+                metrics,
+                cx,
+            ),
             metrics,
         ))
         .child(group(
@@ -396,16 +430,17 @@ fn files(count: u64) -> String {
 fn advanced(metrics: Metrics, cx: &App) -> AnyElement {
     group(
         label("DIAGNOSTICS", metrics, cx),
-        div()
-            .flex()
-            .flex_col()
-            .child(row(
-                "Log level".to_string(),
-                std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-                metrics,
-                cx,
-            ))
-            .child(row("Renderer".to_string(), "GPUI".to_string(), metrics, cx)),
+        card(
+            vec![
+                (
+                    "Log level".to_string(),
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+                ),
+                ("Renderer".to_string(), "GPUI".to_string()),
+            ],
+            metrics,
+            cx,
+        ),
         metrics,
     )
     .into_any_element()

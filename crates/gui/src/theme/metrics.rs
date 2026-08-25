@@ -407,6 +407,15 @@ impl Metrics {
         self.dense(84.0)
     }
 
+    /// One destination in the Settings side navigation.
+    ///
+    /// Its own token, not an avatar's size: nothing on this row is a picture
+    /// of a person, and a list of seven places wants to read as a list rather
+    /// than as seven cards.
+    pub fn nav_item_height(&self) -> Pixels {
+        self.dense(34.0)
+    }
+
     /// The Settings side navigation.
     ///
     /// Not the call card's width. The two were the same number and neither
