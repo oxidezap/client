@@ -411,31 +411,27 @@ fn advanced(metrics: Metrics, cx: &App) -> AnyElement {
     .into_any_element()
 }
 
-/// A size for a settings row: whole units, since nobody acts on the decimal.
-fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::format_size;
+    use super::format_bytes;
 
+    /// The unit is binary and says so. A settings row that reports 1000-based
+    /// "MB" over a filesystem that counts in 1024s is a number nobody can
+    /// check against `du`, and the second formatter this file used to carry
+    /// did exactly that — in KB, tested, and reachable from nothing.
     #[test]
-    fn sizes_scale_to_a_readable_unit() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(900), "900 B");
-        assert_eq!(format_size(2048), "2.0 KB");
-        assert_eq!(format_size(10_485_760), "10.0 MB");
+    fn sizes_scale_to_a_readable_binary_unit() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(900), "900 B");
+        assert_eq!(format_bytes(2048), "2.0 KiB");
+        assert_eq!(format_bytes(10_485_760), "10 MiB");
+    }
+
+    /// One decimal below ten and none above: "1.4 MiB" is useful, "847.3 MiB"
+    /// is three digits of noise.
+    #[test]
+    fn the_decimal_goes_where_it_carries_information() {
+        assert_eq!(format_bytes(1_572_864), "1.5 MiB");
+        assert_eq!(format_bytes(245_366_784), "234 MiB");
     }
 }

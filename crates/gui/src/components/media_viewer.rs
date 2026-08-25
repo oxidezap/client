@@ -91,6 +91,10 @@ pub fn render_media_viewer(
             props.author,
             when,
             position,
+            // Nothing decoded is nothing to write: the screen below is about
+            // to say the file cannot be shown, and a Save beside that sentence
+            // offers to put bytes on disk that this side does not have.
+            props.image.is_some() || props.frame.is_some(),
             close_entity,
             save_entity,
             message_id,
@@ -189,6 +193,9 @@ fn render_bar(
     author: SharedString,
     when: SharedString,
     position: Option<SharedString>,
+    // Whether the viewer decoded anything, which is whether there is a file
+    // to save.
+    can_save: bool,
     close_entity: Entity<WhatsAppApp>,
     save_entity: Entity<WhatsAppApp>,
     message_id: String,
@@ -244,7 +251,12 @@ fn render_bar(
             Button::new("viewer-save")
                 .icon(Icon::new(IconName::ArrowDown))
                 .ghost()
-                .tooltip("Save to Downloads")
+                .disabled(!can_save)
+                .tooltip(if can_save {
+                    "Save to Downloads"
+                } else {
+                    "Nothing to save: this file could not be read"
+                })
                 .on_click(move |_, _window, cx| {
                     save_entity.update(cx, |app, cx| app.save_media(&message_id, cx));
                 }),

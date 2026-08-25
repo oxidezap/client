@@ -28,7 +28,16 @@ pub fn render_nav_rail(
 ) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
     let is_mobile = layout.is_mobile();
-    let thickness = metrics.touch_target() + metrics.space_lg();
+    // A phone's tab bar is sized by the finger; a desktop strip is sized by
+    // the icon it holds. Using the touch target at every width put a 60px rail
+    // beside 34px header icons — two control scales in one window, and the
+    // phone's minimum applied where nothing else in the app uses it.
+    let target = if is_mobile {
+        metrics.touch_target()
+    } else {
+        metrics.icon_button()
+    };
+    let thickness = target + metrics.space_lg();
 
     let base = div()
         .flex_shrink_0()
@@ -66,6 +75,7 @@ pub fn render_nav_rail(
             destination,
             destination == current,
             badge,
+            target,
             entity.clone(),
             metrics,
             cx,
@@ -76,10 +86,14 @@ pub fn render_nav_rail(
 /// One destination. It selects where the window is, the way a chat row selects
 /// a conversation, and the selected one stays visibly selected — which is what
 /// `Button::selected` carries.
+#[allow(clippy::too_many_arguments)]
 fn render_destination(
     destination: Destination,
     is_current: bool,
     badge: usize,
+    // What the rail sized itself for: a finger below the breakpoint, an icon
+    // above it.
+    target: gpui::Pixels,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     cx: &App,
@@ -97,7 +111,7 @@ fn render_destination(
         .ghost()
         .selected(is_current)
         .relative()
-        .size(metrics.touch_target())
+        .size(target)
         .flex()
         .items_center()
         .justify_center()

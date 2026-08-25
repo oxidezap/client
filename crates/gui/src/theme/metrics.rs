@@ -228,7 +228,7 @@ impl Metrics {
     }
     /// Names in a header.
     pub fn text_strong(&self) -> Pixels {
-        self.scaled(15.0)
+        self.scaled(16.0)
     }
     /// Body text.
     pub fn text_body(&self) -> Pixels {
@@ -379,6 +379,25 @@ impl Metrics {
         self.scaled(720.0)
     }
 
+    /// How tall a read-only block of configuration is allowed to get.
+    ///
+    /// Its own token, not half the reading width. A height borrowed from a
+    /// width works right up until someone adjusts the width for the reason it
+    /// exists — line length — and silently resizes a panel that has nothing
+    /// to do with prose.
+    pub fn config_block_height(&self) -> Pixels {
+        self.scaled(360.0)
+    }
+
+    /// One theme preset's swatch in the Appearance pane.
+    ///
+    /// Sized for the row of them, not derived from the call card: they share
+    /// no reason to be related, and tying them made the call card's width a
+    /// remote control for a settings pane.
+    pub fn preset_card_width(&self) -> Pixels {
+        self.dense(150.0)
+    }
+
     // ---- call card ----------------------------------------------------
 
     pub fn call_card_width(&self) -> Pixels {
@@ -428,6 +447,36 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
+
+    /// A step in the scale that is not a step is a lie in a token name: the
+    /// hierarchy between "a name in a header" and "body copy" then exists only
+    /// where a reader cannot see it, and an edit to one silently stops
+    /// matching the other. `text_strong` and `text_body` were both 15px.
+    #[test]
+    fn every_type_token_is_its_own_step() {
+        let m = Metrics::new(REFERENCE_REM, Density::Comfortable);
+        let steps = [
+            ("text_title", m.text_title()),
+            ("text_heading", m.text_heading()),
+            ("text_strong", m.text_strong()),
+            ("text_body", m.text_body()),
+            ("text_secondary", m.text_secondary()),
+            ("text_small", m.text_small()),
+            ("text_meta", m.text_meta()),
+            ("text_micro", m.text_micro()),
+        ];
+        for pair in steps.windows(2) {
+            let (above, below) = (pair[0], pair[1]);
+            assert!(
+                above.1 > below.1,
+                "{} ({}) does not sit above {} ({})",
+                above.0,
+                f32::from(above.1),
+                below.0,
+                f32::from(below.1),
+            );
+        }
+    }
     use super::*;
 
     #[test]

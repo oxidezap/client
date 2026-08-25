@@ -87,7 +87,7 @@ fn render_preset_card(
     Button::new(SharedString::from(format!("preset-{}", preset.id())))
         .ghost()
         .selected(is_selected)
-        .w(metrics.call_card_width() * 0.45)
+        .w(metrics.preset_card_width())
         .h_auto()
         .flex()
         .flex_col()
@@ -172,7 +172,7 @@ fn render_swatch(palette: &Palette, metrics: Metrics, cx: &App) -> impl IntoElem
 
 fn render_custom_card(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     div()
-        .w(metrics.call_card_width() * 0.45)
+        .w(metrics.preset_card_width())
         .flex()
         .flex_col()
         .items_center()
@@ -404,7 +404,7 @@ fn render_theme_file(
             .child(
                 div()
                     .id("theme-json")
-                    .max_h(metrics.reading_width() / 2.0)
+                    .max_h(metrics.config_block_height())
                     .overflow_y_scroll()
                     .p(metrics.space_lg())
                     .rounded(metrics.radius_md())
