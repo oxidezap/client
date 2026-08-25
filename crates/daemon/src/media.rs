@@ -12,6 +12,7 @@
 //! bookkeeping, just files whose names say what is in them.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -35,8 +36,15 @@ const SWEEP_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
 /// The message id is already unique and already stable across restarts, so it
 /// is the address. Prefixed to keep it from colliding with a download's key,
 /// which is addressed by content rather than by message.
+///
+/// The prefix also says *what* is under it: only full media is cached, so a
+/// hit is the real thing. It reads `f-` rather than `m-` because an earlier
+/// build wrote fallback thumbnails under the message key too, and a viewer
+/// that opened one of those showed a blur at full size. Changing the prefix
+/// orphans those files rather than trusting them; the budget sweep clears
+/// them in its own time.
 pub fn message_key(message_id: &str) -> String {
-    format!("m-{}", sanitize(message_id))
+    format!("f-{}", sanitize(message_id))
 }
 
 /// The key under which a downloadable's bytes are cached.
@@ -185,6 +193,124 @@ fn sweep_occasionally(dir: &std::path::Path, written: u64) {
     }
 }
 
+/// What the media cache occupies: bytes, and how many files.
+///
+/// A walk, not a running total: the sweep deletes and the writers add from
+/// several tasks, and a counter kept alongside them would be one more thing to
+/// keep true. The directory holds a few hundred flat files at most, so asking
+/// it is cheap enough to do when a person opens the Storage pane.
+pub fn cache_usage() -> (u64, u64) {
+    let Some(dir) = oxidezap_ipc::media_dir() else {
+        return (0, 0);
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return (0, 0);
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .fold((0, 0), |(bytes, files), meta| {
+            (bytes + meta.len(), files + 1)
+        })
+}
+
+/// How much of the directory a wipe is entitled to.
+///
+/// The directory holds two different things under one roof. `f-` and `d-` are
+/// the cache: bytes the daemon fetched, which it can always fetch again.
+/// `u-` is not — it is a payload a front end staged for a send that has not
+/// run yet, and the only copy of it. Deleting one turns an unrelated "clear
+/// cached media" into a voice note that fails with "no audio cached".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wipe {
+    /// Cached downloads only.
+    Cache,
+    /// Everything, staged uploads included: the account is going, and so is
+    /// anything that was going to be sent under it.
+    Everything,
+}
+
+impl Wipe {
+    /// Whether a file named `name` is this wipe's to take.
+    fn takes(self, name: &str) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Cache => name.starts_with("f-") || name.starts_with("d-"),
+        }
+    }
+}
+
+/// Which cache the writers still in flight think they are writing into.
+///
+/// A download dispatched before a wipe finishes after it, and the eager cache
+/// of an inbound message can be queued across one. Neither can be cancelled,
+/// so the answer is the same as everywhere else in this codebase: bump a
+/// number and let the writer notice.
+static CACHE_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
+/// What to hand back to [`put_since`] later.
+pub fn epoch() -> usize {
+    CACHE_EPOCH.load(Ordering::SeqCst)
+}
+
+/// Cache `bytes` unless the cache has been cleared since `epoch`.
+///
+/// For writes nobody is waiting on — the eager cache of an inbound message,
+/// which the front end can always fetch on demand instead. A download somebody
+/// *asked* for uses [`put`]: the file is how those bytes are delivered, not
+/// merely where they are remembered, so refusing it would fail the download
+/// rather than keep the directory tidy.
+pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
+    if CACHE_EPOCH.load(Ordering::SeqCst) != epoch {
+        anyhow::bail!("the media cache was cleared while this was being prepared");
+    }
+    put(key, bytes)
+}
+
+/// Delete the cached files this wipe is entitled to.
+///
+/// Part of "clear data and pair again", and not optional there: the store is
+/// one file, but the media beside it is a directory that can hold half a
+/// gigabyte of the *previous* account's photos, videos and documents. Leaving
+/// it in place means pairing a different account onto a cache of someone
+/// else's pictures, with no control anywhere that clears them.
+///
+/// Best-effort per entry: one unreadable file must not abandon the rest.
+pub fn wipe(scope: Wipe) -> Result<()> {
+    // Before the deletions, not after: a writer that reads the epoch between
+    // the two would otherwise believe its file survived the wipe that is
+    // about to remove it.
+    CACHE_EPOCH.fetch_add(1, Ordering::SeqCst);
+    let Some(dir) = oxidezap_ipc::media_dir() else {
+        return Ok(());
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // Never downloaded anything, so there is nothing to clear.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if !scope.takes(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    log::info!(
+        "cleared {removed} media files ({scope:?}) from {}",
+        dir.display()
+    );
+    Ok(())
+}
+
 /// Delete oldest-first until the cache is under budget.
 fn sweep(dir: &std::path::Path) -> Result<()> {
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
@@ -219,6 +345,27 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A "clear cached media" that takes a staged upload with it turns an
+    /// unrelated cleanup into a voice note that fails with "no audio cached".
+    #[test]
+    fn clearing_the_cache_spares_a_staged_upload() {
+        assert!(Wipe::Cache.takes("f-3EB0ABC"));
+        assert!(Wipe::Cache.takes("d-9f86d081884c7d65"));
+        assert!(
+            !Wipe::Cache.takes("u-local_audio-7"),
+            "somebody is still waiting for that to be sent"
+        );
+    }
+
+    /// The account is going, and so is anything that was going to be sent
+    /// under it.
+    #[test]
+    fn forgetting_an_account_takes_everything() {
+        assert!(Wipe::Everything.takes("f-3EB0ABC"));
+        assert!(Wipe::Everything.takes("d-9f86d081884c7d65"));
+        assert!(Wipe::Everything.takes("u-local_audio-7"));
+    }
+
     /// A message id comes off the network. One carrying a separator would name
     /// a file outside the cache, which the daemon writes to as the user who
     /// owns the session.
@@ -248,10 +395,15 @@ mod tests {
     }
 
     /// Message keys and download keys share a directory and must not collide:
-    /// one is addressed by message, the other by content.
+    /// one is addressed by message, the other by content. The message prefix
+    /// is `f-` because it also promises *full* media — see [`message_key`].
     #[test]
     fn the_two_key_spaces_stay_apart() {
-        assert!(message_key("abc").starts_with("m-"));
+        assert!(message_key("abc").starts_with("f-"));
         assert!(download_key(&[1; 32]).starts_with("d-"));
+        assert!(
+            !message_key("abc").starts_with("m-"),
+            "the old prefix cached thumbnails under it and must stay orphaned"
+        );
     }
 }

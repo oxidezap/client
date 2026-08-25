@@ -17,10 +17,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use log::{debug, error, info, warn};
-use oxidezap_core::{CallState, DownloadableMedia, MediaContent, UiEvent};
+use oxidezap_core::{CallState, DownloadableMedia, MediaContent, QuotedMessage, UiEvent};
 use oxidezap_ipc::{
-    CallAction, ClientRequest, ConnectionState, DaemonMessage, Endpoint, PROTOCOL_VERSION, Request,
-    RequestId, StateSnapshot, endpoint_path, media_path,
+    CallAction, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, Endpoint,
+    PROTOCOL_VERSION, Request, RequestId, StateSnapshot, StateVersion, endpoint_path, media_path,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::{mpsc, oneshot};
@@ -34,6 +34,14 @@ use tokio::sync::{mpsc, oneshot};
 /// overruns, and it says `Resync`. That is the recovery this protocol already
 /// has; the point is to reach it rather than to hide from it.
 const EVENT_QUEUE: usize = 512;
+
+/// What this account occupies on disk, as the daemon measured it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageUsage {
+    pub database_bytes: u64,
+    pub media_bytes: u64,
+    pub media_files: u64,
+}
 
 /// What the reader hands the front end.
 ///
@@ -51,6 +59,8 @@ pub enum FromDaemon {
     /// event — the front end that dialled built it locally — so there is
     /// nothing to replay it from.
     Calls(Box<CallState>),
+    /// Who this device is linked as, at the moment this client attached.
+    Account(Option<oxidezap_ipc::AccountIdentity>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
 }
@@ -63,11 +73,19 @@ pub enum FromDaemon {
 /// drew is already able to render.
 enum Awaiting {
     Download(oneshot::Sender<Result<Vec<u8>, String>>),
+    /// What this account occupies on disk, for the Storage pane.
+    Storage(oneshot::Sender<StorageUsage>),
     /// A message drawn before it was sent. On refusal it has to stop being
     /// pending, and the front end is the side that knows which bubble it is.
     Send {
         chat_jid: String,
         local_id: String,
+        /// A recording staged in the media cache for this request, if there
+        /// is one. `media::take` is what normally removes it — and that only
+        /// runs if the daemon actually acts on the request, so a send that
+        /// never got that far would leave the file behind and every retry
+        /// would stage another.
+        staged: Option<std::path::PathBuf>,
     },
 }
 
@@ -76,6 +94,7 @@ impl Awaiting {
     fn is_abandoned(&self) -> bool {
         match self {
             Self::Download(tx) => tx.is_closed(),
+            Self::Storage(tx) => tx.is_closed(),
             // A drawn message is never abandoned: the bubble stays on screen
             // until something resolves it.
             Self::Send { .. } => false,
@@ -88,7 +107,24 @@ impl Awaiting {
             Self::Download(tx) => {
                 let _ = tx.send(Err(detail.to_string()));
             }
-            Self::Send { chat_jid, local_id } => {
+            // Dropping the sender is the failure: the pane it feeds shows
+            // what it knows and says the rest is unavailable.
+            Self::Storage(tx) => {
+                log::debug!("storage query failed: {detail}");
+                drop(tx);
+            }
+            Self::Send {
+                chat_jid,
+                local_id,
+                staged,
+            } => {
+                // Nothing will ever read these bytes: the request they were
+                // staged for is not going to run. Best-effort, and silent on
+                // a file that is already gone — the daemon may have taken it
+                // and failed afterwards.
+                if let Some(path) = staged {
+                    let _ = std::fs::remove_file(path);
+                }
                 // The message is already drawn; without this it stays pending
                 // forever.
                 if let Some(events) = events {
@@ -113,6 +149,13 @@ pub struct Session {
     writer: Mutex<Endpoint>,
     pending: Pending,
     next_id: AtomicU64,
+    /// The same channel the reader publishes on.
+    ///
+    /// A send can fail on *this* side — the socket is gone, or the recording
+    /// could not be staged in the media cache — and the front end has already
+    /// drawn the message. Without a way to say so from here those failures had
+    /// nowhere to go, and the bubble sat pending for good with no retry.
+    events: mpsc::Sender<FromDaemon>,
 }
 
 impl Session {
@@ -124,11 +167,13 @@ impl Session {
     pub fn connect() -> std::io::Result<(Self, mpsc::Receiver<FromDaemon>)> {
         let stream = connect_or_start()?;
         let reader = stream.try_clone()?;
+        let (events, rx) = mpsc::channel(EVENT_QUEUE);
 
         let session = Self {
             writer: Mutex::new(stream),
             pending: Pending::default(),
             next_id: AtomicU64::new(1),
+            events: events.clone(),
         };
         // Before the reader starts, because the daemon serves nothing until it
         // has one and answers it with the history this connection asked for.
@@ -137,13 +182,29 @@ impl Session {
             session_events: true,
         })?;
 
-        let (events, rx) = mpsc::channel(EVENT_QUEUE);
         let pending = Arc::clone(&session.pending);
         std::thread::Builder::new()
             .name("oxidezap-ipc".to_string())
             .spawn(move || read_frames(reader, &events, &pending))?;
 
         Ok((session, rx))
+    }
+
+    /// Report a send that failed before it ever left this process.
+    ///
+    /// The message is already on screen, so something has to move it off
+    /// `Pending`. `try_send` rather than a blocking one: this runs on the GPUI
+    /// executor, where blocking on a tokio channel is not allowed, and a queue
+    /// that full has bigger problems than one lost failure.
+    fn report_send_failed(&self, chat_jid: &str, local_id: &str, reason: String) {
+        error!("send failed before it left: {reason}");
+        let _ = self
+            .events
+            .try_send(FromDaemon::Session(Box::new(UiEvent::SendFailed {
+                chat_jid: chat_jid.to_string(),
+                message_id: local_id.to_string(),
+                reason,
+            })));
     }
 
     /// Send a request nobody is waiting on an answer for.
@@ -196,22 +257,50 @@ impl Session {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&id)
             {
-                waiting.failed(&format!("could not reach the daemon: {e}"), None);
+                let detail = format!("could not reach the daemon: {e}");
+                match waiting {
+                    // This runs on the GPUI executor, and that executor is
+                    // what drains this queue. `failed` reports a send with
+                    // `blocking_send`, so a full queue would park the only
+                    // thread that could empty it — the window stops rather
+                    // than saying the message did not go.
+                    Awaiting::Send {
+                        chat_jid,
+                        local_id,
+                        staged,
+                    } => {
+                        // Same reason as in `failed`: this request is not
+                        // going to run, so its staged recording is dead.
+                        if let Some(path) = staged {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        self.report_send_failed(&chat_jid, &local_id, detail);
+                    }
+                    waiting => waiting.failed(&detail, None),
+                }
             }
         }
         id
     }
 
-    pub fn send_message(&self, jid: &str, text: &str, local_id: String) {
+    pub fn send_message(
+        &self,
+        jid: &str,
+        text: &str,
+        local_id: String,
+        quoted: Option<QuotedMessage>,
+    ) {
         self.ask(
             ClientRequest::SendText {
                 jid: jid.to_string(),
                 text: text.to_string(),
                 local_id: Some(local_id.clone()),
+                quoted,
             },
             Awaiting::Send {
                 chat_jid: jid.to_string(),
                 local_id,
+                staged: None,
             },
         );
     }
@@ -223,20 +312,32 @@ impl Session {
         duration_secs: u32,
         waveform: Vec<u8>,
         local_id: String,
+        quoted: Option<QuotedMessage>,
     ) {
         // Through the media cache: a voice note is the one thing this side
         // sends that does not belong in a frame. The key is the local id,
         // which is already unique per recording.
         let upload = format!("u-{}", sanitize(&local_id));
         let Some(path) = media_path(&upload) else {
-            error!("no media cache to stage the recording in");
+            self.report_send_failed(
+                jid,
+                &local_id,
+                "no media cache to stage the recording".into(),
+            );
             return;
         };
         if let Some(dir) = path.parent()
             && let Err(e) =
                 std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &audio))
         {
-            error!("could not stage the recording: {e}");
+            // The caller draws the bubble either way, and nothing was
+            // registered as pending here — so this is the only chance to say
+            // the recording is not going anywhere.
+            self.report_send_failed(
+                jid,
+                &local_id,
+                format!("could not stage the recording: {e}"),
+            );
             return;
         }
         self.ask(
@@ -246,10 +347,12 @@ impl Session {
                 duration_secs,
                 waveform,
                 local_id: Some(local_id.clone()),
+                quoted,
             },
             Awaiting::Send {
                 chat_jid: jid.to_string(),
                 local_id,
+                staged: Some(path),
             },
         );
     }
@@ -333,6 +436,21 @@ impl Session {
     /// The same signature the old client had, so the callers that thread this
     /// receiver through a timeout did not change. The bytes come back rather
     /// than a path because that is what every caller wanted anyway.
+    /// Ask what the store and the media cache occupy.
+    ///
+    /// The daemon measures, because it is the only process that owns either
+    /// path. The answer arrives under this request's id.
+    pub fn storage_usage(&self) -> oneshot::Receiver<StorageUsage> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(ClientRequest::StorageUsage, Awaiting::Storage(tx));
+        rx
+    }
+
+    /// Delete the cached media, keeping the history.
+    pub fn clear_media_cache(&self) {
+        self.tell(ClientRequest::ClearMediaCache);
+    }
+
     pub fn download_downloadable_media(
         &self,
         media: DownloadableMedia,
@@ -366,6 +484,16 @@ fn sanitize(id: &str) -> String {
 fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pending) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
+    // How far the state this side holds has been carried.
+    //
+    // The daemon subscribes a client and *then* snapshots it, so everything
+    // published in between arrives twice — once inside the snapshot and once
+    // as an update — and the version on each frame is what tells them apart.
+    // Applying the overlap again is not harmless: a `CallsChanged` from before
+    // the snapshot puts a call back on a stage the snapshot had already
+    // cleared, and the next frame removing it reads as that call ending, which
+    // writes a record for a call that never happened.
+    let mut applied = StateVersion::INITIAL;
     // What to tell the user when this ends. The generic message is right for
     // a daemon that simply went away, and wrong for every case this side
     // actually diagnosed.
@@ -382,6 +510,41 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
         }
 
         match serde_json::from_str::<DaemonMessage>(line.trim_end()) {
+            // The first frame, and the only one that describes where things
+            // already stand. A window opened while the daemon was already
+            // linked hears nothing else about the account it is attached to:
+            // `AccountUpdated` is a live event that fired before this
+            // connection existed, and nothing replays it. Without this the
+            // account row read as unlinked and the own-number checks that
+            // depend on it — "(You)", the read ticks in your own chat — had
+            // nothing to compare against.
+            Ok(DaemonMessage::Hello { protocol, snapshot }) if protocol == PROTOCOL_VERSION => {
+                applied = snapshot.version;
+                if catch_up(&snapshot)
+                    .into_iter()
+                    .any(|event| events.blocking_send(event).is_err())
+                {
+                    break;
+                }
+            }
+            // Both ends check, because both ends act on what the other says.
+            // The daemon refuses a hello it cannot read; this is the same
+            // refusal from the other side, and it matters more here — the
+            // snapshot is a whole state to adopt, and a frame that merely
+            // *deserializes* is not a frame that means what this build
+            // thinks it means.
+            Ok(DaemonMessage::Hello { protocol, .. }) => {
+                error!(
+                    "the daemon speaks protocol {protocol}, this build speaks {PROTOCOL_VERSION}"
+                );
+                reason = Some(format!(
+                    "This window and the background service are different \
+                     versions (protocol {protocol} against \
+                     {PROTOCOL_VERSION}). Quit oxidezap completely and start \
+                     it again."
+                ));
+                break;
+            }
             Ok(DaemonMessage::Session { event }) => {
                 let mut event = *event;
                 // On this thread rather than the UI's: a history load names
@@ -447,6 +610,61 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
                     break;
                 }
             }
+            // The one state update this front end does not derive for
+            // itself. Everything else in a snapshot is rebuilt from the
+            // session stream; a call the *daemon* answered is not in that
+            // stream at all, so without this a second window keeps ringing.
+            Ok(DaemonMessage::Storage {
+                id,
+                database_bytes,
+                media_bytes,
+                media_files,
+            }) => match take_pending(pending, id) {
+                Some(Awaiting::Storage(tx)) => {
+                    let _ = tx.send(StorageUsage {
+                        database_bytes,
+                        media_bytes,
+                        media_files,
+                    });
+                }
+                Some(waiting) => waiting.failed("unexpected storage answer", Some(events)),
+                None => debug!("a storage answer arrived for {id}, which nobody is waiting on"),
+            },
+            // Already inside the snapshot this connection started from. The
+            // daemon publishes the overlap rather than risking a gap; dropping
+            // it is this side's half of that bargain.
+            Ok(DaemonMessage::Update { version, .. }) if version.is_covered_by(applied) => {}
+            // The account, once the daemon knows it. A window attached
+            // during pairing had nothing in its snapshot to know it from.
+            Ok(DaemonMessage::Update {
+                version,
+                event: DaemonEvent::AccountChanged(account),
+            }) => {
+                applied = version;
+                if events
+                    .blocking_send(FromDaemon::Account(Some(account)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(DaemonMessage::Update {
+                version,
+                event: DaemonEvent::CallsChanged(calls),
+            }) => {
+                applied = version;
+                if events
+                    .blocking_send(FromDaemon::Calls(Box::new(calls)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            // Chat summaries, which this front end derives from the session
+            // stream instead. The version still advances: it describes how far
+            // the *state* has been carried, not how much of it this client
+            // happens to use.
+            Ok(DaemonMessage::Update { version, .. }) => applied = version,
             // Summaries: the daemon serves other front ends too, and this one
             // derives its own state from the session stream.
             Ok(_) => {}
@@ -527,6 +745,7 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     // ringing call went out before this window existed, and a call this
     // account placed was never an event at all.
     events.push(FromDaemon::Calls(Box::new(snapshot.calls.clone())));
+    events.push(FromDaemon::Account(snapshot.account.clone()));
     events
 }
 
@@ -569,7 +788,11 @@ fn fill(media: &mut Option<MediaContent>) {
         return;
     };
     match media_path(&key).map(std::fs::read) {
-        Some(Ok(bytes)) => media.data = Arc::new(bytes),
+        // The daemon only caches the real thing, so whatever came out of the
+        // cache is it — including when the row arrived carrying a fallback
+        // thumbnail, which is the shape a reload takes. The metadata beside
+        // the bytes described that thumbnail, and has to move with them.
+        Some(Ok(bytes)) => media.adopt_full_bytes(Arc::new(bytes)),
         // The renderer falls back to offering the download, which is the same
         // thing it does for media that was never cached.
         Some(Err(e)) => debug!("media {key} is not in the cache: {e}"),
@@ -685,6 +908,7 @@ mod tests {
             is_animated: false,
             duration_secs: None,
             data_is_preview: false,
+            waveform: None,
         };
         let small = serde_json::to_string(&media).unwrap();
         let bigger = serde_json::to_string(&MediaContent {

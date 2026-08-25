@@ -13,6 +13,7 @@ use diesel::prelude::*;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use log::warn;
 use tokio::sync::{broadcast, mpsc, oneshot};
+use wacore::stanza::groups::GroupNotificationAction;
 use wacore::store::error::StoreError;
 use wacore::types::events::{Event, EventHandler, EventInterest, EventKind, InboundMessage};
 use wacore::types::presence::ReceiptType;
@@ -140,6 +141,7 @@ impl EventHandler for ChatStoreHandler {
             EventKind::DeleteChatUpdate,
             EventKind::ClearChatUpdate,
             EventKind::DeleteMessageForMeUpdate,
+            EventKind::GroupUpdate,
         ])
     }
 }
@@ -1023,6 +1025,36 @@ fn apply_event(
                 update.action.first_name.as_deref(),
             )?;
             cs.contacts = true;
+            Ok(())
+        }
+        // A group renamed is a fact about the chat row, not only a sentence
+        // in the timeline. Without it the header and the sidebar kept the old
+        // name for as long as the store was the thing being asked — which is
+        // always, since a front end's list is the store's — while the
+        // conversation said underneath that it had changed.
+        Event::GroupUpdate(update) => {
+            let GroupNotificationAction::Subject { subject, .. } = &update.action else {
+                // Every other action is people and permissions; the timeline
+                // notice says all there is to say about those.
+                return Ok(());
+            };
+            let chat =
+                crate::lid::route_chat_key(conn, device_id, &update.group_jid.to_string(), cs)?;
+            ensure_chat(conn, device_id, &chat)?;
+            // Only when it is news. The server redelivers notifications, and
+            // an invalidation is a claim that something changed: setting the
+            // flag for a subject the row already holds buys a whole chat-list
+            // reload for nothing.
+            let stored: Option<String> = chat_row(device_id, &chat)
+                .select(schema::chats::name)
+                .first::<Option<String>>(conn)?;
+            if stored.as_deref() == Some(subject.as_str()) {
+                return Ok(());
+            }
+            diesel::update(chat_row(device_id, &chat))
+                .set(schema::chats::name.eq(subject))
+                .execute(conn)?;
+            cs.chats = true;
             Ok(())
         }
         Event::PinUpdate(update) => {

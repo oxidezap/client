@@ -1,4 +1,6 @@
-use gpui::{Pixels, Size};
+use gpui::{Pixels, Size, px};
+
+use crate::theme::Metrics;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Breakpoint {
@@ -51,47 +53,63 @@ impl MobilePanel {
     }
 }
 
+/// The viewport facts and the resolved design scale, together.
+///
+/// Render helpers are already threaded this value, so carrying [`Metrics`]
+/// here is what lets a component read a density- and zoom-aware dimension
+/// without every signature growing a second parameter. The two stay separately
+/// *defined*: this type answers "how wide is the window", `Metrics` answers
+/// "how big is a row".
 #[derive(Debug, Clone, Copy)]
 pub struct ResponsiveLayout {
     breakpoint: Breakpoint,
     mobile_panel: MobilePanel,
-    viewport_width: f32,
+    /// The whole window, not just its width: anything positioned against the
+    /// window's edges — a card floating over the conversation — needs both.
+    viewport: Size<Pixels>,
+    metrics: Metrics,
 }
 
 impl ResponsiveLayout {
-    const SIDEBAR_WIDTH_DESKTOP: f32 = 320.0;
-    const SIDEBAR_WIDTH_TABLET: f32 = 240.0;
-    const SIDEBAR_WIDTH_MIN: f32 = 200.0;
+    // Widths the design fixes in device pixels because they answer "how much
+    // window does this pane get", not "how big is a control". They are the
+    // viewport's own geometry, so unlike the design scale they do not follow
+    // the base font.
+    const SIDEBAR_WIDTH_DESKTOP: f32 = 340.0;
+    const SIDEBAR_WIDTH_TABLET: f32 = 280.0;
+    const SIDEBAR_WIDTH_MIN: f32 = 240.0;
 
-    const HEADER_HEIGHT: f32 = 56.0;
-    const HEADER_HEIGHT_MOBILE: f32 = 52.0;
-
-    const CHAT_ITEM_HEIGHT_DESKTOP: f32 = 72.0;
-    const CHAT_ITEM_HEIGHT_TABLET: f32 = 68.0;
-    const CHAT_ITEM_HEIGHT_MOBILE: f32 = 64.0;
-
-    const AVATAR_SIZE_LARGE: f32 = 48.0;
-    const AVATAR_SIZE_MOBILE: f32 = 44.0;
-
-    const INPUT_AREA_HEIGHT: f32 = 62.0;
-    const INPUT_AREA_HEIGHT_MOBILE: f32 = 56.0;
-
-    const MAX_BUBBLE_WIDTH_DESKTOP: f32 = 400.0;
-    const MAX_BUBBLE_WIDTH_TABLET: f32 = 350.0;
+    const MAX_BUBBLE_WIDTH_DESKTOP: f32 = 520.0;
+    const MAX_BUBBLE_WIDTH_TABLET: f32 = 420.0;
     const MAX_BUBBLE_WIDTH_MOBILE_RATIO: f32 = 0.85;
 
     const MAX_MEDIA_SIZE_DESKTOP: f32 = 300.0;
     const MAX_MEDIA_SIZE_TABLET: f32 = 280.0;
     const MAX_MEDIA_SIZE_MOBILE_RATIO: f32 = 0.75;
 
-    pub fn new(viewport: Size<Pixels>, mobile_panel: MobilePanel) -> Self {
+    /// Below this the header has no room for its action row, so the actions
+    /// move into the overflow menu rather than disappearing.
+    const CALL_BUTTON_MIN_WIDTH: f32 = 400.0;
+
+    pub fn new(viewport: Size<Pixels>, mobile_panel: MobilePanel, metrics: Metrics) -> Self {
         let width: f32 = viewport.width.into();
 
         Self {
             breakpoint: Breakpoint::from_width(width),
             mobile_panel,
-            viewport_width: width,
+            viewport,
+            metrics,
         }
+    }
+
+    /// The window this layout describes.
+    pub fn viewport(&self) -> Size<Pixels> {
+        self.viewport
+    }
+
+    /// The active design scale: spacing, radii, type steps and control frames.
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     pub fn breakpoint(&self) -> Breakpoint {
@@ -136,61 +154,64 @@ impl ResponsiveLayout {
         self.is_mobile() && self.mobile_panel.is_chat()
     }
 
+    /// Whether the header has room to show its actions as buttons.
+    ///
+    /// Below this they are still reachable — the overflow menu carries every
+    /// one of them — so this decides presentation, never availability.
     pub fn show_call_buttons(&self) -> bool {
-        self.viewport_width >= 400.0
+        f32::from(self.viewport.width) >= Self::CALL_BUTTON_MIN_WIDTH
     }
 
-    pub fn sidebar_width(&self) -> f32 {
-        match self.breakpoint {
+    pub fn sidebar_width(&self) -> Pixels {
+        px(match self.breakpoint {
             Breakpoint::Desktop => Self::SIDEBAR_WIDTH_DESKTOP,
             Breakpoint::Tablet => {
-                let proportional = self.viewport_width * 0.35;
+                let proportional = f32::from(self.viewport.width) * 0.35;
                 proportional.clamp(Self::SIDEBAR_WIDTH_MIN, Self::SIDEBAR_WIDTH_TABLET)
             }
-            Breakpoint::Mobile => self.viewport_width,
-        }
+            Breakpoint::Mobile => f32::from(self.viewport.width),
+        })
     }
 
-    pub fn header_height(&self) -> f32 {
+    /// The conversation header. Taller than the sidebar's own header because
+    /// it carries a subtitle — presence, member count, who is typing.
+    pub fn header_height(&self) -> Pixels {
         if self.is_mobile() {
-            Self::HEADER_HEIGHT_MOBILE
+            self.metrics.mobile_header_height()
         } else {
-            Self::HEADER_HEIGHT
+            self.metrics.header_height()
         }
     }
 
-    pub fn chat_item_height(&self) -> f32 {
-        match self.breakpoint {
-            Breakpoint::Desktop => Self::CHAT_ITEM_HEIGHT_DESKTOP,
-            Breakpoint::Tablet => Self::CHAT_ITEM_HEIGHT_TABLET,
-            Breakpoint::Mobile => Self::CHAT_ITEM_HEIGHT_MOBILE,
-        }
+    pub fn chat_item_height(&self) -> Pixels {
+        self.metrics.chat_row_height()
     }
 
-    pub fn avatar_size(&self) -> f32 {
+    pub fn avatar_size(&self) -> Pixels {
+        self.metrics.avatar_row()
+    }
+
+    /// The composer's height.
+    ///
+    /// `InputAreaView` reads this rather than a constant of its own. The two
+    /// used to disagree by 6px on mobile, and the composer drew itself into a
+    /// shorter slot than it claimed.
+    pub fn input_area_height(&self) -> Pixels {
         if self.is_mobile() {
-            Self::AVATAR_SIZE_MOBILE
+            self.metrics.composer_height_mobile()
         } else {
-            Self::AVATAR_SIZE_LARGE
+            self.metrics.composer_height()
         }
     }
 
-    pub fn input_area_height(&self) -> f32 {
-        if self.is_mobile() {
-            Self::INPUT_AREA_HEIGHT_MOBILE
-        } else {
-            Self::INPUT_AREA_HEIGHT
-        }
-    }
-
-    pub fn max_bubble_width(&self) -> f32 {
-        match self.breakpoint {
+    pub fn max_bubble_width(&self) -> Pixels {
+        px(match self.breakpoint {
             Breakpoint::Desktop => Self::MAX_BUBBLE_WIDTH_DESKTOP,
             Breakpoint::Tablet => Self::MAX_BUBBLE_WIDTH_TABLET,
             Breakpoint::Mobile => {
-                (self.viewport_width * Self::MAX_BUBBLE_WIDTH_MOBILE_RATIO).min(350.0)
+                (f32::from(self.viewport.width) * Self::MAX_BUBBLE_WIDTH_MOBILE_RATIO).min(350.0)
             }
-        }
+        })
     }
 
     pub fn max_media_size(&self) -> f32 {
@@ -198,39 +219,86 @@ impl ResponsiveLayout {
             Breakpoint::Desktop => Self::MAX_MEDIA_SIZE_DESKTOP,
             Breakpoint::Tablet => Self::MAX_MEDIA_SIZE_TABLET,
             Breakpoint::Mobile => {
-                (self.viewport_width * Self::MAX_MEDIA_SIZE_MOBILE_RATIO).min(280.0)
+                (f32::from(self.viewport.width) * Self::MAX_MEDIA_SIZE_MOBILE_RATIO).min(280.0)
             }
         }
     }
 
     pub fn chat_area_width(&self) -> f32 {
         match self.breakpoint {
-            Breakpoint::Desktop | Breakpoint::Tablet => self.viewport_width - self.sidebar_width(),
-            Breakpoint::Mobile => self.viewport_width,
+            Breakpoint::Desktop | Breakpoint::Tablet => {
+                f32::from(self.viewport.width) - f32::from(self.sidebar_width())
+            }
+            Breakpoint::Mobile => f32::from(self.viewport.width),
         }
     }
 
     pub fn message_list_width(&self) -> f32 {
-        self.chat_area_width() - (self.padding() * 2.0) - self.gap()
+        self.chat_area_width() - f32::from(self.padding()) * 2.0 - f32::from(self.gap())
     }
 
-    pub fn min_touch_target(&self) -> f32 {
-        if self.is_mobile() { 48.0 } else { 36.0 }
+    /// The smallest comfortable pointer target. Touch needs more room than a
+    /// mouse, so this is the floor every action in a header or composer is
+    /// sized against.
+    pub fn min_touch_target(&self) -> Pixels {
+        if self.is_mobile() {
+            self.metrics.touch_target()
+        } else {
+            self.metrics.icon_button()
+        }
     }
 
-    pub fn icon_button_size(&self) -> f32 {
-        if self.is_mobile() { 44.0 } else { 36.0 }
+    pub fn icon_button_size(&self) -> Pixels {
+        if self.is_mobile() {
+            self.metrics.touch_target()
+        } else {
+            self.metrics.icon_button()
+        }
     }
 
-    pub fn padding(&self) -> f32 {
-        if self.is_mobile() { 12.0 } else { 16.0 }
+    pub fn padding(&self) -> Pixels {
+        if self.is_mobile() {
+            self.metrics.space_lg()
+        } else {
+            self.metrics.space_xl()
+        }
     }
 
-    pub fn padding_small(&self) -> f32 {
-        if self.is_mobile() { 8.0 } else { 12.0 }
+    /// The conversation's own gutter, which is wider than a panel's padding.
+    ///
+    /// A bubble is a shape with an edge, and an edge sitting 16px from the
+    /// window reads as clipped rather than placed. The timeline gets room on
+    /// both sides for the same reason it gets room above the composer: this
+    /// is the surface the reader spends their time in.
+    pub fn conversation_padding(&self) -> Pixels {
+        if self.is_mobile() {
+            self.metrics.space_lg()
+        } else {
+            self.metrics.space_xxxl()
+        }
     }
 
-    pub fn gap(&self) -> f32 {
-        if self.is_mobile() { 8.0 } else { 12.0 }
+    /// Breathing room at the head and foot of the timeline.
+    ///
+    /// Without it the newest message sits on the composer and the oldest
+    /// under the header, which is what made the whole pane read as crowded.
+    pub fn conversation_gap(&self) -> Pixels {
+        self.metrics.space_xl()
+    }
+
+    pub fn padding_small(&self) -> Pixels {
+        if self.is_mobile() {
+            self.metrics.space_md()
+        } else {
+            self.metrics.space_lg()
+        }
+    }
+
+    pub fn gap(&self) -> Pixels {
+        if self.is_mobile() {
+            self.metrics.space_md()
+        } else {
+            self.metrics.space_lg()
+        }
     }
 }

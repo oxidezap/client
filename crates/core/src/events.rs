@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::call::{CallId, IncomingCall};
 use super::chat::ChatMessage;
+use super::presence::{Availability, ComposingKind};
+use super::system_notice::SystemNotice;
 
 pub use wacore::types::presence::ReceiptType;
 
@@ -72,10 +74,37 @@ pub enum UiEvent {
         sender: String,
         emoji: String,
     },
+    /// Someone started or stopped composing in a chat.
+    ///
+    /// The notice expires on its own (see [`crate::PresenceRegistry`]): the
+    /// matching stop is not guaranteed to arrive, so the UI must not wait for
+    /// one before it stops claiming somebody is typing.
+    ChatPresence {
+        chat_jid: String,
+        sender_jid: String,
+        /// The sender's push name, when the server offered one.
+        sender_name: Option<String>,
+        /// `None` means they stopped.
+        composing: Option<ComposingKind>,
+    },
+    /// A contact came online, or went away.
+    PresenceUpdated {
+        jid: String,
+        availability: Availability,
+    },
     IncomingCall(IncomingCall),
     OutgoingCallStarted {
         call_id: CallId,
         recipient_jid: String,
+        /// The id the front end invented for this placement, before the
+        /// server had one.
+        ///
+        /// What makes the rename land on the attempt it belongs to. Matching
+        /// on the recipient instead let a late answer for an abandoned call
+        /// rename a *second* call to the same person — which then held an id
+        /// nobody was ringing under, while the abandoned one rang on with
+        /// nothing on this side holding it.
+        placeholder_id: CallId,
     },
     OutgoingCallFailed {
         recipient_jid: String,
@@ -84,5 +113,43 @@ pub enum UiEvent {
     #[allow(dead_code)]
     CallAccepted(CallId),
     CallEnded(CallId),
+    /// The call is over here because another of this account's devices
+    /// answered or refused it. Not a missed call: the device that took it has
+    /// the entry, and this one has nothing true to write down.
+    CallEndedElsewhere(CallId),
+    /// Who this device is linked as.
+    ///
+    /// Sent on connect and whenever the push name changes, rather than only
+    /// at pairing: the name lives in the device store, and a client attaching
+    /// after a restart never saw the pairing that set it. Without it the
+    /// account row had nothing to show and claimed "not linked" over a linked
+    /// session.
+    AccountUpdated {
+        /// The push name, when the account has one.
+        name: Option<String>,
+        /// The account's own JID, for the number under the name.
+        jid: Option<String>,
+        /// The same account's LID, when it has one.
+        ///
+        /// Both, because a chat is keyed by whichever alias the server used:
+        /// the conversation with your own number can arrive as a LID while
+        /// the account announces a phone number, and neither string matches
+        /// the other.
+        lid: Option<String>,
+    },
+    /// Something happened *to* a chat rather than in it: a group renamed, a
+    /// member added, the settings changed.
+    ///
+    /// Its own event rather than a `MessageReceived` carrying a system
+    /// notice, because it is not a message: it must not raise an unread
+    /// badge, and nothing ever acknowledges or replies to it.
+    SystemNotice {
+        chat_jid: String,
+        /// Stable within one notification, so a redelivery does not stack a
+        /// second identical row.
+        notice_id: String,
+        at: chrono::DateTime<chrono::Utc>,
+        notice: SystemNotice,
+    },
     Error(String),
 }

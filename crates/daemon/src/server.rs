@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use oxidezap_ipc::{
-    ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, Request, RequestId,
+    CallAction, ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, Request, RequestId,
     endpoint_path, lock_path, state_dir,
 };
 use tokio::io::{
@@ -700,6 +700,7 @@ async fn handle_request(
             jid,
             text,
             local_id,
+            quoted,
         } => acted(
             dispatch(
                 hub,
@@ -708,6 +709,7 @@ async fn handle_request(
                     jid,
                     text,
                     local_id,
+                    quoted,
                 },
             )
             .await,
@@ -718,6 +720,7 @@ async fn handle_request(
             duration_secs,
             waveform,
             local_id,
+            quoted,
         } => acted(
             dispatch(
                 hub,
@@ -728,6 +731,7 @@ async fn handle_request(
                     duration_secs,
                     waveform,
                     local_id,
+                    quoted,
                 },
             )
             .await,
@@ -751,18 +755,26 @@ async fn handle_request(
                     .ok(),
                 );
             };
-            acted(
-                dispatch(
-                    hub,
-                    commands,
-                    Action::Download {
-                        id,
-                        media,
-                        answer_to: outbox.clone(),
-                    },
-                )
-                .await,
+            // The one request whose answer is *not* an acknowledgement. It
+            // comes back as `Downloaded` under this id, seconds later, from
+            // the task the action spawns — so acknowledging it here would be
+            // a second answer under the same id, and a client that took its
+            // waiter off the first one would drop the bytes when they arrived.
+            // Only a refusal is answered here, because then nothing else will.
+            match dispatch(
+                hub,
+                commands,
+                Action::Download {
+                    id,
+                    media,
+                    answer_to: outbox.clone(),
+                },
             )
+            .await
+            {
+                Ok(()) => Answer::frame(None),
+                Err(error) => Answer::frame(error_frame(Some(id), error).ok()),
+            }
         }
         ClientRequest::ReloadHistory => acted(dispatch(hub, commands, Action::ReloadHistory).await),
         ClientRequest::ForgetSession => acted(dispatch(hub, commands, Action::ForgetSession).await),
@@ -780,6 +792,48 @@ async fn handle_request(
             )
             .await,
         ),
+        // Measured here rather than by the client: the daemon is the only
+        // process that opens the store or writes the media cache, so a front
+        // end asking the filesystem would be guessing at paths it does not
+        // own. No session needed — this is two directory reads.
+        ClientRequest::StorageUsage => {
+            // Answered under an id like a download, because the numbers are
+            // the answer rather than an acknowledgement of it.
+            let Some(id) = id else {
+                return Answer::frame(
+                    error_frame(
+                        None,
+                        ProtocolError::Malformed {
+                            detail: "a storage query needs an id to answer under".into(),
+                        },
+                    )
+                    .ok(),
+                );
+            };
+            let (media_bytes, media_files) = crate::media::cache_usage();
+            Answer::frame(
+                serde_json::to_string(&DaemonMessage::Storage {
+                    id,
+                    database_bytes: database_bytes(),
+                    media_bytes,
+                    media_files,
+                })
+                .ok(),
+            )
+        }
+        // The store stays; every message keeps its `downloadable`, so what
+        // this costs is a re-download of whatever is looked at again.
+        ClientRequest::ClearMediaCache => {
+            acted(
+                // Cached downloads only: a staged upload belongs to a send
+                // that has not run yet. See `media::Wipe`.
+                crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| {
+                    ProtocolError::Malformed {
+                        detail: format!("could not clear the media cache: {e}"),
+                    }
+                }),
+            )
+        }
         // The daemon has no window of its own, so this is relayed rather than
         // acted on: whoever owns a window is the only one that can raise it.
         // Published to every client, including the one that asked, because a
@@ -816,6 +870,17 @@ async fn dispatch(
     // [`Action::needs_network`].
     let connection = hub.connection();
     if action.needs_network() && !connection.is_connected() {
+        // A call the asking window already drew has to be un-drawn. It
+        // passed its own connection check before this one moved, the refusal
+        // rides no request id, and nothing on that side connects the error
+        // back to the stage it is holding — so the stage would sit there
+        // until the next snapshot dropped it, and disappearing is what a
+        // front end writes down as an attempt that was never answered. The
+        // bridge's busy refusal says the same thing one layer down.
+        if let Action::Call(CallAction::Start { placeholder_id, .. }) = &action {
+            hub.calls(|calls| calls.mark_unrecorded(placeholder_id));
+            hub.republish_calls();
+        }
         return Err(no_session(format!("not connected: {connection:?}")));
     }
 
@@ -848,6 +913,17 @@ fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<St
         Ok(()) => serde_json::to_string(&DaemonMessage::Accepted { id }).ok(),
         Err(error) => error_frame(id, error).ok(),
     }
+}
+
+/// The store's footprint: the database plus the journal files SQLite would
+/// replay into it. All three are the same data, so all three are counted.
+fn database_bytes() -> u64 {
+    let base = oxidezap_session::resolve_database_path();
+    ["", "-wal", "-shm"]
+        .iter()
+        .filter_map(|suffix| std::fs::metadata(format!("{base}{suffix}")).ok())
+        .map(|meta| meta.len())
+        .sum()
 }
 
 fn no_session(detail: impl Into<String>) -> ProtocolError {
@@ -988,6 +1064,7 @@ mod tests {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
             local_id: None,
+            quoted: None,
         });
         let answer = handle_request(request, &hub, &commands, &outbox()).await;
         assert!(matches!(
@@ -1038,6 +1115,7 @@ mod tests {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
             local_id: None,
+            quoted: None,
         });
         let answer = handle_request(request, &hub, &commands, &outbox()).await;
         assert!(matches!(
@@ -1062,6 +1140,7 @@ mod tests {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
             local_id: None,
+            quoted: None,
         });
         let answer = handle_request(request, &hub, &commands, &outbox()).await;
         assert!(matches!(
@@ -1413,6 +1492,7 @@ mod tests {
                 jid: "a@s.whatsapp.net".into(),
                 text: "hi".into(),
                 local_id: None,
+                quoted: None,
             }
             .needs_network()
         );
@@ -1433,6 +1513,7 @@ mod tests {
                 jid: "a@s.whatsapp.net".into(),
                 text: "hi".into(),
                 local_id: Some("local_1".into()),
+                quoted: None,
             },
         };
         let answer = handle_request(request, &hub, &commands, &outbox()).await;

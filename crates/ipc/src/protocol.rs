@@ -1,6 +1,6 @@
 //! Messages exchanged over the socket.
 
-use oxidezap_core::{CallState, DownloadableMedia, UiEvent};
+use oxidezap_core::{CallState, DownloadableMedia, QuotedMessage, UiEvent};
 use serde::{Deserialize, Serialize};
 
 /// Monotonic counter over daemon state.
@@ -145,6 +145,27 @@ pub struct StateSnapshot {
     /// both sides already share [`CallState`], so the snapshot hands it over.
     #[serde(default)]
     pub calls: CallState,
+    /// Who this device is linked as, when the session has said.
+    ///
+    /// State for the same reason the calls are: it is announced on connect,
+    /// once, and a client attaching after that never saw it. Without it the
+    /// account row claimed "not linked" over a live session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountIdentity>,
+}
+
+/// The account this device is linked to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountIdentity {
+    /// The push name, absent until the profile has synced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jid: Option<String>,
+    /// The same account's LID, when it has one. A chat with your own number
+    /// can be keyed by either alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lid: Option<String>,
 }
 
 impl StateSnapshot {
@@ -176,6 +197,22 @@ pub enum DaemonEvent {
     ChatRemoved {
         jid: String,
     },
+    /// The call state, whole. A call is one machine with one live stage, so
+    /// there is nothing to delta and applying this twice is harmless.
+    ///
+    /// It exists because the *daemon* makes some of these transitions itself:
+    /// accepting a call brings the media up here and there is no later event
+    /// to replay, so a second window would otherwise keep ringing an offer
+    /// that the first one answered.
+    CallsChanged(CallState),
+    /// Who this device is linked as.
+    ///
+    /// It reaches a client in the [`DaemonMessage::Hello`] snapshot too, but
+    /// the snapshot is only what was known when that client attached: a window
+    /// opened during pairing attaches before there is an account at all, and
+    /// nothing replayed the answer when it arrived. This is what "(You)" and
+    /// the read ticks in your own chat compare against.
+    AccountChanged(AccountIdentity),
 }
 
 /// A daemon-to-client frame.
@@ -187,6 +224,16 @@ pub enum DaemonMessage {
     Hello {
         protocol: u32,
         snapshot: StateSnapshot,
+    },
+    /// What this account occupies on disk, answering
+    /// [`ClientRequest::StorageUsage`].
+    Storage {
+        id: RequestId,
+        /// The store: the database and its journal files.
+        database_bytes: u64,
+        /// The media cache: photos, video, audio and documents.
+        media_bytes: u64,
+        media_files: u64,
     },
     /// A change, tagged with the version it produced.
     Update {
@@ -322,6 +369,14 @@ pub enum ClientRequest {
         /// the daemon makes one up.
         #[serde(default)]
         local_id: Option<String>,
+        /// The message being replied to, when this is a reply.
+        ///
+        /// Carried on the request rather than set up beforehand, because a
+        /// reply is one send: the quote is part of the message, and a client
+        /// that composed one has everything the wire needs — the original's
+        /// id, who wrote it, and the line to show in the quote bar.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quoted: Option<QuotedMessage>,
     },
     /// Send a recorded voice note.
     ///
@@ -335,6 +390,15 @@ pub enum ClientRequest {
         duration_secs: u32,
         waveform: Vec<u8>,
         local_id: Option<String>,
+        /// The message being replied to, when this is a reply.
+        ///
+        /// The same field [`ClientRequest::SendText`] carries, for the same
+        /// reason: recording is a way of answering, not a different kind of
+        /// message. Without it a reply draft open when the user pressed the
+        /// microphone was silently dropped — and worse, stayed armed and
+        /// attached itself to whatever was typed next.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quoted: Option<QuotedMessage>,
     },
     /// Tell the peer whether we are typing. One request rather than two,
     /// because it is one piece of state with two values.
@@ -378,6 +442,19 @@ pub enum ClientRequest {
         jid: String,
         through_message_id: Option<String>,
     },
+    /// Ask what this account is taking up on disk.
+    ///
+    /// Answered with [`DaemonMessage::Storage`] under the request's id. The
+    /// daemon is the only process that opens the store or writes the media
+    /// cache, so it is the only one that can measure either — a front end
+    /// asking the filesystem would be guessing at paths it does not own.
+    StorageUsage,
+    /// Delete the cached media, keeping the store.
+    ///
+    /// Distinct from [`ForgetSession`](Self::ForgetSession): the history stays
+    /// and every message keeps its `downloadable`, so what this costs is a
+    /// re-download of anything looked at again.
+    ClearMediaCache,
     /// Ask the daemon to bring a front end to the foreground, which is what
     /// the tray's "Open" item does.
     ///
@@ -495,6 +572,7 @@ mod tests {
             connection: ConnectionState::Connected,
             chats: vec![chat(u32::MAX), chat(5)],
             calls: CallState::default(),
+            account: None,
         };
         assert_eq!(snapshot.total_unread(), u32::MAX);
     }
@@ -518,6 +596,7 @@ mod tests {
             connection: ConnectionState::Connected,
             chats: vec![chat.clone()],
             calls: CallState::default(),
+            account: None,
         };
         assert_eq!(
             snapshot.total_unread(),

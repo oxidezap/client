@@ -98,6 +98,25 @@ impl RecordedAudio {
     }
 }
 
+/// How much of the tail the meter averages: ~150ms at the capture rate.
+/// Short enough to follow speech, long enough not to flicker.
+const LEVEL_WINDOW: usize = (CAPTURE_SAMPLE_RATE as usize * 150) / 1000;
+
+/// Root-mean-square of a slice, scaled so ordinary speech lands mid-meter.
+///
+/// The bare RMS of a voice sits around 0.05–0.2, which would leave the meter
+/// looking dead; the gain is the difference between a meter and a decoration.
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = samples.iter().map(|s| s * s).sum();
+    ((sum / samples.len() as f32).sqrt() * LEVEL_GAIN).clamp(0.0, 1.0)
+}
+
+/// Chosen so a normal speaking voice fills roughly half the meter.
+const LEVEL_GAIN: f32 = 4.0;
+
 pub struct AudioRecorder {
     stream: Option<Stream>,
     samples: Arc<Mutex<Vec<f32>>>,
@@ -235,6 +254,23 @@ impl AudioRecorder {
         Ok(())
     }
 
+    /// The input level right now, 0..=1, for a meter.
+    ///
+    /// Read off the tail of what has been captured rather than from a second
+    /// tap on the device: the callback is already writing every sample here,
+    /// and a meter that opened its own stream would be a second consumer of a
+    /// microphone the user only agreed to share once.
+    ///
+    /// RMS, not peak: a peak meter is pinned by a single click and says
+    /// nothing about whether a voice is being picked up.
+    pub fn level(&self) -> f32 {
+        let Ok(samples) = self.samples.lock() else {
+            return 0.0;
+        };
+        let from = samples.len().saturating_sub(LEVEL_WINDOW);
+        rms(&samples[from..])
+    }
+
     pub fn stop(&mut self) -> Result<RecordedAudio, RecorderError> {
         if !self.is_recording {
             return Err(RecorderError::NotRecording);
@@ -336,6 +372,30 @@ impl std::error::Error for RecorderError {}
 
 #[cfg(test)]
 mod tests {
+    use super::rms;
+
+    #[test]
+    fn silence_reads_as_nothing() {
+        assert_eq!(rms(&[]), 0.0);
+        assert_eq!(rms(&[0.0; 128]), 0.0);
+    }
+
+    #[test]
+    fn a_speaking_level_lands_in_the_middle_of_the_meter() {
+        // ~0.12 RMS is an ordinary speaking voice off a laptop microphone.
+        let level = rms(&[0.12; 512]);
+        assert!(
+            (0.3..0.7).contains(&level),
+            "expected a mid-meter reading, got {level}"
+        );
+    }
+
+    #[test]
+    fn a_loud_burst_pins_the_meter_without_passing_it() {
+        assert_eq!(rms(&[1.0; 512]), 1.0);
+        assert_eq!(rms(&[-1.0; 512]), 1.0);
+    }
+
     use super::*;
 
     #[test]

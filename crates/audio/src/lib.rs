@@ -11,6 +11,7 @@ mod call_device;
 mod encoder;
 mod player;
 mod recorder;
+mod timescale;
 mod waveform;
 
 pub use call_device::{spawn_mic, spawn_speaker};

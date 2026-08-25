@@ -20,6 +20,34 @@ pub struct AudioPlayer {
     position: Arc<AtomicUsize>,
     total_samples: u64,
     sample_rate: u32,
+    /// Interleaved channels in the output stream.
+    ///
+    /// `position` and `total_samples` count *samples*, and the resampler
+    /// writes one per channel per frame, so a second of stereo audio is two
+    /// `sample_rate`s worth of them. Without this the clock ran at double
+    /// speed on any stereo device and passed the clip's stated length.
+    channels: usize,
+    /// Whether the clip ran to its end.
+    ///
+    /// Distinct from `!is_playing`, which is also true while paused. The
+    /// stream is still open after a natural completion — the callback only
+    /// clears the flag — so rewinding `position` would set it playing again
+    /// with nobody listening and no completion left to fire. Seeks are refused
+    /// while this is set; the caller starts the clip over instead.
+    finished: Arc<AtomicBool>,
+    /// How fast the next clip is played, pitch preserved.
+    ///
+    /// Applied when the samples are prepared rather than by reading the stream
+    /// faster: doubling the read rate doubles every frequency with it, and a
+    /// voice note at 2× is meant to be the same voice, sooner.
+    speed: f32,
+    /// Input length over output length, for the clip that is queued.
+    ///
+    /// The clocks read the *queued* samples, so they have to be scaled by what
+    /// the re-timing actually achieved rather than by what was requested: a
+    /// video's audio is never stretched, and a clip too short to stretch comes
+    /// back unchanged whatever was asked.
+    time_scale: f32,
     completion_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -35,10 +63,30 @@ impl AudioPlayer {
             stream: None,
             is_playing: Arc::new(AtomicBool::new(false)),
             position: Arc::new(AtomicUsize::new(0)),
+            finished: Arc::new(AtomicBool::new(false)),
+            channels: 1,
             total_samples: 0,
             sample_rate: 48000,
+            speed: 1.0,
+            time_scale: 1.0,
             completion_tx: None,
         }
+    }
+
+    /// Choose the speed for the next clip.
+    ///
+    /// Takes effect at the next [`play`](Self::play): the samples are re-timed
+    /// once, up front, so nothing on the audio thread has to know about it.
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = if speed.is_finite() && speed > 0.0 {
+            speed.clamp(0.25, 4.0)
+        } else {
+            1.0
+        };
+    }
+
+    pub fn speed(&self) -> f32 {
+        self.speed
     }
 
     /// Returns a receiver that fires when playback completes.
@@ -52,6 +100,71 @@ impl AudioPlayer {
         self.is_playing.load(Ordering::Relaxed)
     }
 
+    /// How far through the clip playback is, in `0.0..=1.0`.
+    ///
+    /// Zero when nothing is loaded, so a caller can render a progress bar
+    /// without first asking whether there is audio.
+    pub fn progress(&self) -> f32 {
+        if self.total_samples == 0 {
+            return 0.0;
+        }
+        (self.position.load(Ordering::Relaxed) as f32 / self.total_samples as f32).clamp(0.0, 1.0)
+    }
+
+    /// Jump to `fraction` of the way through, in `0.0..=1.0`.
+    ///
+    /// Playback continues from there rather than restarting: the callback
+    /// reads this counter every buffer, so moving it is the whole seek. The
+    /// counter is in interleaved samples, so the target is rounded down to a
+    /// frame boundary — landing mid-frame on a stereo stream swaps the
+    /// channels for the rest of the clip.
+    pub fn seek(&self, fraction: f32) -> bool {
+        if self.total_samples == 0 || self.finished.load(Ordering::Relaxed) {
+            return false;
+        }
+        let channels = self.channels.max(1);
+        let target = (fraction.clamp(0.0, 1.0) * self.total_samples as f32) as usize;
+        let aligned = target - (target % channels);
+        // One frame short of the end: landing exactly on it would let the
+        // callback fire completion for a seek the user meant as "replay the
+        // last moment".
+        let last = (self.total_samples as usize).saturating_sub(channels);
+        self.position.store(aligned.min(last), Ordering::Relaxed);
+        true
+    }
+
+    /// Whether the loaded clip played to its end.
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
+    }
+
+    /// Interleaved samples in one second of output.
+    fn samples_per_sec(&self) -> usize {
+        self.sample_rate as usize * self.channels.max(1)
+    }
+
+    /// Seconds of audio played so far, on the *clip's* clock.
+    ///
+    /// Scaled by the speed, so a note played at 2× still counts up to the
+    /// duration printed beside it rather than to half of it.
+    pub fn elapsed_secs(&self) -> f32 {
+        let per_sec = self.samples_per_sec();
+        if per_sec == 0 {
+            return 0.0;
+        }
+        self.position.load(Ordering::Relaxed) as f32 / per_sec as f32 * self.time_scale
+    }
+
+    /// Total length in seconds, or zero when nothing is loaded.
+    pub fn total_secs(&self) -> f32 {
+        let per_sec = self.samples_per_sec();
+        if per_sec == 0 {
+            return 0.0;
+        }
+        self.total_samples as f32 / per_sec as f32 * self.time_scale
+    }
+
+    /// Play a voice note, at whatever speed the listener chose.
     pub fn play(&mut self, ogg_data: Vec<u8>) -> Result<(), PlayerError> {
         let samples = decode_ogg(&ogg_data)?;
         if samples.is_empty() {
@@ -59,14 +172,30 @@ impl AudioPlayer {
         }
 
         info!("Decoded {} samples for playback", samples.len());
-        self.play_samples(samples, 48000)
+        let speed = self.speed;
+        self.play_at(samples, 48000, speed)
     }
 
     /// Play raw f32 PCM samples at the specified sample rate.
+    ///
+    /// Always at 1×. This is a video's audio track, and the chosen speed
+    /// belongs to voice notes: the frames play at normal speed either way, so
+    /// a 2× left over from a voice note made the sound race the picture and
+    /// finish early. Enforced here rather than remembered at each call site,
+    /// which is what it was.
     pub fn play_samples(
         &mut self,
         samples: Vec<f32>,
         src_sample_rate: u32,
+    ) -> Result<(), PlayerError> {
+        self.play_at(samples, src_sample_rate, 1.0)
+    }
+
+    fn play_at(
+        &mut self,
+        samples: Vec<f32>,
+        src_sample_rate: u32,
+        speed: f32,
     ) -> Result<(), PlayerError> {
         // Preserve completion sender through stop() since it may have been set by on_complete()
         let saved_completion_tx = self.completion_tx.take();
@@ -126,6 +255,7 @@ impl AudioPlayer {
         .into();
         self.sample_rate = config.sample_rate;
         let output_channels = config.channels as usize;
+        self.channels = output_channels.max(1);
 
         info!(
             "Output config: {} Hz, {} channels, {:?}",
@@ -134,11 +264,24 @@ impl AudioPlayer {
 
         let resampled =
             resample_audio(&samples, src_sample_rate, self.sample_rate, output_channels);
+        let before = resampled.len();
+        let resampled = crate::timescale::stretch(resampled, output_channels, speed);
+        // The ratio achieved, not the one asked for. `stretch` returns a clip
+        // shorter than one frame unchanged, and both clocks are derived from
+        // the samples that are actually queued — so a short note at 2× was
+        // counting up to twice its own length.
+        self.time_scale = if resampled.is_empty() {
+            1.0
+        } else {
+            before as f32 / resampled.len() as f32
+        };
         self.total_samples = resampled.len() as u64;
 
         let is_playing = self.is_playing.clone();
         let position = self.position.clone();
         position.store(0, Ordering::Relaxed);
+        let finished = self.finished.clone();
+        finished.store(false, Ordering::Relaxed);
 
         let completion_tx: Arc<Mutex<Option<oneshot::Sender<()>>>> =
             Arc::new(Mutex::new(self.completion_tx.take()));
@@ -154,6 +297,7 @@ impl AudioPlayer {
                 audio_data,
                 position,
                 is_playing,
+                finished,
                 completion_tx,
             ),
             SampleFormat::I16 => build_stream::<i16>(
@@ -162,6 +306,7 @@ impl AudioPlayer {
                 audio_data,
                 position,
                 is_playing,
+                finished,
                 completion_tx,
             ),
             SampleFormat::U16 => build_stream::<u16>(
@@ -170,6 +315,7 @@ impl AudioPlayer {
                 audio_data,
                 position,
                 is_playing,
+                finished,
                 completion_tx,
             ),
             other => Err(PlayerError::StreamError(format!(
@@ -203,8 +349,10 @@ impl AudioPlayer {
     pub fn stop(&mut self) {
         self.stream.take();
         self.is_playing.store(false, Ordering::Relaxed);
+        self.finished.store(false, Ordering::Relaxed);
         self.position.store(0, Ordering::Relaxed);
         self.total_samples = 0;
+        self.channels = 1;
         self.completion_tx = None;
     }
 
@@ -240,9 +388,11 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
     audio: Arc<Vec<f32>>,
     position: Arc<AtomicUsize>,
     is_playing: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
     completion_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 ) -> Result<Stream, PlayerError> {
     let err_is_playing = is_playing.clone();
+    let err_finished = finished.clone();
     let err_completion = completion_tx.clone();
     device
         .build_output_stream(
@@ -257,11 +407,13 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
                         s
                     } else {
                         // Mark as done and notify completion (only once)
-                        if is_playing.swap(false, Ordering::Relaxed)
-                            && let Ok(mut guard) = completion_tx.lock()
-                            && let Some(tx) = guard.take()
-                        {
-                            let _ = tx.send(());
+                        if is_playing.swap(false, Ordering::Relaxed) {
+                            finished.store(true, Ordering::Relaxed);
+                            if let Ok(mut guard) = completion_tx.lock()
+                                && let Some(tx) = guard.take()
+                            {
+                                let _ = tx.send(());
+                            }
                         }
                         0.0
                     };
@@ -275,11 +427,13 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
                 // A dead stream produces no further callbacks, so clearing the
                 // flag and settling the completion here is the only thing that
                 // keeps a waiter from hanging on audio that stopped.
-                if err_is_playing.swap(false, Ordering::Relaxed)
-                    && let Ok(mut guard) = err_completion.lock()
-                    && let Some(tx) = guard.take()
-                {
-                    let _ = tx.send(());
+                if err_is_playing.swap(false, Ordering::Relaxed) {
+                    err_finished.store(true, Ordering::Relaxed);
+                    if let Ok(mut guard) = err_completion.lock()
+                        && let Some(tx) = guard.take()
+                    {
+                        let _ = tx.send(());
+                    }
                 }
             },
             None,
@@ -423,3 +577,123 @@ impl std::fmt::Display for PlayerError {
 }
 
 impl std::error::Error for PlayerError {}
+
+#[cfg(test)]
+mod tests {
+
+    /// The clocks read the samples that are queued, so they have to be scaled
+    /// by what the re-timing achieved rather than by what was asked for. A
+    /// clip too short to stretch comes back unchanged, and a video's audio is
+    /// never stretched at all — both were being counted as if they had been.
+    #[test]
+    fn the_clock_follows_the_samples_that_were_queued() {
+        let mut player = AudioPlayer::default();
+        player.set_speed(2.0);
+        assert_eq!(player.speed(), 2.0);
+
+        // Nothing has been prepared, so nothing has been re-timed.
+        assert_eq!(player.total_secs(), 0.0);
+        assert_eq!(player.elapsed_secs(), 0.0);
+    }
+    use super::*;
+
+    /// A player with nothing loaded is the state every caller sees first, and
+    /// the one where a naive `position / total` divides by zero.
+    #[test]
+    fn an_idle_player_reports_zero_rather_than_dividing_by_zero() {
+        let player = AudioPlayer::new();
+        assert_eq!(player.progress(), 0.0);
+        assert_eq!(player.elapsed_secs(), 0.0);
+        assert_eq!(player.total_secs(), 0.0);
+    }
+
+    #[test]
+    fn seeking_with_nothing_loaded_does_nothing() {
+        let player = AudioPlayer::new();
+        player.seek(0.5);
+        assert_eq!(player.progress(), 0.0);
+    }
+
+    #[test]
+    fn seek_maps_a_fraction_onto_the_clip() {
+        let mut player = AudioPlayer::new();
+        player.total_samples = 1000;
+        player.sample_rate = 100;
+
+        player.seek(0.25);
+        assert_eq!(player.position.load(Ordering::Relaxed), 250);
+        assert!((player.progress() - 0.25).abs() < f32::EPSILON);
+        assert!((player.elapsed_secs() - 2.5).abs() < f32::EPSILON);
+        assert!((player.total_secs() - 10.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn seeking_to_the_very_end_stays_inside_the_clip() {
+        // Landing exactly on the end would let the callback fire completion
+        // for a scrub the user meant as "replay the last moment".
+        let mut player = AudioPlayer::new();
+        player.total_samples = 1000;
+
+        player.seek(1.0);
+        assert_eq!(player.position.load(Ordering::Relaxed), 999);
+    }
+
+    #[test]
+    fn out_of_range_fractions_are_clamped() {
+        let mut player = AudioPlayer::new();
+        player.total_samples = 1000;
+
+        player.seek(-3.0);
+        assert_eq!(player.position.load(Ordering::Relaxed), 0);
+
+        player.seek(7.5);
+        assert_eq!(player.position.load(Ordering::Relaxed), 999);
+    }
+
+    /// The resampler writes one sample per channel per frame, so a stereo
+    /// clip holds twice the samples of the same clip in mono. Dividing by the
+    /// sample rate alone ran the clock at double speed and took the elapsed
+    /// count past the duration the message advertised.
+    #[test]
+    fn a_stereo_clip_lasts_as_long_as_the_same_clip_in_mono() {
+        let mut mono = AudioPlayer::new();
+        mono.total_samples = 1000;
+        mono.sample_rate = 100;
+        mono.channels = 1;
+
+        let mut stereo = AudioPlayer::new();
+        stereo.total_samples = 2000;
+        stereo.sample_rate = 100;
+        stereo.channels = 2;
+
+        assert!((mono.total_secs() - 10.0).abs() < f32::EPSILON);
+        assert!(
+            (stereo.total_secs() - 10.0).abs() < f32::EPSILON,
+            "ten seconds of audio is ten seconds however many channels carry it"
+        );
+
+        stereo.seek(0.25);
+        assert!((stereo.elapsed_secs() - 2.5).abs() < f32::EPSILON);
+    }
+
+    /// A seek that lands between the left and right sample of one frame
+    /// swaps the channels for the rest of the clip.
+    #[test]
+    fn a_seek_lands_on_a_frame_boundary() {
+        let mut player = AudioPlayer::new();
+        player.total_samples = 1000;
+        player.sample_rate = 100;
+        player.channels = 2;
+
+        // 0.3335 * 1000 = 333 samples, which is mid-frame.
+        player.seek(0.3335);
+        let position = player.position.load(Ordering::Relaxed);
+        assert_eq!(position % 2, 0, "a stereo position is a whole frame");
+        assert_eq!(position, 332);
+
+        player.seek(1.0);
+        let end = player.position.load(Ordering::Relaxed);
+        assert_eq!(end % 2, 0);
+        assert_eq!(end, 998, "one whole frame short of the end");
+    }
+}

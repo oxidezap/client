@@ -8,6 +8,10 @@ use std::sync::Arc;
 use wacore::download::{Downloadable, MediaType as DownloadMediaType};
 use wacore_binary::jid::{Jid, JidExt, Server};
 
+use crate::message_status::MessageStatus;
+use crate::quoted::QuotedMessage;
+use crate::system_notice::SystemNotice;
+
 /// Maximum number of unique emoji reactions per message to prevent spam
 const MAX_REACTIONS_PER_MESSAGE: usize = 50;
 
@@ -29,6 +33,18 @@ pub fn fallback_chat_name(jid: &Jid) -> String {
     } else {
         "Unknown chat".to_string()
     }
+}
+
+/// The address every status update is addressed to.
+pub const STATUS_BROADCAST_JID: &str = "status@broadcast";
+
+/// Whether `jid` is the status broadcast.
+///
+/// A string compare rather than a parse: the address is a single fixed
+/// constant, and both chat constructors are on paths that otherwise never
+/// need a parsed JID.
+fn is_status_jid(jid: &str) -> bool {
+    jid == STATUS_BROADCAST_JID
 }
 
 /// Type of media content
@@ -148,6 +164,14 @@ pub struct MediaContent {
     /// Whether `data` holds only a fallback thumbnail (eager download of the
     /// full media failed), so the renderer keeps offering the real download
     pub data_is_preview: bool,
+    /// Amplitude envelope for a voice note, one byte per bucket in `0..=100`.
+    ///
+    /// WhatsApp ships this on the message itself, so the bars can be drawn
+    /// before a single byte of audio is fetched — which is the point: the
+    /// shape of a voice note is most useful *while deciding* whether to play
+    /// it. Absent for older messages and for senders that omit it; the player
+    /// falls back to a flat bar rather than inventing a shape.
+    pub waveform: Option<Arc<Vec<u8>>>,
 }
 
 impl MediaContent {
@@ -188,11 +212,73 @@ pub struct ChatMessage {
     pub media: Option<MediaContent>,
     /// Reactions on this message (emoji -> list of sender JIDs)
     pub reactions: HashMap<String, Vec<String>>,
-    /// Whether an outgoing send attempt for this message failed
-    pub failed: bool,
+    /// How far an outgoing message got. Meaningless for an incoming one:
+    /// read it through [`Self::delivery`], which returns `None` there rather
+    /// than reporting our own send state for someone else's message.
+    pub status: MessageStatus,
+    /// The message this one replies to, if any.
+    pub quoted: Option<QuotedMessage>,
+    /// Set when nobody typed this: a call record, a group change. Such a row
+    /// has no author and no ticks, and renders centred rather than as a bubble.
+    /// Whether the sender took this message back.
+    ///
+    /// Kept as a fact rather than left implicit in the "[Message deleted]"
+    /// text it produces: a tombstone is still a row, and the surfaces that
+    /// have to know it is one — the status feed, which must not offer a
+    /// deleted update to watch — should not have to recognise a sentence.
+    #[serde(default)]
+    pub revoked: bool,
+    pub system: Option<SystemNotice>,
+}
+
+impl MediaContent {
+    /// The full media has arrived: take the bytes, and the metadata that
+    /// describes *them*.
+    ///
+    /// A row can carry a poster frame or a thumbnail until the real file is
+    /// fetched, and the fields beside it describe that stand-in — a sticker's
+    /// PNG preview says `image/png` where the sticker itself is an animated
+    /// WebP. Swapping only the bytes left every later reader decoding the new
+    /// file under the old file's type. One place does both, because doing one
+    /// without the other is the bug.
+    pub fn adopt_full_bytes(&mut self, bytes: Arc<Vec<u8>>) {
+        self.data = bytes;
+        self.data_is_preview = false;
+        if let Some(downloadable) = &self.downloadable {
+            self.mime_type = downloadable.mime_type.clone();
+        }
+    }
+}
+
+/// What a failed message can be sent again as.
+///
+/// Borrowed from the message, because the common caller only wants to know
+/// whether there is anything here at all.
+pub enum Resend<'a> {
+    Text(&'a str),
+    VoiceNote(&'a MediaContent),
 }
 
 impl ChatMessage {
+    /// What to draw for whoever wrote this: the name somebody has for them,
+    /// or the number if nobody has one yet.
+    ///
+    /// The number is produced here rather than stored in `sender_name`,
+    /// because that field only ever gains a value —
+    /// [`Chat::update_participant`] fills blanks. A row stamped with a number
+    /// could never take the push name that arrives a second later, so the
+    /// same person would read as a number on their reloaded bubbles and by
+    /// name on their new ones.
+    pub fn author_label(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(name) = &self.sender_name {
+            return std::borrow::Cow::Borrowed(name);
+        }
+        match self.sender.parse::<Jid>() {
+            Ok(jid) => std::borrow::Cow::Owned(fallback_chat_name(&jid)),
+            Err(_) => std::borrow::Cow::Borrowed(&self.sender),
+        }
+    }
+
     /// Create a new outgoing message
     pub fn new_outgoing(id: String, content: String) -> Self {
         Self {
@@ -205,7 +291,10 @@ impl ChatMessage {
             is_read: false,
             media: None,
             reactions: HashMap::new(),
-            failed: false,
+            status: MessageStatus::Pending,
+            quoted: None,
+            revoked: false,
+            system: None,
         }
     }
 
@@ -221,7 +310,10 @@ impl ChatMessage {
             is_read: false,
             media: Some(media),
             reactions: HashMap::new(),
-            failed: false,
+            status: MessageStatus::Pending,
+            quoted: None,
+            revoked: false,
+            system: None,
         }
     }
 
@@ -238,8 +330,66 @@ impl ChatMessage {
             is_read: false,
             media: None,
             reactions: HashMap::new(),
-            failed: false,
+            status: MessageStatus::default(),
+            quoted: None,
+            revoked: false,
+            system: None,
         }
+    }
+
+    /// How far this message got, or `None` when it is not ours to report.
+    pub fn delivery(&self) -> Option<MessageStatus> {
+        self.is_from_me.then_some(self.status)
+    }
+
+    /// The ticks to draw, given whether this conversation is with your own
+    /// number.
+    ///
+    /// A message to yourself has been read by the only person who could read
+    /// it, and every WhatsApp client shows it as read the moment it lands. No
+    /// receipt ever arrives to say so — the peer that would send one is this
+    /// account — so a status derived from receipts alone sits on one grey tick
+    /// for good. The rule lives here rather than in a renderer because the
+    /// timeline and the chat list both draw those ticks and would otherwise
+    /// have to agree by hand.
+    pub fn delivery_in(&self, is_self_chat: bool) -> Option<MessageStatus> {
+        let status = self.delivery()?;
+        // Not a blanket promotion: a send that is still pending or has failed
+        // says something true about this device, and claiming it was read
+        // would be a lie about a message that never left.
+        if is_self_chat && status.has_left_this_device() {
+            return Some(MessageStatus::Read);
+        }
+        Some(status)
+    }
+
+    /// Whether the send failed, which is what the bubble draws in red.
+    pub fn is_failed(&self) -> bool {
+        self.is_from_me && self.status.is_failed()
+    }
+
+    /// What sending this again would put on the wire, if anything.
+    ///
+    /// One question with one answer, asked by the bubble to decide whether to
+    /// offer a retry and by the retry to decide what to send. They were two
+    /// separate conditions — "did it fail" and "is there text or opus here" —
+    /// so a failed message with neither drew a control that answered a click
+    /// with nothing. Text and voice notes are what this client composes, and
+    /// therefore what it can compose a second time.
+    pub fn resend(&self) -> Option<Resend<'_>> {
+        if !self.is_failed() {
+            return None;
+        }
+        if !self.content.is_empty() {
+            return Some(Resend::Text(&self.content));
+        }
+        // A voice note has no text and is not therefore beyond recovery: the
+        // failed bubble still holds the encoded opus, its length and its
+        // waveform, which is everything the send needs.
+        self.media
+            .as_ref()
+            .filter(|media| media.media_type == MediaType::Audio && !media.data.is_empty())
+            .map(Resend::VoiceNote)
     }
 
     /// Add or update a reaction to this message from a sender.
@@ -426,6 +576,14 @@ pub struct Chat {
     pub manually_unread: bool,
     /// Whether this is a group chat
     pub is_group: bool,
+    /// Whether this is the status broadcast.
+    ///
+    /// Not a conversation: nothing is addressed to it and nothing is replied
+    /// to in it — every message is one contact's status update, and the whole
+    /// thing belongs on its own screen rather than in a list of people to
+    /// talk to.
+    #[serde(default)]
+    pub is_status: bool,
     /// Participant names in group chats (sender JID -> display name)
     pub participants: HashMap<String, String>,
     /// Messages in this chat
@@ -447,6 +605,7 @@ impl Chat {
             .map(|jid| fallback_chat_name(&jid))
             .unwrap_or_else(|_| "Unknown chat".to_string());
         let is_group = jid.contains("@g.us");
+        let is_status = is_status_jid(&jid);
 
         Self {
             jid,
@@ -457,6 +616,7 @@ impl Chat {
             unread_count: 0,
             manually_unread: false,
             is_group,
+            is_status,
             participants: HashMap::new(),
             messages: Vec::new(),
             from_store: false,
@@ -491,6 +651,7 @@ impl Chat {
 
     pub(crate) fn with_name_priority(jid: String, name: String, name_priority: u8) -> Self {
         let is_group = jid.contains("@g.us");
+        let is_status = is_status_jid(&jid);
 
         Self {
             jid,
@@ -501,6 +662,7 @@ impl Chat {
             unread_count: 0,
             manually_unread: false,
             is_group,
+            is_status,
             participants: HashMap::new(),
             messages: Vec::new(),
             from_store: false,
@@ -528,26 +690,143 @@ impl Chat {
         }
     }
 
-    /// Update a participant's display name (for group chats)
+    /// Learn what to call a participant, and say it everywhere this chat
+    /// already names them.
+    ///
+    /// The one place a name enters a conversation, which is what keeps the
+    /// bubble, the quote bar above it and the row in the list from drifting
+    /// apart: a name that arrives late is written onto the rows that were
+    /// waiting for it rather than left to whichever surface happens to
+    /// consult the participant map. Both back-fills only fill blanks — a row
+    /// that already carries a name was named by the same resolver and is not
+    /// improved by a second answer.
     pub fn update_participant(&mut self, jid: String, name: String) {
+        for message in &mut self.messages {
+            if let Some(quoted) = message.quoted.as_mut()
+                && quoted.sender_name.is_empty()
+                && quoted.sender == jid
+            {
+                quoted.sender_name.clone_from(&name);
+            }
+            if message.sender_name.is_none() && !message.is_from_me && message.sender == jid {
+                message.sender_name = Some(name.clone());
+            }
+        }
         self.participants.insert(jid, name);
     }
 
-    /// Get a participant's display name, with fallback to JID prefix
-    #[allow(dead_code)]
-    pub fn get_participant_name(&self, jid: &str) -> String {
-        self.participants.get(jid).cloned().unwrap_or_else(|| {
-            jid.parse::<Jid>()
+    /// What to call whoever wrote `message`, in this chat.
+    ///
+    /// Every surface that names an author asks this, so a bubble, the list's
+    /// preview prefix and a reply bar cannot answer differently: the name the
+    /// message arrived under, then the participant map, and `None` when
+    /// nobody here knows. What to draw instead of `None` is the caller's —
+    /// the list says nothing, the reply bar names the chat.
+    pub fn author_name<'a>(&'a self, message: &'a ChatMessage) -> Option<&'a str> {
+        message
+            .sender_name
+            .as_deref()
+            .or_else(|| self.participant_name(&message.sender))
+    }
+
+    /// What this chat calls whoever is at `jid`, if it knows.
+    pub fn participant_name(&self, jid: &str) -> Option<&str> {
+        self.participants.get(jid).map(String::as_str)
+    }
+
+    /// Give a reply's quote bar the name of whoever it is answering.
+    ///
+    /// The envelope carries the quoted author's JID and never their push
+    /// name, so this is the only place the two meet: the chat holds the
+    /// participant map, and its own name is the answer in a 1:1 where there
+    /// is no map to hold.
+    fn name_quoted_author(&self, message: &mut ChatMessage) {
+        let Some(quoted) = message.quoted.as_mut() else {
+            return;
+        };
+        if !quoted.sender_name.is_empty() {
+            return;
+        }
+        if let Some(name) = self.quoted_author(quoted) {
+            quoted.sender_name = name;
+        }
+    }
+
+    /// Give every loaded reply the name of whoever it is answering.
+    ///
+    /// A page of hydrated history is assigned wholesale rather than added a
+    /// row at a time, so the naming [`add_message`](Self::add_message) does
+    /// per row has to be run over the page afterwards — without it every
+    /// reloaded reply drew the generic "Message" where an author belonged.
+    pub fn name_quoted_authors(&mut self) {
+        // Resolved against the whole page first: the answer for one row can
+        // come from another row, and both borrows cannot be held at once.
+        let resolved: Vec<Option<String>> = self
+            .messages
+            .iter()
+            .map(|message| {
+                let quoted = message.quoted.as_ref()?;
+                quoted
+                    .sender_name
+                    .is_empty()
+                    .then(|| self.quoted_author(quoted))
+                    .flatten()
+            })
+            .collect();
+        for (message, name) in self.messages.iter_mut().zip(resolved) {
+            if let Some(quoted) = message.quoted.as_mut()
+                && let Some(name) = name
+            {
+                quoted.sender_name = name;
+            }
+        }
+    }
+
+    /// Who wrote the message a quote is quoting, as far as this chat knows.
+    fn quoted_author(&self, quoted: &QuotedMessage) -> Option<String> {
+        // The original is often still loaded, and it is the better answer:
+        // it knows whether the reader wrote it, and carries the name it was
+        // received under.
+        if let Some(original) = self
+            .messages
+            .iter()
+            .find(|message| message.id == quoted.message_id)
+        {
+            if original.is_from_me {
+                return Some("You".to_string());
+            }
+            if let Some(name) = &original.sender_name {
+                return Some(name.clone());
+            }
+        }
+        // No participant on the envelope and no loaded original: nobody here
+        // knows who wrote it. Naming the chat would be a guess, and in a 1:1
+        // it is wrong exactly when the reader quoted themselves — the quote
+        // bar falls back to its own generic label instead.
+        if quoted.sender.is_empty() {
+            return None;
+        }
+        if let Some(name) = self.participant_name(&quoted.sender) {
+            Some(name.to_string())
+        } else if !self.is_group {
+            Some(self.name.clone())
+        } else {
+            // Better than "Message": a number is at least *someone*, and the
+            // real name replaces it as soon as a push name arrives.
+            quoted
+                .sender
+                .parse::<Jid>()
+                .ok()
                 .map(|jid| fallback_chat_name(&jid))
-                .unwrap_or_else(|_| "Unknown contact".to_string())
-        })
+        }
     }
 
     /// Add a message to the chat, maintaining chronological order by timestamp.
     /// Returns true when the message became the chat's newest content, so the
     /// caller knows whether to bump the chat in the list; duplicates and older
     /// backfills return false.
-    pub fn add_message(&mut self, message: ChatMessage) -> bool {
+    pub fn add_message(&mut self, mut message: ChatMessage) -> bool {
+        self.name_quoted_author(&mut message);
         // Redelivery of a message we already show (live traffic overlapping
         // hydrated history): no duplicate bubble, no recount. Id-only, not
         // (timestamp, id): the optimistic bubble's UI clock and the store's
@@ -579,7 +858,15 @@ impl Chat {
         // blocks redelivery recounts, so every incoming message that reaches
         // this point is new even when it lands behind the newest bubble
         // (offline catch-up, out-of-order decryption).
-        if !message.is_from_me {
+        //
+        // It *is* gated on `is_read`, the same way the daemon gates it. A row
+        // that arrives already read is not unread, and the case that made this
+        // matter is the call record: a call you just finished, placed, or
+        // declined is written into the conversation as an incoming row, and
+        // badging the chat for an event the user was party to is nonsense. A
+        // missed call still arrives unread, which is the one that earns a
+        // badge.
+        if !message.is_from_me && !message.is_read {
             self.unread_count += 1;
         }
 
@@ -644,6 +931,7 @@ impl Chat {
     /// authoritative (edits and revokes materialize there), so the hydrated
     /// copy must not be dropped in favor of stale content.
     pub fn insert_history_message(&mut self, mut message: ChatMessage) {
+        self.name_quoted_author(&mut message);
         // Id-only match: the hydrated copy may carry a slightly different
         // timestamp than the optimistic bubble. Remove-and-reinsert keeps
         // the (timestamp, id) sort invariant when the timestamp shifted.
@@ -664,8 +952,12 @@ impl Chat {
                 new_media.data_is_preview = old_media.data_is_preview;
             }
             // Live-only state the store doesn't carry must also survive the
-            // replace: the SendFailed flag and the push name on group bubbles.
-            message.failed |= existing.failed;
+            // replace: a delivery state the hydrated row has not caught up
+            // with, and the push name on group bubbles. `advance` is what
+            // makes this safe in both directions — whichever side is further
+            // along wins, so a reload can neither un-fail a send nor pull a
+            // read bubble back to delivered.
+            message.status.advance(existing.status);
             if message.sender_name.is_none() {
                 message.sender_name = existing.sender_name;
             }
@@ -694,22 +986,59 @@ impl Chat {
         }
     }
 
-    /// Mark specific messages as read by their IDs
+    /// Mark specific messages as read by their IDs.
+    ///
+    /// Only touches incoming messages: an outgoing bubble's ticks say what the
+    /// *peer* did, which a local read cannot speak for. Receipts about our own
+    /// messages go through [`Self::advance_status`] instead.
     ///
     /// Returns the number of messages that were actually updated.
     pub fn mark_messages_as_read(&mut self, message_ids: &[String]) -> usize {
         let mut count = 0;
         for msg in &mut self.messages {
-            if message_ids.contains(&msg.id) && !msg.is_read {
+            if !msg.is_from_me && message_ids.contains(&msg.id) && !msg.is_read {
                 msg.is_read = true;
                 count += 1;
-                // Decrement unread count for incoming messages
-                if !msg.is_from_me && self.unread_count > 0 {
+                if self.unread_count > 0 {
                     self.unread_count -= 1;
                 }
             }
         }
         count
+    }
+
+    /// Advance the delivery state of our own messages, never regressing one.
+    ///
+    /// Returns how many bubbles actually changed, so a receipt that tells us
+    /// nothing new does not buy a re-render.
+    pub fn advance_status(&mut self, message_ids: &[String], status: MessageStatus) -> usize {
+        let mut count = 0;
+        for msg in &mut self.messages {
+            if msg.is_from_me && message_ids.contains(&msg.id) {
+                let before = msg.status;
+                msg.status.advance(status);
+                if msg.status != before {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Mark one of our messages failed, for a send that never landed.
+    pub fn mark_send_failed(&mut self, message_id: &str) -> bool {
+        self.messages
+            .iter_mut()
+            .find(|m| m.id == message_id && m.is_from_me)
+            // Only a row still in flight. A `SendFailed` can arrive *after*
+            // the server's own acknowledgement — the send future returns its
+            // error late — and regressing a Sent, Delivered or Read bubble to
+            // Failed contradicts an answer the server already gave. The
+            // store's writer refuses the same regression for the same reason;
+            // this is the front end keeping the same rule.
+            .filter(|m| m.status.is_pending())
+            .map(|m| m.status.advance(MessageStatus::Failed))
+            .is_some()
     }
 
     /// Get the initial letter for avatar display
@@ -733,6 +1062,148 @@ impl Chat {
 
 #[cfg(test)]
 mod tests {
+
+    /// A row that arrives already read is not unread. The case that made this
+    /// matter is the call record: it is written as an incoming message, so a
+    /// call the user had just finished raised a badge for itself.
+    #[test]
+    fn a_row_that_arrives_read_raises_no_badge() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+
+        let mut seen = ChatMessage::new_incoming("call-1".into(), "a".into(), String::new());
+        seen.is_read = true;
+        chat.add_message(seen);
+        assert_eq!(chat.unread_count, 0);
+
+        chat.add_message(ChatMessage::new_incoming(
+            "m1".into(),
+            "a".into(),
+            "hi".into(),
+        ));
+        assert_eq!(chat.unread_count, 1, "a real arrival still counts");
+    }
+
+    /// A message to your own number has been read by the only person who could
+    /// read it, and no receipt will ever say so — the peer that would send one
+    /// is this account. Left to receipts alone the bubble sat on one grey tick
+    /// for good.
+    #[test]
+    fn a_message_to_yourself_is_read_the_moment_it_lands() {
+        let mut message = ChatMessage::new_outgoing("m".into(), "hi".into());
+        message.status = MessageStatus::Sent;
+
+        assert_eq!(message.delivery_in(false), Some(MessageStatus::Sent));
+        assert_eq!(message.delivery_in(true), Some(MessageStatus::Read));
+    }
+
+    /// Not a blanket promotion: a send still queued, or one that failed, says
+    /// something true about this device. Calling it read would claim a message
+    /// was seen that never left.
+    #[test]
+    fn a_send_that_never_left_is_not_read_even_in_your_own_chat() {
+        for status in [MessageStatus::Pending, MessageStatus::Failed] {
+            let mut message = ChatMessage::new_outgoing("m".into(), "hi".into());
+            message.status = status;
+            assert_eq!(message.delivery_in(true), Some(status), "for {status:?}");
+        }
+    }
+
+    /// One person, one name. The bug: the same participant was "Eu" on their
+    /// bubbles and "jlucaso" in the typing line, because the two surfaces
+    /// asked different sources. Everything that names an author asks here.
+    #[test]
+    fn every_surface_names_an_author_the_same_way() {
+        let mut chat = Chat::new("120363000000000001@g.us".to_string());
+        chat.is_group = true;
+
+        let mut named = ChatMessage::new_incoming("m1".into(), "a@lid".into(), "ping".into());
+        named.sender_name = Some("Eu".into());
+        let anonymous = ChatMessage::new_incoming("m2".into(), "a@lid".into(), "pong".into());
+
+        assert_eq!(chat.author_name(&named), Some("Eu"));
+        assert_eq!(chat.author_name(&anonymous), None, "nobody here knows yet");
+
+        chat.update_participant("a@lid".into(), "Eu".into());
+        assert_eq!(chat.author_name(&anonymous), Some("Eu"));
+        assert_eq!(chat.participant_name("a@lid"), Some("Eu"));
+        assert_eq!(chat.participant_name("b@lid"), None);
+    }
+
+    /// A name that arrives after the rows it belongs to is written onto them,
+    /// so a bubble and the list row above it cannot disagree about who spoke.
+    #[test]
+    fn a_name_learned_late_reaches_the_rows_that_were_waiting() {
+        let mut chat = Chat::new("120363000000000001@g.us".to_string());
+        chat.is_group = true;
+        chat.add_message(ChatMessage::new_incoming(
+            "m1".into(),
+            "a@lid".into(),
+            "ping".into(),
+        ));
+        let mut theirs = ChatMessage::new_incoming("m2".into(), "b@lid".into(), "pong".into());
+        theirs.sender_name = Some("Ana".into());
+        chat.add_message(theirs);
+        chat.add_message(ChatMessage::new_outgoing("m3".into(), "ok".into()));
+
+        chat.update_participant("a@lid".into(), "Eu".into());
+
+        assert_eq!(chat.messages[0].sender_name.as_deref(), Some("Eu"));
+        assert_eq!(
+            chat.messages[1].sender_name.as_deref(),
+            Some("Ana"),
+            "somebody else's row is not touched"
+        );
+        assert_eq!(
+            chat.messages[2].sender_name, None,
+            "your own row is named by the reader, not by the map"
+        );
+    }
+
+    /// A page of history is assigned wholesale, not added a row at a time, so
+    /// the per-row naming has to be run over it afterwards. Without it every
+    /// reloaded reply drew the generic label where an author belonged.
+    #[test]
+    fn a_reloaded_reply_still_names_who_it_answers() {
+        let mut chat = Chat::new("120363000000000001@g.us".to_string());
+        chat.is_group = true;
+
+        let mut original = ChatMessage::new_incoming("m1".into(), "a@lid".into(), "ping".into());
+        original.sender_name = Some("Ana".into());
+        let mut reply = ChatMessage::new_incoming("m2".into(), "b@lid".into(), "pong".into());
+        reply.quoted = Some(crate::QuotedMessage {
+            message_id: "m1".into(),
+            sender: "a@lid".into(),
+            sender_name: String::new(),
+            preview: "ping".into(),
+            kind: None,
+        });
+        // Assigned the way hydration assigns a page.
+        chat.messages = vec![original, reply];
+
+        chat.name_quoted_authors();
+        assert_eq!(chat.messages[1].quoted.as_ref().unwrap().sender_name, "Ana");
+    }
+
+    /// A person nobody has named is still somebody. The number is drawn, not
+    /// stored: the stored field only ever gains a value, so a row stamped
+    /// with a number could never take the name that arrives after it.
+    #[test]
+    fn an_unnamed_author_is_drawn_as_their_number() {
+        let mut message =
+            ChatMessage::new_incoming("m".into(), "12025550143@s.whatsapp.net".into(), "hi".into());
+        assert_eq!(message.author_label(), "+12025550143");
+
+        message.sender_name = Some("Ana".into());
+        assert_eq!(message.author_label(), "Ana");
+    }
+
+    /// Their message in your own chat is not yours to have ticks on at all.
+    #[test]
+    fn an_incoming_message_has_no_ticks_in_any_chat() {
+        let mut message = ChatMessage::new_outgoing("m".into(), "hi".into());
+        message.is_from_me = false;
+        assert_eq!(message.delivery_in(true), None);
+    }
     use super::*;
     use chrono::TimeZone;
 
@@ -747,8 +1218,36 @@ mod tests {
             is_read: false,
             media: None,
             reactions: HashMap::new(),
-            failed: false,
+            status: MessageStatus::default(),
+            quoted: None,
+            revoked: false,
+            system: None,
         }
+    }
+
+    /// A late `SendFailed` must not overwrite an answer the server already
+    /// gave. The store's writer refuses the same regression.
+    #[test]
+    fn a_failure_after_the_acknowledgement_does_not_regress_the_row() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        let mut sent = make_message("m1", 10);
+        sent.is_from_me = true;
+        sent.status = MessageStatus::Delivered;
+        chat.messages.push(sent);
+
+        assert!(!chat.mark_send_failed("m1"), "nothing to fail");
+        assert_eq!(chat.messages[0].status, MessageStatus::Delivered);
+    }
+
+    #[test]
+    fn a_failure_while_still_pending_marks_the_row() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        let mut pending = make_message("m1", 10);
+        pending.is_from_me = true;
+        chat.messages.push(pending);
+
+        assert!(chat.mark_send_failed("m1"));
+        assert_eq!(chat.messages[0].status, MessageStatus::Failed);
     }
 
     fn make_media(data: Vec<u8>, data_is_preview: bool) -> MediaContent {
@@ -765,6 +1264,7 @@ mod tests {
             is_animated: false,
             duration_secs: None,
             data_is_preview,
+            waveform: None,
         }
     }
 
@@ -1110,28 +1610,28 @@ mod tests {
     }
 
     #[test]
-    fn test_hydration_replacement_keeps_failed_flag_and_sender_name() {
+    fn test_hydration_replacement_keeps_delivery_state_and_sender_name() {
         let mut chat = Chat::new("123456789-group@g.us".to_string());
 
         // Live bubble: an outgoing send that failed, plus an incoming group
         // bubble that carried its sender's push name
         let mut failed_send = make_message("OUT-1", 1000);
         failed_send.is_from_me = true;
-        failed_send.failed = true;
+        failed_send.status = MessageStatus::Failed;
         chat.add_message(failed_send);
         let mut incoming = make_message("IN-1", 2000);
         incoming.sender_name = Some("Alice".to_string());
         chat.add_message(incoming);
 
-        // The hydrated rows carry neither the failure flag nor the push name;
-        // the replace must not lose them
+        // The hydrated rows carry neither the failure state nor the push
+        // name; the replace must not lose either
         let mut hydrated_send = make_message("OUT-1", 1000);
         hydrated_send.is_from_me = true;
         chat.insert_history_message(hydrated_send);
         chat.insert_history_message(make_message("IN-1", 2000));
 
         assert_eq!(chat.messages.len(), 2);
-        assert!(chat.messages[0].failed);
+        assert!(chat.messages[0].is_failed());
         assert_eq!(chat.messages[1].sender_name.as_deref(), Some("Alice"));
 
         // A hydrated name wins over the live one (store is authoritative)

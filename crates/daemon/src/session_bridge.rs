@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use oxidezap_core::{Chat, ChatMessage, MediaContent, UiEvent};
+use oxidezap_core::{CallOutcome, Chat, ChatMessage, MediaContent, UiEvent};
 use oxidezap_ipc::{
     CallAction, ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview,
     PairingCode, RequestId,
@@ -33,6 +33,8 @@ pub enum Action {
         jid: String,
         text: String,
         local_id: Option<String>,
+        /// The message being replied to, when this is a reply.
+        quoted: Option<oxidezap_core::QuotedMessage>,
     },
     SendAudio {
         jid: String,
@@ -41,6 +43,7 @@ pub enum Action {
         duration_secs: u32,
         waveform: Vec<u8>,
         local_id: Option<String>,
+        quoted: Option<oxidezap_core::QuotedMessage>,
     },
     MarkRead {
         jid: String,
@@ -131,6 +134,20 @@ pub type Commands = tokio::sync::mpsc::Sender<SessionCommand>;
 /// request is sitting in a queue it cannot see.
 const MAX_IN_FLIGHT: usize = 64;
 
+/// What the session has to be told after an event was folded into daemon
+/// state.
+///
+/// A return value rather than a client call inside [`Bridge::observe`], so
+/// folding stays a pure function of the event and the state — which is what
+/// lets it be tested without opening a store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Answer {
+    Nothing,
+    /// An offer with nowhere to go. Nothing on this side holds its id, so no
+    /// front end can be asked to refuse it.
+    Decline(oxidezap_core::CallId),
+}
+
 /// Run the session until it ends or `shutdown` resolves.
 ///
 /// Shutdown is a parameter rather than something the caller races this future
@@ -158,7 +175,11 @@ pub async fn run(
     loop {
         tokio::select! {
             event = events.recv() => match event {
-                Some(event) => bridge.observe(event),
+                Some(event) => {
+                    if let Answer::Decline(call_id) = bridge.observe(event) {
+                        client.decline_call(&call_id);
+                    }
+                }
                 // The session dropped its sender: the run loop is gone and no
                 // further event can arrive.
                 None => break,
@@ -185,17 +206,55 @@ pub async fn run(
     // drops the tokio runtime it owns, which tokio refuses inside an async
     // context ("Cannot drop a runtime in a context where blocking is not
     // allowed").
-    if let Err(e) = tokio::task::spawn_blocking(move || close(client)).await {
-        log::error!("session teardown did not complete: {e}");
+    let grace = if bridge.forget {
+        FORGET_GRACE
+    } else {
+        SHUTDOWN_GRACE
+    };
+    let closed = match tokio::task::spawn_blocking(move || close(client, grace)).await {
+        Ok(closed) => closed,
+        Err(e) => {
+            log::error!("session teardown did not complete: {e}");
+            false
+        }
+    };
+
+    // Before anything is deleted, and on a blocking thread because joining
+    // one is: the publisher writes this account's media, and a wipe that
+    // starts while it is still draining its queue deletes a directory that
+    // is about to be written into again.
+    if let Some(publisher) = bridge.stop_publishing()
+        && let Err(e) = tokio::task::spawn_blocking(move || publisher.join()).await
+    {
+        log::error!("the publish thread did not finish: {e}");
     }
 
     // After the teardown, never before: the store is one file and the session
     // was holding it open. Unlinking it first leaves the closing session free
     // to write a fresh WAL beside a database that is already gone.
-    if bridge.forget {
+    // And only once it *has* torn down. Giving up waiting is not the same as
+    // being finished: a session still closing can write a fresh WAL beside a
+    // database that has just been unlinked, and the store is one file — a
+    // partial wipe orphans everything behind the new device. Refusing to
+    // delete leaves the old account intact, which is a state the user can act
+    // on again; racing leaves one nobody can.
+    if bridge.forget && !closed {
+        log::error!(
+            "local state was NOT wiped: the session is still closing, and deleting the store \
+             from under it would leave a partial wipe. Start oxidezap again and repeat \
+             \"clear data and pair again\"."
+        );
+    } else if bridge.forget {
         match oxidezap_session::wipe_local_state() {
             Ok(()) => log::info!("local state wiped; pair again on the next start"),
             Err(e) => log::error!("could not wipe local state: {e}"),
+        }
+        // The store is one file; the media is a directory beside it, and it
+        // is just as much this account's data.
+        // Everything, staged uploads included: the account is going, and so
+        // is anything that was going to be sent under it.
+        if let Err(e) = crate::media::wipe(crate::media::Wipe::Everything) {
+            log::error!("could not clear the media cache: {e}");
         }
     }
     Ok(())
@@ -208,12 +267,26 @@ pub async fn run(
 /// not die has to be killed, which is worse than one that gave up waiting.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long to wait when the store is about to be deleted.
+///
+/// Longer than the ordinary grace, because a wipe is only safe once the
+/// session has actually let go of SQLite. Still bounded — a daemon that will
+/// not die has to be killed — but here the answer to running out of patience
+/// is to skip the wipe rather than to race it.
+const FORGET_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Stop the session and wait for its thread, so the socket is closed and
 /// SQLite is flushed before the process goes away.
-pub fn close(mut client: WhatsAppClient) {
-    if !client.shutdown_and_join(SHUTDOWN_GRACE) {
-        log::warn!("session did not finish closing within {SHUTDOWN_GRACE:?}");
+///
+/// Returns whether it actually finished. On the ordinary path that answer is
+/// only worth logging; on the forget path it decides whether anything may be
+/// deleted at all.
+pub fn close(mut client: WhatsAppClient, grace: std::time::Duration) -> bool {
+    let closed = client.shutdown_and_join(grace);
+    if !closed {
+        log::warn!("session did not finish closing within {grace:?}");
     }
+    closed
 }
 
 /// Everything the event loop carries between one event and the next.
@@ -227,7 +300,14 @@ struct Bridge {
     /// loop, every connection task and the shutdown branch for its duration.
     /// One thread, and a queue, so the order the daemon publishes in is still
     /// the order things happened.
-    publish: tokio::sync::mpsc::UnboundedSender<UiEvent>,
+    ///
+    /// `None` once the publisher has been asked to stop, which is the state
+    /// that closes the channel: the thread ends when its last sender is gone.
+    publish: Option<tokio::sync::mpsc::UnboundedSender<UiEvent>>,
+    /// The publisher, kept joinable rather than detached. It writes the media
+    /// a session event carries, and forgetting the session deletes exactly
+    /// the directory it writes into.
+    publisher: Option<std::thread::JoinHandle<()>>,
     reads: ReadTracker,
     in_flight: Arc<Semaphore>,
     /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
@@ -242,8 +322,8 @@ impl Bridge {
         // limit here could only stall the loop this exists to unblock or drop
         // events no client could then recover.
         let (publish, mut queue) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
-        let publisher = Arc::clone(&hub);
-        std::thread::Builder::new()
+        let hub_for_publisher = Arc::clone(&hub);
+        let publisher = std::thread::Builder::new()
             .name("oxidezap-publish".to_string())
             .spawn(move || {
                 while let Some(mut event) = queue.blocking_recv() {
@@ -251,7 +331,7 @@ impl Bridge {
                     match serde_json::to_string(&DaemonMessage::Session {
                         event: Box::new(event),
                     }) {
-                        Ok(frame) => publisher.publish_session(frame),
+                        Ok(frame) => hub_for_publisher.publish_session(frame),
                         Err(e) => log::error!("dropping unserializable session event: {e}"),
                     }
                 }
@@ -262,15 +342,35 @@ impl Bridge {
 
         Self {
             hub,
-            publish,
+            publish: Some(publish),
+            publisher: Some(publisher),
             reads: ReadTracker::default(),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             forget: false,
         }
     }
 
-    /// Fold one session event into daemon state.
-    fn observe(&mut self, event: UiEvent) {
+    /// Close the publish queue and hand back the thread to wait on.
+    ///
+    /// Not a tidy-up. The publisher externalizes media — it writes this
+    /// account's photos into the cache directory — and it runs behind an
+    /// unbounded queue, so an event accepted before `ForgetSession` can still
+    /// be in there. Deleting the directory while that thread is working
+    /// through the backlog recreates the very bytes the wipe exists to
+    /// remove, moments after it finishes.
+    fn stop_publishing(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        // The thread ends when its last sender is gone, and this is it.
+        self.publish = None;
+        self.publisher.take()
+    }
+
+    /// Fold one session event into daemon state, and say what the session has
+    /// to be told back.
+    ///
+    /// Folding does not touch the client, so this stays testable without a
+    /// store: what it cannot do itself it returns, and the run loop performs.
+    fn observe(&mut self, event: UiEvent) -> Answer {
+        let mut answer = Answer::Nothing;
         // Before anything is published, so a `MarkRead` that arrives right
         // behind a message already covers it.
         self.reads.observe(&event);
@@ -283,27 +383,67 @@ impl Bridge {
         // same transitions the front end applies, from the same type, so the
         // two cannot drift.
         match &event {
-            UiEvent::IncomingCall(call) => self.hub.calls(|s| s.set_incoming(call.clone())),
+            UiEvent::IncomingCall(call) => {
+                // A second offer during a live call is parked rather than
+                // dropped; the front end draws it as a refusable strip. A
+                // third has nowhere to go, and a caller nothing on this side
+                // holds an id for would ring until they gave up — so it is
+                // refused here, where the session is.
+                let mut admission = oxidezap_core::Admission::Ringing;
+                self.hub.calls(|s| admission = s.set_incoming(call.clone()));
+                if admission == oxidezap_core::Admission::Refused {
+                    answer = Answer::Decline(call.call_id.clone());
+                }
+            }
             UiEvent::OutgoingCallStarted {
                 call_id,
-                recipient_jid,
-            } => self.hub.calls(|s| {
-                s.update_outgoing_call_id(recipient_jid, call_id.clone());
-            }),
+                recipient_jid: _,
+                placeholder_id,
+            } => {
+                // Renamed *and* advanced: the placeholder id was ours, and the
+                // server answering with the real one is also what says the
+                // call has started ringing at the far end. Leaving the state
+                // to say "calling…" for the rest of the call was a difference
+                // between the daemon and a front end that applied both.
+                //
+                // Matched on the placeholder, not the recipient: see
+                // `CallState::update_outgoing_call_id`.
+                let mut adopted = false;
+                self.hub.calls(|s| {
+                    adopted = s.update_outgoing_call_id(placeholder_id, call_id.clone());
+                    if adopted {
+                        s.set_outgoing_ringing(call_id);
+                    }
+                });
+            }
+            // Answered, from either side: the call becomes live rather than
+            // being cleared. A front end attaching now has to find a call in
+            // progress, not an empty state over running audio.
             UiEvent::CallAccepted(id) => self.hub.calls(|s| {
-                s.dismiss_incoming(id);
-                s.set_outgoing_connected(id);
+                s.connect(id);
             }),
             UiEvent::CallEnded(id) => self.hub.calls(|s| {
-                s.dismiss_incoming(id);
-                s.dismiss_outgoing(id);
+                s.end(id);
             }),
+            // The same removal, and one more thing said about it: the front
+            // end writes the conversation's call record off the stage it was
+            // holding, and an incoming stage that simply vanishes reads as
+            // missed.
+            UiEvent::CallEndedElsewhere(id) => self.hub.calls(|s| {
+                s.end_elsewhere(id);
+            }),
+            UiEvent::AccountUpdated { name, jid, lid } => {
+                self.hub.set_account(oxidezap_ipc::AccountIdentity {
+                    name: name.clone(),
+                    jid: jid.clone(),
+                    lid: lid.clone(),
+                });
+            }
+            // The stage empties for good here — nothing is about to replace
+            // a call that never got placed — so a second caller parked behind
+            // it comes forward, the same as when a call ends.
             UiEvent::OutgoingCallFailed { recipient_jid, .. } => self.hub.calls(|s| {
-                if s.outgoing()
-                    .is_some_and(|c| c.recipient_jid == *recipient_jid)
-                {
-                    s.take_outgoing();
-                }
+                s.fail_outgoing_to(recipient_jid);
             }),
             _ => {}
         }
@@ -330,8 +470,12 @@ impl Bridge {
         if let Some(event) = pending {
             // The receiver lives as long as the thread, which lives as long as
             // the daemon.
-            let _ = self.publish.send(event);
+            if let Some(publish) = &self.publish {
+                let _ = publish.send(event);
+            }
         }
+
+        answer
     }
 
     /// Act on one client command, and answer the connection that asked.
@@ -350,6 +494,16 @@ impl Bridge {
         // sees.
         let connection = self.hub.connection();
         if action.needs_network() && !connection.is_connected() {
+            // The same un-drawing the server does one layer up, because this
+            // check exists for the window between the two: a call the asking
+            // window has already drawn must not be left to disappear on the
+            // next snapshot, which is what a front end writes down as an
+            // attempt nobody answered.
+            if let Action::Call(CallAction::Start { placeholder_id, .. }) = &action {
+                self.hub
+                    .calls(|calls| calls.mark_unrecorded(placeholder_id));
+                self.hub.republish_calls();
+            }
             return CommandOutcome::NoSession(format!("not connected: {connection:?}"));
         }
 
@@ -358,6 +512,7 @@ impl Bridge {
                 jid,
                 text,
                 local_id,
+                quoted,
             } => {
                 let Some(permit) = self.permit() else {
                     return too_busy();
@@ -369,7 +524,12 @@ impl Bridge {
                 // wrong send.
                 hold(
                     permit,
-                    [client.send_message(&jid, &text, local_id.unwrap_or_else(next_local_id))],
+                    [client.send_message(
+                        &jid,
+                        &text,
+                        local_id.unwrap_or_else(next_local_id),
+                        quoted,
+                    )],
                 );
                 CommandOutcome::Accepted
             }
@@ -379,6 +539,7 @@ impl Bridge {
                 duration_secs,
                 waveform,
                 local_id,
+                quoted,
             } => {
                 // Through the cache, not the socket: a voice note is the one
                 // thing a client sends that is too big for a frame. Taken
@@ -401,6 +562,7 @@ impl Bridge {
                         duration_secs,
                         waveform,
                         local_id.unwrap_or_else(next_local_id),
+                        quoted,
                     )],
                 );
                 CommandOutcome::Accepted
@@ -431,6 +593,30 @@ impl Bridge {
                         video,
                         placeholder_id,
                     } => {
+                        // Refused here, not merely in the window that asked.
+                        // Two front ends can both pass their own `is_busy`
+                        // check before either has seen the other's state, and
+                        // `set_outgoing` replaces the stage — which left the
+                        // first call running with no UI anywhere and no way to
+                        // hang it up. The daemon owns the session and the
+                        // audio devices, so its state is the one that decides.
+                        if self.hub.call_state().is_busy() {
+                            // Refusing is not enough on its own. The window
+                            // that asked drew its own outgoing call before
+                            // asking — it passed its copy of the state before
+                            // this one moved — and the refusal rides no
+                            // request id, so nothing on that side connects it
+                            // back to the stage it drew. Marking the call
+                            // unrecorded stops it being written into the
+                            // conversation as an attempt that was never made,
+                            // and republishing is what clears it from screen.
+                            self.hub
+                                .calls(|calls| calls.mark_unrecorded(&placeholder_id));
+                            self.hub.republish_calls();
+                            return CommandOutcome::Refused(
+                                "a call is already up; end it before placing another".to_string(),
+                            );
+                        }
                         // The name off the chat list, the same place a front
                         // end would look.
                         let name = self
@@ -447,20 +633,44 @@ impl Bridge {
                         });
                         client.start_call(&jid, video, placeholder_id);
                     }
-                    CallAction::Accept { call_id } => client.accept_call(&call_id),
+                    // Answering brings the media up here, so the call is live
+                    // from this moment: waiting for an event that only fires
+                    // for the *other* direction left the daemon publishing a
+                    // ringing offer over a connected call.
+                    CallAction::Accept { call_id } => {
+                        self.hub.calls(|calls| {
+                            calls.connect(&call_id);
+                        });
+                        client.accept_call(&call_id);
+                    }
+                    // A decline is the one ending only the declining side
+                    // knows about. Every other window watches the same stage
+                    // disappear and, with nothing said, writes it down as
+                    // missed — an unread badge and a "call back" prompt for a
+                    // call its owner had just refused. Said in the state
+                    // frame, so it cannot arrive after the record it prevents.
                     CallAction::Decline { call_id } => {
                         self.hub.calls(|calls| {
-                            calls.dismiss_incoming(&call_id);
+                            calls.end(&call_id);
+                            calls.mark_ended_as(&call_id, CallOutcome::Declined);
                         });
                         client.decline_call(&call_id);
                     }
+                    // `end`, not `dismiss_outgoing`: hanging up is the same
+                    // gesture whatever stage the call is in, and matching only
+                    // the outgoing stage left a *connected* call in the
+                    // daemon's state — which it then published straight back
+                    // to the front end that had just ended it.
                     CallAction::Cancel { call_id } => {
                         self.hub.calls(|calls| {
-                            calls.dismiss_outgoing(&call_id);
+                            calls.end(&call_id);
                         });
                         client.cancel_call(&call_id);
                     }
                     CallAction::SetMuted { call_id, muted } => {
+                        self.hub.calls(|calls| {
+                            calls.set_muted(&call_id, muted);
+                        });
                         client.set_call_muted(&call_id, muted);
                     }
                 }
@@ -580,31 +790,31 @@ impl Bridge {
             return Err(format!("no such chat: {}", observe_str(jid)));
         };
 
-        // What the requester says it is looking at against what a snapshot
-        // would hand it right now. A read is irreversible, so a client that
-        // has fallen behind — because a message arrived, or because another
-        // client is further along — must catch up rather than have the daemon
-        // guess on its behalf. By id, not by time: WhatsApp stamps to the
-        // second, so a second arrival within the same second would compare
-        // equal and slip through.
-        let preview = summary.last_message.as_ref().and_then(|m| m.id.as_deref());
-        if through_message_id != preview {
-            return Err(format!(
-                "{} has moved on since you last saw it; take a snapshot and ask again",
-                observe_str(jid)
-            ));
-        }
-
         match self.reads.boundary(jid) {
             Some((secs, ids)) => {
-                // A read action clears whole seconds, so this covers every
-                // message at `secs` — which is right only if the one the
-                // client is looking at is among them. When it is not, the
-                // daemon holds messages the client has never seen (its
-                // hydrated messages and the store's preview columns can
-                // drift), and marking those read is the thing this guard
-                // exists to prevent.
-                if !preview.is_some_and(|id| ids.iter().any(|(known, ..)| known == id)) {
+                // What the requester says it is looking at, against the second
+                // this read would clear. A read is irreversible and clears
+                // *whole seconds*, so a client that has fallen behind — because
+                // a message arrived, or because another client is further along
+                // — must catch up rather than have the daemon consume arrivals
+                // on its behalf. Naming a message from an older second fails
+                // here, which is the guard.
+                //
+                // Membership, not equality with the daemon's own newest.
+                // WhatsApp stamps to the second, so a burst arrives with
+                // identical timestamps and the two sides order those siblings
+                // by whatever their storage did — the store's row order here,
+                // `(timestamp, id)` in a front end. Demanding the *same* last
+                // message meant a chat that had ever received two messages in
+                // one second could never be marked read again by anyone: every
+                // request was refused, the badge came back on the next
+                // hydration, and the advice in the refusal ("take a snapshot
+                // and ask again") could not be followed, because asking again
+                // produced the same id. Every id at `secs` is one this read
+                // covers, so any of them is an honest claim to have seen it.
+                let seen =
+                    through_message_id.is_some_and(|id| ids.iter().any(|(known, ..)| known == id));
+                if !seen {
                     return Err(format!(
                         "{} holds messages the preview you saw does not cover; \
                          take a snapshot and ask again",
@@ -704,12 +914,26 @@ impl Bridge {
                 if !message.is_from_me && !message.is_read {
                     summary.unread = summary.unread.saturating_add(1);
                 }
-                summary.last_message = Some(MessagePreview {
-                    id: Some(message.id.clone()),
-                    text: message.content.clone(),
-                    from_me: message.is_from_me,
-                    timestamp_ms: message.timestamp.timestamp_millis(),
+                // Only when it really is the newest. Live messages are not
+                // ordered: history decryption and offline catch-up deliver
+                // out of order, and moving the preview *backwards* onto an
+                // older message put the daemon's boundary behind what every
+                // client holds — after which a bounded read named a message
+                // outside it and was refused until a store reload repaired
+                // the summary. Ties by id, so a same-second sibling is
+                // settled the same way on both sides.
+                let arrival = (message.timestamp.timestamp_millis(), message.id.as_str());
+                let newer = summary.last_message.as_ref().is_none_or(|current| {
+                    arrival >= (current.timestamp_ms, current.id.as_deref().unwrap_or(""))
                 });
+                if newer {
+                    summary.last_message = Some(MessagePreview {
+                        id: Some(message.id.clone()),
+                        text: message.content.clone(),
+                        from_me: message.is_from_me,
+                        timestamp_ms: message.timestamp.timestamp_millis(),
+                    });
+                }
                 // Live, not from the store: a chat first seen here has no row
                 // yet, and a complete reload that omits it is not evidence it
                 // was deleted. See `StateHub::store_backed_chat_jids`.
@@ -784,13 +1008,19 @@ fn too_busy() -> CommandOutcome {
 /// the first attach: a message's media is addressed by its message id, and a
 /// message's media does not change.
 fn externalize_media(event: &mut UiEvent) {
+    // Read once for the whole event: this runs on the publish thread behind
+    // an unbounded queue, so a clear can land between being handed the event
+    // and writing its media. See `media::put_since`.
+    let epoch = crate::media::epoch();
     match event {
-        UiEvent::MessageReceived { message, .. } => cache_media(&message.id, &mut message.media),
+        UiEvent::MessageReceived { message, .. } => {
+            cache_media(epoch, &message.id, &mut message.media)
+        }
         UiEvent::HistoryLoaded { chats, .. } => {
             for chat in chats {
                 for message in &mut chat.messages {
                     let id = message.id.clone();
-                    cache_media(&id, &mut message.media);
+                    cache_media(epoch, &id, &mut message.media);
                 }
             }
         }
@@ -798,13 +1028,42 @@ fn externalize_media(event: &mut UiEvent) {
     }
 }
 
-fn cache_media(message_id: &str, media: &mut Option<MediaContent>) {
+fn cache_media(cache_epoch: usize, message_id: &str, media: &mut Option<MediaContent>) {
     let Some(media) = media else { return };
-    if media.data.is_empty() {
+    let key = crate::media::message_key(message_id);
+
+    // Only the real thing is cached. A fallback thumbnail written under the
+    // message's key would take the place of the full image already there —
+    // and a hydrated row carries a thumbnail every time, so the cache would
+    // lose a photo to a blur on the first reload after seeing it.
+    let is_cacheable = !media.data.is_empty() && !media.data_is_preview;
+    if !is_cacheable {
+        // Nothing to write, but the bytes may already be here: the store
+        // never holds media, so this is what makes a photo survive a restart
+        // instead of being downloaded again.
+        if crate::media::has(&key) {
+            media.cache_key = Some(key);
+            return;
+        }
+        // The other key the same bytes can be under. A download is cached by
+        // its content — `d-<hash>` — and only the eager fetch writes the
+        // message's own key, so a photo whose eager fetch failed and was
+        // fetched on demand later is on this disk under a name a hydrated row
+        // never looks for. It was downloaded again on every restart.
+        if let Some(downloadable) = &media.downloadable {
+            let by_content = crate::media::download_key(&downloadable.file_enc_sha256);
+            if crate::media::has(&by_content) {
+                media.cache_key = Some(by_content);
+            }
+        }
         return;
     }
-    let key = crate::media::message_key(message_id);
-    match crate::media::put(&key, &media.data) {
+
+    // Nobody asked for this one: it is the eager cache of media that arrived
+    // with a message, and the front end can fetch it on demand if it is not
+    // here. So a clear that lands while it is queued wins, and the directory
+    // the user just emptied stays empty.
+    match crate::media::put_since(cache_epoch, &key, &media.data) {
         Ok(key) => media.cache_key = Some(key),
         // The front end still gets the message; the media renders as the
         // download it also is. A cache that cannot be written is not a reason
@@ -1192,7 +1451,10 @@ mod tests {
             is_read: read,
             media: None,
             reactions: Default::default(),
-            failed: false,
+            status: Default::default(),
+            quoted: None,
+            revoked: false,
+            system: None,
         }
     }
 
@@ -1486,6 +1748,97 @@ mod tests {
         assert!(bridge.hub.call_state().incoming().is_none());
     }
 
+    /// A call the phone answered is not a call this window missed. The
+    /// removal is identical either way, so the reason has to ride the same
+    /// frame — a front end writes the conversation's record off the stage
+    /// that disappeared.
+    #[test]
+    fn a_call_answered_on_another_device_says_so_in_the_state() {
+        let mut taken = bridge();
+        let call = oxidezap_core::IncomingCall {
+            call_id: "call-1".into(),
+            caller_name: "Alice".into(),
+            caller_jid: "1@s.whatsapp.net".into(),
+            is_video: false,
+            is_offline: false,
+            received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        taken.observe(UiEvent::IncomingCall(call.clone()));
+        taken.observe(UiEvent::CallEndedElsewhere("call-1".into()));
+
+        let state = taken.hub.call_state();
+        assert!(state.incoming().is_none(), "the offer is gone either way");
+        assert!(state.is_unrecorded("call-1"));
+
+        // The ordinary ending says nothing of the sort, and that is what
+        // makes a genuine missed call still count as one.
+        let mut missed = bridge();
+        missed.observe(UiEvent::IncomingCall(call));
+        missed.observe(UiEvent::CallEnded("call-1".into()));
+        assert!(!missed.hub.call_state().is_unrecorded("call-1"));
+    }
+
+    /// Live messages are not ordered: history decryption and offline catch-up
+    /// deliver out of order. Moving the preview backwards onto an older
+    /// message put the daemon's boundary behind what every client held, and
+    /// the bounded read was refused until a store reload repaired it.
+    #[test]
+    fn an_out_of_order_arrival_does_not_move_the_preview_backwards() {
+        let mut bridge = bridge();
+        bridge.observe(received(
+            "1@s.whatsapp.net",
+            message("newest", "1@s.whatsapp.net", 30, false, false),
+            None,
+        ));
+        bridge.observe(received(
+            "1@s.whatsapp.net",
+            message("late", "1@s.whatsapp.net", 10, false, false),
+            None,
+        ));
+
+        let summary = bridge.hub.chat("1@s.whatsapp.net").unwrap();
+        assert_eq!(
+            summary.last_message.and_then(|m| m.id).as_deref(),
+            Some("newest"),
+            "an older arrival is still news, but it is not the preview"
+        );
+        assert_eq!(summary.unread, 2, "both are unread all the same");
+    }
+
+    /// There is one waiting slot. A third offer has nowhere to go, and no
+    /// front end can be asked to refuse a caller it was never told about — so
+    /// the daemon, which owns the session, answers the session itself.
+    #[test]
+    fn a_third_offer_is_declined_by_the_daemon() {
+        let mut bridge = bridge();
+        let offer = |id: &str| {
+            UiEvent::IncomingCall(oxidezap_core::IncomingCall {
+                call_id: id.into(),
+                caller_name: "Someone".into(),
+                caller_jid: format!("{id}@s.whatsapp.net"),
+                is_video: false,
+                is_offline: false,
+                received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            })
+        };
+
+        assert_eq!(bridge.observe(offer("one")), Answer::Nothing);
+        bridge.hub.calls(|s| {
+            s.connect(&"one".to_string());
+        });
+        assert_eq!(bridge.observe(offer("two")), Answer::Nothing, "parked");
+
+        assert_eq!(
+            bridge.observe(offer("three")),
+            Answer::Decline("three".into())
+        );
+        assert_eq!(
+            bridge.hub.call_state().waiting().unwrap().call_id(),
+            "two",
+            "the caller already on screen keeps the slot"
+        );
+    }
+
     /// A call this account placed was never an event: the front end that
     /// dialled built it locally. Nothing replays it, so the daemon has to
     /// hold it for a window that attaches mid-call.
@@ -1506,16 +1859,52 @@ mod tests {
         bridge.observe(UiEvent::OutgoingCallStarted {
             call_id: "call-1".into(),
             recipient_jid: "1@s.whatsapp.net".into(),
+            placeholder_id: "ui-call-1".into(),
         });
         bridge.observe(UiEvent::CallAccepted("call-1".into()));
 
         let calls = bridge.hub.call_state();
-        let outgoing = calls.outgoing().expect("still on the call");
-        assert_eq!(outgoing.call_id, "call-1", "renamed from its placeholder");
-        assert_eq!(outgoing.state, oxidezap_core::OutgoingCallState::Connected);
+        let active = calls.active().expect("still on the call");
+        assert_eq!(active.call_id, "call-1", "renamed from its placeholder");
+        assert_eq!(active.peer_jid, "1@s.whatsapp.net");
 
         bridge.observe(UiEvent::CallEnded("call-1".into()));
-        assert!(bridge.hub.call_state().outgoing().is_none());
+        assert!(!bridge.hub.call_state().is_busy());
+    }
+
+    /// Give up on a call before the server has named it, dial the same person
+    /// again, and the first attempt's answer arrives while the second is on
+    /// the stage. Matched by recipient it renamed the redial, so the daemon
+    /// published an id nobody was ringing under — and the window, seeing the
+    /// state hold it, skipped cancelling the call that really was ringing.
+    #[test]
+    fn a_late_answer_does_not_rename_the_redial_that_replaced_it() {
+        let mut bridge = bridge();
+        bridge.hub.calls(|s| {
+            s.set_outgoing(oxidezap_core::OutgoingCall::new(
+                "ui-call-2",
+                "1@s.whatsapp.net".into(),
+                "Alice".into(),
+                false,
+            ));
+        });
+
+        bridge.observe(UiEvent::OutgoingCallStarted {
+            call_id: "call-1".into(),
+            recipient_jid: "1@s.whatsapp.net".into(),
+            placeholder_id: "ui-call-1".into(),
+        });
+
+        let calls = bridge.hub.call_state();
+        assert_eq!(
+            calls.outgoing().map(|c| c.call_id.as_str()),
+            Some("ui-call-2"),
+            "the redial keeps its own placeholder"
+        );
+        assert!(
+            !calls.holds("call-1"),
+            "so the abandoned call is an orphan the window will cancel"
+        );
     }
 
     /// A failed send changes no state, so no snapshot can carry it: without
@@ -1615,40 +2004,53 @@ mod tests {
         let refusal = bridge
             .read_plan("1@s.whatsapp.net", Some("seen"))
             .expect_err("must not mark read what nobody has seen");
-        assert!(refusal.contains("moved on"), "{refusal}");
+        assert!(refusal.contains("does not cover"), "{refusal}");
 
         // Caught up, and it goes through.
         assert!(bridge.read_plan("1@s.whatsapp.net", Some("unseen")).is_ok());
     }
 
-    /// The reason the request names a message rather than a time: WhatsApp
-    /// stamps to the second, so a burst of two arrivals is a single timestamp
-    /// and a client that saw only the first would compare equal.
+    /// The two sides of a burst do not agree on which of it came last, and
+    /// they are both right.
+    ///
+    /// WhatsApp stamps to the second, so a ping and its pong are one
+    /// timestamp. The store returns them in arrival order and a front end
+    /// sorts them by `(timestamp, id)`, so `messages.last()` names a different
+    /// message on each side whenever id order and arrival order disagree.
+    /// Requiring the request to echo *the daemon's* last message therefore
+    /// refused every read of such a chat, for good: the receipt never went
+    /// out, the read was never persisted, and the badge came back on the next
+    /// hydration. The advice in the refusal could not even be followed —
+    /// asking again produced the same id.
+    ///
+    /// A read clears whole seconds, so naming either sibling has exactly the
+    /// same effect. Both are honest claims to have seen the burst.
     #[test]
-    fn a_same_second_arrival_is_not_mistaken_for_what_the_client_saw() {
+    fn either_half_of_a_one_second_burst_is_a_read_of_the_burst() {
         let mut bridge = bridge();
-        bridge.observe(received(
-            "1@s.whatsapp.net",
-            message("first", "1@s.whatsapp.net", 20, false, false),
-            None,
-        ));
-        let seen = bridge.hub.chat("1@s.whatsapp.net").unwrap().last_message;
-        bridge.observe(received(
-            "1@s.whatsapp.net",
-            message("second", "1@s.whatsapp.net", 20, false, false),
-            None,
-        ));
-        let now = bridge.hub.chat("1@s.whatsapp.net").unwrap().last_message;
-        assert_eq!(
-            seen.as_ref().unwrap().timestamp_ms,
-            now.as_ref().unwrap().timestamp_ms,
-            "the timestamps are identical, which is the whole problem"
-        );
+        for id in ["pong", "ping"] {
+            bridge.observe(received(
+                "1@s.whatsapp.net",
+                message(id, "1@s.whatsapp.net", 20, false, false),
+                None,
+            ));
+        }
+        // Both are at the same second, so the preview keeps whichever the
+        // tie-break puts last — and a front end sorting its own messages can
+        // land on either. Neither side is behind the other.
+        let daemon_newest = bridge
+            .hub
+            .chat("1@s.whatsapp.net")
+            .unwrap()
+            .last_message
+            .and_then(|m| m.id);
+        assert_eq!(daemon_newest.as_deref(), Some("pong"));
 
-        let refusal = bridge
-            .read_plan("1@s.whatsapp.net", Some("first"))
-            .expect_err("the client never saw `second`");
-        assert!(refusal.contains("moved on"), "{refusal}");
+        assert!(
+            bridge.read_plan("1@s.whatsapp.net", Some("pong")).is_ok(),
+            "the id a front end would echo has to be accepted"
+        );
+        assert!(bridge.read_plan("1@s.whatsapp.net", Some("ping")).is_ok());
     }
 
     /// The daemon's hydrated messages and the store's preview columns are

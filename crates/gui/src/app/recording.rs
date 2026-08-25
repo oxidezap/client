@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// How often the recording panel is repainted while capture runs.
+///
+/// Ten a second: fast enough that the meter follows a voice, slow enough that
+/// it is nothing next to the audio callback already running.
+const RECORDING_TICK_MS: u64 = 100;
+
 impl WhatsAppApp {
     /// Update the recording state in the input area (call only when recording state changes)
     fn update_input_recording(&self, cx: &mut Context<Self>) {
@@ -11,6 +17,42 @@ impl WhatsAppApp {
                 view.set_recording(is_recording, cx);
             });
         }
+    }
+
+    /// Repaint the recording panel while capture is running.
+    ///
+    /// Without it the panel drew once and then sat there: the timer is derived
+    /// from an `Instant`, which is only as current as the last repaint, and
+    /// the meter had no source at all. This is that source — the recorder's
+    /// own buffer, read at a rate a person can follow, and stopped the moment
+    /// recording does so an idle window wakes for nothing.
+    fn ensure_recording_tick(&mut self, cx: &mut Context<Self>) {
+        if self.recording_tick.is_some() || !self.is_recording() {
+            return;
+        }
+        self.recording_tick = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            loop {
+                smol::Timer::after(std::time::Duration::from_millis(RECORDING_TICK_MS)).await;
+                let keep_going = entity.update(cx, |app, cx| {
+                    if !app.is_recording() {
+                        return false;
+                    }
+                    let level = app.audio_recorder.level();
+                    if let Some(ref input_area) = app.input_area {
+                        input_area.update(cx, |view, cx| view.set_level(level, cx));
+                    }
+                    // The clock lives in the view and is read from an
+                    // `Instant`, so the repaint above is what advances it.
+                    cx.notify();
+                    true
+                });
+                match keep_going {
+                    Ok(true) => continue,
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            let _ = entity.update(cx, |app, _| app.recording_tick = None);
+        }));
     }
     /// Check if currently recording
     pub fn is_recording(&self) -> bool {
@@ -40,10 +82,16 @@ impl WhatsAppApp {
         }
 
         self.recording_state = RecordingState::Recording;
-        // Bind the note to the chat it started in: resolving the destination
-        // at stop time would misdeliver if the user switches chats meanwhile.
-        self.recording_chat = self.selected_chat.clone();
+        // Bind the note to the chat it started in *and* to the reply it is
+        // answering: resolving either at stop time would misdeliver if the
+        // user switches chats meanwhile — which also cancels the draft, so
+        // the note arrived in the right conversation with its quote gone.
+        self.recording_target = self.selected_chat.clone().map(|jid| RecordingTarget {
+            jid,
+            reply: self.reply_to.clone(),
+        });
         self.update_input_recording(cx);
+        self.ensure_recording_tick(cx);
         info!("PTT recording started");
         cx.notify();
     }
@@ -61,13 +109,10 @@ impl WhatsAppApp {
             return;
         }
 
-        let jid = match self.recording_chat.take() {
-            Some(jid) => jid,
-            None => {
-                warn!("No recording chat, cancelling recording");
-                self.cancel_recording(cx);
-                return;
-            }
+        let Some(RecordingTarget { jid, reply }) = self.recording_target.take() else {
+            warn!("No recording chat, cancelling recording");
+            self.cancel_recording(cx);
+            return;
         };
 
         self.recording_state = RecordingState::Processing;
@@ -110,6 +155,11 @@ impl WhatsAppApp {
             cx.notify();
             return;
         }
+        // Which recording this encode belongs to. The task below is detached
+        // and cannot be stopped from outside, so the only way a teardown can
+        // disown it is for it to ask on the way back whether the recording it
+        // was started for is still the current one.
+        let epoch = self.recording_epoch;
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             // GPUI's own background pool. This used to borrow the session's
             // tokio runtime, which was only ever within reach because the
@@ -123,7 +173,16 @@ impl WhatsAppApp {
                 })
                 .await;
             let _ = entity.update(cx, |app, cx| {
-                app.finish_recording_send(jid, encoded, cx);
+                // A disconnect, a logout or a plain cancel while the encoder
+                // ran makes this note something nobody is waiting for. Sending
+                // it anyway delivers a cancelled recording; and setting `Idle`
+                // over a recording that has since started hides its controls
+                // with the microphone still open.
+                if app.recording_epoch != epoch {
+                    info!("Discarding an encode from a recording that was cancelled");
+                    return;
+                }
+                app.finish_recording_send(jid, reply, encoded, cx);
             });
         })
         .detach();
@@ -131,6 +190,7 @@ impl WhatsAppApp {
     fn finish_recording_send(
         &mut self,
         jid: String,
+        reply: Option<ReplyDraft>,
         encoded: Result<(Vec<u8>, Vec<u8>, u32), String>,
         cx: &mut Context<Self>,
     ) {
@@ -152,16 +212,64 @@ impl WhatsAppApp {
             cx.notify();
             return;
         };
+        let _ = client;
+        // Recording is a way of answering, so the draft the note was bound to
+        // belongs to *this* send — and leaving it armed made it attach itself
+        // to whatever was typed next, which is the half of the bug nobody
+        // would connect to having pressed the microphone. Cleared only if it
+        // is still that draft: one picked while the note was being recorded
+        // or encoded is answering something else.
+        let quoted = reply.map(|draft| {
+            if self
+                .reply_to
+                .as_ref()
+                .is_some_and(|current| current.message_id == draft.message_id)
+            {
+                self.reply_to = None;
+                if let Some(input) = &self.input_area {
+                    input.update(cx, |view, cx| view.set_reply(None, cx));
+                }
+            }
+            QuotedMessage::from(draft)
+        });
+        self.send_voice_note(&jid, ogg_data, waveform, duration_secs, quoted);
+        self.recording_state = RecordingState::Idle;
+        self.update_input_recording(cx);
+        info!("PTT audio sent successfully");
+        cx.notify();
+    }
+
+    /// Send encoded opus into a chat and draw the bubble for it.
+    ///
+    /// Shared with the retry path, because a voice note that failed still
+    /// holds everything it needs to go again — the encoded bytes, its length
+    /// and its waveform — and re-encoding is not something a retry can do.
+    pub(super) fn send_voice_note(
+        &mut self,
+        jid: &str,
+        ogg_data: Vec<u8>,
+        waveform: Vec<u8>,
+        duration_secs: u32,
+        quoted: Option<QuotedMessage>,
+    ) {
+        let Some(client) = &self.client else {
+            warn!("Cannot send audio: client is unavailable");
+            return;
+        };
         let local_id = Self::next_local_id("local_audio");
+        // Shared with the bubble below rather than moved: our own voice note
+        // should draw the same shape the recipient sees, not a flat bar.
+        let envelope = Arc::new(waveform.clone());
         client.send_audio_message(
-            &jid,
+            jid,
             ogg_data.clone(),
             duration_secs,
             waveform,
             local_id.clone(),
+            quoted.clone(),
         );
 
-        let msg = ChatMessage::new_outgoing_with_media(
+        let mut msg = ChatMessage::new_outgoing_with_media(
             local_id,
             String::new(),
             MediaContent {
@@ -177,22 +285,35 @@ impl WhatsAppApp {
                 is_animated: false,
                 duration_secs: Some(duration_secs),
                 data_is_preview: false,
+                waveform: Some(envelope),
             },
         );
 
-        if self.add_message_to_chat(&jid, msg) {
+        // The bubble shows the quote too, or the sender sees a bare note
+        // where the recipient sees a reply.
+        msg.quoted = quoted;
+
+        // Following the note down is only what the sender expects if they are
+        // looking at where it landed. There is one timeline, so a note that
+        // finished encoding after the user moved on would otherwise yank
+        // whatever is on screen to its newest message — out from under someone
+        // reading its history. Against `visible_chat` and not the selection,
+        // because the selection is deliberately *kept* while the reader is in
+        // Status or, on a phone, walking the chat list: coming back to a
+        // conversation should land where they left it.
+        if self.add_message_to_chat(jid, msg) && self.visible_chat.as_deref() == Some(jid) {
             self.scroll_to_last_message();
         }
-        self.recording_state = RecordingState::Idle;
-        self.update_input_recording(cx);
-        info!("PTT audio sent successfully");
-        cx.notify();
     }
     /// Cancel recording without sending
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
         self.audio_recorder.cancel();
         self.recording_state = RecordingState::Idle;
-        self.recording_chat = None;
+        self.recording_target = None;
+        // Disown an encode that is still running. Cancelling is the only way
+        // out of `Processing` other than the completion itself, which is why
+        // this is the one place that has to say so.
+        self.recording_epoch = self.recording_epoch.wrapping_add(1);
         self.update_input_recording(cx);
         info!("PTT recording cancelled");
         cx.notify();

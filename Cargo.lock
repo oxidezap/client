@@ -5717,6 +5717,7 @@ dependencies = [
  "chrono",
  "log",
  "serde",
+ "serde_json",
  "wacore",
  "wacore-binary",
 ]
@@ -5765,6 +5766,7 @@ dependencies = [
  "portable-atomic",
  "qrcode",
  "rust-embed",
+ "serde",
  "serde_json",
  "smallvec",
  "smol",

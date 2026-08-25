@@ -5,6 +5,41 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 12: the call state's note about a departing call names the outcome to
+/// write, not just that there is none. A decline is a refusal only the
+/// declining window knows about; every other one watched the same stage
+/// disappear and wrote it down as missed.
+///
+/// 11: `DaemonEvent::AccountChanged`. The linked identity was daemon state
+/// with no event, so it travelled only in the hello snapshot — and a window
+/// attached before pairing finished never learned whose account it was.
+///
+/// 10: the call state remembers the last call another of this account's
+/// devices handled. A front end writes a conversation's call record off the
+/// stage that disappeared, and "answered on the phone" and "nobody picked
+/// up" are the same disappearance without it.
+///
+/// 9: `SendAudio` carries what it quotes, the same way `SendText` does.
+/// Recording is a way of answering, and a reply draft open when the
+/// microphone was pressed had nowhere to go.
+///
+/// 8: the account identity carries its LID as well as its phone number. A
+/// chat with your own number can be keyed by either alias, and a client
+/// holding only one of them cannot recognise the other.
+///
+/// 7: `StorageUsage` and `ClearMediaCache`, answered by
+/// `DaemonMessage::Storage`. The daemon is the only process that opens the
+/// store or writes the media cache, so it is the only one that can measure
+/// either.
+///
+/// 6: `DaemonEvent::CallsChanged` publishes the call state to every front
+/// end. The daemon makes some call transitions itself — accepting one brings
+/// the media up in the process that owns the microphone — and a second window
+/// had no way to hear about them.
+///
+/// 5: `SendText` carries what it quotes, so a reply is sent as one rather
+/// than as a fresh message, and the snapshot names the linked account.
+///
 /// 4: every request may carry an id, and every answer echoes it. Before that
 /// a refused send could only be reported by inventing a failure against the
 /// message the client had drawn, and a refused download by nothing at all.
@@ -26,7 +61,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

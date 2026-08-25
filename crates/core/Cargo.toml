@@ -23,3 +23,7 @@ wacore-binary = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The call snapshot crosses the daemon socket; the round trip is a test.
+serde_json = { workspace = true, features = ["std"] }

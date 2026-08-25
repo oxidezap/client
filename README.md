@@ -78,10 +78,8 @@ local history, which is exactly what the in-app "pair again" action does.
 
 ## Known limitations
 
-* Voice calls only. The library's call facade is 1:1 audio, so the video call
-  button places a voice call.
-* Media bubbles re-download on demand after a restart.
-* Reactions persist but are not hydrated into the UI at startup.
+* Voice calls only. The library's call facade is 1:1 audio, so video calls,
+  group calls and output-device selection are drawn but disabled.
 * Spacing does not yet follow the rem scale, so the UI ignores base-font zoom.
 
 ## License

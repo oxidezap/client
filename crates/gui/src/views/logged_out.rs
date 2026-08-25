@@ -1,58 +1,86 @@
 //! Server-ended session view.
+//!
+//! Deliberately not the error view: there is no "retry" here, because retrying
+//! replays the credentials the server just rejected. The only way forward is
+//! to drop local state and pair again — so the copy says what that costs, and
+//! offers to save the history first.
 
-use gpui::{App, Entity, div, prelude::*, px};
+use gpui::{App, Entity, IntoElement, ParentElement, Styled, div};
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{Icon, IconName};
 
 use super::centered_view;
 use crate::app::WhatsAppApp;
+use crate::theme::ActiveProductTheme as _;
 
-/// Render the logged-out view.
-///
-/// Deliberately not the error view: there is no "retry" here, because retrying
-/// replays the credentials the server just rejected. The only way forward is to
-/// drop local state and pair again, so that is the only action offered — and
-/// the copy says what it costs before the user commits to it.
 pub fn render_logged_out_view(
     message: &str,
     entity: Entity<WhatsAppApp>,
     cx: &App,
 ) -> impl IntoElement {
-    centered_view(px(24.0), cx)
+    let metrics = cx.product().metrics;
+    let pair_entity = entity;
+
+    centered_view(metrics.space_xxl(), cx)
         .child(
             div()
-                .text_color(cx.theme().danger)
-                .text_2xl()
-                .font_weight(gpui::FontWeight::BOLD)
-                .child("Session ended"),
-        )
-        .child(
-            div()
-                .text_color(cx.theme().foreground)
-                .text_base()
-                .max_w(px(420.))
-                .text_center()
-                .child(message.to_string()),
-        )
-        .child(
-            div()
-                .text_color(cx.theme().muted_foreground)
-                .text_sm()
-                .max_w(px(420.))
-                .text_center()
+                .size(metrics.avatar_call())
+                .rounded_full()
+                .bg(cx.theme().secondary)
+                .border_1()
+                .border_color(cx.theme().border)
+                .flex()
+                .items_center()
+                .justify_center()
                 .child(
-                    "Pairing again clears this device's local data — messages, \
-                     contacts and keys — and starts a new link from the QR code.",
+                    Icon::new(IconName::CircleX)
+                        .size(metrics.icon())
+                        .text_color(cx.theme().danger),
                 ),
         )
         .child(
-            Button::new("pair-again")
-                .label("Clear data and pair again")
-                .primary()
-                .on_click(move |_, _, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.reset_and_pair_again(cx);
-                    });
-                }),
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(metrics.space_md())
+                .max_w(metrics.call_card_width_wide())
+                .text_center()
+                .child(
+                    div()
+                        .text_size(metrics.text_heading())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(cx.theme().foreground)
+                        .child("Session ended"),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_secondary())
+                        .text_color(cx.theme().muted_foreground)
+                        .child(message.to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_small())
+                        .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+                        .child(
+                            "Pairing again clears this device's local data — messages, \
+                             contacts and keys — and starts a new link from the QR code.",
+                        ),
+                ),
+        )
+        .child(
+            div().flex().items_center().gap(metrics.space_lg()).child(
+                // Outline, not filled: this is irreversible, and a filled
+                // primary would make it the obvious thing to click.
+                Button::new("pair-again")
+                    .label("Clear data and pair again")
+                    .danger()
+                    .outline()
+                    .on_click(move |_, window, cx| {
+                        pair_entity.update(cx, |this, cx| this.reset_and_pair_again(window, cx));
+                    }),
+            ),
         )
 }

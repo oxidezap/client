@@ -1,6 +1,38 @@
 //! Media attachments inside a message bubble: images, video, documents.
 
-use super::*;
+use std::sync::Arc;
+
+use gpui::StyledImage as _;
+use gpui::{
+    App, Entity, Image, ImageSource, InteractiveElement, IntoElement, ObjectFit, ParentElement,
+    RenderImage, SharedString, StatefulInteractiveElement, Styled, div, img,
+    prelude::FluentBuilder as _, px,
+};
+use gpui_component::ActiveTheme as _;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Disableable as _, Icon, IconName};
+
+use crate::app::WhatsAppApp;
+use crate::components::ProductIcon;
+use crate::theme::ActiveProductTheme as _;
+use crate::utils::{mime_to_image_format, scale_media_dimensions};
+use crate::video::VideoPlayerState;
+use oxidezap_core::{DownloadableMedia, MediaType};
+
+/// What a media bubble needs from the app, read out before the row is built.
+///
+/// The virtual list has already leased the app to build this row, so reading
+/// that entity again inside it panics; everything the app knows arrives here
+/// instead.
+pub(super) struct MediaProps {
+    pub video_player_state: Option<VideoPlayerState>,
+    pub video_frame: Option<Arc<RenderImage>>,
+    pub sticker_image: Option<Arc<Image>>,
+    pub audio: Option<super::AudioProgress>,
+    pub playback_speed: f32,
+    pub is_downloading: bool,
+    pub max_media_size: f32,
+}
 
 pub(super) fn render_media_content(
     el: gpui::Div,
@@ -8,12 +40,18 @@ pub(super) fn render_media_content(
     message_id: String,
     is_playing: bool,
     entity: Entity<WhatsAppApp>,
-    video_player_state: Option<VideoPlayerState>,
-    video_frame: Option<Arc<RenderImage>>,
-    sticker_image: Option<Arc<Image>>,
-    max_media_size: f32,
+    props: MediaProps,
     cx: &App,
 ) -> gpui::Div {
+    let MediaProps {
+        video_player_state,
+        video_frame,
+        sticker_image,
+        audio,
+        playback_speed,
+        is_downloading,
+        max_media_size,
+    } = props;
     match media_content.media_type {
         MediaType::Image => {
             let (display_w, display_h) = scale_media_dimensions(
@@ -30,12 +68,13 @@ pub(super) fn render_media_content(
                         .w(px(display_w))
                         .h(px(display_h))
                         .object_fit(gpui::ObjectFit::Contain)
-                        .rounded(px(layout::RADIUS_SMALL)),
+                        .rounded(cx.product().metrics.radius_sm()),
                     None => render_image_from_bytes(
                         media_content.data,
                         &media_content.mime_type,
                         display_w,
                         display_h,
+                        cx.product().metrics.radius_lg(),
                         true,
                     ),
                 };
@@ -59,7 +98,21 @@ pub(super) fn render_media_content(
                             .child(image),
                     )
                 } else {
-                    el.child(image)
+                    // The bytes are real, so the picture can be looked at.
+                    // A bubble is a thumbnail of a photo; this is the photo.
+                    let open_id: SharedString = format!("img-open-{message_id}").into();
+                    el.child(
+                        div()
+                            .id(open_id)
+                            .cursor_pointer()
+                            .on_click(move |_, window, cx| {
+                                let msg_id = message_id.clone();
+                                entity.update(cx, |app, cx| {
+                                    app.open_media_viewer(&msg_id, window, cx)
+                                });
+                            })
+                            .child(image),
+                    )
                 }
             } else if let Some(dl) = media_content.downloadable.clone() {
                 // Eager download failed but the metadata survived: keep the
@@ -70,6 +123,7 @@ pub(super) fn render_media_content(
                     message_id,
                     dl,
                     entity,
+                    is_downloading,
                     display_w,
                     display_h,
                     cx,
@@ -98,6 +152,7 @@ pub(super) fn render_media_content(
                     &media_content.mime_type,
                     display_w,
                     display_h,
+                    cx.product().metrics.radius_lg(),
                     false,
                 );
                 let preview_id: SharedString = format!("sticker-preview-{}", message_id).into();
@@ -129,6 +184,7 @@ pub(super) fn render_media_content(
                     &media_content.mime_type,
                     display_w,
                     display_h,
+                    cx.product().metrics.radius_lg(),
                     false,
                 ))
             } else if let Some(dl) = media_content.downloadable.clone() {
@@ -140,6 +196,7 @@ pub(super) fn render_media_content(
                     message_id,
                     dl,
                     entity,
+                    is_downloading,
                     display_w,
                     display_h,
                     cx,
@@ -162,10 +219,12 @@ pub(super) fn render_media_content(
             max_media_size,
             cx,
         )),
-        MediaType::Audio => el.child(render_audio_player(
+        MediaType::Audio => el.child(super::audio::render_audio_player(
             media_content,
             message_id,
             is_playing,
+            audio,
+            playback_speed,
             entity,
             cx,
         )),
@@ -173,34 +232,97 @@ pub(super) fn render_media_content(
             media_content,
             message_id,
             entity,
+            is_downloading,
             cx,
         )),
     }
 }
-/// Tap-to-download placeholder for media whose bytes aren't local yet, sized
-/// like the real media so virtual-list row heights don't jump on arrival.
+/// Media whose bytes are not local yet.
+///
+/// Sized like the real thing so the virtual list's row height does not jump
+/// when it arrives, and labelled with what it will cost to fetch — "Tap to
+/// download" tells you nothing about whether to do it on a phone tether.
+#[allow(clippy::too_many_arguments)]
 fn render_download_placeholder(
     id_prefix: &str,
     label: &'static str,
     message_id: String,
     dl: DownloadableMedia,
     entity: Entity<WhatsAppApp>,
+    is_downloading: bool,
     width: f32,
     height: f32,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    let metrics = cx.product().metrics;
     let placeholder_id: SharedString = format!("{id_prefix}-{message_id}").into();
+    let size = dl.file_length;
+
     div()
         .id(placeholder_id)
         .w(px(width))
         .h(px(height))
-        .bg(cx.theme().list_active)
-        .rounded(px(layout::RADIUS_SMALL))
-        .cursor_pointer()
+        // The box is the size the media will be, and its label has to live
+        // inside it: an unclipped row ran the download prompt out past both
+        // edges of the bubble and over the message beside it.
+        .overflow_hidden()
+        .px(metrics.space_md())
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(metrics.radius_lg())
         .flex()
+        .flex_col()
         .justify_center()
         .items_center()
-        .child(div().text_color(cx.theme().muted_foreground).child(label))
+        .gap(metrics.space_md())
+        .when(!is_downloading, |el| el.cursor_pointer())
+        .map(|el| {
+            if is_downloading {
+                // Indeterminate on purpose: the transport hands back a
+                // completed buffer, not a byte count, and a fake percentage
+                // that jumps to 100 is worse than an honest spinner.
+                el.child(
+                    Icon::new(IconName::LoaderCircle)
+                        .size(metrics.icon())
+                        .text_color(cx.theme().primary),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_small())
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Downloading…"),
+                )
+            } else {
+                el.child(
+                    Icon::new(IconName::ArrowDown)
+                        .size(metrics.icon())
+                        .text_color(cx.theme().muted_foreground),
+                )
+                .child(
+                    div()
+                        .max_w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(metrics.space_sm())
+                        .text_size(metrics.text_small())
+                        .text_color(cx.theme().muted_foreground)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(label)
+                        .children(format_bytes(size).map(|size| {
+                            div()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(metrics.text_micro())
+                                .text_color(
+                                    cx.product().hsla(cx.product().palette.subtle_foreground),
+                                )
+                                .child(size)
+                        })),
+                )
+            }
+        })
         .on_click(move |_, _window, cx| {
             let msg_id = message_id.clone();
             let dl = dl.clone();
@@ -209,6 +331,7 @@ fn render_download_placeholder(
             });
         })
 }
+
 fn render_media_placeholder(
     text: &'static str,
     width: f32,
@@ -218,18 +341,27 @@ fn render_media_placeholder(
     div()
         .w(px(width))
         .h(px(height))
-        .bg(cx.theme().list_active)
-        .rounded(px(layout::RADIUS_SMALL))
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.product().metrics.radius_lg())
         .flex()
         .justify_center()
         .items_center()
-        .child(div().text_color(cx.theme().muted_foreground).child(text))
+        .child(
+            div()
+                .text_size(cx.product().metrics.text_small())
+                .text_color(cx.theme().muted_foreground)
+                .child(text),
+        )
 }
+
 fn render_image_from_bytes(
     data: Arc<Vec<u8>>,
     mime_type: &str,
     width: f32,
     height: f32,
+    radius: gpui::Pixels,
     rounded: bool,
 ) -> gpui::Img {
     let format = mime_to_image_format(mime_type);
@@ -242,64 +374,165 @@ fn render_image_from_bytes(
         .object_fit(gpui::ObjectFit::Contain);
 
     if rounded {
-        img_el.rounded(px(layout::RADIUS_SMALL))
+        img_el.rounded(radius)
     } else {
         img_el
     }
 }
+/// A document: what it is, what it weighs, and how to keep it.
+///
+/// The old row was a 200x50 grey box carrying a file name. A document is
+/// chosen from a list by its extension and its size as much as its name, so
+/// all three are on the card.
 fn render_document_placeholder(
     media_content: oxidezap_core::MediaContent,
     message_id: String,
     entity: Entity<WhatsAppApp>,
+    is_downloading: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let label: SharedString = media_content
+    let metrics = cx.product().metrics;
+    let name = media_content
         .file_name
         .clone()
-        .unwrap_or_else(|| "Document".to_string())
-        .into();
+        .unwrap_or_else(|| "Document".to_string());
+    let extension = extension_of(&name);
+    let size = media_content
+        .downloadable
+        .as_ref()
+        .and_then(|dl| format_bytes(dl.file_length));
+    let detail = match (&extension, &size) {
+        (Some(ext), Some(size)) => format!("{ext} · {size}"),
+        (Some(ext), None) => ext.clone(),
+        (None, Some(size)) => size.clone(),
+        (None, None) => "Document".to_string(),
+    };
+
     let row = div()
-        .w(px(200.))
-        .h(px(50.))
-        .bg(cx.theme().list_active)
-        .rounded(px(layout::RADIUS_MEDIUM))
         .flex()
         .items_center()
-        .px_3()
-        .gap_2()
+        .gap(metrics.space_lg())
+        .p(metrics.space_md())
+        .rounded(metrics.radius_md())
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().border)
+        .child(
+            // The extension in the tile, because that is what identifies a
+            // document at a glance in any file manager.
+            div()
+                .flex_shrink_0()
+                .size(metrics.avatar_header())
+                .rounded(metrics.radius_sm())
+                .bg(cx.theme().background)
+                .flex()
+                .items_center()
+                .justify_center()
+                .map(|el| match &extension {
+                    Some(ext) if ext.len() <= 4 => el
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_size(metrics.text_micro())
+                        .text_color(cx.theme().muted_foreground)
+                        .child(ext.clone()),
+                    _ => el.child(
+                        Icon::new(ProductIcon::FileText)
+                            .size(metrics.icon_small())
+                            .text_color(cx.theme().muted_foreground),
+                    ),
+                }),
+        )
         .child(
             div()
-                .min_w_0()
                 .flex_1()
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
-                .text_color(cx.theme().muted_foreground)
-                .child(label),
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(metrics.text_secondary())
+                        .text_color(cx.theme().foreground)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(name.clone()),
+                )
+                .child(
+                    div()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_size(metrics.text_micro())
+                        .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+                        .child(if is_downloading {
+                            "Saving…".to_string()
+                        } else {
+                            detail
+                        }),
+                ),
         );
 
     // Doc bytes are never cached for rendering; with download metadata the
-    // row saves the file to the Downloads dir on tap.
-    if let Some(dl) = media_content.downloadable {
-        let file_name = media_content
-            .file_name
-            .unwrap_or_else(|| "document".to_string());
-        let doc_id: SharedString = format!("doc-{}", message_id).into();
-        row.id(doc_id)
-            .cursor_pointer()
-            .on_click(move |_, _window, cx| {
-                let msg_id = message_id.clone();
-                let name = file_name.clone();
-                let dl = dl.clone();
-                entity.update(cx, |app, cx| {
-                    app.download_document(msg_id, name, dl, cx);
-                });
-            })
+    // card saves the file to the Downloads dir.
+    match media_content.downloadable {
+        Some(dl) => {
+            let file_name = media_content
+                .file_name
+                .unwrap_or_else(|| "document".to_string());
+            row.child(
+                Button::new(SharedString::from(format!("save-{message_id}")))
+                    .icon(Icon::new(IconName::ArrowDown).size(metrics.icon_small()))
+                    .ghost()
+                    .tooltip("Save to Downloads")
+                    .disabled(is_downloading)
+                    .w(metrics.icon_button())
+                    .h(metrics.icon_button())
+                    .on_click(move |_, _window, cx| {
+                        let msg_id = message_id.clone();
+                        let name = file_name.clone();
+                        let dl = dl.clone();
+                        entity.update(cx, |app, cx| {
+                            app.download_document(msg_id, name, dl, cx);
+                        });
+                    }),
+            )
             .into_any_element()
-    } else {
-        row.into_any_element()
+        }
+        None => row.into_any_element(),
     }
 }
+
+/// The uppercase extension, when the name has a short, plausible one.
+///
+/// Guards against a name whose "extension" is really part of the title
+/// (`Report v1.2 final`), which would otherwise fill the tile with noise.
+fn extension_of(name: &str) -> Option<String> {
+    let ext = name.rsplit_once('.')?.1;
+    let plausible =
+        !ext.is_empty() && ext.len() <= 4 && ext.chars().all(|c| c.is_ascii_alphanumeric());
+    plausible.then(|| ext.to_ascii_uppercase())
+}
+
+/// A file size a person can act on.
+///
+/// `None` when the sender did not say, which is different from zero: a
+/// document of unknown size still downloads, it just cannot promise a cost.
+fn format_bytes(bytes: u64) -> Option<String> {
+    if bytes == 0 {
+        return None;
+    }
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    Some(if unit == 0 || value >= 100.0 {
+        format!("{:.0} {}", value, UNITS[unit])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    })
+}
+
 fn render_video_player(
     media_content: oxidezap_core::MediaContent,
     message_id: String,
@@ -323,12 +556,14 @@ fn render_video_player(
     let is_paused = state.is_paused();
     let is_loading = state.is_loading();
     let is_error = state.is_error();
+    let scrim = cx.product().hsla(cx.product().palette.scrim);
+    let on_scrim = cx.product().hsla(cx.product().palette.on_scrim);
 
     div()
         .relative()
         .w(px(display_w))
         .h(px(display_h))
-        .rounded(px(layout::RADIUS_SMALL))
+        .rounded(cx.product().metrics.radius_sm())
         .overflow_hidden()
         .child(
             if let Some(frame) = video_frame.filter(|_| is_playing || is_paused) {
@@ -354,6 +589,7 @@ fn render_video_player(
                         &media_content.mime_type,
                         display_w,
                         display_h,
+                        cx.product().metrics.radius_lg(),
                         false,
                     ))
                     .into_any_element()
@@ -380,18 +616,24 @@ fn render_video_player(
                 .flex()
                 .justify_center()
                 .items_center()
-                .bg(gpui::rgba(0x00000066))
-                .when(is_playing, |el| el.bg(gpui::rgba(0x00000000)))
+                // The viewer's pair of tokens, not the theme's inks: this is
+                // a dark wash over a picture, so what goes on it is the ink
+                // for a scrim in *either* preset. Drawn with `foreground` it
+                // was near-black on near-black the moment the light preset
+                // existed — and the wash itself was a literal colour, which
+                // is the same mistake one layer down.
+                .bg(scrim.opacity(0.4))
+                .when(is_playing, |el| el.bg(scrim.opacity(0.)))
                 .child(if is_loading {
                     div()
                         .w(px(48.))
                         .h(px(48.))
                         .rounded_full()
-                        .bg(gpui::rgba(0x00000088))
+                        .bg(scrim.opacity(0.55))
                         .flex()
                         .justify_center()
                         .items_center()
-                        .child(div().text_color(cx.theme().foreground).text_sm().child(
+                        .child(div().text_color(on_scrim).text_sm().child(
                             if state == VideoPlayerState::Downloading {
                                 "↓"
                             } else {
@@ -407,15 +649,11 @@ fn render_video_player(
                         .w(px(48.))
                         .h(px(48.))
                         .rounded_full()
-                        .bg(gpui::rgba(0xFF000088))
+                        .bg(cx.theme().danger.opacity(0.65))
                         .flex()
                         .justify_center()
                         .items_center()
-                        .child(
-                            Icon::new(IconName::Redo)
-                                .text_color(cx.theme().foreground)
-                                .size(px(20.)),
-                        )
+                        .child(Icon::new(IconName::Redo).text_color(on_scrim).size(px(20.)))
                         .when_some(downloadable.clone(), |el, dl| {
                             el.cursor_pointer().on_click(move |_, _window, cx| {
                                 let msg_id = message_id.clone();
@@ -431,7 +669,7 @@ fn render_video_player(
                         .icon(
                             Icon::default()
                                 .path("icons/play.svg")
-                                .text_color(cx.theme().foreground)
+                                .text_color(on_scrim)
                                 .size(px(32.)),
                         )
                         .ghost()
@@ -453,7 +691,12 @@ fn render_video_player(
                         .icon(
                             Icon::default()
                                 .path("icons/pause.svg")
-                                .text_color(gpui::rgba(0xFFFFFF66))
+                                // The same ink as the controls it replaces:
+                                // this one sits over a *playing* frame rather
+                                // than the wash, which is exactly when a
+                                // fixed white is a guess about someone else's
+                                // video.
+                                .text_color(on_scrim.opacity(0.6))
                                 .size(px(24.)),
                         )
                         .ghost()
@@ -471,4 +714,45 @@ fn render_video_player(
                         .into_any_element()
                 }),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extension_of, format_bytes};
+
+    #[test]
+    fn a_real_extension_becomes_the_tile_label() {
+        assert_eq!(extension_of("contrato.pdf").as_deref(), Some("PDF"));
+        assert_eq!(extension_of("planilha.XLSX").as_deref(), Some("XLSX"));
+    }
+
+    #[test]
+    fn a_dot_in_the_title_is_not_an_extension() {
+        // Otherwise the tile fills with "2 FINAL" instead of a document icon.
+        assert_eq!(extension_of("Report v1.2 final"), None);
+        assert_eq!(extension_of("backup.tar.gzipped"), None);
+        assert_eq!(extension_of("no-dot-at-all"), None);
+        assert_eq!(extension_of("trailing."), None);
+    }
+
+    #[test]
+    fn sizes_read_the_way_a_person_would_say_them() {
+        assert_eq!(format_bytes(512).as_deref(), Some("512 B"));
+        assert_eq!(format_bytes(1024).as_deref(), Some("1.0 KB"));
+        assert_eq!(format_bytes(1_572_864).as_deref(), Some("1.5 MB"));
+        assert_eq!(format_bytes(5_368_709_120).as_deref(), Some("5.0 GB"));
+    }
+
+    #[test]
+    fn large_values_in_a_unit_drop_the_decimal() {
+        // "234 MB" is the number that matters; "234.7 MB" is noise.
+        assert_eq!(format_bytes(245_366_784).as_deref(), Some("234 MB"));
+    }
+
+    #[test]
+    fn an_unstated_size_is_not_reported_as_zero() {
+        // A sender that omits the length still sends a downloadable document;
+        // it just cannot promise what it will cost.
+        assert_eq!(format_bytes(0), None);
+    }
 }

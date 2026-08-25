@@ -95,10 +95,110 @@ profile here repeats it deliberately.
   server subscribes and then snapshots, so the window between the two is
   delivered twice rather than lost, and the client drops the overlap by
   comparing versions. Reversing the order loses it instead.
+- **The status reader is anchored to an update, not to a place in the run.**
+  A position was safe only while a run grew at the end, and it does not: a
+  live update and a hydrated one can both be stamped before the one being
+  watched, and the same index then silently becomes a different message —
+  never marked watched, never fetched, with the previous one's video still
+  playing over it. `StatusPane::shown` is the anchor and
+  `reconcile_status_pane` puts the index back under it.
 - **A daemon chat that only ever arrived live is not prunable.** A complete
   store reload is the store's whole truth *about rows it has*, and during
   pairing it has none while live messages already exist. Only store-backed
   chats are diffed against a reload; see `StateHub::store_backed_chat_jids`.
+  On the window's side the same diff spares what is *on screen* rather than
+  what is selected — the selection survives a trip to Status, to Settings and
+  under the viewer, so sparing on it kept a deleted chat nobody was looking
+  at. `departed_chats` is the deferral and the render pass spends it, against
+  what the previous frame drew.
+- **How a call ended is said in the state, not derived from its absence.** A
+  front end learns a call is over by watching the stage disappear, and it
+  writes the conversation's record from the stage it was holding — so a call
+  answered on another device reads as missed, one the daemon refused to place
+  reads as an attempt that was never made, and one *another window* declined
+  reads as missed in every window but that one. `CallState::ending` is the one
+  answer to all three: `Ending::Nothing` for the calls with no honest local
+  record, `Ending::As` for an outcome only the acting side knew. It travels in
+  the same frame as the removal, because an explanation sent beside it rides a
+  different channel and can arrive after the record it was meant to change.
+- **An outgoing call is named twice, and the second name lands by the first.**
+  The window draws the call it placed before the server has answered, under a
+  placeholder id of its own; `OutgoingCallStarted` carries both, and the rename
+  is matched on the placeholder. Matching on the recipient instead was right
+  until someone gave up and dialled again: the abandoned attempt's answer then
+  renamed the *redial*, so the state held an id nobody was ringing under and
+  the window's orphan-cancellation path let the abandoned call ring on.
+- **An account reset is a departure, not just a clear.** Everything a
+  disconnect stops has to stop here too — `forget_account_state` goes through
+  `leave_connected_view` — and everything keyed to the account has to go,
+  including the two selections that are JIDs themselves (the status reader and
+  the destination) and the call state. A stage left standing is read as ending
+  by the *next* account's first snapshot, which writes the old peer's call into
+  the new account's history.
+- **The call card belongs to the window, not to the conversation.** It is
+  drawn by the root, above whichever screen is up, because a call arriving
+  while Settings was open rang at the far end with no card, no Accept and no
+  Decline anywhere — the card and `sync_overlay_focus` were both built by the
+  conversation view alone.
+- **Whenever the stage empties, the parked caller comes forward.** A second
+  offer during a call waits behind the one on screen, and nothing draws a
+  waiting call on its own — so a stage cleared without promoting it leaves
+  someone ringing with no card, no Accept and no Decline. The rule is about
+  the stage being empty rather than about how it emptied, which is why
+  `CallState::promote_waiting` is one method that `take`, `end` and
+  `fail_outgoing_to` all go through, and why `take_incoming`/`take_outgoing`
+  deliberately do not: those hand the stage to what replaces it.
+- **A revoked message is a fact, not a sentence.** The store keeps the row
+  and hydration turns it into "[Message deleted]" — which a conversation is
+  right to draw and the status feed is not: an update its author took back has
+  nothing left to watch, and counting it kept a ring and a badge up for the
+  rest of its 24 hours. `ChatMessage::revoked` is what the feed asks, so
+  nobody has to recognise the text.
+- **A transient surface that takes the keyboard has to give it back, and to
+  one place.** The call card's Enter and Escape and the viewer's arrow keys
+  are scoped to their key contexts, so they do nothing unless something
+  focuses them — and a teardown that merely blurs leaves the window with no
+  keyboard target at all. `KeyboardOwner` names who should have it and
+  `sync_overlay_focus` hands it over, from the render pass, because focusing
+  needs a `Window` and the state it follows comes from the daemon. A ringing
+  call outranks the viewer; an *answered* call owns nothing, because a call
+  people talk through is one they type through — which is why mute is a
+  window-wide chord rather than a card binding.
+- **What a recording will be sent as is bound when the microphone opens.**
+  Not read when it closes: the destination *and* the reply it answers are one
+  answer to "where is this note going", and resolving either at the end sent
+  it to whichever chat was on screen by then, or quoted whichever message had
+  been picked since. `RecordingTarget` is that pair, and the draft is cleared
+  at send only if it is still the one the note was bound to.
+- **An overlay that names a row is reconciled where rows change.** The media
+  viewer holds a message id and resolves it every frame, so a revoke behind
+  it left a modal that drew nothing and still swallowed the Escape meant to
+  close it. `invalidate_message_cache` is the announcement that a chat's
+  history changed, which makes it the whole set of ways the thing being
+  looked at can stop existing.
+- **The media directory holds two different things.** `f-`/`d-` is the
+  cache — bytes the daemon fetched and can fetch again — and `u-` is a payload
+  a front end staged for a send that has not run yet, which is its only copy.
+  `Wipe::Cache` is what "clear cached media" may take; `Wipe::Everything` is
+  for the account leaving. A writer that cannot be cancelled asks
+  `media::epoch` instead: the eager cache of an inbound message loses to a
+  clear, and a download somebody asked for does not, because there the file is
+  how the bytes are delivered rather than where they are remembered.
+- **Nothing may still be writing this account's media when it is deleted.**
+  The publish thread externalizes media behind an unbounded queue, so an
+  event accepted before `ForgetSession` can still be in it. `stop_publishing`
+  closes the queue and hands back the thread to join, before the wipe.
+- **The timeline anchor describes the rows, not how many there are.** The
+  list keeps a measured height per index, so the only question worth asking
+  is whether the rows it measured are still those rows. A count cannot say:
+  a backfill before the head, a notice stamped in the past and a message
+  landing mid-history all raise it exactly as an arrival does, and only an
+  arrival leaves the earlier rows alone. The row at the end of the measured
+  prefix is what answers it (`MessageListCache::row_id`), because that is the
+  row every one of those moves and an append does not. A row can also change
+  height with the count standing still — an image arrives, a reaction lands,
+  a send fails and grows a retry button — which the `build` number answers.
+  The three outcomes are splice, remeasure and reset.
 - **A daemon frame is either state or news, and they use different channels.**
   State carries a version and is recoverable from a snapshot; a window request
   or a failed send is neither, so it must not ride a channel a client stops
@@ -110,11 +210,31 @@ profile here repeats it deliberately.
   the store agrees — otherwise a deliberate unread from another device would
   be papered over too.
 - **A read is bounded by what the *requester* saw**, not by what the daemon
-  knows: `MarkRead` names the preview's message id, and anything else is
-  refused. Not a timestamp — WhatsApp stamps to the second, so two arrivals in
-  one burst compare equal and a client that saw only the first would slip
-  through. A read action clears whole seconds, so an unchecked request from a
-  stale client consumes arrivals nobody ever laid eyes on.
+  knows: `MarkRead` names a message id, and one from an older second is
+  refused. A read action clears whole seconds, so an unchecked request from a
+  stale client consumes arrivals nobody ever laid eyes on. What it may *not*
+  demand is that the id be the daemon's own newest: WhatsApp stamps to the
+  second, the store returns a burst in arrival order and a front end sorts it
+  by `(timestamp, id)`, so `messages.last()` names a different message on each
+  side. Requiring them to match refused every read of a chat that had ever
+  received two messages in one second — permanently, since asking again
+  produced the same id. Membership in the boundary second is the test, and
+  either half of a burst is an honest claim to have seen it.
+- **A person has one name, and one place decides it.** WhatsApp answers "who
+  is this" three ways — the synced address book, the push name the sender
+  chose, the number — and the live path used to ship the push name while a
+  hydrated row resolved the address book, so the same participant was one
+  name on their bubbles and another on the typing line above them.
+  `session/names.rs` is that choice made once, in one order, for live
+  messages, chat presence and hydration alike; `Chat::update_participant` is
+  the one place a name enters a conversation and writes it onto the rows that
+  were waiting for it, and `Chat::author_name` is what every surface asks. A
+  full history load is what re-reads the address book, so it is also what
+  clears the book's memo. It decides the *key* as well as the label:
+  `ChatIdentity::canonical_jid` is what a person is filed under, so a
+  composing arriving as a phone number and its paused as a LID do not become
+  two entries — one of which nobody can clear, leaving the typing line up
+  until its TTL runs out.
 - **The chat store's writer queue is ordered on purpose.** Anything that
   targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row
@@ -136,7 +256,11 @@ into gpui-component's `Theme` global, so our surfaces and the library's own
 controls resolve the same tokens. A literal colour in a component is invisible
 to theme switching and drifts the moment either side changes. The two
 exceptions are message bubbles (`theme::brand`, which encode authorship and
-have no semantic token) and text drawn on the QR code's white raster.
+have no semantic token) and text drawn on the QR code's white raster. The
+fullscreen viewer's ground *was* a third, and is not: `scrim`/`on_scrim` are
+its own pair of tokens, because the theme's inks are the wrong answer there —
+`background` is the deepest surface in a dark preset, which is near-black
+text on a near-black wash.
 
 Render helpers take `&App` and return `impl IntoElement + use<>`: they read
 colours out of the theme but retain nothing borrowed, and without `use<>` the
