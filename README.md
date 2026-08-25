@@ -24,7 +24,7 @@ process that opens the database, however many windows you like.
 | `oxidezap-audio` | Capture, playback, Opus encoding, waveforms. |
 | `oxidezap-chat-store` | SQLite chat history materialized from the event stream, with FTS5 search. |
 | `oxidezap-session` | Connection, event stream, sends, store hydration. |
-| `oxidezap-ipc` | The protocol between the daemon and its front ends. Types only. |
+| `oxidezap-ipc` | The protocol between the daemon and its front ends, and the client end of the transport. No runtime. |
 | `oxidezap-daemon` | `oxidezapd`: the session, the socket and the tray. |
 | `oxidezap-gui` | `oxidezap`: GPUI front end, plus video decode. |
 

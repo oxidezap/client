@@ -11,6 +11,9 @@
 
 use anyhow::{Context, Result};
 
+#[cfg(windows)]
+mod security;
+
 /// One accepted connection.
 #[cfg(unix)]
 pub type Stream = tokio::net::UnixStream;
@@ -30,6 +33,15 @@ pub struct Listener {
     /// no daemon at all.
     #[cfg(windows)]
     pending: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
+    /// The name this listener bound, kept rather than derived again.
+    ///
+    /// `accept` creates the next instance, and deriving the name a second
+    /// time makes the two agree only for as long as every caller passes the
+    /// same path. Diverging would put the first client on one pipe and every
+    /// later one on another — the two-endpoint state this module exists to
+    /// prevent.
+    #[cfg(windows)]
+    name: String,
     /// Only a Unix socket leaves something behind to remove.
     #[cfg(unix)]
     path: std::path::PathBuf,
@@ -76,12 +88,10 @@ impl Listener {
     #[cfg(windows)]
     pub fn bind(path: &std::path::Path) -> Result<Self> {
         let name = path.to_string_lossy().into_owned();
-        let pending = tokio::net::windows::named_pipe::ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&name)
-            .with_context(|| format!("creating {name}"))?;
+        let pending = create_pipe(&name, true).with_context(|| format!("creating {name}"))?;
         Ok(Self {
             pending: Some(pending),
+            name,
         })
     }
 
@@ -93,15 +103,14 @@ impl Listener {
 
     #[cfg(windows)]
     pub async fn accept(&mut self) -> std::io::Result<Stream> {
-        let name = crate::server::endpoint_name()?;
         let server = match self.pending.take() {
             Some(server) => server,
-            None => tokio::net::windows::named_pipe::ServerOptions::new().create(&name)?,
+            None => create_pipe(&self.name, false)?,
         };
         server.connect().await?;
         // The next instance before handing this one over, so the name is
         // never momentarily unserved.
-        self.pending = Some(tokio::net::windows::named_pipe::ServerOptions::new().create(&name)?);
+        self.pending = Some(create_pipe(&self.name, false)?);
         Ok(server)
     }
 }
@@ -114,6 +123,23 @@ impl Drop for Listener {
         #[cfg(unix)]
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// One pipe instance, readable and writable by this user alone.
+///
+/// The default security descriptor grants read access to `Everyone` and the
+/// anonymous account, and this endpoint carries the session stream. Every
+/// instance gets the restricted descriptor, not just the first: they are
+/// separate objects and a client can land on any of them.
+#[cfg(windows)]
+fn create_pipe(name: &str, first: bool) -> std::io::Result<Stream> {
+    let security = security::UserOnly::new()?;
+    let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
+    options.first_pipe_instance(first);
+    // SAFETY: `security` lives across the call, and the pointer is to a
+    // `SECURITY_ATTRIBUTES` it keeps valid for exactly that long. The kernel
+    // copies the descriptor into the object it creates.
+    unsafe { options.create_with_security_attributes_raw(name, security.as_ptr()) }
 }
 
 /// Whether something is accepting connections on `path`.

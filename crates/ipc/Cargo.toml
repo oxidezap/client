@@ -14,7 +14,8 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 
-# `socket_path` needs the uid for its TMPDIR fallback.
+# The uid for the `TMPDIR` fallback, and the peer's uid to check that the
+# daemon answering is ours.
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 

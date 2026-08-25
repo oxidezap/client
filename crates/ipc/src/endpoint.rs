@@ -41,7 +41,9 @@ impl Endpoint {
 
         #[cfg(unix)]
         {
-            Inner::connect(&path).map(Self)
+            let stream = Inner::connect(&path)?;
+            check_peer(&stream)?;
+            Ok(Self(stream))
         }
         #[cfg(windows)]
         {
@@ -67,6 +69,31 @@ impl Endpoint {
     pub fn try_clone(&self) -> std::io::Result<Self> {
         self.0.try_clone().map(Self)
     }
+}
+
+/// Refuse a daemon that is not us.
+///
+/// The socket lives at a predictable path, and where `XDG_RUNTIME_DIR` is
+/// unset that path is under `/tmp` — where another local user can create the
+/// directory first and bind a socket of their own. The daemon checks the
+/// directory it creates; a client that simply connects checks nothing, and
+/// would hand its session requests, message text included, to whoever
+/// answered. The kernel knows who that is, so ask it.
+#[cfg(unix)]
+fn check_peer(stream: &Inner) -> std::io::Result<()> {
+    let peer = rustix::net::sockopt::socket_peercred(stream)?;
+    let us = rustix::process::getuid();
+    if peer.uid == us {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "the daemon socket is owned by uid {}, not by us ({}); refusing to talk to it",
+            peer.uid.as_raw(),
+            us.as_raw()
+        ),
+    ))
 }
 
 impl Read for Endpoint {

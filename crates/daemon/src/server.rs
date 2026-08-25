@@ -32,14 +32,6 @@ pub struct Claim {
     _lock: StartupLock,
 }
 
-/// The endpoint as a name, for the platform whose endpoint is one.
-#[cfg(windows)]
-pub fn endpoint_name() -> std::io::Result<String> {
-    endpoint_path()
-        .map(|path| path.to_string_lossy().into_owned())
-        .ok_or_else(|| std::io::Error::other("no per-user directory to place the endpoint in"))
-}
-
 /// Prepare the socket directory and take the per-user lock.
 ///
 /// Separate from [`run`], and called first, for two reasons that both come

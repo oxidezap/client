@@ -219,6 +219,15 @@ pub fn close(mut client: WhatsAppClient) {
 /// Everything the event loop carries between one event and the next.
 struct Bridge {
     hub: Arc<StateHub>,
+    /// Events on their way to the front ends that asked for them.
+    ///
+    /// A thread of its own, because preparing one writes every photo it
+    /// carries to the cache: a history load is one event and hundreds of
+    /// synchronous writes, and doing that on a runtime worker stops the accept
+    /// loop, every connection task and the shutdown branch for its duration.
+    /// One thread, and a queue, so the order the daemon publishes in is still
+    /// the order things happened.
+    publish: tokio::sync::mpsc::UnboundedSender<UiEvent>,
     reads: ReadTracker,
     in_flight: Arc<Semaphore>,
     /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
@@ -228,8 +237,32 @@ struct Bridge {
 
 impl Bridge {
     fn new(hub: Arc<StateHub>) -> Self {
+        // Unbounded, and the bound that matters is upstream: the only producer
+        // is the event loop draining the session's own unbounded channel, so a
+        // limit here could only stall the loop this exists to unblock or drop
+        // events no client could then recover.
+        let (publish, mut queue) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
+        let publisher = Arc::clone(&hub);
+        std::thread::Builder::new()
+            .name("oxidezap-publish".to_string())
+            .spawn(move || {
+                while let Some(mut event) = queue.blocking_recv() {
+                    externalize_media(&mut event);
+                    match serde_json::to_string(&DaemonMessage::Session {
+                        event: Box::new(event),
+                    }) {
+                        Ok(frame) => publisher.publish_session(frame),
+                        Err(e) => log::error!("dropping unserializable session event: {e}"),
+                    }
+                }
+            })
+            // A daemon that cannot spawn a thread is a daemon that will not
+            // get far; failing here beats doing the writes on a worker.
+            .expect("spawning the publish thread");
+
         Self {
             hub,
+            publish,
             reads: ReadTracker::default(),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             forget: false,
@@ -254,14 +287,14 @@ impl Bridge {
             _ => {}
         }
 
-        // Prepared before the state changes and published after it. A front
-        // end reacts to what it is told the instant it is told — a message
-        // arriving in the open chat is marked read immediately — and the
-        // runtime is multithreaded, so that `MarkRead` can reach another
+        // Cloned before `translate` consumes it, queued after the hub has it.
+        // A front end reacts to what it is told the instant it is told — a
+        // message arriving in the open chat is marked read immediately — and
+        // the runtime is multithreaded, so that `MarkRead` can reach another
         // worker while this one has not applied the message yet. `read_plan`
-        // would refuse it as stale, after the client had already cleared its
-        // own badge and with nothing to make it ask again.
-        let frame = self.session_frame(&event);
+        // would refuse it as stale, after the client had cleared its own badge
+        // and with nothing to make it ask again.
+        let pending = self.hub.wants_session_events().then(|| event.clone());
 
         for change in self.translate(event) {
             // A chat that left the store owes nothing and will never be read
@@ -273,8 +306,10 @@ impl Bridge {
             self.hub.apply(change);
         }
 
-        if let Some(frame) = frame {
-            self.hub.publish_session(frame);
+        if let Some(event) = pending {
+            // The receiver lives as long as the thread, which lives as long as
+            // the daemon.
+            let _ = self.publish.send(event);
         }
     }
 
@@ -437,28 +472,6 @@ impl Bridge {
             drop(permit);
         });
         CommandOutcome::Accepted
-    }
-
-    /// The frame that carries one session event, if anyone wants it.
-    ///
-    /// `None` when nobody is listening, which is the common case: a tray wants
-    /// summaries, and preparing an event means writing every photo in it to
-    /// the cache.
-    fn session_frame(&self, event: &UiEvent) -> Option<String> {
-        if !self.hub.wants_session_events() {
-            return None;
-        }
-        let mut event = event.clone();
-        externalize_media(&mut event);
-        match serde_json::to_string(&DaemonMessage::Session {
-            event: Box::new(event),
-        }) {
-            Ok(frame) => Some(frame),
-            Err(e) => {
-                log::error!("dropping unserializable session event: {e}");
-                None
-            }
-        }
     }
 
     /// Mark a chat read, no further than the requester has actually seen.

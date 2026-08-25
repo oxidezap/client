@@ -48,6 +48,12 @@ ksni = "0.3"
 # The Unix syscalls the daemon makes directly: flock for the startup lock and
 # getuid for the state directory's ownership check. Safe wrappers, so neither
 # needs an `unsafe` block.
+# The named pipe's security descriptor. Windows has no way to ask for a
+# user-only endpoint other than building one, and its default grants read
+# access to Everyone.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_Threading"] }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 

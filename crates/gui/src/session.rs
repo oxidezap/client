@@ -223,10 +223,16 @@ impl Session {
     ) -> oneshot::Receiver<Result<Vec<u8>, String>> {
         let (tx, rx) = oneshot::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, tx);
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            // Whoever timed out is no longer listening, and its answer may
+            // never come — a frame the daemon dropped from a full outbox has
+            // nothing left to arrive. Swept here rather than on a timer: this
+            // is the only thing that grows the map, so it is the only place
+            // that needs to shrink it.
+            pending.retain(|_, waiting| !waiting.is_closed());
+            pending.insert(id, tx);
+        }
 
         if let Err(e) = self.send(&ClientRequest::Download {
             id,

@@ -56,12 +56,16 @@ profile here repeats it deliberately.
 
 ## Gotchas
 
-- **The platform split lives in exactly two files.** `ipc/endpoint.rs` is the
-  client end and `daemon/listener.rs` is the server end; everything above them
+- **The platform split lives in exactly two places.** `ipc/endpoint.rs` is the
+  client end and `daemon/listener/` is the server end; everything above them
   — framing, requests, the whole protocol — is written once. A Unix socket is
   a filesystem entry that survives a crash and a named pipe is a name that
   does not, which is why reclaiming a stale endpoint exists on one and not the
-  other.
+  other — and why the Windows listener builds a security descriptor by hand,
+  since a named pipe's default grants read access to `Everyone` while a Unix
+  socket inherits a `0700` directory. A client checks who answered, too: the
+  socket sits at a predictable path, and under the `/tmp` fallback another
+  user can get there first.
 - **Nothing stops the daemon but `main`.** The tray's Quit and an IPC
   `Shutdown` ask through `shutdown::request`; ending the process from a D-Bus
   callback or a connection task would skip disconnecting the session and
