@@ -1468,6 +1468,12 @@ mod tests {
 
     /// The fallback directory sits at a predictable path in a world-writable
     /// place, so a symlink planted there must not be followed.
+    ///
+    /// Unix only, and not for want of porting: on Windows the state directory
+    /// is under the user's own profile, so there is no world-writable parent
+    /// for anyone to plant anything in, and `prepare_state_dir` has nothing
+    /// to check.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_socket_dir_is_refused() {
         let base = std::env::temp_dir().join(format!("oxidezap-symlink-{}", std::process::id()));
@@ -1489,6 +1495,9 @@ mod tests {
     }
 
     /// A directory we already own is reused, and tightened if it is loose.
+    ///
+    /// Unix only, for the same reason as the symlink check above.
+    #[cfg(unix)]
     #[test]
     fn a_loose_but_owned_dir_is_tightened_rather_than_refused() {
         use std::os::unix::fs::PermissionsExt;

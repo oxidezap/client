@@ -131,15 +131,18 @@ fn socket_is_live(path: &std::path::Path) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     /// The bug this replaced: unlinking before binding let a second daemon
     /// steal a live one's path, leaving two sessions on one account.
+    ///
+    /// There is nothing to reclaim on Windows: a named pipe is a name the
+    /// kernel drops when its owner dies, so a crashed daemon leaves no stale
+    /// endpoint behind.
     // tokio's UnixListener registers with the reactor, so binding needs a
     // runtime even though the rest of this check is synchronous.
-    #[cfg(unix)]
     #[tokio::test]
     async fn binding_over_a_live_endpoint_fails_instead_of_stealing_it() {
         let dir = std::env::temp_dir().join(format!("oxidezap-bind-test-{}", std::process::id()));

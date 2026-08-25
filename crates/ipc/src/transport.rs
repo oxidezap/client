@@ -21,6 +21,8 @@ use std::path::PathBuf;
 /// [`PairingCode`]: crate::PairingCode
 pub const PROTOCOL_VERSION: u32 = 3;
 
+/// Only a Unix endpoint is a file with a name in a directory.
+#[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
 const DIR_NAME: &str = "oxidezap";
 const MEDIA_DIR: &str = "media";
