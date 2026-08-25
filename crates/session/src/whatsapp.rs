@@ -206,6 +206,38 @@ pub struct CallRegistry {
     /// Ids cancelled before any handle existed (the UI's placeholder id while
     /// start_call is still connecting); start_call hangs these up on arrival.
     cancelled: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// One mute lane per live call. Pruned against `active` where it grows,
+    /// so a call that ends takes its lane with it without every teardown
+    /// path having to remember.
+    mute: Arc<std::sync::Mutex<HashMap<String, Arc<MuteLane>>>>,
+}
+
+/// What keeps a call's mute requests in the order the daemon took them.
+///
+/// Spawning is not sequencing: two requests spawned in order can start in
+/// either one, and the last to reach the wire wins. That is how a rapid
+/// unmute-then-mute could leave the microphone open under a state — and every
+/// window — showing it muted, with both tasks finding the device in the state
+/// they themselves had asked for and so correcting nothing.
+#[derive(Default)]
+struct MuteLane {
+    /// The newest request, stamped on the caller's thread *before* its task
+    /// exists. That is the only place the order still exists.
+    ///
+    /// A `std` lock on purpose: it is taken from a synchronous method and
+    /// never held across an await.
+    intent: std::sync::Mutex<MuteIntent>,
+    /// One announcement in flight per call. The library serializes its own
+    /// transitions, but it serializes them in arrival order, which is the
+    /// order this exists to stop trusting.
+    lane: Mutex<()>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct MuteIntent {
+    /// Bumped per request, so a task can ask whether it is still the newest.
+    seq: u64,
+    muted: bool,
 }
 
 /// WhatsApp client wrapper that manages the connection and provides
@@ -1825,6 +1857,11 @@ impl WhatsAppClient {
     /// published; an announcement that went through changes nothing, and a
     /// call state that does not change sends no frame.
     ///
+    /// The request is stamped here, on the caller's thread, and the work is
+    /// what gets spawned — see [`MuteLane`]. A task compares the device
+    /// against the *newest* request rather than its own, because its own is
+    /// exactly what a superseded task must not restore.
+    ///
     /// A call still ringing has nowhere to publish the state, and answering
     /// does not replay it. That is not a gap here: mute is offered on an
     /// active call only ([`oxidezap_core::CallState::set_muted`] matches the
@@ -1834,24 +1871,63 @@ impl WhatsAppClient {
         let ui_sender = self.ui_sender.clone();
         let call_id = call_id.to_string();
         let runtime = self.runtime.clone();
+
+        // Before the spawn, because after it the order is gone.
+        let (lane, seq) = {
+            let mut lanes = calls.mute.lock().expect("mute lanes poisoned");
+            let lane = lanes.entry(call_id.clone()).or_default().clone();
+            let mut intent = lane.intent.lock().expect("mute intent poisoned");
+            intent.seq += 1;
+            intent.muted = muted;
+            let seq = intent.seq;
+            drop(intent);
+            (lane, seq)
+        };
+
         runtime.spawn(async move {
             // Cloned out from under the lock: `set_muted` waits on the call's
             // answer-transition lane, and holding the registry across that
             // would stall every other call's bookkeeping behind one peer.
-            let Some(handle) = calls.active.lock().await.get(&call_id).cloned() else {
+            let handle = {
+                let active = calls.active.lock().await;
+                let handle = active.get(&call_id).cloned();
+                // Where the lane map grows is where it is swept.
+                calls
+                    .mute
+                    .lock()
+                    .expect("mute lanes poisoned")
+                    .retain(|id, _| active.contains_key(id));
+                handle
+            };
+            let Some(handle) = handle else {
                 debug!("set_call_muted: no live handle for {}", call_id);
                 return;
             };
-            if let Err(e) = handle.set_muted(muted).await {
+
+            let _serialized = lane.lane.lock().await;
+            // A newer request either has already run or is blocked on the
+            // lane behind us; either way it, and not this one, is what the
+            // device should end up saying.
+            let want = *lane.intent.lock().expect("mute intent poisoned");
+            if want.seq != seq {
+                return;
+            }
+            if let Err(e) = handle.set_muted(want.muted).await {
                 warn!(
                     "Failed to announce {} on call {}: {}",
-                    if muted { "mute" } else { "unmute" },
+                    if want.muted { "mute" } else { "unmute" },
                     call_id,
                     e
                 );
             }
+            // Superseded while announcing: the request behind us is about to
+            // set the state anyway, and a correction from here would describe
+            // a device that is already on its way somewhere else.
+            if lane.intent.lock().expect("mute intent poisoned").seq != seq {
+                return;
+            }
             let settled = handle.is_muted();
-            if settled != muted
+            if settled != want.muted
                 && let Some(tx) = ui_sender.lock().await.as_ref()
             {
                 let _ = tx.send(UiEvent::CallMuteChanged {
@@ -2806,7 +2882,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ChatStore, Client, NameBook, ReadBoundary, ReloadScope, SqliteStore, StoreChange,
+        ChatStore, Client, MuteLane, NameBook, ReadBoundary, ReloadScope, SqliteStore, StoreChange,
         WhatsAppClient, media_metadata, merge_alias_history_messages, read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
@@ -2815,6 +2891,51 @@ mod tests {
     use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
     use whatsapp_rust::wacore_binary::Jid;
     use whatsapp_rust::waproto::whatsapp as wa;
+
+    /// Stamp a request the way `set_call_muted` does, on the caller's thread.
+    fn request(lane: &MuteLane, muted: bool) -> u64 {
+        let mut intent = lane.intent.lock().unwrap();
+        intent.seq += 1;
+        intent.muted = muted;
+        intent.seq
+    }
+
+    /// Two toggles in quick succession are spawned as two tasks, and spawn
+    /// order is not run order. Run the wrong way round, each task saw the
+    /// device holding the value it had itself asked for and corrected
+    /// nothing — so an unmute that executed last left the microphone open
+    /// under a state, and every window, still showing it muted.
+    ///
+    /// The order survives because it is stamped before the tasks exist, and a
+    /// task that is no longer the newest does nothing at all.
+    #[test]
+    fn only_the_newest_mute_request_reaches_the_device() {
+        let lane = MuteLane::default();
+        // Muted, and the user changes their mind twice.
+        let unmute = request(&lane, false);
+        let remute = request(&lane, true);
+
+        // Whichever task wins the lane, the gate answers the same way.
+        let newest = *lane.intent.lock().unwrap();
+        assert_ne!(unmute, remute);
+        assert_eq!(newest.seq, remute, "the last request is the live one");
+        assert!(newest.muted, "and it is the one the device must end on");
+        assert_ne!(
+            newest.seq, unmute,
+            "the superseded task yields instead of restoring its own value"
+        );
+    }
+
+    /// A lone request is nobody's stale task: it applies, and it is the one
+    /// that answers for what the device really did.
+    #[test]
+    fn a_single_mute_request_is_the_newest_one() {
+        let lane = MuteLane::default();
+        let seq = request(&lane, true);
+        let newest = *lane.intent.lock().unwrap();
+        assert_eq!(newest.seq, seq);
+        assert!(newest.muted);
+    }
 
     /// A name book with nothing behind its handle: the history paths hand the
     /// store in with every call, and only the live paths read it from there.
