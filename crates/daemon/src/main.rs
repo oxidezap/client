@@ -5,6 +5,7 @@
 //! meet at [`state::StateHub`], which is the only thing that mutates, and each
 //! observes it through the channel that suits it.
 
+mod listener;
 mod media;
 mod server;
 mod session_bridge;
@@ -35,13 +36,11 @@ fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    // Registered before anything can ask us to stop. Both the tray's Quit
-    // item and an IPC `Shutdown` raise SIGTERM at this process, and until
-    // these handlers exist SIGTERM still has its default disposition: the
-    // process would die on the spot, without disconnecting the session or
-    // closing SQLite — the exact teardown the signal was chosen to reach. The
-    // tray is registered on a bus a user can click within microseconds, so
-    // this is not a theoretical window.
+    // Registered before anything can ask us to stop. Until these handlers
+    // exist SIGTERM still has its default disposition: a service manager
+    // stopping the daemon during startup would kill it on the spot, without
+    // disconnecting the session or closing SQLite. The tray is registered on
+    // a bus a user can reach within microseconds, so the window is real.
     let mut termination = Termination::install()?;
 
     // Before anything else touches the account. The socket is only the
@@ -136,7 +135,8 @@ fn finish(
     server_outcome.and(session_outcome)
 }
 
-/// The termination signals, registered up front.
+/// Everything that means "stop": a signal from outside, or an ask from
+/// inside.
 ///
 /// A struct rather than a function because *when* the handlers are installed
 /// matters more than what they do: tokio registers them when the stream is
@@ -145,7 +145,7 @@ fn finish(
 ///
 /// Both SIGINT and SIGTERM: a daemon is as likely to be stopped by a service
 /// manager as by a terminal, and leaving SIGTERM to the default handler would
-/// skip the teardown below it.
+/// skip the teardown below it. Ctrl-C where there are no signals at all.
 struct Termination {
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
@@ -167,16 +167,18 @@ impl Termination {
         Ok(Self {})
     }
 
-    /// Resolve on the first termination signal.
+    /// Resolve when anything asks the daemon to stop.
     async fn recv(&mut self) {
         #[cfg(unix)]
         tokio::select! {
             _ = self.interrupt.recv() => {}
             _ = self.terminate.recv() => {}
+            () = shutdown::requested() => {}
         }
         #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = shutdown::requested() => {}
         }
     }
 }

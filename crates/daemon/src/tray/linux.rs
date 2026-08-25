@@ -75,8 +75,8 @@ impl KsniTray for Item {
                 // exits: tearing the process down from a D-Bus callback would
                 // skip the session teardown.
                 activate: Box::new(|_: &mut Self| {
-                    // Reuses the one shutdown path the daemon already has,
-                    // instead of adding a second one.
+                    // Asks; `main` is what acts. Stopping the process from a
+                    // D-Bus callback would skip the session teardown.
                     crate::shutdown::request("tray menu");
                 }),
                 ..Default::default()

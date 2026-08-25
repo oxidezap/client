@@ -130,9 +130,12 @@ pub fn has(key: &str) -> bool {
 fn prepare_dir(dir: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) | Err(_) if dir.is_dir() => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("creating {}", dir.display())),
         Ok(()) => Ok(()),
+        // Already there is the common case, and the only failure that is not
+        // one: the directory is created once and written to thousands of
+        // times.
+        Err(_) if dir.is_dir() => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("creating {}", dir.display())),
     }
 }
 

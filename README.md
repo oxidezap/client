@@ -13,8 +13,8 @@ Read [known limitations](#known-limitations) before relying on it.
 ## Layout
 
 The WhatsApp connection lives in one background process, `oxidezapd`. It holds
-the session, owns the store, shows a tray icon and serves front ends over a
-per-user socket. `oxidezap` is the GPUI desktop window; it owns no session of
+the session, owns the store, shows a tray icon on Linux and serves front ends
+over a per-user local transport — a Unix socket, or a named pipe on Windows. `oxidezap` is the GPUI desktop window; it owns no session of
 its own and starts the daemon when none is running. One session per user, one
 process that opens the database, however many windows you like.
 

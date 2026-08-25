@@ -3,24 +3,35 @@
 //! The tray's "Quit" item and a client's [`ClientRequest::Shutdown`] both run
 //! far from `main`'s teardown, and neither may end the process itself:
 //! exiting from a D-Bus callback or a connection task would skip disconnecting
-//! the session and closing SQLite. Both raise SIGTERM at this process instead,
-//! which lands on the handler `main` already installs, so the daemon keeps
-//! exactly one shutdown path however it is asked to leave.
+//! the session and closing SQLite.
+//!
+//! So they ask instead, and `main` is the only thing that acts. A signal was
+//! the obvious way to carry that ask — the daemon already had to handle
+//! SIGTERM for a service manager — but a signal is not something Windows has,
+//! which would have left an IPC `Shutdown` inert there. One in-process
+//! notification serves both, and the signal handler now feeds the same one
+//! rather than being a second route to the same place.
 //!
 //! [`ClientRequest::Shutdown`]: oxidezap_ipc::ClientRequest::Shutdown
 
-/// Ask this process to shut down, as if a service manager had asked.
+use std::sync::LazyLock;
+
+use tokio::sync::Notify;
+
+/// Raised once, waited on by `main`.
+///
+/// `notify_one` stores a permit, so an ask that arrives before `main` is
+/// watching is not lost — which is the case whenever the daemon fails fast
+/// during startup.
+static STOP: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+/// Ask this process to shut down.
 pub fn request(reason: &str) {
     log::info!("shutdown requested: {reason}");
+    STOP.notify_one();
+}
 
-    #[cfg(unix)]
-    {
-        use rustix::process::{Signal, getpid, kill_process};
-        // The only failure a signal to ourselves can report is a signal number
-        // the kernel does not know, which SIGTERM is not. Logged rather than
-        // propagated: the caller has no better answer than the daemon does.
-        if let Err(e) = kill_process(getpid(), Signal::TERM) {
-            log::error!("could not signal ourselves to stop: {e}");
-        }
-    }
+/// Resolve once somebody has asked.
+pub async fn requested() {
+    STOP.notified().await;
 }

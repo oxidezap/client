@@ -13,15 +13,14 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use log::{debug, error, info, warn};
 use oxidezap_core::{DownloadableMedia, MediaContent, UiEvent};
 use oxidezap_ipc::{
-    CallAction, ClientRequest, ConnectionState, DaemonMessage, PROTOCOL_VERSION, RequestId,
-    StateSnapshot, media_path, socket_path,
+    CallAction, ClientRequest, ConnectionState, DaemonMessage, Endpoint, PROTOCOL_VERSION,
+    RequestId, StateSnapshot, endpoint_path, media_path,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::{mpsc, oneshot};
@@ -43,7 +42,7 @@ type Pending = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Vec<u8>, Stri
 ///
 /// Shared because recovery is something the reader decides: it is the side
 /// that sees a `Resync`, and answering one means sending a request.
-type Writer = Arc<Mutex<UnixStream>>;
+type Writer = Arc<Mutex<Endpoint>>;
 
 /// A connection to `oxidezapd`.
 pub struct Session {
@@ -273,7 +272,7 @@ fn write_request(writer: &Writer, request: &ClientRequest) -> std::io::Result<()
 
 /// Read frames until the daemon goes away.
 fn read_frames(
-    stream: UnixStream,
+    stream: Endpoint,
     events: &mpsc::Sender<UiEvent>,
     pending: &Pending,
     writer: &Writer,
@@ -459,15 +458,16 @@ const START_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(2);
 /// spawn has already given up. Retrying until the deadline is what closes it,
 /// and it is why nothing here watches the socket to decide the old daemon has
 /// gone: the socket goes first.
-fn connect_or_start() -> std::io::Result<UnixStream> {
-    let path = socket_path().ok_or_else(|| {
-        std::io::Error::other("no runtime directory to look for the daemon's socket in")
-    })?;
+fn connect_or_start() -> std::io::Result<Endpoint> {
+    // Only for the message: connecting is the endpoint's business, and on
+    // Windows this is a pipe name rather than anything on disk.
+    let path = endpoint_path()
+        .ok_or_else(|| std::io::Error::other("no per-user directory to look for the daemon in"))?;
     let program = daemon_program();
     let deadline = wacore::time::Instant::now() + START_TIMEOUT;
 
     loop {
-        match UnixStream::connect(&path) {
+        match Endpoint::connect() {
             Ok(stream) => return Ok(stream),
             Err(e) if wacore::time::Instant::now() >= deadline => {
                 return Err(std::io::Error::other(format!(
@@ -488,7 +488,7 @@ fn connect_or_start() -> std::io::Result<UnixStream> {
         // short of the socket answering.
         let attempt = wacore::time::Instant::now() + START_ATTEMPT;
         while wacore::time::Instant::now() < attempt {
-            if let Ok(stream) = UnixStream::connect(&path) {
+            if let Ok(stream) = Endpoint::connect() {
                 return Ok(stream);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -502,7 +502,11 @@ fn connect_or_start() -> std::io::Result<UnixStream> {
 /// not on anybody's `PATH`. A bare name otherwise, so a development build run
 /// from `cargo` finds the one on the path.
 fn daemon_program() -> std::path::PathBuf {
-    const NAME: &str = "oxidezapd";
+    const NAME: &str = if cfg!(windows) {
+        "oxidezapd.exe"
+    } else {
+        "oxidezapd"
+    };
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))

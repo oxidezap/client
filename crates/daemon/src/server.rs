@@ -9,26 +9,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use oxidezap_ipc::{ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, socket_path};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use oxidezap_ipc::{
+    ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, endpoint_path, lock_path,
+    state_dir,
+};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf,
+    WriteHalf,
+};
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::listener::Listener;
 use crate::session_bridge::{Action, CommandOutcome, Commands, Outbox, SessionCommand};
 use crate::state::StateHub;
-
-/// Owns the listening socket and removes it on drop.
-pub struct Server {
-    path: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        // Best effort: a leftover socket file makes the next start fail to
-        // bind, and there is nothing useful to do if removal fails.
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 /// This process's claim on being *the* daemon for this user.
 ///
@@ -37,6 +30,14 @@ impl Drop for Server {
 pub struct Claim {
     path: PathBuf,
     _lock: StartupLock,
+}
+
+/// The endpoint as a name, for the platform whose endpoint is one.
+#[cfg(windows)]
+pub fn endpoint_name() -> std::io::Result<String> {
+    endpoint_path()
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or_else(|| std::io::Error::other("no per-user directory to place the endpoint in"))
 }
 
 /// Prepare the socket directory and take the per-user lock.
@@ -54,10 +55,10 @@ pub struct Claim {
 ///   store and connected before discovering the lock was taken would have
 ///   already broken it.
 pub fn claim() -> Result<Claim> {
-    let path = socket_path().context("no runtime directory to place the socket in")?;
-    let dir = path.parent().context("socket path has no parent")?;
-    prepare_socket_dir(dir)?;
-    let lock = acquire_startup_lock(&path)?;
+    let path = endpoint_path().context("no per-user directory to place the endpoint in")?;
+    let dir = state_dir().context("no per-user directory for the daemon's own state")?;
+    prepare_state_dir(&dir)?;
+    let lock = acquire_startup_lock(&lock_path().context("no per-user directory for the lock")?)?;
     Ok(Claim { path, _lock: lock })
 }
 
@@ -93,15 +94,14 @@ const OUTBOX_CAPACITY: usize = 64;
 /// which is exactly the window a second daemon must not find open.
 pub async fn run(claim: &Claim, hub: Arc<StateHub>, commands: Commands) -> Result<()> {
     let path = claim.path.clone();
-    let listener = bind(&path)?;
-    let _guard = Server { path: path.clone() };
+    let mut listener = Listener::bind(&path)?;
     log::info!("listening on {}", path.display());
 
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
 
     loop {
         let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
+            Ok(stream) => stream,
             // Per-connection failures, not listener failures: the peer went
             // away between the SYN and the accept, or the process is briefly
             // out of descriptors. Tearing down the WhatsApp session over one
@@ -158,39 +158,14 @@ const ENFILE: i32 = 23;
 /// peer. The task is still bounded — one small frame into a socket nobody has
 /// had a chance to fill, then done — so a refused client costs a write, not a
 /// slot.
-async fn reject(stream: UnixStream) {
+async fn reject<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
     log::warn!("refusing a client: already serving {MAX_CLIENTS}");
-    let (_, mut writer) = stream.into_split();
+    let (_, mut writer) = tokio::io::split(stream);
     if let Ok(frame) = serde_json::to_string(&DaemonMessage::Error(ProtocolError::TooManyClients {
         limit: MAX_CLIENTS,
     })) {
         let _ = write_line(&mut writer, &frame).await;
     }
-}
-
-/// Bind the socket, reclaiming a stale one from a crashed daemon.
-///
-/// The directory is already prepared and the startup lock already held: see
-/// [`claim`], which is why this can treat the path as ours alone.
-fn bind(path: &Path) -> Result<UnixListener> {
-    // Bind first, and only treat the address as stale after proving nothing
-    // answers on it. Unlinking first would let a second daemon steal the path
-    // from a running one: the first keeps its already-connected clients while
-    // every new client reaches the second, and two sessions then drive the
-    // same account with neither aware of the other.
-    match UnixListener::bind(path) {
-        Ok(listener) => return Ok(listener),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
-        Err(e) => return Err(e).with_context(|| format!("binding {}", path.display())),
-    }
-
-    if socket_is_live(path) {
-        anyhow::bail!("another daemon is already listening on {}", path.display());
-    }
-
-    log::warn!("removing a stale socket at {}", path.display());
-    std::fs::remove_file(path).context("removing a stale socket")?;
-    UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
 }
 
 /// An exclusive lock on this user's daemon, released when the file closes.
@@ -204,13 +179,12 @@ struct StartupLock {
 /// dies however it dies, so a crashed daemon leaves nothing to clean up and
 /// no stale pid to misread.
 #[cfg(unix)]
-fn acquire_startup_lock(socket: &Path) -> Result<StartupLock> {
-    let path = socket.with_extension("lock");
+fn acquire_startup_lock(path: &Path) -> Result<StartupLock> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
 
     // rustix rather than a hand-rolled `extern "C"`: the same syscall,
@@ -226,25 +200,34 @@ fn acquire_startup_lock(socket: &Path) -> Result<StartupLock> {
     Ok(StartupLock { _file: file })
 }
 
-#[cfg(not(unix))]
-fn acquire_startup_lock(_socket: &Path) -> Result<StartupLock> {
-    Ok(StartupLock {
-        _file: std::fs::File::open(std::env::temp_dir()).context("opening a placeholder handle")?,
-    })
+/// The same exclusion without `flock`, which Windows does not have.
+///
+/// Opening with no sharing is the platform's own way to say "only me": a
+/// second daemon's open fails while the first holds the handle, and the
+/// kernel closes it however the first dies — which is the property the lock
+/// was chosen for.
+#[cfg(windows)]
+fn acquire_startup_lock(path: &Path) -> Result<StartupLock> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .share_mode(0)
+        .open(path)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "another daemon holds {} ({e}); refusing to start a second session",
+                path.display()
+            )
+        })?;
+    Ok(StartupLock { _file: file })
 }
 
-/// Whether something is accepting connections on `path`.
-///
-/// A blocking connect, deliberately: it runs once at startup before the
-/// runtime has any work, and `ECONNREFUSED` is the answer that matters.
-/// Anything else (a permission error, a path that is no longer a socket) is
-/// treated as live, because refusing to start is recoverable while stealing a
-/// live daemon's socket is not.
-fn socket_is_live(path: &Path) -> bool {
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::ConnectionRefused,
-    }
+#[cfg(not(any(unix, windows)))]
+fn acquire_startup_lock(_path: &Path) -> Result<StartupLock> {
+    anyhow::bail!("no way to take a startup lock on this platform")
 }
 
 /// Create the socket directory, or verify an existing one is safe to use.
@@ -260,7 +243,7 @@ fn socket_is_live(path: &Path) -> bool {
 /// anyone else. Refusing to start is a bad outcome; putting a socket that
 /// controls the account somewhere another user can reach is a worse one.
 #[cfg(unix)]
-fn prepare_socket_dir(dir: &Path) -> Result<()> {
+fn prepare_state_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -307,7 +290,7 @@ fn current_uid() -> u32 {
 }
 
 #[cfg(not(unix))]
-fn prepare_socket_dir(dir: &Path) -> Result<()> {
+fn prepare_state_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
 }
 
@@ -336,16 +319,7 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// shape — would silently eat the head of every request that happened to be
 /// in flight when a chat update landed, and the client would see its command
 /// answered with a parse error it did not cause.
-async fn read_frame(
-    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-    buf: &mut Vec<u8>,
-) -> Result<Option<FrameRead>> {
-    read_frame_generic(reader, buf).await
-}
-
-/// The body of [`read_frame`], over any reader, so the framing rules can be
-/// tested without a socket.
-async fn read_frame_generic<R: tokio::io::AsyncRead + Unpin>(
+async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     buf: &mut Vec<u8>,
 ) -> Result<Option<FrameRead>> {
@@ -408,8 +382,11 @@ enum FrameRead {
     TooLong,
 }
 
-async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+async fn serve_client<S>(stream: S, hub: Arc<StateHub>, commands: Commands) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::with_capacity(1024);
 
@@ -587,9 +564,9 @@ async fn serve_client(stream: UnixStream, hub: Arc<StateHub>, commands: Commands
 /// rejected hello from a dead socket. The caller bounds the whole thing in
 /// time, which is what stops that leniency from being a way to hold a slot
 /// open forever.
-async fn handshake(
-    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+async fn handshake<S: AsyncRead + AsyncWrite>(
+    reader: &mut BufReader<ReadHalf<S>>,
+    writer: &mut WriteHalf<S>,
     buf: &mut Vec<u8>,
 ) -> Result<Option<Attached>> {
     loop {
@@ -893,7 +870,7 @@ fn no_session(detail: impl Into<String>) -> ProtocolError {
     }
 }
 
-async fn write_line(writer: &mut tokio::net::unix::OwnedWriteHalf, line: &str) -> Result<()> {
+async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> Result<()> {
     writer.write_all(line.as_bytes()).await?;
     // Newline-delimited framing: the reader above splits on it, so a frame
     // containing one would desynchronize the stream. serde_json never emits a
@@ -1176,7 +1153,7 @@ mod tests {
         });
 
         for i in 0..frames {
-            match read_frame_generic(&mut reader, &mut buf).await {
+            match read_frame(&mut reader, &mut buf).await {
                 Ok(Some(FrameRead::Line(line))) => assert_eq!(line.len(), 1000),
                 other => panic!("frame {i} of {frames} was cut short: {other:?}"),
             }
@@ -1199,12 +1176,12 @@ mod tests {
         });
 
         assert!(matches!(
-            read_frame_generic(&mut reader, &mut buf).await,
+            read_frame(&mut reader, &mut buf).await,
             Ok(Some(FrameRead::NotUtf8))
         ));
         // The stream survives it.
         assert!(matches!(
-            read_frame_generic(&mut reader, &mut buf).await,
+            read_frame(&mut reader, &mut buf).await,
             Ok(Some(FrameRead::Line(_)))
         ));
     }
@@ -1225,7 +1202,7 @@ mod tests {
         // because the frame is not finished; the ready branch wins.
         tokio::select! {
             biased;
-            frame = read_frame_generic(&mut reader, &mut buf) => {
+            frame = read_frame(&mut reader, &mut buf) => {
                 panic!("an unterminated frame must not complete: {frame:?}");
             }
             () = std::future::ready(()) => {}
@@ -1233,7 +1210,7 @@ mod tests {
         assert!(!buf.is_empty(), "the prefix was consumed and kept");
 
         client.write_all(b"shot\"}\n").await.unwrap();
-        match read_frame_generic(&mut reader, &mut buf).await {
+        match read_frame(&mut reader, &mut buf).await {
             Ok(Some(FrameRead::Line(line))) => {
                 assert!(
                     matches!(
@@ -1258,7 +1235,7 @@ mod tests {
         let mut buf = vec![b'x'; MAX_REQUEST_BYTES];
 
         assert!(matches!(
-            read_frame_generic(&mut reader, &mut buf).await,
+            read_frame(&mut reader, &mut buf).await,
             Ok(Some(FrameRead::TooLong))
         ));
         assert!(buf.is_empty(), "a refused frame leaves nothing behind");
@@ -1270,8 +1247,8 @@ mod tests {
     /// hello from a dead socket.
     #[tokio::test]
     async fn a_hello_that_is_not_text_is_answered_rather_than_dropped() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let (reader, mut writer) = server.into_split();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (reader, mut writer) = tokio::io::split(server);
         let mut reader = BufReader::new(reader);
         let mut buf = Vec::new();
 
@@ -1301,7 +1278,7 @@ mod tests {
     /// ended the connection on a closed channel and opting out produced one.
     #[tokio::test]
     async fn a_client_that_wants_only_summaries_stays_connected() {
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
@@ -1344,7 +1321,7 @@ mod tests {
     /// summary stream keeps working alongside.
     #[tokio::test]
     async fn a_client_that_asked_for_events_receives_them() {
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
@@ -1430,7 +1407,7 @@ mod tests {
     /// down, and the daemon treats a dead listener as fatal.
     #[tokio::test(start_paused = true)]
     async fn a_client_that_never_speaks_does_not_hold_its_slot_forever() {
-        let (client, server) = UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(64 * 1024);
         let hub = StateHub::new();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
@@ -1453,7 +1430,7 @@ mod tests {
     /// it retries against a daemon that will keep refusing it.
     #[tokio::test]
     async fn a_refused_client_is_told_the_daemon_is_full() {
-        let (client, server) = UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(64 * 1024);
         reject(server).await;
 
         let mut answer = String::new();
@@ -1502,7 +1479,7 @@ mod tests {
         let link = base.join("sockdir");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let err = prepare_socket_dir(&link).expect_err("a symlink must be refused");
+        let err = prepare_state_dir(&link).expect_err("a symlink must be refused");
         assert!(
             err.to_string().contains("not a directory"),
             "unexpected reason: {err}"
@@ -1521,33 +1498,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        prepare_socket_dir(&dir).expect("our own directory is usable");
+        prepare_state_dir(&dir).expect("our own directory is usable");
 
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "left readable by other users");
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The bug this replaced: unlinking before binding let a second daemon
-    /// steal a live one's path, leaving two sessions on one account.
-    // tokio's UnixListener registers with the reactor, so binding needs a
-    // runtime even though the rest of this check is synchronous.
-    #[tokio::test]
-    async fn binding_over_a_live_socket_fails_instead_of_stealing_it() {
-        let dir = std::env::temp_dir().join(format!("oxidezap-bind-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("daemon.sock");
-        let _ = std::fs::remove_file(&path);
-
-        let first = bind(&path).expect("first bind succeeds");
-        let second = bind(&path);
-        assert!(second.is_err(), "a live socket must not be taken over");
-
-        drop(first);
-        // With the listener gone the path is stale, and reclaiming it is
-        // exactly what lets a daemon restart after a crash.
-        assert!(bind(&path).is_ok(), "a stale socket is reclaimed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

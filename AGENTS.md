@@ -13,11 +13,12 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 - **oxidezap-session**: the WhatsApp connection: events, sends, store hydration.
   Knows nothing about how anything is drawn, and nothing about IPC either —
   the daemon translates requests onto its methods.
-- **oxidezap-ipc**: the wire protocol between the daemon and its front ends.
-  Types only, no sockets and no runtime, so a protocol change breaks
-  compilation on both sides rather than a running client. The domain types in
-  `oxidezap-core` *are* the wire format; this crate adds the framing around
-  them.
+- **oxidezap-ipc**: the wire protocol between the daemon and its front ends,
+  plus the blocking client end of the transport (`Endpoint`). No runtime: a
+  front end needs one thread to read and a lock to serialize writes, and the
+  daemon is the side with thousands of things happening at once. The domain
+  types in `oxidezap-core` *are* the wire format; this crate adds the framing
+  around them.
 - **oxidezap-daemon**: binary `oxidezapd`. The only process that opens the
   store or holds a WhatsApp connection. Serves front ends over a per-user Unix
   socket and carries a tray presence.
@@ -55,6 +56,18 @@ profile here repeats it deliberately.
 
 ## Gotchas
 
+- **The platform split lives in exactly two files.** `ipc/endpoint.rs` is the
+  client end and `daemon/listener.rs` is the server end; everything above them
+  — framing, requests, the whole protocol — is written once. A Unix socket is
+  a filesystem entry that survives a crash and a named pipe is a name that
+  does not, which is why reclaiming a stale endpoint exists on one and not the
+  other.
+- **Nothing stops the daemon but `main`.** The tray's Quit and an IPC
+  `Shutdown` ask through `shutdown::request`; ending the process from a D-Bus
+  callback or a connection task would skip disconnecting the session and
+  closing SQLite. A signal would have been the obvious carrier and is not one
+  Windows has, so the signal handlers feed the same in-process notification
+  rather than being a second route.
 - **The front end owns no session.** `oxidezap` starts `oxidezapd` when none is
   listening and speaks to it; the two ship together and the release packages
   them in one directory. A front end that cannot reach the daemon has no

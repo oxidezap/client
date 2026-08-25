@@ -25,31 +25,80 @@ const SOCKET_NAME: &str = "daemon.sock";
 const DIR_NAME: &str = "oxidezap";
 const MEDIA_DIR: &str = "media";
 
-/// Path of the daemon's listening socket.
+/// Where the daemon listens and a client connects.
 ///
-/// Prefers `XDG_RUNTIME_DIR`, which is per-user, mode 0700 and cleared on
-/// logout: a socket that grants control of a WhatsApp session does not belong
-/// in a world-writable `/tmp`. Falls back to `TMPDIR` with the uid in the
-/// directory name, so two users on one machine cannot collide or reach each
-/// other's daemon.
+/// Two things on Unix and one thing on Windows, which is why it is separate
+/// from [`state_dir`]: a Unix socket *is* a filesystem entry beside the
+/// daemon's other state, while a Windows named pipe is a name in a namespace
+/// of its own and has no directory to sit in.
 ///
-/// Returns `None` when neither is usable rather than inventing a path, so the
-/// caller reports it instead of listening somewhere unexpected.
+/// Returns `None` when there is nowhere sensible rather than inventing a
+/// path, so the caller reports it instead of listening somewhere unexpected.
 #[must_use]
-pub fn socket_path() -> Option<PathBuf> {
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(runtime).join(DIR_NAME).join(SOCKET_NAME));
+pub fn endpoint_path() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        Some(state_dir()?.join(SOCKET_NAME))
+    }
+    #[cfg(windows)]
+    {
+        // Named pipes are machine-wide, so the name carries the user: two
+        // people signed into one machine must not land on each other's
+        // session. The same reason the Unix fallback carries the uid.
+        Some(PathBuf::from(format!(
+            r"\\.\pipe\{DIR_NAME}-{}",
+            user_suffix()
+        )))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// The directory holding everything the daemon keeps between frames: its
+/// startup lock and its media cache.
+///
+/// On Unix this prefers `XDG_RUNTIME_DIR`, which is per-user, mode 0700 and
+/// cleared on logout: a socket that grants control of a WhatsApp session does
+/// not belong in a world-writable `/tmp`. It falls back to `TMPDIR` with the
+/// uid in the directory name, so two users on one machine cannot collide or
+/// reach each other's daemon.
+///
+/// On Windows it is under `LOCALAPPDATA`, which is already inside the user's
+/// profile and so already private to them.
+#[must_use]
+pub fn state_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let local = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty())?;
+        Some(PathBuf::from(local).join(DIR_NAME))
     }
 
-    let tmp = std::env::var_os("TMPDIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    #[cfg(not(windows))]
+    {
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(runtime).join(DIR_NAME));
+        }
 
-    // Only reachable when XDG_RUNTIME_DIR is unset, which is unusual on a
-    // desktop; the uid keeps the fallback per-user anyway.
-    let uid = uid_suffix();
-    Some(tmp.join(format!("{DIR_NAME}-{uid}")).join(SOCKET_NAME))
+        let tmp = std::env::var_os("TMPDIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+
+        // Only reachable when XDG_RUNTIME_DIR is unset, which is unusual on a
+        // desktop; the uid keeps the fallback per-user anyway.
+        Some(tmp.join(format!("{DIR_NAME}-{}", user_suffix())))
+    }
+}
+
+/// Where the daemon's startup lock lives.
+///
+/// A file rather than the socket path with an extension, because on Windows
+/// the endpoint is not a file at all.
+#[must_use]
+pub fn lock_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("daemon.lock"))
 }
 
 /// Where a media payload with this cache key lives.
@@ -57,13 +106,13 @@ pub fn socket_path() -> Option<PathBuf> {
 /// A photo is megabytes and the socket carries newline-delimited JSON, so
 /// media never travels as a frame: the side that has the bytes writes them
 /// here and the other side reads the file. Both derive the path from the same
-/// place the socket comes from, so they cannot disagree about it.
+/// place, so they cannot disagree about it.
 ///
-/// The directory is the daemon's, mode 0700 like its parent, and both
-/// processes run as the same user — a client writing a voice note into it is
-/// putting a file in its own scratch space, not reaching into the daemon.
+/// The directory is the daemon's, and both processes run as the same user — a
+/// client writing a voice note into it is putting a file in its own scratch
+/// space, not reaching into the daemon.
 ///
-/// Returns `None` for the same reason [`socket_path`] does, and for a key that
+/// Returns `None` for the same reason [`state_dir`] does, and for a key that
 /// is not a plain name: a key is echoed from a peer, and one carrying a
 /// separator or a leading dot would name a file outside the cache.
 #[must_use]
@@ -80,18 +129,19 @@ pub fn media_path(key: &str) -> Option<PathBuf> {
 /// The directory [`media_path`] resolves into.
 #[must_use]
 pub fn media_dir() -> Option<PathBuf> {
-    Some(socket_path()?.parent()?.join(MEDIA_DIR))
+    Some(state_dir()?.join(MEDIA_DIR))
 }
 
+/// What distinguishes one user's daemon from another's on the same machine.
 #[cfg(unix)]
-fn uid_suffix() -> String {
+fn user_suffix() -> String {
     // rustix rather than a hand-rolled `extern "C"`: the same syscall with no
     // `unsafe` at this call site, from a crate already in the tree.
     rustix::process::getuid().as_raw().to_string()
 }
 
 #[cfg(not(unix))]
-fn uid_suffix() -> String {
+fn user_suffix() -> String {
     std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string())
 }
 
@@ -136,7 +186,7 @@ mod tests {
 
     #[test]
     fn a_path_is_always_produced() {
-        let path = socket_path().expect("a path is always derivable");
+        let path = endpoint_path().expect("a path is always derivable");
         assert_eq!(path.file_name().unwrap(), SOCKET_NAME);
         assert!(
             path.parent()

@@ -45,9 +45,9 @@ tokio = { workspace = true, features = ["test-util"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.3"
 
-# The Unix syscalls the daemon makes directly: flock for the startup lock,
-# getuid for the socket directory's ownership check, kill for the one
-# shutdown path. Safe wrappers, so none of them needs an `unsafe` block.
+# The Unix syscalls the daemon makes directly: flock for the startup lock and
+# getuid for the state directory's ownership check. Safe wrappers, so neither
+# needs an `unsafe` block.
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
