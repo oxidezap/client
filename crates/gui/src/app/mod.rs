@@ -349,6 +349,9 @@ pub struct WhatsAppApp {
     /// completions autoplay only if they still match it, so a stale download
     /// can't steal playback from media the user started meanwhile.
     pending_media_request: Option<String>,
+    /// Message ids whose media is being fetched right now, so a bubble can
+    /// say so and a second tap cannot start the same download twice.
+    downloads_in_flight: std::collections::HashSet<String>,
     /// Call state (incoming and outgoing calls)
     call_state: CallState,
     /// Cache of JID -> display name mappings (from notify/pushname attribute)
@@ -451,6 +454,7 @@ impl WhatsAppApp {
             audio_owner: None,
             active_media: ActiveMedia::None,
             pending_media_request: None,
+            downloads_in_flight: std::collections::HashSet::new(),
             call_state: CallState::new(),
             name_cache: HashMap::new(),
             video_players: HashMap::new(),

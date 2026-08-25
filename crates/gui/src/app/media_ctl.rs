@@ -282,27 +282,56 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = &self.client else {
-            warn!("Cannot download image: client is unavailable");
-            return;
+        // A second tap while the first is still in flight would download the
+        // same bytes twice; the marker is also what the bubble reads to show
+        // that something is happening.
+        let download_rx = {
+            let Some(client) = &self.client else {
+                warn!("Cannot download image: client is unavailable");
+                return;
+            };
+            client.download_downloadable_media(downloadable)
         };
-        let download_rx = client.download_downloadable_media(downloadable);
+        if !self.begin_download(&message_id, cx) {
+            return;
+        }
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            match download_with_timeout(download_rx).await {
-                Ok(data) => {
-                    info!("Image downloaded: {} bytes", data.len());
-                    let _ = entity.update(cx, |app, cx| {
+            let result = download_with_timeout(download_rx).await;
+            let _ = entity.update(cx, |app, cx| {
+                app.finish_download(&message_id);
+                match result {
+                    Ok(data) => {
+                        info!("Image downloaded: {} bytes", data.len());
                         app.update_message_media_data(&message_id, data);
-                        cx.notify();
-                    });
+                    }
+                    Err(e) => error!("Failed to download image: {}", e),
                 }
-                Err(e) => {
-                    error!("Failed to download image: {}", e);
-                }
-            }
+                cx.notify();
+            });
         })
         .detach();
+    }
+
+    /// Whether a download for this message is in flight.
+    pub fn is_downloading(&self, message_id: &str) -> bool {
+        self.downloads_in_flight.contains(message_id)
+    }
+
+    /// Claim the download slot for a message.
+    ///
+    /// Returns whether the caller owns it — `false` means one is already
+    /// running and this tap should be ignored rather than duplicated.
+    fn begin_download(&mut self, message_id: &str, cx: &mut Context<Self>) -> bool {
+        if !self.downloads_in_flight.insert(message_id.to_string()) {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
+    fn finish_download(&mut self, message_id: &str) {
+        self.downloads_in_flight.remove(message_id);
     }
     /// Download a document and save it to the user's Downloads directory.
     /// Documents open in external apps, so bytes on disk beat cached bytes.
