@@ -69,8 +69,11 @@ pub fn render_chat_header(
     } else {
         match availability {
             Some(Availability::Online) => Some(Presence::Online),
-            Some(Availability::LastSeen(_) | Availability::Unknown) => Some(Presence::Away),
-            None => None,
+            Some(Availability::LastSeen(_)) => Some(Presence::Away),
+            // `Unknown` is "offline and not saying when", which the subtitle
+            // already declines to describe — a dot with no line under it
+            // explaining it asserts more than the app knows.
+            Some(Availability::Unknown) | None => None,
         }
     };
 

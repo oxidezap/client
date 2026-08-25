@@ -113,7 +113,7 @@ pub fn render_notice(text: String, metrics: Metrics, cx: &App) -> impl IntoEleme
 pub fn render_encryption_notice(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     div()
         .flex()
-        .items_center()
+        .items_start()
         .gap(metrics.space_md())
         .px(metrics.space_lg())
         .py(metrics.space_md())
@@ -129,7 +129,11 @@ pub fn render_encryption_notice(metrics: Metrics, cx: &App) -> impl IntoElement 
                 .text_color(cx.theme().success),
         )
         .child(
+            // Shrinkable, so the sentence wraps inside the pill instead of
+            // laying out to its natural width and running out past the border.
             div()
+                .flex_1()
+                .min_w_0()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().muted_foreground)
                 .child(

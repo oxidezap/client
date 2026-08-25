@@ -127,13 +127,25 @@ pub fn render_media_viewer(
                                 app.close_media_viewer(cx);
                             });
                         })
-                        .child(render_frame(
-                            props.image,
-                            props.frame,
-                            is_video,
-                            metrics,
-                            cx,
-                        )),
+                        .child(
+                            // The picture swallows its own clicks. Without
+                            // this they bubble to the scrim and dismiss the
+                            // viewer, so a mis-aimed drag on the photo closes
+                            // the thing being looked at.
+                            div()
+                                .id("viewer-frame")
+                                .flex()
+                                .max_w_full()
+                                .max_h_full()
+                                .on_click(|_, _window, cx| cx.stop_propagation())
+                                .child(render_frame(
+                                    props.image,
+                                    props.frame,
+                                    is_video,
+                                    metrics,
+                                    cx,
+                                )),
+                        ),
                 )
                 .child(step_button(
                     "viewer-next",
@@ -156,7 +168,7 @@ pub fn render_media_viewer(
                     div()
                         .max_w(px(720.0))
                         .text_size(metrics.text_secondary())
-                        .text_color(cx.theme().background)
+                        .text_color(gpui::white())
                         .child(caption),
                 )
         }))
@@ -174,10 +186,11 @@ fn render_bar(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    // Drawn against the scrim, not the theme surface: this bar sits on black
-    // in every preset, so it takes its colours from the scrim rather than
-    // from a background nothing here is painted with.
-    let on_scrim = cx.theme().background;
+    // The scrim is black in every preset, so the ink is the colour that reads
+    // on black. `theme().background` is the *deepest* surface in a dark
+    // preset — near-black text on a near-black scrim, invisible everywhere but
+    // the light theme.
+    let on_scrim = gpui::white();
 
     div()
         .flex_shrink_0()
@@ -246,7 +259,7 @@ fn render_frame(
     frame: Option<Arc<RenderImage>>,
     is_video: bool,
     metrics: Metrics,
-    cx: &App,
+    _cx: &App,
 ) -> impl IntoElement + use<> {
     if let Some(image) = image {
         return img(ImageSource::Image(image))
@@ -279,12 +292,12 @@ fn render_frame(
                 ProductIcon::Image
             })
             .size(metrics.icon())
-            .text_color(cx.theme().background.opacity(0.6)),
+            .text_color(gpui::white().opacity(0.6)),
         )
         .child(
             div()
                 .text_size(metrics.text_secondary())
-                .text_color(cx.theme().background.opacity(0.6))
+                .text_color(gpui::white().opacity(0.6))
                 .child("This file cannot be shown here."),
         )
         .into_any_element()

@@ -27,4 +27,4 @@ pub use events::{ReceiptType, UiEvent};
 pub use message_status::MessageStatus;
 pub use presence::{Availability, ChatTyping, ComposingKind, PresenceRegistry, TypingSummary};
 pub use quoted::{QuotedKind, QuotedMessage};
-pub use system_notice::{CallOutcome, CallRecord, SystemNotice};
+pub use system_notice::{CallOutcome, CallRecord, SystemNotice, format_duration};

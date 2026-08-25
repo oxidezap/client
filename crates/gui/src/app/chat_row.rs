@@ -5,7 +5,9 @@
 //! badge is a count or a dot — can be tested without a window.
 
 use chrono::{DateTime, Utc};
-use oxidezap_core::{Chat, ChatMessage, MediaType, MessageStatus, SystemNotice, TypingSummary};
+use oxidezap_core::{
+    Chat, ChatMessage, MediaType, MessageStatus, SystemNotice, TypingSummary, format_duration,
+};
 
 /// The badge at the end of a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,16 +198,6 @@ fn body_for(last: &ChatMessage) -> String {
     }
 }
 
-/// `m:ss`, or `h:mm:ss` past an hour.
-pub fn format_duration(total_secs: u32) -> String {
-    let (hours, minutes, seconds) = (total_secs / 3600, (total_secs / 60) % 60, total_secs % 60);
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes}:{seconds:02}")
-    }
-}
-
 /// Collapse whitespace so a multi-line message cannot stretch a fixed row.
 fn single_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -375,12 +367,5 @@ mod tests {
             Unread::Count(3),
             "a real count wins over the sentinel"
         );
-    }
-
-    #[test]
-    fn durations_grow_a_leading_hour_only_when_they_need_one() {
-        assert_eq!(format_duration(7), "0:07");
-        assert_eq!(format_duration(74), "1:14");
-        assert_eq!(format_duration(3_725), "1:02:05");
     }
 }

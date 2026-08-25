@@ -49,7 +49,6 @@ pub fn render_message_list(
     _cx: &App,
 ) -> impl IntoElement {
     let metrics = *layout.metrics();
-    let padding = layout.padding();
 
     if cache.messages.is_empty() {
         return div()
@@ -81,7 +80,8 @@ pub fn render_message_list(
                 )
             })
             .size_full()
-            .px(padding),
+            .px(layout.conversation_padding())
+            .py(layout.conversation_gap()),
         )
         .into_any_element()
 }

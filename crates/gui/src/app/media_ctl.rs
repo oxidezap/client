@@ -79,8 +79,11 @@ impl WhatsAppApp {
     ///
     /// Playback continues from there rather than restarting, which is what
     /// makes the waveform a scrub bar and not a progress read-out.
-    pub fn seek_audio(&mut self, fraction: f32, cx: &mut Context<Self>) {
-        if self.audio_owner.is_none() {
+    pub fn seek_audio(&mut self, message_id: &str, fraction: f32, cx: &mut Context<Self>) {
+        // Named, not merely "something is loaded": every downloaded voice note
+        // draws a scrubbable waveform, and an unnamed seek let a click on one
+        // row move the position of whichever clip happened to be loaded.
+        if self.audio_owner.as_deref() != Some(message_id) {
             return;
         }
         self.audio_player.seek(fraction);
@@ -205,6 +208,9 @@ impl WhatsAppApp {
                 self.audio_player.pause();
             } else {
                 self.audio_player.resume();
+                // The tick loop ends as soon as playback stops, so a resume
+                // has to start a new one or the playhead never moves again.
+                self.ensure_playback_tick(cx);
             }
         } else {
             // Different message or not playing - play it
@@ -225,6 +231,7 @@ impl WhatsAppApp {
                 self.audio_player.pause();
             } else {
                 self.audio_player.resume();
+                self.ensure_playback_tick(cx);
             }
             cx.notify();
             return;
@@ -346,13 +353,22 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = &self.client else {
+        if self.client.is_none() {
             warn!("Cannot download document: client is unavailable");
+            return;
+        }
+        // The same slot an image claims, so the card can say "Saving…" and a
+        // second tap does not start a second download.
+        if !self.begin_download(&message_id, cx) {
+            return;
+        }
+        let Some(client) = &self.client else {
+            self.finish_download(&message_id);
             return;
         };
         let download_rx = client.download_downloadable_media(downloadable);
 
-        cx.spawn(async move |_entity: WeakEntity<Self>, cx| {
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
                 Ok(data) => {
                     let saved = cx
@@ -365,6 +381,10 @@ impl WhatsAppApp {
                 }
                 Err(e) => error!("Failed to download document {}: {}", message_id, e),
             }
+            let _ = entity.update(cx, |app, cx| {
+                app.finish_download(&message_id);
+                cx.notify();
+            });
         })
         .detach();
     }

@@ -264,6 +264,28 @@ impl ResponsiveLayout {
         }
     }
 
+    /// The conversation's own gutter, which is wider than a panel's padding.
+    ///
+    /// A bubble is a shape with an edge, and an edge sitting 16px from the
+    /// window reads as clipped rather than placed. The timeline gets room on
+    /// both sides for the same reason it gets room above the composer: this
+    /// is the surface the reader spends their time in.
+    pub fn conversation_padding(&self) -> Pixels {
+        if self.is_mobile() {
+            self.metrics.space_lg()
+        } else {
+            self.metrics.space_xxxl()
+        }
+    }
+
+    /// Breathing room at the head and foot of the timeline.
+    ///
+    /// Without it the newest message sits on the composer and the oldest
+    /// under the header, which is what made the whole pane read as crowded.
+    pub fn conversation_gap(&self) -> Pixels {
+        self.metrics.space_xl()
+    }
+
     pub fn padding_small(&self) -> Pixels {
         if self.is_mobile() {
             self.metrics.space_md()

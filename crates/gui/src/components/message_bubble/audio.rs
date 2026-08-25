@@ -89,7 +89,7 @@ pub(super) fn render_audio_player(
                 // number a listener wants at each moment.
                 .child(format_clock(elapsed.or(duration))),
         )
-        .child(render_speed_chip(speed, entity, metrics, cx))
+        .child(render_speed_chip(&message_id, speed, entity, metrics, cx))
 }
 
 fn render_play_button(
@@ -146,6 +146,7 @@ fn render_waveform(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let id: SharedString = format!("waveform-{message_id}").into();
+    let seek_id = message_id.to_string();
     let height = metrics.waveform_height();
     let played = cx.theme().primary;
     let remaining = cx.product().hsla(cx.product().palette.faint_foreground);
@@ -176,7 +177,7 @@ fn render_waveform(
                 MouseButton::Left,
                 move |event: &MouseDownEvent, _w, cx| {
                     let fraction = seek_fraction(event.position.x, strip.get());
-                    entity.update(cx, |app, cx| app.seek_audio(fraction, cx));
+                    entity.update(cx, |app, cx| app.seek_audio(&seek_id, fraction, cx));
                 },
             )
         })
@@ -212,6 +213,7 @@ fn render_waveform(
 
 /// 1× / 1.5× / 2×, cycled by clicking.
 fn render_speed_chip(
+    message_id: &str,
     speed: f32,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
@@ -220,7 +222,10 @@ fn render_speed_chip(
     let is_default = (speed - 1.0).abs() < f32::EPSILON;
 
     div()
-        .id("playback-speed")
+        // Per message: a GPUI id is scoped to its first identified ancestor,
+        // and every voice note in a conversation is a sibling of the rest, so
+        // one constant made them all the same element.
+        .id(SharedString::from(format!("playback-speed-{message_id}")))
         .flex_shrink_0()
         .px(metrics.space_sm())
         .rounded_full()
@@ -281,7 +286,7 @@ pub fn resample(source: Option<&[u8]>, target: usize) -> Vec<u8> {
 /// `m:ss`, or a placeholder when the length is unknown.
 fn format_clock(secs: Option<u32>) -> String {
     match secs {
-        Some(secs) => crate::app::chat_row::format_duration(secs),
+        Some(secs) => oxidezap_core::format_duration(secs),
         None => "--:--".to_string(),
     }
 }

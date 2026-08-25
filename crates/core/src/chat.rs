@@ -611,12 +611,11 @@ impl Chat {
                 return;
             }
         }
-        // An empty participant means the quote came off a 1:1, where the only
-        // two authors are the chat and the reader.
+        // No participant on the envelope and no loaded original: nobody here
+        // knows who wrote it. Naming the chat would be a guess, and in a 1:1
+        // it is wrong exactly when the reader quoted themselves — the quote
+        // bar falls back to its own generic label instead.
         if quoted.sender.is_empty() {
-            if !self.is_group {
-                quoted.sender_name = self.name.clone();
-            }
             return;
         }
         if let Some(name) = self.participants.get(&quoted.sender) {

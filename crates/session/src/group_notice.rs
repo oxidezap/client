@@ -8,13 +8,17 @@
 //! being news in it, and a row for each would bury the conversation.
 
 use whatsapp_rust::wacore::stanza::groups::{GroupNotificationAction, GroupParticipantInfo};
-use whatsapp_rust::wacore_binary::jid::Jid;
+use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _};
 
 /// What to say about `action`, or `None` when it is not worth a row.
 ///
 /// `actor` is whoever triggered the change, already resolved to a name where
 /// one is known.
-pub fn describe(action: &GroupNotificationAction, actor: Option<&str>) -> Option<String> {
+pub fn describe(
+    action: &GroupNotificationAction,
+    actor: Option<&str>,
+    actor_jid: Option<&Jid>,
+) -> Option<String> {
     let who = actor.unwrap_or("Someone");
     Some(match action {
         GroupNotificationAction::Add { participants, .. } => {
@@ -23,8 +27,10 @@ pub fn describe(action: &GroupNotificationAction, actor: Option<&str>) -> Option
         // Leaving and being removed read very differently, and the difference
         // is whether the actor is the only participant named.
         GroupNotificationAction::Remove { participants, .. } => {
+            // Identity, not display name: two members can share a name, and an
+            // admin removing their namesake would have read as "Ana left".
             if let [only] = participants.as_slice()
-                && actor.is_some_and(|actor| actor == name_of(only))
+                && actor_jid.is_some_and(|actor| actor.is_same_user_as(&only.jid))
             {
                 format!("{who} left")
             } else {
@@ -146,9 +152,13 @@ mod tests {
             subject_time: None,
         };
         assert_eq!(
-            describe(&action, Some("Ana")).as_deref(),
+            describe(&action, Some("Ana"), None).as_deref(),
             Some("Ana changed the group name to \"Trip\"")
         );
+    }
+
+    fn jid(user: &str) -> Jid {
+        format!("{user}@s.whatsapp.net").parse().expect("valid jid")
     }
 
     #[test]
@@ -157,7 +167,10 @@ mod tests {
             participants: vec![participant("1", Some("Ana"))],
             reason: None,
         };
-        assert_eq!(describe(&action, Some("Ana")).as_deref(), Some("Ana left"));
+        assert_eq!(
+            describe(&action, Some("Ana"), Some(&jid("1"))).as_deref(),
+            Some("Ana left")
+        );
     }
 
     #[test]
@@ -167,8 +180,22 @@ mod tests {
             reason: None,
         };
         assert_eq!(
-            describe(&action, Some("Ana")).as_deref(),
+            describe(&action, Some("Ana"), Some(&jid("1"))).as_deref(),
             Some("Ana removed Bruno")
+        );
+    }
+
+    /// Two members can share a display name, and an admin removing their
+    /// namesake is not that namesake leaving.
+    #[test]
+    fn a_namesake_removal_is_not_a_departure() {
+        let action = GroupNotificationAction::Remove {
+            participants: vec![participant("2", Some("Ana"))],
+            reason: None,
+        };
+        assert_eq!(
+            describe(&action, Some("Ana"), Some(&jid("1"))).as_deref(),
+            Some("Ana removed Ana")
         );
     }
 
@@ -183,7 +210,7 @@ mod tests {
             reason: None,
         };
         assert_eq!(
-            describe(&action, Some("You")).as_deref(),
+            describe(&action, Some("You"), None).as_deref(),
             Some("You added Ana and 2 others")
         );
     }
@@ -195,7 +222,7 @@ mod tests {
             reason: None,
         };
         assert_eq!(
-            describe(&action, None).as_deref(),
+            describe(&action, None, None).as_deref(),
             Some("Someone added 5511999")
         );
     }
@@ -203,7 +230,7 @@ mod tests {
     #[test]
     fn bookkeeping_gets_no_row() {
         let action = GroupNotificationAction::RevokeInvite;
-        assert!(describe(&action, Some("Ana")).is_none());
+        assert!(describe(&action, Some("Ana"), None).is_none());
     }
 
     #[test]

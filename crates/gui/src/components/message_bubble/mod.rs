@@ -125,6 +125,10 @@ pub fn render_message_bubble(
     div()
         .id(SharedString::from(format!("row-{message_id}")))
         .w_full()
+        // The row gives before the gutter does: a bubble at its maximum width
+        // plus the action bar beside it is wider than a narrow pane, and
+        // without this the overflow went out through the window's edge.
+        .min_w_0()
         .flex()
         .group(SharedString::from(format!("bubble-{message_id}")))
         .map(|el| {
@@ -146,6 +150,7 @@ pub fn render_message_bubble(
         .when(is_from_me, |el| {
             el.child(
                 div()
+                    .flex_shrink_0()
                     .invisible()
                     .group_hover(SharedString::from(format!("bubble-{message_id}")), |s| {
                         s.visible()
@@ -161,6 +166,7 @@ pub fn render_message_bubble(
         })
         .child(
             v_flex()
+                .min_w_0()
                 .when(is_from_me, |el| el.items_end())
                 .when(!is_from_me, |el| el.items_start())
                 .child(
@@ -267,6 +273,7 @@ pub fn render_message_bubble(
         .when(!is_from_me, |el| {
             el.child(
                 div()
+                    .flex_shrink_0()
                     .invisible()
                     .group_hover(SharedString::from(format!("bubble-{message_id}")), |s| {
                         s.visible()

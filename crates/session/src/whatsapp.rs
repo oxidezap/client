@@ -685,8 +685,11 @@ impl WhatsAppClient {
                     update.participant.as_ref(),
                     update.participant_username.as_deref(),
                 );
-                if let Some(text) = crate::group_notice::describe(&update.action, actor.as_deref())
-                {
+                if let Some(text) = crate::group_notice::describe(
+                    &update.action,
+                    actor.as_deref(),
+                    update.participant.as_ref(),
+                ) {
                     let _ = ui_tx.send(UiEvent::SystemNotice {
                         chat_jid: update.group_jid.to_string(),
                         // The stanza id plus the index within it: one

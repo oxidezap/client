@@ -753,18 +753,26 @@ async fn handle_request(
                     .ok(),
                 );
             };
-            acted(
-                dispatch(
-                    hub,
-                    commands,
-                    Action::Download {
-                        id,
-                        media,
-                        answer_to: outbox.clone(),
-                    },
-                )
-                .await,
+            // The one request whose answer is *not* an acknowledgement. It
+            // comes back as `Downloaded` under this id, seconds later, from
+            // the task the action spawns — so acknowledging it here would be
+            // a second answer under the same id, and a client that took its
+            // waiter off the first one would drop the bytes when they arrived.
+            // Only a refusal is answered here, because then nothing else will.
+            match dispatch(
+                hub,
+                commands,
+                Action::Download {
+                    id,
+                    media,
+                    answer_to: outbox.clone(),
+                },
             )
+            .await
+            {
+                Ok(()) => Answer::frame(None),
+                Err(error) => Answer::frame(error_frame(Some(id), error).ok()),
+            }
         }
         ClientRequest::ReloadHistory => acted(dispatch(hub, commands, Action::ReloadHistory).await),
         ClientRequest::ForgetSession => acted(dispatch(hub, commands, Action::ForgetSession).await),

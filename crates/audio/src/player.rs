@@ -20,6 +20,13 @@ pub struct AudioPlayer {
     position: Arc<AtomicUsize>,
     total_samples: u64,
     sample_rate: u32,
+    /// Interleaved channels in the output stream.
+    ///
+    /// `position` and `total_samples` count *samples*, and the resampler
+    /// writes one per channel per frame, so a second of stereo audio is two
+    /// `sample_rate`s worth of them. Without this the clock ran at double
+    /// speed on any stereo device and passed the clip's stated length.
+    channels: usize,
     completion_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -35,6 +42,7 @@ impl AudioPlayer {
             stream: None,
             is_playing: Arc::new(AtomicBool::new(false)),
             position: Arc::new(AtomicUsize::new(0)),
+            channels: 1,
             total_samples: 0,
             sample_rate: 48000,
             completion_tx: None,
@@ -67,34 +75,44 @@ impl AudioPlayer {
     ///
     /// Playback continues from there rather than restarting: the callback
     /// reads this counter every buffer, so moving it is the whole seek. The
-    /// position is in output frames, which is what makes a mid-clip scrub land
-    /// where the waveform says it will.
+    /// counter is in interleaved samples, so the target is rounded down to a
+    /// frame boundary — landing mid-frame on a stereo stream swaps the
+    /// channels for the rest of the clip.
     pub fn seek(&self, fraction: f32) {
         if self.total_samples == 0 {
             return;
         }
+        let channels = self.channels.max(1);
         let target = (fraction.clamp(0.0, 1.0) * self.total_samples as f32) as usize;
+        let aligned = target - (target % channels);
         // One frame short of the end: landing exactly on it would let the
         // callback fire completion for a seek the user meant as "replay the
         // last moment".
-        let last = (self.total_samples as usize).saturating_sub(1);
-        self.position.store(target.min(last), Ordering::Relaxed);
+        let last = (self.total_samples as usize).saturating_sub(channels);
+        self.position.store(aligned.min(last), Ordering::Relaxed);
+    }
+
+    /// Interleaved samples in one second of output.
+    fn samples_per_sec(&self) -> usize {
+        self.sample_rate as usize * self.channels.max(1)
     }
 
     /// Seconds of audio played so far.
     pub fn elapsed_secs(&self) -> f32 {
-        if self.sample_rate == 0 {
+        let per_sec = self.samples_per_sec();
+        if per_sec == 0 {
             return 0.0;
         }
-        self.position.load(Ordering::Relaxed) as f32 / self.sample_rate as f32
+        self.position.load(Ordering::Relaxed) as f32 / per_sec as f32
     }
 
     /// Total length in seconds, or zero when nothing is loaded.
     pub fn total_secs(&self) -> f32 {
-        if self.sample_rate == 0 {
+        let per_sec = self.samples_per_sec();
+        if per_sec == 0 {
             return 0.0;
         }
-        self.total_samples as f32 / self.sample_rate as f32
+        self.total_samples as f32 / per_sec as f32
     }
 
     pub fn play(&mut self, ogg_data: Vec<u8>) -> Result<(), PlayerError> {
@@ -171,6 +189,7 @@ impl AudioPlayer {
         .into();
         self.sample_rate = config.sample_rate;
         let output_channels = config.channels as usize;
+        self.channels = output_channels.max(1);
 
         info!(
             "Output config: {} Hz, {} channels, {:?}",
@@ -250,6 +269,7 @@ impl AudioPlayer {
         self.is_playing.store(false, Ordering::Relaxed);
         self.position.store(0, Ordering::Relaxed);
         self.total_samples = 0;
+        self.channels = 1;
         self.completion_tx = None;
     }
 
@@ -524,5 +544,52 @@ mod tests {
 
         player.seek(7.5);
         assert_eq!(player.position.load(Ordering::Relaxed), 999);
+    }
+
+    /// The resampler writes one sample per channel per frame, so a stereo
+    /// clip holds twice the samples of the same clip in mono. Dividing by the
+    /// sample rate alone ran the clock at double speed and took the elapsed
+    /// count past the duration the message advertised.
+    #[test]
+    fn a_stereo_clip_lasts_as_long_as_the_same_clip_in_mono() {
+        let mut mono = AudioPlayer::new();
+        mono.total_samples = 1000;
+        mono.sample_rate = 100;
+        mono.channels = 1;
+
+        let mut stereo = AudioPlayer::new();
+        stereo.total_samples = 2000;
+        stereo.sample_rate = 100;
+        stereo.channels = 2;
+
+        assert!((mono.total_secs() - 10.0).abs() < f32::EPSILON);
+        assert!(
+            (stereo.total_secs() - 10.0).abs() < f32::EPSILON,
+            "ten seconds of audio is ten seconds however many channels carry it"
+        );
+
+        stereo.seek(0.25);
+        assert!((stereo.elapsed_secs() - 2.5).abs() < f32::EPSILON);
+    }
+
+    /// A seek that lands between the left and right sample of one frame
+    /// swaps the channels for the rest of the clip.
+    #[test]
+    fn a_seek_lands_on_a_frame_boundary() {
+        let mut player = AudioPlayer::new();
+        player.total_samples = 1000;
+        player.sample_rate = 100;
+        player.channels = 2;
+
+        // 0.3335 * 1000 = 333 samples, which is mid-frame.
+        player.seek(0.3335);
+        let position = player.position.load(Ordering::Relaxed);
+        assert_eq!(position % 2, 0, "a stereo position is a whole frame");
+        assert_eq!(position, 332);
+
+        player.seek(1.0);
+        let end = player.position.load(Ordering::Relaxed);
+        assert_eq!(end % 2, 0);
+        assert_eq!(end, 998, "one whole frame short of the end");
     }
 }

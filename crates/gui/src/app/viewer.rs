@@ -98,11 +98,14 @@ impl MediaViewer {
 /// Downloaded bytes are the bar, not the media kind: an image whose bytes are
 /// still a blurred placeholder would open to a blurred placeholder at full
 /// size, which reads as a broken viewer rather than a pending download.
+///
+/// Pictures only. A video's bytes are an encoded stream, and the viewer has
+/// no decoder of its own — opening one would show the "cannot be shown"
+/// placeholder for something it had just called viewable. Video plays in its
+/// bubble until the viewer grows a player.
 fn is_viewable(message: &ChatMessage) -> bool {
     message.media.as_ref().is_some_and(|media| {
-        matches!(media.media_type, MediaType::Image | MediaType::Video)
-            && !media.data.is_empty()
-            && !media.data_is_preview
+        media.media_type == MediaType::Image && !media.data.is_empty() && !media.data_is_preview
     })
 }
 
@@ -143,13 +146,31 @@ mod tests {
         }
     }
 
+    fn video() -> MediaContent {
+        MediaContent {
+            media_type: MediaType::Video,
+            ..image(false, true)
+        }
+    }
+
     fn history() -> Vec<ChatMessage> {
         vec![
             message("text", None),
             message("photo-1", Some(image(false, true))),
             message("thumb", Some(image(true, true))),
+            message("clip", Some(video())),
             message("photo-2", Some(image(false, true))),
         ]
+    }
+
+    #[test]
+    fn a_video_is_not_something_the_viewer_can_show() {
+        assert!(MediaViewer::open("chat".into(), "clip", &history()).is_none());
+        let viewer = MediaViewer::open("chat".into(), "photo-1", &history()).expect("viewable");
+        assert!(
+            !viewer.items.iter().any(|id| id == "clip"),
+            "and stepping does not land on one"
+        );
     }
 
     #[test]

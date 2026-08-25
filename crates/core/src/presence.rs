@@ -77,6 +77,10 @@ impl ChatTyping {
         self.participants.retain(|_, c| c.expires_at > now);
     }
 
+    fn len(&self) -> usize {
+        self.participants.len()
+    }
+
     fn is_empty(&self) -> bool {
         self.participants.is_empty()
     }
@@ -248,12 +252,20 @@ impl PresenceRegistry {
     /// Returns whether anything was removed, so the caller can skip a redraw.
     pub fn prune(&mut self) -> bool {
         let now = wacore::time::now_utc();
-        let before = self.typing.len();
+        // Typists, not chats. Counting chats missed the case that matters in
+        // a group: one of two typists stops, the chat is still typing, and the
+        // caller skipped the redraw that would have dropped their name.
+        let before = self.typists();
         for entry in self.typing.values_mut() {
             entry.drop_expired(now);
         }
         self.typing.retain(|_, entry| !entry.is_empty());
-        before != self.typing.len()
+        before != self.typists()
+    }
+
+    /// How many people are typing anywhere.
+    fn typists(&self) -> usize {
+        self.typing.values().map(ChatTyping::len).sum()
     }
 }
 

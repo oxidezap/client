@@ -262,6 +262,13 @@ impl CallState {
     /// the current one alone, which is what keeps a late ack for a call
     /// already gone from cancelling its successor.
     pub fn dismiss_incoming(&mut self, call_id: &CallId) -> bool {
+        // A parked second offer is an incoming call too. Matching only the
+        // stage left a refused caller sitting in the state, to be published
+        // back to the front end that had just refused them.
+        if self.waiting.as_ref().is_some_and(|w| w.call_id == *call_id) {
+            self.waiting = None;
+            return true;
+        }
         if matches!(&self.stage, Some(Stage::Incoming(call)) if call.call_id == *call_id) {
             self.stage = None;
             return true;
@@ -539,6 +546,23 @@ mod tests {
         assert!(state.end(&"SECOND".to_string()));
         assert!(state.waiting().is_none());
         assert_eq!(state.stage().unwrap().call_id(), "FIRST");
+    }
+
+    /// Refusing the parked caller has to remove them from the state that
+    /// gets published, or the next snapshot brings the strip back.
+    #[test]
+    fn dismissing_reaches_the_parked_call_too() {
+        let mut state = CallState::new();
+        state.set_incoming(incoming("FIRST"));
+        state.set_incoming(incoming("SECOND"));
+
+        assert!(state.dismiss_incoming(&"SECOND".to_string()));
+        assert!(state.waiting().is_none());
+        assert_eq!(
+            state.stage().unwrap().call_id(),
+            "FIRST",
+            "the call on screen is untouched"
+        );
     }
 
     #[test]
