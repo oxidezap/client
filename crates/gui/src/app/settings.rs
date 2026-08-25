@@ -125,11 +125,20 @@ impl WhatsAppApp {
             return;
         };
         let waiting = client.storage_usage();
+        // Which account asked. The task is detached and the daemon it asked
+        // can be replaced while it is still measuring, so the answer has to
+        // say whose it is: Settings stays open across a re-pair, and the old
+        // account's totals landing under the new one is a number that is
+        // simply untrue.
+        let epoch = self.account_epoch;
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let Ok(usage) = waiting.await else {
                 return;
             };
             let _ = entity.update(cx, |app, cx| {
+                if app.account_epoch != epoch {
+                    return;
+                }
                 app.storage_usage = Some(usage);
                 cx.notify();
             });

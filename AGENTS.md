@@ -148,6 +148,12 @@ profile here repeats it deliberately.
   `CallState::promote_waiting` is one method that `take`, `end` and
   `fail_outgoing_to` all go through, and why `take_incoming`/`take_outgoing`
   deliberately do not: those hand the stage to what replaces it.
+- **A revoked message is a fact, not a sentence.** The store keeps the row
+  and hydration turns it into "[Message deleted]" — which a conversation is
+  right to draw and the status feed is not: an update its author took back has
+  nothing left to watch, and counting it kept a ring and a badge up for the
+  rest of its 24 hours. `ChatMessage::revoked` is what the feed asks, so
+  nobody has to recognise the text.
 - **A transient surface that takes the keyboard has to give it back, and to
   one place.** The call card's Enter and Escape and the viewer's arrow keys
   are scoped to their key contexts, so they do nothing unless something

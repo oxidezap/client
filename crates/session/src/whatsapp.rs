@@ -855,6 +855,7 @@ impl WhatsAppClient {
                 MessageStatus::default()
             },
             quoted: quoted_from(base_msg),
+            revoked: false,
             system: None,
         };
 
@@ -2496,6 +2497,7 @@ fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage) -> ChatMes
             MessageStatus::default()
         },
         quoted,
+        revoked: stored.revoked,
         system: None,
     }
 }
@@ -2937,6 +2939,7 @@ mod tests {
             reactions: HashMap::new(),
             status: MessageStatus::default(),
             quoted: None,
+            revoked: false,
             system: None,
         };
         let mut chat = Chat::new("111222333444555@lid".to_string());

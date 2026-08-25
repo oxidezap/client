@@ -14,6 +14,12 @@ impl WhatsAppApp {
         if self.settings.is_some() {
             self.settings = None;
         }
+        // And so does searching from Status: the field belongs to the chat
+        // list, and that list is not on screen while the status list is in its
+        // slot. Focusing it there handed the keyboard to an input nothing was
+        // drawing — the shortcut looked like it had done nothing, and every
+        // keystroke after it edited a query no one could see.
+        self.set_destination(Destination::Chats, cx);
         // Mobile shows one pane at a time, and the field lives on the list.
         if self.mobile_panel.is_chat() {
             self.mobile_panel = MobilePanel::ChatList;
@@ -258,6 +264,11 @@ impl WhatsAppApp {
             return true;
         }
         false
+    }
+
+    /// Whether a Settings screen is up, for `sync_overlay_focus`.
+    pub(super) fn showing_settings(&self) -> bool {
+        self.settings.is_some()
     }
 
     /// Escape: dismiss the topmost surface, one layer per press.

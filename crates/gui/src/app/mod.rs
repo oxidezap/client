@@ -104,6 +104,14 @@ enum KeyboardOwner {
     RingingCall(String),
     /// The fullscreen viewer, which owns the arrow keys while it is up.
     Viewer,
+    /// A screen with its own controls — Settings. Nothing here focuses it:
+    /// the control the user clicked already has the keyboard, and taking it
+    /// away would be worse than leaving it. Naming it is the point, because
+    /// that is what makes *leaving* Settings a change — otherwise the owner
+    /// still read `Composer` throughout, the next sync saw nothing to do, and
+    /// the window was left with its keyboard on a control that had stopped
+    /// being rendered.
+    Screen,
 }
 
 struct TimelineAnchor {
@@ -556,6 +564,13 @@ pub struct WhatsAppApp {
     /// Chat the current PTT recording started in; the note is sent there even
     /// if the user switches chats before stopping
     recording_target: Option<RecordingTarget>,
+    /// Which account the answers still in flight belong to.
+    ///
+    /// A measurement asked of one daemon can land after the window has been
+    /// handed to another, and the surfaces that show it — Settings, most of
+    /// all — survive the change. Bumped by `forget_account_state`; an answer
+    /// whose epoch no longer matches is dropped rather than displayed.
+    account_epoch: usize,
     /// Which recording the encode still in flight belongs to.
     ///
     /// Encoding runs detached on the background pool and nothing can stop it,
@@ -754,6 +769,7 @@ impl WhatsAppApp {
             audio_recorder: AudioRecorder::new(),
             recording_state: RecordingState::default(),
             recording_target: None,
+            account_epoch: 0,
             recording_epoch: 0,
             audio_player: AudioPlayer::new(),
             playback_speed: 1.0,
@@ -1182,6 +1198,12 @@ impl WhatsAppApp {
         // recreating a chat for the old account's peer to hold it.
         self.call_state = CallState::new();
         self.call_card.call_ended();
+        // What the *old* account occupied, and the query that is still
+        // measuring it. Settings survives the reset, so a completion landing
+        // after it would show the previous account's database and media under
+        // the new one; `account_epoch` is what the detached task checks.
+        self.storage_usage = None;
+        self.account_epoch = self.account_epoch.wrapping_add(1);
         self.chats.clear();
         self.selected_chat = None;
         self.visible_chat = None;
@@ -1414,11 +1436,15 @@ impl WhatsAppApp {
     /// deletion is a fact from the moment the complete load arrived, and the
     /// only reason to keep the rows is that someone is reading them.
     ///
-    /// Called at the top of the render pass, against what the *previous*
-    /// frame drew, because that is the one place every way of looking away —
+    /// Called from the render pass, straight after
+    /// [`Self::note_visible_conversation`] and before anything reads the chat
+    /// list — so it answers against *this* frame's visibility rather than the
+    /// last one's. Every way of looking away is already accounted for there:
     /// Status, Settings, the viewer, another conversation, a phone going back
-    /// to its list — is already accounted for.
-    fn prune_departed_chats(&mut self) {
+    /// to its list. Asking a frame earlier meant a mobile Back deferred the
+    /// removal one last time and then drew the list with the stale row still
+    /// in it, with no repaint scheduled to take it away.
+    pub(crate) fn prune_departed_chats(&mut self) {
         if self.departed_chats.is_empty() {
             return;
         }
@@ -2459,11 +2485,6 @@ impl Focusable for WhatsAppApp {
 impl Render for WhatsAppApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
-        // Against what the last frame drew, so it has to happen before that
-        // record is cleared: a chat a complete load said was gone is kept
-        // only while it is on screen, and this is where looking away is
-        // noticed. See `prune_departed_chats`.
-        self.prune_departed_chats();
         // Cleared here and set by whichever branch below actually draws a
         // conversation, so it describes this frame rather than an older one:
         // the pairing, error and Settings screens draw none.

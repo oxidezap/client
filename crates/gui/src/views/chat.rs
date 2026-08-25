@@ -60,6 +60,10 @@ pub fn render_connected_view(
         .then(|| selected_jid.clone())
         .flatten(),
     );
+    // Against what this frame is about to draw, and before anything reads the
+    // chat list: a chat a complete load said was gone is kept only while it is
+    // on screen, and this is where looking away is noticed.
+    app.prune_departed_chats();
 
     let viewer_focus = app.viewer_focus().clone();
 

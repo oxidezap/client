@@ -1441,6 +1441,7 @@ mod tests {
             reactions: Default::default(),
             status: Default::default(),
             quoted: None,
+            revoked: false,
             system: None,
         }
     }

@@ -81,7 +81,12 @@ impl WhatsAppApp {
             warn!("Cannot decline call: client is unavailable");
             return;
         };
-        if let Some(call) = self.call_state.take_incoming() {
+        // `decline_incoming`, not `take_incoming`: refusing an offer replaces
+        // it with nothing, so a caller parked behind it has to come forward.
+        // Taking the stage without promoting left the optimistic state with
+        // no stage at all, and the card drew neither caller until a daemon
+        // update repaired it — or, if the decline never landed, not at all.
+        if let Some(call) = self.call_state.decline_incoming() {
             info!(
                 "Declining call {} from {}",
                 call.call_id,
@@ -334,6 +339,7 @@ impl WhatsAppApp {
         {
             Some(stage) => KeyboardOwner::RingingCall(stage.call_id().to_string()),
             None if self.media_viewer.is_some() => KeyboardOwner::Viewer,
+            None if self.showing_settings() => KeyboardOwner::Screen,
             None => KeyboardOwner::Composer,
         };
         if wanted == self.keyboard_owner {
@@ -342,6 +348,9 @@ impl WhatsAppApp {
         match &wanted {
             KeyboardOwner::RingingCall(_) => window.focus(&self.call_focus, cx),
             KeyboardOwner::Viewer => window.focus(&self.viewer_focus, cx),
+            // Nothing to hand it to, and nothing that needs handing: see the
+            // variant.
+            KeyboardOwner::Screen => {}
             KeyboardOwner::Composer => self.focus_composer(window, cx),
         }
         self.keyboard_owner = wanted;

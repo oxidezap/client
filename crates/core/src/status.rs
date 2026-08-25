@@ -106,6 +106,14 @@ impl StatusFeed {
             if message.system.is_some() {
                 continue;
             }
+            // Nor can one the author took back. The row survives — the store
+            // keeps what it was told, and the tombstone is what a conversation
+            // draws — but there is nothing left to watch, so counting it kept
+            // a ring and a badge up for the rest of its 24 hours, over a
+            // reader that opened on "[Message deleted]".
+            if message.revoked {
+                continue;
+            }
             // An update older than its lifetime is not there any more. The row
             // is, because the store keeps what it was told; the feed is what
             // says whether it can still be watched.
@@ -263,6 +271,38 @@ mod tests {
     /// real one these tests would start failing a day after they were written.
     fn feed_of(messages: Vec<ChatMessage>) -> StatusFeed {
         StatusFeed::from_chat_at(&broadcast(messages), at(59))
+    }
+
+    /// A contact deleting a status they posted an hour ago leaves a row —
+    /// the store keeps what it was told — but nothing to look at. Counted, it
+    /// kept the ring and the badge up for the rest of the update's 24 hours
+    /// and opened a reader on "[Message deleted]".
+    #[test]
+    fn an_update_its_author_took_back_is_not_in_the_feed() {
+        let mut revoked = update("gone", "a@s.whatsapp.net", Some("Ana"), 10, false);
+        revoked.revoked = true;
+        let feed = feed_of(vec![
+            revoked,
+            update("kept", "a@s.whatsapp.net", Some("Ana"), 20, false),
+        ]);
+
+        let author = feed.author("a@s.whatsapp.net").expect("Ana still posted");
+        assert_eq!(author.count(), 1, "only the update that is still there");
+        assert_eq!(
+            feed.updates_of(author).map(|m| m.id.as_str()).next(),
+            Some("kept")
+        );
+        assert_eq!(feed.unseen_authors(), 1);
+    }
+
+    #[test]
+    fn an_author_whose_only_update_was_revoked_leaves_the_feed() {
+        let mut revoked = update("gone", "a@s.whatsapp.net", Some("Ana"), 10, false);
+        revoked.revoked = true;
+        let feed = feed_of(vec![revoked]);
+
+        assert!(feed.author("a@s.whatsapp.net").is_none());
+        assert_eq!(feed.unseen_authors(), 0, "no ring for a deleted update");
     }
 
     #[test]

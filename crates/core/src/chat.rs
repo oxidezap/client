@@ -220,6 +220,14 @@ pub struct ChatMessage {
     pub quoted: Option<QuotedMessage>,
     /// Set when nobody typed this: a call record, a group change. Such a row
     /// has no author and no ticks, and renders centred rather than as a bubble.
+    /// Whether the sender took this message back.
+    ///
+    /// Kept as a fact rather than left implicit in the "[Message deleted]"
+    /// text it produces: a tombstone is still a row, and the surfaces that
+    /// have to know it is one — the status feed, which must not offer a
+    /// deleted update to watch — should not have to recognise a sentence.
+    #[serde(default)]
+    pub revoked: bool,
     pub system: Option<SystemNotice>,
 }
 
@@ -285,6 +293,7 @@ impl ChatMessage {
             reactions: HashMap::new(),
             status: MessageStatus::Pending,
             quoted: None,
+            revoked: false,
             system: None,
         }
     }
@@ -303,6 +312,7 @@ impl ChatMessage {
             reactions: HashMap::new(),
             status: MessageStatus::Pending,
             quoted: None,
+            revoked: false,
             system: None,
         }
     }
@@ -322,6 +332,7 @@ impl ChatMessage {
             reactions: HashMap::new(),
             status: MessageStatus::default(),
             quoted: None,
+            revoked: false,
             system: None,
         }
     }
@@ -1209,6 +1220,7 @@ mod tests {
             reactions: HashMap::new(),
             status: MessageStatus::default(),
             quoted: None,
+            revoked: false,
             system: None,
         }
     }

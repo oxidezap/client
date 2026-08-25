@@ -337,6 +337,19 @@ impl CallState {
         }
     }
 
+    /// Refuse the offer on screen.
+    ///
+    /// A *final* removal, so whoever was parked comes forward — which is what
+    /// separates it from [`Self::take_incoming`], whose caller is about to put
+    /// something else on the stage. Declining puts nothing there, and a second
+    /// caller left behind an empty stage is somebody ringing with no card, no
+    /// Accept and no Decline anywhere in the window.
+    pub fn decline_incoming(&mut self) -> Option<IncomingCall> {
+        let refused = self.take_incoming()?;
+        self.promote_waiting();
+        Some(refused)
+    }
+
     pub fn take_outgoing(&mut self) -> Option<OutgoingCall> {
         match self.stage.take() {
             Some(Stage::Outgoing(call)) => Some(call),
@@ -1005,6 +1018,29 @@ mod tests {
             !state.holds("REAL-1"),
             "so the abandoned call reads as an orphan, and is cancelled"
         );
+    }
+
+    #[test]
+    fn declining_the_call_on_screen_brings_the_parked_one_forward() {
+        let mut state = CallState::default();
+        state.set_incoming(incoming("first"));
+        state.connect(&"first".to_string());
+        assert_eq!(state.set_incoming(incoming("second")), Admission::Parked);
+        // Back to an offer on the stage with one behind it.
+        state.end(&"first".to_string());
+        assert_eq!(state.stage().map(Stage::call_id), Some("second"));
+        assert_eq!(state.set_incoming(incoming("third")), Admission::Parked);
+
+        assert_eq!(
+            state.decline_incoming().map(|call| call.call_id),
+            Some("second".to_string())
+        );
+        assert_eq!(
+            state.stage().map(Stage::call_id),
+            Some("third"),
+            "the parked caller is drawn instead of nobody"
+        );
+        assert!(state.waiting().is_none());
     }
 
     /// The window draws the call it placed before the server has answered,
