@@ -2018,7 +2018,14 @@ impl WhatsAppClient {
                 // Groups *and* the status broadcast: both carry rows written
                 // by many people, and a hydrated row has no push name on it.
                 if existing.is_group || existing.is_status {
-                    Self::hydrate_sender_names(chat_store, client, &mut msgs, names).await;
+                    Self::hydrate_sender_names(
+                        chat_store,
+                        client,
+                        &mut msgs,
+                        names,
+                        existing.is_status,
+                    )
+                    .await;
                 }
                 // Each alias still needs its unread tail marked for receipts,
                 // but PN/LID counters describe the same logical chat.
@@ -2056,7 +2063,15 @@ impl WhatsAppClient {
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_reactions(chat_store, &entry.jid, &mut chat.messages).await;
             if chat.is_group || chat.is_status {
-                Self::hydrate_sender_names(chat_store, client, &mut chat.messages, names).await;
+                let is_status = chat.is_status;
+                Self::hydrate_sender_names(
+                    chat_store,
+                    client,
+                    &mut chat.messages,
+                    names,
+                    is_status,
+                )
+                .await;
             }
             // The newest `unread_count` incoming messages are the unread ones;
             // select_chat only sends read receipts for !is_read, so hydrated
@@ -2147,6 +2162,7 @@ impl WhatsAppClient {
         client: &Arc<Client>,
         msgs: &mut [ChatMessage],
         names: &NameBook,
+        is_status: bool,
     ) {
         for msg in msgs.iter_mut() {
             if msg.is_from_me || msg.sender_name.is_some() {
@@ -2156,6 +2172,15 @@ impl WhatsAppClient {
                 continue;
             };
             let identity = names.identity(client, &jid).await;
+            // One person, one row in the feed. The status broadcast is
+            // grouped by sender, and the same contact reaches it under a
+            // phone number on some updates and their LID on others — which
+            // split their ring, their unseen count and their playback run in
+            // two. Chat identities are canonicalized on the way in; these had
+            // been left as they arrived.
+            if is_status {
+                msg.sender.clone_from(&identity.canonical_jid);
+            }
             // The same answer the live path gives, and for the same reason a
             // number is not one: this field only ever gains a value, because
             // `Chat::update_participant` fills blanks. A row stamped with a

@@ -155,6 +155,17 @@ pub struct Palette {
     pub success: Rgb,
     pub info: Rgb,
 
+    /// The wash a fullscreen picture sits on, and the ink that reads on it.
+    ///
+    /// Its own pair rather than a surface and an `on()` call: the point of a
+    /// viewer's ground is that *nothing* competes with the picture, so it is
+    /// near-black in every preset including the light one — which makes it
+    /// the one place where the theme's own inks are the wrong answer. Tokens
+    /// all the same, so a hand-edited `theme.json` can move them and nothing
+    /// in a component is a literal.
+    pub scrim: Rgb,
+    pub on_scrim: Rgb,
+
     /// Outgoing bubble.
     pub message_sent: Rgb,
     /// Incoming bubble.
@@ -312,6 +323,8 @@ pub const TOKYO_NIGHT: Palette = Palette {
     success: rgb(0x9ece6a),
     info: rgb(0x7dcfff),
 
+    scrim: rgb(0x0b0d16),
+    on_scrim: rgb(0xf2f4fb),
     message_sent: rgb(0x2b4d4a),
     message_received: rgb(0x24283b),
 
@@ -368,6 +381,8 @@ pub const TOKYO_NIGHT_LIGHT: Palette = Palette {
     success: rgb(0x4c6431),
     info: rgb(0x056677),
 
+    scrim: rgb(0x0b0d16),
+    on_scrim: rgb(0xf2f4fb),
     message_sent: rgb(0xbfe6dc),
     message_received: rgb(0xf2f3f7),
 

@@ -169,12 +169,13 @@ profile here repeats it deliberately.
 Colours come from `cx.theme()`. The palette is registered once in `theme.rs`
 into gpui-component's `Theme` global, so our surfaces and the library's own
 controls resolve the same tokens. A literal colour in a component is invisible
-to theme switching and drifts the moment either side changes. The
+to theme switching and drifts the moment either side changes. The two
 exceptions are message bubbles (`theme::brand`, which encode authorship and
-have no semantic token), and the two rasters a theme does not own: the QR
-code's white one, and the media viewer's near-black scrim — a preset that
-lightened either would break the thing it exists to make legible, so the ink
-on them is fixed rather than resolved.
+have no semantic token) and text drawn on the QR code's white raster. The
+fullscreen viewer's ground *was* a third, and is not: `scrim`/`on_scrim` are
+its own pair of tokens, because the theme's inks are the wrong answer there —
+`background` is the deepest surface in a dark preset, which is near-black
+text on a near-black wash.
 
 Render helpers take `&App` and return `impl IntoElement + use<>`: they read
 colours out of the theme but retain nothing borrowed, and without `use<>` the

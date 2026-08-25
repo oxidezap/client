@@ -191,6 +191,13 @@ pub fn parse(source: &str) -> RichText {
                         at += width;
                         continue;
                     }
+                    // A marker still open *inside* this run never matched
+                    // anything, so it is text — and text lends no emphasis to
+                    // the run closing over it. Left on the stack it did:
+                    // `*bold _dangling*` came out bold *and* italic, with the
+                    // stray underscore restored inside the span it had no
+                    // business styling.
+                    restore_unclosed(&mut out, &mut open, depth + 1);
                     let from = open.remove(depth).from;
                     // The newline that put the closing fence on its own line
                     // belongs to the delimiter, not to the code. Left in, every
@@ -237,13 +244,13 @@ pub fn parse(source: &str) -> RichText {
         // exception it exists for — it is the one form that spans lines — so
         // while one is open the newline is nothing but text.
         if ch == '\n' && !open.iter().any(|run| run.fenced) {
-            restore_unclosed(&mut out, &mut open);
+            restore_unclosed(&mut out, &mut open, 0);
         }
         out.text.push(ch);
         at += ch.len_utf8();
     }
 
-    restore_unclosed(&mut out, &mut open);
+    restore_unclosed(&mut out, &mut open, 0);
 
     // Innermost first is the order a renderer wants to apply them in, and the
     // parser produces them by closing order, which is the same thing.
@@ -257,8 +264,8 @@ pub fn parse(source: &str) -> RichText {
 /// text, so they go back where they stood — all of a fence's three
 /// characters, not one of them, or the text loses two and every span after
 /// the hole describes the wrong letters.
-fn restore_unclosed(out: &mut RichText, open: &mut Vec<Open>) {
-    for run in open.drain(..).rev() {
+fn restore_unclosed(out: &mut RichText, open: &mut Vec<Open>, from_depth: usize) {
+    for run in open.drain(from_depth..).rev() {
         let literal = run.literal();
         out.text.insert_str(run.from, literal);
         let shift = literal.len();
@@ -497,6 +504,19 @@ mod tests {
         let (text, spans) = only("*first*\n*second*");
         assert_eq!(text, "first\nsecond");
         assert_eq!(spans, vec![(0..5, bold()), (6..12, bold())]);
+    }
+
+    /// A marker left open inside a run was never formatting, so it must not
+    /// lend its emphasis to the run that closes over it. `*bold _dangling*`
+    /// is bold, with an underscore in it — not bold *and* italic.
+    #[test]
+    fn an_unmatched_inner_marker_styles_nothing() {
+        let (text, spans) = only("*bold _dangling*");
+        assert_eq!(text, "bold _dangling");
+        assert_eq!(spans.len(), 1, "one run: {spans:?}");
+        assert!(spans[0].1.bold);
+        assert!(!spans[0].1.italic, "the stray underscore is text");
+        assert_eq!(&text[spans[0].0.clone()], "bold _dangling");
     }
 
     /// The exception the fence exists for: inside one, a newline is text and

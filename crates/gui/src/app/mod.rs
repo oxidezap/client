@@ -523,6 +523,13 @@ pub struct WhatsAppApp {
     call_card: CallCard,
     /// Cache of JID -> display name mappings (from notify/pushname attribute)
     name_cache: HashMap<String, String>,
+    /// System notices whose conversation has not arrived yet.
+    ///
+    /// "You were added to a group" reaches this window before the group does,
+    /// every time. The store does not hold system notices, so the reload that
+    /// finally brings the chat cannot bring the row with it — dropped here,
+    /// it is gone for good.
+    pending_notices: HashMap<String, Vec<(String, chrono::DateTime<chrono::Utc>, SystemNotice)>>,
     /// Video players for each message (message_id -> VideoPlayer)
     video_players: HashMap<String, VideoPlayer>,
     /// Task for video frame updates
@@ -685,6 +692,7 @@ impl WhatsAppApp {
             call_state: CallState::new(),
             call_card: CallCard::default(),
             name_cache: HashMap::new(),
+            pending_notices: HashMap::new(),
             video_players: HashMap::new(),
             video_update_task: None,
             decoded_images: RefCell::new(IndexMap::new()),
@@ -1935,11 +1943,17 @@ impl WhatsAppApp {
         cx: &mut Context<Self>,
     ) {
         let Some(chat) = self.find_chat_mut(&chat_jid) else {
-            // A notification for a chat this window has never loaded. The
-            // history sync that brings the chat will not bring this row, but
-            // fabricating the chat around a notice is worse: it would appear
-            // with no messages and no name.
-            debug!("system notice for unknown chat {}", observe_str(&chat_jid));
+            // A notification for a chat this window has never loaded — which
+            // is the *normal* order for the one that says you were added to a
+            // group. Fabricating the chat around it would draw a conversation
+            // with no messages and no name; dropping it loses the row for
+            // good, because the store does not hold system notices and the
+            // reload that brings the chat cannot bring this back. So it waits.
+            debug!("holding a system notice for {}", observe_str(&chat_jid));
+            self.pending_notices
+                .entry(chat_jid)
+                .or_default()
+                .push((notice_id, at, notice));
             return;
         };
         if chat.messages.iter().any(|message| message.id == notice_id) {
@@ -1953,6 +1967,31 @@ impl WhatsAppApp {
 
         self.invalidate_message_cache(&chat_jid);
         cx.notify();
+    }
+
+    /// Put back the notices that arrived before their conversation did.
+    ///
+    /// Called wherever chats are installed. Only the ones whose chat is now
+    /// here are taken, so a notice for a group this account is still syncing
+    /// keeps waiting rather than being dropped a second time.
+    fn flush_pending_notices(&mut self, cx: &mut Context<Self>) {
+        if self.pending_notices.is_empty() {
+            return;
+        }
+        let ready: Vec<String> = self
+            .pending_notices
+            .keys()
+            .filter(|jid| self.find_chat(jid).is_some())
+            .cloned()
+            .collect();
+        for jid in ready {
+            let Some(held) = self.pending_notices.remove(&jid) else {
+                continue;
+            };
+            for (notice_id, at, notice) in held {
+                self.handle_system_notice(jid.clone(), notice_id, at, notice, cx);
+            }
+        }
     }
 
     /// Handle a reaction event

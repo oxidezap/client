@@ -79,6 +79,10 @@ impl WhatsAppApp {
                     .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
                 // Count-based cache guards can't see reordering/merges.
                 self.invalidate_chat_cache();
+                // Whatever arrived before its conversation did. A group
+                // change is announced to a window that has never seen the
+                // group, and this load is what makes it placeable.
+                self.flush_pending_notices(cx);
                 // A status update expires on the clock with nothing arriving
                 // to say so, and this is where the feed that holds one is
                 // installed. Without arming it here nothing ever did: the

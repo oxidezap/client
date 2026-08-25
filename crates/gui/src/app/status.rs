@@ -327,40 +327,42 @@ impl WhatsAppApp {
     /// a video status sat on "cannot be shown" having never asked for the
     /// bytes that would show it.
     fn fetch_shown_status(&mut self, cx: &mut Context<Self>) {
-        let Some((message_id, downloadable, kind)) = self.shown_status_media() else {
+        let Some((message_id, media)) = self.shown_status_media() else {
             return;
         };
         if self.is_downloading(&message_id) {
             return;
         }
-        match kind {
-            MediaType::Image => self.download_image(message_id, downloadable, cx),
-            // The video path downloads *and* starts decoding, which is what
-            // produces the frame the pane draws.
+        let Some(downloadable) = media.downloadable else {
+            log::debug!("the update on screen offers no way to fetch it");
+            return;
+        };
+        // Whether the bytes are here is the *image's* question. A picture
+        // that has arrived is drawn and there is nothing else to do.
+        let needs_bytes = media.data.is_empty() || media.data_is_preview;
+        match media.media_type {
+            MediaType::Image if needs_bytes => self.download_image(message_id, downloadable, cx),
+            MediaType::Image => {}
+            // A video needs a *player*, and that is a different thing from
+            // needing bytes: `toggle_video` downloads when it must and starts
+            // decoding either way, and the frames it produces are what the
+            // pane draws. Skipping it once the bytes were here left a watched
+            // video reopening on its poster frame with nothing to start it.
             MediaType::Video => self.toggle_video(message_id, downloadable, cx),
             other => log::debug!("a status update of type {other:?} has nothing to show"),
         }
     }
 
-    /// The update on screen, when it has bytes worth fetching.
+    /// The update on screen and its media, whatever state that media is in.
     ///
-    /// `None` once they are here, or when there is nothing to fetch: a text
-    /// status, or media the server gave no way to download.
-    fn shown_status_media(&self) -> Option<(String, oxidezap_core::DownloadableMedia, MediaType)> {
+    /// `None` for a text status, which has none.
+    fn shown_status_media(&self) -> Option<(String, oxidezap_core::MediaContent)> {
         let author_jid = self.status_pane.author()?.to_string();
         let feed = self.status_feed();
         let author = feed.author(&author_jid)?;
         let at = self.status_pane.index_in(author.count());
         let message = feed.updates_of(author).nth(at)?;
-        let media = message.media.as_ref()?;
-        if !media.data.is_empty() && !media.data_is_preview {
-            return None;
-        }
-        Some((
-            message.id.clone(),
-            media.downloadable.clone()?,
-            media.media_type.clone(),
-        ))
+        Some((message.id.clone(), message.media.clone()?))
     }
 
     /// Whether the broadcast is the chat with this JID, so the parts of the

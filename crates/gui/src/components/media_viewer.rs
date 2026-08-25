@@ -17,7 +17,7 @@ use gpui_component::{Disableable as _, FocusTrapElement as _, Icon, IconName, Si
 
 use crate::app::{MediaViewer, VIEWER_CONTEXT, ViewerNext, ViewerPrev, WhatsAppApp};
 use crate::components::ProductIcon;
-use crate::theme::Metrics;
+use crate::theme::{ActiveProductTheme as _, Metrics};
 use crate::utils::format_list_time;
 use oxidezap_core::{ChatMessage, MediaType};
 
@@ -86,7 +86,7 @@ pub fn render_media_viewer(
         .flex_col()
         // Nearly opaque rather than a light wash: the point is that nothing
         // else is competing with the picture.
-        .bg(gpui::black().opacity(0.92))
+        .bg(cx.product().hsla(cx.product().palette.scrim).opacity(0.92))
         .child(render_bar(
             props.author,
             when,
@@ -183,7 +183,7 @@ pub fn render_media_viewer(
                     div()
                         .max_w(metrics.reading_width())
                         .text_size(metrics.text_secondary())
-                        .text_color(gpui::white())
+                        .text_color(cx.product().hsla(cx.product().palette.on_scrim))
                         .child(caption),
                 )
         }))
@@ -207,11 +207,11 @@ fn render_bar(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    // The scrim is black in every preset, so the ink is the colour that reads
-    // on black. `theme().background` is the *deepest* surface in a dark
-    // preset — near-black text on a near-black scrim, invisible everywhere but
-    // the light theme.
-    let on_scrim = gpui::white();
+    // The theme's own inks are the wrong answer here: `background` is the
+    // *deepest* surface in a dark preset, which is near-black text on a
+    // near-black scrim, and in the light preset it is white on white. The
+    // viewer's ground is its own pair of tokens for exactly that reason.
+    let on_scrim = cx.product().hsla(cx.product().palette.on_scrim);
 
     div()
         .flex_shrink_0()
@@ -285,7 +285,7 @@ fn render_frame(
     frame: Option<Arc<RenderImage>>,
     is_video: bool,
     metrics: Metrics,
-    _cx: &App,
+    cx: &App,
 ) -> impl IntoElement + use<> {
     if let Some(image) = image {
         return img(ImageSource::Image(image))
@@ -318,12 +318,20 @@ fn render_frame(
                 ProductIcon::Image
             })
             .size(metrics.icon())
-            .text_color(gpui::white().opacity(0.6)),
+            .text_color(
+                cx.product()
+                    .hsla(cx.product().palette.on_scrim)
+                    .opacity(0.6),
+            ),
         )
         .child(
             div()
                 .text_size(metrics.text_secondary())
-                .text_color(gpui::white().opacity(0.6))
+                .text_color(
+                    cx.product()
+                        .hsla(cx.product().palette.on_scrim)
+                        .opacity(0.6),
+                )
                 .child("This file cannot be shown here."),
         )
         .into_any_element()
