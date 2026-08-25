@@ -9,11 +9,11 @@ use std::sync::Arc;
 use gpui::StyledImage as _;
 use gpui::{
     App, Entity, Image, ImageSource, InteractiveElement, IntoElement, ParentElement, RenderImage,
-    SharedString, StatefulInteractiveElement, Styled, div, img, px,
+    SharedString, StatefulInteractiveElement, Styled, div, img,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
+use gpui_component::{Disableable as _, FocusTrapElement as _, Icon, IconName, Sizable as _};
 
 use crate::app::{MediaViewer, VIEWER_CONTEXT, ViewerNext, ViewerPrev, WhatsAppApp};
 use crate::components::ProductIcon;
@@ -68,6 +68,12 @@ pub fn render_media_viewer(
         .id("media-viewer")
         .key_context(VIEWER_CONTEXT)
         .track_focus(focus_handle)
+        // The viewer is modal, so it has to actually *be* a lid. It covers
+        // the window, but covering is only paint: a wheel event over the
+        // scrim still reached the timeline underneath and scrolled the
+        // conversation nobody could see. Swallowing it here is what makes the
+        // picture the only thing on screen that responds.
+        .on_scroll_wheel(|_, _window, cx| cx.stop_propagation())
         .on_action(move |_: &ViewerPrev, _window, cx| {
             key_prev_entity.update(cx, |app, cx| app.step_media_viewer(false, cx));
         })
@@ -166,12 +172,15 @@ pub fn render_media_viewer(
                 .justify_center()
                 .child(
                     div()
-                        .max_w(px(720.0))
+                        .max_w(metrics.reading_width())
                         .text_size(metrics.text_secondary())
                         .text_color(gpui::white())
                         .child(caption),
                 )
         }))
+        // And the same for the keyboard: Tab inside a modal cycles its own
+        // controls rather than walking into the chat list behind it.
+        .focus_trap("media-viewer-trap", focus_handle)
 }
 
 /// Who sent it, when, and the two things to do with it.

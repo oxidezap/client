@@ -255,10 +255,15 @@ mod tests {
     }
 
     /// Message keys and download keys share a directory and must not collide:
-    /// one is addressed by message, the other by content.
+    /// one is addressed by message, the other by content. The message prefix
+    /// is `f-` because it also promises *full* media — see [`message_key`].
     #[test]
     fn the_two_key_spaces_stay_apart() {
-        assert!(message_key("abc").starts_with("m-"));
+        assert!(message_key("abc").starts_with("f-"));
         assert!(download_key(&[1; 32]).starts_with("d-"));
+        assert!(
+            !message_key("abc").starts_with("m-"),
+            "the old prefix cached thumbnails under it and must stay orphaned"
+        );
     }
 }

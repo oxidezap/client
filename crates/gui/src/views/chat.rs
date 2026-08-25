@@ -8,11 +8,12 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Icon, IconName};
 
-use crate::app::{MessageListCache, WhatsAppApp};
+use crate::app::{Destination, MessageListCache, WhatsAppApp};
 use crate::components::{
-    ChatListProps, EmptyState, InputAreaView, ProductIcon, ViewerProps, render_call_card,
-    render_chat_header, render_chat_list, render_conversation_search, render_media_viewer,
-    render_message_list,
+    ChatListProps, EmptyState, InputAreaView, ProductIcon, StatusListProps, StatusViewProps,
+    ViewerProps, render_call_card, render_chat_header, render_chat_list,
+    render_conversation_search, render_media_viewer, render_message_list, render_nav_rail,
+    render_status_list, render_status_view,
 };
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
@@ -133,6 +134,37 @@ pub fn render_connected_view(
             .into_any_element(),
         )
     });
+    // Status, when that is where the window is. Resolved here for the same
+    // reason the viewer is: the picture is the app's to decode, and this is
+    // the level that still has it.
+    let destination = app.destination();
+    let status_feed = (destination == Destination::Status).then(|| app.status_feed());
+    let status_view = status_feed.as_ref().and_then(|feed| {
+        let selected = app.status_pane().author()?;
+        let author = feed.author(selected)?;
+        let at = app.status_pane().index_in(author.count());
+        let message = feed.updates_of(author).nth(at)?.clone();
+        let image = message
+            .media
+            .as_ref()
+            .filter(|media| !media.data.is_empty())
+            .map(|media| app.get_decoded_image(&message.id, &media.data, &media.mime_type));
+        Some(StatusViewProps {
+            author_jid: author.jid.clone(),
+            author_name: author.name.clone().into(),
+            message,
+            image,
+            index: at,
+            count: author.count(),
+        })
+    });
+    let status_list = status_feed.map(|feed| StatusListProps {
+        feed,
+        selected: app.status_pane().author().map(str::to_string),
+    });
+    let unseen_status = app.status_unseen();
+    let unread_chats = app.unread_chat_count();
+
     let call_card = render_call_card(
         app.call_state(),
         app.call_card(),
@@ -142,40 +174,71 @@ pub fn render_connected_view(
         cx,
     );
 
+    let rail = render_nav_rail(
+        destination,
+        unread_chats,
+        unseen_status,
+        entity.clone(),
+        layout,
+        cx,
+    );
+
+    // The two panes, whichever destination they belong to.
+    let panes = div()
+        .flex()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .bg(cx.theme().sidebar)
+        .when(layout.show_sidebar(), |el| match status_list {
+            Some(props) => el.child(render_status_list(props, entity.clone(), layout, cx)),
+            None => el.child(render_chat_list(
+                list_props,
+                &chat_list_scroll,
+                &chat_list_focus,
+                entity.clone(),
+                layout,
+                cx,
+            )),
+        })
+        .when(layout.show_chat_area(), |el| {
+            if destination == Destination::Status {
+                el.child(render_status_view(status_view, entity.clone(), layout, cx))
+            } else {
+                el.child(render_chat_area(
+                    selected_chat.as_ref(),
+                    message_cache,
+                    banner,
+                    typing.as_ref(),
+                    availability.as_ref(),
+                    search_bar,
+                    &message_list,
+                    input_area,
+                    entity.clone(),
+                    layout,
+                    cx,
+                ))
+            }
+        });
+
+    // A strip down the side where there is width for one, a bar across the
+    // foot where there is not — and on a phone only while the list is on
+    // screen, because a conversation there is the whole window.
+    let shell = if layout.is_mobile() {
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(panes)
+            .when(layout.show_sidebar(), |el| el.child(rail))
+    } else {
+        div().flex().size_full().child(rail).child(panes)
+    };
+
     div()
         .relative()
         .size_full()
-        .child(
-            div()
-                .flex()
-                .size_full()
-                .bg(cx.theme().sidebar)
-                .when(layout.show_sidebar(), |el| {
-                    el.child(render_chat_list(
-                        list_props,
-                        &chat_list_scroll,
-                        &chat_list_focus,
-                        entity.clone(),
-                        layout,
-                        cx,
-                    ))
-                })
-                .when(layout.show_chat_area(), |el| {
-                    el.child(render_chat_area(
-                        selected_chat.as_ref(),
-                        message_cache,
-                        banner,
-                        typing.as_ref(),
-                        availability.as_ref(),
-                        search_bar,
-                        &message_list,
-                        input_area,
-                        entity.clone(),
-                        layout,
-                        cx,
-                    ))
-                }),
-        )
+        .child(shell)
         .children(viewer)
         // The card floats: it does not take the app's input, so the
         // conversation underneath stays usable for the whole call.

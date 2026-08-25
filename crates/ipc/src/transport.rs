@@ -5,6 +5,14 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 6: `DaemonEvent::CallsChanged` publishes the call state to every front
+/// end. The daemon makes some call transitions itself — accepting one brings
+/// the media up in the process that owns the microphone — and a second window
+/// had no way to hear about them.
+///
+/// 5: `SendText` carries what it quotes, so a reply is sent as one rather
+/// than as a fresh message, and the snapshot names the linked account.
+///
 /// 4: every request may carry an id, and every answer echoes it. Before that
 /// a refused send could only be reported by inventing a failure against the
 /// message the client had drawn, and a refused download by nothing at all.
@@ -26,7 +34,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

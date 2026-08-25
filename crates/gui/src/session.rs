@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use log::{debug, error, info, warn};
 use oxidezap_core::{CallState, DownloadableMedia, MediaContent, QuotedMessage, UiEvent};
 use oxidezap_ipc::{
-    CallAction, ClientRequest, ConnectionState, DaemonMessage, Endpoint, PROTOCOL_VERSION, Request,
-    RequestId, StateSnapshot, endpoint_path, media_path,
+    CallAction, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, Endpoint,
+    PROTOCOL_VERSION, Request, RequestId, StateSnapshot, endpoint_path, media_path,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::{mpsc, oneshot};
@@ -453,6 +453,21 @@ fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pe
             }
             Ok(DaemonMessage::ShowWindow) => {
                 if events.blocking_send(FromDaemon::ShowWindow).is_err() {
+                    break;
+                }
+            }
+            // The one state update this front end does not derive for
+            // itself. Everything else in a snapshot is rebuilt from the
+            // session stream; a call the *daemon* answered is not in that
+            // stream at all, so without this a second window keeps ringing.
+            Ok(DaemonMessage::Update {
+                event: DaemonEvent::CallsChanged(calls),
+                ..
+            }) => {
+                if events
+                    .blocking_send(FromDaemon::Calls(Box::new(calls)))
+                    .is_err()
+                {
                     break;
                 }
             }

@@ -25,7 +25,7 @@ pub fn render(
         .flex()
         .flex_col()
         .gap(metrics.space_xxl())
-        .max_w(gpui::px(720.0))
+        .max_w(metrics.reading_width())
         .child(render_presets(settings, entity.clone(), metrics, cx))
         .child(
             div()

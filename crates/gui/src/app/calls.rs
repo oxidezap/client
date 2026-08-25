@@ -110,6 +110,14 @@ impl CallCard {
     /// which is correct: nothing can be dragged before it exists.
     fn travel(&self, viewport: Size<Pixels>, inset: Pixels) -> Point<Pixels> {
         let card = self.measured.get();
+        // The doc comment above is the invariant, and it has to be enforced
+        // rather than assumed: an unmeasured card is zero by zero, and
+        // subtracting that from the window says the card may travel the whole
+        // of it — which is how a drag before the first paint sent it off the
+        // far edge.
+        if card.width <= px(0.0) || card.height <= px(0.0) {
+            return Point::default();
+        }
         Point {
             x: (viewport.width - card.width - inset - inset).max(px(0.0)),
             y: (viewport.height - card.height - inset - inset).max(px(0.0)),

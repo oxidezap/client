@@ -260,12 +260,33 @@ impl StateHub {
         true
     }
 
-    /// Change what is happening on the call front.
+    /// Change what is happening on the call front, and tell everyone.
     ///
     /// The transitions live in [`oxidezap_core::CallState`], so the daemon and
-    /// the front end cannot disagree about what a call is.
+    /// the front end cannot disagree about what a call is. Publishing them is
+    /// what keeps a *second* front end in step: the daemon answers a call
+    /// itself — it owns the microphone — and no later session event replays
+    /// that, so a window that did not press Accept would go on ringing an
+    /// offer that is already connected.
+    ///
+    /// A change that leaves the state identical consumes no version and sends
+    /// no frame: a mute already muted is not news.
     pub fn calls(&self, change: impl FnOnce(&mut oxidezap_core::CallState)) {
-        change(&mut self.lock().calls);
+        let published = {
+            let mut inner = self.lock();
+            let before = inner.calls.clone();
+            change(&mut inner.calls);
+            if inner.calls == before {
+                None
+            } else {
+                inner.version = inner.version.next();
+                Some((inner.version, inner.calls.clone()))
+            }
+        };
+
+        if let Some((version, calls)) = published {
+            self.broadcast(version, DaemonEvent::CallsChanged(calls));
+        }
     }
 
     /// What is happening on the call front right now.
@@ -369,24 +390,16 @@ impl StateHub {
                 DaemonEvent::ChatRemoved { jid } => {
                     inner.chats.remove(jid);
                 }
+                // Not the usual route in — [`Self::calls`] is — but the state
+                // it names is the state this holds, so applying it here keeps
+                // one field with one writer.
+                DaemonEvent::CallsChanged(calls) => inner.calls = calls.clone(),
             }
 
             (inner.version, inner.tray_state())
         };
 
-        // Serialize once, and only when someone is listening. With no clients
-        // the daemon still tracks state for the tray, but pays nothing to
-        // format frames nobody reads.
-        if self.updates.receiver_count() > 0 {
-            match serde_json::to_string(&DaemonMessage::Update { version, event }) {
-                Ok(line) => {
-                    // Err means every receiver dropped between the count above
-                    // and here. Nothing to do: the state is already recorded.
-                    let _ = self.updates.send(Arc::from(line.as_str()));
-                }
-                Err(e) => log::error!("dropping unserializable event: {e}"),
-            }
-        }
+        self.broadcast(version, event);
 
         // `send_if_modified` so an update that leaves the tray identical wakes
         // nothing: receipts and typing churn state constantly without changing
@@ -401,6 +414,25 @@ impl StateHub {
         });
 
         version
+    }
+
+    /// Put one versioned event on the update channel.
+    ///
+    /// Serializes once, and only when someone is listening: with no clients
+    /// the daemon still tracks state for the tray, but pays nothing to format
+    /// frames nobody reads.
+    fn broadcast(&self, version: StateVersion, event: DaemonEvent) {
+        if self.updates.receiver_count() == 0 {
+            return;
+        }
+        match serde_json::to_string(&DaemonMessage::Update { version, event }) {
+            Ok(line) => {
+                // Err means every receiver dropped between the count above and
+                // here. Nothing to do: the state is already recorded.
+                let _ = self.updates.send(Arc::from(line.as_str()));
+            }
+            Err(e) => log::error!("dropping unserializable event: {e}"),
+        }
     }
 
     /// A poisoned lock means a previous holder panicked mid-mutation. The
@@ -464,6 +496,88 @@ mod tests {
 
     fn removed(jid: &str) -> Change {
         Change::live(DaemonEvent::ChatRemoved { jid: jid.into() })
+    }
+
+    /// A minimal library offer, so a test can ring a call the way the session
+    /// does. `IncomingCall::new` takes one and the type is `#[non_exhaustive]`.
+    fn offer(id: &str) -> wacore::types::call::IncomingCall {
+        let jid: wacore_binary::jid::Jid = "a@s.whatsapp.net".parse().expect("valid jid");
+        wacore::types::call::IncomingCall::builder()
+            .from(jid.clone())
+            .stanza_id(id.to_string())
+            .timestamp(wacore::time::now_utc())
+            .offline(false)
+            .action(wacore::types::call::CallAction::Offer {
+                call_id: id.to_string(),
+                call_creator: jid,
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            })
+            .build()
+    }
+
+    /// Two windows, and only one of them pressed Accept. The daemon is what
+    /// answered — it owns the microphone — so the other window learns about it
+    /// here or not at all.
+    #[tokio::test]
+    async fn answering_a_call_in_one_window_reaches_the_other() {
+        let hub = StateHub::new();
+        let mut other = hub.subscribe();
+
+        let call_id: oxidezap_core::CallId = "call-1".to_string();
+        let call = oxidezap_core::IncomingCall::new(
+            call_id.clone(),
+            "Ana".to_string(),
+            "a@s.whatsapp.net".to_string(),
+            false,
+            &offer("call-1"),
+        );
+        hub.calls(|calls| {
+            calls.set_incoming(call);
+        });
+        hub.calls(|calls| {
+            calls.connect(&call_id);
+        });
+
+        let ringing: DaemonMessage = serde_json::from_str(&other.recv().await.unwrap()).unwrap();
+        let answered: DaemonMessage = serde_json::from_str(&other.recv().await.unwrap()).unwrap();
+        assert!(matches!(
+            &ringing,
+            DaemonMessage::Update {
+                event: DaemonEvent::CallsChanged(calls),
+                ..
+            } if calls.incoming().is_some()
+        ));
+        let DaemonMessage::Update {
+            event: DaemonEvent::CallsChanged(calls),
+            version,
+        } = answered
+        else {
+            panic!("the answer is a versioned state update");
+        };
+        assert!(
+            calls.active().is_some(),
+            "the other window sees a live call"
+        );
+        assert_eq!(hub.snapshot().version, version, "and can order it");
+    }
+
+    /// A transition that changes nothing is not news: it must not consume a
+    /// version, or a client that resynchronised would be told to catch up on
+    /// a state identical to the one it already has.
+    #[tokio::test]
+    async fn a_call_change_that_changes_nothing_is_not_published() {
+        let hub = StateHub::new();
+        let before = hub.snapshot().version;
+        hub.calls(|calls| {
+            calls.end(&"nobody-is-calling".to_string());
+        });
+        assert_eq!(hub.snapshot().version, before);
     }
 
     #[test]

@@ -19,6 +19,7 @@ mod recording;
 mod recovery;
 mod search;
 mod settings;
+mod status;
 mod timeline_ctl;
 mod viewer;
 
@@ -35,6 +36,7 @@ struct TimelineAnchor {
 }
 pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
+pub use status::{Destination, StatusPane};
 pub use viewer::MediaViewer;
 
 use std::cell::RefCell;
@@ -471,6 +473,13 @@ pub struct WhatsAppApp {
     account_jid: Option<String>,
     /// The Settings screen, when it is open. `None` is the conversation view.
     settings: Option<SettingsState>,
+    /// Which of the sidebar's destinations is on screen.
+    destination: Destination,
+    /// Whose status updates are open, and which one of them.
+    status_pane: StatusPane,
+    /// The broadcast grouped by author, against the message count it was
+    /// built from.
+    status_feed_cache: RefCell<Option<(usize, oxidezap_core::StatusFeed)>>,
     /// Repaints the call duration, and expires stale typing notices. Only
     /// alive while there is something to tick.
     #[allow(dead_code)]
@@ -583,6 +592,9 @@ impl WhatsAppApp {
             decoded_images: RefCell::new(IndexMap::new()),
             message_list_cache: RefCell::new(HashMap::new()),
             chat_list_cache: RefCell::new(None),
+            destination: Destination::default(),
+            status_pane: StatusPane::default(),
+            status_feed_cache: RefCell::new(None),
             mobile_panel: MobilePanel::default(),
             chat_filter: ChatFilter::default(),
             reply_to: None,
@@ -636,8 +648,7 @@ impl WhatsAppApp {
 
         let query = &self.chat_search_query;
         let filtered: Vec<&Chat> = self
-            .chats
-            .iter()
+            .conversations()
             .filter(|chat| self.chat_filter.matches(chat))
             .filter(|chat| {
                 query.is_empty()
@@ -685,10 +696,18 @@ impl WhatsAppApp {
     /// Counted over every chat rather than the filtered view: the number has
     /// to say what pressing `Unread` would reveal.
     pub fn unread_chat_count(&self) -> usize {
-        self.chats
-            .iter()
+        self.conversations()
             .filter(|chat| ChatFilter::Unread.matches(chat))
             .count()
+    }
+
+    /// The chats that are conversations.
+    ///
+    /// Every list of people to talk to goes through here, so the status
+    /// broadcast is excluded once rather than at each of them: it is not a
+    /// conversation, and it has [its own destination](Destination::Status).
+    fn conversations(&self) -> impl Iterator<Item = &Chat> {
+        self.chats.iter().filter(|chat| !chat.is_status)
     }
 
     pub fn chat_filter(&self) -> ChatFilter {
@@ -755,8 +774,13 @@ impl WhatsAppApp {
     }
 
     /// Invalidate chat list cache (call when chats change or search changes)
+    ///
+    /// The status feed is derived from the same chats, so it goes with it: a
+    /// second cache that outlived the first would draw a run of updates that
+    /// no longer matches the messages behind it.
     fn invalidate_chat_cache(&self) {
         *self.chat_list_cache.borrow_mut() = None;
+        *self.status_feed_cache.borrow_mut() = None;
     }
 
     // ========== Message List Cache ==========

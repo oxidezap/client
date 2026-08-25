@@ -35,6 +35,18 @@ pub fn fallback_chat_name(jid: &Jid) -> String {
     }
 }
 
+/// The address every status update is addressed to.
+pub const STATUS_BROADCAST_JID: &str = "status@broadcast";
+
+/// Whether `jid` is the status broadcast.
+///
+/// A string compare rather than a parse: the address is a single fixed
+/// constant, and both chat constructors are on paths that otherwise never
+/// need a parsed JID.
+fn is_status_jid(jid: &str) -> bool {
+    jid == STATUS_BROADCAST_JID
+}
+
 /// Type of media content
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaType {
@@ -461,6 +473,14 @@ pub struct Chat {
     pub manually_unread: bool,
     /// Whether this is a group chat
     pub is_group: bool,
+    /// Whether this is the status broadcast.
+    ///
+    /// Not a conversation: nothing is addressed to it and nothing is replied
+    /// to in it — every message is one contact's status update, and the whole
+    /// thing belongs on its own screen rather than in a list of people to
+    /// talk to.
+    #[serde(default)]
+    pub is_status: bool,
     /// Participant names in group chats (sender JID -> display name)
     pub participants: HashMap<String, String>,
     /// Messages in this chat
@@ -482,6 +502,7 @@ impl Chat {
             .map(|jid| fallback_chat_name(&jid))
             .unwrap_or_else(|_| "Unknown chat".to_string());
         let is_group = jid.contains("@g.us");
+        let is_status = is_status_jid(&jid);
 
         Self {
             jid,
@@ -492,6 +513,7 @@ impl Chat {
             unread_count: 0,
             manually_unread: false,
             is_group,
+            is_status,
             participants: HashMap::new(),
             messages: Vec::new(),
             from_store: false,
@@ -526,6 +548,7 @@ impl Chat {
 
     pub(crate) fn with_name_priority(jid: String, name: String, name_priority: u8) -> Self {
         let is_group = jid.contains("@g.us");
+        let is_status = is_status_jid(&jid);
 
         Self {
             jid,
@@ -536,6 +559,7 @@ impl Chat {
             unread_count: 0,
             manually_unread: false,
             is_group,
+            is_status,
             participants: HashMap::new(),
             messages: Vec::new(),
             from_store: false,

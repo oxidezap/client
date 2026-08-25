@@ -69,10 +69,15 @@ pub fn render_message_list(
     let messages = Arc::clone(&cache.messages);
     let items = Arc::clone(&cache.items);
 
+    // The gutter is the container's, not the list's: `gpui::list` honours the
+    // vertical half of its own padding and lays every row out at the left
+    // edge of its bounds regardless of the horizontal half, which is why
+    // asking the list for `px` left the bubbles flush against the window.
     div()
         .flex_1()
         .min_h_0()
         .overflow_hidden()
+        .px(layout.conversation_padding())
         .child(
             list(state.clone(), move |ix, _window, cx| {
                 render_row(
@@ -80,7 +85,6 @@ pub fn render_message_list(
                 )
             })
             .size_full()
-            .px(layout.conversation_padding())
             .py(layout.conversation_gap()),
         )
         .into_any_element()

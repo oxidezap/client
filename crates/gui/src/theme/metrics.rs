@@ -354,6 +354,15 @@ impl Metrics {
         self.scaled(22.0)
     }
 
+    /// How wide a column of prose is allowed to get.
+    ///
+    /// Scales with the base font rather than sitting at a pixel count: the
+    /// limit exists so a line stays a comfortable number of characters, and
+    /// that is a property of the text size, not of the window.
+    pub fn reading_width(&self) -> Pixels {
+        self.scaled(720.0)
+    }
+
     // ---- call card ----------------------------------------------------
 
     pub fn call_card_width(&self) -> Pixels {

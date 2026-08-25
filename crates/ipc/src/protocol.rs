@@ -193,6 +193,14 @@ pub enum DaemonEvent {
     ChatRemoved {
         jid: String,
     },
+    /// The call state, whole. A call is one machine with one live stage, so
+    /// there is nothing to delta and applying this twice is harmless.
+    ///
+    /// It exists because the *daemon* makes some of these transitions itself:
+    /// accepting a call brings the media up here and there is no later event
+    /// to replay, so a second window would otherwise keep ringing an offer
+    /// that the first one answered.
+    CallsChanged(CallState),
 }
 
 /// A daemon-to-client frame.
