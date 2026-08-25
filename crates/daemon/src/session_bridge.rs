@@ -279,11 +279,32 @@ impl Bridge {
             self.hub.signal(&frame);
         }
 
-        // A ringing call is state, not just an event: see
-        // `StateSnapshot::ringing`.
+        // Calls are state, not just events: see `StateSnapshot::calls`. The
+        // same transitions the front end applies, from the same type, so the
+        // two cannot drift.
         match &event {
-            UiEvent::IncomingCall(call) => self.hub.start_ringing(call.clone()),
-            UiEvent::CallAccepted(id) | UiEvent::CallEnded(id) => self.hub.stop_ringing(id),
+            UiEvent::IncomingCall(call) => self.hub.calls(|s| s.set_incoming(call.clone())),
+            UiEvent::OutgoingCallStarted {
+                call_id,
+                recipient_jid,
+            } => self.hub.calls(|s| {
+                s.update_outgoing_call_id(recipient_jid, call_id.clone());
+            }),
+            UiEvent::CallAccepted(id) => self.hub.calls(|s| {
+                s.dismiss_incoming(id);
+                s.set_outgoing_connected(id);
+            }),
+            UiEvent::CallEnded(id) => self.hub.calls(|s| {
+                s.dismiss_incoming(id);
+                s.dismiss_outgoing(id);
+            }),
+            UiEvent::OutgoingCallFailed { recipient_jid, .. } => self.hub.calls(|s| {
+                if s.outgoing()
+                    .is_some_and(|c| c.recipient_jid == *recipient_jid)
+                {
+                    s.take_outgoing();
+                }
+            }),
             _ => {}
         }
 
@@ -399,16 +420,46 @@ impl Bridge {
                 }
                 CommandOutcome::Accepted
             }
+            // The daemon mirrors what the caller just did to its own call
+            // state, because a call placed here is not an event anybody could
+            // replay: `OutgoingCallStarted` only renames one that already
+            // exists. A window that attaches mid-call is served this.
             Action::Call(action) => {
                 match action {
                     CallAction::Start {
                         jid,
                         video,
                         placeholder_id,
-                    } => client.start_call(&jid, video, placeholder_id),
+                    } => {
+                        // The name off the chat list, the same place a front
+                        // end would look.
+                        let name = self
+                            .hub
+                            .chat(&jid)
+                            .map_or_else(|| jid.clone(), |chat| chat.name);
+                        self.hub.calls(|calls| {
+                            calls.set_outgoing(oxidezap_core::OutgoingCall::new(
+                                placeholder_id.clone(),
+                                jid.clone(),
+                                name,
+                                video,
+                            ));
+                        });
+                        client.start_call(&jid, video, placeholder_id);
+                    }
                     CallAction::Accept { call_id } => client.accept_call(&call_id),
-                    CallAction::Decline { call_id } => client.decline_call(&call_id),
-                    CallAction::Cancel { call_id } => client.cancel_call(&call_id),
+                    CallAction::Decline { call_id } => {
+                        self.hub.calls(|calls| {
+                            calls.dismiss_incoming(&call_id);
+                        });
+                        client.decline_call(&call_id);
+                    }
+                    CallAction::Cancel { call_id } => {
+                        self.hub.calls(|calls| {
+                            calls.dismiss_outgoing(&call_id);
+                        });
+                        client.cancel_call(&call_id);
+                    }
                     CallAction::SetMuted { call_id, muted } => {
                         client.set_call_muted(&call_id, muted);
                     }
@@ -762,10 +813,21 @@ fn cache_media(message_id: &str, media: &mut Option<MediaContent>) {
     }
 }
 
+/// The answer to a download, whichever way it went.
+///
+/// Success names the cache key; failure is the same error frame every other
+/// request gets, under the same id.
 fn downloaded(id: RequestId, result: Result<String, String>) -> String {
-    // A `Result<String, String>` cannot fail to serialize, so the fallback is
-    // unreachable; spelling it out beats an unwrap in a spawned task.
-    serde_json::to_string(&DaemonMessage::Downloaded { id, result })
+    let frame = match result {
+        Ok(key) => DaemonMessage::Downloaded { id, key },
+        Err(detail) => DaemonMessage::Error {
+            id: Some(id),
+            error: oxidezap_ipc::ProtocolError::Refused { detail },
+        },
+    };
+    // Neither shape can fail to serialize; spelling the fallback out beats an
+    // unwrap in a spawned task.
+    serde_json::to_string(&frame)
         .unwrap_or_else(|e| format!(r#"{{"type":"error","error":"malformed","detail":"{e}"}}"#))
 }
 
@@ -1417,11 +1479,43 @@ mod tests {
             received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         };
         bridge.observe(UiEvent::IncomingCall(call));
-        assert_eq!(bridge.hub.snapshot_ringing().len(), 1);
+        assert!(bridge.hub.call_state().incoming().is_some());
 
         // Answered or hung up, it is no longer something to attach to.
         bridge.observe(UiEvent::CallEnded("call-1".into()));
-        assert!(bridge.hub.snapshot_ringing().is_empty());
+        assert!(bridge.hub.call_state().incoming().is_none());
+    }
+
+    /// A call this account placed was never an event: the front end that
+    /// dialled built it locally. Nothing replays it, so the daemon has to
+    /// hold it for a window that attaches mid-call.
+    #[test]
+    fn an_outgoing_call_is_state_a_new_window_can_attach_to() {
+        let mut bridge = bridge();
+        // What the daemon records when it takes the request.
+        bridge.hub.calls(|s| {
+            s.set_outgoing(oxidezap_core::OutgoingCall::new(
+                "ui-call-1",
+                "1@s.whatsapp.net".into(),
+                "Alice".into(),
+                false,
+            ));
+        });
+
+        // The server names it, and the peer answers.
+        bridge.observe(UiEvent::OutgoingCallStarted {
+            call_id: "call-1".into(),
+            recipient_jid: "1@s.whatsapp.net".into(),
+        });
+        bridge.observe(UiEvent::CallAccepted("call-1".into()));
+
+        let calls = bridge.hub.call_state();
+        let outgoing = calls.outgoing().expect("still on the call");
+        assert_eq!(outgoing.call_id, "call-1", "renamed from its placeholder");
+        assert_eq!(outgoing.state, oxidezap_core::OutgoingCallState::Connected);
+
+        bridge.observe(UiEvent::CallEnded("call-1".into()));
+        assert!(bridge.hub.call_state().outgoing().is_none());
     }
 
     /// A failed send changes no state, so no snapshot can carry it: without

@@ -111,11 +111,13 @@ struct ChatEntry {
 struct Inner {
     version: StateVersion,
     connection: ConnectionState,
-    /// Calls ringing right now, by call id.
+    /// Which calls are happening.
     ///
-    /// Not a chat and not a summary, so it rides neither: it exists so a
-    /// window opened mid-ring has something to answer.
-    ringing: std::collections::HashMap<String, oxidezap_core::IncomingCall>,
+    /// Not a chat and not a summary, so it rides neither. The same type the
+    /// front end keeps, so attaching hands it over whole rather than replaying
+    /// events that would not reconstruct it: a call this account placed was
+    /// never an event at all.
+    calls: oxidezap_core::CallState,
     /// Chats keyed by JID. A map, not a Vec: every update is a lookup by JID,
     /// and a Vec would make a rename or a receipt O(n) over every chat.
     chats: std::collections::HashMap<String, ChatEntry>,
@@ -158,7 +160,7 @@ impl StateHub {
             inner: Mutex::new(Inner {
                 version: StateVersion::INITIAL,
                 connection: ConnectionState::Connecting,
-                ringing: std::collections::HashMap::new(),
+                calls: oxidezap_core::CallState::default(),
                 chats: std::collections::HashMap::new(),
             }),
             updates,
@@ -236,26 +238,25 @@ impl StateHub {
             version: inner.version,
             connection: inner.connection.clone(),
             chats,
-            ringing: inner.ringing.values().cloned().collect(),
+            calls: inner.calls.clone(),
         }
     }
 
-    /// Remember a call that is ringing, so a window opened during it can
-    /// answer.
-    pub fn start_ringing(&self, call: oxidezap_core::IncomingCall) {
-        self.lock().ringing.insert(call.call_id.clone(), call);
+    /// Change what is happening on the call front.
+    ///
+    /// The transitions live in [`oxidezap_core::CallState`], so the daemon and
+    /// the front end cannot disagree about what a call is.
+    pub fn calls(&self, change: impl FnOnce(&mut oxidezap_core::CallState)) {
+        change(&mut self.lock().calls);
     }
 
-    /// Forget one that has been answered or has stopped.
-    pub fn stop_ringing(&self, call_id: &str) {
-        self.lock().ringing.remove(call_id);
-    }
-
-    /// The calls currently ringing, for a test or a caller that only wants
-    /// those.
+    /// What is happening on the call front right now.
+    ///
+    /// The snapshot reads the field directly; this is for a caller that wants
+    /// only the calls.
     #[cfg(test)]
-    pub fn snapshot_ringing(&self) -> Vec<oxidezap_core::IncomingCall> {
-        self.lock().ringing.values().cloned().collect()
+    pub fn call_state(&self) -> oxidezap_core::CallState {
+        self.lock().calls.clone()
     }
 
     /// Where the connection stands right now.
