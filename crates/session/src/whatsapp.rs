@@ -32,7 +32,7 @@ use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 /// path would silently split state between launch methods (desktop launcher
 /// vs terminal), so prefer the platform data dir and only fall back to the
 /// working directory when no home is known.
-fn resolve_database_path() -> String {
+pub fn resolve_database_path() -> String {
     resolve_database_dir()
         .map(|dir| dir.join(DB_FILE).to_string_lossy().into_owned())
         .unwrap_or_else(|| DB_FILE.to_string())

@@ -6,4 +6,4 @@
 mod quoting;
 mod whatsapp;
 
-pub use whatsapp::{ReadBoundary, WhatsAppClient, wipe_local_state};
+pub use whatsapp::{ReadBoundary, WhatsAppClient, resolve_database_path, wipe_local_state};

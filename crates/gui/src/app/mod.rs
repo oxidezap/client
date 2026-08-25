@@ -36,7 +36,7 @@ use indexmap::IndexMap;
 
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, Image, KeyBinding, ScrollStrategy, Task,
-    WeakEntity, Window, actions, prelude::*,
+    WeakEntity, Window, actions, div, prelude::*,
 };
 use gpui_component::VirtualListScrollHandle;
 use gpui_component::input::InputState;
@@ -70,7 +70,7 @@ use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
 use crate::views::pairing::generate_qr_png;
 use crate::views::{
     render_connected_view, render_connecting_view, render_error_view, render_loading_view,
-    render_logged_out_view, render_pairing_view, render_syncing_view,
+    render_logged_out_view, render_pairing_view, render_settings_view, render_syncing_view,
 };
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
@@ -1475,7 +1475,24 @@ impl Render for WhatsAppApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
 
-        match &self.app_state {
+        // Window-level commands hang off the root so they work wherever focus
+        // happens to be, which is the point of a window-level command.
+        let root = div()
+            .size_full()
+            .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
+                app.focus_search(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &OpenSettings, window, cx| {
+                app.open_settings(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &CloseOverlay, window, cx| {
+                app.close_overlay(window, cx);
+            }))
+            .on_action(cx.listener(|app, _: &ReturnToCall, _window, cx| {
+                app.return_to_call(cx);
+            }));
+
+        let body = match &self.app_state {
             AppState::Loading => render_loading_view(cx).into_any_element(),
             AppState::Connecting => render_connecting_view(cx).into_any_element(),
             AppState::WaitingForPairing {
@@ -1485,11 +1502,18 @@ impl Render for WhatsAppApp {
             } => render_pairing_view(qr_code.as_ref(), pair_code.clone(), *timeout_secs, cx)
                 .into_any_element(),
             AppState::Syncing => render_syncing_view(cx).into_any_element(),
+            // Settings is a screen over the conversation view, so it takes
+            // the whole frame while it is open rather than floating.
+            AppState::Connected if self.settings.is_some() => {
+                render_settings_view(self, window, cx).into_any_element()
+            }
             AppState::Connected => render_connected_view(self, window, cx).into_any_element(),
             AppState::Error(msg) => render_error_view(msg, entity, cx).into_any_element(),
             AppState::LoggedOut { message } => {
                 render_logged_out_view(message, entity, cx).into_any_element()
             }
-        }
+        };
+
+        root.child(body)
     }
 }
