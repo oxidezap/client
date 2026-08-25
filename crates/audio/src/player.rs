@@ -52,6 +52,51 @@ impl AudioPlayer {
         self.is_playing.load(Ordering::Relaxed)
     }
 
+    /// How far through the clip playback is, in `0.0..=1.0`.
+    ///
+    /// Zero when nothing is loaded, so a caller can render a progress bar
+    /// without first asking whether there is audio.
+    pub fn progress(&self) -> f32 {
+        if self.total_samples == 0 {
+            return 0.0;
+        }
+        (self.position.load(Ordering::Relaxed) as f32 / self.total_samples as f32).clamp(0.0, 1.0)
+    }
+
+    /// Jump to `fraction` of the way through, in `0.0..=1.0`.
+    ///
+    /// Playback continues from there rather than restarting: the callback
+    /// reads this counter every buffer, so moving it is the whole seek. The
+    /// position is in output frames, which is what makes a mid-clip scrub land
+    /// where the waveform says it will.
+    pub fn seek(&self, fraction: f32) {
+        if self.total_samples == 0 {
+            return;
+        }
+        let target = (fraction.clamp(0.0, 1.0) * self.total_samples as f32) as usize;
+        // One frame short of the end: landing exactly on it would let the
+        // callback fire completion for a seek the user meant as "replay the
+        // last moment".
+        let last = (self.total_samples as usize).saturating_sub(1);
+        self.position.store(target.min(last), Ordering::Relaxed);
+    }
+
+    /// Seconds of audio played so far.
+    pub fn elapsed_secs(&self) -> f32 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        self.position.load(Ordering::Relaxed) as f32 / self.sample_rate as f32
+    }
+
+    /// Total length in seconds, or zero when nothing is loaded.
+    pub fn total_secs(&self) -> f32 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        self.total_samples as f32 / self.sample_rate as f32
+    }
+
     pub fn play(&mut self, ogg_data: Vec<u8>) -> Result<(), PlayerError> {
         let samples = decode_ogg(&ogg_data)?;
         if samples.is_empty() {
@@ -423,3 +468,61 @@ impl std::fmt::Display for PlayerError {
 }
 
 impl std::error::Error for PlayerError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A player with nothing loaded is the state every caller sees first, and
+    /// the one where a naive `position / total` divides by zero.
+    #[test]
+    fn an_idle_player_reports_zero_rather_than_dividing_by_zero() {
+        let player = AudioPlayer::new();
+        assert_eq!(player.progress(), 0.0);
+        assert_eq!(player.elapsed_secs(), 0.0);
+        assert_eq!(player.total_secs(), 0.0);
+    }
+
+    #[test]
+    fn seeking_with_nothing_loaded_does_nothing() {
+        let player = AudioPlayer::new();
+        player.seek(0.5);
+        assert_eq!(player.progress(), 0.0);
+    }
+
+    #[test]
+    fn seek_maps_a_fraction_onto_the_clip() {
+        let mut player = AudioPlayer::new();
+        player.total_samples = 1000;
+        player.sample_rate = 100;
+
+        player.seek(0.25);
+        assert_eq!(player.position.load(Ordering::Relaxed), 250);
+        assert!((player.progress() - 0.25).abs() < f32::EPSILON);
+        assert!((player.elapsed_secs() - 2.5).abs() < f32::EPSILON);
+        assert!((player.total_secs() - 10.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn seeking_to_the_very_end_stays_inside_the_clip() {
+        // Landing exactly on the end would let the callback fire completion
+        // for a scrub the user meant as "replay the last moment".
+        let mut player = AudioPlayer::new();
+        player.total_samples = 1000;
+
+        player.seek(1.0);
+        assert_eq!(player.position.load(Ordering::Relaxed), 999);
+    }
+
+    #[test]
+    fn out_of_range_fractions_are_clamped() {
+        let mut player = AudioPlayer::new();
+        player.total_samples = 1000;
+
+        player.seek(-3.0);
+        assert_eq!(player.position.load(Ordering::Relaxed), 0);
+
+        player.seek(7.5);
+        assert_eq!(player.position.load(Ordering::Relaxed), 999);
+    }
+}
