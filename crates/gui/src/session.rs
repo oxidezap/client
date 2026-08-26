@@ -64,6 +64,12 @@ pub enum FromDaemon {
     Account(Option<oxidezap_ipc::AccountIdentity>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
+    /// Status updates watched somewhere else on this device.
+    ///
+    /// The window that watched one already knows; this is for every other
+    /// one, which is drawing a ring and a badge off rows that stopped being
+    /// true the moment the daemon wrote the view.
+    StatusWatched(Vec<String>),
 }
 
 /// What to do when a request comes back, by the id it was sent under.
@@ -617,6 +623,14 @@ fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pend
                         .to_string(),
                 );
                 break;
+            }
+            Ok(DaemonMessage::StatusWatched { message_ids }) => {
+                if events
+                    .blocking_send(FromDaemon::StatusWatched(message_ids))
+                    .is_err()
+                {
+                    break;
+                }
             }
             Ok(DaemonMessage::ShowWindow) => {
                 if events.blocking_send(FromDaemon::ShowWindow).is_err() {

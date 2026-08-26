@@ -289,6 +289,15 @@ pub enum DaemonMessage {
     /// front end reports it against the chat, which is where a user is
     /// looking when they wonder whether their message went out.
     SendFailed { jid: String, reason: String },
+    /// These status updates have been watched, by whoever asked for it.
+    ///
+    /// Versionless like the two above, and for a reason of its own: a view is
+    /// stored, so a client that resynchronizes gets it back in the history it
+    /// reloads. What it cannot get back is the *other* window's view arriving
+    /// while it is attached — a status view is a fact about the device, and
+    /// without this the second window kept a ring and a badge over an update
+    /// somebody had already watched until an unrelated reload happened by.
+    StatusWatched { message_ids: Vec<String> },
     /// The client fell too far behind and its stream was truncated. Whatever
     /// it holds is now untrustworthy, so it must snapshot again rather than
     /// keep applying.
@@ -687,6 +696,19 @@ mod tests {
             serde_json::from_str::<Request>(&line).unwrap().request,
             request
         );
+    }
+
+    /// The answer travels versionless, like every other piece of news: it is
+    /// recoverable from the store on the next reload, and what it is *for* is
+    /// the window between now and then.
+    #[test]
+    fn a_watched_status_reaches_the_other_windows() {
+        let frame = DaemonMessage::StatusWatched {
+            message_ids: vec!["3EB0A".into()],
+        };
+        let line = serde_json::to_string(&frame).unwrap();
+        assert!(line.contains(r#""type":"status_watched""#), "{line}");
+        assert_eq!(serde_json::from_str::<DaemonMessage>(&line).unwrap(), frame);
     }
 
     /// A client that never reads an answer should not have to invent an id,

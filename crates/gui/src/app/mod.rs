@@ -717,6 +717,14 @@ impl WhatsAppApp {
                         app.account_lid = account.and_then(|a| a.lid);
                         cx.notify();
                     }),
+                    // Watched in another window. The ring is derived from
+                    // the rows, so this both writes them and remembers the
+                    // ids: the next hydration merge replaces those rows from
+                    // a store that agrees, but one already in flight was
+                    // assembled before the view existed.
+                    FromDaemon::StatusWatched(message_ids) => entity.update(cx, |app, cx| {
+                        app.adopt_status_views(message_ids, cx);
+                    }),
                     // The tray's "Open", or another front end asking on a
                     // user's behalf. One window, so there is one to raise.
                     FromDaemon::ShowWindow => {

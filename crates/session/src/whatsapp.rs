@@ -1619,17 +1619,24 @@ impl WhatsAppClient {
     /// carrying everybody's updates, so clearing it would watch every
     /// contact's run at once.
     ///
-    /// Returns a handle that completes when the row is written; see
-    /// [`WhatsAppClient::send_message`] for why.
-    pub fn mark_status_watched(&self, message_ids: Vec<String>) -> tokio::task::JoinHandle<()> {
+    /// Returns a handle that answers whether the row reached the store. The
+    /// caller waits for it: a view is the whole point of the request and
+    /// there is no retry — the window has already drawn the ring as watched —
+    /// so "accepted" has to mean "written", not "queued behind a teardown
+    /// that may cancel it".
+    pub fn mark_status_watched(&self, message_ids: Vec<String>) -> tokio::task::JoinHandle<bool> {
         let chat_store = self.chat_store.clone();
         self.runtime.spawn(async move {
             let Some(store) = chat_store.lock().await.clone() else {
                 warn!("no chat store yet; a watched status update was not recorded");
-                return;
+                return false;
             };
-            if let Err(e) = store.mark_status_watched(message_ids).await {
-                warn!("failed to record watched status updates: {e}");
+            match store.mark_status_watched(message_ids).await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("failed to record watched status updates: {e}");
+                    false
+                }
             }
         })
     }

@@ -459,6 +459,24 @@ impl WhatsAppApp {
         self.invalidate_chat_cache();
     }
 
+    /// Take on views recorded elsewhere on this device.
+    ///
+    /// The daemon says so once the row is written, which is what makes a
+    /// second window's ring agree with the first's without waiting for a
+    /// history reload that may be minutes away. Remembered as well as
+    /// applied, for the same reason this window remembers its own: a
+    /// hydration merge assembled before the view landed would otherwise put
+    /// the ring back.
+    pub(super) fn adopt_status_views(&mut self, message_ids: Vec<String>, cx: &mut Context<Self>) {
+        if message_ids.is_empty() {
+            return;
+        }
+        self.watched_status.extend(message_ids);
+        self.restore_watched_status();
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
     /// Put the locally watched updates back after a hydration merge.
     ///
     /// The daemon is told too, and answers a later reload with the row
