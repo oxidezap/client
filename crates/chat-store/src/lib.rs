@@ -39,6 +39,7 @@ mod store;
 pub mod types;
 
 pub use error::{ChatStoreError, Result};
+pub use queries::STATUS_VIEW_LIFETIME;
 pub use store::ChatStore;
 pub use types::{
     ArrivalCursor, ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind,

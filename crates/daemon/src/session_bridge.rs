@@ -51,6 +51,11 @@ pub enum Action {
         /// [`oxidezap_ipc::ClientRequest::MarkRead`].
         through_message_id: Option<String>,
     },
+    MarkStatusWatched {
+        /// The updates the reader has looked at. See
+        /// [`oxidezap_ipc::ClientRequest::MarkStatusWatched`].
+        message_ids: Vec<String>,
+    },
     Typing {
         jid: String,
         composing: bool,
@@ -78,8 +83,17 @@ impl Action {
     /// deletes it. Gating those on a connection refuses them exactly when
     /// they are wanted: dead credentials are a state the account is
     /// unreachable in by definition, and re-pairing is the only way out of it.
+    ///
+    /// Recording a status view is the same kind of thing: it writes one local
+    /// row and tells nobody, and the updates it describes are stored history a
+    /// disconnected window can still read. Refusing it offline would lose
+    /// exactly the views taken while offline, and there is no retry — the
+    /// window has already drawn the ring as watched.
     pub fn needs_network(&self) -> bool {
-        !matches!(self, Self::ReloadHistory | Self::ForgetSession)
+        !matches!(
+            self,
+            Self::ReloadHistory | Self::ForgetSession | Self::MarkStatusWatched { .. }
+        )
     }
 }
 
@@ -578,6 +592,14 @@ impl Bridge {
                 jid,
                 through_message_id,
             } => self.mark_read(client, &jid, through_message_id.as_deref()),
+            // No permit and no boundary check: this writes one local row and
+            // sends nothing, so there is no receipt to get wrong and nothing
+            // for a stale client to consume on somebody's behalf. Watching an
+            // update it has already watched is the same row again.
+            Action::MarkStatusWatched { message_ids } => {
+                client.mark_status_watched(message_ids);
+                CommandOutcome::Accepted
+            }
             // No permit: these send one small stanza and hold nothing open,
             // and a typing indicator refused for being busy would be a worse
             // answer than a late one.

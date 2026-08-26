@@ -1607,6 +1607,33 @@ impl WhatsAppClient {
         self.reload.notify_one();
     }
 
+    /// Remember that these status updates have been watched.
+    ///
+    /// Local, and deliberately so: WhatsApp's own answer is a status read
+    /// receipt, which is a privacy setting the library does not expose. What
+    /// this buys is the honest half — the ring stops claiming there is
+    /// something new here, and it stays stopped across a restart, which is
+    /// what a front end's own memory of it could not do.
+    ///
+    /// The broadcast's unread cursor is not that answer: it counts one chat
+    /// carrying everybody's updates, so clearing it would watch every
+    /// contact's run at once.
+    ///
+    /// Returns a handle that completes when the row is written; see
+    /// [`WhatsAppClient::send_message`] for why.
+    pub fn mark_status_watched(&self, message_ids: Vec<String>) -> tokio::task::JoinHandle<()> {
+        let chat_store = self.chat_store.clone();
+        self.runtime.spawn(async move {
+            let Some(store) = chat_store.lock().await.clone() else {
+                warn!("no chat store yet; a watched status update was not recorded");
+                return;
+            };
+            if let Err(e) = store.mark_status_watched(message_ids).await {
+                warn!("failed to record watched status updates: {e}");
+            }
+        })
+    }
+
     /// Synchronize a bounded read action so newer messages remain unread.
     ///
     /// Returns a handle that completes when the action has run; see
@@ -2080,6 +2107,24 @@ fn merge_alias_history_messages(
         .max(visible_unread);
 }
 
+/// Mark the watched updates read, in the broadcast and nowhere else.
+///
+/// Our own updates are left alone: they are never unseen to begin with, and a
+/// row from us carries the peer-read ticks in `is_read`, which a local view has
+/// no business setting.
+fn apply_status_views(chats: &mut [oxidezap_core::Chat], watched: &HashSet<String>) {
+    if watched.is_empty() {
+        return;
+    }
+    for chat in chats.iter_mut().filter(|chat| chat.is_status) {
+        for message in &mut chat.messages {
+            if !message.is_from_me && watched.contains(&message.id) {
+                message.is_read = true;
+            }
+        }
+    }
+}
+
 impl WhatsAppClient {
     const HISTORY_CHAT_LIMIT: i64 = 100;
     const HISTORY_MESSAGES_PER_CHAT: i64 = 50;
@@ -2300,7 +2345,35 @@ impl WhatsAppClient {
                 history_preview(entry.last_message_preview.clone(), chat.messages.last());
             chats.push(chat);
         }
+        Self::restore_status_views(chat_store, &mut chats).await;
         Ok((chats, complete))
+    }
+
+    /// Put back the updates already watched on this device.
+    ///
+    /// A status row hydrates read or unread from the broadcast's unread
+    /// cursor, which is the whole feed's counter and knows nothing about which
+    /// of *these* updates was looked at — so without this every restart
+    /// offered yesterday's watched updates as new, ring, badge and all.
+    ///
+    /// One pass at the end rather than inside the per-chat branches: the alias
+    /// merge re-marks rows unread from the chat it is merging into, so a fix
+    /// applied before it would be undone by it.
+    async fn restore_status_views(chat_store: &Arc<ChatStore>, chats: &mut [oxidezap_core::Chat]) {
+        if !chats.iter().any(|chat| chat.is_status) {
+            return;
+        }
+        let watched: HashSet<String> = match chat_store.watched_status().await {
+            Ok(ids) => ids.into_iter().collect(),
+            // Best-effort, like every other hydration step: a table that
+            // cannot be read costs a ring that should not be there, not a
+            // history load that fails and blanks the list.
+            Err(e) => {
+                warn!("failed to read watched status updates: {e}");
+                return;
+            }
+        };
+        apply_status_views(chats, &watched);
     }
 
     /// Every storage key the invalidated chats are held under.
@@ -2925,7 +2998,8 @@ mod tests {
 
     use super::{
         ChatStore, Client, MuteLane, NameBook, ReadBoundary, ReloadScope, SqliteStore, StoreChange,
-        WhatsAppClient, media_metadata, merge_alias_history_messages, read_message_range,
+        WhatsAppClient, apply_status_views, media_metadata, merge_alias_history_messages,
+        read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
     use std::sync::Arc;
@@ -3204,6 +3278,57 @@ mod tests {
             3,
         );
         assert_eq!(chat.unread_count, 4);
+    }
+
+    /// A status row hydrates read or unread from the broadcast's unread
+    /// cursor, which counts everybody's updates at once and cannot say which
+    /// of them was looked at. Without the views put back, every restart
+    /// offered watched updates as new.
+    #[test]
+    fn watched_updates_come_back_watched() {
+        let update = |id: &str, from_me: bool| ChatMessage {
+            id: id.to_string(),
+            sender: "12025550143@s.whatsapp.net".to_string(),
+            sender_name: None,
+            content: id.to_string(),
+            timestamp: whatsapp_rust::wacore::time::now_utc(),
+            is_from_me: from_me,
+            is_read: false,
+            media: None,
+            reactions: HashMap::new(),
+            status: MessageStatus::default(),
+            quoted: None,
+            revoked: false,
+            system: None,
+        };
+        let mut broadcast = Chat::new(oxidezap_core::STATUS_BROADCAST_JID.to_string());
+        broadcast.messages = vec![
+            update("SEEN", false),
+            update("NEW", false),
+            update("MINE", true),
+        ];
+        let mut conversation = Chat::new("12025550143@s.whatsapp.net".to_string());
+        conversation.messages = vec![update("SEEN", false)];
+
+        let watched = ["SEEN".to_string(), "MINE".to_string()]
+            .into_iter()
+            .collect();
+        let mut chats = vec![broadcast, conversation];
+        apply_status_views(&mut chats, &watched);
+
+        assert!(
+            chats[0].messages[0].is_read,
+            "watched update comes back watched"
+        );
+        assert!(!chats[0].messages[1].is_read, "one nobody opened stays new");
+        assert!(
+            !chats[0].messages[2].is_read,
+            "our own row carries the peer's read ticks; a local view must not set them"
+        );
+        assert!(
+            !chats[1].messages[0].is_read,
+            "a conversation is not the broadcast, whatever ids collide"
+        );
     }
 
     #[test]

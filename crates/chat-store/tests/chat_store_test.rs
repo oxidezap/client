@@ -6482,3 +6482,122 @@ async fn mark_send_failed_fails_pending_row_only() {
     let msg = chat_store.message(&chat, "OUT-WON").await.unwrap().unwrap();
     assert_eq!(msg.status, MessageStatus::ServerAck);
 }
+
+/// Watching a status is local — there is no receipt to send and the broadcast's
+/// unread cursor covers everybody's updates at once — so the only thing that
+/// can carry it across a restart is a row of its own.
+#[tokio::test]
+async fn a_watched_status_survives_reopening_the_store() {
+    let (store, chat_store) = test_store().await;
+    chat_store
+        .mark_status_watched(vec!["STATUS-1".to_string(), "STATUS-2".to_string()])
+        .await
+        .unwrap();
+
+    // The same file, opened again: what a restart of the daemon does.
+    let reopened = ChatStore::new(&store).await.unwrap();
+    let mut watched = reopened.watched_status().await.unwrap();
+    watched.sort();
+    assert_eq!(watched, vec!["STATUS-1", "STATUS-2"]);
+}
+
+/// Watching the same update twice must not move the instant the row is pruned
+/// by: the view is when it was first looked at, not the last time the reader
+/// passed over it.
+#[tokio::test]
+async fn watching_an_update_again_keeps_the_first_instant() {
+    let (store, chat_store) = test_store().await;
+    chat_store
+        .mark_status_watched(vec!["STATUS-1".to_string()])
+        .await
+        .unwrap();
+    store
+        .shared()
+        .run(|conn| {
+            diesel::sql_query(
+                "UPDATE status_views SET watched_at_ms = 111 WHERE msg_id = 'STATUS-1'",
+            )
+            .execute(conn)
+            .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))
+        })
+        .await
+        .unwrap();
+
+    chat_store
+        .mark_status_watched(vec!["STATUS-1".to_string()])
+        .await
+        .unwrap();
+
+    #[derive(diesel::QueryableByName)]
+    struct At {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        watched_at_ms: i64,
+    }
+    let rows: Vec<At> = store
+        .shared()
+        .run(|conn| {
+            diesel::sql_query("SELECT watched_at_ms FROM status_views WHERE msg_id = 'STATUS-1'")
+                .load(conn)
+                .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one row per update, however often it is watched"
+    );
+    assert_eq!(rows[0].watched_at_ms, 111, "the first view is the one kept");
+}
+
+/// An update lapses 24 hours after it was posted and cannot be watched before
+/// it was, so a view older than that describes something nobody can reach. The
+/// read is what trims them, because it is what already walks the table.
+#[tokio::test]
+async fn a_view_of_a_lapsed_update_is_dropped_on_the_way_out() {
+    let (store, chat_store) = test_store().await;
+    chat_store
+        .mark_status_watched(vec!["OLD".to_string(), "RECENT".to_string()])
+        .await
+        .unwrap();
+    let stale_ms = Utc::now().timestamp_millis()
+        - oxidezap_chat_store::STATUS_VIEW_LIFETIME.as_millis() as i64
+        - 1;
+    store
+        .shared()
+        .run(move |conn| {
+            diesel::sql_query(format!(
+                "UPDATE status_views SET watched_at_ms = {stale_ms} WHERE msg_id = 'OLD'"
+            ))
+            .execute(conn)
+            .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(chat_store.watched_status().await.unwrap(), vec!["RECENT"]);
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Count> = store
+        .shared()
+        .run(|conn| {
+            diesel::sql_query("SELECT COUNT(*) AS n FROM status_views")
+                .load(conn)
+                .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows[0].n, 1, "the lapsed view is gone from the table too");
+}
+
+/// Nothing to watch is not an error, and must not cost a statement.
+#[tokio::test]
+async fn watching_nothing_is_a_no_op() {
+    let (_store, chat_store) = test_store().await;
+    chat_store.mark_status_watched(Vec::new()).await.unwrap();
+    assert!(chat_store.watched_status().await.unwrap().is_empty());
+}

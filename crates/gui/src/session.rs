@@ -386,6 +386,19 @@ impl Session {
         });
     }
 
+    /// Tell the daemon these status updates have been watched.
+    ///
+    /// Not `mark_chat_read` on the broadcast: that clears one chat, and the
+    /// broadcast holds every contact's updates. Nothing goes to the network —
+    /// this is the local half of a status view, and the daemon is where it has
+    /// to live to outlast the window.
+    pub fn mark_status_watched(&self, message_ids: Vec<String>) {
+        if message_ids.is_empty() {
+            return;
+        }
+        self.tell(ClientRequest::MarkStatusWatched { message_ids });
+    }
+
     pub fn start_call(&self, jid: &str, is_video: bool, placeholder_id: String) {
         self.call(CallAction::Start {
             jid: jid.to_string(),

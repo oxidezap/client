@@ -445,20 +445,26 @@ impl WhatsAppApp {
             return;
         }
         message.is_read = true;
-        // Remembered as well as set. Watching a status is local by design —
-        // there is no receipt to send — but the *store* is what a hydration
-        // merge replaces these rows from, and it has never been told, so the
-        // ring and the badge came back on the next reload. The store cannot
-        // know about a view it was never told about; this window can.
-        self.watched_status.insert(message_id);
+        // Remembered as well as set, in two places that answer different
+        // questions. This window's own set survives a hydration merge, which
+        // replaces these rows from the store and would otherwise put the ring
+        // straight back before the daemon has been heard from. The daemon's
+        // copy survives the window: it owns the store, and a view that lived
+        // only here died with the process — which is why every restart
+        // offered updates that had already been watched as new.
+        self.watched_status.insert(message_id.clone());
+        if let Some(client) = &self.client {
+            client.mark_status_watched(vec![message_id]);
+        }
         self.invalidate_chat_cache();
     }
 
     /// Put the locally watched updates back after a hydration merge.
     ///
-    /// The store's copy of a status row is honest — it says unread, because
-    /// nothing ever told it otherwise — so re-applying is what keeps
-    /// "watched" from being undone by a reload or a reconnect.
+    /// The daemon is told too, and answers a later reload with the row
+    /// already read — but not this one: a hydration merge in flight was
+    /// assembled before the view was recorded. This is what keeps "watched"
+    /// from flickering back on in between.
     pub(super) fn restore_watched_status(&mut self) {
         if self.watched_status.is_empty() {
             return;

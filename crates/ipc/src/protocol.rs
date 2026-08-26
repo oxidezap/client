@@ -442,6 +442,22 @@ pub enum ClientRequest {
         jid: String,
         through_message_id: Option<String>,
     },
+    /// Remember that these status updates have been watched.
+    ///
+    /// Not a [`MarkRead`](Self::MarkRead) for the broadcast: that one clears a
+    /// whole chat, and the broadcast is every contact's updates in one — it
+    /// would watch runs nobody opened. This names the updates themselves.
+    ///
+    /// The daemon owns the store, so it is the only process that can make a
+    /// view outlive the window that had it: a front end's own memory of what
+    /// was watched dies with the front end, and the next one to attach put the
+    /// ring back on everything.
+    ///
+    /// Nothing is sent to anyone. A status read receipt is a privacy setting
+    /// the library does not expose.
+    MarkStatusWatched {
+        message_ids: Vec<String>,
+    },
     /// Ask what this account is taking up on disk.
     ///
     /// Answered with [`DaemonMessage::Storage`] under the request's id. The
@@ -652,6 +668,25 @@ mod tests {
             "{line}"
         );
         assert_eq!(serde_json::from_str::<Request>(&line).unwrap().id, Some(7));
+    }
+
+    /// Watching a status names the updates, not the chat: the broadcast holds
+    /// every contact's run, so a chat-shaped request would clear runs nobody
+    /// opened.
+    #[test]
+    fn a_status_view_names_the_updates_it_watched() {
+        let request = ClientRequest::MarkStatusWatched {
+            message_ids: vec!["3EB0A".into(), "3EB0B".into()],
+        };
+        let line = serde_json::to_string(&Request::bare(request.clone())).unwrap();
+        assert!(
+            line.contains(r#""request":"mark_status_watched""#),
+            "{line}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(&line).unwrap().request,
+            request
+        );
     }
 
     /// A client that never reads an answer should not have to invent an id,
