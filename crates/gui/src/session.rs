@@ -20,7 +20,8 @@ use log::{debug, error, info, warn};
 use oxidezap_core::{CallState, DownloadableMedia, MediaContent, QuotedMessage, UiEvent};
 use oxidezap_ipc::{
     CallAction, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, Endpoint,
-    PROTOCOL_VERSION, Request, RequestId, StateSnapshot, StateVersion, endpoint_path, media_path,
+    PROTOCOL_VERSION, Reader, Request, RequestId, StateSnapshot, StateVersion, Writer,
+    endpoint_path, media_path,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::{mpsc, oneshot};
@@ -144,9 +145,9 @@ type Pending = Arc<Mutex<HashMap<RequestId, Awaiting>>>;
 
 /// A connection to `oxidezapd`.
 pub struct Session {
-    /// The write half. The reader thread holds its own handle, so this is not
-    /// shared with it: recovery is reconnecting, not writing.
-    writer: Mutex<Endpoint>,
+    /// The write half. The reader thread holds the other one, and the two are
+    /// used at the same time — see [`Endpoint::split`].
+    writer: Mutex<Writer>,
     pending: Pending,
     next_id: AtomicU64,
     /// The same channel the reader publishes on.
@@ -165,12 +166,11 @@ impl Session {
     /// client that asks for events, so the chats arrive without being asked
     /// for separately.
     pub fn connect() -> std::io::Result<(Self, mpsc::Receiver<FromDaemon>)> {
-        let stream = connect_or_start()?;
-        let reader = stream.try_clone()?;
+        let (reader, writer) = connect_or_start()?.split()?;
         let (events, rx) = mpsc::channel(EVENT_QUEUE);
 
         let session = Self {
-            writer: Mutex::new(stream),
+            writer: Mutex::new(writer),
             pending: Pending::default(),
             next_id: AtomicU64::new(1),
             events: events.clone(),
@@ -481,7 +481,7 @@ fn sanitize(id: &str) -> String {
 }
 
 /// Read frames until the daemon goes away.
-fn read_frames(stream: Endpoint, events: &mpsc::Sender<FromDaemon>, pending: &Pending) {
+fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pending) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     // How far the state this side holds has been carried.

@@ -22,7 +22,7 @@ mod transport;
 #[cfg(windows)]
 pub mod windows_user;
 
-pub use endpoint::Endpoint;
+pub use endpoint::{Endpoint, Reader, Writer};
 pub use protocol::{
     AccountIdentity, CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent,
     DaemonMessage, MessagePreview, PairingCode, ProtocolError, Request, RequestId, StateSnapshot,

@@ -9,22 +9,42 @@
 //! transport needs one thread to read and a lock to serialize writes, not a
 //! runtime. The daemon is the side that has thousands of things happening at
 //! once; a client has one.
+//!
+//! Those two threads run *at the same time*, which is a requirement on the
+//! transport rather than a detail of the caller — [`Endpoint::split`] is where
+//! it is written down, because a platform can quietly fail to provide it. See
+//! the `overlapped` module for the one that did.
 
 use std::io::{Read, Write};
 
-/// A connected, blocking, duplex stream to the daemon.
+#[cfg(windows)]
+mod overlapped;
+
+/// A connection to the daemon, before it is put to work.
+///
+/// Not readable or writable itself: it becomes a [`Reader`] and a [`Writer`],
+/// and the point of making that a step is that the two are used from different
+/// threads at once. A transport that cannot do that is broken for this
+/// protocol, and there is now one place that says so.
 pub struct Endpoint(Inner);
+
+/// The half a reader thread parks in.
+pub struct Reader(Inner);
+
+/// The half everything else writes through, behind a lock.
+pub struct Writer(Inner);
 
 #[cfg(unix)]
 type Inner = std::os::unix::net::UnixStream;
 
-/// A named pipe opened as a file.
+/// A named pipe, opened overlapped.
 ///
-/// Windows has no `std` named-pipe client, but a pipe *is* openable by name
-/// with the ordinary file API, and the handle it returns is the duplex stream
-/// this needs. Nothing above cares which one it got.
+/// Windows has no `std` named-pipe client, and a pipe *is* openable by name
+/// with the ordinary file API — but that gives a synchronous handle, on which
+/// Windows serializes reads against writes and deadlocks this protocol. See
+/// [`overlapped`].
 #[cfg(windows)]
-type Inner = std::fs::File;
+type Inner = overlapped::Overlapped;
 
 impl Endpoint {
     /// Connect to the daemon, or report why not.
@@ -38,22 +58,36 @@ impl Endpoint {
         let path = crate::endpoint_path().ok_or_else(|| {
             std::io::Error::other("no per-user directory to look for the daemon in")
         })?;
+        Self::connect_at(&path)
+    }
 
+    /// Connect to an endpoint by name.
+    ///
+    /// [`connect`](Self::connect) is this with the daemon's own name. Taking
+    /// one is what lets a test stand up a real endpoint of its own — which
+    /// matters more than it sounds, because the difference between the two
+    /// platforms here is a runtime one that no amount of compiling catches.
+    pub fn connect_at(path: &std::path::Path) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
-            let stream = Inner::connect(&path)?;
+            let stream = Inner::connect(path)?;
             check_peer(&stream)?;
             Ok(Self(stream))
         }
         #[cfg(windows)]
         {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
             // Read and write, because the pipe is duplex and opening it for
-            // one direction would half-connect.
-            std::fs::OpenOptions::new()
+            // one direction would half-connect. Overlapped, because the two
+            // directions are used at once and a synchronous handle will not
+            // have that — see `overlapped`.
+            let pipe = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&path)
-                .map(Self)
+                .custom_flags(overlapped::FILE_FLAG_OVERLAPPED)
+                .open(path)?;
+            overlapped::Overlapped::new(pipe).map(Self)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -62,12 +96,33 @@ impl Endpoint {
         }
     }
 
-    /// A second handle on the same connection.
+    /// The two ends, for the two threads that use them.
     ///
-    /// One thread reads while the rest of the program writes; both need the
-    /// stream, and neither may own it exclusively.
-    pub fn try_clone(&self) -> std::io::Result<Self> {
-        self.0.try_clone().map(Self)
+    /// One thread parks in a read for as long as the connection lives, and the
+    /// rest of the program writes while it does. Both of those are true at the
+    /// same time — which reads like a caller's business and is not: on Windows
+    /// a synchronous handle makes the write wait for the read, so a request
+    /// waits for an answer to the request. Splitting here is what gives that
+    /// requirement somewhere to be stated and checked.
+    pub fn split(self) -> std::io::Result<(Reader, Writer)> {
+        let writer = self.0.try_clone()?;
+        Ok((Reader(self.0), Writer(writer)))
+    }
+}
+
+impl Read for Reader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for Writer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
     }
 }
 
@@ -116,21 +171,5 @@ fn peer_uid(stream: &Inner) -> std::io::Result<u32> {
         Ok(uid)
     } else {
         Err(std::io::Error::last_os_error())
-    }
-}
-
-impl Read for Endpoint {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-impl Write for Endpoint {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
     }
 }
