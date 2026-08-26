@@ -17,14 +17,6 @@ use crate::types::{
     MessageStatus, ReactionEntry, ReceiptEntry, StoredMessage,
 };
 
-/// How long a status view is worth keeping.
-///
-/// WhatsApp's own rule for the update itself, mirrored here because it is what
-/// makes a view prunable: `oxidezap_core::STATUS_LIFETIME` says the same thing
-/// on the other side of the daemon, and this crate is a data layer that does
-/// not depend on it.
-pub const STATUS_VIEW_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(ms)
 }
@@ -692,83 +684,6 @@ impl ChatStore {
             })
             .await?;
         Ok(())
-    }
-
-    /// Record that these status updates have been watched on this device.
-    ///
-    /// Local by design: WhatsApp's own answer is a read receipt, which is a
-    /// privacy setting the library does not expose, and the chat's unread
-    /// cursor cannot say it either — the status broadcast is one chat holding
-    /// everybody's updates, so clearing it would watch every contact's run at
-    /// once. This is the per-update half that survives a restart.
-    ///
-    /// Idempotent: watching the same update twice keeps the first instant,
-    /// because it is the one that decides when the row can be pruned.
-    pub async fn mark_status_watched(&self, msg_ids: Vec<String>) -> Result<()> {
-        use schema::status_views::dsl;
-        if msg_ids.is_empty() {
-            return Ok(());
-        }
-        let device_id = self.device_id();
-        let now_ms = wacore::time::now_utc().timestamp_millis();
-        self.db()
-            .run(move |conn| {
-                let rows: Vec<_> = msg_ids
-                    .iter()
-                    .map(|id| {
-                        (
-                            dsl::device_id.eq(device_id),
-                            dsl::msg_id.eq(id),
-                            dsl::watched_at_ms.eq(now_ms),
-                        )
-                    })
-                    .collect();
-                diesel::insert_into(dsl::status_views)
-                    .values(rows)
-                    .on_conflict((dsl::device_id, dsl::msg_id))
-                    .do_nothing()
-                    .execute(conn)
-                    .map(|_| ())
-                    .map_err(db_err)
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// The updates watched on this device that could still be on screen.
-    ///
-    /// Views of lapsed updates are dropped on the way out rather than
-    /// accumulating for the life of the account: an update is watchable for
-    /// [`STATUS_VIEW_LIFETIME`] from the moment it was posted, and it cannot
-    /// be watched before it is posted, so a view older than that describes an
-    /// update nobody can reach any more.
-    pub async fn watched_status(&self) -> Result<Vec<String>> {
-        use schema::status_views::dsl;
-        let device_id = self.device_id();
-        let cutoff_ms =
-            wacore::time::now_utc().timestamp_millis() - STATUS_VIEW_LIFETIME.as_millis() as i64;
-        self.db()
-            .run(move |conn| {
-                // Pruned where it is read, so the table is trimmed by the
-                // thing that already has to walk it and no timer has to exist
-                // for a table this small.
-                diesel::delete(
-                    dsl::status_views.filter(
-                        dsl::device_id
-                            .eq(device_id)
-                            .and(dsl::watched_at_ms.lt(cutoff_ms)),
-                    ),
-                )
-                .execute(conn)
-                .map_err(db_err)?;
-                dsl::status_views
-                    .filter(dsl::device_id.eq(device_id))
-                    .select(dsl::msg_id)
-                    .load::<String>(conn)
-                    .map_err(db_err)
-            })
-            .await
-            .map_err(Into::into)
     }
 
     pub async fn media_ref(&self, file_sha256: &[u8]) -> Result<Option<MediaRef>> {

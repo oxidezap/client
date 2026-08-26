@@ -1624,6 +1624,11 @@ impl WhatsAppClient {
     /// there is no retry — the window has already drawn the ring as watched —
     /// so "accepted" has to mean "written", not "queued behind a teardown
     /// that may cancel it".
+    ///
+    /// A row that moves invalidates its chat, so the reloader republishes the
+    /// broadcast and every attached front end learns about the view through
+    /// the history it already knows how to recover. Nothing has to be told
+    /// separately, and nothing is lost if a client is behind.
     pub fn mark_status_watched(&self, message_ids: Vec<String>) -> tokio::task::JoinHandle<bool> {
         let chat_store = self.chat_store.clone();
         self.runtime.spawn(async move {
@@ -1631,7 +1636,19 @@ impl WhatsAppClient {
                 warn!("no chat store yet; a watched status update was not recorded");
                 return false;
             };
-            match store.mark_status_watched(message_ids).await {
+            let Ok(broadcast) = oxidezap_core::STATUS_BROADCAST_JID.parse::<Jid>() else {
+                warn!("the status broadcast address does not parse");
+                return false;
+            };
+            // Enqueued and then awaited: the write goes through the same
+            // ordered queue as the insert that created the row it targets,
+            // and `flush` is what turns "queued" into "committed", which is
+            // what the caller is waiting to hear.
+            let written = match store.mark_status_watched(&broadcast, message_ids) {
+                Ok(()) => store.flush().await,
+                Err(e) => Err(e),
+            };
+            match written {
                 Ok(()) => true,
                 Err(e) => {
                     warn!("failed to record watched status updates: {e}");
@@ -2114,6 +2131,25 @@ fn merge_alias_history_messages(
         .max(visible_unread);
 }
 
+/// The updates in `page` whose stored ack says they were watched here.
+///
+/// `Read` on an incoming row means exactly that and nothing else: the column
+/// is written once at insert as `Delivered`, peer receipts only advance our
+/// own messages, and a redelivery refreshes content without touching it. The
+/// same field WhatsApp Web moves to `ACK.READ` when a status is viewed.
+fn watched_ids(page: &[oxidezap_chat_store::StoredMessage]) -> impl Iterator<Item = String> + '_ {
+    page.iter()
+        .filter(|stored| {
+            !stored.from_me
+                && matches!(
+                    stored.status,
+                    oxidezap_chat_store::MessageStatus::Read
+                        | oxidezap_chat_store::MessageStatus::Played
+                )
+        })
+        .map(|stored| stored.id.clone())
+}
+
 /// Mark the watched updates read, in the broadcast and nowhere else.
 ///
 /// Our own updates are left alone: they are never unseen to begin with, and a
@@ -2253,6 +2289,10 @@ impl WhatsAppClient {
             entries.retain(|entry| wanted.contains(&entry.jid.to_non_ad_string()));
         }
         let mut chats: Vec<oxidezap_core::Chat> = Vec::with_capacity(entries.len());
+        // Updates whose stored ack says they were watched here. Gathered from
+        // the rows as they are read and applied once at the end; see the call
+        // to `apply_status_views` below for why it cannot be done in place.
+        let mut status_views: HashSet<String> = HashSet::new();
         for entry in entries {
             // Same PN->LID mapping live events go through, or the restored
             // chat and the next live message split into two conversations.
@@ -2269,6 +2309,9 @@ impl WhatsAppClient {
                     .messages(&entry.jid, None, Self::HISTORY_MESSAGES_PER_CHAT)
                     .await?;
                 page.reverse();
+                if existing.is_status {
+                    status_views.extend(watched_ids(&page));
+                }
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
                 Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut msgs).await;
@@ -2317,6 +2360,9 @@ impl WhatsAppClient {
                 .messages(&entry.jid, None, Self::HISTORY_MESSAGES_PER_CHAT)
                 .await?;
             page.reverse(); // store returns newest-first; the UI renders oldest-first
+            if chat.is_status {
+                status_views.extend(watched_ids(&page));
+            }
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut chat.messages)
                 .await;
@@ -2352,35 +2398,13 @@ impl WhatsAppClient {
                 history_preview(entry.last_message_preview.clone(), chat.messages.last());
             chats.push(chat);
         }
-        Self::restore_status_views(chat_store, &mut chats).await;
+        // The views come off the rows that were just read, not from a second
+        // query: a watched update is one whose stored ack reached `Read`.
+        // Applied in one pass at the end rather than inside the branches
+        // above, because the alias merge re-marks rows unread from the chat
+        // it merges into and would undo a fix applied before it.
+        apply_status_views(&mut chats, &status_views);
         Ok((chats, complete))
-    }
-
-    /// Put back the updates already watched on this device.
-    ///
-    /// A status row hydrates read or unread from the broadcast's unread
-    /// cursor, which is the whole feed's counter and knows nothing about which
-    /// of *these* updates was looked at — so without this every restart
-    /// offered yesterday's watched updates as new, ring, badge and all.
-    ///
-    /// One pass at the end rather than inside the per-chat branches: the alias
-    /// merge re-marks rows unread from the chat it is merging into, so a fix
-    /// applied before it would be undone by it.
-    async fn restore_status_views(chat_store: &Arc<ChatStore>, chats: &mut [oxidezap_core::Chat]) {
-        if !chats.iter().any(|chat| chat.is_status) {
-            return;
-        }
-        let watched: HashSet<String> = match chat_store.watched_status().await {
-            Ok(ids) => ids.into_iter().collect(),
-            // Best-effort, like every other hydration step: a table that
-            // cannot be read costs a ring that should not be there, not a
-            // history load that fails and blanks the list.
-            Err(e) => {
-                warn!("failed to read watched status updates: {e}");
-                return;
-            }
-        };
-        apply_status_views(chats, &watched);
     }
 
     /// Every storage key the invalidated chats are held under.

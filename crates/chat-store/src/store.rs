@@ -77,6 +77,10 @@ pub(crate) enum WriterMsg {
         chat: Jid,
         msg_id: String,
     },
+    StatusWatched {
+        chat: Jid,
+        msg_ids: Vec<String>,
+    },
     // String, not StoreError: one batch outcome fans out to many waiters and
     // StoreError is not Clone.
     Flush(oneshot::Sender<std::result::Result<(), String>>),
@@ -284,6 +288,31 @@ impl ChatStore {
             .send(WriterMsg::SendFailed {
                 chat: chat.clone(),
                 msg_id: msg_id.into(),
+            })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Record that these status updates have been watched on this device.
+    ///
+    /// The same place WhatsApp Web keeps it — the message's own ack moved to
+    /// [`Read`](crate::types::MessageStatus::Read) — rather than a table
+    /// beside it. The column is otherwise inert on an incoming row: it is
+    /// written once at insert as `Delivered`, peer receipts only ever advance
+    /// our own messages, and a redelivery refreshes content without touching
+    /// it. So `Read` on an incoming row has one meaning, and this is it.
+    ///
+    /// Through the writer queue like every other write that targets a row, so
+    /// it cannot outrun the insert that created its target; use
+    /// [`flush`](Self::flush) to await completion. Never regresses, and a
+    /// batch that moved nothing broadcasts nothing.
+    pub fn mark_status_watched(&self, chat: &Jid, msg_ids: Vec<String>) -> Result<()> {
+        if msg_ids.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(WriterMsg::StatusWatched {
+                chat: chat.clone(),
+                msg_ids,
             })
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
@@ -851,6 +880,33 @@ fn apply_writer_msg(
                 )?;
             }
             cs.message_chats.insert(chat_str);
+            Ok(())
+        }
+        WriterMsg::StatusWatched { chat, msg_ids } => {
+            let chat_str = chat.to_string();
+            // Ours carry the peer's read tick in this column, so a local view
+            // must not set it; and `< READ` is what keeps a second viewing —
+            // or a played voice status — from moving anything backwards.
+            let updated = diesel::update(
+                schema::messages::table.filter(
+                    schema::messages::device_id
+                        .eq(device_id)
+                        .and(schema::messages::chat_jid.eq(&chat_str))
+                        .and(schema::messages::msg_id.eq_any(msg_ids.as_slice()))
+                        .and(schema::messages::from_me.eq(false))
+                        .and(
+                            schema::messages::status.lt(wa::web_message_info::Status::READ as i32),
+                        ),
+                ),
+            )
+            .set(schema::messages::status.eq(wa::web_message_info::Status::READ as i32))
+            .execute(conn)?;
+            // Same rule as every other write here: an invalidation is a claim
+            // that something changed, and re-watching an update changes
+            // nothing.
+            if updated > 0 {
+                cs.message_chats.insert(chat_str);
+            }
             Ok(())
         }
         WriterMsg::SendFailed { chat, msg_id } => {

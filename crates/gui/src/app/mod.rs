@@ -717,14 +717,6 @@ impl WhatsAppApp {
                         app.account_lid = account.and_then(|a| a.lid);
                         cx.notify();
                     }),
-                    // Watched in another window. The ring is derived from
-                    // the rows, so this both writes them and remembers the
-                    // ids: the next hydration merge replaces those rows from
-                    // a store that agrees, but one already in flight was
-                    // assembled before the view existed.
-                    FromDaemon::StatusWatched(message_ids) => entity.update(cx, |app, cx| {
-                        app.adopt_status_views(message_ids, cx);
-                    }),
                     // Refused, or it never left this process. The ring came
                     // down when the update was opened, which is right — a
                     // view that waits for a round trip flickers — so the

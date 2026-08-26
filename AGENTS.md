@@ -169,19 +169,20 @@ profile here repeats it deliberately.
   `CallState::promote_waiting` is one method that `take`, `end` and
   `fail_outgoing_to` all go through, and why `take_incoming`/`take_outgoing`
   deliberately do not: those hand the stage to what replaces it.
-- **Watching a status is a local fact, and it has to be written down.**
+- **Watching a status is the row's own ack, not a second place to look.**
   There is no receipt to send — a status read receipt is a privacy setting the
   library does not expose — and the broadcast's unread cursor cannot say it
   either: that counter covers one chat holding *everybody's* updates, so
-  clearing it would watch every contact's run at once. So the view is a row of
-  its own, `status_views`, keyed by device id in the same file as the updates
-  it describes, and `MarkStatusWatched` is how a front end records one. A
-  window's own memory of what it watched is still there and still needed — it
-  spares the ring a flicker while a hydration merge already in flight lands —
-  but it dies with the window, which is why every restart used to offer
-  yesterday's watched updates as new. The row is pruned where it is read: a
-  view older than `STATUS_LIFETIME` describes an update that has lapsed,
-  because nothing can be watched before it is posted.
+  clearing it would watch every contact's run at once. It goes where WhatsApp
+  Web puts it, on the message: `messages.status` moved to `Read`. That column
+  is inert on an incoming row — written once at insert as `Delivered`, and
+  `advance_status` only ever moves `from_me` rows — so `Read` there has one
+  meaning. It goes through the writer queue like every other write that
+  targets a row, which is also what invalidates the broadcast: the reload that
+  follows is how every *other* window learns, over the channel it can already
+  recover from, rather than a piece of news a lagging client would miss. A
+  window still remembers its own views, for the merge already in flight when
+  it watched one.
 - **A revoked message is a fact, not a sentence.** The store keeps the row
   and hydration turns it into "[Message deleted]" — which a conversation is
   right to draw and the status feed is not: an update its author took back has

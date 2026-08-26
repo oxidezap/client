@@ -609,17 +609,16 @@ impl Bridge {
             // no retry, and a session torn down a moment later would cancel
             // it — losing exactly the view the request exists to keep.
             Action::MarkStatusWatched { message_ids } => {
-                let written = client.mark_status_watched(message_ids.clone()).await;
+                let written = client.mark_status_watched(message_ids).await;
                 match written {
-                    Ok(true) => {
-                        // Every attached front end, not only the one that
-                        // asked: a view is a fact about the device, and the
-                        // other window is deriving its ring and its badge
-                        // from rows that have just stopped being true.
-                        self.hub
-                            .signal(&DaemonMessage::StatusWatched { message_ids });
-                        CommandOutcome::Accepted
-                    }
+                    // No frame of its own: the row that moved invalidates the
+                    // broadcast, so the reloader republishes it and every
+                    // attached front end — including this one — learns about
+                    // the view through the history channel it can already
+                    // recover from. A signal would be news on a lossy
+                    // channel, and a client behind by more than its capacity
+                    // would keep a ring nothing puts back.
+                    Ok(true) => CommandOutcome::Accepted,
                     // Said rather than swallowed: the window has already
                     // drawn the ring as watched, and a refusal is the only
                     // thing that can tell it the ring is coming back.

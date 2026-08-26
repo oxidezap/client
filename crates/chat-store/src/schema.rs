@@ -83,14 +83,6 @@ diesel::table! {
     }
 }
 
-diesel::table! {
-    status_views (device_id, msg_id) {
-        device_id -> Integer,
-        msg_id -> Text,
-        watched_at_ms -> BigInt,
-    }
-}
-
 diesel::allow_tables_to_appear_in_same_query!(
     chats,
     messages,
