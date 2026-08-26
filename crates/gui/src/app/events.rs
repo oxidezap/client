@@ -74,7 +74,18 @@ impl WhatsAppApp {
                     drop(cache);
                     self.departed_chats = departed;
                 }
-                let carried_status = chats.iter().any(|chat| chat.is_status);
+                // The updates this load itself brought back already read:
+                // the store has caught up on those, and only those. Read off
+                // the load rather than the merge, because a merge keeps the
+                // row this window marked and it is indistinguishable
+                // afterwards from one the store agreed about.
+                let agreed: std::collections::HashSet<String> = chats
+                    .iter()
+                    .filter(|chat| chat.is_status)
+                    .flat_map(|chat| chat.messages.iter())
+                    .filter(|message| message.is_read)
+                    .map(|message| message.id.clone())
+                    .collect();
                 for chat in chats {
                     // Later loads (post-HistorySync re-hydration) fold into
                     // chats the UI already shows instead of being dropped.
@@ -107,11 +118,8 @@ impl WhatsAppApp {
                 self.forget_missing_selection();
                 // The merge above took the store's word for every row, and
                 // a merge assembled before a view was written does not carry
-                // it. Told whether the broadcast was in this load, because
-                // that is what decides whether the store has now had its say
-                // about these updates — a load of some other chat says
-                // nothing about them.
-                self.restore_watched_status(carried_status);
+                // it.
+                self.restore_watched_status(&agreed);
                 // Count-based cache guards can't see reordering/merges.
                 self.invalidate_chat_cache();
                 // Whatever arrived before its conversation did. A group

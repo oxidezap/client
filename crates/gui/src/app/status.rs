@@ -123,26 +123,24 @@ impl StatusPane {
     }
 }
 
-/// Mark `watched` read in `chat`, and answer with the ids that needed it.
+/// Mark every update in `watched` read, and answer with how many needed it.
 ///
-/// The answer is what this window is still the only holder of. An id the load
-/// brought back already read is one the store agrees about, and an id the load
-/// does not carry names nothing on screen — neither can be protecting a merge,
-/// and a window left open for days would otherwise keep one string per update
-/// it ever watched.
+/// Never one of ours: `is_read` on a row from us is the peer's read tick, and
+/// nothing local may set it. Nothing should put one in the set either — this
+/// is the second lock on the same door.
 fn apply_watched(
     chat: &mut oxidezap_core::Chat,
     watched: &std::collections::HashSet<String>,
-) -> std::collections::HashSet<String> {
-    let mut still_ours = std::collections::HashSet::new();
+) -> usize {
+    let mut marked = 0;
     for message in &mut chat.messages {
-        if message.is_read || !watched.contains(&message.id) {
+        if message.is_from_me || message.is_read || !watched.contains(&message.id) {
             continue;
         }
         message.is_read = true;
-        still_ours.insert(message.id.clone());
+        marked += 1;
     }
-    still_ours
+    marked
 }
 
 impl WhatsAppApp {
@@ -463,7 +461,11 @@ impl WhatsAppApp {
         else {
             return;
         };
-        if message.is_read {
+        // Ours are never unseen — the feed does not count them and no ring
+        // is drawn over them — and `is_read` on a row from us means the peer
+        // read it. Marking one here falsifies that tick, and remembering it
+        // would have `apply_watched` re-falsify it after every load.
+        if message.is_from_me || message.is_read {
             return;
         }
         message.is_read = true;
@@ -516,23 +518,25 @@ impl WhatsAppApp {
     /// assembled before the view was recorded. This is what keeps "watched"
     /// from flickering back on in between.
     ///
-    /// `carried_status` says whether this load brought the broadcast. Only
-    /// then has the store had its say about these updates, and only then may
-    /// the claim be dropped — a load of some other chat leaves rows this
-    /// window marked itself, which look identical to rows the store agreed
-    /// about and are not.
-    pub(super) fn restore_watched_status(&mut self, carried_status: bool) {
+    /// `agreed` names the updates *this load* brought back already read. Those
+    /// are the claims worth dropping and the only ones: a load of some other
+    /// chat says nothing about these updates, and neither does one whose page
+    /// stopped short of an older update still on screen — the row survives the
+    /// merge carrying the `is_read` this window wrote, which afterwards looks
+    /// exactly like one the store agreed about.
+    pub(super) fn restore_watched_status(&mut self, agreed: &std::collections::HashSet<String>) {
         if self.watched_status.is_empty() {
             return;
         }
+        // Dropped first: a claim the store now makes for itself is not one
+        // this window has to keep making, and holding every id it ever
+        // watched is a set that only grows.
+        self.watched_status.retain(|id| !agreed.contains(id));
         let watched = &self.watched_status;
         let Some(chat) = self.chats.iter_mut().find(|chat| chat.is_status) else {
             return;
         };
-        let still_ours = apply_watched(chat, watched);
-        if carried_status {
-            self.watched_status = still_ours;
-        }
+        apply_watched(chat, watched);
     }
 
     /// Fetch the update on screen, if its bytes are not here.
@@ -604,45 +608,45 @@ mod tests {
         message
     }
 
-    /// The set exists to survive one hydration merge, and a merge that
-    /// carried the row is exactly when it stops being needed: the store now
-    /// says the same thing. Kept for good, a window open for days holds one
-    /// string per update it ever watched.
+    /// Marking is against what is on screen; the *claim* is dropped against
+    /// what the load itself carried. A row the merge kept — an older update
+    /// past the page's end — still reads as watched here, which is exactly
+    /// why the prune cannot be read off this.
     #[test]
-    fn a_view_the_store_agrees_about_is_no_longer_ours_to_hold() {
+    fn applying_a_view_marks_only_what_still_needs_it() {
         let mut chat = oxidezap_core::Chat::new(STATUS_BROADCAST_JID.to_string());
-        chat.messages = vec![update("AGREED", true), update("OURS", false)];
+        chat.messages = vec![
+            update("AGREED", true),
+            update("OURS", false),
+            update("THEIRS", false),
+        ];
         let watched: std::collections::HashSet<String> = ["AGREED".to_string(), "OURS".to_string()]
             .into_iter()
             .collect();
 
-        let still_ours = apply_watched(&mut chat, &watched);
-
+        assert_eq!(apply_watched(&mut chat, &watched), 1);
         assert!(
             chat.messages[1].is_read,
             "the row the store had not caught up on"
         );
-        assert_eq!(
-            still_ours,
-            std::collections::HashSet::from(["OURS".to_string()]),
-            "only the claim the load did not already carry"
+        assert!(
+            !chat.messages[2].is_read,
+            "an update nobody watched is left new"
         );
     }
 
-    /// An id no load carries names nothing on screen, so it protects nothing.
+    /// `is_read` on a row from us is the peer's read tick. Nothing local sets
+    /// it, however the id got into the set.
     #[test]
-    fn a_view_of_an_update_that_is_gone_is_dropped() {
+    fn a_view_never_touches_one_of_our_own_updates() {
         let mut chat = oxidezap_core::Chat::new(STATUS_BROADCAST_JID.to_string());
-        chat.messages = vec![update("HERE", false)];
-        let watched: std::collections::HashSet<String> = ["HERE".to_string(), "LAPSED".to_string()]
-            .into_iter()
-            .collect();
+        let mut ours = update("MINE", false);
+        ours.is_from_me = true;
+        chat.messages = vec![ours];
+        let watched: std::collections::HashSet<String> = ["MINE".to_string()].into_iter().collect();
 
-        let still_ours = apply_watched(&mut chat, &watched);
-        assert_eq!(
-            still_ours,
-            std::collections::HashSet::from(["HERE".to_string()])
-        );
+        assert_eq!(apply_watched(&mut chat, &watched), 0);
+        assert!(!chat.messages[0].is_read, "the peer has still not read it");
     }
 
     #[test]

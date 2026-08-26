@@ -2287,6 +2287,33 @@ impl WhatsAppClient {
         if let Some(only) = only {
             let wanted = Self::alias_closure(client, &entries, only, names).await;
             entries.retain(|entry| wanted.contains(&entry.jid.to_non_ad_string()));
+            // The page above is the hundred most recently active chats, and a
+            // narrowed load is about the chats somebody named — which is not
+            // the same set. A chat that has fallen past that window would be
+            // filtered down to nothing here, and a load with nothing in it
+            // publishes nothing: the invalidation that asked for it would be
+            // silently spent, leaving every front end on rows that changed.
+            // Asked for by name instead, and only for what the page missed.
+            let found: HashSet<String> = entries
+                .iter()
+                .map(|entry| entry.jid.to_non_ad_string())
+                .collect();
+            for jid in only.iter().filter(|jid| !found.contains(*jid)) {
+                let Ok(parsed) = jid.parse::<Jid>() else {
+                    continue;
+                };
+                match chat_store.chat(&parsed).await {
+                    Ok(Some(entry)) => entries.push(entry),
+                    // No row: the chat is live-only, or gone. Either way this
+                    // load has nothing to say about it, which is what a
+                    // narrowed load is allowed to be.
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        "failed to look up {} for a scoped load: {e}",
+                        observe_str(jid)
+                    ),
+                }
+            }
         }
         let mut chats: Vec<oxidezap_core::Chat> = Vec::with_capacity(entries.len());
         // Updates whose stored ack says they were watched here. Gathered from
@@ -3425,5 +3452,77 @@ mod tests {
                 .as_deref(),
             Some("12025550144@s.whatsapp.net")
         );
+    }
+
+    /// A narrowed load is about the chats somebody named, and the page it
+    /// starts from is the hundred most recently active ones. A chat past that
+    /// window was filtered down to nothing — and a load with nothing in it
+    /// publishes nothing, so the invalidation that asked for it was spent in
+    /// silence and every front end stayed on rows that had changed.
+    #[tokio::test]
+    async fn a_scoped_load_finds_a_chat_the_page_left_out() {
+        use whatsapp_rust::wacore::types::events::{
+            BatchOrigin, Event, InboundMessage, MessageBatch,
+        };
+        use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+        let (chat_store, client) = test_session("scoped-load-beyond-the-page").await;
+        // The target is the oldest, so the hundred newer ones fill the page
+        // ahead of it. One batch, because a hundred flushes is a hundred
+        // transactions for a fact this test states once.
+        let target = "559900000000@s.whatsapp.net";
+        let mut batch = Vec::new();
+        for (index, jid) in std::iter::once(target.to_string())
+            .chain((1..=100).map(|n| format!("55990000{n:04}@s.whatsapp.net")))
+            .enumerate()
+        {
+            let sender: Jid = jid.parse().expect("test JID");
+            batch.push(
+                InboundMessage::builder()
+                    .message(Arc::new(wa::Message::text("oi")))
+                    .info(Arc::new(MessageInfo {
+                        source: MessageSource {
+                            chat: sender.clone(),
+                            sender,
+                            ..Default::default()
+                        },
+                        id: format!("MSG-{index}"),
+                        // Ascending, so the target's is the oldest.
+                        timestamp: whatsapp_rust::wacore::time::from_secs(
+                            1_700_000_000 + index as i64,
+                        )
+                        .expect("test timestamp"),
+                        ..Default::default()
+                    }))
+                    .build(),
+            );
+        }
+        feed(
+            &chat_store,
+            Event::Messages(
+                MessageBatch::builder()
+                    .messages(Arc::from(batch))
+                    .origin(BatchOrigin::Live)
+                    .build(),
+            ),
+        )
+        .await;
+
+        let only = std::collections::HashSet::from([target.to_string()]);
+        let (chats, complete) =
+            WhatsAppClient::load_history_scoped(&chat_store, &client, Some(&only), &book())
+                .await
+                .expect("history loads");
+
+        assert!(!complete, "a narrowed load is never the whole list");
+        assert_eq!(
+            chats
+                .iter()
+                .map(|chat| chat.jid.as_str())
+                .collect::<Vec<_>>(),
+            vec![target],
+            "the chat it was asked about, page or no page"
+        );
+        assert_eq!(chats[0].messages.len(), 1);
     }
 }
