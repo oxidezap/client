@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 
 #[cfg(windows)]
 mod security;
+#[cfg(test)]
+mod transport_tests;
 
 /// One accepted connection.
 #[cfg(unix)]

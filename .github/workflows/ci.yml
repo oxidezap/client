@@ -64,15 +64,22 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
 
-  # Compilation on the platforms the release ships to, without paying for a
-  # release build of each. The Linux job above is the one that lints and runs
-  # tests; this one only answers "does it still compile there", which is the
-  # question a change to the IPC transport or anything behind a `cfg` can
-  # silently get wrong — and which, before this job existed, was first asked
-  # by the nightly build after main had already moved.
+  # The platforms the release ships to, compiled and — for the crates where it
+  # matters — run.
+  #
+  # Compiling was not enough. The IPC transport compiled on Windows for weeks
+  # while deadlocking on it: a named pipe opened the ordinary way serializes
+  # reads against writes, so the front end's first request after startup waited
+  # on a read that was waiting for the answer to that request. No `cfg` was
+  # wrong and nothing failed to build; the behaviour differed. Only running
+  # something finds that.
+  #
+  # The GUI is excluded from the test step deliberately: its tests are pure
+  # logic that the Linux job already runs, and linking the gpui tree three
+  # times to learn nothing is most of this job's wall clock.
   #
   # Native runners rather than cross-compiling: `x86_64-pc-windows-msvc` needs
-  # the MSVC libraries, and the point is to compile the way the release does.
+  # the MSVC libraries, and the point is to build the way the release does.
   cross:
     name: Check (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -102,6 +109,10 @@ jobs:
       # test that no longer builds is the same break as a `cfg`-gated module
       # that no longer builds.
       - run: cargo check --workspace --all-targets --all-features
+      # And the ones that touch the platform actually run. `oxidezap-daemon`
+      # is where the transport tests live, because they need both ends of it.
+      - name: Test the platform-sensitive crates
+        run: cargo test -p oxidezap-ipc -p oxidezap-daemon -p oxidezap-core --all-features
 
   # The library crates an embedder can depend on: the chat store, which lost
   # the MSRV job it had in whatsapp-rust when it moved here, and the IPC
