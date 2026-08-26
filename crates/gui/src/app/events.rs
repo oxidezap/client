@@ -74,6 +74,7 @@ impl WhatsAppApp {
                     drop(cache);
                     self.departed_chats = departed;
                 }
+                let carried_status = chats.iter().any(|chat| chat.is_status);
                 for chat in chats {
                     // Later loads (post-HistorySync re-hydration) fold into
                     // chats the UI already shows instead of being dropped.
@@ -105,8 +106,12 @@ impl WhatsAppApp {
                 // would draw the empty state with no way back on a phone.
                 self.forget_missing_selection();
                 // The merge above took the store's word for every row, and
-                // the store was never told which updates have been watched.
-                self.restore_watched_status();
+                // a merge assembled before a view was written does not carry
+                // it. Told whether the broadcast was in this load, because
+                // that is what decides whether the store has now had its say
+                // about these updates — a load of some other chat says
+                // nothing about them.
+                self.restore_watched_status(carried_status);
                 // Count-based cache guards can't see reordering/merges.
                 self.invalidate_chat_cache();
                 // Whatever arrived before its conversation did. A group

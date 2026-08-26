@@ -181,8 +181,11 @@ profile here repeats it deliberately.
   targets a row, which is also what invalidates the broadcast: the reload that
   follows is how every *other* window learns, over the channel it can already
   recover from, rather than a piece of news a lagging client would miss. A
-  window still remembers its own views, for the merge already in flight when
-  it watched one.
+  window still remembers its own views, but only until the load that carries
+  them proves the store agrees — a claim nobody else disputes is not one worth
+  holding. And a refused view does not force the ring back on: the flush
+  contract is temporal, so a refusal is not proof that nothing was written, and
+  the only honest answer to "did that land" is to read the history again.
 - **A revoked message is a fact, not a sentence.** The store keeps the row
   and hydration turns it into "[Message deleted]" — which a conversation is
   right to draw and the status feed is not: an update its author took back has

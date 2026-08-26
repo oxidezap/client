@@ -434,6 +434,16 @@ impl Session {
     /// broadcast holds every contact's updates. Nothing goes to the network —
     /// this is the local half of a status view, and the daemon is where it has
     /// to live to outlast the window.
+    /// Ask the daemon to republish the history it holds.
+    ///
+    /// Only used to settle a disagreement this side cannot settle on its own:
+    /// the store is the truth about what was written, and re-reading it beats
+    /// guessing at it. Nothing else needs it — a client that attaches is sent
+    /// a reload without asking.
+    pub fn reload_history(&self) {
+        self.tell(ClientRequest::ReloadHistory);
+    }
+
     /// Tracked rather than told, unlike the other one-way requests: the
     /// window takes the ring down before the daemon has answered, so a
     /// refusal — a read-only store, a full disk, a socket that is gone — has
