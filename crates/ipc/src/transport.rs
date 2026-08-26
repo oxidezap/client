@@ -5,6 +5,12 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 15: `MarkStatusWatched`. A v14 daemon does not know the request and
+/// refuses it as malformed, so the upgraded window would go on watching
+/// updates into a set that dies with it — which is the bug the request exists
+/// to fix. The view itself needs no frame: it moves a stored row, and the
+/// history reload that follows is what carries it to every front end.
+///
 /// 12: the call state's note about a departing call names the outcome to
 /// write, not just that there is none. A decline is a refusal only the
 /// declining window knows about; every other one watched the same stage
@@ -61,7 +67,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

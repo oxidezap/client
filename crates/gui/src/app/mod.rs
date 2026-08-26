@@ -717,6 +717,14 @@ impl WhatsAppApp {
                         app.account_lid = account.and_then(|a| a.lid);
                         cx.notify();
                     }),
+                    // Refused, or it never left this process. The ring came
+                    // down when the update was opened, which is right — a
+                    // view that waits for a round trip flickers — so the
+                    // correction is to put it back rather than to leave a
+                    // watched update that returns new on the next start.
+                    FromDaemon::StatusViewLost(message_ids) => entity.update(cx, |app, cx| {
+                        app.forget_status_views(&message_ids, cx);
+                    }),
                     // The tray's "Open", or another front end asking on a
                     // user's behalf. One window, so there is one to raise.
                     FromDaemon::ShowWindow => {

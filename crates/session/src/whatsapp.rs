@@ -1607,6 +1607,57 @@ impl WhatsAppClient {
         self.reload.notify_one();
     }
 
+    /// Remember that these status updates have been watched.
+    ///
+    /// Local, and deliberately so: WhatsApp's own answer is a status read
+    /// receipt, which is a privacy setting the library does not expose. What
+    /// this buys is the honest half — the ring stops claiming there is
+    /// something new here, and it stays stopped across a restart, which is
+    /// what a front end's own memory of it could not do.
+    ///
+    /// The broadcast's unread cursor is not that answer: it counts one chat
+    /// carrying everybody's updates, so clearing it would watch every
+    /// contact's run at once.
+    ///
+    /// Returns a handle that answers whether the row reached the store. The
+    /// caller waits for it: a view is the whole point of the request and
+    /// there is no retry — the window has already drawn the ring as watched —
+    /// so "accepted" has to mean "written", not "queued behind a teardown
+    /// that may cancel it".
+    ///
+    /// A row that moves invalidates its chat, so the reloader republishes the
+    /// broadcast and every attached front end learns about the view through
+    /// the history it already knows how to recover. Nothing has to be told
+    /// separately, and nothing is lost if a client is behind.
+    pub fn mark_status_watched(&self, message_ids: Vec<String>) -> tokio::task::JoinHandle<bool> {
+        let chat_store = self.chat_store.clone();
+        self.runtime.spawn(async move {
+            let Some(store) = chat_store.lock().await.clone() else {
+                warn!("no chat store yet; a watched status update was not recorded");
+                return false;
+            };
+            let Ok(broadcast) = oxidezap_core::STATUS_BROADCAST_JID.parse::<Jid>() else {
+                warn!("the status broadcast address does not parse");
+                return false;
+            };
+            // Enqueued and then awaited: the write goes through the same
+            // ordered queue as the insert that created the row it targets,
+            // and `flush` is what turns "queued" into "committed", which is
+            // what the caller is waiting to hear.
+            let written = match store.mark_status_watched(&broadcast, message_ids) {
+                Ok(()) => store.flush().await,
+                Err(e) => Err(e),
+            };
+            match written {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("failed to record watched status updates: {e}");
+                    false
+                }
+            }
+        })
+    }
+
     /// Synchronize a bounded read action so newer messages remain unread.
     ///
     /// Returns a handle that completes when the action has run; see
@@ -2080,6 +2131,43 @@ fn merge_alias_history_messages(
         .max(visible_unread);
 }
 
+/// The updates in `page` whose stored ack says they were watched here.
+///
+/// `Read` on an incoming row means exactly that and nothing else: the column
+/// is written once at insert as `Delivered`, peer receipts only advance our
+/// own messages, and a redelivery refreshes content without touching it. The
+/// same field WhatsApp Web moves to `ACK.READ` when a status is viewed.
+fn watched_ids(page: &[oxidezap_chat_store::StoredMessage]) -> impl Iterator<Item = String> + '_ {
+    page.iter()
+        .filter(|stored| {
+            !stored.from_me
+                && matches!(
+                    stored.status,
+                    oxidezap_chat_store::MessageStatus::Read
+                        | oxidezap_chat_store::MessageStatus::Played
+                )
+        })
+        .map(|stored| stored.id.clone())
+}
+
+/// Mark the watched updates read, in the broadcast and nowhere else.
+///
+/// Our own updates are left alone: they are never unseen to begin with, and a
+/// row from us carries the peer-read ticks in `is_read`, which a local view has
+/// no business setting.
+fn apply_status_views(chats: &mut [oxidezap_core::Chat], watched: &HashSet<String>) {
+    if watched.is_empty() {
+        return;
+    }
+    for chat in chats.iter_mut().filter(|chat| chat.is_status) {
+        for message in &mut chat.messages {
+            if !message.is_from_me && watched.contains(&message.id) {
+                message.is_read = true;
+            }
+        }
+    }
+}
+
 impl WhatsAppClient {
     const HISTORY_CHAT_LIMIT: i64 = 100;
     const HISTORY_MESSAGES_PER_CHAT: i64 = 50;
@@ -2199,8 +2287,39 @@ impl WhatsAppClient {
         if let Some(only) = only {
             let wanted = Self::alias_closure(client, &entries, only, names).await;
             entries.retain(|entry| wanted.contains(&entry.jid.to_non_ad_string()));
+            // The page above is the hundred most recently active chats, and a
+            // narrowed load is about the chats somebody named — which is not
+            // the same set. A chat that has fallen past that window would be
+            // filtered down to nothing here, and a load with nothing in it
+            // publishes nothing: the invalidation that asked for it would be
+            // silently spent, leaving every front end on rows that changed.
+            // Asked for by name instead, and only for what the page missed.
+            let found: HashSet<String> = entries
+                .iter()
+                .map(|entry| entry.jid.to_non_ad_string())
+                .collect();
+            for jid in only.iter().filter(|jid| !found.contains(*jid)) {
+                let Ok(parsed) = jid.parse::<Jid>() else {
+                    continue;
+                };
+                match chat_store.chat(&parsed).await {
+                    Ok(Some(entry)) => entries.push(entry),
+                    // No row: the chat is live-only, or gone. Either way this
+                    // load has nothing to say about it, which is what a
+                    // narrowed load is allowed to be.
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        "failed to look up {} for a scoped load: {e}",
+                        observe_str(jid)
+                    ),
+                }
+            }
         }
         let mut chats: Vec<oxidezap_core::Chat> = Vec::with_capacity(entries.len());
+        // Updates whose stored ack says they were watched here. Gathered from
+        // the rows as they are read and applied once at the end; see the call
+        // to `apply_status_views` below for why it cannot be done in place.
+        let mut status_views: HashSet<String> = HashSet::new();
         for entry in entries {
             // Same PN->LID mapping live events go through, or the restored
             // chat and the next live message split into two conversations.
@@ -2217,6 +2336,9 @@ impl WhatsAppClient {
                     .messages(&entry.jid, None, Self::HISTORY_MESSAGES_PER_CHAT)
                     .await?;
                 page.reverse();
+                if existing.is_status {
+                    status_views.extend(watched_ids(&page));
+                }
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
                 Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut msgs).await;
@@ -2265,6 +2387,9 @@ impl WhatsAppClient {
                 .messages(&entry.jid, None, Self::HISTORY_MESSAGES_PER_CHAT)
                 .await?;
             page.reverse(); // store returns newest-first; the UI renders oldest-first
+            if chat.is_status {
+                status_views.extend(watched_ids(&page));
+            }
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut chat.messages)
                 .await;
@@ -2300,6 +2425,12 @@ impl WhatsAppClient {
                 history_preview(entry.last_message_preview.clone(), chat.messages.last());
             chats.push(chat);
         }
+        // The views come off the rows that were just read, not from a second
+        // query: a watched update is one whose stored ack reached `Read`.
+        // Applied in one pass at the end rather than inside the branches
+        // above, because the alias merge re-marks rows unread from the chat
+        // it merges into and would undo a fix applied before it.
+        apply_status_views(&mut chats, &status_views);
         Ok((chats, complete))
     }
 
@@ -2925,7 +3056,8 @@ mod tests {
 
     use super::{
         ChatStore, Client, MuteLane, NameBook, ReadBoundary, ReloadScope, SqliteStore, StoreChange,
-        WhatsAppClient, media_metadata, merge_alias_history_messages, read_message_range,
+        WhatsAppClient, apply_status_views, media_metadata, merge_alias_history_messages,
+        read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
     use std::sync::Arc;
@@ -3206,6 +3338,57 @@ mod tests {
         assert_eq!(chat.unread_count, 4);
     }
 
+    /// A status row hydrates read or unread from the broadcast's unread
+    /// cursor, which counts everybody's updates at once and cannot say which
+    /// of them was looked at. Without the views put back, every restart
+    /// offered watched updates as new.
+    #[test]
+    fn watched_updates_come_back_watched() {
+        let update = |id: &str, from_me: bool| ChatMessage {
+            id: id.to_string(),
+            sender: "12025550143@s.whatsapp.net".to_string(),
+            sender_name: None,
+            content: id.to_string(),
+            timestamp: whatsapp_rust::wacore::time::now_utc(),
+            is_from_me: from_me,
+            is_read: false,
+            media: None,
+            reactions: HashMap::new(),
+            status: MessageStatus::default(),
+            quoted: None,
+            revoked: false,
+            system: None,
+        };
+        let mut broadcast = Chat::new(oxidezap_core::STATUS_BROADCAST_JID.to_string());
+        broadcast.messages = vec![
+            update("SEEN", false),
+            update("NEW", false),
+            update("MINE", true),
+        ];
+        let mut conversation = Chat::new("12025550143@s.whatsapp.net".to_string());
+        conversation.messages = vec![update("SEEN", false)];
+
+        let watched = ["SEEN".to_string(), "MINE".to_string()]
+            .into_iter()
+            .collect();
+        let mut chats = vec![broadcast, conversation];
+        apply_status_views(&mut chats, &watched);
+
+        assert!(
+            chats[0].messages[0].is_read,
+            "watched update comes back watched"
+        );
+        assert!(!chats[0].messages[1].is_read, "one nobody opened stays new");
+        assert!(
+            !chats[0].messages[2].is_read,
+            "our own row carries the peer's read ticks; a local view must not set them"
+        );
+        assert!(
+            !chats[1].messages[0].is_read,
+            "a conversation is not the broadcast, whatever ids collide"
+        );
+    }
+
     #[test]
     fn historical_sticker_keeps_thumbnail_without_download_metadata() {
         let message = wa::Message {
@@ -3269,5 +3452,77 @@ mod tests {
                 .as_deref(),
             Some("12025550144@s.whatsapp.net")
         );
+    }
+
+    /// A narrowed load is about the chats somebody named, and the page it
+    /// starts from is the hundred most recently active ones. A chat past that
+    /// window was filtered down to nothing — and a load with nothing in it
+    /// publishes nothing, so the invalidation that asked for it was spent in
+    /// silence and every front end stayed on rows that had changed.
+    #[tokio::test]
+    async fn a_scoped_load_finds_a_chat_the_page_left_out() {
+        use whatsapp_rust::wacore::types::events::{
+            BatchOrigin, Event, InboundMessage, MessageBatch,
+        };
+        use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+        let (chat_store, client) = test_session("scoped-load-beyond-the-page").await;
+        // The target is the oldest, so the hundred newer ones fill the page
+        // ahead of it. One batch, because a hundred flushes is a hundred
+        // transactions for a fact this test states once.
+        let target = "559900000000@s.whatsapp.net";
+        let mut batch = Vec::new();
+        for (index, jid) in std::iter::once(target.to_string())
+            .chain((1..=100).map(|n| format!("55990000{n:04}@s.whatsapp.net")))
+            .enumerate()
+        {
+            let sender: Jid = jid.parse().expect("test JID");
+            batch.push(
+                InboundMessage::builder()
+                    .message(Arc::new(wa::Message::text("oi")))
+                    .info(Arc::new(MessageInfo {
+                        source: MessageSource {
+                            chat: sender.clone(),
+                            sender,
+                            ..Default::default()
+                        },
+                        id: format!("MSG-{index}"),
+                        // Ascending, so the target's is the oldest.
+                        timestamp: whatsapp_rust::wacore::time::from_secs(
+                            1_700_000_000 + index as i64,
+                        )
+                        .expect("test timestamp"),
+                        ..Default::default()
+                    }))
+                    .build(),
+            );
+        }
+        feed(
+            &chat_store,
+            Event::Messages(
+                MessageBatch::builder()
+                    .messages(Arc::from(batch))
+                    .origin(BatchOrigin::Live)
+                    .build(),
+            ),
+        )
+        .await;
+
+        let only = std::collections::HashSet::from([target.to_string()]);
+        let (chats, complete) =
+            WhatsAppClient::load_history_scoped(&chat_store, &client, Some(&only), &book())
+                .await
+                .expect("history loads");
+
+        assert!(!complete, "a narrowed load is never the whole list");
+        assert_eq!(
+            chats
+                .iter()
+                .map(|chat| chat.jid.as_str())
+                .collect::<Vec<_>>(),
+            vec![target],
+            "the chat it was asked about, page or no page"
+        );
+        assert_eq!(chats[0].messages.len(), 1);
     }
 }

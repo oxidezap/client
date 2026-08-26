@@ -51,6 +51,11 @@ pub enum Action {
         /// [`oxidezap_ipc::ClientRequest::MarkRead`].
         through_message_id: Option<String>,
     },
+    MarkStatusWatched {
+        /// The updates the reader has looked at. See
+        /// [`oxidezap_ipc::ClientRequest::MarkStatusWatched`].
+        message_ids: Vec<String>,
+    },
     Typing {
         jid: String,
         composing: bool,
@@ -78,8 +83,17 @@ impl Action {
     /// deletes it. Gating those on a connection refuses them exactly when
     /// they are wanted: dead credentials are a state the account is
     /// unreachable in by definition, and re-pairing is the only way out of it.
+    ///
+    /// Recording a status view is the same kind of thing: it writes one local
+    /// row and tells nobody, and the updates it describes are stored history a
+    /// disconnected window can still read. Refusing it offline would lose
+    /// exactly the views taken while offline, and there is no retry — the
+    /// window has already drawn the ring as watched.
     pub fn needs_network(&self) -> bool {
-        !matches!(self, Self::ReloadHistory | Self::ForgetSession)
+        !matches!(
+            self,
+            Self::ReloadHistory | Self::ForgetSession | Self::MarkStatusWatched { .. }
+        )
     }
 }
 
@@ -186,7 +200,7 @@ pub async fn run(
             },
             command = commands.recv(), if !commands_closed => match command {
                 Some(command) => {
-                    bridge.execute(&client, command);
+                    bridge.execute(&client, command).await;
                     // Asked to forget: stop here so the teardown below runs
                     // before anything deletes the file it is closing.
                     if bridge.forget {
@@ -486,15 +500,21 @@ impl Bridge {
     }
 
     /// Act on one client command, and answer the connection that asked.
-    fn execute(&mut self, client: &WhatsAppClient, command: SessionCommand) {
+    ///
+    /// Async because one action is finished when its answer is: recording a
+    /// status view writes a row and nothing else, and a client told
+    /// `Accepted` before that row exists could see it lost to the very
+    /// teardown the answer outran. Everything else still hands work to the
+    /// session and returns.
+    async fn execute(&mut self, client: &WhatsAppClient, command: SessionCommand) {
         let SessionCommand { action, reply } = command;
-        let outcome = self.act(client, action);
+        let outcome = self.act(client, action).await;
         // A refusal nobody is listening for is not worth logging: the client
         // hung up, which is its right.
         let _ = reply.send(outcome);
     }
 
-    fn act(&mut self, client: &WhatsAppClient, action: Action) -> CommandOutcome {
+    async fn act(&mut self, client: &WhatsAppClient, action: Action) -> CommandOutcome {
         // Checked again here, not only where the request arrived. The account
         // can drop in the window between the two, and the session's own answer
         // to a command it cannot carry out is a log line the requester never
@@ -578,6 +598,38 @@ impl Bridge {
                 jid,
                 through_message_id,
             } => self.mark_read(client, &jid, through_message_id.as_deref()),
+            // No permit and no boundary check: this writes one local row and
+            // sends nothing, so there is no receipt to get wrong and nothing
+            // for a stale client to consume on somebody's behalf. Watching an
+            // update it has already watched is the same row again.
+            //
+            // Awaited, unlike everything around it. The other actions are
+            // finished when the session has taken them and what the network
+            // makes of them arrives later; this one *is* the write, there is
+            // no retry, and a session torn down a moment later would cancel
+            // it — losing exactly the view the request exists to keep.
+            Action::MarkStatusWatched { message_ids } => {
+                let written = client.mark_status_watched(message_ids).await;
+                match written {
+                    // No frame of its own: the row that moved invalidates the
+                    // broadcast, so the reloader republishes it and every
+                    // attached front end — including this one — learns about
+                    // the view through the history channel it can already
+                    // recover from. A signal would be news on a lossy
+                    // channel, and a client behind by more than its capacity
+                    // would keep a ring nothing puts back.
+                    Ok(true) => CommandOutcome::Accepted,
+                    // Said rather than swallowed: the window has already
+                    // drawn the ring as watched, and a refusal is the only
+                    // thing that can tell it the ring is coming back.
+                    Ok(false) => {
+                        CommandOutcome::Refused("the status view could not be recorded".to_string())
+                    }
+                    Err(e) => CommandOutcome::Refused(format!(
+                        "the status view could not be recorded: {e}"
+                    )),
+                }
+            }
             // No permit: these send one small stanza and hold nothing open,
             // and a typing indicator refused for being busy would be a worse
             // answer than a late one.

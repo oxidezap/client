@@ -792,6 +792,9 @@ async fn handle_request(
             )
             .await,
         ),
+        ClientRequest::MarkStatusWatched { message_ids } => {
+            acted(dispatch(hub, commands, Action::MarkStatusWatched { message_ids }).await)
+        }
         // Measured here rather than by the client: the daemon is the only
         // process that opens the store or writes the media cache, so a front
         // end asking the filesystem would be guessing at paths it does not
@@ -1487,6 +1490,14 @@ mod tests {
     fn the_local_actions_do_not_need_a_connection() {
         assert!(!Action::ForgetSession.needs_network());
         assert!(!Action::ReloadHistory.needs_network());
+        // A view is one local row and no stanza, over history a disconnected
+        // window can still read — and the ring it watched is already drawn.
+        assert!(
+            !Action::MarkStatusWatched {
+                message_ids: vec!["3EB0".into()],
+            }
+            .needs_network()
+        );
         assert!(
             Action::SendText {
                 jid: "a@s.whatsapp.net".into(),

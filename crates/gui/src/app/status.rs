@@ -123,6 +123,26 @@ impl StatusPane {
     }
 }
 
+/// Mark every update in `watched` read, and answer with how many needed it.
+///
+/// Never one of ours: `is_read` on a row from us is the peer's read tick, and
+/// nothing local may set it. Nothing should put one in the set either — this
+/// is the second lock on the same door.
+fn apply_watched(
+    chat: &mut oxidezap_core::Chat,
+    watched: &std::collections::HashSet<String>,
+) -> usize {
+    let mut marked = 0;
+    for message in &mut chat.messages {
+        if message.is_from_me || message.is_read || !watched.contains(&message.id) {
+            continue;
+        }
+        message.is_read = true;
+        marked += 1;
+    }
+    marked
+}
+
 impl WhatsAppApp {
     pub fn destination(&self) -> Destination {
         self.destination
@@ -441,37 +461,82 @@ impl WhatsAppApp {
         else {
             return;
         };
-        if message.is_read {
+        // Ours are never unseen — the feed does not count them and no ring
+        // is drawn over them — and `is_read` on a row from us means the peer
+        // read it. Marking one here falsifies that tick, and remembering it
+        // would have `apply_watched` re-falsify it after every load.
+        if message.is_from_me || message.is_read {
             return;
         }
         message.is_read = true;
-        // Remembered as well as set. Watching a status is local by design —
-        // there is no receipt to send — but the *store* is what a hydration
-        // merge replaces these rows from, and it has never been told, so the
-        // ring and the badge came back on the next reload. The store cannot
-        // know about a view it was never told about; this window can.
-        self.watched_status.insert(message_id);
+        // Remembered as well as set, in two places that answer different
+        // questions. This window's own set survives a hydration merge, which
+        // replaces these rows from the store and would otherwise put the ring
+        // straight back before the daemon has been heard from. The daemon's
+        // copy survives the window: it owns the store, and a view that lived
+        // only here died with the process — which is why every restart
+        // offered updates that had already been watched as new.
+        self.watched_status.insert(message_id.clone());
+        if let Some(client) = &self.client {
+            client.mark_status_watched(vec![message_id]);
+        }
         self.invalidate_chat_cache();
+    }
+
+    /// Take back views the daemon did not record.
+    ///
+    /// The ring is *not* forced back on here, because a refusal is not proof
+    /// that nothing was written. The store's flush contract is temporal — a
+    /// batch somebody else's write dropped is reported to whoever flushed
+    /// next — so a view can be refused and stored, and another window may
+    /// have stored the same one anyway. Writing `is_read = false` over that
+    /// would replace durable truth with a guess, and the refused write raises
+    /// no invalidation to correct it.
+    ///
+    /// So this drops the claim and asks for the history again. The reload
+    /// answers both cases with the same fact: watched updates come back
+    /// watched, and one that was never written comes back new.
+    pub(super) fn forget_status_views(&mut self, message_ids: &[String], cx: &mut Context<Self>) {
+        let mut taken_back = false;
+        for id in message_ids {
+            taken_back |= self.watched_status.remove(id);
+        }
+        if !taken_back {
+            return;
+        }
+        if let Some(client) = &self.client {
+            client.reload_history();
+        }
+        self.invalidate_chat_cache();
+        cx.notify();
     }
 
     /// Put the locally watched updates back after a hydration merge.
     ///
-    /// The store's copy of a status row is honest — it says unread, because
-    /// nothing ever told it otherwise — so re-applying is what keeps
-    /// "watched" from being undone by a reload or a reconnect.
-    pub(super) fn restore_watched_status(&mut self) {
+    /// The daemon is told too, and answers a later reload with the row
+    /// already read — but not this one: a hydration merge in flight was
+    /// assembled before the view was recorded. This is what keeps "watched"
+    /// from flickering back on in between.
+    ///
+    /// `agreed` names the updates *this load* brought back already read. Those
+    /// are the claims worth dropping and the only ones: a load of some other
+    /// chat says nothing about these updates, and neither does one whose page
+    /// stopped short of an older update still on screen — the row survives the
+    /// merge carrying the `is_read` this window wrote, which afterwards looks
+    /// exactly like one the store agreed about.
+    pub(super) fn restore_watched_status(&mut self, agreed: &std::collections::HashSet<String>) {
         if self.watched_status.is_empty() {
             return;
         }
+        // Dropped first: a claim the store now makes for itself is not one
+        // this window has to keep making, and holding every id it ever
+        // watched is a set that only grows.
+        self.watched_status.retain(|id| !agreed.contains(id));
         let watched = &self.watched_status;
         let Some(chat) = self.chats.iter_mut().find(|chat| chat.is_status) else {
             return;
         };
-        for message in &mut chat.messages {
-            if !message.is_read && watched.contains(&message.id) {
-                message.is_read = true;
-            }
-        }
+        apply_watched(chat, watched);
     }
 
     /// Fetch the update on screen, if its bytes are not here.
@@ -534,6 +599,55 @@ impl WhatsAppApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn update(id: &str, read: bool) -> oxidezap_core::ChatMessage {
+        let mut message =
+            oxidezap_core::ChatMessage::new_outgoing(id.to_string(), "hi".to_string());
+        message.is_from_me = false;
+        message.is_read = read;
+        message
+    }
+
+    /// Marking is against what is on screen; the *claim* is dropped against
+    /// what the load itself carried. A row the merge kept — an older update
+    /// past the page's end — still reads as watched here, which is exactly
+    /// why the prune cannot be read off this.
+    #[test]
+    fn applying_a_view_marks_only_what_still_needs_it() {
+        let mut chat = oxidezap_core::Chat::new(STATUS_BROADCAST_JID.to_string());
+        chat.messages = vec![
+            update("AGREED", true),
+            update("OURS", false),
+            update("THEIRS", false),
+        ];
+        let watched: std::collections::HashSet<String> = ["AGREED".to_string(), "OURS".to_string()]
+            .into_iter()
+            .collect();
+
+        assert_eq!(apply_watched(&mut chat, &watched), 1);
+        assert!(
+            chat.messages[1].is_read,
+            "the row the store had not caught up on"
+        );
+        assert!(
+            !chat.messages[2].is_read,
+            "an update nobody watched is left new"
+        );
+    }
+
+    /// `is_read` on a row from us is the peer's read tick. Nothing local sets
+    /// it, however the id got into the set.
+    #[test]
+    fn a_view_never_touches_one_of_our_own_updates() {
+        let mut chat = oxidezap_core::Chat::new(STATUS_BROADCAST_JID.to_string());
+        let mut ours = update("MINE", false);
+        ours.is_from_me = true;
+        chat.messages = vec![ours];
+        let watched: std::collections::HashSet<String> = ["MINE".to_string()].into_iter().collect();
+
+        assert_eq!(apply_watched(&mut chat, &watched), 0);
+        assert!(!chat.messages[0].is_read, "the peer has still not read it");
+    }
 
     #[test]
     fn a_run_of_one_has_nowhere_to_step() {
