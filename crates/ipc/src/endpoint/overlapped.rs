@@ -57,7 +57,7 @@ impl Overlapped {
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // SAFETY: `buf` is valid for `len` bytes and outlives the call, which
         // does not return until the operation it started has finished.
-        unsafe {
+        let read = unsafe {
             self.perform(|handle, ov| {
                 ReadFile(
                     handle,
@@ -67,11 +67,24 @@ impl Overlapped {
                     ov,
                 )
             })
+        };
+        match read {
+            // A pipe whose other end has gone reports `ERROR_BROKEN_PIPE`.
+            // For a stream that is end of file — the same thing a Unix socket
+            // says by returning zero, and what the `BufRead` above needs to
+            // see to stop.
+            Err(e) if hung_up(&e) => Ok(0),
+            other => other,
         }
     }
 
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // SAFETY: as above; the buffer is only read.
+        //
+        // A broken pipe stays an error here, unlike in `read`: there is no
+        // such thing as writing end-of-file, and reporting zero would have
+        // `write_all` call it a `WriteZero` rather than the disconnection it
+        // is.
         unsafe {
             self.perform(|handle, ov| {
                 WriteFile(
@@ -83,6 +96,12 @@ impl Overlapped {
                 )
             })
         }
+    }
+
+    /// Nothing is buffered on this side: a completed write has been handed to
+    /// the pipe. Present because `Write` asks for it.
+    pub fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 
     /// Start one operation and wait for that one to finish.
@@ -111,13 +130,15 @@ impl Overlapped {
             ..Default::default()
         };
 
-        // SAFETY: the caller's contract, plus an `OVERLAPPED` that lives on
-        // this stack frame until the wait below has completed the operation.
-        let started = unsafe { start(handle, &raw mut overlapped) };
+        // The closure is safe to call; what it does inside is the caller's
+        // contract. The `OVERLAPPED` lives on this stack frame until the wait
+        // below has completed the operation, which is what makes handing out
+        // a pointer to it sound.
+        let started = start(handle, &raw mut overlapped);
         if started == 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
-                return finished(e, 0);
+                return Err(e);
             }
         }
 
@@ -126,22 +147,18 @@ impl Overlapped {
         // `OVERLAPPED`, and `TRUE` waits for it rather than polling.
         let ok = unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 1) };
         if ok == 0 {
-            return finished(io::Error::last_os_error(), 0);
+            return Err(io::Error::last_os_error());
         }
         Ok(transferred as usize)
     }
 }
 
-/// The other end went away, or the call really failed.
-///
-/// A pipe whose server has closed reports `ERROR_BROKEN_PIPE`, which for a
-/// stream is end of file — the same thing a Unix socket reports as a
-/// zero-length read, and what `BufRead` above needs to see to stop.
-fn finished(error: io::Error, at_eof: usize) -> io::Result<usize> {
-    match error.raw_os_error().map(|code| code as u32) {
-        Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED) => Ok(at_eof),
-        _ => Err(error),
-    }
+/// Whether this error means the other end is gone.
+fn hung_up(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error().map(|code| code as u32),
+        Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED)
+    )
 }
 
 fn manual_reset_event() -> io::Result<OwnedHandle> {
