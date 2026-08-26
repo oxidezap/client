@@ -17,6 +17,9 @@
 
 use std::io::{Read, Write};
 
+#[cfg(windows)]
+mod overlapped;
+
 /// A connection to the daemon, before it is put to work.
 ///
 /// Not readable or writable itself: it becomes a [`Reader`] and a [`Writer`],
@@ -34,9 +37,14 @@ pub struct Writer(Inner);
 #[cfg(unix)]
 type Inner = std::os::unix::net::UnixStream;
 
-/// A named pipe opened as a file.
+/// A named pipe, opened overlapped.
+///
+/// Windows has no `std` named-pipe client, and a pipe *is* openable by name
+/// with the ordinary file API — but that gives a synchronous handle, on which
+/// Windows serializes reads against writes and deadlocks this protocol. See
+/// [`overlapped`].
 #[cfg(windows)]
-type Inner = std::fs::File;
+type Inner = overlapped::Overlapped;
 
 impl Endpoint {
     /// Connect to the daemon, or report why not.
@@ -68,13 +76,18 @@ impl Endpoint {
         }
         #[cfg(windows)]
         {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
             // Read and write, because the pipe is duplex and opening it for
-            // one direction would half-connect.
-            std::fs::OpenOptions::new()
+            // one direction would half-connect. Overlapped, because the two
+            // directions are used at once and a synchronous handle will not
+            // have that — see `overlapped`.
+            let pipe = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(path)
-                .map(Self)
+                .custom_flags(overlapped::FILE_FLAG_OVERLAPPED)
+                .open(path)?;
+            overlapped::Overlapped::new(pipe).map(Self)
         }
         #[cfg(not(any(unix, windows)))]
         {
