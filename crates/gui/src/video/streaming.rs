@@ -28,6 +28,70 @@ const NAL_START_CODE: &[u8] = &[0x00, 0x00, 0x00, 0x01];
 /// come from downloaded media, so their product is attacker-influenced.
 const MAX_VIDEO_PIXELS: usize = 7680 * 4320;
 
+/// Display rotation carried by the track's transformation matrix. A phone
+/// records in its sensor's orientation and writes the correction here, so a
+/// portrait clip decodes as landscape and only the matrix says which way is
+/// up. Angles are clockwise, as applied when drawing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rotation {
+    None,
+    Cw90,
+    Cw180,
+    Cw270,
+}
+
+const ONE: i32 = 0x0001_0000;
+const NEG_ONE: i32 = -ONE;
+
+impl Rotation {
+    /// Classify the upper-left 2x2 of the ISO 14496-12 matrix. Its entries are
+    /// 16.16 fixed point; only the quarter turns are representable as a pixel
+    /// move, so anything else (a flip, a shear, a scale) is left alone.
+    fn from_matrix(a: i32, b: i32, c: i32, d: i32) -> Self {
+        match (a, b, c, d) {
+            (0, ONE, NEG_ONE, 0) => Self::Cw90,
+            (NEG_ONE, 0, 0, NEG_ONE) => Self::Cw180,
+            (0, NEG_ONE, ONE, 0) => Self::Cw270,
+            _ => Self::None,
+        }
+    }
+
+    /// Whether the rotation exchanges width and height.
+    fn transposes(self) -> bool {
+        matches!(self, Self::Cw90 | Self::Cw270)
+    }
+}
+
+/// Copy `src` (RGBA, `width` x `height`) into `dst` as BGRA, applying `rotation`.
+///
+/// Two corrections in one pass: `RenderImage` is BGRA and openh264 writes
+/// RGBA, and the frame has to be turned by the track matrix. `dst` holds the
+/// same bytes laid out in the destination geometry, which is the source's
+/// transposed for a quarter turn.
+fn write_bgra_rotated(src: &[u8], width: usize, height: usize, rotation: Rotation, dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), width * height * 4);
+    debug_assert_eq!(dst.len(), src.len());
+
+    let dst_width = if rotation.transposes() { height } else { width };
+
+    for y in 0..height {
+        for x in 0..width {
+            let (dx, dy) = match rotation {
+                Rotation::None => (x, y),
+                Rotation::Cw90 => (height - 1 - y, x),
+                Rotation::Cw180 => (width - 1 - x, height - 1 - y),
+                Rotation::Cw270 => (y, width - 1 - x),
+            };
+            let s = (y * width + x) * 4;
+            let t = (dy * dst_width + dx) * 4;
+            dst[t] = src[s + 2];
+            dst[t + 1] = src[s + 1];
+            dst[t + 2] = src[s];
+            dst[t + 3] = src[s + 3];
+        }
+    }
+}
+
 /// A decoded video frame, BGRA8-encoded and ready to hand to `gpui::img`.
 #[derive(Clone)]
 pub struct StreamingFrame {
@@ -53,9 +117,11 @@ pub struct StreamingVideoDecoder {
     samples: Vec<H264Sample>,
     /// SPS/PPS NAL units (needed to initialize decoder)
     sps_pps: Vec<u8>,
-    /// Video dimensions
+    /// Coded frame dimensions, as the decoder produces them.
     width: u32,
     height: u32,
+    /// Display rotation from the track matrix, applied to every kept frame.
+    rotation: Rotation,
     /// Frame duration
     frame_duration: Duration,
     /// Total video duration
@@ -68,11 +134,11 @@ pub struct StreamingVideoDecoder {
     current_frame: Option<StreamingFrame>,
     /// Decoded audio from the video
     audio: Option<VideoAudio>,
-    /// Reusable RGBA scratch buffer so we don't allocate `w*h*4` per frame.
-    /// `std::mem::take`'d each time a frame is kept, to move ownership into
-    /// `RenderImage`; refilled from capacity on the next keep.
+    /// Reusable RGBA scratch the decoder writes into, kept across frames: the
+    /// buffer handed to `RenderImage` is a second one, because the channel
+    /// swap and the rotation both read the source while writing elsewhere.
     rgba_buffer: Vec<u8>,
-    /// Precomputed `width * height * 4`; re-allocation size for the buffer.
+    /// Precomputed `width * height * 4`; size of both buffers.
     rgba_byte_len: usize,
 }
 
@@ -153,6 +219,11 @@ impl StreamingVideoDecoder {
         let width = video_track.width() as u32;
         let height = video_track.height() as u32;
 
+        // The coded frame is the sensor's orientation; the track matrix is the
+        // correction a phone writes instead of re-encoding.
+        let matrix = &video_track.trak.tkhd.matrix;
+        let rotation = Rotation::from_matrix(matrix.a, matrix.b, matrix.c, matrix.d);
+
         // Bound the frame before anything allocates width*height*4: a
         // malformed or hostile file must not be able to ask for a buffer that
         // overflows the multiply or kills the process.
@@ -179,9 +250,10 @@ impl StreamingVideoDecoder {
             duration.as_secs_f64(),
         );
         log::info!(
-            "Video track details: timescale={}, bitrate={} kbps",
+            "Video track details: timescale={}, bitrate={} kbps, rotation={:?}",
             video_track.timescale(),
             video_track.bitrate() / 1000,
+            rotation,
         );
 
         // Get SPS and PPS from the track
@@ -278,6 +350,7 @@ impl StreamingVideoDecoder {
             sps_pps,
             width,
             height,
+            rotation,
             frame_duration,
             duration,
             decoder,
@@ -511,9 +584,19 @@ impl StreamingVideoDecoder {
                     // when the host supports it, scalar fallback otherwise).
                     yuv.write_rgba8(&mut self.rgba_buffer);
 
-                    let owned =
-                        std::mem::replace(&mut self.rgba_buffer, vec![0u8; self.rgba_byte_len]);
-                    let Some(image) = RgbaImage::from_raw(self.width, self.height, owned) else {
+                    // `RenderImage` reads the buffer as BGRA, and the frame
+                    // still has to be turned the way the track says.
+                    let mut owned = vec![0u8; self.rgba_byte_len];
+                    write_bgra_rotated(
+                        &self.rgba_buffer,
+                        self.width as usize,
+                        self.height as usize,
+                        self.rotation,
+                        &mut owned,
+                    );
+                    let (display_width, display_height) = self.display_size();
+                    let Some(image) = RgbaImage::from_raw(display_width, display_height, owned)
+                    else {
                         log::warn!(
                             "Frame {}: RgbaImage::from_raw failed (size mismatch)",
                             index
@@ -532,10 +615,11 @@ impl StreamingVideoDecoder {
 
                     if index == 0 {
                         log::info!(
-                            "First frame RGBA created: {} bytes ({}x{})",
+                            "First frame BGRA created: {} bytes ({}x{}, rotation={:?})",
                             self.rgba_byte_len,
-                            self.width,
-                            self.height
+                            display_width,
+                            display_height,
+                            self.rotation
                         );
                     }
                 }
@@ -604,6 +688,15 @@ impl StreamingVideoDecoder {
         }
     }
 
+    /// Frame geometry as drawn: the coded size, transposed by a quarter turn.
+    fn display_size(&self) -> (u32, u32) {
+        if self.rotation.transposes() {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
+    }
+
     /// Get current decoded frame
     pub fn current_frame(&self) -> Option<&StreamingFrame> {
         self.current_frame.as_ref()
@@ -669,5 +762,76 @@ impl StreamingVideoDecoder {
     /// Extract audio from MP4
     fn extract_audio(mp4_data: &[u8]) -> Option<VideoAudio> {
         super::audio::extract_audio_from_mp4(mp4_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_matrix_is_no_rotation() {
+        assert_eq!(Rotation::from_matrix(ONE, 0, 0, ONE), Rotation::None);
+        // A horizontal flip is not a quarter turn and must not be mistaken for one.
+        assert_eq!(Rotation::from_matrix(NEG_ONE, 0, 0, ONE), Rotation::None);
+    }
+
+    #[test]
+    fn quarter_turns_are_classified() {
+        assert_eq!(Rotation::from_matrix(0, ONE, NEG_ONE, 0), Rotation::Cw90);
+        assert_eq!(
+            Rotation::from_matrix(NEG_ONE, 0, 0, NEG_ONE),
+            Rotation::Cw180
+        );
+        assert_eq!(Rotation::from_matrix(0, NEG_ONE, ONE, 0), Rotation::Cw270);
+    }
+
+    /// One pixel per position, tagged by its index, so a move is visible.
+    fn tagged(width: usize, height: usize) -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|i| [i as u8, 0, 0, 255])
+            .collect()
+    }
+
+    /// Red channel of each pixel, read back out of a BGRA buffer.
+    fn reds(buf: &[u8]) -> Vec<u8> {
+        buf.as_chunks::<4>().0.iter().map(|p| p[2]).collect()
+    }
+
+    #[test]
+    fn no_rotation_still_swaps_red_and_blue() {
+        let src = [10u8, 20, 30, 40];
+        let mut dst = [0u8; 4];
+        write_bgra_rotated(&src, 1, 1, Rotation::None, &mut dst);
+        assert_eq!(dst, [30, 20, 10, 40]);
+    }
+
+    #[test]
+    fn cw90_moves_the_top_left_pixel_to_the_top_right() {
+        // 3x2 source, indices 0..6 laid out row-major.
+        let src = tagged(3, 2);
+        let mut dst = vec![0u8; src.len()];
+        write_bgra_rotated(&src, 3, 2, Rotation::Cw90, &mut dst);
+        // Destination is 2x3: columns become rows, bottom row first.
+        assert_eq!(reds(&dst), vec![3, 0, 4, 1, 5, 2]);
+    }
+
+    #[test]
+    fn cw270_is_the_inverse_of_cw90() {
+        let src = tagged(3, 2);
+        let mut once = vec![0u8; src.len()];
+        write_bgra_rotated(&src, 3, 2, Rotation::Cw90, &mut once);
+        let mut back = vec![0u8; src.len()];
+        // The intermediate is BGRA, so turning it back swaps the channels again.
+        write_bgra_rotated(&once, 2, 3, Rotation::Cw270, &mut back);
+        assert_eq!(back, src);
+    }
+
+    #[test]
+    fn cw180_reverses_the_pixels() {
+        let src = tagged(3, 2);
+        let mut dst = vec![0u8; src.len()];
+        write_bgra_rotated(&src, 3, 2, Rotation::Cw180, &mut dst);
+        assert_eq!(reds(&dst), vec![5, 4, 3, 2, 1, 0]);
     }
 }
