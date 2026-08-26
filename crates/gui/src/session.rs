@@ -64,6 +64,14 @@ pub enum FromDaemon {
     Account(Option<oxidezap_ipc::AccountIdentity>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
+    /// A status view the daemon did not record after all.
+    ///
+    /// The ring was taken down the moment the update was opened, before the
+    /// daemon had answered — which is right, because a view that has to wait
+    /// for a round trip flickers. When the answer is a refusal, the honest
+    /// thing is to put it back: nothing durable exists, and the next restart
+    /// would bring the ring back anyway, with nothing having said why.
+    StatusViewLost(Vec<String>),
     /// Status updates watched somewhere else on this device.
     ///
     /// The window that watched one already knows; this is for every other
@@ -94,6 +102,11 @@ enum Awaiting {
         /// would stage another.
         staged: Option<std::path::PathBuf>,
     },
+    /// Status updates this window has already drawn as watched. A refusal has
+    /// to reach them, or the ring stays down over a view nothing recorded.
+    StatusView {
+        message_ids: Vec<String>,
+    },
 }
 
 impl Awaiting {
@@ -102,6 +115,9 @@ impl Awaiting {
         match self {
             Self::Download(tx) => tx.is_closed(),
             Self::Storage(tx) => tx.is_closed(),
+            // Nor is a ring that has already been taken down: the window is
+            // showing the update as watched and only an answer can correct it.
+            Self::StatusView { .. } => false,
             // A drawn message is never abandoned: the bubble stays on screen
             // until something resolves it.
             Self::Send { .. } => false,
@@ -141,6 +157,15 @@ impl Awaiting {
                             message_id: local_id,
                             reason: detail.to_string(),
                         })));
+                }
+            }
+            // The ring is already down over these. Nothing durable exists, so
+            // the window has to be told to put it back rather than showing a
+            // watched update that comes back new on the next start.
+            Self::StatusView { message_ids } => {
+                log::warn!("a status view was not recorded: {detail}");
+                if let Some(events) = events {
+                    let _ = events.blocking_send(FromDaemon::StatusViewLost(message_ids));
                 }
             }
         }
@@ -213,6 +238,18 @@ impl Session {
             })));
     }
 
+    /// Report a status view that never reached the daemon.
+    ///
+    /// `try_send` for the same reason as the one above: this runs on the GPUI
+    /// executor, which is what drains the queue, so blocking on it would park
+    /// the only thread that could empty it.
+    fn report_status_view_lost(&self, message_ids: Vec<String>, reason: &str) {
+        error!("a status view never left this process: {reason}");
+        let _ = self
+            .events
+            .try_send(FromDaemon::StatusViewLost(message_ids));
+    }
+
     /// Send a request nobody is waiting on an answer for.
     fn send(&self, request: ClientRequest) -> std::io::Result<()> {
         self.send_frame(&Request::bare(request))
@@ -281,6 +318,11 @@ impl Session {
                             let _ = std::fs::remove_file(path);
                         }
                         self.report_send_failed(&chat_jid, &local_id, detail);
+                    }
+                    // Same thread, same rule: `failed` would `blocking_send`
+                    // on the queue this executor drains.
+                    Awaiting::StatusView { message_ids } => {
+                        self.report_status_view_lost(message_ids, &detail);
                     }
                     waiting => waiting.failed(&detail, None),
                 }
@@ -398,11 +440,22 @@ impl Session {
     /// broadcast holds every contact's updates. Nothing goes to the network —
     /// this is the local half of a status view, and the daemon is where it has
     /// to live to outlast the window.
+    /// Tracked rather than told, unlike the other one-way requests: the
+    /// window takes the ring down before the daemon has answered, so a
+    /// refusal — a read-only store, a full disk, a socket that is gone — has
+    /// to find its way back to the update it was about. Without an id the
+    /// daemon's answer is an uncorrelated log line, and the ring stays down
+    /// over a view nothing recorded.
     pub fn mark_status_watched(&self, message_ids: Vec<String>) {
         if message_ids.is_empty() {
             return;
         }
-        self.tell(ClientRequest::MarkStatusWatched { message_ids });
+        self.ask(
+            ClientRequest::MarkStatusWatched {
+                message_ids: message_ids.clone(),
+            },
+            Awaiting::StatusView { message_ids },
+        );
     }
 
     pub fn start_call(&self, jid: &str, is_video: bool, placeholder_id: String) {
@@ -915,6 +968,34 @@ mod tests {
             let key = format!("u-{}", sanitize(id));
             assert!(media_path(&key).is_some(), "{id} produced {key}");
             assert!(!key.contains('/'), "{key}");
+        }
+    }
+
+    /// The pending map is swept by whoever adds to it, and a status view has
+    /// nobody holding a channel to be closed — the thing waiting on it is a
+    /// ring already drawn. Swept as abandoned, its refusal would be dropped
+    /// and the ring would stay down over a view nothing recorded.
+    #[test]
+    fn a_status_view_is_never_swept_before_its_answer() {
+        let waiting = Awaiting::StatusView {
+            message_ids: vec!["3EB0".into()],
+        };
+        assert!(!waiting.is_abandoned());
+    }
+
+    /// A refusal has to come back as the updates it was about, or the window
+    /// has no way to know which ring to put back.
+    #[test]
+    fn a_refused_status_view_names_the_updates_it_lost() {
+        let (tx, mut rx) = mpsc::channel(4);
+        Awaiting::StatusView {
+            message_ids: vec!["A".into(), "B".into()],
+        }
+        .failed("the store is read-only", Some(&tx));
+
+        match rx.try_recv() {
+            Ok(FromDaemon::StatusViewLost(ids)) => assert_eq!(ids, vec!["A", "B"]),
+            _ => panic!("the refusal did not come back as the updates it was about"),
         }
     }
 

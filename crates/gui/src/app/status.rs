@@ -477,6 +477,32 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    /// Take back views the daemon did not record.
+    ///
+    /// Only what this window still claims: a view the daemon *did* record for
+    /// another window arrives as its own announcement, and a refusal here says
+    /// nothing about that one. The row is the truth either way — the next
+    /// hydration reads it — so this is about the meantime, which is the whole
+    /// time somebody is looking at the ring.
+    pub(super) fn forget_status_views(&mut self, message_ids: &[String], cx: &mut Context<Self>) {
+        let mut taken_back = false;
+        for id in message_ids {
+            taken_back |= self.watched_status.remove(id);
+        }
+        if !taken_back {
+            return;
+        }
+        if let Some(chat) = self.chats.iter_mut().find(|chat| chat.is_status) {
+            for message in &mut chat.messages {
+                if !message.is_from_me && message_ids.contains(&message.id) {
+                    message.is_read = false;
+                }
+            }
+        }
+        self.invalidate_chat_cache();
+        cx.notify();
+    }
+
     /// Put the locally watched updates back after a hydration merge.
     ///
     /// The daemon is told too, and answers a later reload with the row
