@@ -1114,7 +1114,14 @@ impl Bridge {
                 // was deleted. See `StateHub::store_backed_chat_jids`.
                 vec![Change::live(DaemonEvent::ChatUpdated(summary))]
             }
-            UiEvent::HistoryLoaded { chats, complete } => {
+            UiEvent::HistoryLoaded {
+                chats,
+                complete,
+                // Where the *chat list* continues, which is a front end's
+                // business: this side holds no list position, it holds the
+                // rows. The event carries it through untouched.
+                next: _,
+            } => {
                 let mut changes: Vec<Change> = Vec::with_capacity(chats.len() + 1);
 
                 // A complete load is the store's whole truth, so a chat
@@ -1716,6 +1723,7 @@ mod tests {
         UiEvent::HistoryLoaded {
             chats,
             complete: true,
+            next: None,
         }
     }
 

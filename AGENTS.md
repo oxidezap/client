@@ -382,6 +382,12 @@ profile here repeats it deliberately.
   its end like any other, so the frame asks on the sidebar's behalf when a
   filter matches nothing: the virtual list that would have asked is not built
   when there is nothing to put in it.
+  Where the list continues is said by the load that walked it: a truncated
+  `HistoryLoaded` carries the position it stopped at and a complete one is the
+  whole list, so a window's first "load more" is a page it does not have. It
+  costs the load nothing — it has already walked that far — and the ask it
+  replaces was a hundred rows re-read, re-serialized and re-merged to learn
+  one token.
   Two rules keep it honest. A cursor is **opaque** — what a page is ordered by
   is the store's business, and a front end that parsed one would be a second
   implementation of that order — so `PageCursor` is a token the daemon writes

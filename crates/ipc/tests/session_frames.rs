@@ -25,6 +25,7 @@ fn every_shape_of_session_event_survives_a_frame() {
         UiEvent::HistoryLoaded {
             chats: vec![oxidezap_core::Chat::new("1@s.whatsapp.net".into())],
             complete: true,
+            next: None,
         },
     ] {
         let frame = DaemonMessage::Session {
@@ -47,6 +48,37 @@ fn every_shape_of_session_event_survives_a_frame() {
 /// while every one of them reads back as its default, so this is the test
 /// that says so: the empty message must round-trip unchanged, and the full
 /// one must not lose anything on the way.
+/// A load with nowhere to continue says so by leaving the field out, and an
+/// older daemon says the same thing by not knowing the field at all. Both
+/// have to read back as "no position", or a window would take a load's
+/// silence for a place in the list.
+#[test]
+fn a_load_with_no_cursor_reads_back_without_one() {
+    let ended = UiEvent::HistoryLoaded {
+        chats: vec![oxidezap_core::Chat::new("1@s.whatsapp.net".into())],
+        complete: true,
+        next: None,
+    };
+    let line = serde_json::to_string(&ended).expect("serializes");
+    assert!(!line.contains("next"), "an absent cursor is absent: {line}");
+    assert_eq!(
+        serde_json::from_str::<UiEvent>(&line).expect("parses back"),
+        ended
+    );
+
+    // And a daemon that does carry one hands back the same token.
+    let paged = UiEvent::HistoryLoaded {
+        chats: vec![oxidezap_core::Chat::new("1@s.whatsapp.net".into())],
+        complete: false,
+        next: Some("c1:-:1700000000123:1@s.whatsapp.net".into()),
+    };
+    let line = serde_json::to_string(&paged).expect("serializes");
+    assert_eq!(
+        serde_json::from_str::<UiEvent>(&line).expect("parses back"),
+        paged
+    );
+}
+
 #[test]
 fn an_omitted_field_comes_back_as_what_it_was() {
     use oxidezap_core::{ChatMessage, MediaContent, MediaType};
@@ -131,6 +163,7 @@ fn history_load_wire_cost() {
         UiEvent::HistoryLoaded {
             chats: list,
             complete: true,
+            next: None,
         }
     }
 
