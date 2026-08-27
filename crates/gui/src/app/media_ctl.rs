@@ -530,14 +530,24 @@ impl WhatsAppApp {
     /// entry when the real bytes replace a preview, so a stale thumbnail cannot
     /// outlive its download.
     /// Uses interior mutability (RefCell) so it can be called during immutable render.
-    pub fn get_decoded_image(&self, message_id: &str, data: &[u8], mime_type: &str) -> Arc<Image> {
+    ///
+    /// `None` where `data` is not a still picture — a video's bytes are its
+    /// own file once it has been fetched, and nothing decodes those as one.
+    /// Answered before the cache is touched, so an MP4 cannot take a slot
+    /// from the pictures the cache exists for.
+    pub fn get_decoded_image(
+        &self,
+        message_id: &str,
+        data: &[u8],
+        mime_type: &str,
+    ) -> Option<Arc<Image>> {
+        let format = mime_to_image_format(mime_type)?;
+
         // Check if already cached
         if let Some(cached) = self.decoded_images.borrow().get(message_id).cloned() {
-            return cached;
+            return Some(cached);
         }
 
-        // Create and cache the image
-        let format = mime_to_image_format(mime_type);
         let image = Arc::new(Image::from_bytes(format, data.to_vec()));
 
         let mut cache = self.decoded_images.borrow_mut();
@@ -549,7 +559,7 @@ impl WhatsAppApp {
         }
 
         cache.insert(message_id.to_string(), image.clone());
-        image
+        Some(image)
     }
     /// Toggle video playback for a message
     pub fn toggle_video(

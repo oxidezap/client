@@ -3,19 +3,33 @@
 use chrono::{DateTime, Local, Utc};
 use gpui::ImageFormat;
 
-/// Convert a MIME type string to a GPUI ImageFormat
-pub fn mime_to_image_format(mime: &str) -> ImageFormat {
+/// How GPUI should decode these bytes, when they are a still picture at all.
+///
+/// `None` is the answer for everything that is not one, and it is a real
+/// answer rather than a failure: a row's `data` is whatever can be *shown*
+/// for it, and for a video that is a poster thumbnail right up until the file
+/// itself is fetched — after which [`MediaContent::adopt_full_bytes`] puts
+/// the MP4 in `data` and `video/mp4` beside it. Every surface that draws a
+/// still asks here first, so the one that has a frame to draw instead falls
+/// through to it.
+///
+/// [`MediaContent::adopt_full_bytes`]: oxidezap_core::MediaContent::adopt_full_bytes
+pub fn mime_to_image_format(mime: &str) -> Option<ImageFormat> {
     match mime {
         // image/jpg is non-standard but some senders emit it
-        "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
-        "image/png" => ImageFormat::Png,
-        "image/gif" => ImageFormat::Gif,
-        "image/webp" => ImageFormat::Webp,
-        "image/bmp" => ImageFormat::Bmp,
-        _ => {
+        "image/jpeg" | "image/jpg" => Some(ImageFormat::Jpeg),
+        "image/png" => Some(ImageFormat::Png),
+        "image/gif" => Some(ImageFormat::Gif),
+        "image/webp" => Some(ImageFormat::Webp),
+        "image/bmp" => Some(ImageFormat::Bmp),
+        // A picture in a subtype we do not name. PNG is a guess, and one
+        // worth making: the bytes claim to be an image, and GPUI sniffing
+        // them itself is a better outcome than a row that draws nothing.
+        _ if mime.starts_with("image/") => {
             log::warn!("unrecognized image MIME type {mime}, falling back to PNG");
-            ImageFormat::Png
+            Some(ImageFormat::Png)
         }
+        _ => None,
     }
 }
 
@@ -108,7 +122,31 @@ pub fn format_time_local(timestamp: &DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::scale_media_dimensions;
+    use super::{mime_to_image_format, scale_media_dimensions};
+    use gpui::ImageFormat;
+
+    #[test]
+    fn names_the_formats_senders_actually_use() {
+        assert_eq!(mime_to_image_format("image/jpeg"), Some(ImageFormat::Jpeg));
+        // Non-standard, and emitted anyway.
+        assert_eq!(mime_to_image_format("image/jpg"), Some(ImageFormat::Jpeg));
+        assert_eq!(mime_to_image_format("image/webp"), Some(ImageFormat::Webp));
+    }
+
+    #[test]
+    fn guesses_only_within_images() {
+        assert_eq!(mime_to_image_format("image/avif"), Some(ImageFormat::Png));
+    }
+
+    #[test]
+    fn a_video_is_not_a_still() {
+        // What a status posted as a photo with music arrives as: an MP4 with
+        // two keyframes. Decoding it as a picture is a guess that can only
+        // draw nothing, and the surfaces that ask have a frame to draw.
+        assert_eq!(mime_to_image_format("video/mp4"), None);
+        assert_eq!(mime_to_image_format("audio/ogg; codecs=opus"), None);
+        assert_eq!(mime_to_image_format("application/pdf"), None);
+    }
 
     fn assert_close(actual: (f32, f32), expected: (f32, f32)) {
         assert!(

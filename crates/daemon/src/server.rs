@@ -841,9 +841,11 @@ async fn handle_request(
         // acted on: whoever owns a window is the only one that can raise it.
         // Published to every client, including the one that asked, because a
         // front end that sent this on a user's behalf wants the window up
-        // regardless of which process is holding it.
+        // regardless of which process is holding it. Through the same door as
+        // the tray's Open, so that "there should be a window" means the same
+        // thing however it was asked — including when there is none to raise.
         ClientRequest::ShowWindow => {
-            hub.signal(&DaemonMessage::ShowWindow);
+            crate::window::show(hub);
             acted(Ok(()))
         }
         // The acknowledgement goes out first; see the caller.

@@ -12,6 +12,7 @@ mod session_bridge;
 mod shutdown;
 mod state;
 mod tray;
+mod window;
 
 use std::sync::Arc;
 

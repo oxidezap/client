@@ -364,16 +364,21 @@ impl StateHub {
     /// through to whoever owns a window, and a failed send is news about one
     /// message rather than a fact a snapshot could hold. Serialized only when
     /// someone is listening, like every other frame.
-    pub fn signal(&self, message: &DaemonMessage) {
+    ///
+    /// Returns whether it reached anybody. For most frames that is nothing to
+    /// act on — nobody listening *is* the outcome — but a window request has
+    /// somewhere else to go: see [`crate::window::show`].
+    pub fn signal(&self, message: &DaemonMessage) -> bool {
         if self.signals.receiver_count() == 0 {
-            return;
+            return false;
         }
         match serde_json::to_string(message) {
             // Err means every receiver dropped since the count above.
-            Ok(line) => {
-                let _ = self.signals.send(Arc::from(line.as_str()));
+            Ok(line) => self.signals.send(Arc::from(line.as_str())).is_ok(),
+            Err(e) => {
+                log::error!("dropping unserializable frame: {e}");
+                false
             }
-            Err(e) => log::error!("dropping unserializable frame: {e}"),
         }
     }
 
