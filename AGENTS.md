@@ -281,16 +281,18 @@ profile here repeats it deliberately.
   a backfill before the head, a notice stamped in the past and a message
   landing mid-history all raise it exactly as an arrival does, and only an
   arrival leaves the earlier rows alone. The row at the end of the measured
-  prefix is what answers it (`MessageListCache::row_id`), because that is the
-  row every one of those moves and an append does not. A row can also change
-  height with the count standing still — an image arrives, a reaction lands,
-  a send fails and grows a retry button — which the `build` number answers.
-  The four outcomes are splice at the end, splice at the *front*, remeasure
-  and reset — and the second is what a page of older history is: the last row
-  is still the last row, everything measured is still there one page further
-  down, and a bottom-anchored list is unmoved by that. Reset instead, and a
-  reader who scrolled back far enough to ask for more was thrown to the newest
-  message for asking.
+  prefix is what answers it, and *where it ended up* is the whole answer
+  (`MessageListCache::position_of`): how far it moved is how many rows arrived
+  in front of it, and what is left after it is what arrived behind. A row can
+  also change height with the count standing still — an image arrives, a
+  reaction lands, a send fails and grows a retry button — which the `build`
+  number answers. So the outcomes are one splice at either end, remeasure and
+  reset, and rows at the *front* are what a page of older history is:
+  everything measured is still there one page further down, and a
+  bottom-anchored list is unmoved by that. Asking each end its own yes/no
+  question instead makes a frame that carries both — a page landing beside an
+  arrival — answer neither, and a reader who scrolled back far enough to ask
+  for more was thrown to the newest message for asking.
 - **What a frame leaves out, its reader fills in.** The wire is
   newline-delimited JSON and a history load is a hundred chats of fifty rows,
   most of whose fields are empty — no reaction, no quote, no media, nothing
@@ -364,10 +366,18 @@ profile here repeats it deliberately.
   implementation of that order — so `PageCursor` is a token the daemon writes
   and reads, and `session/whatsapp.rs` is where it is spelled. And the daemon
   **learns from what it serves**: a page of messages is folded into
-  `ReadTracker` and a page of chats into the hub on the way out, because a
-  read is bounded by what this side has observed and a chat past the attach
-  window is otherwise in no snapshot — a window naming either would be refused
-  for naming something the daemon has never heard of.
+  `ReadTracker` and a page of chats into the hub *and* the tracker on the way
+  out, because a read is bounded by what this side has observed and a chat
+  past the attach window is otherwise in no snapshot — a window naming either
+  would be refused for naming something the daemon has never heard of. A page
+  is a frame like any other, so its media is externalized like any other
+  (`externalize_messages`) and read back on the client's own IPC thread; the
+  status broadcast gets a whole page of its own, because nothing opens it as a
+  conversation and so nothing ever asks it for messages; and a page's rows
+  carry each row's other half, since a PN/LID pair is collapsed over the rows
+  one hydration is given and a page boundary falls wherever the store's order
+  puts it — half a pair alone is a chat with half the pair's unread count,
+  merged over the whole one the window already had.
 - **The reload debounce is for bursts, not for askers.** A history sync commits
   many batches and each emits a change; the quiet window folds them into one
   load. A front end that asked outright is not a burst — it holds nothing, it
