@@ -513,11 +513,14 @@ impl Inner {
         TrayState {
             connected: self.connection.is_connected(),
             // A manually-unread chat carries a badge with no number, so it
-            // counts as one for a tray that can only show a total.
+            // counts as one for a tray that can only show a total. The status
+            // broadcast is left out of it entirely: see
+            // `ChatSummary::counts_toward_unread`.
             unread: self
                 .chats
                 .values()
                 .map(|e| &e.summary)
+                .filter(|c| c.counts_toward_unread())
                 .fold(0u32, |acc, c| {
                     acc.saturating_add(if c.unread == 0 && c.manually_unread {
                         1
@@ -811,6 +814,33 @@ mod tests {
 
         hub.apply(live(chat("a@s.whatsapp.net", 2, 99)));
         assert!(tray.has_changed().unwrap(), "a new unread count must");
+    }
+
+    /// The status broadcast is not a conversation and its counter is never
+    /// cleared by watching an update — the ack goes on the message. Counted,
+    /// the tray said "3 unread messages" over a chat list with nothing unread
+    /// in it, and nothing could ever bring it back down.
+    #[tokio::test]
+    async fn status_updates_do_not_raise_the_tray_badge() {
+        let hub = StateHub::new();
+        let mut tray = hub.watch_tray();
+
+        hub.apply(live(chat("a@s.whatsapp.net", 2, 10)));
+        assert_eq!(tray.borrow_and_update().unread, 2);
+
+        hub.apply(live(chat(oxidezap_core::STATUS_BROADCAST_JID, 7, 20)));
+        assert_eq!(
+            tray.borrow_and_update().unread,
+            2,
+            "seven unread status updates are not seven unread messages"
+        );
+        assert!(
+            hub.snapshot()
+                .chats
+                .iter()
+                .any(|c| c.jid == oxidezap_core::STATUS_BROADCAST_JID),
+            "and the chat itself still reaches a client, which draws its own feed"
+        );
     }
 
     /// A chat marked unread by hand carries a badge with no number. Counting

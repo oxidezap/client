@@ -16,10 +16,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use chrono::DateTime;
 use log::{debug, error, info, warn};
-use oxidezap_core::{CallState, DownloadableMedia, MediaContent, QuotedMessage, UiEvent};
+use oxidezap_core::{CallState, Chat, DownloadableMedia, MediaContent, QuotedMessage, UiEvent};
 use oxidezap_ipc::{
-    CallAction, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, Endpoint,
+    CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, Endpoint,
     PROTOCOL_VERSION, Reader, Request, RequestId, StateSnapshot, StateVersion, Writer,
     endpoint_path, media_path,
 };
@@ -785,6 +786,22 @@ fn take_pending(pending: &Pending, id: RequestId) -> Option<Awaiting> {
 /// it already handles.
 fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     let mut events = Vec::new();
+    // The list first, before the state that draws it: the daemon already
+    // holds every row this window is about to ask the store for, and a
+    // window that ignored them drew an empty pane until its own load came
+    // back — a chat list flashing into place a few hundred milliseconds
+    // after every launch. Sent as the load event this front end already
+    // knows how to fold in, so nothing downstream learns a second
+    // vocabulary; the store's load merges into these rows when it arrives.
+    if !snapshot.chats.is_empty() {
+        events.push(session(UiEvent::HistoryLoaded {
+            chats: snapshot.chats.iter().map(placeholder_chat).collect(),
+            // Never complete, whatever the daemon knows: a summary has no
+            // messages in it, so this load is not the store's whole truth
+            // and must not prune anything.
+            complete: false,
+        }));
+    }
     match &snapshot.connection {
         ConnectionState::Connecting => events.push(session(UiEvent::InitComplete)),
         ConnectionState::Pairing { qr, pair_code } => {
@@ -827,6 +844,29 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     events.push(FromDaemon::Calls(Box::new(snapshot.calls.clone())));
     events.push(FromDaemon::Account(snapshot.account.clone()));
     events
+}
+
+/// One summary, as much of a chat as a summary can be.
+///
+/// Everything a row draws — the name, the badge, the preview line and its
+/// time — and no messages, because the wire deliberately does not carry them
+/// (see [`ChatSummary`]). `preview_for` already answers for a chat in exactly
+/// that shape: the list hydrates before the timeline does.
+///
+/// Live-created rather than store-backed, so a complete load that does not
+/// return it leaves it alone. The daemon's own list is what these came from
+/// and the load that follows will contradict them where it must — but during
+/// pairing that load is empty while these rows are all there is, and being
+/// prunable there would wipe the list a window had just been handed.
+fn placeholder_chat(summary: &ChatSummary) -> Chat {
+    let mut chat = Chat::labelled(summary.jid.clone(), summary.name.clone());
+    chat.unread_count = summary.unread;
+    chat.manually_unread = summary.manually_unread;
+    if let Some(preview) = &summary.last_message {
+        chat.last_message = Some(preview.text.clone());
+        chat.last_message_time = DateTime::from_timestamp_millis(preview.timestamp_ms);
+    }
+    chat
 }
 
 fn session(event: UiEvent) -> FromDaemon {
@@ -959,6 +999,80 @@ fn daemon_program() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_of(chats: Vec<ChatSummary>) -> StateSnapshot {
+        StateSnapshot {
+            version: StateVersion::INITIAL,
+            connection: ConnectionState::Connected,
+            chats,
+            calls: CallState::default(),
+            account: None,
+        }
+    }
+
+    fn summary(jid: &str, name: &str, unread: u32) -> ChatSummary {
+        ChatSummary {
+            jid: jid.to_string(),
+            name: name.to_string(),
+            unread,
+            manually_unread: false,
+            last_message: Some(oxidezap_ipc::MessagePreview {
+                id: Some("3EB0".into()),
+                text: "olá".into(),
+                from_me: false,
+                timestamp_ms: 1_700_000_000_000,
+            }),
+        }
+    }
+
+    /// The list the daemon already holds, drawn on the first frame instead of
+    /// a few hundred milliseconds later. Before the state that draws it, so
+    /// the frame that turns connected is not the one with an empty pane in
+    /// it.
+    #[test]
+    fn attaching_paints_the_list_the_daemon_already_has() {
+        let events = catch_up(&snapshot_of(vec![summary(
+            "559900000001@s.whatsapp.net",
+            "Alguém",
+            3,
+        )]));
+
+        let Some(FromDaemon::Session(first)) = events.first() else {
+            panic!("the list is not the first event");
+        };
+        let UiEvent::HistoryLoaded { chats, complete } = first.as_ref() else {
+            panic!("the list does not come first: {first:?}");
+        };
+        assert!(!complete, "a summary is never the store's whole truth");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].name, "Alguém");
+        assert_eq!(chats[0].unread_count, 3);
+        assert_eq!(chats[0].last_message.as_deref(), Some("olá"));
+        assert!(chats[0].last_message_time.is_some(), "the row has a time");
+        assert!(
+            chats[0].messages.is_empty(),
+            "a summary carries no messages, by design"
+        );
+        assert!(
+            !chats[0].is_from_store(),
+            "a row from a summary must survive a complete load that omits it"
+        );
+    }
+
+    /// Nothing to paint is nothing to say: a daemon with no chats must not
+    /// make the window handle an empty load before its real one.
+    #[test]
+    fn an_empty_snapshot_carries_no_list() {
+        let events = catch_up(&snapshot_of(Vec::new()));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                FromDaemon::Session(session)
+                    if matches!(session.as_ref(), UiEvent::HistoryLoaded { .. })
+            )),
+            "an empty snapshot produced a load event"
+        );
+    }
 
     /// The recording's key is a local id, which the front end composes; it
     /// still has to be a plain file name.
