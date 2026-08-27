@@ -186,13 +186,17 @@ struct TimelineAnchor {
 /// so it can be reasoned about — and tested — without a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimelineSync {
-    /// Rows arrived after everything the list measured. Their heights stand,
-    /// and so does the reader's place.
-    Appended { at: usize, count: usize },
-    /// Rows arrived before everything the list measured — a page of older
-    /// history. The list is anchored at its bottom, so the heights below
-    /// still describe the same rows and the reader does not move.
-    Prepended { count: usize },
+    /// Rows arrived at the ends of the ones the list measured, and those
+    /// heights still describe those rows.
+    ///
+    /// `appended` are rows after everything measured — an arrival, which
+    /// leaves the reader's place alone. `prepended` are rows before all of
+    /// them — a page of older history, which a bottom-anchored list is
+    /// equally unmoved by. One frame can carry both: a page landing in the
+    /// same frame as an incoming message is two ends of the same unchanged
+    /// middle, and resetting for it threw a reader who had just asked for
+    /// older history to the newest message.
+    Spliced { prepended: usize, appended: usize },
     /// The same rows, against a layout that has moved under them.
     Remeasure,
     /// A different conversation, or rows that moved under the ones already
@@ -220,29 +224,33 @@ fn timeline_sync(
     };
     let moved = anchor.measured != measured || anchor.build != rows.build;
 
-    // The prefix the list measured is still that prefix: whatever changed
-    // happened after it.
-    if count >= anchor.count && rows.row_id(anchor.count.saturating_sub(1)) == anchor.boundary {
-        return match (count > anchor.count, moved) {
-            (true, _) => TimelineSync::Appended {
-                at: anchor.count,
-                count: count - anchor.count,
-            },
-            (false, true) => TimelineSync::Remeasure,
-            (false, false) => TimelineSync::Nothing,
-        };
-    }
+    // Where the last row the list measured has ended up. Everything the list
+    // measured ends there, so how far it moved is how many rows arrived in
+    // front of it — and what is left after it is what arrived behind.
+    let Some(at) = anchor
+        .boundary
+        .as_ref()
+        .and_then(|boundary| rows.position_of(boundary))
+    else {
+        // Gone: the rows it measured are not these rows.
+        return TimelineSync::Reset;
+    };
 
-    // The row that was last is still last, with rows in front of it: a page
-    // of older history. Everything the list measured is still there, shifted
-    // down — which is exactly what a bottom-anchored list is unmoved by.
-    if count > anchor.count && rows.row_id(count - 1) == anchor.boundary {
-        return TimelineSync::Prepended {
-            count: count - anchor.count,
-        };
-    }
+    // Fewer rows in front of it than the list measured, so some of them are
+    // no longer there: a removal, or a message landing mid-history.
+    let Some(prepended) = (at + 1).checked_sub(anchor.count) else {
+        return TimelineSync::Reset;
+    };
+    let appended = count - (at + 1);
 
-    TimelineSync::Reset
+    match (prepended + appended > 0, moved) {
+        (true, _) => TimelineSync::Spliced {
+            prepended,
+            appended,
+        },
+        (false, true) => TimelineSync::Remeasure,
+        (false, false) => TimelineSync::Nothing,
+    }
 }
 pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
@@ -1335,27 +1343,29 @@ impl WhatsAppApp {
         let previous = self.timeline_anchor.take();
 
         match timeline_sync(previous.as_ref(), chat_jid, rows, measured) {
-            // Rows arrived at the end: keep the measurements taken for
-            // everything before them, and the reader's place with them — but
-            // only while they still describe those rows. A window resized in
-            // the same frame a message arrived in is one where the prefix is
-            // stale too, and splicing alone would keep every one of its
-            // heights.
-            TimelineSync::Appended { at, count: added } => {
-                self.message_list.splice(at..at, added);
-                if previous.as_ref().is_some_and(|a| a.measured != measured) {
-                    self.message_list.remeasure();
+            // Rows arrived at one end or the other — an arrival, a page of
+            // older history, or one frame carrying both. The measurements
+            // between them stand, and the reader's place with them: a
+            // bottom-anchored list is moved by neither splice. Reset instead,
+            // and a reader who scrolled back far enough to ask for more was
+            // thrown to the newest message for asking.
+            //
+            // The front first, so the rows behind it are counted against the
+            // list it is being spliced into rather than the one before it.
+            TimelineSync::Spliced {
+                prepended,
+                appended,
+            } => {
+                if prepended > 0 {
+                    self.message_list.splice(0..0, prepended);
                 }
-            }
-            // A page of older history. Spliced at the front rather than reset,
-            // which is the difference between a reader staying where they were
-            // reading and being thrown to the newest message every time they
-            // scroll back far enough to ask for more.
-            TimelineSync::Prepended { count: added } => {
-                self.message_list.splice(0..0, added);
-                // The same caveat as an append: a page landing in the frame
-                // that resized the window leaves every measured height stale,
-                // and a splice keeps all of them.
+                if appended > 0 {
+                    let at = prepended + previous.as_ref().map_or(0, |a| a.count);
+                    self.message_list.splice(at..at, appended);
+                }
+                // Only while those measurements still describe those rows: a
+                // window resized in the same frame is one where the middle is
+                // stale too, and splicing alone would keep every height in it.
                 if previous.as_ref().is_some_and(|a| a.measured != measured) {
                     self.message_list.remeasure();
                 }
@@ -3029,8 +3039,33 @@ mod tests {
         let added = after.items.len() - before.items.len();
         assert_eq!(
             timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout()),
-            TimelineSync::Prepended { count: added }
+            TimelineSync::Spliced {
+                prepended: added,
+                appended: 0
+            }
         );
+    }
+
+    /// A page and an arrival between two frames. Both ends moved and the
+    /// middle did not, which is two splices — and was a reset, throwing the
+    /// reader who had just asked for older history to the newest message.
+    #[test]
+    fn a_page_and_an_arrival_in_one_frame_are_both_splices() {
+        let before = timeline_of(&["m3", "m4"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = timeline_of(&["m1", "m2", "m3", "m4", "m5"]);
+
+        let TimelineSync::Spliced {
+            prepended,
+            appended,
+        } = timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout())
+        else {
+            panic!("both ends moved, and the middle is still the middle");
+        };
+        // Every row here carries its own divider, so the counts are in rows
+        // rather than in messages — and they account for all of them.
+        assert_eq!(prepended + appended, after.items.len() - before.items.len());
+        assert!(prepended > 0 && appended > 0);
     }
 
     /// An arrival is still an append: the rows the list measured are all
@@ -3043,9 +3078,9 @@ mod tests {
 
         assert_eq!(
             timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout()),
-            TimelineSync::Appended {
-                at: before.items.len(),
-                count: after.items.len() - before.items.len()
+            TimelineSync::Spliced {
+                prepended: 0,
+                appended: after.items.len() - before.items.len()
             }
         );
     }

@@ -294,6 +294,14 @@ impl Session {
             .try_send(FromDaemon::StatusViewLost(message_ids));
     }
 
+    /// Report a page request that never left this process.
+    ///
+    /// `try_send` for the same reason as the two above.
+    fn report_page_lost(&self, jid: Option<String>, reason: &str) {
+        error!("a page request never left this process: {reason}");
+        let _ = self.events.try_send(FromDaemon::PageLost { jid });
+    }
+
     /// Send a request nobody is waiting on an answer for.
     fn send(&self, request: ClientRequest) -> std::io::Result<()> {
         self.send_frame(&Request::bare(request))
@@ -368,6 +376,12 @@ impl Session {
                     Awaiting::StatusView { message_ids } => {
                         self.report_status_view_lost(message_ids, &detail);
                     }
+                    // And the same rule again, for the same reason it is a
+                    // rule: a view waiting on a page asks for nothing until it
+                    // hears, so a request that never left has to say so — the
+                    // reconnect keeps the chats and the paging state, and a
+                    // list left `Loading` never asks again.
+                    Awaiting::Page { jid } => self.report_page_lost(jid, &detail),
                     waiting => waiting.failed(&detail, None),
                 }
             }
@@ -739,10 +753,23 @@ fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pend
                     break;
                 }
             }
-            Ok(DaemonMessage::Chats { id, chats, next }) => {
+            Ok(DaemonMessage::Chats {
+                id,
+                mut chats,
+                next,
+            }) => {
                 if take_pending(pending, id).is_none() {
                     debug!("a chat page arrived for {id}, which nobody is waiting on");
                     continue;
+                }
+                // A chat page carries one message per row and that row is the
+                // list's preview: its media is externalized like any other, so
+                // it has to be read back here like any other. Skipping it drew
+                // a photo the daemon had cached as a download-only bubble.
+                for chat in &mut chats {
+                    for message in &mut chat.messages {
+                        fill(&mut message.media);
+                    }
                 }
                 if events
                     .blocking_send(FromDaemon::Chats { chats, next })

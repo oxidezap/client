@@ -100,6 +100,19 @@ impl MessageListCache {
             TimelineItem::Encryption => RowId::Encryption,
         })
     }
+
+    /// Where a row the list measured has ended up, if it is still drawn.
+    ///
+    /// Searched from the end, which is where a bottom-anchored timeline keeps
+    /// the row this is asked about: the boundary is the last row measured, so
+    /// an append finds it one row in and a page of older history finds it at
+    /// the end. A row id is unique in a timeline — a message by its id, a
+    /// divider by its day, and one each of the other two.
+    pub fn position_of(&self, row: &RowId) -> Option<usize> {
+        (0..self.items.len())
+            .rev()
+            .find(|ix| self.row_id(*ix).as_ref() == Some(row))
+    }
 }
 
 impl MessageListCache {

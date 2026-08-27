@@ -222,6 +222,11 @@ fn parse_message_cursor(token: &str) -> Option<oxidezap_chat_store::MessageCurso
 ///
 /// The JID goes last and is not split on, because a device address carries a
 /// colon of its own (`5599…:57`).
+/// The one chat nobody opens as a conversation.
+fn is_status_broadcast(entry: &ChatEntry) -> bool {
+    entry.jid.to_non_ad_string() == oxidezap_core::STATUS_BROADCAST_JID
+}
+
 fn chat_cursor(entry: &ChatEntry) -> String {
     let cursor = oxidezap_chat_store::ChatCursor::from(entry);
     let pinned = cursor
@@ -1774,14 +1779,26 @@ impl WhatsAppClient {
                 .chats_page(false, after, limit)
                 .await
                 .map_err(|e| e.to_string())?;
+            // Off the page as it was read, before the aliases below join it:
+            // where the list continues is a position in the store's own order,
+            // and a row pulled in from outside the page is not one.
             let next = ((entries.len() as i64) == limit)
                 .then(|| entries.last().map(chat_cursor))
                 .flatten();
+            let entries = Self::with_alias_rows(&store, &client, &names, entries).await;
             // One message each: the row and its preview. Whatever else a
-            // conversation holds is what `load_messages` is for.
-            let chats = Self::hydrate_entries(&store, &client, &names, entries, |_| 1)
-                .await
-                .map_err(|e| e.to_string())?;
+            // conversation holds is what `load_messages` is for — except the
+            // status broadcast, which no front end opens as a conversation and
+            // so never asks about. Its whole run is its page, as at attach.
+            let chats = Self::hydrate_entries(&store, &client, &names, entries, |entry| {
+                if is_status_broadcast(entry) {
+                    Self::MESSAGE_PAGE
+                } else {
+                    1
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?;
             Ok(Page { items: chats, next })
         })
     }
@@ -2701,8 +2718,59 @@ impl WhatsAppClient {
     /// and the newest row the list previews from. The status broadcast is the
     /// exception: its feed *is* those rows — there is no conversation to open
     /// that would ask for more — so it keeps a whole page.
+    /// A page of chats, with each row's other half beside it.
+    ///
+    /// A PN/LID pair is one conversation and `hydrate_entries` is what
+    /// collapses it — but only over the rows it is given, and a page boundary
+    /// falls wherever the store's order puts it. Half a pair alone hydrates
+    /// into a chat carrying half the pair's unread count, which the window
+    /// merges over the whole one it already had.
+    ///
+    /// Both halves are pulled in, from whichever half the page holds, so the
+    /// answer is the same collapsed chat either way: a page that lands after
+    /// one that already carried this person repeats it rather than reducing
+    /// it. Costs one read per row that has an alias the page does not.
+    async fn with_alias_rows(
+        chat_store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        names: &NameBook,
+        entries: Vec<ChatEntry>,
+    ) -> Vec<ChatEntry> {
+        let mut have: HashSet<String> = entries.iter().map(|e| e.jid.to_string()).collect();
+        let mut entries = entries;
+        for ix in 0..entries.len() {
+            let identity = names.identity(client, &entries[ix].jid).await;
+            for alias in identity.contact_jids.iter() {
+                if !have.insert(alias.to_string()) {
+                    continue;
+                }
+                match chat_store.chat(alias).await {
+                    Ok(Some(row)) => entries.push(row),
+                    // No row under that alias, which is the ordinary case.
+                    Ok(None) => {}
+                    Err(e) => log::warn!("could not read an alias of a paged chat: {e}"),
+                }
+            }
+        }
+        // Display order again, because that is what decides which half of a
+        // pair keeps the metadata — the rows appended above are behind the
+        // page's own until they are put back in it.
+        entries.sort_by(|a, b| {
+            let key = |e: &ChatEntry| {
+                (
+                    e.pinned_at.map(|t| t.timestamp_millis()),
+                    e.last_message_at.map(|t| t.timestamp_millis()),
+                )
+            };
+            key(b)
+                .cmp(&key(a))
+                .then_with(|| b.jid.to_string().cmp(&a.jid.to_string()))
+        });
+        entries
+    }
+
     fn attach_page(entry: &ChatEntry) -> i64 {
-        if entry.jid.to_non_ad_string() == oxidezap_core::STATUS_BROADCAST_JID {
+        if is_status_broadcast(entry) {
             return Self::MESSAGE_PAGE;
         }
         i64::from(entry.unread_count.max(0)).clamp(Self::ATTACH_FLOOR, Self::ATTACH_CEILING)
