@@ -29,7 +29,7 @@ pub mod palette;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use gpui::{App, Global, Hsla, rgb};
+use gpui::{App, Global, Hsla, Pixels, Size, rgb};
 
 pub use config::ThemeSettings;
 pub use metrics::Metrics;
@@ -39,7 +39,17 @@ pub use palette::{Palette, Preset, Rgb};
 /// resolved scale and the provenance Settings needs to explain itself.
 pub struct ProductTheme {
     pub palette: Palette,
+    /// The scale in force: the base font the user asked for, fitted to the
+    /// window. Everything drawn reads this one.
     pub metrics: Metrics,
+    /// The base font as it is written in the file, before the window had a
+    /// say. Settings shows and saves this — a scale the window imposed is not
+    /// a preference to write back.
+    base_font_size: f32,
+    /// What the window's size did to that base. Kept so a theme reload — a
+    /// palette edit, a font-size step — does not silently restore a design
+    /// scale the screen has no room for.
+    fit: f32,
     pub preset: Preset,
     /// Whatever the config file asked for that could not be honoured. Empty
     /// when the file is absent or fully applied.
@@ -55,11 +65,13 @@ pub struct ProductTheme {
 impl Global for ProductTheme {}
 
 impl ProductTheme {
-    fn from_settings(settings: ThemeSettings) -> Self {
+    fn from_settings(settings: ThemeSettings, fit: f32) -> Self {
         let path = config::config_path();
         let loaded_at = path.as_deref().and_then(config::modified_at);
         Self {
-            metrics: Metrics::new(settings.font_size, settings.density),
+            metrics: Metrics::new(settings.font_size * fit, settings.density),
+            base_font_size: settings.font_size,
+            fit,
             palette: settings.palette,
             preset: settings.preset,
             problems: settings.problems,
@@ -75,7 +87,7 @@ impl ProductTheme {
             preset: self.preset,
             palette: self.palette,
             density: self.metrics.density(),
-            font_size: self.metrics.rem_size(),
+            font_size: self.base_font_size,
             problems: self.problems.clone(),
         }
     }
@@ -122,8 +134,37 @@ pub fn install(settings: ThemeSettings, cx: &mut App) {
     for problem in &settings.problems {
         log::warn!("theme.json: {problem}");
     }
-    apply::apply(&settings, cx);
-    cx.set_global(ProductTheme::from_settings(settings));
+    // Whatever the window last imposed, carried across. A palette edit is not
+    // news about the screen's size, and reinstalling at full scale would put
+    // a handheld back into a design it cannot fit until the next resize —
+    // which, on a device whose window never resizes, is never.
+    let fit = cx
+        .try_global::<ProductTheme>()
+        .map_or(1.0, |theme| theme.fit);
+    apply::apply(&settings, fit, cx);
+    cx.set_global(ProductTheme::from_settings(settings, fit));
+}
+
+/// Fold a window's size into the design scale.
+///
+/// The one place a viewport reaches the theme. Called from the root's render
+/// pass, because that is where the window's size is a fact rather than an
+/// event, and it answers whether anything moved so the caller can refresh a
+/// window whose frames were laid out against the previous scale.
+pub fn fit_to_viewport(viewport: Size<Pixels>, cx: &mut App) -> bool {
+    let fit = metrics::viewport_fit(viewport);
+    let current = cx.global::<ProductTheme>();
+    if (current.fit - fit).abs() < f32::EPSILON {
+        return false;
+    }
+    let settings = current.settings();
+    install_fitted(settings, fit, cx);
+    true
+}
+
+fn install_fitted(settings: ThemeSettings, fit: f32, cx: &mut App) {
+    apply::apply(&settings, fit, cx);
+    cx.set_global(ProductTheme::from_settings(settings, fit));
 }
 
 /// Whether there is a `theme.json` worth polling at all.

@@ -24,7 +24,7 @@ fn hsla(colour: Rgb) -> Hsla {
 /// follow. Call `window.refresh()` afterwards when reapplying to a live
 /// window — the base font is the rem reference and existing frames are laid
 /// out against the old one.
-pub fn apply(settings: &ThemeSettings, cx: &mut App) {
+pub fn apply(settings: &ThemeSettings, fit: f32, cx: &mut App) {
     let mode = if settings.preset.is_dark() {
         ThemeMode::Dark
     } else {
@@ -35,12 +35,17 @@ pub fn apply(settings: &ThemeSettings, cx: &mut App) {
     let palette = &settings.palette;
     let theme = cx.global_mut::<Theme>();
 
-    theme.font_size = px(settings.font_size);
+    // The base the *window* can carry, not the one that was asked for: the
+    // library's controls resolve their own sizes from this rem, so a fit the
+    // product's metrics applied and this did not would put our chrome and the
+    // library's buttons on two different scales in the same header.
+    let font_size = settings.font_size * fit;
+    theme.font_size = px(font_size);
     // Radii the library resolves for its own controls. Ours come from
     // `Metrics`, which scales them with the base font; these two are the
     // library's equivalents of `radius_md` and `radius_xl` at that base.
-    theme.radius = px(10.0 * settings.font_size / 16.0);
-    theme.radius_lg = px(14.0 * settings.font_size / 16.0);
+    theme.radius = px(10.0 * font_size / 16.0);
+    theme.radius_lg = px(14.0 * font_size / 16.0);
 
     apply_palette(&mut theme.colors, palette);
 

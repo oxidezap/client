@@ -331,6 +331,16 @@ impl WhatsAppApp {
     /// state it follows arrives from the daemon, which has none. It acts only
     /// on a change, so clicking into the composer while a phone rings does not
     /// start a fight for the caret.
+    ///
+    /// Every frame, and not only the connected ones: this is the window's
+    /// only route to having a keyboard at all. The tail of the list is what
+    /// makes that true — a surface is named only while the frame is drawing
+    /// it, and the window itself is what remains when none of them is, so
+    /// there is no state in which the answer is "nobody". There used to be,
+    /// and it was the state every launch started in: the composer was
+    /// recorded as the owner before one existed, the first sync found nothing
+    /// to change, and every window-level shortcut stayed dead until a click
+    /// gave the window a focus of its own.
     pub fn sync_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let wanted = match self
             .call_state
@@ -340,20 +350,24 @@ impl WhatsAppApp {
             Some(stage) => KeyboardOwner::RingingCall(stage.call_id().to_string()),
             None if self.media_viewer.is_some() => KeyboardOwner::Viewer,
             None if self.showing_settings() => KeyboardOwner::Screen,
-            None => KeyboardOwner::Composer,
+            None if self.keyboard_surfaces.composer => KeyboardOwner::Composer,
+            None if self.keyboard_surfaces.chat_list => KeyboardOwner::ChatList,
+            None => KeyboardOwner::Root,
         };
-        if wanted == self.keyboard_owner {
+        if self.keyboard_owner.as_ref() == Some(&wanted) {
             return;
         }
+        log::debug!("keyboard: {:?} -> {wanted:?}", self.keyboard_owner);
         match &wanted {
             KeyboardOwner::RingingCall(_) => window.focus(&self.call_focus, cx),
             KeyboardOwner::Viewer => window.focus(&self.viewer_focus, cx),
-            // Nothing to hand it to, and nothing that needs handing: see the
-            // variant.
-            KeyboardOwner::Screen => {}
+            KeyboardOwner::ChatList => window.focus(&self.chat_list_focus, cx),
+            // Escape is the way out of Settings and Escape is the window's,
+            // not the screen's: see the variant.
+            KeyboardOwner::Screen | KeyboardOwner::Root => window.focus(&self.root_focus, cx),
             KeyboardOwner::Composer => self.focus_composer(window, cx),
         }
-        self.keyboard_owner = wanted;
+        self.keyboard_owner = Some(wanted);
     }
 
     /// Put the names this window knows onto the calls the daemon sent.

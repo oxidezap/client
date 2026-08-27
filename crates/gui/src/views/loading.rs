@@ -58,7 +58,7 @@ pub fn render_syncing_view(cx: &App) -> impl IntoElement {
 fn render_progress(current: Step, cx: &App) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
 
-    centered_view(metrics.space_xxl(), cx)
+    centered_view("startup-screen", metrics.space_xxl())
         .child(
             Spinner::new()
                 .large()

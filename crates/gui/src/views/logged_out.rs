@@ -22,7 +22,7 @@ pub fn render_logged_out_view(
     let metrics = cx.product().metrics;
     let pair_entity = entity;
 
-    centered_view(metrics.space_xxl(), cx)
+    centered_view("logged-out-screen", metrics.space_xxl())
         .child(
             div()
                 .size(metrics.avatar_call())

@@ -12,14 +12,65 @@
 //! other base font they scale with it, which is what makes the base font the
 //! application's zoom control. Anything cached from these values — virtual
 //! list row heights above all — must therefore key on [`Metrics::rem_size`].
+//!
+//! The window has a say in that base as well as the user: a viewport smaller
+//! than the canvas the design was drawn on multiplies it by [`viewport_fit`].
+//! That is deliberately the *only* thing a small screen changes here. One
+//! factor on the rem moves type, rhythm, control frames and the layout
+//! thresholds together, so a 480×640 handheld gets the design it was drawn —
+//! at its size — rather than a second design assembled out of special cases.
 
 use std::fmt;
 use std::str::FromStr;
 
-use gpui::{Pixels, px};
+use gpui::{Pixels, Size, px};
 
 /// The base font the design was measured against.
 const REFERENCE_REM: f32 = 16.0;
+
+/// The smallest window the design was drawn to fit at full size.
+///
+/// Not a breakpoint and not a minimum: it is the canvas every fixed dimension
+/// in this file was measured against. A window smaller than this in either
+/// axis gets the same design at a smaller scale — see [`viewport_fit`] — which
+/// is the one lever that keeps a 480×640 handheld showing the whole screen
+/// instead of the top-left corner of it.
+const DESIGN_VIEWPORT: Size<f32> = Size {
+    width: 400.0,
+    height: 720.0,
+};
+
+/// How far the fit may shrink the design.
+///
+/// Past this the type stops being legible and shrinking further buys a screen
+/// nobody can read; what does not fit below the floor is what the scroll
+/// containers are for.
+const FIT_MIN: f32 = 0.7;
+
+/// How coarsely the fit is quantised.
+///
+/// A continuous factor would move every cached row height on every pixel of a
+/// window drag — the timeline keys its measurements on [`Metrics::rem_size`],
+/// which the fit multiplies. Twentieths are fine enough that no step is
+/// visible and coarse enough that a resize crosses only a handful of them.
+const FIT_STEP: f32 = 20.0;
+
+/// The design scale a window of this size can carry, as a factor on the base
+/// font.
+///
+/// One number for both axes, taken from whichever is tighter: a screen is too
+/// small in the axis that runs out first, and scaling only that one would
+/// stretch the design rather than shrink it. Never above 1.0 — a large window
+/// is a window with room to spare, not an instruction to magnify.
+pub fn viewport_fit(viewport: Size<Pixels>) -> f32 {
+    let width = f32::from(viewport.width) / DESIGN_VIEWPORT.width;
+    let height = f32::from(viewport.height) / DESIGN_VIEWPORT.height;
+    let raw = width.min(height).min(1.0);
+    if !raw.is_finite() {
+        return 1.0;
+    }
+    ((raw * FIT_STEP).floor() / FIT_STEP).clamp(FIT_MIN, 1.0)
+}
 
 /// The narrowest and widest base font the layout stays usable at.
 ///
@@ -128,6 +179,17 @@ impl Metrics {
             },
             density,
         }
+    }
+
+    /// The scale a window of this size can carry, from the base font the user
+    /// asked for.
+    ///
+    /// The fit multiplies the base rather than sitting beside it, so
+    /// everything derived from the rem — every token in this file, and the
+    /// cache keys taken from [`Self::rem_size`] — follows the window without
+    /// a single call site learning that windows have sizes.
+    pub fn for_viewport(rem_size: f32, density: Density, viewport: Size<Pixels>) -> Self {
+        Self::new(rem_size * viewport_fit(viewport), density)
     }
 
     /// The base font in force. Include this in the invalidation key of
@@ -460,6 +522,59 @@ impl Metrics {
         self.scaled(2.0)
     }
 
+    // ---- layout -------------------------------------------------------
+    //
+    // How much window a pane gets, and where the layout changes shape. These
+    // scale like everything else on purpose: "is there room for two panes"
+    // is a question about the content, not about the glass. A window 700px
+    // wide holds two panes at the reference base and one at double it, and a
+    // threshold fixed in device pixels answered the same either way — which
+    // is how a zoomed-in window ended up with a sidebar and a conversation
+    // four words wide.
+
+    /// Below this the window shows one pane at a time.
+    pub fn breakpoint_mobile(&self) -> Pixels {
+        self.scaled(600.0)
+    }
+    /// Below this the sidebar is narrowed rather than dropped.
+    pub fn breakpoint_tablet(&self) -> Pixels {
+        self.scaled(900.0)
+    }
+    /// Below this the conversation header has no room for its action row, so
+    /// the actions move into the overflow menu.
+    pub fn breakpoint_header_actions(&self) -> Pixels {
+        self.scaled(400.0)
+    }
+
+    pub fn sidebar_width(&self) -> Pixels {
+        self.scaled(340.0)
+    }
+    pub fn sidebar_width_compact(&self) -> Pixels {
+        self.scaled(280.0)
+    }
+    pub fn sidebar_width_min(&self) -> Pixels {
+        self.scaled(240.0)
+    }
+
+    /// How wide a bubble may get where there is a conversation pane to spare,
+    /// and where the conversation is the whole window.
+    pub fn bubble_max_width(&self) -> Pixels {
+        self.scaled(520.0)
+    }
+    pub fn bubble_max_width_compact(&self) -> Pixels {
+        self.scaled(420.0)
+    }
+    pub fn bubble_max_width_phone(&self) -> Pixels {
+        self.scaled(350.0)
+    }
+
+    pub fn media_max_size(&self) -> Pixels {
+        self.scaled(300.0)
+    }
+    pub fn media_max_size_compact(&self) -> Pixels {
+        self.scaled(280.0)
+    }
+
     // ---- other --------------------------------------------------------
 
     pub fn qr_size(&self) -> Pixels {
@@ -474,6 +589,8 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use gpui::size;
 
     /// A step in the scale that is not a step is a lie in a token name: the
     /// hierarchy between "a name in a header" and "body copy" then exists only
@@ -504,7 +621,6 @@ mod tests {
             );
         }
     }
-    use super::*;
 
     #[test]
     fn reference_base_reproduces_the_designed_measurements() {
@@ -546,6 +662,60 @@ mod tests {
     fn a_nonsensical_base_font_cannot_collapse_the_layout() {
         let metrics = Metrics::new(0.0, Density::Comfortable);
         assert!(metrics.chat_row_height() > px(0.0));
+    }
+
+    /// The window the design was drawn for, and anything larger, gets it at
+    /// full size. A factor above 1.0 would magnify a desktop window instead.
+    #[test]
+    fn a_window_with_room_to_spare_is_not_scaled() {
+        assert_eq!(viewport_fit(size(px(1200.0), px(800.0))), 1.0);
+        assert_eq!(viewport_fit(size(px(3840.0), px(2160.0))), 1.0);
+        assert_eq!(
+            viewport_fit(size(px(DESIGN_VIEWPORT.width), px(DESIGN_VIEWPORT.height))),
+            1.0
+        );
+    }
+
+    /// The axis that runs out first is the one that decides, because a screen
+    /// is too small in whichever direction it is too small.
+    #[test]
+    fn the_tighter_axis_decides_the_fit() {
+        // A handheld: wide enough for the phone layout, and much too short.
+        let handheld = viewport_fit(size(px(480.0), px(640.0)));
+        assert!(handheld < 1.0, "a 640px-tall window is short of the design");
+        assert_eq!(handheld, viewport_fit(size(px(2000.0), px(640.0))));
+    }
+
+    #[test]
+    fn the_fit_never_shrinks_past_legibility() {
+        assert_eq!(viewport_fit(size(px(120.0), px(90.0))), FIT_MIN);
+        assert_eq!(viewport_fit(size(px(0.0), px(0.0))), FIT_MIN);
+    }
+
+    /// Quantised, so dragging a window edge does not rebuild every cached row
+    /// height on every pixel: the timeline keys its measurements on the rem.
+    #[test]
+    fn a_pixel_of_resize_does_not_move_the_scale() {
+        let at = |h: f32| viewport_fit(size(px(480.0), px(h)));
+        assert_eq!(at(640.0), at(641.0));
+        assert!(at(400.0) < at(640.0), "a much shorter window does move it");
+    }
+
+    /// The whole point of folding the fit into the base font: every token
+    /// follows, and so does every cache keyed on the rem.
+    #[test]
+    fn fitting_a_small_window_scales_the_whole_design() {
+        let full = Metrics::for_viewport(16.0, Density::Comfortable, size(px(1200.0), px(800.0)));
+        let handheld =
+            Metrics::for_viewport(16.0, Density::Comfortable, size(px(480.0), px(640.0)));
+        assert_eq!(full.rem_size(), 16.0);
+        assert!(handheld.rem_size() < full.rem_size());
+        assert!(handheld.text_body() < full.text_body());
+        assert!(handheld.chat_row_height() < full.chat_row_height());
+        assert!(handheld.qr_size() < full.qr_size());
+        // A layout threshold is content-sized too, so a window that shrank
+        // the design does not also cross into a layout meant for a wider one.
+        assert!(handheld.breakpoint_mobile() < full.breakpoint_mobile());
     }
 
     #[test]

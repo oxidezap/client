@@ -224,6 +224,15 @@ impl WhatsAppApp {
 
     /// Open Settings over the conversation view.
     pub fn open_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // Only over a window that has one. Settings is drawn in place of the
+        // conversation view and nowhere else, so opening it from the pairing
+        // or error screen used to set a state nothing drew — invisible until
+        // the connection finished and then already open. Harmless while the
+        // only route was a click on a screen that has no such control, and
+        // not once the shortcut works before the first click.
+        if !matches!(self.app_state, AppState::Connected | AppState::Offline) {
+            return;
+        }
         if self.settings.is_none() {
             // Settings replaces the body, so a viewer left open is a surface
             // that is not drawn and still owns things: `sync_overlay_focus`
