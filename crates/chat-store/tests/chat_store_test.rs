@@ -6889,4 +6889,25 @@ async fn batched_reads_answer_what_the_single_ones_do() {
         .await
         .unwrap();
     assert!(empty.is_empty());
+
+    // And the rows themselves, by the keys a caller already holds: a key that
+    // names nothing is absent rather than an error, which is what makes this
+    // the read for "the other half of a pair, if there is one".
+    let rows = chat_store
+        .chats_by_jids(vec![
+            chat.clone(),
+            other.clone(),
+            jid("559900000003@s.whatsapp.net"),
+        ])
+        .await
+        .unwrap();
+    let found: std::collections::HashSet<String> =
+        rows.iter().map(|row| row.jid.to_string()).collect();
+    assert_eq!(found.len(), 2, "two rows exist, the third does not");
+    assert!(found.contains(&chat.to_string()));
+    assert!(found.contains(&other.to_string()));
+    assert!(
+        chat_store.chats_by_jids(vec![]).await.unwrap().is_empty(),
+        "nothing asked for is nothing read"
+    );
 }

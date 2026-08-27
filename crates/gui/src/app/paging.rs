@@ -301,14 +301,21 @@ fn settle_chat_list_end(pages: &mut Paging, complete: bool, next: Option<String>
     }
     match (complete, next) {
         // The store's whole list, so there is nothing behind it — and nothing
-        // worth asking for, since asking returns these same rows.
+        // worth asking for, since asking returns these same rows. True however
+        // far this window had paged: the list ends here.
         (true, _) => *pages = Paging::Done { from: None },
-        (false, Some(cursor)) => *pages = Paging::More(PageCursor::new(&cursor)),
-        // A load that says neither: a scoped reload, which is about named
-        // chats rather than about the list, or a daemon that predates the
-        // cursor. The position stays what it was — for a window that has
-        // never asked, "from the top".
-        (false, None) => {}
+        // Where the *first* page ends, which is only news to a list that has
+        // never asked. A window that has paged deeper is already past it, and
+        // adopting it would walk it back — re-fetching pages it has merged,
+        // once per history load, which during a sync is repeatedly.
+        (false, Some(cursor)) if matches!(pages, Paging::Unasked) => {
+            *pages = Paging::More(PageCursor::new(&cursor));
+        }
+        // A load that says nothing about the list — a scoped reload, or a
+        // daemon that predates the cursor — and a load whose position this
+        // window is already past. Both leave it where it is; for a window
+        // that has never asked, that is "from the top".
+        _ => {}
     }
 }
 
@@ -389,6 +396,30 @@ mod tests {
             settled_by(Paging::More(cursor("c1:-:9:a@s.whatsapp.net")), false, None),
             Paging::More(cursor("c1:-:9:a@s.whatsapp.net"))
         );
+    }
+
+    /// The cursor a load carries is where its *first* page ends, so it is
+    /// news only to a list that has not asked for anything. A reader who has
+    /// paged deeper is already past it, and every history load carries it
+    /// again — adopting it would walk them back to the first page, over and
+    /// over, for the length of a history sync.
+    #[test]
+    fn a_load_does_not_walk_a_deeper_list_back() {
+        let deeper = Paging::More(cursor("c1:-:300:z@s.whatsapp.net"));
+        assert_eq!(
+            settled_by(deeper.clone(), false, Some("c1:-:100:a@s.whatsapp.net")),
+            deeper
+        );
+        // Reached the end already: the load's position is behind that too.
+        let ended = Paging::Done {
+            from: Some(cursor("c1:-:300:z@s.whatsapp.net")),
+        };
+        assert_eq!(
+            settled_by(ended.clone(), false, Some("c1:-:100:a@s.whatsapp.net")),
+            ended
+        );
+        // But a complete load is the whole list however deep the reader is.
+        assert_eq!(settled_by(deeper, true, None), Paging::Done { from: None });
     }
 
     /// A page already asked for names its own continuation, and its answer is

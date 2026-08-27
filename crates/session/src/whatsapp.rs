@@ -2593,6 +2593,21 @@ impl WhatsAppClient {
                 }
             }
         }
+        // The other half of every row this load carries. A PN/LID pair is one
+        // conversation and the collapse below is what makes its unread count
+        // the pair's sum — but only over the rows it is given, and the window
+        // above ends wherever the store's order puts it. Half a pair alone is
+        // a chat with half the pair's unread count, and now that a front end
+        // continues *past* this window rather than re-fetching it, nothing
+        // else would go back for the other half. The cursor is already taken
+        // from the raw boundary, so this cannot move where the list continues.
+        let entries = if only.is_none() {
+            Self::with_alias_rows(chat_store, client, names, entries).await
+        } else {
+            // A narrowed load has its own closure, which starts from the
+            // chats somebody named rather than from a page.
+            entries
+        };
         let chats =
             Self::hydrate_entries(chat_store, client, names, entries, Self::attach_page).await?;
         Ok(LoadedHistory {
@@ -2770,19 +2785,26 @@ impl WhatsAppClient {
         entries: Vec<ChatEntry>,
     ) -> Vec<ChatEntry> {
         let mut have: HashSet<String> = entries.iter().map(|e| e.jid.to_string()).collect();
+        let mut wanted: Vec<Jid> = Vec::new();
+        for entry in &entries {
+            let identity = names.identity(client, &entry.jid).await;
+            for alias in &identity.contact_jids {
+                // `have` is what this page holds plus what has already been
+                // asked for, so a pair whose halves are both on the page
+                // costs nothing and neither half is asked for twice.
+                if have.insert(alias.to_string()) {
+                    wanted.push(alias.clone());
+                }
+            }
+        }
         let mut entries = entries;
-        for ix in 0..entries.len() {
-            let identity = names.identity(client, &entries[ix].jid).await;
-            for alias in identity.contact_jids.iter() {
-                if !have.insert(alias.to_string()) {
-                    continue;
-                }
-                match chat_store.chat(alias).await {
-                    Ok(Some(row)) => entries.push(row),
-                    // No row under that alias, which is the ordinary case.
-                    Ok(None) => {}
-                    Err(e) => log::warn!("could not read an alias of a paged chat: {e}"),
-                }
+        if !wanted.is_empty() {
+            // One read for the page, not one per alias: most people have a
+            // single row, and finding that out a hundred times over is a
+            // hundred permits and transactions spent on nothing.
+            match chat_store.chats_by_jids(wanted).await {
+                Ok(rows) => entries.extend(rows),
+                Err(e) => log::warn!("could not read the aliases of a page of chats: {e}"),
             }
         }
         // Display order again, because that is what decides which half of a
