@@ -16,16 +16,27 @@
 //! subscribe first and snapshot second, which loses nothing, and the duplicate
 //! window resolves on the client with a comparison rather than a lock.
 
+// A byte-stream endpoint is a thing only an operating system has. A page gets
+// `web` instead, and everything above both gets [`Link`].
+#[cfg(not(target_family = "wasm"))]
 mod endpoint;
+mod link;
 mod protocol;
 mod transport;
+#[cfg(target_family = "wasm")]
+pub mod web;
 #[cfg(windows)]
 pub mod windows_user;
 
+#[cfg(not(target_family = "wasm"))]
 pub use endpoint::{Endpoint, Reader, Writer};
+pub use link::Link;
 pub use protocol::{
     AccountIdentity, CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent,
     DaemonMessage, MessagePreview, PairingCode, ProtocolError, Request, RequestId, StateSnapshot,
     StateVersion,
 };
-pub use transport::{PROTOCOL_VERSION, endpoint_path, lock_path, media_dir, media_path, state_dir};
+pub use transport::{
+    DEFAULT_WEB_PORT, PROTOCOL_VERSION, WEB_MEDIA_PATH, WEB_SOCKET_PATH, endpoint_path, lock_path,
+    media_dir, media_path, state_dir,
+};

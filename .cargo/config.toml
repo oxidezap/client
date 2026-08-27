@@ -29,3 +29,26 @@ rustflags = [
     # 2.5 and lld emits both by default.
     "-Clink-arg=-Wl,--hash-style=gnu",
 ]
+
+# The web front end. Everything here is what `gpui_web` requires of a page: it
+# runs its background executor on real workers, which on wasm means threads
+# over a `SharedArrayBuffer` — so the module has to be built with the atomics
+# proposal on, import its memory rather than define it, and export the thread
+# local symbols the worker bootstrap initializes. Without these the module
+# links, loads, and then has no executor.
+#
+# `build-std` is deliberately NOT set here. It has to be passed on the command
+# line (`-Z build-std=std,panic_abort`, which `web/build.sh` and the Pages
+# workflow both do), because a `[unstable]` table in this file applies to
+# every build — including the native one, which is meant to stay on stable.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--max-memory=1073741824",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__tls_base",
+]

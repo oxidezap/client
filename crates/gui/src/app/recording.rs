@@ -32,7 +32,7 @@ impl WhatsAppApp {
         }
         self.recording_tick = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
-                smol::Timer::after(std::time::Duration::from_millis(RECORDING_TICK_MS)).await;
+                crate::platform::sleep(std::time::Duration::from_millis(RECORDING_TICK_MS)).await;
                 let keep_going = entity.update(cx, |app, cx| {
                     if !app.is_recording() {
                         return false;

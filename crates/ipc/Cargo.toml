@@ -9,10 +9,31 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+log = { workspace = true }
 oxidezap-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
+
+# The write half of every transport is a `Link`, and on the web that is a
+# queue into the task holding the socket rather than the socket itself. On a
+# byte stream it is a mutex, which needs nothing.
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = "0.3"
+tokio = { workspace = true, features = ["sync"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "CloseEvent",
+    "Event",
+    "Location",
+    "MessageEvent",
+    "Request",
+    "RequestInit",
+    "Response",
+    "WebSocket",
+    "Window",
+] }
 
 # The uid for the `TMPDIR` fallback, and the peer's uid to check that the
 # daemon answering is ours.

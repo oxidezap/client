@@ -172,7 +172,7 @@ impl WhatsAppApp {
             loop {
                 // ~15fps: the playhead only has to look continuous, and a
                 // voice note is not worth a frame-rate repaint of the list.
-                smol::Timer::after(std::time::Duration::from_millis(66)).await;
+                crate::platform::sleep(std::time::Duration::from_millis(66)).await;
                 let playing = entity.update(cx, |app, cx| {
                     let playing = app.audio_player.is_playing();
                     if playing {
@@ -756,7 +756,7 @@ impl WhatsAppApp {
                                 let audio_for_play = audio;
                                 cx.spawn(async move |entity: WeakEntity<Self>, cx| {
                                     // Wait one frame (~16ms at 60fps) for GPUI to decode the first frame
-                                    smol::Timer::after(std::time::Duration::from_millis(16)).await;
+                                    crate::platform::sleep(std::time::Duration::from_millis(16)).await;
 
                                     let _ = entity.update(cx, |app, cx| {
                                         // Skip autoplay when the user started

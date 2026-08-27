@@ -247,7 +247,7 @@ use crate::components::{
     AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft, new_timeline_state,
 };
 use log::{debug, error, info, warn};
-use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
+use wacore_binary::jid::{Jid, JidExt, observe_str};
 
 use crate::responsive::{MobilePanel, ResponsiveLayout};
 use crate::session::{FromDaemon, Session};
@@ -299,7 +299,6 @@ const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 async fn download_with_timeout(
     download_rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
 ) -> Result<Vec<u8>, String> {
-    let timeout = smol::Timer::after(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS));
     let download = async {
         download_rx
             .await
@@ -307,10 +306,10 @@ async fn download_with_timeout(
     };
 
     // Race between download and timeout
-    smol::future::or(async { Some(download.await) }, async {
-        timeout.await;
-        None
-    })
+    crate::platform::with_timeout(
+        download,
+        std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS),
+    )
     .await
     .ok_or_else(|| "Download timed out".to_string())?
 }
@@ -2112,7 +2111,7 @@ impl WhatsAppApp {
         format!(
             "{prefix}_{}_{}_{}",
             std::process::id(),
-            whatsapp_rust::wacore::time::now_millis(),
+            wacore::time::now_millis(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         )
     }
@@ -2225,7 +2224,7 @@ impl WhatsAppApp {
                 }
 
                 // Wait for next frame (~30 fps)
-                smol::Timer::after(std::time::Duration::from_millis(33)).await;
+                crate::platform::sleep(std::time::Duration::from_millis(33)).await;
 
                 // Update frame
                 let should_stop = entity
@@ -2678,7 +2677,7 @@ impl WhatsAppApp {
         }
         self.heartbeat = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
-                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                crate::platform::sleep(std::time::Duration::from_secs(1)).await;
                 // A `stat` unless the stamp moved, which is why polling a
                 // file a person edits by hand is affordable.
                 let (theme_changed, watching) = cx.update(|cx| {

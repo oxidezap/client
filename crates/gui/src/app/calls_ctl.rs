@@ -212,7 +212,7 @@ impl WhatsAppApp {
             observe_str(&recipient_jid)
         );
 
-        let placeholder_call_id = format!("ui-call-{}", whatsapp_rust::wacore::time::now_millis());
+        let placeholder_call_id = format!("ui-call-{}", wacore::time::now_millis());
         let call = OutgoingCall::new(
             placeholder_call_id.clone(),
             recipient_jid.clone(),
@@ -461,7 +461,7 @@ impl WhatsAppApp {
         }
         self.tick_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
-                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                crate::platform::sleep(std::time::Duration::from_secs(1)).await;
                 let keep_going = entity.update(cx, |app, cx| {
                     // Expiring a stale typing notice matters even with no
                     // call up: the peer that stopped may never say so.

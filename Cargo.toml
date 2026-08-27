@@ -39,6 +39,17 @@ chrono = { version = "0.4", default-features = false }
 diesel = { version = "2.3.11", default-features = false, features = ["sqlite", "r2d2", "32-column-tables"] }
 diesel_migrations = { version = "2.3.2", default-features = false, features = ["sqlite"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+# Wasm has no OS entropy source of its own: `getrandom` refuses to build for
+# `wasm32-unknown-unknown` unless a backend is named, and everything under
+# `wacore` that signs, pads or generates an id reaches for it. Declared here so
+# the one crate every other one depends on can turn the backend on for the
+# whole graph — features are additive, so naming it once is naming it
+# everywhere.
+getrandom = { version = "0.4", default-features = false, features = ["wasm_js"] }
+# The same problem one major behind. Both are in the graph — 0.4 under
+# `wacore`, 0.2 under an older transitive dependency — and each refuses to
+# build for the web until its own backend is named, so both have to be.
+getrandom_02 = { package = "getrandom", version = "0.2", default-features = false, features = ["js"] }
 log = "0.4"
 oxidezap-audio = { path = "crates/audio" }
 oxidezap-chat-store = { path = "crates/chat-store" }

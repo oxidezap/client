@@ -9,6 +9,7 @@
 mod app;
 mod assets;
 mod components;
+mod platform;
 mod responsive;
 mod session;
 mod theme;

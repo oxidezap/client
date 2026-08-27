@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use whatsapp_rust::wacore::time::Instant;
+use wacore::time::Instant;
 
 use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, div, prelude::*};
 use gpui_component::{
@@ -195,7 +195,7 @@ impl InputAreaView {
 
         self.typing_monitor_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
-                smol::Timer::after(TYPING_MONITOR_INTERVAL).await;
+                crate::platform::sleep(TYPING_MONITOR_INTERVAL).await;
 
                 let should_stop = entity
                     .update(cx, |view, cx| {

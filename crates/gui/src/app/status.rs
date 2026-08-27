@@ -223,7 +223,7 @@ impl WhatsAppApp {
 
         self.status_tick_at = Some(when);
         self.status_tick = Some(cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
-            smol::Timer::after(wait).await;
+            crate::platform::sleep(wait).await;
             let _ = entity.update(cx, |app, cx| {
                 app.status_tick = None;
                 app.status_tick_at = None;

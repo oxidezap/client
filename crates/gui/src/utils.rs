@@ -71,7 +71,7 @@ pub fn scale_media_dimensions(width: u32, height: u32, max_size: f32) -> (f32, f
 /// out a full date on every row would make the column unscannable.
 pub fn format_list_time(timestamp: &DateTime<Utc>) -> String {
     let local: DateTime<Local> = timestamp.with_timezone(&Local);
-    let today = whatsapp_rust::wacore::time::now_utc()
+    let today = wacore::time::now_utc()
         .with_timezone(&Local)
         .date_naive();
     let date = local.date_naive();
@@ -94,7 +94,7 @@ pub fn format_list_time(timestamp: &DateTime<Utc>) -> String {
 /// is what the hour tells you.
 pub fn format_status_time(timestamp: &DateTime<Utc>) -> String {
     let local: DateTime<Local> = timestamp.with_timezone(&Local);
-    let today = whatsapp_rust::wacore::time::now_utc()
+    let today = wacore::time::now_utc()
         .with_timezone(&Local)
         .date_naive();
 
@@ -108,7 +108,7 @@ pub fn format_status_time(timestamp: &DateTime<Utc>) -> String {
 /// The heading over a group of messages sent on the same day.
 pub fn format_date_divider(timestamp: &DateTime<Utc>) -> String {
     let local: DateTime<Local> = timestamp.with_timezone(&Local);
-    let today = whatsapp_rust::wacore::time::now_utc()
+    let today = wacore::time::now_utc()
         .with_timezone(&Local)
         .date_naive();
 

@@ -19,7 +19,7 @@ use super::{Avatar, ProductIcon};
 /// Only plain PN/LID user JIDs can receive a call (not groups, broadcast
 /// lists, status or newsletters).
 fn is_callable_user(jid: &str) -> bool {
-    jid.parse::<whatsapp_rust::wacore_binary::jid::Jid>()
+    jid.parse::<wacore_binary::jid::Jid>()
         .map(|j| j.is_pn() || j.is_lid())
         .unwrap_or(false)
 }

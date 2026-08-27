@@ -21,6 +21,13 @@ serde = { workspace = true }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 
+# Not used by this crate: named so the backend `wacore` needs on the web is
+# enabled for the whole graph. `oxidezap-core` is the crate everything else
+# depends on, which makes it the one place that reaches all of them.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { workspace = true }
+getrandom_02 = { workspace = true }
+
 [lints]
 workspace = true
 
