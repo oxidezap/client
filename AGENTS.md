@@ -283,7 +283,12 @@ profile here repeats it deliberately.
   arrival leaves the earlier rows alone. The row at the end of the measured
   prefix is what answers it, and *where it ended up* is the whole answer
   (`MessageListCache::position_of`): how far it moved is how many rows arrived
-  in front of it, and what is left after it is what arrived behind. A row can
+  in front of it, and what is left after it is what arrived behind. Which row
+  that is, is `last_stable` rather than the last one drawn: the typing
+  indicator sits after every message, is somebody else's keystrokes rather
+  than the conversation, and anchored on it a message landing *in front of it*
+  read as a page of older history and was spliced to the top. So arrivals go
+  where the boundary is, not at the end. A row can
   also change height with the count standing still — an image arrives, a
   reaction lands, a send fails and grows a retry button — which the `build`
   number answers. So the outcomes are one splice at either end, remeasure and

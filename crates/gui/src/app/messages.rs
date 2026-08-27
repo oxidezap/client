@@ -101,6 +101,21 @@ impl MessageListCache {
         })
     }
 
+    /// The last row that is about the conversation, and where it is.
+    ///
+    /// Everything but the typing indicator: that row is somebody else's
+    /// keystrokes, it comes and goes under a conversation that has not
+    /// changed, and it always sits last. An anchor on it says the last row is
+    /// still the last row while a message lands in front of it — which reads
+    /// as a page of older history, and put an arrival at the top of the
+    /// timeline.
+    pub fn last_stable(&self) -> Option<(usize, RowId)> {
+        (0..self.items.len())
+            .rev()
+            .find(|ix| !matches!(self.items.get(*ix), Some(TimelineItem::Typing(_))))
+            .and_then(|ix| Some((ix, self.row_id(ix)?)))
+    }
+
     /// Where a row the list measured has ended up, if it is still drawn.
     ///
     /// Searched from the end, which is where a bottom-anchored timeline keeps
