@@ -130,6 +130,17 @@ impl WhatsAppApp {
         next: Option<PageCursor>,
         cx: &mut Context<Self>,
     ) {
+        // A page nobody is waiting for is a page from before an account
+        // reset: `forget_paging` clears these positions, and the answer to a
+        // request made under the old account can still be on the socket.
+        // Folding it in would put that account's rows into this one's list.
+        if !matches!(self.timeline_pages.get(&jid), Some(Paging::Loading { .. })) {
+            debug!(
+                "a page arrived for {}, which nobody asked for",
+                observe_str(&jid)
+            );
+            return;
+        }
         self.timeline_pages
             .insert(jid.clone(), Paging::arrived(next));
         if messages.is_empty() {
@@ -160,6 +171,12 @@ impl WhatsAppApp {
         next: Option<PageCursor>,
         cx: &mut Context<Self>,
     ) {
+        // The same rule, and the one that matters most: this page's rows go
+        // into the list whether or not anything else remembers them.
+        if !matches!(self.chat_pages, Paging::Loading { .. }) {
+            debug!("a chat page arrived that nobody asked for");
+            return;
+        }
         self.chat_pages = Paging::arrived(next);
         if chats.is_empty() {
             return;
@@ -231,6 +248,24 @@ mod tests {
 
     fn cursor(at: &str) -> PageCursor {
         PageCursor::new(at)
+    }
+
+    /// An answer is only folded in while something is waiting for it: an
+    /// account reset clears these positions, and the page it asked for can
+    /// still be on its way.
+    #[test]
+    fn only_a_waiting_list_takes_a_page() {
+        assert!(matches!(
+            Paging::Loading { from: None },
+            Paging::Loading { .. }
+        ));
+        for settled in [
+            Paging::Unasked,
+            Paging::Done,
+            Paging::More(cursor("c1:-:9:a@s.whatsapp.net")),
+        ] {
+            assert!(!matches!(settled, Paging::Loading { .. }));
+        }
     }
 
     /// The three states that mean different things about asking: never asked,
