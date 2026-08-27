@@ -55,6 +55,13 @@ const SIGNAL_CAPACITY: usize = 32;
 /// from a fresh load rather than from a cheap snapshot.
 const SESSION_CAPACITY: usize = 1024;
 
+/// A quarter of a second of video at the rate a call runs, and no more. This
+/// is the one channel where depth is the *problem*: every frame held here is
+/// latency between the person talking and the person watching, and a reader
+/// that cannot keep up should be shown the newest frame rather than led
+/// through the backlog.
+const VIDEO_CAPACITY: usize = 8;
+
 /// What the tray renders. Small and comparable so `watch` can drop
 /// no-op updates before they reach the icon.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +156,15 @@ pub struct StateHub {
     /// the account, and a front end subscribes to events and has no use for
     /// summaries it derives itself.
     sessions: broadcast::Sender<Arc<str>>,
+    /// A live call's video, for front ends that draw it.
+    ///
+    /// A third channel because it obeys neither of the other two's rules.
+    /// State converges from a snapshot and news must not be lost; a video
+    /// frame is neither — the newest one is the only one worth having, and a
+    /// client that falls behind is *right* to skip. Sharing `sessions` would
+    /// turn a slow window into a `Resync` and throw its whole history away to
+    /// recover a picture that had already moved on.
+    video: broadcast::Sender<Arc<str>>,
     tray: watch::Sender<TrayState>,
     /// How many attached clients own a window.
     ///
@@ -178,6 +194,7 @@ impl StateHub {
         let (updates, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (signals, _) = broadcast::channel(SIGNAL_CAPACITY);
         let (sessions, _) = broadcast::channel(SESSION_CAPACITY);
+        let (video, _) = broadcast::channel(VIDEO_CAPACITY);
         let (tray, _) = watch::channel(TrayState {
             connected: false,
             unread: 0,
@@ -193,6 +210,7 @@ impl StateHub {
             updates,
             signals,
             sessions,
+            video,
             tray,
             windows: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -229,6 +247,37 @@ impl StateHub {
     /// is a copy of every photo in the account for no reader.
     pub fn wants_session_events(&self) -> bool {
         self.sessions.receiver_count() > 0
+    }
+
+    /// Subscribe to the live call's video.
+    pub fn subscribe_video(&self) -> broadcast::Receiver<Arc<str>> {
+        self.video.subscribe()
+    }
+
+    /// Whether anybody is drawing a call.
+    ///
+    /// Asked before a frame is serialized, which is the whole reason it
+    /// exists: base64 and a JSON pass over every access unit of a call
+    /// nobody is watching is real work for no reader — and a daemon holding
+    /// a call with its window closed is the ordinary case.
+    pub fn wants_video(&self) -> bool {
+        self.video.receiver_count() > 0
+    }
+
+    /// Publish one video frame.
+    ///
+    /// Dropped rather than queued when there is nobody to take it, like every
+    /// other frame on this channel.
+    pub fn publish_video(&self, frame: oxidezap_core::CallVideoFrame) {
+        if !self.wants_video() {
+            return;
+        }
+        match serde_json::to_string(&DaemonMessage::CallVideo(Box::new(frame))) {
+            Ok(line) => {
+                let _ = self.video.send(Arc::from(line.as_str()));
+            }
+            Err(e) => log::error!("dropping an unserializable video frame: {e}"),
+        }
     }
 
     /// Publish one session event, already serialized.
@@ -914,6 +963,77 @@ mod tests {
         assert_eq!(hub.updates.receiver_count(), 0);
         let version = hub.apply(live(chat("a@s.whatsapp.net", 1, 10)));
         assert_eq!(hub.snapshot().version, version, "state still advanced");
+    }
+
+    fn video_frame(call_id: &str) -> oxidezap_core::CallVideoFrame {
+        oxidezap_core::CallVideoFrame::new(
+            call_id.to_string(),
+            oxidezap_core::VideoStream::Remote,
+            vec![0, 0, 0, 1, 0x65],
+            true,
+            0,
+        )
+    }
+
+    /// Video is a stream, not state and not news: it consumes no version, so
+    /// a client that skipped a frame has not missed anything a snapshot would
+    /// have to carry.
+    #[tokio::test]
+    async fn a_video_frame_carries_no_version() {
+        let hub = StateHub::new();
+        let mut video = hub.subscribe_video();
+        let before = hub.snapshot().version;
+
+        hub.publish_video(video_frame("call"));
+
+        assert_eq!(hub.snapshot().version, before, "state did not move");
+        let frame: DaemonMessage = serde_json::from_str(&video.recv().await.unwrap()).unwrap();
+        let DaemonMessage::CallVideo(frame) = frame else {
+            panic!("expected a video frame");
+        };
+        assert_eq!(*frame, video_frame("call"));
+    }
+
+    /// A daemon holding a call with every window closed must not spend base64
+    /// and a JSON pass on every access unit of it.
+    #[test]
+    fn nobody_watching_means_nothing_is_serialized() {
+        let hub = StateHub::new();
+        assert!(!hub.wants_video());
+        hub.publish_video(video_frame("call"));
+        // Subscribing afterwards proves the channel is empty rather than
+        // holding a backlog for a reader that did not exist.
+        let mut video = hub.subscribe_video();
+        assert!(video.try_recv().is_err());
+    }
+
+    /// The one channel where falling behind is *correct*: the reader keeps
+    /// its subscription and picks up at the newest frame, rather than being
+    /// told to throw its state away and start again.
+    #[tokio::test]
+    async fn a_reader_that_falls_behind_on_video_skips_rather_than_resyncs() {
+        let hub = StateHub::new();
+        let mut video = hub.subscribe_video();
+
+        for index in 0..(VIDEO_CAPACITY + 4) {
+            hub.publish_video(video_frame(&format!("call-{index}")));
+        }
+
+        assert!(
+            matches!(
+                video.try_recv(),
+                Err(broadcast::error::TryRecvError::Lagged(_))
+            ),
+            "the backlog was dropped rather than queued"
+        );
+        let frame: DaemonMessage = serde_json::from_str(&video.recv().await.unwrap()).unwrap();
+        let DaemonMessage::CallVideo(frame) = frame else {
+            panic!("expected a video frame");
+        };
+        assert_eq!(
+            frame.call_id, "call-4",
+            "the reader resumes at the oldest frame still held, not at the start"
+        );
     }
 
     /// A pass-through frame changes nothing, so it must not consume a version:

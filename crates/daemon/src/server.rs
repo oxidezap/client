@@ -427,6 +427,10 @@ where
     // already gone, because that looks exactly like a closed channel and the
     // branch below ends the connection on one.
     let mut sessions = attached.session_events.then(|| hub.subscribe_sessions());
+    // The same gate, for the same reason: the count of these receivers is
+    // what tells the session whether to publish video at all, so a client
+    // that draws nothing must not hold one.
+    let mut video = attached.session_events.then(|| hub.subscribe_video());
 
     // Held for the connection's whole life, so the count falls again however
     // this task ends. What it answers is "is there a window to raise": see
@@ -508,6 +512,21 @@ where
                 // is not mistaken for a state gap.
                 Err(RecvError::Lagged(missed)) => {
                     log::debug!("client missed {missed} pass-through frames");
+                }
+                Err(RecvError::Closed) => return Ok(()),
+            },
+
+            // Lossy on purpose, and the only branch that is. A video frame
+            // carries no version and nothing recovers it, but unlike a window
+            // request it is *worthless* a moment later: a client that fell
+            // behind wants the newest frame, not the backlog, and telling it
+            // to resync would throw its whole history away to catch up on a
+            // picture that has already moved on.
+            picture = async { video.as_mut().expect("guarded").recv().await },
+                if video.is_some() => match picture {
+                Ok(frame) => write_line(&mut writer, &frame).await?,
+                Err(RecvError::Lagged(missed)) => {
+                    log::trace!("client missed {missed} video frames");
                 }
                 Err(RecvError::Closed) => return Ok(()),
             },

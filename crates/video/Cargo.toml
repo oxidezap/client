@@ -1,0 +1,32 @@
+[package]
+name = "oxidezap-video"
+description = "Camera capture and H.264 encoding for video calls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-channel = "2"
+log = { workspace = true }
+# The camera, on every platform that has one: V4L2 on Linux, AVFoundation on
+# macOS, Media Foundation on Windows. `input-native` is the only feature
+# taken; the defaults would add an MJPEG decoder we reach through the same
+# crate's own path, and `input-opencv` would pull a C++ toolchain.
+nokhwa = { version = "0.10.11", default-features = false, features = [
+    "input-native",
+    "decoding",
+] }
+# The same encoder the GUI already decodes with: one copy of OpenH264 in the
+# tree, and a video call adds no codec the binary did not already carry.
+openh264 = "0.9"
+portable-atomic = { workspace = true }
+# `wacore::time::Instant` rather than std's, which /clippy.toml disallows: the
+# same portable clock the rest of the tree stamps against.
+wacore = { workspace = true }
+
+[lints]
+workspace = true

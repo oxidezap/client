@@ -6,6 +6,7 @@
 mod group_notice;
 mod names;
 mod quoting;
+mod video;
 mod whatsapp;
 
 pub use whatsapp::{ReadBoundary, WhatsAppClient, resolve_database_path, wipe_local_state};

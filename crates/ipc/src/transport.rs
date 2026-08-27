@@ -5,6 +5,14 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 18: video calls. `DaemonMessage::CallVideo` carries a call's encoded
+/// frames in both directions, `ClientRequest::Call(SetVideo)` turns this
+/// side's camera on and off, and the call state says which of the two
+/// cameras are running. A v17 daemon refuses `SetVideo` as malformed, so an
+/// upgraded window would draw a camera button that could never do anything;
+/// a v17 client drops every video frame as unparsable and shows a video call
+/// with no picture in it.
+///
 /// 17: `LoadMessages` and `LoadChats`, answered by `DaemonMessage::Messages`
 /// and `DaemonMessage::Chats`. History is asked for rather than pushed: the
 /// attach load carries the chat list and the newest rows the daemon's own
@@ -87,7 +95,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

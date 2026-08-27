@@ -204,6 +204,10 @@ pub async fn run(
     let mut events = client
         .start()
         .map_err(|e| anyhow::anyhow!("starting the session: {e}"))?;
+    // Asked for once, here, rather than per front end: the session has one
+    // camera and one call, and what decides whether a frame is *serialized*
+    // is whether anybody is subscribed to the hub's video channel.
+    let mut video = client.video_events();
     let mut bridge = Bridge::new(hub);
 
     // Set when every sender is gone. A closed channel yields `None`
@@ -224,6 +228,11 @@ pub async fn run(
                 // further event can arrive.
                 None => break,
             },
+            // Not folded into daemon state and not published as an event: a
+            // frame is neither. It goes straight out to whoever is drawing,
+            // and is dropped when nobody is.
+            Some(frame) = video.recv() => bridge.hub.publish_video(frame),
+
             command = commands.recv(), if !commands_closed => match command {
                 Some(command) => {
                     bridge.execute(&client, command).await;
@@ -469,6 +478,13 @@ impl Bridge {
             // The front end drew what it asked for; this is what the device
             // is actually doing. Nothing is published when the two agree, so
             // the ordinary mute costs no frame.
+            UiEvent::CallVideoChanged {
+                call_id,
+                stream,
+                on,
+            } => self.hub.calls(|s| {
+                s.set_video(call_id, *stream, *on);
+            }),
             UiEvent::CallMuteChanged { call_id, muted } => self.hub.calls(|s| {
                 s.set_muted(call_id, *muted);
             }),
@@ -723,10 +739,22 @@ impl Bridge {
                     // for the *other* direction left the daemon publishing a
                     // ringing offer over a connected call.
                     CallAction::Accept { call_id } => {
+                        // Answering a video call answers it with video: the
+                        // offer said what kind of call this is, and the
+                        // camera has to be attached before the accept goes
+                        // out. A window that wants to answer with the camera
+                        // off turns it off once the call is up, which is what
+                        // a phone does too.
+                        let with_video = self
+                            .hub
+                            .call_state()
+                            .incoming()
+                            .filter(|call| call.call_id == call_id)
+                            .is_some_and(|call| call.is_video);
                         self.hub.calls(|calls| {
                             calls.connect(&call_id);
                         });
-                        client.accept_call(&call_id);
+                        client.accept_call(&call_id, with_video);
                     }
                     // A decline is the one ending only the declining side
                     // knows about. Every other window watches the same stage
@@ -757,6 +785,14 @@ impl Bridge {
                             calls.set_muted(&call_id, muted);
                         });
                         client.set_call_muted(&call_id, muted);
+                    }
+                    // Not mirrored optimistically, unlike mute: opening a
+                    // camera can fail and takes long enough to notice, and a
+                    // state that said the camera was on before the device
+                    // agreed would be published to every other window too.
+                    // The session announces what the device actually did.
+                    CallAction::SetVideo { call_id, enabled } => {
+                        client.set_call_video(&call_id, enabled);
                     }
                 }
                 CommandOutcome::Accepted

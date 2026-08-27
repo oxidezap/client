@@ -1,0 +1,227 @@
+//! A call's video plane: the camera in, the peer's picture out.
+//!
+//! The session owns the camera for the same reason it owns the microphone —
+//! it is the process holding the call — and the whole of what leaves this
+//! module is *encoded*. That is what makes a picture affordable across the
+//! daemon socket: 16 KiB of H.264 per frame rather than 3.5 MiB of pixels,
+//! and the front end already carries a decoder for the video it plays in a
+//! conversation.
+//!
+//! Both directions are published. The peer's because it is the call; our own
+//! because nothing above this process has the camera, and re-encoding a
+//! second preview stream would cost more than decoding the one already going
+//! out. Sending exactly what the peer is sent also makes the self-view
+//! honest: what is drawn is what they see, framing, freezes and all.
+//!
+//! Everything here is lossy by construction. A frame that cannot be delivered
+//! *now* is worth nothing later, so every queue is short and every send is a
+//! `try_send` — the one thing a drop must not do is leave the peer decoding
+//! against a reference it never received, which is why the camera is asked
+//! for a keyframe whenever one is lost.
+
+use std::sync::Arc;
+
+use log::{debug, warn};
+use oxidezap_core::{CallVideoFrame, VideoStream};
+use oxidezap_video::{CameraStream, EncodedFrame, VideoQuality};
+use whatsapp_rust::voip::{VideoFrame, VideoSource};
+
+/// Where finished frames go on their way to whoever draws them.
+///
+/// Bounded and dropped from rather than blocked on: this is a stream, and the
+/// only frame worth having is the newest one.
+pub type VideoFrameSender = tokio::sync::mpsc::Sender<CallVideoFrame>;
+
+/// How many frames may wait for the daemon. Small: a backlog here is latency
+/// the person on screen can see.
+pub(crate) const PUBLISH_DEPTH: usize = 4;
+
+/// How many encoded units may wait for the media plane, and how many decoded
+/// ones for the front end.
+const PLANE_DEPTH: usize = 2;
+
+/// The camera, wired to a call.
+///
+/// Held for as long as the local direction is on: dropping it stops the
+/// device.
+pub(crate) struct LocalVideo {
+    camera: Arc<CameraStream>,
+    /// The fan-out task, stopped by dropping the camera's channel.
+    pump: tokio::task::JoinHandle<()>,
+    id: CallIdSlot,
+}
+
+/// Which call the frames belong to, as a slot rather than a value.
+///
+/// An outgoing call is named twice — the window's placeholder, then the id
+/// the server answers with — and the camera opens before the first frame of
+/// that exchange, because the offer has to *be* a video offer. So the pumps
+/// read the id per frame instead of capturing it, and the rename lands
+/// without restarting the device.
+pub(crate) type CallIdSlot = Arc<std::sync::Mutex<String>>;
+
+pub(crate) fn slot(call_id: &str) -> CallIdSlot {
+    Arc::new(std::sync::Mutex::new(call_id.to_string()))
+}
+
+fn read(id: &CallIdSlot) -> String {
+    id.lock().expect("call id slot poisoned").clone()
+}
+
+impl LocalVideo {
+    /// Address this call's frames by the name the server gave it.
+    pub(crate) fn rename(&self, call_id: &str) {
+        *self.id.lock().expect("call id slot poisoned") = call_id.to_string();
+    }
+
+    /// Tell the encoder the peer has lost the stream.
+    pub(crate) fn request_keyframe(&self) {
+        self.camera.request_keyframe();
+    }
+
+    /// Close the device and wait for the thread to let go of it.
+    ///
+    /// Waited for because the next call opens the same camera, and a backend
+    /// that still holds it fails that open rather than queueing behind it.
+    pub(crate) async fn stop(self) {
+        self.pump.abort();
+        let camera = self.camera;
+        // On a blocking thread: joining the capture thread waits for the
+        // frame it is asleep in.
+        let _ = tokio::task::spawn_blocking(move || drop(camera)).await;
+    }
+}
+
+/// What the library is handed for one call's video.
+pub(crate) struct Endpoints {
+    pub(crate) source: CameraSource,
+    pub(crate) sink: async_channel::Sender<VideoFrame>,
+}
+
+/// The camera as a [`VideoSource`].
+///
+/// A bare channel would already satisfy the trait, and would also claim the
+/// default 15 fps stride. The stride is what paces RTP, so a camera opened at
+/// 20 fps under a 15 fps stride drifts against its own timestamps — hence a
+/// named type whose whole purpose is to state the one the device is actually
+/// running at.
+pub(crate) struct CameraSource {
+    frames: async_channel::Receiver<Vec<u8>>,
+    stride: u32,
+}
+
+impl VideoSource for CameraSource {
+    fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
+        self.frames.clone()
+    }
+
+    fn rtp_timestamp_stride(&self) -> u32 {
+        self.stride
+    }
+}
+
+/// Open the camera and wire both directions up for `call_id`.
+///
+/// The open is blocking (every capture backend is) and is done here rather
+/// than by the caller so that a machine with no camera fails *before* an
+/// offer or an accept goes out claiming video.
+pub(crate) async fn open(
+    call_id: CallIdSlot,
+    publish: Option<VideoFrameSender>,
+) -> Result<(LocalVideo, Endpoints), String> {
+    let quality = VideoQuality::from_environment();
+    let camera = tokio::task::spawn_blocking(move || oxidezap_video::open(quality))
+        .await
+        .map_err(|e| format!("camera task failed: {e}"))?
+        .map_err(|e| format!("{e:#}"))?;
+    let stride = camera.quality().timestamp_stride();
+    let camera = Arc::new(camera);
+
+    // The encoder's own queue is upstream of this one; this pair is what the
+    // media plane and the front end read.
+    let (source_tx, source_rx) = async_channel::bounded(PLANE_DEPTH);
+    let (sink_tx, sink_rx) = async_channel::bounded(PLANE_DEPTH);
+
+    let pump = tokio::spawn(pump_local(
+        Arc::clone(&call_id),
+        Arc::clone(&camera),
+        source_tx,
+        publish.clone(),
+    ));
+    tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publish));
+
+    Ok((
+        LocalVideo {
+            camera,
+            pump,
+            id: call_id,
+        },
+        Endpoints {
+            source: CameraSource {
+                frames: source_rx,
+                stride,
+            },
+            sink: sink_tx,
+        },
+    ))
+}
+
+/// Camera to the media plane, and to the self-view.
+///
+/// One reader, two destinations: the plane must not be starved by a front end
+/// that is not reading, and a front end must not hold the plane up. Both are
+/// `try_send`, and only the plane's drop is worth a keyframe — a self-view
+/// that misses a frame recovers on the next one it does get.
+async fn pump_local(
+    call_id: CallIdSlot,
+    camera: Arc<CameraStream>,
+    plane: async_channel::Sender<Vec<u8>>,
+    publish: Option<VideoFrameSender>,
+) {
+    let frames = camera.frames();
+    while let Ok(EncodedFrame { data, keyframe }) = frames.recv().await {
+        if let Some(publish) = &publish {
+            let frame = CallVideoFrame::new(
+                read(&call_id),
+                VideoStream::Local,
+                data.clone(),
+                keyframe,
+                0,
+            );
+            let _ = publish.try_send(frame);
+        }
+        if plane.try_send(data).is_err() {
+            if plane.is_closed() {
+                break;
+            }
+            // The plane is behind. Whatever it sends next has to be
+            // decodable on its own, since everything after a gap references
+            // a unit the peer never received.
+            camera.request_keyframe();
+        }
+    }
+    debug!("local video for {} ended", read(&call_id));
+}
+
+/// The peer's picture, on its way to whoever draws it.
+async fn pump_remote(
+    call_id: CallIdSlot,
+    frames: async_channel::Receiver<VideoFrame>,
+    publish: Option<VideoFrameSender>,
+) {
+    while let Ok(frame) = frames.recv().await {
+        let Some(publish) = &publish else { continue };
+        let published = CallVideoFrame::new(
+            read(&call_id),
+            VideoStream::Remote,
+            frame.data,
+            frame.keyframe,
+            frame.orientation,
+        );
+        if publish.try_send(published).is_err() && publish.is_closed() {
+            warn!("nobody is drawing the video of {}", read(&call_id));
+            break;
+        }
+    }
+    debug!("remote video for {} ended", read(&call_id));
+}

@@ -6,7 +6,11 @@
 //! - `IncomingCall`, `OutgoingCall`, `OutgoingCallState`: Call state
 //! - `MessageStatus`: how far an outgoing message travelled
 //! - `PresenceRegistry`: who is typing, and who is around
+//! - `CallVideo`, `CallVideoFrame`: which of a call's cameras are on, and the
+//!   encoded frames they produce
 //! - `UiEvent`: Events for UI updates
+
+pub mod base64;
 
 mod app_state;
 mod call;
@@ -19,6 +23,7 @@ mod quoted;
 mod rich_text;
 mod status;
 mod system_notice;
+mod video;
 
 pub use app_state::{AppState, CachedQrCode, Issued, Lifetime};
 pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
@@ -38,3 +43,4 @@ pub use rich_text::{
 };
 pub use status::{StatusAuthor, StatusFeed};
 pub use system_notice::{CallOutcome, CallRecord, SystemNotice, format_duration};
+pub use video::{CallVideo, CallVideoFrame, VideoStream};

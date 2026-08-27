@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use super::call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
 use super::system_notice::{CallOutcome, format_duration};
+use super::video::{CallVideo, VideoStream};
 
 /// A call that is connected and running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,10 +29,20 @@ pub struct ActiveCall {
     pub call_id: CallId,
     pub peer_jid: String,
     pub peer_name: String,
-    /// Whether the call was *offered* as video. The library is audio-only, so
-    /// this shapes the card and nothing else; the video controls it reveals
-    /// are drawn disabled.
+    /// Whether the call was *offered* as video.
+    ///
+    /// Not the same question as whether a camera is running: an offer that
+    /// was made as video may be answered with the camera off, and an audio
+    /// call may be upgraded to video by either side. This one says what the
+    /// call was *for*, which is what the conversation's record keeps;
+    /// [`video`](Self::video) says what is on the wire right now.
     pub is_video: bool,
+    /// Which of the two cameras are running.
+    ///
+    /// Defaulted on the wire so a peer that predates it reads an audio call
+    /// rather than failing the frame.
+    #[serde(default, skip_serializing_if = "is_no_video")]
+    pub video: CallVideo,
     /// Whether this account placed the call.
     ///
     /// Carried through connecting rather than derived afterwards: once the
@@ -60,6 +71,16 @@ impl ActiveCall {
     pub fn initial(&self) -> char {
         self.peer_name.chars().next().unwrap_or('?')
     }
+
+    /// Whether this call is drawn with pictures: it was offered as video, or
+    /// a camera has since been turned on.
+    pub fn shows_video(&self) -> bool {
+        self.is_video || self.video.any()
+    }
+}
+
+fn is_no_video(video: &CallVideo) -> bool {
+    !video.any()
 }
 
 /// Where a call is in its life.
@@ -473,6 +494,10 @@ impl CallState {
             peer_jid: stage.peer_jid().to_string(),
             peer_name: stage.peer_name().to_string(),
             is_video: stage.is_video(),
+            // Nothing is on the wire yet whichever way the call was offered:
+            // the media plane is brought up by the accept, and each side
+            // announces its own camera. `set_video` is what turns these on.
+            video: CallVideo::default(),
             is_outgoing: matches!(stage, Stage::Outgoing(_)),
             started_at: wacore::time::now_utc(),
             muted: false,
@@ -488,6 +513,7 @@ impl CallState {
             peer_jid: call.caller_jid.clone(),
             peer_name: call.caller_name.clone(),
             is_video: call.is_video,
+            video: CallVideo::default(),
             // Answering an offer: they called us.
             is_outgoing: false,
             started_at: wacore::time::now_utc(),
@@ -513,6 +539,26 @@ impl CallState {
             }
             _ => false,
         }
+    }
+
+    /// Record that one direction's camera went on or off, returning whether
+    /// it changed.
+    ///
+    /// Named by call id for the same reason [`set_muted`](Self::set_muted)
+    /// is: a window that fell behind can ask about a call that has already
+    /// ended, and applying that to whatever call is live now would claim a
+    /// camera the daemon never opened.
+    pub fn set_video(&mut self, call_id: &CallId, stream: VideoStream, on: bool) -> bool {
+        match &mut self.stage {
+            Some(Stage::Active(call)) if call.call_id == *call_id => call.video.set(stream, on),
+            _ => false,
+        }
+    }
+
+    /// Which cameras are running on the live call, if there is one.
+    pub fn video(&self) -> CallVideo {
+        self.active()
+            .map_or_else(CallVideo::default, |call| call.video)
     }
 
     /// Toggle the microphone, returning the new state.

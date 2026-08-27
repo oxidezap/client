@@ -134,6 +134,28 @@ pub enum UiEvent {
         call_id: CallId,
         muted: bool,
     },
+    /// One of a call's two cameras went on or off.
+    ///
+    /// Said for both directions and by the same rule mute follows: the side
+    /// that owns the device reports what it *did*, rather than a front end
+    /// deriving it from frames arriving or stopping. Frames are lossy and a
+    /// pause looks exactly like a peer who has turned their camera off, so a
+    /// state read off the stream would flicker.
+    CallVideoChanged {
+        call_id: CallId,
+        stream: crate::VideoStream,
+        on: bool,
+    },
+    /// The peer asked to turn this call into a video one.
+    ///
+    /// Distinct from [`CallVideoChanged`](Self::CallVideoChanged) because
+    /// nothing has changed yet: it is a question, and the answer is a person
+    /// turning their own camera on (or not). The token that binds an answer
+    /// to *this* request stays in the session, which is the only place that
+    /// can use it.
+    CallVideoRequested {
+        call_id: CallId,
+    },
     /// The call is over here because another of this account's devices
     /// answered or refused it. Not a missed call: the device that took it has
     /// the entry, and this one has nothing true to write down.

@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::store::SqliteStore;
-use whatsapp_rust::voip::{CallHandle, CallTermination};
+use whatsapp_rust::voip::{CallEvent, CallHandle, CallTermination, VideoState, VideoUpgradeToken};
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
 use whatsapp_rust::wacore::types::events::Event;
@@ -21,12 +21,14 @@ use whatsapp_rust::waproto::whatsapp as wa;
 
 use oxidezap_audio::{spawn_mic, spawn_speaker};
 use oxidezap_core::{
-    Availability, Chat, ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, MediaContent,
-    MediaType, MessageStatus, SystemNotice, UiEvent, fallback_chat_name,
+    Availability, CallVideoFrame, Chat, ChatMessage, ComposingKind, DownloadableMedia,
+    IncomingCall, MediaContent, MediaType, MessageStatus, SystemNotice, UiEvent, VideoStream,
+    fallback_chat_name,
 };
 
 use crate::names::NameBook;
 use crate::quoting::quoted_from;
+use crate::video::{self, LocalVideo, VideoFrameSender};
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
 /// Resolve a stable per-user path for the SQLite database. A CWD-relative
@@ -262,6 +264,16 @@ async fn open_call_audio() -> Result<CallAudio, String> {
     .map_err(|e| format!("audio setup task failed: {e}"))?
 }
 
+/// Whether an offer asked for video.
+///
+/// Read off the offer rather than trusted from the front end: what the card
+/// was drawn as and what the caller actually offered are two different
+/// claims, and only one of them decides whether a video answer is even legal
+/// (the library refuses `.video()` on an audio offer).
+fn offered_video(offer: &WaIncomingCall) -> bool {
+    matches!(&offer.action, CallAction::Offer { is_video, .. } if *is_video)
+}
+
 fn participant_keyed_chat(jid: &Jid) -> bool {
     jid.is_group() || jid.is_broadcast_list() || jid.is_status_broadcast()
 }
@@ -280,6 +292,17 @@ pub struct CallRegistry {
     /// so a call that ends takes its lane with it without every teardown
     /// path having to remember.
     mute: Arc<std::sync::Mutex<HashMap<String, Arc<MuteLane>>>>,
+    /// The camera feeding each call whose local direction is on. Absent is
+    /// the whole of "our video is off": there is no second flag to disagree
+    /// with, and removing the entry is what closes the device.
+    cameras: Arc<Mutex<HashMap<String, LocalVideo>>>,
+    /// A peer's outstanding request to turn a call into a video one.
+    ///
+    /// Kept here rather than handed to the front end because the token is
+    /// what binds an answer to *that* request, and only this process can use
+    /// it. Turning the camera on while one is parked answers it; turning it
+    /// on with none parked asks a question of our own.
+    upgrades: Arc<Mutex<HashMap<String, VideoUpgradeToken>>>,
 }
 
 /// What keeps a call's mute requests in the order the daemon took them.
@@ -321,6 +344,15 @@ pub struct WhatsAppClient {
     ui_sender: UiEventSender,
     /// Live/ringing calls
     calls: CallRegistry,
+    /// Where a call's video frames are published, once somebody has asked
+    /// for them.
+    ///
+    /// Its own channel rather than a `UiEvent`: an event is news that a
+    /// reader which missed one has missed for good, and this is a stream
+    /// whose newest frame is the only one worth having. It is also bounded,
+    /// which the event channel is not — a camera that outran a stalled
+    /// reader would otherwise grow the queue for as long as the call lasted.
+    video_tx: Arc<std::sync::Mutex<Option<VideoFrameSender>>>,
     /// Durable chat history (same SQLite file as the device store)
     chat_store: ChatStoreHandle,
     /// The session's address book, so a page served on request names people
@@ -364,6 +396,7 @@ impl WhatsAppClient {
             client_handle: Arc::new(Mutex::new(None)),
             ui_sender: Arc::new(Mutex::new(None)),
             calls: CallRegistry::default(),
+            video_tx: Arc::new(std::sync::Mutex::new(None)),
             chat_store: Arc::new(Mutex::new(None)),
             names: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -421,6 +454,22 @@ impl WhatsAppClient {
     #[allow(dead_code)]
     pub fn chat_store(&self) -> ChatStoreHandle {
         self.chat_store.clone()
+    }
+
+    /// Subscribe to the video of whatever call is up.
+    ///
+    /// Asked for rather than always produced: publishing costs a clone of
+    /// every access unit, and a caller with nowhere to draw one (a tray, a
+    /// notifier) should not pay for it. Calling this again replaces the
+    /// previous subscriber, which is what a reconnecting front end wants.
+    pub fn video_events(&mut self) -> mpsc::Receiver<CallVideoFrame> {
+        let (tx, rx) = mpsc::channel(video::PUBLISH_DEPTH);
+        *self.video_tx.lock().expect("video sender poisoned") = Some(tx);
+        rx
+    }
+
+    fn video_publisher(&self) -> Option<VideoFrameSender> {
+        self.video_tx.lock().expect("video sender poisoned").clone()
     }
 
     /// Start the WhatsApp client in a background thread
@@ -1898,10 +1947,11 @@ impl WhatsAppClient {
     /// Accept an incoming call: signaling, callKey decrypt, relay connect and
     /// the audio engine are all inside `client.voip().accept(..)`; this side
     /// only supplies the cpal mic/speaker bridge.
-    pub fn accept_call(&self, call_id: &str) {
+    pub fn accept_call(&self, call_id: &str, with_video: bool) {
         let client_handle = self.client_handle.clone();
         let calls = self.calls.clone();
         let ui_sender = self.ui_sender.clone();
+        let publish = self.video_publisher();
         let call_id = call_id.to_string();
         let runtime = self.runtime.clone();
 
@@ -1931,13 +1981,34 @@ impl WhatsAppClient {
                     return;
                 }
             };
-            match client
-                .voip()
-                .accept(&offer)
-                .audio(mic, speaker)
-                .start()
-                .await
-            {
+            // The camera is opened before the accept goes out, so an offer
+            // answered with video is one this side can actually send. A
+            // camera that will not open is not a reason to refuse the call:
+            // the answer is audio, which is exactly what a phone does when
+            // its camera is busy.
+            let video = if with_video {
+                match video::open(video::slot(&call_id), publish).await {
+                    Ok(video) => Some(video),
+                    Err(err) => {
+                        warn!("Answering call {call_id} without video: {err}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let (local, endpoints) = match video {
+                Some((local, endpoints)) => (Some(local), Some(endpoints)),
+                None => (None, None),
+            };
+
+            let voip = client.voip();
+            let accept = voip.accept(&offer).audio(mic, speaker);
+            let accept = match endpoints {
+                Some(endpoints) => accept.video(endpoints.source, endpoints.sink),
+                None => accept,
+            };
+            match accept.start().await {
                 Ok(handle) => {
                     info!("Call {} media live", handle.call_id());
                     let handle = Arc::new(handle);
@@ -1946,14 +2017,120 @@ impl WhatsAppClient {
                         .lock()
                         .await
                         .insert(call_id.clone(), handle.clone());
-                    Self::watch_call_end(handle, calls.clone(), ui_sender.clone());
+                    if let Some(local) = local {
+                        calls.cameras.lock().await.insert(call_id.clone(), local);
+                        Self::announce_video(&ui_sender, &call_id, VideoStream::Local, true).await;
+                    }
+                    // A call offered as video has the caller's camera on by
+                    // definition; the peer's own `<video>` corrects this if
+                    // they turn it off.
+                    if offered_video(&offer) {
+                        Self::announce_video(&ui_sender, &call_id, VideoStream::Remote, true).await;
+                    }
+                    Self::watch_call(handle, calls.clone(), ui_sender.clone());
                 }
                 Err(e) => {
                     error!("Failed to start call media for {}: {}", call_id, e);
+                    if let Some(local) = local {
+                        local.stop().await;
+                    }
                     Self::notify_call_ended(&ui_sender, &call_id).await;
                 }
             }
         });
+    }
+
+    /// Turn this side's camera on or off during a live call.
+    ///
+    /// The two directions of a call's video are independent and each side
+    /// owns its own, so this is only ever about ours. Turning it on answers
+    /// the peer's request when there is one parked — the token is what binds
+    /// the answer to that request — and asks one of our own when there is
+    /// not.
+    ///
+    /// Like mute, what is published is what the device ended up doing rather
+    /// than what was asked for: a camera that will not open, or an
+    /// announcement the peer never got, would otherwise leave a front end
+    /// drawing a picture nobody is being sent.
+    pub fn set_call_video(&self, call_id: &str, on: bool) {
+        let calls = self.calls.clone();
+        let ui_sender = self.ui_sender.clone();
+        let publish = self.video_publisher();
+        let call_id = call_id.to_string();
+        let runtime = self.runtime.clone();
+
+        runtime.spawn(async move {
+            let Some(handle) = calls.active.lock().await.get(&call_id).cloned() else {
+                debug!("set_call_video: no live handle for {}", call_id);
+                return;
+            };
+
+            if !on {
+                if let Some(local) = calls.cameras.lock().await.remove(&call_id) {
+                    // The device is released first, matching `stop_video`
+                    // itself: the user asked for the camera to go off, and a
+                    // failed stanza must not leave it running.
+                    local.stop().await;
+                }
+                if let Err(e) = handle.stop_video().await {
+                    warn!(
+                        "Failed to tell the peer video stopped on {}: {}",
+                        call_id, e
+                    );
+                }
+                Self::announce_video(&ui_sender, &call_id, VideoStream::Local, false).await;
+                return;
+            }
+
+            if calls.cameras.lock().await.contains_key(&call_id) {
+                return;
+            }
+            let (local, endpoints) = match video::open(video::slot(&call_id), publish).await {
+                Ok(video) => video,
+                Err(err) => {
+                    error!("Camera setup failed for call {call_id}: {err}");
+                    // Said out loud rather than left silent: the front end
+                    // drew the camera as coming on the moment it was asked.
+                    Self::announce_video(&ui_sender, &call_id, VideoStream::Local, false).await;
+                    return;
+                }
+            };
+            let answering = calls.upgrades.lock().await.remove(&call_id);
+            let started = match answering {
+                Some(token) => {
+                    handle
+                        .accept_video(token, endpoints.source, endpoints.sink)
+                        .await
+                }
+                None => handle.start_video(endpoints.source, endpoints.sink).await,
+            };
+            match started {
+                Ok(()) => {
+                    calls.cameras.lock().await.insert(call_id.clone(), local);
+                    Self::announce_video(&ui_sender, &call_id, VideoStream::Local, true).await;
+                }
+                Err(e) => {
+                    error!("Failed to start video on call {}: {}", call_id, e);
+                    local.stop().await;
+                    Self::announce_video(&ui_sender, &call_id, VideoStream::Local, false).await;
+                }
+            }
+        });
+    }
+
+    async fn announce_video(
+        ui_sender: &UiEventSender,
+        call_id: &str,
+        stream: VideoStream,
+        on: bool,
+    ) {
+        if let Some(tx) = ui_sender.lock().await.as_ref() {
+            let _ = tx.send(UiEvent::CallVideoChanged {
+                call_id: call_id.to_string(),
+                stream,
+                on,
+            });
+        }
     }
 
     /// Decline an incoming call (sends the reject signaling).
@@ -1979,20 +2156,21 @@ impl WhatsAppClient {
         });
     }
 
-    /// Place an outgoing 1:1 voice call. Device discovery, callKey encrypt,
-    /// offer send and the relay/engine lifecycle are inside
-    /// `client.voip().call(..)`. Video calls are not supported by the library
-    /// yet; `is_video` only shapes the UI.
+    /// Place an outgoing 1:1 call. Device discovery, callKey encrypt, offer
+    /// send and the relay/engine lifecycle are inside `client.voip().call(..)`.
+    ///
+    /// `is_video` reaches the wire: the offer itself says which kind of call
+    /// this is, and it says so because the endpoints were attached before it
+    /// went out. A video call whose camera would not open is placed as a
+    /// voice call rather than not placed at all — the point of the call is
+    /// to reach the person.
     pub fn start_call(&self, recipient_jid_str: &str, is_video: bool, placeholder_id: String) {
         let client_handle = self.client_handle.clone();
         let calls = self.calls.clone();
         let ui_sender = self.ui_sender.clone();
+        let publish = self.video_publisher();
         let recipient_jid = recipient_jid_str.to_string();
         let runtime = self.runtime.clone();
-
-        if is_video {
-            warn!("Video calls are not supported yet; placing a voice call");
-        }
 
         runtime.spawn(async move {
             let notify_failure = |error: String| {
@@ -2037,13 +2215,44 @@ impl WhatsAppClient {
                 }
             };
 
-            match client.voip().call(&jid).audio(mic, speaker).start().await {
+            // Opened under the placeholder id: the server has not named the
+            // call yet, and the frames this produces are addressed to the
+            // call the front end already drew.
+            let video = if is_video {
+                match video::open(video::slot(&placeholder_id), publish).await {
+                    Ok(video) => Some(video),
+                    Err(err) => {
+                        warn!(
+                            "Placing the call to {} without video: {err}",
+                            observe_str(&recipient_jid)
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let (local, endpoints) = match video {
+                Some((local, endpoints)) => (Some(local), Some(endpoints)),
+                None => (None, None),
+            };
+
+            let voip = client.voip();
+            let outgoing = voip.call(&jid).audio(mic, speaker);
+            let outgoing = match endpoints {
+                Some(endpoints) => outgoing.video(endpoints.source, endpoints.sink),
+                None => outgoing,
+            };
+            match outgoing.start().await {
                 Ok(handle) => {
                     let call_id = handle.call_id().to_string();
                     // Cancelled while still connecting: the UI only knew
                     // the placeholder id, so honor it here.
                     if calls.cancelled.lock().await.remove(&placeholder_id) {
                         info!("Outgoing call {} cancelled before start", call_id);
+                        if let Some(local) = local {
+                            local.stop().await;
+                        }
                         // The offer is already out: every device it rang is
                         // ringing, and dropping our side silently would leave
                         // them at it until their own transport gave up.
@@ -2063,16 +2272,35 @@ impl WhatsAppClient {
                         .lock()
                         .await
                         .insert(call_id.clone(), handle.clone());
-                    Self::watch_call_end(handle, calls.clone(), ui_sender.clone());
+                    if let Some(local) = local {
+                        // The frames were being addressed to the placeholder
+                        // the window drew; from here they carry the name the
+                        // server gave the call.
+                        local.rename(&call_id);
+                        calls.cameras.lock().await.insert(call_id.clone(), local);
+                    }
+                    Self::watch_call(handle, calls.clone(), ui_sender.clone());
+                    // The rename first: everything after it is addressed by
+                    // the id the server gave the call, and a front end told
+                    // its camera was on under an id it has not adopted yet
+                    // would drop the news.
                     if let Some(tx) = ui_sender.lock().await.as_ref() {
                         let _ = tx.send(UiEvent::OutgoingCallStarted {
-                            call_id,
+                            call_id: call_id.clone(),
                             recipient_jid,
                             placeholder_id,
                         });
                     }
+                    if is_video {
+                        Self::announce_video(&ui_sender, &call_id, VideoStream::Local, true).await;
+                    }
                 }
-                Err(e) => notify_failure(e.to_string()).await,
+                Err(e) => {
+                    if let Some(local) = local {
+                        local.stop().await;
+                    }
+                    notify_failure(e.to_string()).await;
+                }
             }
         });
     }
@@ -2203,6 +2431,113 @@ impl WhatsAppClient {
         });
     }
 
+    /// Follow a live call: its own event stream while it runs, and its
+    /// ending.
+    ///
+    /// One entry point rather than two spawns at every call site, because
+    /// every path that produces a handle owes both — a call watched for its
+    /// ending but not its events is one whose camera nobody turns off.
+    fn watch_call(handle: Arc<CallHandle>, calls: CallRegistry, ui_sender: UiEventSender) {
+        Self::watch_call_events(handle.clone(), calls.clone(), ui_sender.clone());
+        Self::watch_call_end(handle, calls, ui_sender);
+    }
+
+    /// The call's own event stream: what the peer says about its video, and
+    /// what the network says about ours.
+    fn watch_call_events(handle: Arc<CallHandle>, calls: CallRegistry, ui_sender: UiEventSender) {
+        tokio::spawn(async move {
+            let events = handle.events();
+            let call_id = handle.call_id().to_string();
+            while let Ok(event) = events.recv().await {
+                match event {
+                    CallEvent::VideoStateChanged {
+                        state,
+                        upgrade_token,
+                        ..
+                    } => {
+                        Self::observe_peer_video(
+                            &calls,
+                            &ui_sender,
+                            &call_id,
+                            state,
+                            upgrade_token,
+                        )
+                        .await;
+                    }
+                    // The peer has lost our stream and is asking for a point
+                    // it can start from. Sending it more P-frames it cannot
+                    // decode is the one thing that certainly does not help.
+                    CallEvent::RtcpReceived {
+                        packet_types,
+                        reports_video,
+                        ..
+                    } if reports_video && packet_types.contains(&RTCP_PAYLOAD_FEEDBACK) => {
+                        if let Some(local) = calls.cameras.lock().await.get(&call_id) {
+                            local.request_keyframe();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            debug!("event stream for call {call_id} closed");
+        });
+    }
+
+    /// Fold one `<video state=N>` from the peer into what this side holds.
+    async fn observe_peer_video(
+        calls: &CallRegistry,
+        ui_sender: &UiEventSender,
+        call_id: &str,
+        state: VideoState,
+        upgrade_token: Option<VideoUpgradeToken>,
+    ) {
+        match state {
+            // A request rather than a change: the answer is a person turning
+            // their own camera on, and the token is what binds that answer to
+            // this request. Without a token there is nothing to answer with —
+            // the signaling state machine has already resolved it — so it is
+            // not offered as a question.
+            VideoState::UpgradeRequest | VideoState::UpgradeRequestV2 => {
+                let Some(token) = upgrade_token else { return };
+                calls
+                    .upgrades
+                    .lock()
+                    .await
+                    .insert(call_id.to_string(), token);
+                if let Some(tx) = ui_sender.lock().await.as_ref() {
+                    let _ = tx.send(UiEvent::CallVideoRequested {
+                        call_id: call_id.to_string(),
+                    });
+                }
+            }
+            VideoState::Enabled => {
+                Self::announce_video(ui_sender, call_id, VideoStream::Remote, true).await;
+            }
+            // Paused is drawn the same as off, and deliberately: a peer whose
+            // app went to the background sends nothing, and a pane held open
+            // for it would be a frozen frame nobody can tell from a live one.
+            VideoState::Stopped
+            | VideoState::Disabled
+            | VideoState::Paused
+            | VideoState::Error
+            | VideoState::UnknownPeer => {
+                calls.upgrades.lock().await.remove(call_id);
+                Self::announce_video(ui_sender, call_id, VideoStream::Remote, false).await;
+            }
+            // Our own request was refused or expired: nothing about the
+            // peer's direction changed, but the question is closed.
+            VideoState::UpgradeReject
+            | VideoState::UpgradeRejectByTimeout
+            | VideoState::UpgradeCancel
+            | VideoState::UpgradeCancelByTimeout => {
+                calls.upgrades.lock().await.remove(call_id);
+            }
+            // `UpgradeAccept` is answered by the `Enabled` that follows it,
+            // which is the state that actually says a camera is on.
+            _ => {}
+        }
+    }
+
     /// Watch a live call until it ends (peer hangup, network loss, local
     /// hangup) and clear it from the registry + UI.
     fn watch_call_end(handle: Arc<CallHandle>, calls: CallRegistry, ui_sender: UiEventSender) {
@@ -2210,6 +2545,14 @@ impl WhatsAppClient {
             handle.wait_ended().await;
             let call_id = handle.call_id().to_string();
             calls.active.lock().await.remove(&call_id);
+            // The camera outlives nothing: a call that ended with video on
+            // would otherwise keep the device open, with its light on, for
+            // as long as the process lived.
+            let camera = calls.cameras.lock().await.remove(&call_id);
+            calls.upgrades.lock().await.remove(&call_id);
+            if let Some(camera) = camera {
+                camera.stop().await;
+            }
             // Every call that ever had a handle drains through here, whatever
             // ended it, so this is where a lane is paid for. The sweep in
             // `set_call_muted` is not made redundant by it: a window that fell
@@ -2231,6 +2574,10 @@ impl WhatsAppClient {
         }
     }
 }
+
+/// RTCP payload-specific feedback (RFC 4585), which is what carries PLI and
+/// FIR — a peer saying it cannot decode what we are sending.
+const RTCP_PAYLOAD_FEEDBACK: u8 = 206;
 
 /// Say what a hangup achieved.
 ///
