@@ -5,6 +5,14 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 17: `LoadMessages` and `LoadChats`, answered by `DaemonMessage::Messages`
+/// and `DaemonMessage::Chats`. History is asked for rather than pushed: the
+/// attach load carries the chat list and the newest rows the daemon's own
+/// bookkeeping needs, and a front end fills a timeline when it has somewhere
+/// to draw it. A v16 daemon does not know either request and refuses both as
+/// malformed, which would leave an upgraded window with a list it can never
+/// open.
+///
 /// 16: a frame leaves out what it does not have. The empty half of a
 /// message — no reaction, no quote, no media, nothing revoked — and the
 /// optional half of a `MediaContent` are skipped on the way out and read back
@@ -79,7 +87,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

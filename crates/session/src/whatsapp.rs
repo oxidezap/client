@@ -175,6 +175,71 @@ pub type UiEventSender = Arc<Mutex<Option<mpsc::UnboundedSender<UiEvent>>>>;
 /// Shared chat-store handle (durable message history in the same SQLite file)
 pub type ChatStoreHandle = Arc<Mutex<Option<Arc<ChatStore>>>>;
 
+/// Shared handle on the session's one address book. See [`NameBook`].
+type NameBookHandle = Arc<Mutex<Option<Arc<NameBook>>>>;
+
+/// What the session's own task shares with the handle that started it.
+///
+/// One struct rather than eight parameters: every one of these is a handle
+/// the caller keeps a copy of, and a list of eight is a list nobody can read.
+struct Shared {
+    client_handle: ClientHandle,
+    calls: CallRegistry,
+    chat_store_handle: ChatStoreHandle,
+    names_handle: NameBookHandle,
+    ui_sender: UiEventSender,
+    shutdown: Arc<tokio::sync::Notify>,
+    reload: Arc<tokio::sync::Notify>,
+}
+
+/// One page of something, and where to continue.
+///
+/// `next` is a token this crate writes and this crate reads. Nothing outside
+/// it may parse one: what a page is ordered by is a fact about the store's
+/// indexes, and a caller that took the token apart would be a second
+/// implementation of that order. `None` is the end of the list — there is no
+/// position after the last row, so absence is the only honest way to say so.
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next: Option<String>,
+}
+
+/// The cursor for continuing a conversation before `message`.
+fn message_cursor(message: &oxidezap_chat_store::StoredMessage) -> String {
+    let cursor = oxidezap_chat_store::MessageCursor::from(message);
+    format!("m1:{}:{}", cursor.timestamp_ms, cursor.seq)
+}
+
+fn parse_message_cursor(token: &str) -> Option<oxidezap_chat_store::MessageCursor> {
+    let mut parts = token.strip_prefix("m1:")?.split(':');
+    Some(oxidezap_chat_store::MessageCursor {
+        timestamp_ms: parts.next()?.parse().ok()?,
+        seq: parts.next()?.parse().ok()?,
+    })
+}
+
+/// The cursor for continuing the chat list after `entry`.
+///
+/// The JID goes last and is not split on, because a device address carries a
+/// colon of its own (`5599…:57`).
+fn chat_cursor(entry: &ChatEntry) -> String {
+    let cursor = oxidezap_chat_store::ChatCursor::from(entry);
+    let pinned = cursor
+        .pinned_at_ms
+        .map_or_else(|| "-".to_string(), |t| t.to_string());
+    format!("c1:{pinned}:{}:{}", cursor.last_message_ts, cursor.jid)
+}
+
+fn parse_chat_cursor(token: &str) -> Option<oxidezap_chat_store::ChatCursor> {
+    let mut parts = token.strip_prefix("c1:")?.splitn(3, ':');
+    let pinned = parts.next()?;
+    Some(oxidezap_chat_store::ChatCursor {
+        pinned_at_ms: (pinned != "-").then(|| pinned.parse().ok()).flatten(),
+        last_message_ts: parts.next()?.parse().ok()?,
+        jid: parts.next()?.to_string(),
+    })
+}
+
 pub type ReadBoundary = (i64, Vec<(String, bool, Option<String>)>);
 
 type CallAudio = (
@@ -253,6 +318,9 @@ pub struct WhatsAppClient {
     calls: CallRegistry,
     /// Durable chat history (same SQLite file as the device store)
     chat_store: ChatStoreHandle,
+    /// The session's address book, so a page served on request names people
+    /// the way the load that produced the chat list did.
+    names: NameBookHandle,
     /// Tears down `run_client` on retry: without it the replaced client's
     /// thread would keep its runtime and SQLite pool alive forever (bot.run()
     /// reconnects internally and never returns on its own).
@@ -292,6 +360,7 @@ impl WhatsAppClient {
             ui_sender: Arc::new(Mutex::new(None)),
             calls: CallRegistry::default(),
             chat_store: Arc::new(Mutex::new(None)),
+            names: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             reload: Arc::new(tokio::sync::Notify::new()),
             worker: None,
@@ -363,6 +432,7 @@ impl WhatsAppClient {
         let ui_sender = self.ui_sender.clone();
         let calls = self.calls.clone();
         let chat_store = self.chat_store.clone();
+        let names = self.names.clone();
         let runtime = self.runtime.clone();
         let shutdown = self.shutdown.clone();
         let reload = self.reload.clone();
@@ -377,12 +447,15 @@ impl WhatsAppClient {
                     }
                     Self::run_client(
                         ui_tx,
-                        client_handle,
-                        calls,
-                        chat_store,
-                        ui_sender.clone(),
-                        shutdown,
-                        reload,
+                        Shared {
+                            client_handle,
+                            calls,
+                            chat_store_handle: chat_store,
+                            names_handle: names,
+                            ui_sender: ui_sender.clone(),
+                            shutdown,
+                            reload,
+                        },
                     )
                     .await;
                 });
@@ -399,15 +472,16 @@ impl WhatsAppClient {
     }
 
     /// Internal async function to run the client
-    async fn run_client(
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-        client_handle: ClientHandle,
-        calls: CallRegistry,
-        chat_store_handle: ChatStoreHandle,
-        ui_sender: UiEventSender,
-        shutdown: Arc<tokio::sync::Notify>,
-        reload: Arc<tokio::sync::Notify>,
-    ) {
+    async fn run_client(ui_tx: mpsc::UnboundedSender<UiEvent>, shared: Shared) {
+        let Shared {
+            client_handle,
+            calls,
+            chat_store_handle,
+            names_handle,
+            ui_sender,
+            shutdown,
+            reload,
+        } = shared;
         // Device store + durable chat history share one SQLite file (one pool,
         // one WAL writer).
         let db_path = match tokio::task::spawn_blocking(resolve_database_path).await {
@@ -445,6 +519,12 @@ impl WhatsAppClient {
         // in and the typing line above it are all naming the same person from
         // the same answer.
         let names = Arc::new(NameBook::new(chat_store_handle.clone()));
+        // Published for the paged reads, which run outside this task and have
+        // to name people the same way it does.
+        {
+            let mut guard = names_handle.lock().await;
+            *guard = Some(names.clone());
+        }
 
         let ui_tx_clone = ui_tx.clone();
         let calls_clone = calls.clone();
@@ -1598,6 +1678,114 @@ impl WhatsAppClient {
         })
     }
 
+    /// One page of a chat's messages, older than `before`.
+    ///
+    /// The read a front end makes when it opens a conversation and again when
+    /// it scrolls back through one. Hydrated exactly as the attach load
+    /// hydrates its rows — reactions, sender names — because a bubble drawn
+    /// from a page and the same bubble drawn from a load must say the same
+    /// thing.
+    ///
+    /// The cursor is this side's to write and to read: see [`Page`].
+    pub fn load_messages(
+        &self,
+        jid: String,
+        before: Option<String>,
+        limit: i64,
+    ) -> tokio::task::JoinHandle<Result<Page<ChatMessage>, String>> {
+        let chat_store = self.chat_store.clone();
+        let client_handle = self.client_handle.clone();
+        let names = self.names.clone();
+        self.runtime.spawn(async move {
+            let Some(store) = chat_store.lock().await.clone() else {
+                return Err("no chat store yet".to_string());
+            };
+            let Some(client) = client_handle.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let Some(names) = names.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let chat: Jid = jid.parse().map_err(|_| "not a chat address".to_string())?;
+            let before = before
+                .map(|cursor| parse_message_cursor(&cursor).ok_or("unreadable cursor".to_string()))
+                .transpose()?;
+
+            let limit = limit.clamp(1, Self::MESSAGE_PAGE);
+            let mut page = store
+                .messages(&chat, before, limit)
+                .await
+                .map_err(|e| e.to_string())?;
+            // A page shorter than it asked for is the start of the
+            // conversation: there is nothing older to name a cursor with.
+            let next = ((page.len() as i64) == limit)
+                .then(|| page.last().map(message_cursor))
+                .flatten();
+            page.reverse(); // the store returns newest-first; a timeline is drawn the other way
+            let mut messages: Vec<ChatMessage> =
+                page.into_iter().map(stored_to_chat_message).collect();
+            Self::hydrate_reactions(&store, &client, &names, &chat, &mut messages).await;
+            if chat.is_group() || chat.is_status_broadcast() {
+                Self::hydrate_sender_names(
+                    &store,
+                    &client,
+                    &mut messages,
+                    &names,
+                    chat.is_status_broadcast(),
+                )
+                .await;
+            }
+            Ok(Page {
+                items: messages,
+                next,
+            })
+        })
+    }
+
+    /// One page of the chat list, after `after`.
+    ///
+    /// Rows, not conversations: each carries the newest message the list
+    /// previews from and nothing else. What a front end does with the rest of
+    /// a chat is ask for it.
+    pub fn load_chats(
+        &self,
+        after: Option<String>,
+        limit: i64,
+    ) -> tokio::task::JoinHandle<Result<Page<oxidezap_core::Chat>, String>> {
+        let chat_store = self.chat_store.clone();
+        let client_handle = self.client_handle.clone();
+        let names = self.names.clone();
+        self.runtime.spawn(async move {
+            let Some(store) = chat_store.lock().await.clone() else {
+                return Err("no chat store yet".to_string());
+            };
+            let Some(client) = client_handle.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let Some(names) = names.lock().await.clone() else {
+                return Err("no session yet".to_string());
+            };
+            let after = after
+                .map(|cursor| parse_chat_cursor(&cursor).ok_or("unreadable cursor".to_string()))
+                .transpose()?;
+
+            let limit = limit.clamp(1, Self::CHAT_PAGE);
+            let entries = store
+                .chats_page(false, after, limit)
+                .await
+                .map_err(|e| e.to_string())?;
+            let next = ((entries.len() as i64) == limit)
+                .then(|| entries.last().map(chat_cursor))
+                .flatten();
+            // One message each: the row and its preview. Whatever else a
+            // conversation holds is what `load_messages` is for.
+            let chats = Self::hydrate_entries(&store, &client, &names, entries, |_| 1)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Page { items: chats, next })
+        })
+    }
+
     /// Ask for a full history reload.
     ///
     /// For a front end that has just attached: nothing in the store has
@@ -2170,7 +2358,30 @@ fn apply_status_views(chats: &mut [oxidezap_core::Chat], watched: &HashSet<Strin
 
 impl WhatsAppClient {
     const HISTORY_CHAT_LIMIT: i64 = 100;
-    const HISTORY_MESSAGES_PER_CHAT: i64 = 50;
+    /// One page of a conversation, for a front end that asked for one.
+    ///
+    /// The number WhatsApp Web's own on-demand history request uses
+    /// (`history_sync_on_demand_message_count`), and near enough to a screenful
+    /// of bubbles that scrolling back asks again rather than stalling.
+    pub const MESSAGE_PAGE: i64 = 50;
+    /// One page of the chat list.
+    ///
+    /// WA Web's `web_init_chat_batch_size`, and the same number the list has
+    /// always loaded at once.
+    pub const CHAT_PAGE: i64 = 100;
+    /// How many of a chat's newest messages the attach load carries.
+    ///
+    /// Not a timeline — a front end asks for that when it has somewhere to
+    /// draw it. What stays is what this side needs to do its own job: the
+    /// newest row, which the chat list draws its preview from, and the unread
+    /// tail, which is the set of receipts a read owes and the second a read is
+    /// bounded by. A chat nobody has an unread message in needs almost
+    /// nothing; the floor is there so an ordinary same-second burst is
+    /// covered rather than truncated.
+    const ATTACH_FLOOR: i64 = 8;
+    /// And no more than a page, however many are unread: past that the front
+    /// end is asking for history anyway.
+    const ATTACH_CEILING: i64 = 50;
     /// Quiet window before reloading: one history-sync chunk commits as many
     /// write batches, each emitting a change; reload once per burst.
     const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
@@ -2336,13 +2547,36 @@ impl WhatsAppClient {
                 }
             }
         }
+        let chats =
+            Self::hydrate_entries(chat_store, client, names, entries, Self::attach_page).await?;
+        Ok((chats, complete))
+    }
+
+    /// Turn store rows into the chats a front end draws.
+    ///
+    /// The shared half of every read that produces chats: one page per chat
+    /// in one read, the PN/LID collapse, reactions, sender names, the unread
+    /// tail and the preview. `page_for` says how many messages each chat's
+    /// page carries, because the two callers want different amounts — an
+    /// attach carries what this side needs of a chat, a list page carries the
+    /// row and nothing else.
+    async fn hydrate_entries(
+        chat_store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        names: &NameBook,
+        entries: Vec<ChatEntry>,
+        page_for: impl Fn(&ChatEntry) -> i64,
+    ) -> Result<Vec<oxidezap_core::Chat>, oxidezap_chat_store::ChatStoreError> {
         // Every chat's page in one read, before the loop that needs them: the
         // per-chat call is a permit, a blocking task and a transaction each,
         // and an attaching front end asks for a hundred of them at once.
+        // Sized per chat by what this side needs of it — see `attach_page`.
         let mut pages = chat_store
             .pages(
-                entries.iter().map(|entry| entry.jid.clone()).collect(),
-                Self::HISTORY_MESSAGES_PER_CHAT,
+                entries
+                    .iter()
+                    .map(|entry| (entry.jid.clone(), page_for(entry)))
+                    .collect(),
             )
             .await?;
         let mut chats: Vec<oxidezap_core::Chat> = Vec::with_capacity(entries.len());
@@ -2457,7 +2691,21 @@ impl WhatsAppClient {
         // above, because the alias merge re-marks rows unread from the chat
         // it merges into and would undo a fix applied before it.
         apply_status_views(&mut chats, &status_views);
-        Ok((chats, complete))
+        Ok(chats)
+    }
+
+    /// How many of one chat's newest messages the attach load carries.
+    ///
+    /// The unread tail, because those are the receipts a read owes and the
+    /// second it is bounded by, with a floor that covers a same-second burst
+    /// and the newest row the list previews from. The status broadcast is the
+    /// exception: its feed *is* those rows — there is no conversation to open
+    /// that would ask for more — so it keeps a whole page.
+    fn attach_page(entry: &ChatEntry) -> i64 {
+        if entry.jid.to_non_ad_string() == oxidezap_core::STATUS_BROADCAST_JID {
+            return Self::MESSAGE_PAGE;
+        }
+        i64::from(entry.unread_count.max(0)).clamp(Self::ATTACH_FLOOR, Self::ATTACH_CEILING)
     }
 
     /// Every storage key the invalidated chats are held under.
@@ -3091,8 +3339,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ChatStore, Client, MuteLane, NameBook, ReadBoundary, ReloadScope, SqliteStore, StoreChange,
-        WhatsAppClient, apply_status_views, media_metadata, merge_alias_history_messages,
+        ChatEntry, ChatStore, Client, MuteLane, NameBook, ReadBoundary, ReloadScope, SqliteStore,
+        StoreChange, WhatsAppClient, apply_status_views, chat_cursor, media_metadata,
+        merge_alias_history_messages, message_cursor, parse_chat_cursor, parse_message_cursor,
         read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
@@ -3560,5 +3809,79 @@ mod tests {
             "the chat it was asked about, page or no page"
         );
         assert_eq!(chats[0].messages.len(), 1);
+    }
+
+    /// A cursor is this crate's to write and to read, and the only thing that
+    /// makes that safe is that the two agree.
+    #[test]
+    fn a_message_cursor_survives_the_round_trip() {
+        let mut row = oxidezap_chat_store::StoredMessage {
+            chat_jid: "5599000000001@s.whatsapp.net".parse().unwrap(),
+            id: "3EB0".to_string(),
+            sender_jid: "5599000000001@s.whatsapp.net".parse().unwrap(),
+            from_me: false,
+            timestamp: whatsapp_rust::wacore::time::from_millis(1_700_000_000_123).unwrap(),
+            kind: oxidezap_chat_store::MessageKind::Text,
+            text: Some("olá".to_string()),
+            message: None,
+            status: oxidezap_chat_store::MessageStatus::Delivered,
+            revoked: false,
+            edited_at: None,
+            starred: false,
+            seq: 4242,
+        };
+        let token = message_cursor(&row);
+        assert_eq!(token, "m1:1700000000123:4242");
+        let cursor = parse_message_cursor(&token).expect("reads back");
+        assert_eq!(cursor.timestamp_ms, 1_700_000_000_123);
+        assert_eq!(cursor.seq, 4242);
+
+        // A page boundary inside a same-second run is exactly what the seq is
+        // for: two rows with one timestamp are two positions.
+        row.seq = 4243;
+        assert_ne!(message_cursor(&row), token);
+
+        assert!(
+            parse_message_cursor("c1:-:1:a@s.whatsapp.net").is_none(),
+            "not this list's"
+        );
+        assert!(parse_message_cursor("m1:notanumber:1").is_none());
+        assert!(parse_message_cursor("").is_none());
+    }
+
+    /// The address goes last and is not split on: a device JID carries a
+    /// colon of its own, and a cursor that lost the tail of one would page
+    /// from a chat that does not exist.
+    #[test]
+    fn a_chat_cursor_keeps_an_address_with_a_colon_in_it() {
+        let entry = ChatEntry {
+            jid: "5599000000001:57@s.whatsapp.net".parse().unwrap(),
+            name: None,
+            last_message_at: Some(
+                whatsapp_rust::wacore::time::from_millis(1_700_000_000_123).unwrap(),
+            ),
+            last_message_preview: None,
+            last_message_kind: None,
+            unread_count: 0,
+            pinned_at: Some(whatsapp_rust::wacore::time::from_millis(1_699_999_999_000).unwrap()),
+            muted_until: None,
+            archived: false,
+            ephemeral_expiration: None,
+        };
+        let token = chat_cursor(&entry);
+        assert_eq!(
+            token,
+            "c1:1699999999000:1700000000123:5599000000001:57@s.whatsapp.net"
+        );
+        let cursor = parse_chat_cursor(&token).expect("reads back");
+        assert_eq!(cursor.pinned_at_ms, Some(1_699_999_999_000));
+        assert_eq!(cursor.last_message_ts, 1_700_000_000_123);
+        assert_eq!(cursor.jid, "5599000000001:57@s.whatsapp.net");
+
+        // The unpinned run, which is where most of the list lives.
+        let plain = parse_chat_cursor("c1:-:1700000000123:5599000000001@s.whatsapp.net")
+            .expect("reads back");
+        assert_eq!(plain.pinned_at_ms, None);
+        assert_eq!(plain.jid, "5599000000001@s.whatsapp.net");
     }
 }

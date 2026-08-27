@@ -86,45 +86,7 @@ impl WhatsAppApp {
                     .filter(|message| message.is_read)
                     .map(|message| message.id.clone())
                     .collect();
-                for chat in chats {
-                    // Later loads (post-HistorySync re-hydration) fold into
-                    // chats the UI already shows instead of being dropped.
-                    match self.chats.iter_mut().find(|c| c.jid == chat.jid) {
-                        Some(existing) => {
-                            let jid = chat.jid.clone();
-                            existing.merge_history(chat);
-                            // The chat *on screen* was read locally the
-                            // moment the message arrived; the store row
-                            // commits with the unread bump before our receipt
-                            // lands, so the hydrated counter must not
-                            // resurrect the badge. On screen, not selected —
-                            // the same distinction the live arrival makes, and
-                            // for the same reason: a reload while the reader
-                            // is in Status would otherwise clear the badge of
-                            // a conversation nobody was looking at.
-                            if self.visible_chat.as_deref() == Some(jid.as_str()) {
-                                existing.mark_as_read();
-                            }
-                            // The read a snapshot row could not bound. Spent
-                            // here because this is the load that gave it a
-                            // message to name; see `owed_reads`.
-                            if self.owed_reads.contains(&jid)
-                                && let Some(newest) = newest_shared_message(existing)
-                            {
-                                self.owed_reads.remove(&jid);
-                                if let Some(client) = &self.client {
-                                    info!(
-                                        "Marking {} read, now that it has messages",
-                                        observe_str(&jid)
-                                    );
-                                    client.mark_chat_read(&jid, Some(newest));
-                                }
-                            }
-                            self.invalidate_message_cache(&jid);
-                        }
-                        None => self.chats.push(chat),
-                    }
-                }
+                self.merge_chats(chats);
                 self.chats
                     .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
                 // A selection that no longer names a chat is a selection of

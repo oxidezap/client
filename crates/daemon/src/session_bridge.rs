@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use oxidezap_core::{CallOutcome, Chat, ChatMessage, MediaContent, UiEvent};
 use oxidezap_ipc::{
     CallAction, ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, MessagePreview,
-    PairingCode, RequestId,
+    PageCursor, PairingCode, RequestId,
 };
 use oxidezap_session::{ReadBoundary, WhatsAppClient};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -71,6 +71,24 @@ pub enum Action {
     /// Reload the whole history, for a front end that has just attached and
     /// holds nothing.
     ReloadHistory,
+    /// One page of a chat's messages, answered on `answer_to`.
+    ///
+    /// Addressed like a download rather than published: a page is a position
+    /// in one front end's view of one conversation.
+    LoadMessages {
+        id: RequestId,
+        jid: String,
+        before: Option<PageCursor>,
+        limit: Option<u32>,
+        answer_to: Outbox,
+    },
+    /// One page of the chat list, answered on `answer_to`.
+    LoadChats {
+        id: RequestId,
+        after: Option<PageCursor>,
+        limit: Option<u32>,
+        answer_to: Outbox,
+    },
     /// Wipe local state so the user can pair again. The daemon owns the store
     /// file, so it is the only process that may delete it.
     ForgetSession,
@@ -90,9 +108,17 @@ impl Action {
     /// exactly the views taken while offline, and there is no retry — the
     /// window has already drawn the ring as watched.
     pub fn needs_network(&self) -> bool {
+        // Reading a page is the same kind of thing as reloading history: it
+        // is a query against the local store, and a window scrolling back
+        // through a conversation it already has is not something to refuse
+        // because the network is down.
         !matches!(
             self,
-            Self::ReloadHistory | Self::ForgetSession | Self::MarkStatusWatched { .. }
+            Self::ReloadHistory
+                | Self::ForgetSession
+                | Self::MarkStatusWatched { .. }
+                | Self::LoadMessages { .. }
+                | Self::LoadChats { .. }
         )
     }
 }
@@ -744,6 +770,82 @@ impl Bridge {
                 client.reload_history();
                 CommandOutcome::Accepted
             }
+            // Awaited here rather than spawned, unlike a download: this is a
+            // page of local rows, which is milliseconds of SQLite, and what
+            // comes back has to be folded into this side's own state before
+            // it is sent. `MarkStatusWatched` waits on its write for the same
+            // reason.
+            Action::LoadMessages {
+                id,
+                jid,
+                before,
+                limit,
+                answer_to,
+            } => {
+                let page = client
+                    .load_messages(
+                        jid.clone(),
+                        before.map(|cursor| cursor.as_str().to_string()),
+                        limit.map_or(WhatsAppClient::MESSAGE_PAGE, i64::from),
+                    )
+                    .await;
+                let answer = match page {
+                    Ok(Ok(page)) => {
+                        // What this side served, it now knows. A read is
+                        // bounded by the messages the daemon has observed, and
+                        // the page a front end asked for is the history it is
+                        // about to read: without this, a window naming a
+                        // message from a page nobody told the daemon about is
+                        // refused, and the badge comes back on the next
+                        // hydration.
+                        for message in &page.items {
+                            self.reads.observe_message(&jid, message);
+                        }
+                        Ok(DaemonMessage::Messages {
+                            id,
+                            jid,
+                            messages: page.items,
+                            next: page.next.map(PageCursor::new),
+                        })
+                    }
+                    Ok(Err(detail)) => Err(detail),
+                    Err(_) => Err("the session stopped before the page arrived".to_string()),
+                };
+                let _ = answer_to.try_send(answered(id, answer));
+                CommandOutcome::Accepted
+            }
+            Action::LoadChats {
+                id,
+                after,
+                limit,
+                answer_to,
+            } => {
+                let page = client
+                    .load_chats(
+                        after.map(|cursor| cursor.as_str().to_string()),
+                        limit.map_or(WhatsAppClient::CHAT_PAGE, i64::from),
+                    )
+                    .await;
+                let answer = match page {
+                    Ok(Ok(page)) => {
+                        // The same rule. A chat past the attach window is in
+                        // no snapshot, and a read for one is refused with "no
+                        // such chat" until this side has been told it exists.
+                        for chat in &page.items {
+                            self.hub.apply(chat_updated(chat, &mut self.reads));
+                        }
+                        Ok(DaemonMessage::Chats {
+                            id,
+                            chats: page.items,
+                            next: page.next.map(PageCursor::new),
+                        })
+                    }
+                    Ok(Err(detail)) => Err(detail),
+                    Err(_) => Err("the session stopped before the page arrived".to_string()),
+                };
+                let _ = answer_to.try_send(answered(id, answer));
+                CommandOutcome::Accepted
+            }
             // Deferred rather than done here, because the file to delete is
             // the one the session still has open. The event loop already ends
             // by disconnecting and closing SQLite; the wipe belongs after
@@ -1149,6 +1251,20 @@ fn downloaded(id: RequestId, result: Result<String, String>) -> String {
         .unwrap_or_else(|e| format!(r#"{{"type":"error","error":"malformed","detail":"{e}"}}"#))
 }
 
+/// One answer to a request that carried its own result.
+///
+/// Success is the frame; failure is the error frame every other request gets,
+/// under the same id. Neither shape can fail to serialize; spelling the
+/// fallback out beats an unwrap in a spawned task.
+fn answered(id: RequestId, result: Result<DaemonMessage, String>) -> String {
+    let frame = result.unwrap_or_else(|detail| DaemonMessage::Error {
+        id: Some(id),
+        error: oxidezap_ipc::ProtocolError::Refused { detail },
+    });
+    serde_json::to_string(&frame)
+        .unwrap_or_else(|e| format!(r#"{{"type":"error","error":"malformed","detail":"{e}"}}"#))
+}
+
 /// A frame that is news rather than state, if this event is one.
 ///
 /// Kept apart from `translate` because nothing here changes what a snapshot
@@ -1429,6 +1545,20 @@ impl ReadTracker {
             }
             _ => {}
         }
+    }
+
+    /// Fold in one message of a page this daemon served.
+    ///
+    /// The same bookkeeping an event does, for history that reached a front
+    /// end without passing through the event stream. A page is what a window
+    /// is about to read, and a read is bounded by what this side has seen: a
+    /// window naming a message from a page nobody told the daemon about is
+    /// refused, and the badge comes back on the next hydration.
+    fn observe_message(&mut self, jid: &str, message: &ChatMessage) {
+        self.chats
+            .entry(jid.to_string())
+            .or_default()
+            .observe(message);
     }
 
     /// Where a read action for `jid` must stop, if the daemon knows.

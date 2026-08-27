@@ -285,7 +285,12 @@ profile here repeats it deliberately.
   row every one of those moves and an append does not. A row can also change
   height with the count standing still — an image arrives, a reaction lands,
   a send fails and grows a retry button — which the `build` number answers.
-  The three outcomes are splice, remeasure and reset.
+  The four outcomes are splice at the end, splice at the *front*, remeasure
+  and reset — and the second is what a page of older history is: the last row
+  is still the last row, everything measured is still there one page further
+  down, and a bottom-anchored list is unmoved by that. Reset instead, and a
+  reader who scrolled back far enough to ask for more was thrown to the newest
+  message for asking.
 - **What a frame leaves out, its reader fills in.** The wire is
   newline-delimited JSON and a history load is a hundred chats of fifty rows,
   most of whose fields are empty — no reaction, no quote, no media, nothing
@@ -339,8 +344,30 @@ profile here repeats it deliberately.
   five thousand reads, most of them spent learning that a message has no
   reactions. `ChatStore::reactions_for` and `ChatStore::pages` are the batch
   shapes, and the single-row `reactions` is a page of one so there is one
-  statement to keep right. Measured by `history_hydration_costs`, which is
-  ignored by default because it is a stopwatch.
+  statement to keep right. `pages` takes a limit *per chat* rather than one
+  for all of them, because a load that serves a chat list wants the newest row
+  of most chats and the unread tail of a few. Measured by
+  `history_hydration_costs`, which is ignored by default because it is a
+  stopwatch.
+- **History is asked for, not pushed.** The attach load carries the chat list
+  and, per chat, only what the *daemon* needs of it: the newest row the list
+  previews from and the unread tail, which is the set of receipts a read owes
+  and the second it is bounded by (`attach_page`, floored so an ordinary
+  same-second burst is covered). A timeline is a page a front end asks for
+  when it has somewhere to draw it — `LoadMessages` on opening a conversation
+  and again as the reader nears its top, `LoadChats` as the sidebar nears its
+  end. WhatsApp Web sizes it the same way and preloads neither
+  (`web_preload_chat_messages`, `web_init_chat_batch_size`,
+  `history_sync_on_demand_message_count`).
+  Two rules keep it honest. A cursor is **opaque** — what a page is ordered by
+  is the store's business, and a front end that parsed one would be a second
+  implementation of that order — so `PageCursor` is a token the daemon writes
+  and reads, and `session/whatsapp.rs` is where it is spelled. And the daemon
+  **learns from what it serves**: a page of messages is folded into
+  `ReadTracker` and a page of chats into the hub on the way out, because a
+  read is bounded by what this side has observed and a chat past the attach
+  window is otherwise in no snapshot — a window naming either would be refused
+  for naming something the daemon has never heard of.
 - **The reload debounce is for bursts, not for askers.** A history sync commits
   many batches and each emits a change; the quiet window folds them into one
   load. A front end that asked outright is not a burst — it holds nothing, it

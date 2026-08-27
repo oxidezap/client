@@ -18,10 +18,12 @@ use std::sync::{Arc, Mutex};
 
 use chrono::DateTime;
 use log::{debug, error, info, warn};
-use oxidezap_core::{CallState, Chat, DownloadableMedia, MediaContent, QuotedMessage, UiEvent};
+use oxidezap_core::{
+    CallState, Chat, ChatMessage, DownloadableMedia, MediaContent, QuotedMessage, UiEvent,
+};
 use oxidezap_ipc::{
     CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, Endpoint,
-    PROTOCOL_VERSION, Reader, Request, RequestId, StateSnapshot, StateVersion, Writer,
+    PROTOCOL_VERSION, PageCursor, Reader, Request, RequestId, StateSnapshot, StateVersion, Writer,
     endpoint_path, media_path,
 };
 use portable_atomic::AtomicU64;
@@ -65,6 +67,32 @@ pub enum FromDaemon {
     Account(Option<oxidezap_ipc::AccountIdentity>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
+    /// One page of a conversation, for the timeline that asked for it.
+    ///
+    /// Older rows than the window holds, or the first ones it has: which of
+    /// the two is the *window's* business, because the cursor it asked with
+    /// is the position it is filling in.
+    Messages {
+        jid: String,
+        messages: Vec<ChatMessage>,
+        /// Where to continue, or `None` at the start of the conversation.
+        next: Option<PageCursor>,
+    },
+    /// One page of the chat list, for the list that asked for it.
+    Chats {
+        chats: Vec<Chat>,
+        /// Where to continue, or `None` at the end of the list.
+        next: Option<PageCursor>,
+    },
+    /// A page that never arrived, so whoever is waiting can stop waiting.
+    ///
+    /// Named by what was asked for rather than carrying an error: a timeline
+    /// that keeps a request in flight forever is one that never asks again,
+    /// which is worse than an empty page.
+    PageLost {
+        /// The conversation, or `None` for a page of the chat list.
+        jid: Option<String>,
+    },
     /// A status view the daemon did not record after all.
     ///
     /// The ring was taken down the moment the update was opened, before the
@@ -102,6 +130,12 @@ enum Awaiting {
     StatusView {
         message_ids: Vec<String>,
     },
+    /// A page of history. The timeline holds a request in flight so it does
+    /// not ask twice for the same one, and a refusal is what releases it.
+    Page {
+        /// The conversation, or `None` for a page of the chat list.
+        jid: Option<String>,
+    },
 }
 
 impl Awaiting {
@@ -116,6 +150,9 @@ impl Awaiting {
             // A drawn message is never abandoned: the bubble stays on screen
             // until something resolves it.
             Self::Send { .. } => false,
+            // Nor is a page: the view that asked for it is holding a request
+            // open and only an answer closes it.
+            Self::Page { .. } => false,
         }
     }
 
@@ -152,6 +189,14 @@ impl Awaiting {
                             message_id: local_id,
                             reason: detail.to_string(),
                         })));
+                }
+            }
+            // The view that asked is waiting on this and will not ask again
+            // until it hears something.
+            Self::Page { jid } => {
+                log::warn!("a page of history did not arrive: {detail}");
+                if let Some(events) = events {
+                    let _ = events.blocking_send(FromDaemon::PageLost { jid });
                 }
             }
             // The ring is already down over these. Nothing durable exists, so
@@ -455,6 +500,35 @@ impl Session {
     /// to find its way back to the update it was about. Without an id the
     /// daemon's answer is an uncorrelated log line, and the ring stays down
     /// over a view nothing recorded.
+    /// Ask for one page of a conversation, older than `before`.
+    ///
+    /// `None` asks for the newest page, which is what opening a chat wants;
+    /// the cursor from the last answer asks for what came before it. The page
+    /// arrives as [`FromDaemon::Messages`], and a refusal as
+    /// [`FromDaemon::PageLost`] — the view is holding a request open either
+    /// way, and only an answer releases it.
+    pub fn load_messages(&self, jid: String, before: Option<PageCursor>) {
+        self.ask(
+            ClientRequest::LoadMessages {
+                jid: jid.clone(),
+                before,
+                // The daemon's own page size, which is the one number that
+                // has to match the store's indexes: a front end with an
+                // opinion about it would be guessing.
+                limit: None,
+            },
+            Awaiting::Page { jid: Some(jid) },
+        );
+    }
+
+    /// Ask for one page of the chat list, after `after`.
+    pub fn load_chats(&self, after: Option<PageCursor>) {
+        self.ask(
+            ClientRequest::LoadChats { after, limit: None },
+            Awaiting::Page { jid: None },
+        );
+    }
+
     pub fn mark_status_watched(&self, message_ids: Vec<String>) {
         if message_ids.is_empty() {
             return;
@@ -633,6 +707,45 @@ fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pend
                 load_media(&mut event);
                 if events
                     .blocking_send(FromDaemon::Session(Box::new(event)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(DaemonMessage::Messages {
+                id,
+                jid,
+                mut messages,
+                next,
+            }) => {
+                if take_pending(pending, id).is_none() {
+                    debug!("a page arrived for {id}, which nobody is waiting on");
+                    continue;
+                }
+                // On this thread rather than the window's, for the same reason
+                // a history load fills its media here: a page names photos,
+                // and reading them is I/O.
+                for message in &mut messages {
+                    fill(&mut message.media);
+                }
+                if events
+                    .blocking_send(FromDaemon::Messages {
+                        jid,
+                        messages,
+                        next,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(DaemonMessage::Chats { id, chats, next }) => {
+                if take_pending(pending, id).is_none() {
+                    debug!("a chat page arrived for {id}, which nobody is waiting on");
+                    continue;
+                }
+                if events
+                    .blocking_send(FromDaemon::Chats { chats, next })
                     .is_err()
                 {
                     break;
