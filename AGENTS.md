@@ -306,6 +306,13 @@ profile here repeats it deliberately.
   `an_omitted_field_comes_back_as_what_it_was` is there to hold. It is also
   why these types travel one way only — nothing in `ClientRequest` carries a
   `ChatMessage` — so a sparse frame is never handed to an older reader.
+- **An answer nobody delivered is a request nobody answered.** A connection's
+  outbox is bounded, and a page or a download dropped into a full one leaves
+  the asking view waiting on it forever — the front end keeps the request in
+  `pending` and its list never asks again. Nothing may block on that queue
+  either, because the caller is the bridge and the session waits on it, so
+  `answer_now` hands a full outbox to a task that waits on the connection's
+  own writer. A frame is dropped only when the connection is gone.
 - **A daemon frame is either state or news, and they use different channels.**
   State carries a version and is recoverable from a snapshot; a window request
   or a failed send is neither, so it must not ride a channel a client stops
@@ -366,8 +373,10 @@ profile here repeats it deliberately.
   `history_sync_on_demand_message_count`).
   A list that has reached its end has only reached the end of what the store
   holds *now*: a history sync commits over minutes, so `Paging::Done` keeps
-  the cursor it last asked with and a complete load reopens it
-  (`reopen_finished_pages`) — the rows that arrive are older than everything
+  the cursor it last asked with and *any* history load reopens it
+  (`reopen_finished_pages`) — not a complete one, which is a load that
+  returned fewer chats than it asked for and so is a load an account of a
+  hundred chats never gets — the rows that arrive are older than everything
   fetched, which is exactly where that cursor points. And an empty list is at
   its end like any other, so the frame asks on the sidebar's behalf when a
   filter matches nothing: the virtual list that would have asked is not built

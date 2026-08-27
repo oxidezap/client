@@ -814,7 +814,7 @@ impl Bridge {
                     Ok(Err(detail)) => Err(detail),
                     Err(_) => Err("the session stopped before the page arrived".to_string()),
                 };
-                let _ = answer_to.try_send(answered(id, answer));
+                answer_now(&answer_to, answered(id, answer));
                 CommandOutcome::Accepted
             }
             Action::LoadChats {
@@ -857,7 +857,7 @@ impl Bridge {
                     Ok(Err(detail)) => Err(detail),
                     Err(_) => Err("the session stopped before the page arrived".to_string()),
                 };
-                let _ = answer_to.try_send(answered(id, answer));
+                answer_now(&answer_to, answered(id, answer));
                 CommandOutcome::Accepted
             }
             // Deferred rather than done here, because the file to delete is
@@ -887,7 +887,7 @@ impl Bridge {
         // Already here: the same media shared into two chats, or a front end
         // that restarted. No network, no permit, no wait.
         if crate::media::has(&key) {
-            let _ = answer_to.try_send(downloaded(id, Ok(key)));
+            answer_now(&answer_to, downloaded(id, Ok(key)));
             return CommandOutcome::Accepted;
         }
 
@@ -902,9 +902,9 @@ impl Bridge {
                 // The session went away mid-download.
                 Err(_) => Err("the session stopped before the download finished".to_string()),
             };
-            // `try_send` rather than `send`: a client that has stopped reading
-            // its own answers must not park this task forever.
-            let _ = answer_to.try_send(downloaded(id, result));
+            // The same rule as a page: an answer nobody delivered leaves the
+            // asker waiting on it forever. See `answer_now`.
+            answer_now(&answer_to, downloaded(id, result));
             drop(permit);
         });
         CommandOutcome::Accepted
@@ -1256,6 +1256,27 @@ fn cache_media(cache_epoch: usize, message_id: &str, media: &mut Option<MediaCon
         // download it also is. A cache that cannot be written is not a reason
         // to drop a conversation.
         Err(e) => log::warn!("could not cache media for a message: {e}"),
+    }
+}
+
+/// Hand one answer to the connection that asked for it, without dropping it
+/// and without parking this task.
+///
+/// A connection's outbox is bounded, and a request answered into a full one
+/// is a request that is never answered at all: the front end keeps it in
+/// `pending` and the view that asked keeps waiting, so a page nobody delivered
+/// is a list that never asks again. Nothing here may block on that queue
+/// either — the caller is the bridge, and the whole session waits on it — so a
+/// full outbox is handed to a task that waits on the connection's own writer.
+/// The frame is dropped only when the connection itself is gone, which is the
+/// one case where there is nobody left to tell.
+fn answer_now(answer_to: &Outbox, frame: String) {
+    use tokio::sync::mpsc::error::TrySendError;
+    if let Err(TrySendError::Full(frame)) = answer_to.try_send(frame) {
+        let outbox = answer_to.clone();
+        tokio::spawn(async move {
+            let _ = outbox.send(frame).await;
+        });
     }
 }
 

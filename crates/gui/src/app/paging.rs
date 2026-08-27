@@ -237,14 +237,27 @@ impl WhatsAppApp {
 
     /// Ask the finished lists again, because the store has more to give.
     ///
-    /// Called where a complete load says the store's own answer changed: a
-    /// history sync commits its batches over minutes, so a conversation that
-    /// ended before the sync did did not really end there. Only settled ends
-    /// move — a list still waiting on a page is untouched, and one with a
-    /// cursor already asks for itself.
-    pub(super) fn reopen_finished_pages(&mut self) {
-        for paging in self.timeline_pages.values_mut() {
-            *paging = paging.reopened();
+    /// Called on *any* history load, not only a complete one: a load is
+    /// complete when it returned fewer chats than it asked for, so an account
+    /// with a hundred of them never sees one, and gating this on that gated
+    /// it out of existence for exactly the accounts that page. A history sync
+    /// commits its batches over minutes, so a conversation that ended before
+    /// the sync did did not really end there.
+    ///
+    /// Reopening costs nothing on its own: a settled end becomes a position
+    /// again, and a position is only asked from when a reader is at that end
+    /// of the list. Only settled ends move — a list still waiting on a page is
+    /// untouched, and one with a cursor already asks for itself.
+    ///
+    /// `loaded` are the chats the load carried, which is what a scoped reload
+    /// says changed. The chat list itself reopens either way: a load naming
+    /// chats is one the store answered, and whether it could also have grown
+    /// the list is not something the event says.
+    pub(super) fn reopen_finished_pages(&mut self, loaded: &[String]) {
+        for jid in loaded {
+            if let Some(paging) = self.timeline_pages.get_mut(jid) {
+                *paging = paging.reopened();
+            }
         }
         self.chat_pages = self.chat_pages.reopened();
     }
