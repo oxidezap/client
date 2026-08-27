@@ -205,6 +205,10 @@ impl Session {
         session.send(ClientRequest::Hello {
             protocol: PROTOCOL_VERSION,
             session_events: true,
+            // Said rather than left to the default: this is the client the
+            // daemon's `ShowWindow` is for, and a front end that stays quiet
+            // about it is one the daemon has to guess about.
+            has_window: true,
         })?;
 
         let pending = Arc::clone(&session.pending);

@@ -428,6 +428,11 @@ where
     // branch below ends the connection on one.
     let mut sessions = attached.session_events.then(|| hub.subscribe_sessions());
 
+    // Held for the connection's whole life, so the count falls again however
+    // this task ends. What it answers is "is there a window to raise": see
+    // `crate::window::show`.
+    let _window = attached.has_window.then(|| hub.attach_window());
+
     // Frames addressed to this connection alone: a download's answer belongs
     // to whoever asked, and the ids are client-chosen.
     let (outbox, mut inbox) = tokio::sync::mpsc::channel::<String>(OUTBOX_CAPACITY);
@@ -627,6 +632,8 @@ struct Attached {
     /// Whether this client wants the session's own events as well as
     /// summaries. See [`ClientRequest::Hello`].
     session_events: bool,
+    /// Whether this client owns a window. See [`ClientRequest::Hello`].
+    has_window: bool,
 }
 
 /// Validate the client's opening frame.
@@ -643,7 +650,11 @@ fn check_hello(line: &str) -> Result<Attached, Option<String>> {
         ClientRequest::Hello {
             protocol,
             session_events,
-        } if protocol == PROTOCOL_VERSION => Ok(Attached { session_events }),
+            has_window,
+        } if protocol == PROTOCOL_VERSION => Ok(Attached {
+            session_events,
+            has_window,
+        }),
         ClientRequest::Hello { protocol, .. } => Err(error_frame(
             id,
             ProtocolError::VersionMismatch {
@@ -954,6 +965,7 @@ mod tests {
         serde_json::to_string(&ClientRequest::Hello {
             protocol,
             session_events,
+            has_window: true,
         })
         .unwrap()
     }
@@ -963,7 +975,34 @@ mod tests {
         assert_eq!(
             check_hello(&hello(PROTOCOL_VERSION, false)),
             Ok(Attached {
-                session_events: false
+                session_events: false,
+                has_window: true
+            })
+        );
+    }
+
+    /// Whether there is a window to raise is the client's to say, and a
+    /// client that says nothing is one: every client today is a front end,
+    /// and a build predating the field is likelier than a headless tool. See
+    /// [`ClientRequest::Hello`].
+    #[test]
+    fn a_client_is_a_window_unless_it_says_otherwise() {
+        let silent = format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION}}}"#);
+        assert_eq!(
+            check_hello(&silent),
+            Ok(Attached {
+                session_events: false,
+                has_window: true
+            })
+        );
+
+        let watcher =
+            format!(r#"{{"request":"hello","protocol":{PROTOCOL_VERSION},"has_window":false}}"#);
+        assert_eq!(
+            check_hello(&watcher),
+            Ok(Attached {
+                session_events: false,
+                has_window: false
             })
         );
     }
@@ -975,7 +1014,8 @@ mod tests {
         assert_eq!(
             check_hello(&hello(PROTOCOL_VERSION, true)),
             Ok(Attached {
-                session_events: true
+                session_events: true,
+                has_window: true
             })
         );
         // An older client that does not know the field at all still connects,
@@ -984,7 +1024,8 @@ mod tests {
         assert_eq!(
             check_hello(&line),
             Ok(Attached {
-                session_events: false
+                session_events: false,
+                has_window: true
             })
         );
     }

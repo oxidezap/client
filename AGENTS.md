@@ -81,10 +81,13 @@ profile here repeats it deliberately.
   has nobody to relay `ShowWindow` to and starts one instead (`daemon/window.rs`,
   the mirror of `session::connect_or_start`, down to looking beside its own
   binary first). Asking first and launching only what nobody answered is what
-  keeps it from opening a second window over a live one. The one front end
-  name the daemon has to know is also the one thing worth overriding, so
-  `OXIDEZAP_FRONT_END` names another — a TUI, a second GUI — and the shipped
-  pair is only the default.
+  keeps it from opening a second window over a live one — and who *has* one
+  is said in the hello (`has_window`), not counted off the signal channel:
+  every client reads that channel, so a TUI or a notifier would otherwise
+  stand in for a window that is not there. The one front end name the daemon
+  has to know is also the one thing worth overriding, so `OXIDEZAP_FRONT_END`
+  names another — a TUI, a second GUI — and the shipped pair is only the
+  default.
 - **Calls ring in the daemon.** `oxidezap-session` is what opens the mic and
   speaker, so the process that owns the session owns the audio device. That
   follows from the split rather than being chosen, and it is why a call still

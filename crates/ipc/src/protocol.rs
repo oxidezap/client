@@ -332,6 +332,11 @@ impl Request {
     }
 }
 
+/// The default for [`ClientRequest::Hello::has_window`]. See the field.
+fn owns_a_window() -> bool {
+    true
+}
+
 /// What a client asks the daemon to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -354,6 +359,21 @@ pub enum ClientRequest {
         /// chats before the next thing that happens to change.
         #[serde(default)]
         session_events: bool,
+        /// Whether this client owns a window that can be raised.
+        ///
+        /// The daemon relays [`DaemonMessage::ShowWindow`] to everyone and
+        /// starts a front end when nobody owns one, so it has to be able to
+        /// tell a window from a subscriber that merely watches — a TUI
+        /// reading summaries, a notifier, a monitoring client. Only the
+        /// client knows, so only the client can say.
+        ///
+        /// Defaults to `true`, unlike `session_events`: every client that
+        /// exists today is a window, and a silent one is far more likely to
+        /// be a build that predates this field than a headless tool. The
+        /// costly mistake is the other way round — launching a second window
+        /// over a live one — so the default is the one that never does.
+        #[serde(default = "owns_a_window")]
+        has_window: bool,
     },
     /// Ask for a fresh snapshot, after a [`DaemonMessage::Resync`] or on
     /// reconnect.

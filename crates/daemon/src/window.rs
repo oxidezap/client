@@ -28,9 +28,14 @@ static LAUNCHED: Mutex<Option<Child>> = Mutex::new(None);
 
 /// Raise the front end's window, starting a front end if none is attached.
 ///
-/// The signal goes first, always: an attached front end is one that has a
-/// window to raise, and raising it is cheaper and less surprising than a
-/// second process. Only a request that reached nobody becomes a launch.
+/// The request goes out first, always: a front end that owns a window raises
+/// it, which is cheaper and less surprising than a second process. Only when
+/// nobody owns one does this become a launch.
+///
+/// Who owns one is what the clients said in their hello, not who is
+/// subscribed: every client reads the signal channel, so a TUI or a notifier
+/// watching summaries would otherwise stand in for a window that is not
+/// there — and the tray's Open would go back to doing nothing.
 pub fn show(hub: &StateHub) {
     show_program(hub, &front_end_program());
 }
@@ -39,7 +44,8 @@ pub fn show(hub: &StateHub) {
 /// harmless: the decision worth exercising is when a launch happens, not
 /// which binary it is.
 fn show_program(hub: &StateHub, program: &std::path::Path) {
-    if hub.signal(&DaemonMessage::ShowWindow) {
+    hub.signal(&DaemonMessage::ShowWindow);
+    if hub.windows_attached() {
         return;
     }
 
@@ -130,16 +136,20 @@ mod tests {
         assert_eq!(program, std::path::PathBuf::from(expected));
     }
 
-    /// A request nobody is listening for is what makes this module exist: it
-    /// has to be distinguishable from a delivered one, or the tray cannot
-    /// tell "raised a window" from "did nothing".
+    /// A subscriber is not a window. Reading the signal channel is what every
+    /// client does; owning something to raise is what only a front end does,
+    /// and only the client itself can say which it is.
     #[test]
-    fn an_unheard_signal_says_so() {
+    fn a_subscriber_is_not_a_window() {
         let hub = StateHub::new();
-        assert!(!hub.signal(&DaemonMessage::ShowWindow));
+        let _watcher = hub.subscribe_signals();
+        assert!(!hub.windows_attached(), "a subscriber alone is not one");
 
-        let _client = hub.subscribe_signals();
-        assert!(hub.signal(&DaemonMessage::ShowWindow));
+        let window = hub.attach_window();
+        assert!(hub.windows_attached());
+
+        drop(window);
+        assert!(!hub.windows_attached(), "and it is gone when it leaves");
     }
 
     /// Unix only because the stand-in front end is a shell script. What it
@@ -235,6 +245,7 @@ mod tests {
             let (program, marker) = fake_front_end("attached");
             let hub = StateHub::new();
             let _client = hub.subscribe_signals();
+            let _window = hub.attach_window();
 
             show_program(&hub, &program);
 

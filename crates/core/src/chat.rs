@@ -190,7 +190,13 @@ impl MediaContent {
     /// all. A surface that asked only whether there were *bytes* handed an
     /// MP4 to an image decoder.
     pub fn has_still_image(&self) -> bool {
-        !self.data.is_empty() && self.mime_type.starts_with("image/")
+        // Case-insensitively: a MIME type's tokens are (RFC 2045 §5.1), and
+        // `Image/JPEG` is a photo whoever sent it spelled differently.
+        !self.data.is_empty()
+            && self
+                .mime_type
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
     }
 
     /// Check if this media can be downloaded from server
@@ -1311,6 +1317,19 @@ mod tests {
     fn bytes_are_half_the_question() {
         assert!(!make_media(Vec::new(), false).has_still_image());
         assert!(make_media(vec![1], false).has_still_image());
+    }
+
+    /// A MIME type's tokens are case-insensitive, and senders spell them how
+    /// they like. Reading `Image/JPEG` as "not a picture" would hide a photo
+    /// behind a download prompt.
+    #[test]
+    fn the_type_is_read_case_insensitively() {
+        let mut media = make_media(vec![1], false);
+        media.mime_type = "Image/JPEG".to_string();
+        assert!(media.has_still_image());
+
+        media.mime_type = "VIDEO/MP4".to_string();
+        assert!(!media.has_still_image());
     }
 
     #[test]
