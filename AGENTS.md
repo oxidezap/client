@@ -400,6 +400,12 @@ profile here repeats it deliberately.
   the `search` feature builds its index on it.
 - **No real PII in tests**, including fixtures derived from captures.
 
+A scrollbar belongs to whatever scrolls, and both lists have one: the sidebar
+hands `Scrollbar::vertical` its `VirtualListScrollHandle` and the conversation
+hands it the `ListState` itself, since a self-measuring list is the only thing
+that knows how tall its rows turned out. In both it is drawn over the scrolling
+region at its trailing edge, outside the rows' own gutter.
+
 ## Theme
 
 Colours come from `cx.theme()`. The palette is registered once in `theme.rs`
