@@ -65,11 +65,11 @@ pub struct ProductTheme {
 impl Global for ProductTheme {}
 
 impl ProductTheme {
-    fn from_settings(settings: ThemeSettings, fit: f32) -> Self {
+    fn from_settings(settings: ThemeSettings, fit: f32, metrics: Metrics) -> Self {
         let path = config::config_path();
         let loaded_at = path.as_deref().and_then(config::modified_at);
         Self {
-            metrics: Metrics::new(settings.font_size * fit, settings.density),
+            metrics,
             base_font_size: settings.font_size,
             fit,
             palette: settings.palette,
@@ -141,8 +141,7 @@ pub fn install(settings: ThemeSettings, cx: &mut App) {
     let fit = cx
         .try_global::<ProductTheme>()
         .map_or(1.0, |theme| theme.fit);
-    apply::apply(&settings, fit, cx);
-    cx.set_global(ProductTheme::from_settings(settings, fit));
+    install_fitted(settings, fit, cx);
 }
 
 /// Fold a window's size into the design scale.
@@ -163,8 +162,14 @@ pub fn fit_to_viewport(viewport: Size<Pixels>, cx: &mut App) -> bool {
 }
 
 fn install_fitted(settings: ThemeSettings, fit: f32, cx: &mut App) {
-    apply::apply(&settings, fit, cx);
-    cx.set_global(ProductTheme::from_settings(settings, fit));
+    // Resolved once and handed to both. `Metrics` is what bounds a base font
+    // — the fit can take the smallest configurable one under the floor where
+    // every hairline and focus ring stops resolving — and a second multiplied
+    // value computed beside it is a second answer: the library's buttons
+    // would then sit at 7.7px in a header our own chrome drew at 10.
+    let metrics = Metrics::new(settings.font_size * fit, settings.density);
+    apply::apply(&settings, metrics.rem_size(), cx);
+    cx.set_global(ProductTheme::from_settings(settings, fit, metrics));
 }
 
 /// Whether there is a `theme.json` worth polling at all.

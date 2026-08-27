@@ -718,6 +718,29 @@ mod tests {
         assert!(handheld.breakpoint_mobile() < full.breakpoint_mobile());
     }
 
+    /// The floor is reachable from a configured font, which is why the rem
+    /// the library's controls are given has to be the one `Metrics` resolved
+    /// rather than a second multiplication beside it: the smallest base a
+    /// `theme.json` may ask for, at the smallest fit, lands under the floor.
+    /// A window that computed it twice drew its own chrome at 10 and the
+    /// library's buttons at 7.7, in the same header.
+    #[test]
+    fn the_smallest_configured_base_at_the_smallest_fit_hits_the_floor() {
+        let asked = crate::theme::config::MIN_FONT_SIZE * FIT_MIN;
+        assert!(asked < REM_MIN, "the clamp has to bite for this to matter");
+        assert_eq!(
+            Metrics::new(asked, Density::Comfortable).rem_size(),
+            REM_MIN
+        );
+        // And the other end cannot be reached at all: the fit only shrinks.
+        let largest = crate::theme::config::MAX_FONT_SIZE;
+        assert!(largest <= REM_MAX);
+        assert_eq!(
+            Metrics::new(largest, Density::Comfortable).rem_size(),
+            largest
+        );
+    }
+
     #[test]
     fn density_ids_round_trip() {
         for density in Density::ALL {
