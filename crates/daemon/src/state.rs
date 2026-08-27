@@ -150,6 +150,27 @@ pub struct StateHub {
     /// summaries it derives itself.
     sessions: broadcast::Sender<Arc<str>>,
     tray: watch::Sender<TrayState>,
+    /// How many attached clients own a window.
+    ///
+    /// Not the same question as how many are subscribed: every client reads
+    /// the signal channel, and only a front end can act on a window request.
+    /// A TUI or a notifier attached to summaries would otherwise make
+    /// [`crate::window::show`] believe there was a window to raise.
+    windows: std::sync::atomic::AtomicUsize,
+}
+
+/// One attached client that owns a window, counted while it is connected.
+///
+/// A guard rather than a pair of calls: a connection ends by returning, by
+/// erroring and by being dropped, and only `Drop` covers all three.
+pub struct WindowGuard(Arc<StateHub>);
+
+impl Drop for WindowGuard {
+    fn drop(&mut self) {
+        self.0
+            .windows
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl StateHub {
@@ -173,6 +194,7 @@ impl StateHub {
             signals,
             sessions,
             tray,
+            windows: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -375,6 +397,22 @@ impl StateHub {
             }
             Err(e) => log::error!("dropping unserializable frame: {e}"),
         }
+    }
+
+    /// Count this connection as owning a window until the guard drops.
+    pub fn attach_window(self: &Arc<Self>) -> WindowGuard {
+        self.windows
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WindowGuard(Arc::clone(self))
+    }
+
+    /// Whether any attached client owns a window.
+    ///
+    /// What [`crate::window::show`] asks before starting a front end. The
+    /// clients say so themselves in their hello, because nothing the daemon
+    /// can observe distinguishes a window from any other subscriber.
+    pub fn windows_attached(&self) -> bool {
+        self.windows.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
 
     /// Record a change and publish it.

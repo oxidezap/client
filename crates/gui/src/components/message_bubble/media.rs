@@ -60,7 +60,7 @@ pub(super) fn render_media_content(
                 max_media_size,
             );
 
-            if !media_content.data.is_empty() {
+            if let Some(format) = still_image_format(&media_content) {
                 // Prefer the app-level cache: rebuilding from bytes clones the
                 // buffer and makes GPUI decode it again on every render.
                 let image = match sticker_image.clone() {
@@ -71,7 +71,7 @@ pub(super) fn render_media_content(
                         .rounded(cx.product().metrics.radius_sm()),
                     None => render_image_from_bytes(
                         media_content.data,
-                        &media_content.mime_type,
+                        format,
                         display_w,
                         display_h,
                         cx.product().metrics.radius_lg(),
@@ -142,14 +142,14 @@ pub(super) fn render_media_content(
             );
 
             if media_content.data_is_preview
-                && !media_content.data.is_empty()
+                && let Some(format) = still_image_format(&media_content)
                 && let Some(dl) = media_content.downloadable.clone()
             {
                 // Only the fallback PNG thumbnail is local: tapping fetches
                 // the real sticker, mirroring the image preview branch.
                 let image = render_image_from_bytes(
                     media_content.data,
-                    &media_content.mime_type,
+                    format,
                     display_w,
                     display_h,
                     cx.product().metrics.radius_lg(),
@@ -178,10 +178,10 @@ pub(super) fn render_media_content(
                         .h(px(display_h))
                         .object_fit(gpui::ObjectFit::Contain),
                 )
-            } else if !media_content.data.is_empty() {
+            } else if let Some(format) = still_image_format(&media_content) {
                 el.child(render_image_from_bytes(
                     media_content.data,
-                    &media_content.mime_type,
+                    format,
                     display_w,
                     display_h,
                     cx.product().metrics.radius_lg(),
@@ -356,15 +356,46 @@ fn render_media_placeholder(
         )
 }
 
+/// One decoded video frame, filling the player's box.
+fn render_video_frame(frame: Arc<RenderImage>, width: f32, height: f32) -> gpui::AnyElement {
+    div()
+        .w_full()
+        .h_full()
+        .child(
+            img(frame)
+                .w(px(width))
+                .h(px(height))
+                .object_fit(ObjectFit::Contain),
+        )
+        .into_any_element()
+}
+
+/// The format this row's `data` decodes as, when those bytes are a picture.
+///
+/// Two layers, each answering its own half: `has_still_image` is the data
+/// model's answer and belongs to every front end — a video's `data` stops
+/// being a picture the moment its own file replaces the poster — while the
+/// mapping to a GPUI format is this one's alone.
+fn still_image_format(media: &oxidezap_core::MediaContent) -> Option<gpui::ImageFormat> {
+    media
+        .has_still_image()
+        .then(|| mime_to_image_format(&media.mime_type))
+        .flatten()
+}
+
+/// The bytes, drawn.
+///
+/// Takes the format rather than the MIME type it came from, because whether
+/// there *is* one is the question that decides the branch above: a caller
+/// holding a `Some` is one that already knows it has a picture.
 fn render_image_from_bytes(
     data: Arc<Vec<u8>>,
-    mime_type: &str,
+    format: gpui::ImageFormat,
     width: f32,
     height: f32,
     radius: gpui::Pixels,
     rounded: bool,
 ) -> gpui::Img {
-    let format = mime_to_image_format(mime_type);
     let image_data = Arc::unwrap_or_clone(data);
     let image = Image::from_bytes(format, image_data);
 
@@ -566,33 +597,31 @@ fn render_video_player(
         .rounded(cx.product().metrics.radius_sm())
         .overflow_hidden()
         .child(
-            if let Some(frame) = video_frame.filter(|_| is_playing || is_paused) {
-                // Frame is a pre-decoded RGBA `RenderImage`; render with the
-                // standard `img()` element. GPU-side YUV surfaces (the old
-                // `surface()` path) are macOS-only upstream.
-                div()
-                    .w_full()
-                    .h_full()
-                    .child(
-                        img(frame)
-                            .w(px(display_w))
-                            .h(px(display_h))
-                            .object_fit(ObjectFit::Contain),
-                    )
-                    .into_any_element()
-            } else if !media_content.data.is_empty() {
+            // Frame is a pre-decoded RGBA `RenderImage`; render with the
+            // standard `img()` element. GPU-side YUV surfaces (the old
+            // `surface()` path) are macOS-only upstream.
+            //
+            // The poster sits between the two frame arms rather than after
+            // them, because a video carries its poster only until its own
+            // file arrives: `adopt_full_bytes` then puts the MP4 in `data`,
+            // and a decoded frame is the only picture left to draw.
+            if let Some(frame) = video_frame.clone().filter(|_| is_playing || is_paused) {
+                render_video_frame(frame, display_w, display_h)
+            } else if let Some(format) = still_image_format(&media_content) {
                 div()
                     .w_full()
                     .h_full()
                     .child(render_image_from_bytes(
                         media_content.data,
-                        &media_content.mime_type,
+                        format,
                         display_w,
                         display_h,
                         cx.product().metrics.radius_lg(),
                         false,
                     ))
                     .into_any_element()
+            } else if let Some(frame) = video_frame {
+                render_video_frame(frame, display_w, display_h)
             } else {
                 div()
                     .w_full()

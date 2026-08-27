@@ -3,20 +3,50 @@
 use chrono::{DateTime, Local, Utc};
 use gpui::ImageFormat;
 
-/// Convert a MIME type string to a GPUI ImageFormat
-pub fn mime_to_image_format(mime: &str) -> ImageFormat {
-    match mime {
+/// How GPUI should decode these bytes, when they are a still picture at all.
+///
+/// `None` is the answer for everything that is not one, and it is a real
+/// answer rather than a failure: a row's `data` is whatever can be *shown*
+/// for it, and for a video that is a poster thumbnail right up until the file
+/// itself is fetched — after which [`MediaContent::adopt_full_bytes`] puts
+/// the MP4 in `data` and `video/mp4` beside it. Every surface that draws a
+/// still asks here first, so the one that has a frame to draw instead falls
+/// through to it.
+///
+/// [`MediaContent::adopt_full_bytes`]: oxidezap_core::MediaContent::adopt_full_bytes
+pub fn mime_to_image_format(mime: &str) -> Option<ImageFormat> {
+    // The type, without its parameters and without regard to case: both are
+    // the sender's to choose (RFC 2045 §5.1), and `Image/JPEG` or
+    // `image/jpeg; charset=binary` are the same photo as `image/jpeg`.
+    // Compared rather than lowercased into a `String`, because this is asked
+    // per row per frame.
+    let essence = mime.split(';').next().unwrap_or(mime).trim();
+    for (name, format) in [
+        ("image/jpeg", ImageFormat::Jpeg),
         // image/jpg is non-standard but some senders emit it
-        "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
-        "image/png" => ImageFormat::Png,
-        "image/gif" => ImageFormat::Gif,
-        "image/webp" => ImageFormat::Webp,
-        "image/bmp" => ImageFormat::Bmp,
-        _ => {
-            log::warn!("unrecognized image MIME type {mime}, falling back to PNG");
-            ImageFormat::Png
+        ("image/jpg", ImageFormat::Jpeg),
+        ("image/png", ImageFormat::Png),
+        ("image/gif", ImageFormat::Gif),
+        ("image/webp", ImageFormat::Webp),
+        ("image/bmp", ImageFormat::Bmp),
+    ] {
+        if essence.eq_ignore_ascii_case(name) {
+            return Some(format);
         }
     }
+
+    // A picture in a subtype we do not name. PNG is a guess, and one worth
+    // making: the bytes claim to be an image, and GPUI sniffing them itself
+    // is a better outcome than a row that draws nothing.
+    if essence
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    {
+        log::warn!("unrecognized image MIME type {mime}, falling back to PNG");
+        return Some(ImageFormat::Png);
+    }
+
+    None
 }
 
 /// Scale media dimensions to fit within `max_size` without upscaling, with a
@@ -108,7 +138,44 @@ pub fn format_time_local(timestamp: &DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::scale_media_dimensions;
+    use super::{mime_to_image_format, scale_media_dimensions};
+    use gpui::ImageFormat;
+
+    #[test]
+    fn names_the_formats_senders_actually_use() {
+        assert_eq!(mime_to_image_format("image/jpeg"), Some(ImageFormat::Jpeg));
+        // Non-standard, and emitted anyway.
+        assert_eq!(mime_to_image_format("image/jpg"), Some(ImageFormat::Jpeg));
+        assert_eq!(mime_to_image_format("image/webp"), Some(ImageFormat::Webp));
+    }
+
+    #[test]
+    fn guesses_only_within_images() {
+        assert_eq!(mime_to_image_format("image/avif"), Some(ImageFormat::Png));
+    }
+
+    /// Case and parameters are the sender's to choose, and neither changes
+    /// what the bytes are.
+    #[test]
+    fn the_type_is_read_as_the_sender_may_spell_it() {
+        assert_eq!(mime_to_image_format("Image/JPEG"), Some(ImageFormat::Jpeg));
+        assert_eq!(
+            mime_to_image_format("image/webp; charset=binary"),
+            Some(ImageFormat::Webp)
+        );
+        assert_eq!(mime_to_image_format("IMAGE/AVIF"), Some(ImageFormat::Png));
+        assert_eq!(mime_to_image_format("Video/MP4"), None);
+    }
+
+    #[test]
+    fn a_video_is_not_a_still() {
+        // What a status posted as a photo with music arrives as: an MP4 with
+        // two keyframes. Decoding it as a picture is a guess that can only
+        // draw nothing, and the surfaces that ask have a frame to draw.
+        assert_eq!(mime_to_image_format("video/mp4"), None);
+        assert_eq!(mime_to_image_format("audio/ogg; codecs=opus"), None);
+        assert_eq!(mime_to_image_format("application/pdf"), None);
+    }
 
     fn assert_close(actual: (f32, f32), expected: (f32, f32)) {
         assert!(

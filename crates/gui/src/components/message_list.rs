@@ -147,6 +147,7 @@ fn render_row(
                 (matches!(m.media_type, MediaType::Sticker | MediaType::Image)
                     && !m.data.is_empty())
                 .then(|| app.get_decoded_image(message_id, &m.data, &m.mime_type))
+                .flatten()
             });
             // Progress belongs to the one clip that is loaded; a second voice
             // note in the same conversation must not borrow its position.

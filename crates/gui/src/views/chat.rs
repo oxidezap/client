@@ -123,7 +123,8 @@ pub fn render_connected_view(
         let message = app.media_viewer_message()?.clone();
         let media = message.media.as_ref()?;
         let image = (!media.data.is_empty())
-            .then(|| app.get_decoded_image(&message.id, &media.data, &media.mime_type));
+            .then(|| app.get_decoded_image(&message.id, &media.data, &media.mime_type))
+            .flatten();
         let frame = app.video_current_frame(&message.id);
         let author = if message.is_from_me {
             SharedString::from("You")
@@ -173,11 +174,14 @@ pub fn render_connected_view(
         let author = feed.author(selected)?;
         let at = app.status_pane().index_in(author.count());
         let message = feed.updates_of(author).nth(at)?.clone();
+        // `and_then`, not `map`: a video update's bytes are its own MP4 once
+        // it has been fetched, and there is no still in them to decode. The
+        // frame below is what such an update draws.
         let image = message
             .media
             .as_ref()
             .filter(|media| !media.data.is_empty())
-            .map(|media| app.get_decoded_image(&message.id, &media.data, &media.mime_type));
+            .and_then(|media| app.get_decoded_image(&message.id, &media.data, &media.mime_type));
         let frame = app.video_current_frame(&message.id);
         // A video says it is loading in its *player*, not in the download
         // table: `start_video_download` records progress there and nowhere

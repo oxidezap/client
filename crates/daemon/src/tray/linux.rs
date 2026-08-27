@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ksni::{Handle, Icon, MenuItem, ToolTip, Tray as KsniTray, TrayMethods, menu::StandardItem};
-use oxidezap_ipc::DaemonMessage;
 
 use crate::state::{StateHub, TrayState};
 
@@ -59,11 +58,11 @@ impl KsniTray for Item {
             StandardItem {
                 label: "Open".into(),
                 // The daemon has no window, so this is a request passed
-                // through to whoever has one. A session with no front end
-                // attached publishes it to nobody, which is the honest
-                // outcome: there is no window to raise.
+                // through to whoever has one — and a front end started for it
+                // when nobody is attached, which is the state the tray is
+                // most often clicked in. See `crate::window::show`.
                 activate: Box::new(|item: &mut Self| {
-                    item.hub.signal(&DaemonMessage::ShowWindow);
+                    crate::window::show(&item.hub);
                 }),
                 ..Default::default()
             }

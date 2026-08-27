@@ -180,6 +180,25 @@ impl MediaContent {
         !self.data.is_empty()
     }
 
+    /// Whether [`data`](Self::data) holds a still picture — bytes any front
+    /// end can decode and draw on its own.
+    ///
+    /// Here rather than in a front end because the answer is about the data
+    /// model, not about how anything is drawn: a video carries a poster
+    /// thumbnail until [`adopt_full_bytes`](Self::adopt_full_bytes) puts its
+    /// own file in `data`, and from then on there is no still in there at
+    /// all. A surface that asked only whether there were *bytes* handed an
+    /// MP4 to an image decoder.
+    pub fn has_still_image(&self) -> bool {
+        // Case-insensitively: a MIME type's tokens are (RFC 2045 §5.1), and
+        // `Image/JPEG` is a photo whoever sent it spelled differently.
+        !self.data.is_empty()
+            && self
+                .mime_type
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    }
+
     /// Check if this media can be downloaded from server
     pub fn can_download(&self) -> bool {
         self.downloadable.is_some()
@@ -1266,6 +1285,51 @@ mod tests {
             data_is_preview,
             waveform: None,
         }
+    }
+
+    /// The bug this predicate exists for: a status posted as a photo with
+    /// music arrives as an MP4, and its poster is gone the moment the file
+    /// itself is fetched. Asking only whether there were bytes handed those
+    /// to an image decoder.
+    #[test]
+    fn a_fetched_video_has_no_still_left_in_it() {
+        let mut media = make_media(vec![1, 2, 3], true);
+        media.media_type = MediaType::Video;
+        media.downloadable = Some(DownloadableMedia {
+            direct_path: "/v/t62".to_string(),
+            media_key: Vec::new(),
+            file_enc_sha256: Vec::new(),
+            file_length: 3,
+            mime_type: "video/mp4".to_string(),
+            duration_secs: Some(15),
+            download_type: DownloadMediaType::Video,
+        });
+        assert!(media.has_still_image(), "the poster is a picture");
+
+        media.adopt_full_bytes(Arc::new(vec![4, 5, 6]));
+        assert!(media.has_data(), "the video's own file is there");
+        assert!(!media.has_still_image(), "and it is not a still");
+    }
+
+    /// Empty is not a picture either, whatever the type says: a row whose
+    /// bytes have not arrived draws a placeholder, not a decode of nothing.
+    #[test]
+    fn bytes_are_half_the_question() {
+        assert!(!make_media(Vec::new(), false).has_still_image());
+        assert!(make_media(vec![1], false).has_still_image());
+    }
+
+    /// A MIME type's tokens are case-insensitive, and senders spell them how
+    /// they like. Reading `Image/JPEG` as "not a picture" would hide a photo
+    /// behind a download prompt.
+    #[test]
+    fn the_type_is_read_case_insensitively() {
+        let mut media = make_media(vec![1], false);
+        media.mime_type = "Image/JPEG".to_string();
+        assert!(media.has_still_image());
+
+        media.mime_type = "VIDEO/MP4".to_string();
+        assert!(!media.has_still_image());
     }
 
     #[test]
