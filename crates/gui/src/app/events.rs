@@ -105,6 +105,21 @@ impl WhatsAppApp {
                             if self.visible_chat.as_deref() == Some(jid.as_str()) {
                                 existing.mark_as_read();
                             }
+                            // The read a snapshot row could not bound. Spent
+                            // here because this is the load that gave it a
+                            // message to name; see `owed_reads`.
+                            if self.owed_reads.contains(&jid)
+                                && let Some(newest) = newest_shared_message(existing)
+                            {
+                                self.owed_reads.remove(&jid);
+                                if let Some(client) = &self.client {
+                                    info!(
+                                        "Marking {} read, now that it has messages",
+                                        observe_str(&jid)
+                                    );
+                                    client.mark_chat_read(&jid, Some(newest));
+                                }
+                            }
                             self.invalidate_message_cache(&jid);
                         }
                         None => self.chats.push(chat),

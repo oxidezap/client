@@ -16,10 +16,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use chrono::DateTime;
 use log::{debug, error, info, warn};
-use oxidezap_core::{CallState, DownloadableMedia, MediaContent, QuotedMessage, UiEvent};
+use oxidezap_core::{CallState, Chat, DownloadableMedia, MediaContent, QuotedMessage, UiEvent};
 use oxidezap_ipc::{
-    CallAction, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, Endpoint,
+    CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent, DaemonMessage, Endpoint,
     PROTOCOL_VERSION, Reader, Request, RequestId, StateSnapshot, StateVersion, Writer,
     endpoint_path, media_path,
 };
@@ -785,6 +786,37 @@ fn take_pending(pending: &Pending, id: RequestId) -> Option<Awaiting> {
 /// it already handles.
 fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     let mut events = Vec::new();
+    // The list first, before the state that draws it: the daemon already
+    // holds every row this window is about to ask the store for, and a
+    // window that ignored them drew an empty pane until its own load came
+    // back — a chat list flashing into place a few hundred milliseconds
+    // after every launch. Sent as the load event this front end already
+    // knows how to fold in, so nothing downstream learns a second
+    // vocabulary; the store's load merges into these rows when it arrives.
+    //
+    // Not while pairing, which is the one state where the daemon's list is
+    // not the store's: during a first pairing the store is empty and
+    // whatever the daemon holds arrived live. There is no list on that
+    // screen anyway.
+    let list = (!matches!(snapshot.connection, ConnectionState::Pairing { .. }))
+        .then(|| {
+            snapshot
+                .chats
+                .iter()
+                .take(SNAPSHOT_ROWS)
+                .map(placeholder_chat)
+                .collect::<Vec<_>>()
+        })
+        .filter(|chats| !chats.is_empty());
+    if let Some(chats) = list {
+        events.push(session(UiEvent::HistoryLoaded {
+            chats,
+            // Never complete, whatever the daemon knows: a summary has no
+            // messages in it, so this load is not the store's whole truth
+            // and must not prune anything.
+            complete: false,
+        }));
+    }
     match &snapshot.connection {
         ConnectionState::Connecting => events.push(session(UiEvent::InitComplete)),
         ConnectionState::Pairing { qr, pair_code } => {
@@ -793,22 +825,30 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
             // one would make the other vanish from a window that had only just
             // opened. The QR goes last so it is the one the screen settles on,
             // which is what the pairing view shows when it has both.
+            //
+            // Collected apart from `events` rather than counted inside it:
+            // the question below is whether a *credential* was published, and
+            // asking whether anything at all was would be answered by the
+            // chat list above — which would leave a window pairing with no
+            // credential yet on the loading screen with nothing to move it.
+            let mut credentials = Vec::new();
             if let Some(code) = pair_code {
-                events.push(session(UiEvent::PairCode {
+                credentials.push(session(UiEvent::PairCode {
                     code: code.code.clone(),
                     timeout_secs: remaining_secs(code.expires_at_ms),
                 }));
             }
             if let Some(qr) = qr {
-                events.push(session(UiEvent::QrCode {
+                credentials.push(session(UiEvent::QrCode {
                     code: qr.code.clone(),
                     timeout_secs: remaining_secs(qr.expires_at_ms),
                 }));
             }
             // Pairing with neither credential yet: still coming.
-            if events.is_empty() {
-                events.push(session(UiEvent::InitComplete));
+            if credentials.is_empty() {
+                credentials.push(session(UiEvent::InitComplete));
             }
+            events.extend(credentials);
         }
         // The event that leaves the pairing screen for the syncing one.
         ConnectionState::Syncing => events.push(session(UiEvent::PairSuccess)),
@@ -827,6 +867,43 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     events.push(FromDaemon::Calls(Box::new(snapshot.calls.clone())));
     events.push(FromDaemon::Account(snapshot.account.clone()));
     events
+}
+
+/// How many rows a snapshot may paint.
+///
+/// The window the session's own load fills (`HISTORY_CHAT_LIMIT`). The daemon
+/// remembers every chat it has seen and its list can be longer than that; a
+/// row past the window is one no load will ever put messages in, so painting
+/// it would be offering a conversation that opens empty and stays empty.
+const SNAPSHOT_ROWS: usize = 100;
+
+/// One summary, as much of a chat as a summary can be.
+///
+/// Everything a row draws — the name, the badge, the preview line and its
+/// time — and no messages, because the wire deliberately does not carry them
+/// (see [`ChatSummary`]). `preview_for` already answers for a chat in exactly
+/// that shape: the list hydrates before the timeline does.
+///
+/// Store-backed, so a complete load is allowed to contradict it. These rows
+/// are the daemon's list and the daemon's list is the store's — which is
+/// exactly why they are not sent while pairing, when it is not. Live-only
+/// would mean a chat archived or deleted between this snapshot and the load
+/// that follows had a row nothing could ever remove.
+fn placeholder_chat(summary: &ChatSummary) -> Chat {
+    let mut chat = Chat::from_store(
+        summary.jid.clone(),
+        summary.name.clone(),
+        // Zero: the label is real, but the resolution behind it did not travel
+        // with it, so anything that arrives with a source attached outranks it.
+        0,
+    );
+    chat.unread_count = summary.unread;
+    chat.manually_unread = summary.manually_unread;
+    if let Some(preview) = &summary.last_message {
+        chat.last_message = Some(preview.text.clone());
+        chat.last_message_time = DateTime::from_timestamp_millis(preview.timestamp_ms);
+    }
+    chat
 }
 
 fn session(event: UiEvent) -> FromDaemon {
@@ -959,6 +1036,141 @@ fn daemon_program() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_of(chats: Vec<ChatSummary>) -> StateSnapshot {
+        StateSnapshot {
+            version: StateVersion::INITIAL,
+            connection: ConnectionState::Connected,
+            chats,
+            calls: CallState::default(),
+            account: None,
+        }
+    }
+
+    fn summary(jid: &str, name: &str, unread: u32) -> ChatSummary {
+        ChatSummary {
+            jid: jid.to_string(),
+            name: name.to_string(),
+            unread,
+            manually_unread: false,
+            last_message: Some(oxidezap_ipc::MessagePreview {
+                id: Some("3EB0".into()),
+                text: "olá".into(),
+                from_me: false,
+                timestamp_ms: 1_700_000_000_000,
+            }),
+        }
+    }
+
+    /// The list the daemon already holds, drawn on the first frame instead of
+    /// a few hundred milliseconds later. Before the state that draws it, so
+    /// the frame that turns connected is not the one with an empty pane in
+    /// it.
+    #[test]
+    fn attaching_paints_the_list_the_daemon_already_has() {
+        let events = catch_up(&snapshot_of(vec![summary(
+            "559900000001@s.whatsapp.net",
+            "Alguém",
+            3,
+        )]));
+
+        let Some(FromDaemon::Session(first)) = events.first() else {
+            panic!("the list is not the first event");
+        };
+        let UiEvent::HistoryLoaded { chats, complete } = first.as_ref() else {
+            panic!("the list does not come first: {first:?}");
+        };
+        assert!(!complete, "a summary is never the store's whole truth");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].name, "Alguém");
+        assert_eq!(chats[0].unread_count, 3);
+        assert_eq!(chats[0].last_message.as_deref(), Some("olá"));
+        assert!(chats[0].last_message_time.is_some(), "the row has a time");
+        assert!(
+            chats[0].messages.is_empty(),
+            "a summary carries no messages, by design"
+        );
+        assert!(
+            chats[0].is_from_store(),
+            "a row from the daemon's list is one a complete load may contradict"
+        );
+    }
+
+    /// While pairing the daemon's list is not the store's — the store is
+    /// empty and whatever is there arrived live — so there is nothing to
+    /// paint and nothing that may be marked prunable.
+    #[test]
+    fn pairing_paints_no_list() {
+        let mut snapshot = snapshot_of(vec![summary("559900000001@s.whatsapp.net", "Alguém", 1)]);
+        snapshot.connection = ConnectionState::Pairing {
+            qr: None,
+            pair_code: None,
+        };
+
+        assert!(
+            !catch_up(&snapshot).iter().any(|event| matches!(
+                event,
+                FromDaemon::Session(session)
+                    if matches!(session.as_ref(), UiEvent::HistoryLoaded { .. })
+            )),
+            "a pairing snapshot painted a list"
+        );
+    }
+
+    /// The daemon remembers more chats than a load returns. A row past the
+    /// window the load fills is one that would open empty and stay empty.
+    #[test]
+    fn the_list_stops_where_the_store_load_does() {
+        let chats: Vec<ChatSummary> = (0..SNAPSHOT_ROWS + 25)
+            .map(|i| summary(&format!("5599000{i:05}@s.whatsapp.net"), "Alguém", 0))
+            .collect();
+
+        let events = catch_up(&snapshot_of(chats));
+        let Some(FromDaemon::Session(first)) = events.first() else {
+            panic!("the list is not the first event");
+        };
+        let UiEvent::HistoryLoaded { chats, .. } = first.as_ref() else {
+            panic!("the list does not come first");
+        };
+        assert_eq!(chats.len(), SNAPSHOT_ROWS);
+    }
+
+    /// A window pairing before a credential exists is moved off the loading
+    /// screen by `InitComplete`, and whether to send one is a question about
+    /// credentials — not about whether the frame carried anything at all. The
+    /// list arriving first must not answer it.
+    #[test]
+    fn pairing_with_no_credential_still_says_the_session_is_up() {
+        let mut snapshot = snapshot_of(vec![summary("559900000001@s.whatsapp.net", "Alguém", 0)]);
+        snapshot.connection = ConnectionState::Pairing {
+            qr: None,
+            pair_code: None,
+        };
+
+        let events = catch_up(&snapshot);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                FromDaemon::Session(session) if matches!(session.as_ref(), UiEvent::InitComplete)
+            )),
+            "the window would sit on the loading screen"
+        );
+    }
+
+    /// Nothing to paint is nothing to say: a daemon with no chats must not
+    /// make the window handle an empty load before its real one.
+    #[test]
+    fn an_empty_snapshot_carries_no_list() {
+        let events = catch_up(&snapshot_of(Vec::new()));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                FromDaemon::Session(session)
+                    if matches!(session.as_ref(), UiEvent::HistoryLoaded { .. })
+            )),
+            "an empty snapshot produced a load event"
+        );
+    }
 
     /// The recording's key is a local id, which the front end composes; it
     /// still has to be a plain file name.

@@ -147,22 +147,30 @@ pub struct MediaContent {
     /// MIME type of the display data (may differ from downloadable media)
     pub mime_type: String,
     /// Width in pixels (if known)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<u32>,
     /// Height in pixels (if known)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
     /// Caption text (if any)
     #[allow(dead_code)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
     /// Original file name (documents), used when saving to disk
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
     /// Download info for fetching full media (videos, documents)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downloadable: Option<DownloadableMedia>,
     /// Whether this is an animated sticker (WebP animation)
+    #[serde(default, skip_serializing_if = "is_false")]
     pub is_animated: bool,
     /// Duration in seconds (for audio/video)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<u32>,
     /// Whether `data` holds only a fallback thumbnail (eager download of the
     /// full media failed), so the renderer keeps offering the real download
+    #[serde(default, skip_serializing_if = "is_false")]
     pub data_is_preview: bool,
     /// Amplitude envelope for a voice note, one byte per bucket in `0..=100`.
     ///
@@ -171,6 +179,7 @@ pub struct MediaContent {
     /// shape of a voice note is most useful *while deciding* whether to play
     /// it. Absent for older messages and for senders that omit it; the player
     /// falls back to a flat bar rather than inventing a shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waveform: Option<Arc<Vec<u8>>>,
 }
 
@@ -210,6 +219,17 @@ impl MediaContent {
     }
 }
 
+/// A field whose absence means what its default does.
+///
+/// Paired with `#[serde(default)]` on the way back in, which is what makes
+/// leaving it out safe: the reader fills in the same value the writer skipped.
+/// A history load is a hundred chats of fifty rows and most of those fields
+/// are empty on most of them, so what is skipped is about a third of the
+/// frame — bytes to write, bytes to read, and two passes of serde over both.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// A chat message
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -218,6 +238,7 @@ pub struct ChatMessage {
     /// Sender identifier (JID)
     pub sender: String,
     /// Sender's display name (push name, for group chats)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
     /// Message text content
     pub content: String,
@@ -228,14 +249,17 @@ pub struct ChatMessage {
     /// Whether the message has been read
     pub is_read: bool,
     /// Optional media content
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaContent>,
     /// Reactions on this message (emoji -> list of sender JIDs)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub reactions: HashMap<String, Vec<String>>,
     /// How far an outgoing message got. Meaningless for an incoming one:
     /// read it through [`Self::delivery`], which returns `None` there rather
     /// than reporting our own send state for someone else's message.
     pub status: MessageStatus,
     /// The message this one replies to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quoted: Option<QuotedMessage>,
     /// Set when nobody typed this: a call record, a group change. Such a row
     /// has no author and no ticks, and renders centred rather than as a bubble.
@@ -245,8 +269,9 @@ pub struct ChatMessage {
     /// text it produces: a tombstone is still a row, and the surfaces that
     /// have to know it is one — the status feed, which must not offer a
     /// deleted update to watch — should not have to recognise a sentence.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub revoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemNotice>,
 }
 
@@ -586,6 +611,7 @@ pub struct Chat {
     /// Fallback < history < live push name < address-book contact.
     pub(crate) name_priority: u8,
     /// Last message preview
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message: Option<String>,
     /// Time of last message
     pub last_message_time: Option<DateTime<Utc>>,
@@ -604,6 +630,7 @@ pub struct Chat {
     #[serde(default)]
     pub is_status: bool,
     /// Participant names in group chats (sender JID -> display name)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub participants: HashMap<String, String>,
     /// Messages in this chat
     pub messages: Vec<ChatMessage>,

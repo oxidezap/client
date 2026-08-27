@@ -126,7 +126,22 @@ profile here repeats it deliberately.
 - **The daemon's state version is what makes a mid-stream join safe.** The
   server subscribes and then snapshots, so the window between the two is
   delivered twice rather than lost, and the client drops the overlap by
-  comparing versions. Reversing the order loses it instead.
+  comparing versions. Reversing the order loses it instead. The snapshot is
+  also the *first frame*: a summary carries everything a chat row draws, so
+  `catch_up` turns the list into the load event a front end already handles,
+  and a window opens with the chats in it rather than flashing them in when
+  its own store load returns. Never `complete` — a summary has no messages, so
+  it may not prune — but store-backed, because these rows *are* the daemon's
+  list and the daemon's list is the store's, so a later complete load is
+  allowed to contradict them. Which is also why none are sent while pairing:
+  there the store is empty and whatever the daemon holds arrived live. They
+  stop at the window the session's own load fills, because a row past it is one
+  no load will ever put messages in. And a row without messages cannot be read:
+  `MarkRead` names what the requester saw, the daemon refuses one that names
+  nothing while it knows a boundary, so opening such a row banks the read
+  (`owed_reads`) and the load that brings the messages spends it — otherwise
+  the badge clears locally, no receipt goes out, and the next hydration puts it
+  straight back.
 - **The status reader is anchored to an update, not to a place in the run.**
   A position was safe only while a run grew at the end, and it does not: a
   live update and a hydrated one can both be stamped before the one being
@@ -196,7 +211,11 @@ profile here repeats it deliberately.
   them proves the store agrees — a claim nobody else disputes is not one worth
   holding. And a refused view does not force the ring back on: the flush
   contract is temporal, so a refusal is not proof that nothing was written, and
-  the only honest answer to "did that land" is to read the history again.
+  the only honest answer to "did that land" is to read the history again. It
+  also means the broadcast's own unread counter never comes down, which is why
+  nothing totals it: the tray's badge and `StateSnapshot::total_unread` both go
+  through `ChatSummary::counts_toward_unread`, or the tray claims unread
+  messages over a chat list with nothing unread in it and no way to clear them.
 - **A revoked message is a fact, not a sentence.** The store keeps the row
   and hydration turns it into "[Message deleted]" — which a conversation is
   right to draw and the status feed is not: an update its author took back has
@@ -267,6 +286,16 @@ profile here repeats it deliberately.
   height with the count standing still — an image arrives, a reaction lands,
   a send fails and grows a retry button — which the `build` number answers.
   The three outcomes are splice, remeasure and reset.
+- **What a frame leaves out, its reader fills in.** The wire is
+  newline-delimited JSON and a history load is a hundred chats of fifty rows,
+  most of whose fields are empty — no reaction, no quote, no media, nothing
+  revoked. Every one of those is `#[serde(default, skip_serializing_if …)]`,
+  which is about a third of the frame in bytes and in the two serde passes
+  over it. The pairing is the contract: a field may only be skipped where its
+  absence reads back as the value that was skipped, which
+  `an_omitted_field_comes_back_as_what_it_was` is there to hold. It is also
+  why these types travel one way only — nothing in `ClientRequest` carries a
+  `ChatMessage` — so a sparse frame is never handed to an older reader.
 - **A daemon frame is either state or news, and they use different channels.**
   State carries a version and is recoverable from a snapshot; a window request
   or a failed send is neither, so it must not ride a channel a client stops
@@ -303,6 +332,23 @@ profile here repeats it deliberately.
   composing arriving as a phone number and its paused as a LID do not become
   two entries — one of which nobody can clear, leaving the typing line up
   until its TTL runs out.
+- **A history load is read in pages, not in rows.** Every pooled read costs a
+  permit, a blocking task and a snapshot transaction before it runs anything,
+  so a query per message multiplies all of that by the size of the account:
+  the hundred chats of fifty messages an attaching front end asks for came to
+  five thousand reads, most of them spent learning that a message has no
+  reactions. `ChatStore::reactions_for` and `ChatStore::pages` are the batch
+  shapes, and the single-row `reactions` is a page of one so there is one
+  statement to keep right. Measured by `history_hydration_costs`, which is
+  ignored by default because it is a stopwatch.
+- **The reload debounce is for bursts, not for askers.** A history sync commits
+  many batches and each emits a change; the quiet window folds them into one
+  load. A front end that asked outright is not a burst — it holds nothing, it
+  asked for everything, and waiting the window out is a fifth of a second
+  before the first query — so `spawn_history_reloader` skips the debounce on an
+  explicit ask, and watches for one *inside* the drain as well as outside it: a
+  sync's changes never stop arriving, so a drain waiting on them alone has no
+  quiet window to end on and the asker waits out the whole sync.
 - **The chat store's writer queue is ordered on purpose.** Anything that
   targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row

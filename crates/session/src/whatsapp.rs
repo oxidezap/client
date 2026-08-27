@@ -2196,31 +2196,52 @@ impl WhatsAppClient {
                 // Either a store change or somebody asking outright. An
                 // explicit ask widens to everything, because the asker is a
                 // front end that has just attached and holds nothing.
+                let mut asked = false;
                 tokio::select! {
                     change = changes.recv() => match change {
                         Ok(change) => scope.widen(Some(&change)),
                         Err(RecvError::Lagged(_)) => scope.widen(None),
                         Err(RecvError::Closed) => break,
                     },
-                    () = reload.notified() => scope.widen(None),
+                    () = reload.notified() => {
+                        scope.widen(None);
+                        asked = true;
+                    }
                 }
                 // Drain the burst; a quiet window flushes the reload.
-                loop {
-                    match tokio::time::timeout(Self::RELOAD_DEBOUNCE, changes.recv()).await {
-                        Ok(Ok(change)) => {
-                            scope.widen(Some(&change));
-                            continue;
+                //
+                // Not entered, and broken out of, when somebody asks outright.
+                // The debounce is there to fold a history sync's many
+                // committed batches into one load, and the cost of folding is
+                // a fifth of a second before the first query runs. A front end
+                // that has just attached is holding nothing and is the one
+                // caller that waits on this — and there is nothing to
+                // coalesce for it, because it asked for everything.
+                //
+                // The ask has to be watched *here* as well as in the select
+                // above, not only skipped when it happened to win it: during a
+                // history sync the changes never stop arriving, so a drain
+                // that waits on them alone has no quiet window to end on and
+                // the asker waits out the whole sync.
+                while !asked {
+                    tokio::select! {
+                        change = tokio::time::timeout(Self::RELOAD_DEBOUNCE, changes.recv()) => {
+                            match change {
+                                Ok(Ok(change)) => scope.widen(Some(&change)),
+                                Ok(Err(RecvError::Lagged(_))) => scope.widen(None),
+                                Ok(Err(RecvError::Closed)) => {
+                                    // Reload once more: these changes were committed.
+                                    open = false;
+                                    break;
+                                }
+                                // The quiet window: flush what has piled up.
+                                Err(_) => break,
+                            }
                         }
-                        Ok(Err(RecvError::Lagged(_))) => {
+                        () = reload.notified() => {
                             scope.widen(None);
-                            continue;
+                            asked = true;
                         }
-                        Ok(Err(RecvError::Closed)) => {
-                            // Reload once more: these changes were committed.
-                            open = false;
-                            break;
-                        }
-                        Err(_) => break,
                     }
                 }
                 // An empty COMPLETE load still goes out: the UI prunes
@@ -2315,6 +2336,15 @@ impl WhatsAppClient {
                 }
             }
         }
+        // Every chat's page in one read, before the loop that needs them: the
+        // per-chat call is a permit, a blocking task and a transaction each,
+        // and an attaching front end asks for a hundred of them at once.
+        let mut pages = chat_store
+            .pages(
+                entries.iter().map(|entry| entry.jid.clone()).collect(),
+                Self::HISTORY_MESSAGES_PER_CHAT,
+            )
+            .await?;
         let mut chats: Vec<oxidezap_core::Chat> = Vec::with_capacity(entries.len());
         // Updates whose stored ack says they were watched here. Gathered from
         // the rows as they are read and applied once at the end; see the call
@@ -2332,9 +2362,7 @@ impl WhatsAppClient {
                 .await;
             let jid_str = identity.canonical_jid.clone();
             if let Some(existing) = chats.iter_mut().find(|c| c.jid == jid_str) {
-                let mut page = chat_store
-                    .messages(&entry.jid, None, Self::HISTORY_MESSAGES_PER_CHAT)
-                    .await?;
+                let mut page = pages.remove(&entry.jid.to_string()).unwrap_or_default();
                 page.reverse();
                 if existing.is_status {
                     status_views.extend(watched_ids(&page));
@@ -2383,9 +2411,7 @@ impl WhatsAppClient {
             chat.manually_unread = entry.unread_count < 0;
             chat.last_message_time = entry.last_message_at;
 
-            let mut page = chat_store
-                .messages(&entry.jid, None, Self::HISTORY_MESSAGES_PER_CHAT)
-                .await?;
+            let mut page = pages.remove(&entry.jid.to_string()).unwrap_or_default();
             page.reverse(); // store returns newest-first; the UI renders oldest-first
             if chat.is_status {
                 status_views.extend(watched_ids(&page));
@@ -2470,13 +2496,23 @@ impl WhatsAppClient {
         chat_jid: &Jid,
         msgs: &mut [ChatMessage],
     ) {
+        // One query for the page. A message with no reactions is the common
+        // case by a wide margin, and asking per message spent a pooled read on
+        // each of them.
+        let ids: Vec<String> = msgs.iter().map(|msg| msg.id.clone()).collect();
+        let mut by_message = match chat_store.reactions_for(chat_jid, ids).await {
+            Ok(found) => found,
+            Err(e) => {
+                warn!(
+                    "failed to hydrate reactions for {}: {e}",
+                    observe_str(&chat_jid.to_string())
+                );
+                return;
+            }
+        };
         for msg in msgs.iter_mut() {
-            let entries = match chat_store.reactions(chat_jid, &msg.id).await {
-                Ok(entries) => entries,
-                Err(e) => {
-                    warn!("failed to hydrate reactions for {}: {e}", msg.id);
-                    continue;
-                }
+            let Some(entries) = by_message.remove(&msg.id) else {
+                continue;
             };
             // The store keeps one row per sender, and the live path publishes
             // reactors under their canonical JID — so a row stored under one

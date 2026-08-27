@@ -125,6 +125,30 @@ impl ChatSummary {
     pub fn has_unread(&self) -> bool {
         self.unread > 0 || self.manually_unread
     }
+
+    /// Whether this row is the status broadcast rather than a conversation.
+    ///
+    /// One chat holds everybody's status updates, which is why it is not in
+    /// any front end's chat list — and why its unread counter answers a
+    /// different question from every other row's.
+    #[must_use]
+    pub fn is_status(&self) -> bool {
+        self.jid == oxidezap_core::STATUS_BROADCAST_JID
+    }
+
+    /// Whether this chat's unread belongs in a total somebody reads as
+    /// "messages waiting for you".
+    ///
+    /// The status broadcast does not, and not merely because it is drawn
+    /// elsewhere: watching an update is recorded on the message, so that
+    /// chat's counter is never cleared by watching one (see the status notes
+    /// in AGENTS.md). Counted, it only ever grows — a tray tooltip claiming
+    /// unread messages over a chat list with nothing unread in it, for as
+    /// long as the account keeps receiving updates.
+    #[must_use]
+    pub fn counts_toward_unread(&self) -> bool {
+        !self.is_status()
+    }
 }
 
 /// Everything a freshly connected client needs before it starts applying
@@ -181,6 +205,7 @@ impl StateSnapshot {
     pub fn total_unread(&self) -> u32 {
         self.chats
             .iter()
+            .filter(|c| c.counts_toward_unread())
             .fold(0u32, |acc, c| acc.saturating_add(c.unread))
     }
 }
@@ -562,6 +587,36 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One chat holds everybody's status updates, and watching one is
+    /// recorded on the message rather than on that counter — so it never goes
+    /// down. A total that included it could only grow.
+    #[test]
+    fn a_total_of_unread_messages_leaves_the_status_broadcast_out() {
+        let summary = |jid: &str, unread: u32| ChatSummary {
+            jid: jid.to_string(),
+            name: "quem quer que seja".to_string(),
+            unread,
+            manually_unread: false,
+            last_message: None,
+        };
+        let snapshot = StateSnapshot {
+            version: StateVersion::INITIAL,
+            connection: ConnectionState::Connected,
+            chats: vec![
+                summary("559900000001@s.whatsapp.net", 2),
+                summary(oxidezap_core::STATUS_BROADCAST_JID, 7),
+            ],
+            calls: CallState::default(),
+            account: None,
+        };
+
+        assert_eq!(snapshot.total_unread(), 2);
+        assert!(
+            snapshot.chats[1].has_unread(),
+            "the row itself still has one; it is drawn on its own screen"
+        );
+    }
 
     #[test]
     fn a_snapshot_covers_every_event_up_to_its_own_version() {

@@ -6678,3 +6678,202 @@ async fn watching_nothing_is_a_no_op() {
         .unwrap();
     chat_store.flush().await.unwrap();
 }
+
+/// A stopwatch rather than an assertion: what a front end's attach pays to
+/// read the history it is about to draw.
+///
+/// Ignored by default because it is a measurement — it asserts only that the
+/// two paths agree, which is the part worth keeping honest. Run it with
+/// `cargo test -p oxidezap-chat-store -- --ignored --nocapture hydration_costs`.
+#[tokio::test]
+#[ignore = "a measurement, not an assertion"]
+async fn history_hydration_costs() {
+    const CHATS: usize = 30;
+    const MESSAGES: usize = 50;
+
+    let (_store, chat_store) = test_store().await;
+
+    let mut events = Vec::new();
+    for c in 0..CHATS {
+        let chat = format!("55990000{c:04}@s.whatsapp.net");
+        for m in 0..MESSAGES {
+            let id = format!("M-{c}-{m}");
+            events.push(message_event(
+                wa::Message::text("mensagem"),
+                incoming_info(&chat, &chat, &id, 1_700_000_000 + (m as i64)),
+            ));
+            // A tenth of the page carries one, which is generous: most
+            // messages have none, and that is exactly what the per-message
+            // query was spending a pooled read to discover.
+            if m % 10 == 0 {
+                events.push(message_event(
+                    wa::Message {
+                        reaction_message: MessageField::some(wa::message::ReactionMessage {
+                            key: MessageField::some(wa::MessageKey {
+                                id: Some(id.clone()),
+                                remote_jid: Some(chat.clone()),
+                                from_me: Some(false),
+                                ..Default::default()
+                            }),
+                            text: Some("👍".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    incoming_info(&chat, &chat, &format!("R-{c}-{m}"), 1_700_000_100),
+                ));
+            }
+        }
+    }
+    feed(&chat_store, events).await;
+
+    let entries = chat_store.chats(false, 100).await.unwrap();
+    assert_eq!(entries.len(), CHATS);
+
+    let started = wacore::time::Instant::now();
+    let mut pages = Vec::new();
+    for entry in &entries {
+        let page = chat_store
+            .messages(&entry.jid, None, MESSAGES as i64)
+            .await
+            .unwrap();
+        pages.push((entry.jid.clone(), page));
+    }
+    let per_chat_pages = started.elapsed();
+
+    let started = wacore::time::Instant::now();
+    let batched_pages = chat_store
+        .pages(
+            entries.iter().map(|entry| entry.jid.clone()).collect(),
+            MESSAGES as i64,
+        )
+        .await
+        .unwrap();
+    let one_read_pages = started.elapsed();
+    assert_eq!(batched_pages.len(), pages.len(), "the same chats");
+    for (chat, page) in &pages {
+        assert_eq!(
+            batched_pages[&chat.to_string()].len(),
+            page.len(),
+            "the same page for {chat}"
+        );
+    }
+
+    let started = wacore::time::Instant::now();
+    let mut one_by_one = 0usize;
+    for (chat, page) in &pages {
+        for message in page {
+            one_by_one += chat_store.reactions(chat, &message.id).await.unwrap().len();
+        }
+    }
+    let per_message = started.elapsed();
+
+    let started = wacore::time::Instant::now();
+    let mut batched = 0usize;
+    for (chat, page) in &pages {
+        let ids: Vec<String> = page.iter().map(|m| m.id.clone()).collect();
+        batched += chat_store
+            .reactions_for(chat, ids)
+            .await
+            .unwrap()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+    }
+    let per_chat = started.elapsed();
+
+    assert_eq!(one_by_one, batched, "the two paths read the same reactions");
+    println!(
+        "{CHATS} chats x {MESSAGES} messages\n  \
+         reactions: per-message {per_message:?} -> per-chat {per_chat:?}\n  \
+         pages:     per-chat {per_chat_pages:?} -> one read {one_read_pages:?}"
+    );
+}
+
+/// The batch reads a history load runs answer exactly what the single-row
+/// ones do. They are the same statements on one connection, and this is what
+/// keeps them the same statements.
+#[tokio::test]
+async fn batched_reads_answer_what_the_single_ones_do() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let other = jid("559900000002@s.whatsapp.net");
+
+    let mut events = vec![
+        message_event(
+            wa::Message::text("uma"),
+            incoming_info(PEER, PEER, "B-1", 1_700_000_000),
+        ),
+        message_event(
+            wa::Message::text("outra"),
+            incoming_info(PEER, PEER, "B-2", 1_700_000_010),
+        ),
+        message_event(
+            wa::Message::text("terceira"),
+            incoming_info(
+                "559900000002@s.whatsapp.net",
+                "559900000002@s.whatsapp.net",
+                "B-3",
+                1_700_000_020,
+            ),
+        ),
+    ];
+    // Only the middle one is reacted to: a page is mostly rows with nothing.
+    events.push(message_event(
+        wa::Message {
+            reaction_message: MessageField::some(wa::message::ReactionMessage {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("B-2".into()),
+                    remote_jid: Some(PEER.into()),
+                    from_me: Some(false),
+                    ..Default::default()
+                }),
+                text: Some("🎉".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        incoming_info(PEER, PEER, "B-R", 1_700_000_030),
+    ));
+    feed(&chat_store, events).await;
+
+    let batched = chat_store
+        .reactions_for(&chat, vec!["B-1".into(), "B-2".into()])
+        .await
+        .unwrap();
+    assert!(
+        !batched.contains_key("B-1"),
+        "a message with none is absent"
+    );
+    assert_eq!(batched["B-2"].len(), 1);
+    assert_eq!(batched["B-2"][0].emoji, "🎉");
+    assert_eq!(
+        chat_store.reactions(&chat, "B-2").await.unwrap()[0].emoji,
+        "🎉",
+        "and the single-message read agrees"
+    );
+
+    let pages = chat_store
+        .pages(vec![chat.clone(), other.clone()], 10)
+        .await
+        .unwrap();
+    assert_eq!(pages[&chat.to_string()].len(), 2);
+    assert_eq!(pages[&other.to_string()].len(), 1);
+    let single = chat_store.messages(&chat, None, 10).await.unwrap();
+    assert_eq!(
+        pages[&chat.to_string()]
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        single.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        "same rows, same order"
+    );
+
+    // A chat with nothing in it is absent rather than empty, which is what
+    // `unwrap_or_default` on the caller's side reads as "no page".
+    let empty = chat_store
+        .pages(vec![jid("559900000003@s.whatsapp.net")], 10)
+        .await
+        .unwrap();
+    assert!(empty.is_empty());
+}

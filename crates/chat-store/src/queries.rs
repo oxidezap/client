@@ -2,6 +2,7 @@
 //! come back as plain owned values (the SQLite page cache is the cache — no
 //! row caching on this side).
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -16,6 +17,12 @@ use crate::types::{
     ArrivalCursor, ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind,
     MessageStatus, ReactionEntry, ReceiptEntry, StoredMessage,
 };
+
+/// How many message ids one reaction lookup may bind at a time.
+///
+/// SQLite's compiled-in parameter ceiling is 999 on older builds; a page well
+/// under it costs one extra statement per fifty chats at most.
+const REACTION_ID_CHUNK: usize = 400;
 
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(ms)
@@ -391,6 +398,53 @@ impl ChatStore {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// The newest page of each of several chats, in one read.
+    ///
+    /// The same statement [`messages`](Self::messages) runs, once per chat,
+    /// on one connection inside one snapshot. A front end attaching asks for
+    /// a hundred of these at once and the per-call cost — a permit, a
+    /// blocking task, a transaction — was being paid a hundred times to run
+    /// a hundred indexed lookups of a few microseconds each.
+    ///
+    /// Keyed by the JID string as passed, so a caller holding chat entries
+    /// can look its own page back up. A chat with no rows is absent rather
+    /// than empty; both mean the same thing to a caller using
+    /// `unwrap_or_default`.
+    pub async fn pages(
+        &self,
+        chats: Vec<Jid>,
+        limit: i64,
+    ) -> Result<HashMap<String, Vec<StoredMessage>>> {
+        use schema::messages::dsl;
+        let limit = limit.max(0);
+        let device_id = self.device_id();
+        let chats: Vec<String> = chats.iter().map(Jid::to_string).collect();
+        let pages: HashMap<String, Vec<MessageRow>> = self
+            .db()
+            .read(move |conn| {
+                let mut pages = HashMap::with_capacity(chats.len());
+                for chat in chats {
+                    let keys =
+                        crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
+                    let rows: Vec<MessageRow> = dsl::messages
+                        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
+                        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+                        .limit(limit)
+                        .load(conn)
+                        .map_err(db_err)?;
+                    if !rows.is_empty() {
+                        pages.insert(chat, rows);
+                    }
+                }
+                Ok(pages)
+            })
+            .await?;
+        Ok(pages
+            .into_iter()
+            .map(|(chat, rows)| (chat, rows.into_iter().map(Into::into).collect()))
+            .collect())
+    }
+
     /// One page of the whole session's messages, every chat interleaved, newest
     /// arrival first. `after` is the cursor of the last row of the page you
     /// have; it yields the page after that one, which is the next batch of
@@ -528,38 +582,82 @@ impl ChatStore {
         Ok(row.map(Into::into))
     }
 
+    /// Every reaction on one message.
+    ///
+    /// The page query with a page of one, so there is a single statement to
+    /// keep right: the identity keys a chat's rows may live under, and the
+    /// ordering a repeated reaction from the same sender is resolved by.
     pub async fn reactions(&self, chat: &Jid, msg_id: &str) -> Result<Vec<ReactionEntry>> {
+        Ok(self
+            .reactions_for(chat, vec![msg_id.to_owned()])
+            .await?
+            .remove(msg_id)
+            .unwrap_or_default())
+    }
+
+    /// Every reaction on a page of messages, keyed by message id.
+    ///
+    /// One query for the page rather than one per message. The per-message
+    /// call is what a history load used to multiply out: a front end
+    /// attaching asks for a hundred chats of fifty messages each, and each of
+    /// those five thousand reads is a permit, a blocking task, a transaction
+    /// and its own identity lookup — spent, for most rows, learning that a
+    /// message has no reactions.
+    ///
+    /// Chunked, because the ids go in as bind parameters and SQLite has a
+    /// ceiling on how many a statement may carry.
+    pub async fn reactions_for(
+        &self,
+        chat: &Jid,
+        msg_ids: Vec<String>,
+    ) -> Result<HashMap<String, Vec<ReactionEntry>>> {
         use schema::reactions::dsl;
+        if msg_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let device_id = self.device_id();
         let chat = chat.to_string();
-        let msg_id = msg_id.to_owned();
-        let rows: Vec<(String, String, i64)> = self
+        let rows: Vec<(String, String, String, i64)> = self
             .db()
             .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                dsl::reactions
-                    .filter(
-                        dsl::device_id
-                            .eq(device_id)
-                            .and(dsl::chat_jid.eq_any(keys))
-                            .and(dsl::msg_id.eq(&msg_id))
-                            .and(dsl::emoji.ne("")),
-                    )
-                    .select((dsl::sender_jid, dsl::emoji, dsl::ts_ms))
-                    .order(dsl::ts_ms.asc())
-                    .load(conn)
-                    .map_err(db_err)
+                let mut rows = Vec::new();
+                for page in msg_ids.chunks(REACTION_ID_CHUNK) {
+                    rows.extend(
+                        dsl::reactions
+                            .filter(
+                                dsl::device_id
+                                    .eq(device_id)
+                                    .and(dsl::chat_jid.eq_any(keys.clone()))
+                                    .and(dsl::msg_id.eq_any(page))
+                                    .and(dsl::emoji.ne("")),
+                            )
+                            .select((dsl::msg_id, dsl::sender_jid, dsl::emoji, dsl::ts_ms))
+                            .order(dsl::ts_ms.asc())
+                            .load::<(String, String, String, i64)>(conn)
+                            .map_err(db_err)?,
+                    );
+                }
+                Ok(rows)
             })
             .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(sender, emoji, ts)| ReactionEntry {
+
+        // Grouped here rather than by the query, because the order that
+        // matters is the one within a message — the newest reaction from a
+        // sender wins — and a chunked read cannot express it across pages.
+        let mut by_message: HashMap<String, Vec<ReactionEntry>> = HashMap::new();
+        for (msg_id, sender, emoji, ts) in rows {
+            by_message.entry(msg_id).or_default().push(ReactionEntry {
                 sender_jid: parse_jid(&sender),
                 emoji,
                 timestamp: ms_to_utc(ts).unwrap_or_default(),
-            })
-            .collect())
+            });
+        }
+        for entries in by_message.values_mut() {
+            entries.sort_by_key(|entry| entry.timestamp);
+        }
+        Ok(by_message)
     }
 
     /// Per-user receipts of one message (group "delivered to"/"read by").
