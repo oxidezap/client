@@ -38,6 +38,10 @@ impl WhatsAppApp {
                 // was deleted/archived. (Skipping empty loads instead would
                 // break clearing the last chat deleted on another device.)
                 if complete {
+                    // A complete load is the store's own answer changing, and
+                    // a history sync makes several of them: a list that ended
+                    // before the sync did has more behind it now.
+                    self.reopen_finished_pages();
                     let loaded: std::collections::HashSet<&str> =
                         chats.iter().map(|c| c.jid.as_str()).collect();
                     // What the last frame drew, not what is selected: see

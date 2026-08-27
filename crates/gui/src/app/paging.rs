@@ -39,7 +39,12 @@ pub(super) enum Paging {
     /// There is more, continuing here.
     More(PageCursor),
     /// Everything there is has arrived.
-    Done,
+    ///
+    /// `from` is where the last ask started, which is what makes this
+    /// reopenable: a list can grow *behind* its end while a history sync is
+    /// still committing batches, and asking again from there is asking for
+    /// exactly what was not there the first time.
+    Done { from: Option<PageCursor> },
 }
 
 impl Paging {
@@ -51,13 +56,31 @@ impl Paging {
         match self {
             Self::Unasked => Some(None),
             Self::More(cursor) => Some(Some(cursor.clone())),
-            Self::Loading { .. } | Self::Done => None,
+            Self::Loading { .. } | Self::Done { .. } => None,
         }
     }
 
-    /// What a page's own answer says about where the list continues.
-    fn arrived(next: Option<PageCursor>) -> Self {
-        next.map_or(Self::Done, Self::More)
+    /// What a page's own answer says about where the list continues, given
+    /// where it was asked from.
+    fn arrived(from: Option<PageCursor>, next: Option<PageCursor>) -> Self {
+        next.map_or(Self::Done { from }, Self::More)
+    }
+
+    /// Ask again from where the list ended, because it may not end there any
+    /// more.
+    ///
+    /// A history sync materializes its batches over minutes, and a reader who
+    /// reached the end of a conversation — or of the chat list — before it
+    /// finished was told, truthfully, that there was nothing behind it. The
+    /// rows that arrive afterwards are older than everything fetched, so the
+    /// cursor the last ask used is exactly where they are; without this they
+    /// stayed unreachable until a restart.
+    fn reopened(&self) -> Self {
+        match self {
+            Self::Done { from: Some(cursor) } => Self::More(cursor.clone()),
+            Self::Done { from: None } => Self::Unasked,
+            unsettled => unsettled.clone(),
+        }
     }
 
     /// A request that did not come back. The position is what it was.
@@ -134,15 +157,16 @@ impl WhatsAppApp {
         // reset: `forget_paging` clears these positions, and the answer to a
         // request made under the old account can still be on the socket.
         // Folding it in would put that account's rows into this one's list.
-        if !matches!(self.timeline_pages.get(&jid), Some(Paging::Loading { .. })) {
+        let Some(Paging::Loading { from }) = self.timeline_pages.get(&jid) else {
             debug!(
                 "a page arrived for {}, which nobody asked for",
                 observe_str(&jid)
             );
             return;
-        }
+        };
+        let asked_from = from.clone();
         self.timeline_pages
-            .insert(jid.clone(), Paging::arrived(next));
+            .insert(jid.clone(), Paging::arrived(asked_from, next));
         if messages.is_empty() {
             return;
         }
@@ -173,11 +197,11 @@ impl WhatsAppApp {
     ) {
         // The same rule, and the one that matters most: this page's rows go
         // into the list whether or not anything else remembers them.
-        if !matches!(self.chat_pages, Paging::Loading { .. }) {
+        let Paging::Loading { from } = &self.chat_pages else {
             debug!("a chat page arrived that nobody asked for");
             return;
-        }
-        self.chat_pages = Paging::arrived(next);
+        };
+        self.chat_pages = Paging::arrived(from.clone(), next);
         if chats.is_empty() {
             return;
         }
@@ -209,6 +233,20 @@ impl WhatsAppApp {
         for jid in gone {
             self.timeline_pages.remove(jid);
         }
+    }
+
+    /// Ask the finished lists again, because the store has more to give.
+    ///
+    /// Called where a complete load says the store's own answer changed: a
+    /// history sync commits its batches over minutes, so a conversation that
+    /// ended before the sync did did not really end there. Only settled ends
+    /// move — a list still waiting on a page is untouched, and one with a
+    /// cursor already asks for itself.
+    pub(super) fn reopen_finished_pages(&mut self) {
+        for paging in self.timeline_pages.values_mut() {
+            *paging = paging.reopened();
+        }
+        self.chat_pages = self.chat_pages.reopened();
     }
 
     /// Everything this window learned about where its lists continue.
@@ -261,7 +299,7 @@ mod tests {
         ));
         for settled in [
             Paging::Unasked,
-            Paging::Done,
+            Paging::Done { from: None },
             Paging::More(cursor("c1:-:9:a@s.whatsapp.net")),
         ] {
             assert!(!matches!(settled, Paging::Loading { .. }));
@@ -278,7 +316,7 @@ mod tests {
             Some(Some(cursor("m1:1:2")))
         );
         assert_eq!(Paging::Loading { from: None }.to_ask(), None);
-        assert_eq!(Paging::Done.to_ask(), None);
+        assert_eq!(Paging::Done { from: None }.to_ask(), None);
     }
 
     /// A refusal must leave the list able to ask again, at the same place.
@@ -291,17 +329,47 @@ mod tests {
         assert_eq!(Paging::Loading { from: None }.lost(), Paging::Unasked);
         // A position that was never in flight is not moved by somebody else's
         // failure.
-        assert_eq!(Paging::Done.lost(), Paging::Done);
+        assert_eq!(
+            Paging::Done { from: None }.lost(),
+            Paging::Done { from: None }
+        );
     }
 
     /// The end of a list is a page with no cursor, not an empty page: a page
     /// can be empty and still have something behind it.
     #[test]
     fn a_page_without_a_cursor_ends_the_list() {
-        assert_eq!(Paging::arrived(None), Paging::Done);
         assert_eq!(
-            Paging::arrived(Some(cursor("c1:-:9:a@s.whatsapp.net"))),
+            Paging::arrived(None, None),
+            Paging::Done { from: None },
+            "the first page, and the last"
+        );
+        assert_eq!(
+            Paging::arrived(None, Some(cursor("c1:-:9:a@s.whatsapp.net"))),
             Paging::More(cursor("c1:-:9:a@s.whatsapp.net"))
+        );
+    }
+
+    /// A list that ended while the store was still being written did not end
+    /// there: asking again from where it stopped is asking for what was not
+    /// there yet.
+    #[test]
+    fn a_finished_list_reopens_where_it_stopped() {
+        let ended = Paging::arrived(Some(cursor("m1:9:2")), None);
+        assert_eq!(ended.reopened(), Paging::More(cursor("m1:9:2")));
+        // A first page that was also the last has nowhere to continue from,
+        // so it starts over — the same ask, and the same merge.
+        assert_eq!(
+            Paging::Done { from: None }.reopened(),
+            Paging::Unasked,
+            "from the newest again"
+        );
+        // Anything still moving is left alone.
+        let waiting = Paging::Loading { from: None };
+        assert_eq!(waiting.reopened(), waiting);
+        assert_eq!(
+            Paging::More(cursor("m1:9:2")).reopened(),
+            Paging::More(cursor("m1:9:2"))
         );
     }
 

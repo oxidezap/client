@@ -72,61 +72,60 @@ pub struct MessageListCache {
     pub messages: Arc<[ChatMessage]>,
 }
 
-/// What names one row, so it can be recognised at an index later.
-///
-/// Enough to say "this is still that row", which is all the timeline anchor
-/// asks. Not enough to say the row is unchanged — a bubble grows a reaction
-/// or a retry button without becoming a different row, and the build number
-/// is what answers that.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum RowId {
-    Divider(DateTime<Utc>),
-    Message(String),
-    Typing,
-    Encryption,
-}
-
 impl MessageListCache {
-    /// Which row sits at `ix`, if anything does.
+    /// How many rows at the front of these two are the same row, drawn the
+    /// same way.
     ///
-    /// The anchor asks this about one index — the last row whose measurement
-    /// the list is keeping — because a prepend, a middle insertion and a
-    /// removal all move that row and an append does not.
-    pub fn row_id(&self, ix: usize) -> Option<RowId> {
-        Some(match self.items.get(ix)? {
-            TimelineItem::DateDivider(day) => RowId::Divider(*day),
-            TimelineItem::Message { ix, .. } => RowId::Message(self.messages.get(*ix)?.id.clone()),
-            TimelineItem::Typing(_) => RowId::Typing,
-            TimelineItem::Encryption => RowId::Encryption,
-        })
+    /// The front is not a safe assumption on its own: the encryption notice
+    /// sits at index 0 whatever else happens, and a page of older history
+    /// lands *after* it — so a prepend is an insertion in the middle of the
+    /// rows, not at the top of them. It can also swallow a divider, when the
+    /// page's newest message shares a day with the oldest already drawn.
+    pub fn common_prefix(&self, other: &Self) -> usize {
+        (0..self.items.len().min(other.items.len()))
+            .take_while(|ix| self.row_matches(*ix, other, *ix))
+            .count()
     }
 
-    /// The last row that is about the conversation, and where it is.
-    ///
-    /// Everything but the typing indicator: that row is somebody else's
-    /// keystrokes, it comes and goes under a conversation that has not
-    /// changed, and it always sits last. An anchor on it says the last row is
-    /// still the last row while a message lands in front of it — which reads
-    /// as a page of older history, and put an arrival at the top of the
-    /// timeline.
-    pub fn last_stable(&self) -> Option<(usize, RowId)> {
-        (0..self.items.len())
-            .rev()
-            .find(|ix| !matches!(self.items.get(*ix), Some(TimelineItem::Typing(_))))
-            .and_then(|ix| Some((ix, self.row_id(ix)?)))
+    /// The same from the end, over the rows neither side has already spent on
+    /// [`Self::common_prefix`].
+    pub fn common_suffix(&self, other: &Self, spent: usize) -> usize {
+        let room = (self.items.len().min(other.items.len())).saturating_sub(spent);
+        (1..=room)
+            .take_while(|back| {
+                self.row_matches(self.items.len() - back, other, other.items.len() - back)
+            })
+            .count()
     }
 
-    /// Where a row the list measured has ended up, if it is still drawn.
+    /// Whether two rows are the same row *and* would be drawn the same way.
     ///
-    /// Searched from the end, which is where a bottom-anchored timeline keeps
-    /// the row this is asked about: the boundary is the last row measured, so
-    /// an append finds it one row in and a page of older history finds it at
-    /// the end. A row id is unique in a timeline — a message by its id, a
-    /// divider by its day, and one each of the other two.
-    pub fn position_of(&self, row: &RowId) -> Option<usize> {
-        (0..self.items.len())
-            .rev()
-            .find(|ix| self.row_id(*ix).as_ref() == Some(row))
+    /// Identity is not enough: a message that stops starting a run loses its
+    /// name and avatar, which is a height the list would otherwise keep. The
+    /// bytes inside a bubble are the `build` number's business; this is about
+    /// what the row is.
+    fn row_matches(&self, ix: usize, other: &Self, other_ix: usize) -> bool {
+        match (self.items.get(ix), other.items.get(other_ix)) {
+            (
+                Some(TimelineItem::Message { ix, starts_run }),
+                Some(TimelineItem::Message {
+                    ix: other_ix,
+                    starts_run: other_starts_run,
+                }),
+            ) => {
+                starts_run == other_starts_run
+                    && self.messages.get(*ix).map(|m| &m.id)
+                        == other.messages.get(*other_ix).map(|m| &m.id)
+            }
+            (Some(TimelineItem::DateDivider(day)), Some(TimelineItem::DateDivider(other_day))) => {
+                day == other_day
+            }
+            (Some(TimelineItem::Typing(summary)), Some(TimelineItem::Typing(other_summary))) => {
+                summary == other_summary
+            }
+            (Some(TimelineItem::Encryption), Some(TimelineItem::Encryption)) => true,
+            _ => false,
+        }
     }
 }
 
@@ -238,39 +237,51 @@ mod tests {
             .collect()
     }
 
-    /// What the timeline anchor compares: the row at the end of the prefix
-    /// the list has measured. An append leaves it where it was; a backfill
-    /// before the head, and a row inserted in the middle, both push it along
-    /// — and both raise the count exactly as an arrival does.
+    /// What the timeline anchor compares: which rows the two frames have in
+    /// common at either end, and therefore the stretch between them that
+    /// changed. An append changes the end alone; a page of older history
+    /// changes a stretch that starts *after* the encryption notice.
     #[test]
-    fn the_last_measured_row_is_what_says_the_rest_did_not_move() {
+    fn what_two_frames_share_is_what_the_list_may_keep() {
         let first = message("a", false, at(13, 9));
         let last = message("a", false, at(14, 9));
-
         let before = MessageListCache::new(&[first.clone(), last.clone()], false, None);
-        let boundary = before.row_id(before.items.len() - 1);
-        assert_eq!(boundary, Some(RowId::Message(last.id.clone())));
 
         let appended = MessageListCache::new(
             &[first.clone(), last.clone(), message("a", false, at(15, 9))],
             false,
             None,
         );
+        let at_ix = before.common_prefix(&appended);
         assert_eq!(
-            appended.row_id(before.items.len() - 1),
-            boundary,
+            at_ix,
+            before.items.len(),
             "an append leaves every earlier row where it was"
+        );
+        assert_eq!(before.common_suffix(&appended, at_ix), 0);
+
+        // A page of older history. The encryption notice is still at index 0,
+        // which is exactly the row a splice at the front would trample.
+        let paged = MessageListCache::new(
+            &[message("a", false, at(11, 9)), first.clone(), last.clone()],
+            false,
+            None,
+        );
+        let at_ix = before.common_prefix(&paged);
+        assert_eq!(at_ix, 1, "the encryption notice, and nothing after it");
+        assert_eq!(
+            before.common_suffix(&paged, at_ix),
+            before.items.len() - 1,
+            "everything else is still there, further down"
         );
 
         // Inserted between the two, the way a system notice stamped in the
-        // past joins a conversation.
+        // past joins a conversation: neither end alone accounts for it.
         let inserted =
             MessageListCache::new(&[first, message("a", false, at(13, 18)), last], false, None);
-        assert_ne!(
-            inserted.row_id(before.items.len() - 1),
-            boundary,
-            "a row in the middle moves the one the list measured last"
-        );
+        let at_ix = before.common_prefix(&inserted);
+        assert!(at_ix > 0 && at_ix < before.items.len());
+        assert!(before.common_suffix(&inserted, at_ix) < before.items.len());
     }
 
     /// A rebuild is the signal that something inside a row changed, and it is

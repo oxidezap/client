@@ -281,23 +281,21 @@ profile here repeats it deliberately.
   a backfill before the head, a notice stamped in the past and a message
   landing mid-history all raise it exactly as an arrival does, and only an
   arrival leaves the earlier rows alone. The row at the end of the measured
-  prefix is what answers it, and *where it ended up* is the whole answer
-  (`MessageListCache::position_of`): how far it moved is how many rows arrived
-  in front of it, and what is left after it is what arrived behind. Which row
-  that is, is `last_stable` rather than the last one drawn: the typing
-  indicator sits after every message, is somebody else's keystrokes rather
-  than the conversation, and anchored on it a message landing *in front of it*
-  read as a page of older history and was spliced to the top. So arrivals go
-  where the boundary is, not at the end. A row can
-  also change height with the count standing still — an image arrives, a
-  reaction lands, a send fails and grows a retry button — which the `build`
-  number answers. So the outcomes are one splice at either end, remeasure and
-  reset, and rows at the *front* are what a page of older history is:
-  everything measured is still there one page further down, and a
-  bottom-anchored list is unmoved by that. Asking each end its own yes/no
-  question instead makes a frame that carries both — a page landing beside an
-  arrival — answer neither, and a reader who scrolled back far enough to ask
-  for more was thrown to the newest message for asking.
+  prefix is what answers it — and the honest form of that question is which
+  of the rows it measured this frame still draws, and where
+  (`MessageListCache::common_prefix`/`common_suffix`): what they share at
+  either end is what may be kept, and the stretch between is one splice,
+  removal and insertion alike. Neither end is where a count would put it. The
+  encryption notice holds index 0 whatever arrives in front of the messages,
+  so a page of older history is an insertion in the *middle* and splicing it
+  at 0 slides the notice's height onto a message; the typing indicator holds
+  the last index whatever arrives behind them, so an arrival under it read as
+  a page and went to the top; and a page can swallow a divider its own newest
+  message now shares a day with. A row can also change height with the rows
+  standing still — an image arrives, a reaction lands, a send fails and grows
+  a retry button — which the `build` number answers, and which is also what
+  keeps the diff off the hot path: same build, same rows, nothing to compare.
+  Only another conversation resets.
 - **What a frame leaves out, its reader fills in.** The wire is
   newline-delimited JSON and a history load is a hundred chats of fifty rows,
   most of whose fields are empty — no reaction, no quote, no media, nothing
@@ -366,6 +364,14 @@ profile here repeats it deliberately.
   end. WhatsApp Web sizes it the same way and preloads neither
   (`web_preload_chat_messages`, `web_init_chat_batch_size`,
   `history_sync_on_demand_message_count`).
+  A list that has reached its end has only reached the end of what the store
+  holds *now*: a history sync commits over minutes, so `Paging::Done` keeps
+  the cursor it last asked with and a complete load reopens it
+  (`reopen_finished_pages`) — the rows that arrive are older than everything
+  fetched, which is exactly where that cursor points. And an empty list is at
+  its end like any other, so the frame asks on the sidebar's behalf when a
+  filter matches nothing: the virtual list that would have asked is not built
+  when there is nothing to put in it.
   Two rules keep it honest. A cursor is **opaque** — what a page is ordered by
   is the store's business, and a front end that parsed one would be a second
   implementation of that order — so `PageCursor` is a token the daemon writes
@@ -377,9 +383,10 @@ profile here repeats it deliberately.
   would be refused for naming something the daemon has never heard of. A page
   is a frame like any other, so its media is externalized like any other
   (`externalize_messages`) and read back on the client's own IPC thread; the
-  status broadcast gets a whole page of its own, because nothing opens it as a
-  conversation and so nothing ever asks it for messages; and a page's rows
-  carry each row's other half, since a PN/LID pair is collapsed over the rows
+  page of chats is sized exactly as the attach load sizes one (`attach_page`),
+  because a read owes a receipt per unread message rather than one for the
+  chat and the status broadcast is nobody's conversation to open; and a page's
+  rows carry each row's other half, since a PN/LID pair is collapsed over the rows
   one hydration is given and a page boundary falls wherever the store's order
   puts it — half a pair alone is a chat with half the pair's unread count,
   merged over the whole one the window already had.

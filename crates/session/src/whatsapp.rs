@@ -1786,19 +1786,15 @@ impl WhatsAppClient {
                 .then(|| entries.last().map(chat_cursor))
                 .flatten();
             let entries = Self::with_alias_rows(&store, &client, &names, entries).await;
-            // One message each: the row and its preview. Whatever else a
-            // conversation holds is what `load_messages` is for — except the
-            // status broadcast, which no front end opens as a conversation and
-            // so never asks about. Its whole run is its page, as at attach.
-            let chats = Self::hydrate_entries(&store, &client, &names, entries, |entry| {
-                if is_status_broadcast(entry) {
-                    Self::MESSAGE_PAGE
-                } else {
-                    1
-                }
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+            // Sized exactly as the attach load sizes it, and for the same
+            // reasons: the row previews from its newest message, a read owes
+            // a receipt per unread message rather than one for the chat, and
+            // the status broadcast is nobody's conversation to open. A page
+            // that carried the newest row alone let a window read a chat
+            // whose older unread messages then went unacknowledged.
+            let chats = Self::hydrate_entries(&store, &client, &names, entries, Self::attach_page)
+                .await
+                .map_err(|e| e.to_string())?;
             Ok(Page { items: chats, next })
         })
     }
