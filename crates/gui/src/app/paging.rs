@@ -131,10 +131,11 @@ impl WhatsAppApp {
 
     /// Ask for more of the chat list.
     ///
-    /// The first ask is deliberately from the top: the attach load handed this
-    /// window the first page without a cursor to continue from, so the page
-    /// that re-asks for it is what produces one. Its rows are the ones already
-    /// on screen and merge into them; every page after it is new.
+    /// Normally from where the last history load stopped, which it says in the
+    /// load itself (`note_chat_list_end`) — so the first ask is a page this
+    /// window does not have. Asking from the top is the fallback for a load
+    /// that named no position: it re-fetches the rows already on screen to
+    /// obtain a cursor, and they merge into themselves.
     pub fn want_more_chats(&mut self) {
         let Some(ask) = self.chat_pages.to_ask() else {
             return;
@@ -262,6 +263,21 @@ impl WhatsAppApp {
         self.chat_pages = self.chat_pages.reopened();
     }
 
+    /// Where a history load leaves the chat list.
+    ///
+    /// The load walked the store's order itself, so it knows something no
+    /// front end can infer: `next` is the position it stopped at, and a
+    /// complete load is the whole list with nothing after it. Adopting that
+    /// is what stops the first "load more" from re-fetching the page the
+    /// window was handed — the attach load left no cursor, so the only way to
+    /// obtain one was to ask for those rows again.
+    ///
+    /// A page already in flight is left alone: it asked from a position of
+    /// its own and its answer is what settles the list.
+    pub(super) fn note_chat_list_end(&mut self, complete: bool, next: Option<String>) {
+        settle_chat_list_end(&mut self.chat_pages, complete, next);
+    }
+
     /// Everything this window learned about where its lists continue.
     ///
     /// Dropped with the account: the cursors describe positions in one
@@ -269,6 +285,37 @@ impl WhatsAppApp {
     pub(super) fn forget_paging(&mut self) {
         self.timeline_pages.clear();
         self.chat_pages = Paging::Unasked;
+    }
+}
+
+/// What a history load leaves the chat list's position at.
+///
+/// Apart from the app, because it is one decision about one field and the app
+/// is only where that field is kept.
+fn settle_chat_list_end(pages: &mut Paging, complete: bool, next: Option<String>) {
+    // A page already in flight asked from a position of its own, and its
+    // answer is what settles the list. A load landing in between says nothing
+    // this side did not already ask about.
+    if matches!(pages, Paging::Loading { .. }) {
+        return;
+    }
+    match (complete, next) {
+        // The store's whole list, so there is nothing behind it — and nothing
+        // worth asking for, since asking returns these same rows. True however
+        // far this window had paged: the list ends here.
+        (true, _) => *pages = Paging::Done { from: None },
+        // Where the *first* page ends, which is only news to a list that has
+        // never asked. A window that has paged deeper is already past it, and
+        // adopting it would walk it back — re-fetching pages it has merged,
+        // once per history load, which during a sync is repeatedly.
+        (false, Some(cursor)) if matches!(pages, Paging::Unasked) => {
+            *pages = Paging::More(PageCursor::new(&cursor));
+        }
+        // A load that says nothing about the list — a scoped reload, or a
+        // daemon that predates the cursor — and a load whose position this
+        // window is already past. Both leave it where it is; for a window
+        // that has never asked, that is "from the top".
+        _ => {}
     }
 }
 
@@ -301,6 +348,14 @@ mod tests {
         PageCursor::new(at)
     }
 
+    /// [`WhatsAppApp::note_chat_list_end`] without a window: the decision is
+    /// about one field, and the app is only where it is kept.
+    fn settled_by(from: Paging, complete: bool, next: Option<&str>) -> Paging {
+        let mut pages = from;
+        settle_chat_list_end(&mut pages, complete, next.map(str::to_string));
+        pages
+    }
+
     /// An answer is only folded in while something is waiting for it: an
     /// account reset clears these positions, and the page it asked for can
     /// still be on its way.
@@ -317,6 +372,69 @@ mod tests {
         ] {
             assert!(!matches!(settled, Paging::Loading { .. }));
         }
+    }
+
+    /// A load walks the store's order itself, so what it says about the end
+    /// of the list beats anything a window could infer from the rows.
+    #[test]
+    fn a_load_says_where_the_chat_list_stands() {
+        // The whole list: nothing behind it, so nothing to ask for.
+        assert_eq!(
+            settled_by(Paging::Unasked, true, None),
+            Paging::Done { from: None }
+        );
+        // Stopped at its limit: the next page is the one after these rows,
+        // which is the ask this whole field exists to save.
+        assert_eq!(
+            settled_by(Paging::Unasked, false, Some("c1:-:9:a@s.whatsapp.net")),
+            Paging::More(cursor("c1:-:9:a@s.whatsapp.net"))
+        );
+        // A scoped reload, or a daemon that predates the cursor: it says
+        // nothing about the list, so the position is what it was.
+        assert_eq!(settled_by(Paging::Unasked, false, None), Paging::Unasked);
+        assert_eq!(
+            settled_by(Paging::More(cursor("c1:-:9:a@s.whatsapp.net")), false, None),
+            Paging::More(cursor("c1:-:9:a@s.whatsapp.net"))
+        );
+    }
+
+    /// The cursor a load carries is where its *first* page ends, so it is
+    /// news only to a list that has not asked for anything. A reader who has
+    /// paged deeper is already past it, and every history load carries it
+    /// again — adopting it would walk them back to the first page, over and
+    /// over, for the length of a history sync.
+    #[test]
+    fn a_load_does_not_walk_a_deeper_list_back() {
+        let deeper = Paging::More(cursor("c1:-:300:z@s.whatsapp.net"));
+        assert_eq!(
+            settled_by(deeper.clone(), false, Some("c1:-:100:a@s.whatsapp.net")),
+            deeper
+        );
+        // Reached the end already: the load's position is behind that too.
+        let ended = Paging::Done {
+            from: Some(cursor("c1:-:300:z@s.whatsapp.net")),
+        };
+        assert_eq!(
+            settled_by(ended.clone(), false, Some("c1:-:100:a@s.whatsapp.net")),
+            ended
+        );
+        // But a complete load is the whole list however deep the reader is.
+        assert_eq!(settled_by(deeper, true, None), Paging::Done { from: None });
+    }
+
+    /// A page already asked for names its own continuation, and its answer is
+    /// what settles the list. A load landing in between must not move the
+    /// position out from under it.
+    #[test]
+    fn a_load_does_not_move_a_page_in_flight() {
+        let waiting = Paging::Loading {
+            from: Some(cursor("c1:-:9:a@s.whatsapp.net")),
+        };
+        assert_eq!(settled_by(waiting.clone(), true, None), waiting);
+        assert_eq!(
+            settled_by(waiting.clone(), false, Some("c1:-:1:b@s.whatsapp.net")),
+            waiting
+        );
     }
 
     /// The three states that mean different things about asking: never asked,

@@ -955,6 +955,10 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
             // messages in it, so this load is not the store's whole truth
             // and must not prune anything.
             complete: false,
+            // And no position either: these rows are the daemon's list, not
+            // a walk of the store's order, so there is nothing after them to
+            // name. The session's own load is what says where to continue.
+            next: None,
         }));
     }
     match &snapshot.connection {
@@ -1217,10 +1221,19 @@ mod tests {
         let Some(FromDaemon::Session(first)) = events.first() else {
             panic!("the list is not the first event");
         };
-        let UiEvent::HistoryLoaded { chats, complete } = first.as_ref() else {
+        let UiEvent::HistoryLoaded {
+            chats,
+            complete,
+            next,
+        } = first.as_ref()
+        else {
             panic!("the list does not come first: {first:?}");
         };
         assert!(!complete, "a summary is never the store's whole truth");
+        assert!(
+            next.is_none(),
+            "these rows are the daemon's list, not a walk of the store's order"
+        );
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].name, "Alguém");
         assert_eq!(chats[0].unread_count, 3);

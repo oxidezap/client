@@ -382,6 +382,14 @@ profile here repeats it deliberately.
   its end like any other, so the frame asks on the sidebar's behalf when a
   filter matches nothing: the virtual list that would have asked is not built
   when there is nothing to put in it.
+  Where the list continues is said by the load that walked it: a truncated
+  `HistoryLoaded` carries the position it stopped at and a complete one is the
+  whole list, so a window's first "load more" is a page it does not have —
+  adopted only by a list that has not asked for anything, since that position
+  is where the *first* page ends and every later load carries it again. It
+  costs the load nothing — it has already walked that far — and the ask it
+  replaces was a hundred rows re-read, re-serialized and re-merged to learn
+  one token.
   Two rules keep it honest. A cursor is **opaque** — what a page is ordered by
   is the store's business, and a front end that parsed one would be a second
   implementation of that order — so `PageCursor` is a token the daemon writes
@@ -396,8 +404,9 @@ profile here repeats it deliberately.
   page of chats is sized exactly as the attach load sizes one (`attach_page`),
   because a read owes a receipt per unread message rather than one for the
   chat and the status broadcast is nobody's conversation to open; and a page's
-  rows carry each row's other half, since a PN/LID pair is collapsed over the rows
-  one hydration is given and a page boundary falls wherever the store's order
+  rows carry each row's other half — the attach load's too, now that a front
+  end continues past that window rather than re-fetching it — since a PN/LID
+  pair is collapsed over the rows one hydration is given and a page boundary falls wherever the store's order
   puts it — half a pair alone is a chat with half the pair's unread count,
   merged over the whole one the window already had.
 - **The reload debounce is for bursts, not for askers.** A history sync commits
