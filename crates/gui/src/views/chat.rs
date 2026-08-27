@@ -88,7 +88,13 @@ pub fn render_connected_view(
         .and_then(|chat| app.availability_of(&chat.jid))
         .cloned();
     let message_cache = selected_chat.as_ref().map(|chat| {
-        app.get_message_list_cache(&chat.jid, &chat.messages, chat.is_group, typing.clone())
+        app.get_message_list_cache(
+            &chat.jid,
+            &chat.messages,
+            chat.is_group,
+            typing.clone(),
+            layout,
+        )
     });
     // A call in a chat other than the one on screen is what the return banner
     // is for; a call in *this* chat is already obvious from the card.
@@ -220,6 +226,10 @@ pub fn render_connected_view(
             && layout.show_chat_area()
             && selected_chat.is_some()
             && !is_offline,
+        viewer: viewer.is_some(),
+        // The card floats above this view rather than inside it, so the root
+        // is what knows whether one was drawn. See `WhatsAppApp::render`.
+        call_card: false,
     });
 
     let rail = render_nav_rail(

@@ -342,18 +342,17 @@ impl WhatsAppApp {
     /// to change, and every window-level shortcut stayed dead until a click
     /// gave the window a focus of its own.
     pub fn sync_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let wanted = match self
+        let ringing = self
             .call_state
             .stage()
             .filter(|stage| !matches!(stage, Stage::Active(_)))
-        {
-            Some(stage) => KeyboardOwner::RingingCall(stage.call_id().to_string()),
-            None if self.media_viewer.is_some() => KeyboardOwner::Viewer,
-            None if self.showing_settings() => KeyboardOwner::Screen,
-            None if self.keyboard_surfaces.composer => KeyboardOwner::Composer,
-            None if self.keyboard_surfaces.chat_list => KeyboardOwner::ChatList,
-            None => KeyboardOwner::Root,
-        };
+            .map(|stage| stage.call_id().to_string());
+        let wanted = keyboard_owner_for(
+            ringing,
+            self.keyboard_surfaces,
+            self.keyboard_intent,
+            self.showing_settings(),
+        );
         if self.keyboard_owner.as_ref() == Some(&wanted) {
             return;
         }
@@ -483,5 +482,167 @@ impl WhatsAppApp {
             }
             let _ = entity.update(cx, |app, _| app.tick_task = None);
         }));
+    }
+}
+
+/// Who should have the keyboard, given a ringing call and the surfaces this
+/// frame drew.
+///
+/// Every arm asks what the frame *drew*, never what the state holds. The two
+/// are not the same across a dropped connection: the viewer and the call both
+/// survive it — `leave_connected_view` closes neither — while the error
+/// screen that replaces the conversation draws neither of them. Handing the
+/// keyboard to one there puts it on a handle outside the frame, which sends
+/// every key to gpui's root and past the recovery controls the screen is
+/// there to offer — the exact failure the list exists to end, reintroduced at
+/// its own head.
+///
+/// Pure, and separate from the handing-over, because this is the part with
+/// cases and the other is four lines of `window.focus`.
+fn keyboard_owner_for(
+    ringing_call: Option<String>,
+    surfaces: KeyboardSurfaces,
+    intent: ChatOpen,
+    showing_settings: bool,
+) -> KeyboardOwner {
+    let composing = intent == ChatOpen::ToCompose;
+    match ringing_call.filter(|_| surfaces.call_card) {
+        Some(call_id) => KeyboardOwner::RingingCall(call_id),
+        None if surfaces.viewer => KeyboardOwner::Viewer,
+        None if showing_settings => KeyboardOwner::Screen,
+        // Where both are drawn, the gesture decides. A chat opened to be
+        // talked to hands the caret over; one opened to be looked at leaves
+        // the list holding the arrow keys it is being walked with.
+        None if surfaces.composer && composing => KeyboardOwner::Composer,
+        None if surfaces.chat_list => KeyboardOwner::ChatList,
+        // A phone drawing a conversation is not drawing its list, so there is
+        // nowhere else for it to go — whatever the gesture was.
+        None if surfaces.composer => KeyboardOwner::Composer,
+        None => KeyboardOwner::Root,
+    }
+}
+
+#[cfg(test)]
+mod keyboard_owner_tests {
+    use super::*;
+
+    const NOTHING: KeyboardSurfaces = KeyboardSurfaces {
+        chat_list: false,
+        composer: false,
+        viewer: false,
+        call_card: false,
+    };
+
+    fn owner(surfaces: KeyboardSurfaces) -> KeyboardOwner {
+        keyboard_owner_for(None, surfaces, ChatOpen::ToCompose, false)
+    }
+
+    /// The floor. There is no frame whose answer is "nobody", because the
+    /// window itself is always drawn — and a window with no focus is one
+    /// whose every shortcut is dead until something else gives it one.
+    #[test]
+    fn a_frame_that_draws_no_surface_still_has_an_owner() {
+        assert_eq!(owner(NOTHING), KeyboardOwner::Root);
+    }
+
+    #[test]
+    fn the_surfaces_are_preferred_in_order() {
+        let all = KeyboardSurfaces {
+            chat_list: true,
+            composer: true,
+            viewer: true,
+            call_card: true,
+        };
+        assert_eq!(
+            keyboard_owner_for(Some("call-1".into()), all, ChatOpen::ToCompose, true),
+            KeyboardOwner::RingingCall("call-1".into())
+        );
+        assert_eq!(
+            keyboard_owner_for(None, all, ChatOpen::ToCompose, true),
+            KeyboardOwner::Viewer,
+            "a picture outranks a screen that focuses nothing of its own"
+        );
+        assert_eq!(
+            owner(KeyboardSurfaces {
+                viewer: false,
+                ..all
+            }),
+            KeyboardOwner::Composer
+        );
+        assert_eq!(
+            owner(KeyboardSurfaces {
+                chat_list: true,
+                ..NOTHING
+            }),
+            KeyboardOwner::ChatList
+        );
+    }
+
+    /// A viewer and a call both outlive the connection that opened them, and
+    /// the error screen draws neither. Focus follows the frame, not the
+    /// state.
+    #[test]
+    fn an_overlay_the_frame_did_not_draw_does_not_take_the_keyboard() {
+        assert_eq!(
+            keyboard_owner_for(Some("call-1".into()), NOTHING, ChatOpen::ToPreview, false),
+            KeyboardOwner::Root,
+            "a call ringing behind an error screen has no card to focus"
+        );
+        assert_eq!(
+            keyboard_owner_for(Some("call-1".into()), NOTHING, ChatOpen::ToPreview, true),
+            KeyboardOwner::Screen
+        );
+    }
+
+    /// The composer exists as an entity long after the conversation that made
+    /// it left the screen, and the offline strip replaces it in place.
+    #[test]
+    fn a_composer_that_is_not_drawn_is_not_the_owner() {
+        assert_eq!(
+            owner(KeyboardSurfaces {
+                chat_list: true,
+                ..NOTHING
+            }),
+            KeyboardOwner::ChatList
+        );
+    }
+
+    /// Walking the list with the arrow keys selects chats, and every one of
+    /// them draws a composer. The list's bindings are scoped to the list, so
+    /// a composer that took the keyboard on selection ended the walk after
+    /// one step.
+    #[test]
+    fn previewing_a_chat_leaves_the_arrow_keys_with_the_list() {
+        let both = KeyboardSurfaces {
+            chat_list: true,
+            composer: true,
+            ..NOTHING
+        };
+        assert_eq!(
+            keyboard_owner_for(None, both, ChatOpen::ToPreview, false),
+            KeyboardOwner::ChatList
+        );
+        assert_eq!(
+            keyboard_owner_for(None, both, ChatOpen::ToCompose, false),
+            KeyboardOwner::Composer,
+            "opening a chat to talk to it still hands the caret over"
+        );
+    }
+
+    /// A phone drawing a conversation is not drawing its list.
+    #[test]
+    fn a_preview_with_no_list_on_screen_still_lands_somewhere() {
+        assert_eq!(
+            keyboard_owner_for(
+                None,
+                KeyboardSurfaces {
+                    composer: true,
+                    ..NOTHING
+                },
+                ChatOpen::ToPreview,
+                false
+            ),
+            KeyboardOwner::Composer
+        );
     }
 }

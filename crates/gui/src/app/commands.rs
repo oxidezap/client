@@ -9,6 +9,16 @@ use super::*;
 impl WhatsAppApp {
     /// Move focus to the conversation search field.
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Only where there is a list to search. Every case below reaches the
+        // field by *navigating* to it — out of Settings, off Status, back to
+        // the list on a phone — and there is nowhere to navigate to from the
+        // screens on the way to a conversation: the field does not exist
+        // there, and focusing it anyway handed the keyboard to something
+        // outside the frame, which is a window that has stopped listening.
+        // Unreachable before the shortcut worked without a click.
+        if !matches!(self.app_state, AppState::Connected | AppState::Offline) {
+            return;
+        }
         // Searching from inside Settings means leaving Settings: the field
         // being focused is behind it.
         if self.settings.is_some() {

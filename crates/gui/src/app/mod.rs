@@ -138,11 +138,37 @@ pub struct KeyboardSurfaces {
     /// The composer — which the offline strip replaces, and which a phone
     /// showing its list is not drawing at all.
     pub composer: bool,
+    /// The fullscreen viewer. Held open across a dropped connection —
+    /// `leave_connected_view` does not close it — while the error screen that
+    /// replaces the conversation draws nothing of it.
+    pub viewer: bool,
+    /// The call card, which only the connected screens float.
+    pub call_card: bool,
+}
+
+/// The layout a set of row heights was measured against.
+///
+/// The list keeps one measured height per index and nothing about a row says
+/// how wide or how large it was drawn — so a window that resizes leaves every
+/// one of those heights describing a bubble that no longer exists at that
+/// size. Both halves move on their own: the fit changes the rem at a step
+/// boundary without the pane changing width, and dragging an edge changes the
+/// width without crossing a step.
+#[derive(Clone, Copy, PartialEq)]
+struct MeasuredAgainst {
+    /// The base font in force, which every dimension in a bubble resolves
+    /// from.
+    rem: f32,
+    /// How wide the timeline had to lay text out in, which is what decides
+    /// how many lines a message takes.
+    width: f32,
 }
 
 struct TimelineAnchor {
     jid: String,
     count: usize,
+    /// The layout the measured prefix was measured against.
+    measured: MeasuredAgainst,
     /// The build of the rows the list last measured.
     build: usize,
     /// The row at `count - 1`: the last one whose measurement the list is
@@ -519,6 +545,16 @@ pub struct WhatsAppApp {
     /// keyboard ended up belonging to nobody until the first click.
     /// See `sync_overlay_focus`.
     keyboard_owner: Option<KeyboardOwner>,
+    /// Whether the last gesture that touched a conversation was someone
+    /// meaning to *talk* to it or meaning to *look* at it.
+    ///
+    /// The distinction is [`ChatOpen`]'s and it already decided where focus
+    /// went at the moment of the gesture; this is the same answer kept, so
+    /// the frame after it does not undo it. Without it the composer outranked
+    /// the list whenever both were drawn, and the first arrow key selected a
+    /// chat and took the arrow keys away — the list's own bindings are scoped
+    /// to it, so walking a list with the keyboard ended after one step.
+    keyboard_intent: ChatOpen,
     /// Which of the two keyboard surfaces the last frame actually drew.
     ///
     /// Focus has to land on something that is *in* the frame — an unrendered
@@ -799,6 +835,9 @@ impl WhatsAppApp {
             call_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
             keyboard_owner: None,
+            // Nothing has been opened to talk to yet, and a window that comes
+            // up on a restored selection is one nobody has typed into.
+            keyboard_intent: ChatOpen::ToPreview,
             keyboard_surfaces: KeyboardSurfaces::default(),
             playback_epoch: 0,
             status_tick_at: None,
@@ -1126,6 +1165,7 @@ impl WhatsAppApp {
         messages: &[ChatMessage],
         is_group: bool,
         typing: Option<TypingSummary>,
+        layout: ResponsiveLayout,
     ) -> MessageListCache {
         let cached = {
             let cache = self.message_list_cache.borrow();
@@ -1142,7 +1182,14 @@ impl WhatsAppApp {
             built
         });
 
-        self.sync_timeline(chat_jid, &rows);
+        self.sync_timeline(
+            chat_jid,
+            &rows,
+            MeasuredAgainst {
+                rem: layout.metrics().rem_size(),
+                width: layout.message_list_width(),
+            },
+        );
         rows
     }
 
@@ -1165,7 +1212,12 @@ impl WhatsAppApp {
     /// message newer than the head but older than the tail — all push it
     /// along, and all of those raise the count exactly as an arrival does.
     /// Comparing the first row instead saw none of the middle three.
-    fn sync_timeline(&mut self, chat_jid: &str, rows: &MessageListCache) {
+    fn sync_timeline(
+        &mut self,
+        chat_jid: &str,
+        rows: &MessageListCache,
+        measured: MeasuredAgainst,
+    ) {
         let count = rows.items.len();
         let boundary = rows.row_id(count.saturating_sub(1));
         let previous = self.timeline_anchor.take();
@@ -1180,16 +1232,24 @@ impl WhatsAppApp {
 
         match continued {
             // Rows arrived at the end: keep the measurements taken for
-            // everything before them, and the reader's place with them.
+            // everything before them, and the reader's place with them — but
+            // only while they still describe those rows. A window resized in
+            // the same frame a message arrived in is one where the prefix is
+            // stale too, and splicing alone would keep every one of its
+            // heights.
             Some(anchor) if count > anchor.count => {
                 self.message_list
                     .splice(anchor.count..anchor.count, count - anchor.count);
+                if anchor.measured != measured {
+                    self.message_list.remeasure();
+                }
             }
-            // The same rows, rebuilt. Something inside one of them is a
-            // different size now; remeasure rather than reset, which keeps
-            // the reader where they were reading.
+            // The same rows, rebuilt — or the same rows against a layout that
+            // has moved under them. Either way something is a different size
+            // now; remeasure rather than reset, which keeps the reader where
+            // they were reading.
             Some(anchor) => {
-                if anchor.build != rows.build {
+                if anchor.build != rows.build || anchor.measured != measured {
                     self.message_list.remeasure();
                 }
             }
@@ -1201,6 +1261,7 @@ impl WhatsAppApp {
         self.timeline_anchor = Some(TimelineAnchor {
             jid: chat_jid.to_string(),
             count,
+            measured,
             build: rows.build,
             boundary,
         });
@@ -1347,6 +1408,11 @@ impl WhatsAppApp {
     /// up: a blurred handle leaves the window with no keyboard target at
     /// all, which reads as a window that stopped listening.
     pub(super) fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Putting the caret in the composer *is* the statement that typing
+        // goes here now, so the owner model records it here rather than at
+        // each of the three callers — a reply begun, a chat opened to talk
+        // to, the sync handing it back.
+        self.keyboard_intent = ChatOpen::ToCompose;
         if let Some(input_area) = self.input_area.clone() {
             // Read the handle out before focusing: `focus` needs `&mut App`
             // and `read` holds `cx` borrowed for as long as its result lives.
@@ -1830,6 +1896,7 @@ impl WhatsAppApp {
         self.selected_chat = Some(jid.clone());
         self.navigate_to_chat();
 
+        self.keyboard_intent = open;
         if open == ChatOpen::ToCompose {
             // After `navigate_to_chat`, so on mobile the composer exists on the
             // panel being switched to rather than the one being left.
@@ -2712,6 +2779,9 @@ impl Render for WhatsAppApp {
             .then(|| render_call_overlay(self, window, cx))
             .flatten();
 
+        // The card is the one surface the root draws itself, so it is the
+        // one the root answers for.
+        self.keyboard_surfaces.call_card = call_overlay.is_some();
         // After the body, which is what named the surfaces it drew, and
         // before the frame is painted, which is when the focus it hands over
         // takes effect. Unconditional: the screens on the way to a
