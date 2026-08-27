@@ -5,6 +5,18 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 16: a frame leaves out what it does not have. The empty half of a
+/// message — no reaction, no quote, no media, nothing revoked — and the
+/// optional half of a `MediaContent` are skipped on the way out and read back
+/// as their defaults, which is a third of a history load in bytes and in
+/// serde. A v15 reader requires those fields outright, so it would pass the
+/// handshake and then drop every media-bearing frame as unparsable. This is
+/// the version that turns that into the refusal it should be.
+///
+/// The hello also carries `has_window`, which a v15 client does not send.
+/// That one needs no version of its own — it defaults to what every client
+/// then in existence was.
+///
 /// 15: `MarkStatusWatched`. A v14 daemon does not know the request and
 /// refuses it as malformed, so the upgraded window would go on watching
 /// updates into a set that dies with it — which is the bug the request exists
@@ -67,7 +79,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

@@ -131,8 +131,17 @@ profile here repeats it deliberately.
   `catch_up` turns the list into the load event a front end already handles,
   and a window opens with the chats in it rather than flashing them in when
   its own store load returns. Never `complete` — a summary has no messages, so
-  it may not prune — and never store-backed, because during pairing those rows
-  are all there is and an empty complete load would take them away.
+  it may not prune — but store-backed, because these rows *are* the daemon's
+  list and the daemon's list is the store's, so a later complete load is
+  allowed to contradict them. Which is also why none are sent while pairing:
+  there the store is empty and whatever the daemon holds arrived live. They
+  stop at the window the session's own load fills, because a row past it is one
+  no load will ever put messages in. And a row without messages cannot be read:
+  `MarkRead` names what the requester saw, the daemon refuses one that names
+  nothing while it knows a boundary, so opening such a row banks the read
+  (`owed_reads`) and the load that brings the messages spends it — otherwise
+  the badge clears locally, no receipt goes out, and the next hydration puts it
+  straight back.
 - **The status reader is anchored to an update, not to a place in the run.**
   A position was safe only while a run grew at the end, and it does not: a
   live update and a hydrated one can both be stamped before the one being
@@ -337,7 +346,9 @@ profile here repeats it deliberately.
   load. A front end that asked outright is not a burst — it holds nothing, it
   asked for everything, and waiting the window out is a fifth of a second
   before the first query — so `spawn_history_reloader` skips the debounce on an
-  explicit ask.
+  explicit ask, and watches for one *inside* the drain as well as outside it: a
+  sync's changes never stop arriving, so a drain waiting on them alone has no
+  quiet window to end on and the asker waits out the whole sync.
 - **The chat store's writer queue is ordered on purpose.** Anything that
   targets a row (an ack, a nack, a local send failure) goes through the same
   queue as the write that created it, so it cannot outrun its target. A row

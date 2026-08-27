@@ -589,6 +589,19 @@ pub struct WhatsAppApp {
     /// without remembering the omission, the chat outlived its deletion until
     /// some unrelated later reload happened to notice again.
     departed_chats: std::collections::HashSet<String>,
+    /// Chats opened before their messages arrived, whose reads are still owed.
+    ///
+    /// `MarkRead` is a claim about the message the requester was looking at,
+    /// and the daemon refuses one that names nothing while it knows a
+    /// boundary itself — rightly, since a read clears whole seconds. A row
+    /// painted from the snapshot has no messages to name, so opening one
+    /// straight from the first frame would clear the badge here, send no
+    /// receipt, persist nothing, and have the badge come back on the next
+    /// hydration. Held until the load that carries the messages, and spent
+    /// there. A set rather than one chat: on the frame the snapshot paints,
+    /// every row is a row without messages, so two of them can be opened
+    /// before either load lands.
+    owed_reads: std::collections::HashSet<String>,
     /// Status updates watched in this window. Local by design — there is no
     /// receipt to send — and therefore this window's job to remember across a
     /// hydration merge, which replaces those rows from the store.
@@ -843,6 +856,7 @@ impl WhatsAppApp {
             status_tick_at: None,
             visible_chat: None,
             departed_chats: std::collections::HashSet::new(),
+            owed_reads: std::collections::HashSet::new(),
             watched_status: std::collections::HashSet::new(),
             viewer_focus: cx.focus_handle(),
             chat_search_input: None, // Created lazily when window is available
@@ -1912,10 +1926,20 @@ impl WhatsAppApp {
             .find_chat(&jid)
             .filter(|c| c.unread_count > 0 || c.manually_unread)
         {
-            info!("Marking {} read", observe_str(&jid));
-            let newest = newest_shared_message(chat);
-            if let Some(client) = &self.client {
-                client.mark_chat_read(&jid, newest);
+            match read_bound(chat) {
+                ReadBound::Now(newest) => {
+                    info!("Marking {} read", observe_str(&jid));
+                    if let Some(client) = &self.client {
+                        client.mark_chat_read(&jid, newest);
+                    }
+                }
+                ReadBound::WhenLoaded => {
+                    debug!(
+                        "holding the read for {} until its messages arrive",
+                        observe_str(&jid)
+                    );
+                    self.owed_reads.insert(jid.clone());
+                }
             }
         }
 
@@ -2597,6 +2621,29 @@ impl WhatsAppApp {
 /// boundary anywhere, and the read is refused. The chat is cleared locally all
 /// the same, so no receipt goes out, nothing is persisted, and the next
 /// hydration puts the badge back.
+/// Whether a read for this chat can be bounded now.
+///
+/// The daemon checks a `MarkRead` against the second it would clear and
+/// refuses one that names nothing while it knows messages of its own — so a
+/// row painted from the daemon's snapshot, which carries a preview and no
+/// messages, cannot be read the moment it is opened. A chat with nothing
+/// behind it at all still can: that is the manually-unread case, which has no
+/// message to name and has to stay clearable.
+enum ReadBound {
+    Now(Option<String>),
+    WhenLoaded,
+}
+
+fn read_bound(chat: &Chat) -> ReadBound {
+    match newest_shared_message(chat) {
+        Some(newest) => ReadBound::Now(Some(newest)),
+        // Nothing to name and nothing behind it, so there is no boundary for
+        // the daemon to hold this against either.
+        None if chat.last_message.is_none() => ReadBound::Now(None),
+        None => ReadBound::WhenLoaded,
+    }
+}
+
 fn newest_shared_message(chat: &Chat) -> Option<String> {
     chat.messages
         .iter()
@@ -2815,6 +2862,38 @@ mod tests {
         let mut chat = Chat::new(jid.to_string());
         chat.last_message_time = secs.and_then(at);
         chat
+    }
+
+    /// A row painted from the daemon's snapshot has a preview and no
+    /// messages. Reading it the moment it is opened names nothing, and the
+    /// daemon refuses a read that names nothing for a chat it holds messages
+    /// for — so the badge would clear here and come back on the next
+    /// hydration, with no receipt ever sent.
+    #[test]
+    fn a_row_without_its_messages_owes_its_read_to_the_load() {
+        let mut row = chat("a@s.whatsapp.net", Some(10));
+        row.last_message = Some("olá".to_string());
+        assert!(matches!(read_bound(&row), ReadBound::WhenLoaded));
+
+        row.messages.push(ChatMessage::new_incoming(
+            "3EB0".into(),
+            "a".into(),
+            "olá".into(),
+        ));
+        assert!(
+            matches!(read_bound(&row), ReadBound::Now(Some(id)) if id == "3EB0"),
+            "a loaded row names the message it was looking at"
+        );
+    }
+
+    /// A chat with nothing behind it has no boundary either, and must stay
+    /// clearable: that is what marking a chat unread by hand produces.
+    #[test]
+    fn a_chat_with_nothing_behind_it_is_read_at_once() {
+        assert!(matches!(
+            read_bound(&chat("a@s.whatsapp.net", None)),
+            ReadBound::Now(None)
+        ));
     }
 
     #[test]

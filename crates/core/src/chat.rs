@@ -675,19 +675,6 @@ impl Chat {
         Self::with_name_priority(jid, name, 2)
     }
 
-    /// A chat known only by what somebody else already worked out about it:
-    /// its name as a label to draw, not as an answer to defend.
-    ///
-    /// Priority zero on purpose. The label is real — a front end attaching to
-    /// the daemon is handed the list the daemon resolved — but the resolution
-    /// behind it did not travel with it, and the load that follows carries
-    /// both. Anything that arrives with a source attached wins.
-    pub fn labelled(jid: String, name: String) -> Self {
-        // Zero: the same weight `new` gives the number it falls back to, so
-        // every named source outranks it.
-        Self::with_name_priority(jid, name, 0)
-    }
-
     /// Whether this chat was hydrated from the persistent store rather than
     /// created by live traffic. Only a store-originated chat may be pruned
     /// when a complete load stops returning it.

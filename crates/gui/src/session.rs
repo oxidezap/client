@@ -793,9 +793,24 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     // after every launch. Sent as the load event this front end already
     // knows how to fold in, so nothing downstream learns a second
     // vocabulary; the store's load merges into these rows when it arrives.
-    if !snapshot.chats.is_empty() {
+    //
+    // Not while pairing, which is the one state where the daemon's list is
+    // not the store's: during a first pairing the store is empty and
+    // whatever the daemon holds arrived live. There is no list on that
+    // screen anyway.
+    let list = (!matches!(snapshot.connection, ConnectionState::Pairing { .. }))
+        .then(|| {
+            snapshot
+                .chats
+                .iter()
+                .take(SNAPSHOT_ROWS)
+                .map(placeholder_chat)
+                .collect::<Vec<_>>()
+        })
+        .filter(|chats| !chats.is_empty());
+    if let Some(chats) = list {
         events.push(session(UiEvent::HistoryLoaded {
-            chats: snapshot.chats.iter().map(placeholder_chat).collect(),
+            chats,
             // Never complete, whatever the daemon knows: a summary has no
             // messages in it, so this load is not the store's whole truth
             // and must not prune anything.
@@ -810,22 +825,30 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
             // one would make the other vanish from a window that had only just
             // opened. The QR goes last so it is the one the screen settles on,
             // which is what the pairing view shows when it has both.
+            //
+            // Collected apart from `events` rather than counted inside it:
+            // the question below is whether a *credential* was published, and
+            // asking whether anything at all was would be answered by the
+            // chat list above — which would leave a window pairing with no
+            // credential yet on the loading screen with nothing to move it.
+            let mut credentials = Vec::new();
             if let Some(code) = pair_code {
-                events.push(session(UiEvent::PairCode {
+                credentials.push(session(UiEvent::PairCode {
                     code: code.code.clone(),
                     timeout_secs: remaining_secs(code.expires_at_ms),
                 }));
             }
             if let Some(qr) = qr {
-                events.push(session(UiEvent::QrCode {
+                credentials.push(session(UiEvent::QrCode {
                     code: qr.code.clone(),
                     timeout_secs: remaining_secs(qr.expires_at_ms),
                 }));
             }
             // Pairing with neither credential yet: still coming.
-            if events.is_empty() {
-                events.push(session(UiEvent::InitComplete));
+            if credentials.is_empty() {
+                credentials.push(session(UiEvent::InitComplete));
             }
+            events.extend(credentials);
         }
         // The event that leaves the pairing screen for the syncing one.
         ConnectionState::Syncing => events.push(session(UiEvent::PairSuccess)),
@@ -846,6 +869,14 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     events
 }
 
+/// How many rows a snapshot may paint.
+///
+/// The window the session's own load fills (`HISTORY_CHAT_LIMIT`). The daemon
+/// remembers every chat it has seen and its list can be longer than that; a
+/// row past the window is one no load will ever put messages in, so painting
+/// it would be offering a conversation that opens empty and stays empty.
+const SNAPSHOT_ROWS: usize = 100;
+
 /// One summary, as much of a chat as a summary can be.
 ///
 /// Everything a row draws — the name, the badge, the preview line and its
@@ -853,13 +884,19 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
 /// (see [`ChatSummary`]). `preview_for` already answers for a chat in exactly
 /// that shape: the list hydrates before the timeline does.
 ///
-/// Live-created rather than store-backed, so a complete load that does not
-/// return it leaves it alone. The daemon's own list is what these came from
-/// and the load that follows will contradict them where it must — but during
-/// pairing that load is empty while these rows are all there is, and being
-/// prunable there would wipe the list a window had just been handed.
+/// Store-backed, so a complete load is allowed to contradict it. These rows
+/// are the daemon's list and the daemon's list is the store's — which is
+/// exactly why they are not sent while pairing, when it is not. Live-only
+/// would mean a chat archived or deleted between this snapshot and the load
+/// that follows had a row nothing could ever remove.
 fn placeholder_chat(summary: &ChatSummary) -> Chat {
-    let mut chat = Chat::labelled(summary.jid.clone(), summary.name.clone());
+    let mut chat = Chat::from_store(
+        summary.jid.clone(),
+        summary.name.clone(),
+        // Zero: the label is real, but the resolution behind it did not travel
+        // with it, so anything that arrives with a source attached outranks it.
+        0,
+    );
     chat.unread_count = summary.unread;
     chat.manually_unread = summary.manually_unread;
     if let Some(preview) = &summary.last_message {
@@ -1054,8 +1091,69 @@ mod tests {
             "a summary carries no messages, by design"
         );
         assert!(
-            !chats[0].is_from_store(),
-            "a row from a summary must survive a complete load that omits it"
+            chats[0].is_from_store(),
+            "a row from the daemon's list is one a complete load may contradict"
+        );
+    }
+
+    /// While pairing the daemon's list is not the store's — the store is
+    /// empty and whatever is there arrived live — so there is nothing to
+    /// paint and nothing that may be marked prunable.
+    #[test]
+    fn pairing_paints_no_list() {
+        let mut snapshot = snapshot_of(vec![summary("559900000001@s.whatsapp.net", "Alguém", 1)]);
+        snapshot.connection = ConnectionState::Pairing {
+            qr: None,
+            pair_code: None,
+        };
+
+        assert!(
+            !catch_up(&snapshot).iter().any(|event| matches!(
+                event,
+                FromDaemon::Session(session)
+                    if matches!(session.as_ref(), UiEvent::HistoryLoaded { .. })
+            )),
+            "a pairing snapshot painted a list"
+        );
+    }
+
+    /// The daemon remembers more chats than a load returns. A row past the
+    /// window the load fills is one that would open empty and stay empty.
+    #[test]
+    fn the_list_stops_where_the_store_load_does() {
+        let chats: Vec<ChatSummary> = (0..SNAPSHOT_ROWS + 25)
+            .map(|i| summary(&format!("5599000{i:05}@s.whatsapp.net"), "Alguém", 0))
+            .collect();
+
+        let events = catch_up(&snapshot_of(chats));
+        let Some(FromDaemon::Session(first)) = events.first() else {
+            panic!("the list is not the first event");
+        };
+        let UiEvent::HistoryLoaded { chats, .. } = first.as_ref() else {
+            panic!("the list does not come first");
+        };
+        assert_eq!(chats.len(), SNAPSHOT_ROWS);
+    }
+
+    /// A window pairing before a credential exists is moved off the loading
+    /// screen by `InitComplete`, and whether to send one is a question about
+    /// credentials — not about whether the frame carried anything at all. The
+    /// list arriving first must not answer it.
+    #[test]
+    fn pairing_with_no_credential_still_says_the_session_is_up() {
+        let mut snapshot = snapshot_of(vec![summary("559900000001@s.whatsapp.net", "Alguém", 0)]);
+        snapshot.connection = ConnectionState::Pairing {
+            qr: None,
+            pair_code: None,
+        };
+
+        let events = catch_up(&snapshot);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                FromDaemon::Session(session) if matches!(session.as_ref(), UiEvent::InitComplete)
+            )),
+            "the window would sit on the loading screen"
         );
     }
 

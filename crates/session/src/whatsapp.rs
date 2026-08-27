@@ -2210,31 +2210,37 @@ impl WhatsAppClient {
                 }
                 // Drain the burst; a quiet window flushes the reload.
                 //
-                // Skipped when somebody asked outright: the debounce is there
-                // to fold a history sync's many committed batches into one
-                // load, and the cost of folding is a fifth of a second of
-                // waiting before the first query. A front end that has just
-                // attached is holding nothing and is the one caller that
-                // waits on this — and there is nothing to coalesce for it,
-                // because it asked for everything. A burst landing behind it
-                // still gets its own load; `HistoryLoaded` merges.
-                if !asked {
-                    loop {
-                        match tokio::time::timeout(Self::RELOAD_DEBOUNCE, changes.recv()).await {
-                            Ok(Ok(change)) => {
-                                scope.widen(Some(&change));
-                                continue;
+                // Not entered, and broken out of, when somebody asks outright.
+                // The debounce is there to fold a history sync's many
+                // committed batches into one load, and the cost of folding is
+                // a fifth of a second before the first query runs. A front end
+                // that has just attached is holding nothing and is the one
+                // caller that waits on this — and there is nothing to
+                // coalesce for it, because it asked for everything.
+                //
+                // The ask has to be watched *here* as well as in the select
+                // above, not only skipped when it happened to win it: during a
+                // history sync the changes never stop arriving, so a drain
+                // that waits on them alone has no quiet window to end on and
+                // the asker waits out the whole sync.
+                while !asked {
+                    tokio::select! {
+                        change = tokio::time::timeout(Self::RELOAD_DEBOUNCE, changes.recv()) => {
+                            match change {
+                                Ok(Ok(change)) => scope.widen(Some(&change)),
+                                Ok(Err(RecvError::Lagged(_))) => scope.widen(None),
+                                Ok(Err(RecvError::Closed)) => {
+                                    // Reload once more: these changes were committed.
+                                    open = false;
+                                    break;
+                                }
+                                // The quiet window: flush what has piled up.
+                                Err(_) => break,
                             }
-                            Ok(Err(RecvError::Lagged(_))) => {
-                                scope.widen(None);
-                                continue;
-                            }
-                            Ok(Err(RecvError::Closed)) => {
-                                // Reload once more: these changes were committed.
-                                open = false;
-                                break;
-                            }
-                            Err(_) => break,
+                        }
+                        () = reload.notified() => {
+                            scope.widen(None);
+                            asked = true;
                         }
                     }
                 }
