@@ -38,7 +38,7 @@ pub fn render_pairing_view(
 ) -> impl IntoElement {
     let metrics = cx.product().metrics;
 
-    centered_view(metrics.space_xxl(), cx)
+    centered_view("pairing-screen", metrics.space_xxl())
         .child(
             div()
                 .flex()

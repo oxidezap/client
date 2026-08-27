@@ -1,4 +1,4 @@
-use gpui::{Pixels, Size, px};
+use gpui::{Pixels, Size};
 
 use crate::theme::Metrics;
 
@@ -10,13 +10,19 @@ pub enum Breakpoint {
 }
 
 impl Breakpoint {
-    pub const MOBILE_MAX: f32 = 600.0;
-    pub const TABLET_MAX: f32 = 900.0;
-
-    pub fn from_width(width: f32) -> Self {
-        if width < Self::MOBILE_MAX {
+    /// Which layout a window this wide can carry.
+    ///
+    /// The thresholds come from [`Metrics`] rather than from device pixels,
+    /// because "is there room for two panes" is a question about the content:
+    /// the same 700px window holds two at the reference base and one at
+    /// double it. That also means the viewport fit moves them — a handheld
+    /// that shrank the design to fit is a window with proportionally *more*
+    /// room, not less, and a fixed threshold would have denied it the layout
+    /// its own scale had just made room for.
+    pub fn from_width(width: Pixels, metrics: &Metrics) -> Self {
+        if width < metrics.breakpoint_mobile() {
             Self::Mobile
-        } else if width < Self::TABLET_MAX {
+        } else if width < metrics.breakpoint_tablet() {
             Self::Tablet
         } else {
             Self::Desktop
@@ -71,31 +77,18 @@ pub struct ResponsiveLayout {
 }
 
 impl ResponsiveLayout {
-    // Widths the design fixes in device pixels because they answer "how much
-    // window does this pane get", not "how big is a control". They are the
-    // viewport's own geometry, so unlike the design scale they do not follow
-    // the base font.
-    const SIDEBAR_WIDTH_DESKTOP: f32 = 340.0;
-    const SIDEBAR_WIDTH_TABLET: f32 = 280.0;
-    const SIDEBAR_WIDTH_MIN: f32 = 240.0;
-
-    const MAX_BUBBLE_WIDTH_DESKTOP: f32 = 520.0;
-    const MAX_BUBBLE_WIDTH_TABLET: f32 = 420.0;
+    /// How much of a phone's width one bubble, or one picture, may take.
+    ///
+    /// The two ratios are the only dimensions here that are a share of the
+    /// window rather than a size: where the conversation *is* the window,
+    /// "not the full width" is the whole requirement, and a fixed number
+    /// would either crowd a wide phone or overflow a narrow one.
     const MAX_BUBBLE_WIDTH_MOBILE_RATIO: f32 = 0.85;
-
-    const MAX_MEDIA_SIZE_DESKTOP: f32 = 300.0;
-    const MAX_MEDIA_SIZE_TABLET: f32 = 280.0;
     const MAX_MEDIA_SIZE_MOBILE_RATIO: f32 = 0.75;
 
-    /// Below this the header has no room for its action row, so the actions
-    /// move into the overflow menu rather than disappearing.
-    const CALL_BUTTON_MIN_WIDTH: f32 = 400.0;
-
     pub fn new(viewport: Size<Pixels>, mobile_panel: MobilePanel, metrics: Metrics) -> Self {
-        let width: f32 = viewport.width.into();
-
         Self {
-            breakpoint: Breakpoint::from_width(width),
+            breakpoint: Breakpoint::from_width(viewport.width, &metrics),
             mobile_panel,
             viewport,
             metrics,
@@ -159,18 +152,18 @@ impl ResponsiveLayout {
     /// Below this they are still reachable — the overflow menu carries every
     /// one of them — so this decides presentation, never availability.
     pub fn show_call_buttons(&self) -> bool {
-        f32::from(self.viewport.width) >= Self::CALL_BUTTON_MIN_WIDTH
+        self.viewport.width >= self.metrics.breakpoint_header_actions()
     }
 
     pub fn sidebar_width(&self) -> Pixels {
-        px(match self.breakpoint {
-            Breakpoint::Desktop => Self::SIDEBAR_WIDTH_DESKTOP,
-            Breakpoint::Tablet => {
-                let proportional = f32::from(self.viewport.width) * 0.35;
-                proportional.clamp(Self::SIDEBAR_WIDTH_MIN, Self::SIDEBAR_WIDTH_TABLET)
-            }
-            Breakpoint::Mobile => f32::from(self.viewport.width),
-        })
+        match self.breakpoint {
+            Breakpoint::Desktop => self.metrics.sidebar_width(),
+            Breakpoint::Tablet => (self.viewport.width * 0.35).clamp(
+                self.metrics.sidebar_width_min(),
+                self.metrics.sidebar_width_compact(),
+            ),
+            Breakpoint::Mobile => self.viewport.width,
+        }
     }
 
     /// The conversation header. Taller than the sidebar's own header because
@@ -205,32 +198,28 @@ impl ResponsiveLayout {
     }
 
     pub fn max_bubble_width(&self) -> Pixels {
-        px(match self.breakpoint {
-            Breakpoint::Desktop => Self::MAX_BUBBLE_WIDTH_DESKTOP,
-            Breakpoint::Tablet => Self::MAX_BUBBLE_WIDTH_TABLET,
-            Breakpoint::Mobile => {
-                (f32::from(self.viewport.width) * Self::MAX_BUBBLE_WIDTH_MOBILE_RATIO).min(350.0)
-            }
-        })
+        match self.breakpoint {
+            Breakpoint::Desktop => self.metrics.bubble_max_width(),
+            Breakpoint::Tablet => self.metrics.bubble_max_width_compact(),
+            Breakpoint::Mobile => (self.viewport.width * Self::MAX_BUBBLE_WIDTH_MOBILE_RATIO)
+                .min(self.metrics.bubble_max_width_phone()),
+        }
     }
 
     pub fn max_media_size(&self) -> f32 {
-        match self.breakpoint {
-            Breakpoint::Desktop => Self::MAX_MEDIA_SIZE_DESKTOP,
-            Breakpoint::Tablet => Self::MAX_MEDIA_SIZE_TABLET,
-            Breakpoint::Mobile => {
-                (f32::from(self.viewport.width) * Self::MAX_MEDIA_SIZE_MOBILE_RATIO).min(280.0)
-            }
-        }
+        f32::from(match self.breakpoint {
+            Breakpoint::Desktop => self.metrics.media_max_size(),
+            Breakpoint::Tablet => self.metrics.media_max_size_compact(),
+            Breakpoint::Mobile => (self.viewport.width * Self::MAX_MEDIA_SIZE_MOBILE_RATIO)
+                .min(self.metrics.media_max_size_compact()),
+        })
     }
 
     pub fn chat_area_width(&self) -> f32 {
-        match self.breakpoint {
-            Breakpoint::Desktop | Breakpoint::Tablet => {
-                f32::from(self.viewport.width) - f32::from(self.sidebar_width())
-            }
-            Breakpoint::Mobile => f32::from(self.viewport.width),
-        }
+        f32::from(match self.breakpoint {
+            Breakpoint::Desktop | Breakpoint::Tablet => self.viewport.width - self.sidebar_width(),
+            Breakpoint::Mobile => self.viewport.width,
+        })
     }
 
     pub fn message_list_width(&self) -> f32 {

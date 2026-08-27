@@ -30,7 +30,7 @@ pub fn render_error_view(
     let detail_entity = entity;
     let detail = error.to_string();
 
-    centered_view(metrics.space_xxl(), cx)
+    centered_view("error-screen", metrics.space_xxl())
         .child(
             div()
                 .size(metrics.avatar_call())

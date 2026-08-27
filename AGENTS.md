@@ -201,7 +201,26 @@ profile here repeats it deliberately.
   needs a `Window` and the state it follows comes from the daemon. A ringing
   call outranks the viewer; an *answered* call owns nothing, because a call
   people talk through is one they type through — which is why mute is a
-  window-wide chord rather than a card binding.
+  window-wide chord rather than a card binding. The list ends in the window
+  itself, and that end is what makes the rule total: focus may only be put on
+  a handle the frame actually drew — an absent one sends every key to gpui's
+  own root, past every handler we hung off ours — so the surfaces name
+  themselves per frame (`KeyboardSurfaces`) and the root's own handle is what
+  remains when none of them is drawn. There used to be no such floor: the
+  owner was recorded as the composer before a composer existed, the first
+  sync found nothing to change, and every window-level shortcut stayed dead
+  until a click gave the window a focus of its own. On a desktop that click
+  happens in the first seconds; on a handheld with no pointer it never
+  happens, and the window never listens. The same rule binds the commands
+  that move focus themselves: `focus_search` and `open_settings` reach their
+  surface by *navigating* to it — out of Settings, off Status, back to the
+  list on a phone — and refuse outright where there is nowhere to navigate
+  to, because a shortcut that focuses something the screen does not draw
+  leaves the window as deaf as having no focus at all. Where two surfaces are
+  both drawn the gesture decides, not the ordering: `ChatOpen` already says
+  whether a chat was opened to be talked to or looked at, and a composer that
+  took the keyboard on selection ended a keyboard walk through the list after
+  one step.
 - **What a recording will be sent as is bound when the microphone opens.**
   Not read when it closes: the destination *and* the reply it answers are one
   answer to "where is this note going", and resolving either at the end sent
@@ -304,6 +323,36 @@ Render helpers take `&App` and return `impl IntoElement + use<>`: they read
 colours out of the theme but retain nothing borrowed, and without `use<>` the
 2024 capture rules would make them inherit the lifetime, which the virtual
 list's `&mut Context` closure rejects.
+
+## Responsiveness
+
+One number, in one place. The window's size reaches the interface as a factor
+on the base font — `theme::metrics::viewport_fit`, applied by
+`theme::fit_to_viewport` from the root's render pass — and everything else
+follows from the rem: type steps, vertical rhythm, control frames, the QR
+code, the layout breakpoints, and the row heights the timeline has cached
+(which is why the fit is quantised: it moves `Metrics::rem_size`, their
+invalidation key). A component never learns that small screens exist. The
+breakpoints are themselves rem-derived, because "is there room for two panes"
+is a question about the content and not about the glass — the same 700px
+window holds two panes at the reference base and one at double it.
+
+Two consequences. A base font is bounded in exactly one place — `Metrics` —
+so the rem handed to gpui-component's `Theme` is the one `Metrics` resolved
+rather than a second multiplication beside it; the smallest configurable font
+at the smallest fit lands under the floor, and two answers there put our
+chrome and the library's buttons on different scales in the same header. And
+row heights measured against a scale are stale when it moves: `TimelineAnchor`
+carries the rem *and* the width it measured against, because the fit changes
+one at a step boundary and dragging an edge changes the other.
+
+Two things that are *not* the fit. The window opens no larger than the display
+(`opening_size`), because a window that opens off the edge of a handheld is
+one nobody can drag back. And a pane that centres its content must also be
+able to scroll it: `views::centered_view` does both from one layout, since a
+column that is only centred is clipped at *both* ends the moment it outgrows
+the window — which is how a 640px-tall screen showed the middle of the pairing
+screen, with the title above the glass and the pair code below it.
 
 ## Still to do
 

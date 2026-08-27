@@ -88,7 +88,13 @@ pub fn render_connected_view(
         .and_then(|chat| app.availability_of(&chat.jid))
         .cloned();
     let message_cache = selected_chat.as_ref().map(|chat| {
-        app.get_message_list_cache(&chat.jid, &chat.messages, chat.is_group, typing.clone())
+        app.get_message_list_cache(
+            &chat.jid,
+            &chat.messages,
+            chat.is_group,
+            typing.clone(),
+            layout,
+        )
     });
     // A call in a chat other than the one on screen is what the return banner
     // is for; a call in *this* chat is already obvious from the card.
@@ -210,6 +216,22 @@ pub fn render_connected_view(
         .is_some_and(|chat| app.is_own_number(&chat.jid));
     let can_send = app.can_send();
 
+    // Which surfaces this frame gives the keyboard somewhere to land. Only
+    // the view drawing them can say: the composer outlives the conversation
+    // that made it, the offline strip takes its place, and on a phone the
+    // list and the conversation are one slot. See `sync_overlay_focus`.
+    app.note_keyboard_surfaces(crate::app::KeyboardSurfaces {
+        chat_list: destination == Destination::Chats && layout.show_sidebar(),
+        composer: destination == Destination::Chats
+            && layout.show_chat_area()
+            && selected_chat.is_some()
+            && !is_offline,
+        viewer: viewer.is_some(),
+        // The card floats above this view rather than inside it, so the root
+        // is what knows whether one was drawn. See `WhatsAppApp::render`.
+        call_card: false,
+    });
+
     let rail = render_nav_rail(
         destination,
         unread_chats,
@@ -291,9 +313,6 @@ pub fn render_call_overlay(
     window: &mut Window,
     cx: &mut Context<WhatsAppApp>,
 ) -> Option<AnyElement> {
-    // Before the card is built, so the frame that first draws a ringing call
-    // — or the viewer — is the frame its shortcuts start working on.
-    app.sync_overlay_focus(window, cx);
     let layout = app.responsive_layout(window, cx);
     let call_focus = app.call_focus().clone();
     render_call_card(
@@ -354,26 +373,29 @@ fn render_chat_area(
         .h_full()
         .bg(cx.theme().background)
         .map(|el| match selected_chat {
-            None => el
-                .justify_center()
-                .items_center()
-                .p(metrics.space_xxxl())
-                .child(
-                    EmptyState::new("Pick a conversation")
-                        .icon(ProductIcon::MessageSquare)
-                        .description(
-                            "Choose a chat on the left, or search for one by name or message.",
-                        )
-                        .shortcut(
-                            if cfg!(target_os = "macos") {
-                                "⌘K"
-                            } else {
-                                "Ctrl K"
-                            },
-                            "Search",
-                        )
-                        .shortcut("↑ ↓", "Move between chats"),
-                ),
+            // Centred by the same container the startup screens use, which
+            // is also the one that does not clip what it centres: an empty
+            // state is short, but not shorter than a pane on a handheld.
+            None => el.child(
+                super::centered_view("empty-conversation", metrics.space_xxxl())
+                    .surface(cx.theme().background)
+                    .child(
+                        EmptyState::new("Pick a conversation")
+                            .icon(ProductIcon::MessageSquare)
+                            .description(
+                                "Choose a chat on the left, or search for one by name or message.",
+                            )
+                            .shortcut(
+                                if cfg!(target_os = "macos") {
+                                    "⌘K"
+                                } else {
+                                    "Ctrl K"
+                                },
+                                "Search",
+                            )
+                            .shortcut("↑ ↓", "Move between chats"),
+                    ),
+            ),
             Some(chat) => {
                 let is_group = chat.is_group;
                 el.child(render_chat_header(

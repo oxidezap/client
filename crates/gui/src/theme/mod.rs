@@ -29,7 +29,7 @@ pub mod palette;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use gpui::{App, Global, Hsla, rgb};
+use gpui::{App, Global, Hsla, Pixels, Size, rgb};
 
 pub use config::ThemeSettings;
 pub use metrics::Metrics;
@@ -39,7 +39,17 @@ pub use palette::{Palette, Preset, Rgb};
 /// resolved scale and the provenance Settings needs to explain itself.
 pub struct ProductTheme {
     pub palette: Palette,
+    /// The scale in force: the base font the user asked for, fitted to the
+    /// window. Everything drawn reads this one.
     pub metrics: Metrics,
+    /// The base font as it is written in the file, before the window had a
+    /// say. Settings shows and saves this — a scale the window imposed is not
+    /// a preference to write back.
+    base_font_size: f32,
+    /// What the window's size did to that base. Kept so a theme reload — a
+    /// palette edit, a font-size step — does not silently restore a design
+    /// scale the screen has no room for.
+    fit: f32,
     pub preset: Preset,
     /// Whatever the config file asked for that could not be honoured. Empty
     /// when the file is absent or fully applied.
@@ -48,18 +58,27 @@ pub struct ProductTheme {
     /// look in.
     pub path: Option<PathBuf>,
     /// Last-modified stamp the current palette was read from, so an edit made
-    /// outside the app can be noticed without re-parsing every tick.
+    /// outside the app can be noticed without re-parsing every tick. Moved
+    /// only by a read of the file: an install of settings this process
+    /// already had must carry the old stamp forward, or it claims to have
+    /// read an edit it never looked at.
     pub loaded_at: Option<SystemTime>,
 }
 
 impl Global for ProductTheme {}
 
 impl ProductTheme {
-    fn from_settings(settings: ThemeSettings) -> Self {
+    fn from_settings(
+        settings: ThemeSettings,
+        fit: f32,
+        metrics: Metrics,
+        loaded_at: Option<SystemTime>,
+    ) -> Self {
         let path = config::config_path();
-        let loaded_at = path.as_deref().and_then(config::modified_at);
         Self {
-            metrics: Metrics::new(settings.font_size, settings.density),
+            metrics,
+            base_font_size: settings.font_size,
+            fit,
             palette: settings.palette,
             preset: settings.preset,
             problems: settings.problems,
@@ -75,7 +94,7 @@ impl ProductTheme {
             preset: self.preset,
             palette: self.palette,
             density: self.metrics.density(),
-            font_size: self.metrics.rem_size(),
+            font_size: self.base_font_size,
             problems: self.problems.clone(),
         }
     }
@@ -110,7 +129,18 @@ impl ActiveProductTheme for App {
 /// Load `theme.json` and install it. Call once during startup, after
 /// `gpui_component::init`.
 pub fn init(cx: &mut App) {
-    install(config::load(), cx);
+    // Stamped before the read, not after: an edit that lands while the file
+    // is being parsed then shows a newer time than this one and is picked up
+    // by the next poll, where a stamp taken afterwards would have claimed to
+    // have already read it.
+    let loaded_at = config::config_path()
+        .as_deref()
+        .and_then(config::modified_at);
+    let settings = config::load();
+    for problem in &settings.problems {
+        log::warn!("theme.json: {problem}");
+    }
+    install_resolved(settings, 1.0, loaded_at, cx);
 }
 
 /// Install a resolved theme, replacing whatever is active.
@@ -122,8 +152,61 @@ pub fn install(settings: ThemeSettings, cx: &mut App) {
     for problem in &settings.problems {
         log::warn!("theme.json: {problem}");
     }
-    apply::apply(&settings, cx);
-    cx.set_global(ProductTheme::from_settings(settings));
+    let current = cx.global::<ProductTheme>();
+    // Whatever the window last imposed, carried across. A palette edit is not
+    // news about the screen's size, and reinstalling at full scale would put
+    // a handheld back into a design it cannot fit until the next resize —
+    // which, on a device whose window never resizes, is never.
+    let fit = current.fit;
+    // And so is the stamp: these settings came from memory — a preset picked
+    // in the editor, a font size stepped — not from a read of the file. See
+    // [`install_resolved`].
+    let loaded_at = current.loaded_at;
+    install_resolved(settings, fit, loaded_at, cx);
+}
+
+/// Fold a window's size into the design scale.
+///
+/// The one place a viewport reaches the theme. Called from the root's render
+/// pass, because that is where the window's size is a fact rather than an
+/// event, and it answers whether anything moved so the caller can refresh a
+/// window whose frames were laid out against the previous scale.
+pub fn fit_to_viewport(viewport: Size<Pixels>, cx: &mut App) -> bool {
+    let fit = metrics::viewport_fit(viewport);
+    let current = cx.global::<ProductTheme>();
+    if (current.fit - fit).abs() < f32::EPSILON {
+        return false;
+    }
+    let (settings, loaded_at) = (current.settings(), current.loaded_at);
+    install_resolved(settings, fit, loaded_at, cx);
+    true
+}
+
+/// Install settings that are already resolved, at a known fit and under a
+/// known stamp.
+///
+/// The stamp is passed in rather than taken from the file here, because only
+/// a *read* of the file may claim to have read it: a reinstall of settings
+/// this process already had — a viewport fit crossing a step, a preset picked
+/// in the editor — that stamped itself with the file's current time would
+/// answer "already loaded" for an edit it never looked at, and
+/// [`reload_if_changed`] would skip it for the life of the process.
+fn install_resolved(
+    settings: ThemeSettings,
+    fit: f32,
+    loaded_at: Option<SystemTime>,
+    cx: &mut App,
+) {
+    // Resolved once and handed to both. `Metrics` is what bounds a base font
+    // — the fit can take the smallest configurable one under the floor where
+    // every hairline and focus ring stops resolving — and a second multiplied
+    // value computed beside it is a second answer: the library's buttons
+    // would then sit at 7.7px in a header our own chrome drew at 10.
+    let metrics = Metrics::new(settings.font_size * fit, settings.density);
+    apply::apply(&settings, metrics.rem_size(), cx);
+    cx.set_global(ProductTheme::from_settings(
+        settings, fit, metrics, loaded_at,
+    ));
 }
 
 /// Whether there is a `theme.json` worth polling at all.
@@ -149,6 +232,14 @@ pub fn reload_if_changed(cx: &mut App) -> bool {
     if modified == cx.global::<ProductTheme>().loaded_at {
         return false;
     }
-    install(config::load_from(&path), cx);
+    let settings = config::load_from(&path);
+    for problem in &settings.problems {
+        log::warn!("theme.json: {problem}");
+    }
+    // The stamp this decision was made against, not a second `stat` after the
+    // read: a save landing between the two would otherwise be recorded as
+    // read and never picked up.
+    let fit = cx.global::<ProductTheme>().fit;
+    install_resolved(settings, fit, modified, cx);
     true
 }

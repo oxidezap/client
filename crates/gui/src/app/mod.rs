@@ -95,28 +95,80 @@ struct RecordingTarget {
 /// all, which reads as a window that has stopped listening. Naming the owner
 /// is what makes "give it back" a single rule rather than something every
 /// teardown path has to remember.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum KeyboardOwner {
-    /// Where typing goes, and where focus returns.
+    /// Where typing goes, when there is somewhere to type.
     Composer,
+    /// The conversation list, which owns the arrow keys that move between
+    /// chats. The resting owner of a window with no conversation open.
+    ChatList,
+    /// The window itself: the one surface that is always on screen, and so
+    /// the only honest answer when nothing more specific is drawn. Its
+    /// actions are the window-level ones — search, settings, escape — which
+    /// were unreachable for exactly as long as nobody had focus at all,
+    /// because a focus handle that is not in the frame sends dispatch to
+    /// gpui's own root and never reaches ours. On a machine with a pointer
+    /// the first click hid it; on one without, the window never listened.
+    Root,
     /// A call that is ringing — not one that has been answered, which is a
     /// call people type through.
     RingingCall(String),
     /// The fullscreen viewer, which owns the arrow keys while it is up.
     Viewer,
-    /// A screen with its own controls — Settings. Nothing here focuses it:
-    /// the control the user clicked already has the keyboard, and taking it
-    /// away would be worse than leaving it. Naming it is the point, because
-    /// that is what makes *leaving* Settings a change — otherwise the owner
-    /// still read `Composer` throughout, the next sync saw nothing to do, and
-    /// the window was left with its keyboard on a control that had stopped
-    /// being rendered.
+    /// A screen with its own controls — Settings. It is handed the window's
+    /// own handle rather than any control of its own: the way *out* of
+    /// Settings is Escape, which is a window-level action, and the first
+    /// control the user clicks takes the keyboard from there without a fight,
+    /// because the sync only acts when the owner changes. Naming it
+    /// separately is what makes *leaving* Settings a change — otherwise the
+    /// owner still read `Composer` throughout, the next sync saw nothing to
+    /// do, and the window was left with its keyboard on a control that had
+    /// stopped being rendered.
     Screen,
+}
+
+/// Which keyboard surfaces a frame drew.
+///
+/// Answered by the view that draws them and read by `sync_overlay_focus`,
+/// which may only hand the keyboard to something in the frame.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyboardSurfaces {
+    /// The conversation list.
+    pub chat_list: bool,
+    /// The composer — which the offline strip replaces, and which a phone
+    /// showing its list is not drawing at all.
+    pub composer: bool,
+    /// The fullscreen viewer. Held open across a dropped connection —
+    /// `leave_connected_view` does not close it — while the error screen that
+    /// replaces the conversation draws nothing of it.
+    pub viewer: bool,
+    /// The call card, which only the connected screens float.
+    pub call_card: bool,
+}
+
+/// The layout a set of row heights was measured against.
+///
+/// The list keeps one measured height per index and nothing about a row says
+/// how wide or how large it was drawn — so a window that resizes leaves every
+/// one of those heights describing a bubble that no longer exists at that
+/// size. Both halves move on their own: the fit changes the rem at a step
+/// boundary without the pane changing width, and dragging an edge changes the
+/// width without crossing a step.
+#[derive(Clone, Copy, PartialEq)]
+struct MeasuredAgainst {
+    /// The base font in force, which every dimension in a bubble resolves
+    /// from.
+    rem: f32,
+    /// How wide the timeline had to lay text out in, which is what decides
+    /// how many lines a message takes.
+    width: f32,
 }
 
 struct TimelineAnchor {
     jid: String,
     count: usize,
+    /// The layout the measured prefix was measured against.
+    measured: MeasuredAgainst,
     /// The build of the rows the list last measured.
     build: usize,
     /// The row at `count - 1`: the last one whose measurement the list is
@@ -481,9 +533,36 @@ pub struct WhatsAppApp {
     /// Focus target for the call card, so its actions are reachable from
     /// the keyboard while it floats over the app.
     call_focus: FocusHandle,
-    /// Which overlay the keyboard was handed to, so it is handed over once
-    /// and given back once. See `sync_overlay_focus`.
-    keyboard_owner: KeyboardOwner,
+    /// Focus target for the window itself, so the actions hung off the root
+    /// are reachable whatever else is on screen — including on the screens on
+    /// the way to a conversation, which have no list and no composer to
+    /// focus.
+    root_focus: FocusHandle,
+    /// Which surface the keyboard was handed to, so it is handed over once
+    /// and given back once. `None` until the first frame hands it somewhere:
+    /// a window that starts out claiming an owner it never focused is a
+    /// window the first sync finds nothing to do in, which is how the
+    /// keyboard ended up belonging to nobody until the first click.
+    /// See `sync_overlay_focus`.
+    keyboard_owner: Option<KeyboardOwner>,
+    /// Whether the last gesture that touched a conversation was someone
+    /// meaning to *talk* to it or meaning to *look* at it.
+    ///
+    /// The distinction is [`ChatOpen`]'s and it already decided where focus
+    /// went at the moment of the gesture; this is the same answer kept, so
+    /// the frame after it does not undo it. Without it the composer outranked
+    /// the list whenever both were drawn, and the first arrow key selected a
+    /// chat and took the arrow keys away — the list's own bindings are scoped
+    /// to it, so walking a list with the keyboard ended after one step.
+    keyboard_intent: ChatOpen,
+    /// Which of the two keyboard surfaces the last frame actually drew.
+    ///
+    /// Focus has to land on something that is *in* the frame — an unrendered
+    /// handle sends every key to gpui's root instead — and only the view that
+    /// draws them knows: the composer exists as an entity long after the
+    /// conversation holding it left the screen, and on a phone the list and
+    /// the conversation are the same slot.
+    keyboard_surfaces: KeyboardSurfaces,
     /// Which playback the completion still in flight belongs to. See
     /// `stop_current_media`.
     playback_epoch: usize,
@@ -754,7 +833,12 @@ impl WhatsAppApp {
             chat_list_scroll: VirtualListScrollHandle::new(),
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
-            keyboard_owner: KeyboardOwner::Composer,
+            root_focus: cx.focus_handle(),
+            keyboard_owner: None,
+            // Nothing has been opened to talk to yet, and a window that comes
+            // up on a restored selection is one nobody has typed into.
+            keyboard_intent: ChatOpen::ToPreview,
+            keyboard_surfaces: KeyboardSurfaces::default(),
             playback_epoch: 0,
             status_tick_at: None,
             visible_chat: None,
@@ -1081,6 +1165,7 @@ impl WhatsAppApp {
         messages: &[ChatMessage],
         is_group: bool,
         typing: Option<TypingSummary>,
+        layout: ResponsiveLayout,
     ) -> MessageListCache {
         let cached = {
             let cache = self.message_list_cache.borrow();
@@ -1097,7 +1182,14 @@ impl WhatsAppApp {
             built
         });
 
-        self.sync_timeline(chat_jid, &rows);
+        self.sync_timeline(
+            chat_jid,
+            &rows,
+            MeasuredAgainst {
+                rem: layout.metrics().rem_size(),
+                width: layout.message_list_width(),
+            },
+        );
         rows
     }
 
@@ -1120,7 +1212,12 @@ impl WhatsAppApp {
     /// message newer than the head but older than the tail — all push it
     /// along, and all of those raise the count exactly as an arrival does.
     /// Comparing the first row instead saw none of the middle three.
-    fn sync_timeline(&mut self, chat_jid: &str, rows: &MessageListCache) {
+    fn sync_timeline(
+        &mut self,
+        chat_jid: &str,
+        rows: &MessageListCache,
+        measured: MeasuredAgainst,
+    ) {
         let count = rows.items.len();
         let boundary = rows.row_id(count.saturating_sub(1));
         let previous = self.timeline_anchor.take();
@@ -1135,16 +1232,24 @@ impl WhatsAppApp {
 
         match continued {
             // Rows arrived at the end: keep the measurements taken for
-            // everything before them, and the reader's place with them.
+            // everything before them, and the reader's place with them — but
+            // only while they still describe those rows. A window resized in
+            // the same frame a message arrived in is one where the prefix is
+            // stale too, and splicing alone would keep every one of its
+            // heights.
             Some(anchor) if count > anchor.count => {
                 self.message_list
                     .splice(anchor.count..anchor.count, count - anchor.count);
+                if anchor.measured != measured {
+                    self.message_list.remeasure();
+                }
             }
-            // The same rows, rebuilt. Something inside one of them is a
-            // different size now; remeasure rather than reset, which keeps
-            // the reader where they were reading.
+            // The same rows, rebuilt — or the same rows against a layout that
+            // has moved under them. Either way something is a different size
+            // now; remeasure rather than reset, which keeps the reader where
+            // they were reading.
             Some(anchor) => {
-                if anchor.build != rows.build {
+                if anchor.build != rows.build || anchor.measured != measured {
                     self.message_list.remeasure();
                 }
             }
@@ -1156,6 +1261,7 @@ impl WhatsAppApp {
         self.timeline_anchor = Some(TimelineAnchor {
             jid: chat_jid.to_string(),
             count,
+            measured,
             build: rows.build,
             boundary,
         });
@@ -1182,6 +1288,17 @@ impl WhatsAppApp {
     /// [`Self::visible_chat`].
     pub fn note_visible_conversation(&mut self, jid: Option<String>) {
         self.visible_chat = jid;
+    }
+
+    /// Record which keyboard surfaces this frame drew. See
+    /// [`KeyboardSurfaces`].
+    pub fn note_keyboard_surfaces(&mut self, surfaces: KeyboardSurfaces) {
+        self.keyboard_surfaces = surfaces;
+    }
+
+    /// The window's own focus target, which every frame draws.
+    pub fn root_focus(&self) -> &FocusHandle {
+        &self.root_focus
     }
 
     /// Drop everything this window learned from the account it is leaving.
@@ -1291,6 +1408,11 @@ impl WhatsAppApp {
     /// up: a blurred handle leaves the window with no keyboard target at
     /// all, which reads as a window that stopped listening.
     pub(super) fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Putting the caret in the composer *is* the statement that typing
+        // goes here now, so the owner model records it here rather than at
+        // each of the three callers — a reply begun, a chat opened to talk
+        // to, the sync handing it back.
+        self.keyboard_intent = ChatOpen::ToCompose;
         if let Some(input_area) = self.input_area.clone() {
             // Read the handle out before focusing: `focus` needs `&mut App`
             // and `read` holds `cx` borrowed for as long as its result lives.
@@ -1774,6 +1896,7 @@ impl WhatsAppApp {
         self.selected_chat = Some(jid.clone());
         self.navigate_to_chat();
 
+        self.keyboard_intent = open;
         if open == ChatOpen::ToCompose {
             // After `navigate_to_chat`, so on mobile the composer exists on the
             // panel being switched to rather than the one being left.
@@ -2556,16 +2679,35 @@ impl Focusable for WhatsAppApp {
 
 impl Render for WhatsAppApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // First, because every dimension below resolves from the scale this
+        // settles: the window's size is folded into the base font here and
+        // nowhere else, which is what lets a 480×640 handheld get the whole
+        // design at its own size without a single component learning that
+        // small screens exist. See `theme::fit_to_viewport`.
+        if crate::theme::fit_to_viewport(window.viewport_size(), cx) {
+            // Frames already laid out against the previous scale are stale —
+            // including the rem gpui-component's own controls resolve from.
+            window.refresh();
+        }
         let entity = cx.entity().clone();
         // Cleared here and set by whichever branch below actually draws a
         // conversation, so it describes this frame rather than an older one:
-        // the pairing, error and Settings screens draw none.
+        // the pairing, error and Settings screens draw none. The keyboard
+        // surfaces go the same way and for the same reason — focus may only
+        // be handed to something this frame drew.
         self.visible_chat = None;
+        self.keyboard_surfaces = KeyboardSurfaces::default();
 
         // Window-level commands hang off the root so they work wherever focus
         // happens to be, which is the point of a window-level command.
         let root = div()
             .size_full()
+            // The window's own keyboard target. Every frame draws it, which
+            // is what makes it somewhere focus can always be put — and what
+            // brings the handlers below into the dispatch path, since a
+            // focused handle that is not in the frame sends keys to gpui's
+            // root and never reaches ours.
+            .track_focus(&self.root_focus)
             // The call overlay is positioned against this box, because it
             // outlives the branch below: a phone ringing while Settings is
             // open is still a phone ringing.
@@ -2636,6 +2778,15 @@ impl Render for WhatsAppApp {
         let call_overlay = connected
             .then(|| render_call_overlay(self, window, cx))
             .flatten();
+
+        // The card is the one surface the root draws itself, so it is the
+        // one the root answers for.
+        self.keyboard_surfaces.call_card = call_overlay.is_some();
+        // After the body, which is what named the surfaces it drew, and
+        // before the frame is painted, which is when the focus it hands over
+        // takes effect. Unconditional: the screens on the way to a
+        // conversation need a keyboard too, and the window is what they get.
+        self.sync_overlay_focus(window, cx);
 
         root.child(body).children(call_overlay)
     }

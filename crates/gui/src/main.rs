@@ -16,7 +16,9 @@ mod utils;
 mod video;
 mod views;
 
-use gpui::{App, AppContext, Bounds, SharedString, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext, Bounds, Pixels, SharedString, Size, WindowBounds, WindowOptions, px, size,
+};
 use gpui_component::Root;
 
 use crate::app::{WhatsAppApp, init_app_bindings};
@@ -60,7 +62,7 @@ fn main() {
             theme::init(cx);
             init_app_bindings(cx);
 
-            let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+            let bounds = Bounds::centered(None, opening_size(cx), cx);
 
             if let Err(error) = cx.open_window(
                 WindowOptions {
@@ -95,4 +97,28 @@ fn main() {
                 cx.quit();
             }
         });
+}
+
+/// How big the window opens.
+///
+/// The design's own size, or the screen's, whichever is smaller. A window
+/// that opens larger than the display is not a window someone can resize
+/// back: a handheld running a bare compositor has no title bar to drag and
+/// no keyboard shortcut to tile with, so it simply loses whatever fell off
+/// the edges. Nothing here decides how the interface *looks* at that size —
+/// that is `theme::fit_to_viewport`, from whatever size the window ends up.
+fn opening_size(cx: &App) -> Size<Pixels> {
+    const DESIGN: Size<Pixels> = Size {
+        width: px(1200.0),
+        height: px(800.0),
+    };
+
+    let Some(display) = cx.primary_display() else {
+        return DESIGN;
+    };
+    let screen = display.bounds().size;
+    size(
+        DESIGN.width.min(screen.width),
+        DESIGN.height.min(screen.height),
+    )
 }

@@ -9,6 +9,16 @@ use super::*;
 impl WhatsAppApp {
     /// Move focus to the conversation search field.
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Only where there is a list to search. Every case below reaches the
+        // field by *navigating* to it — out of Settings, off Status, back to
+        // the list on a phone — and there is nowhere to navigate to from the
+        // screens on the way to a conversation: the field does not exist
+        // there, and focusing it anyway handed the keyboard to something
+        // outside the frame, which is a window that has stopped listening.
+        // Unreachable before the shortcut worked without a click.
+        if !matches!(self.app_state, AppState::Connected | AppState::Offline) {
+            return;
+        }
         // Searching from inside Settings means leaving Settings: the field
         // being focused is behind it.
         if self.settings.is_some() {
@@ -224,6 +234,15 @@ impl WhatsAppApp {
 
     /// Open Settings over the conversation view.
     pub fn open_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // Only over a window that has one. Settings is drawn in place of the
+        // conversation view and nowhere else, so opening it from the pairing
+        // or error screen used to set a state nothing drew — invisible until
+        // the connection finished and then already open. Harmless while the
+        // only route was a click on a screen that has no such control, and
+        // not once the shortcut works before the first click.
+        if !matches!(self.app_state, AppState::Connected | AppState::Offline) {
+            return;
+        }
         if self.settings.is_none() {
             // Settings replaces the body, so a viewer left open is a surface
             // that is not drawn and still owns things: `sync_overlay_focus`
