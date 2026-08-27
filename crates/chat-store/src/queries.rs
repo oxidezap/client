@@ -410,20 +410,26 @@ impl ChatStore {
     /// can look its own page back up. A chat with no rows is absent rather
     /// than empty; both mean the same thing to a caller using
     /// `unwrap_or_default`.
+    ///
+    /// A limit per chat rather than one for all of them, because the caller
+    /// does not want the same number from each: a load that exists to serve a
+    /// chat list wants the newest row of most chats and the unread tail of a
+    /// few.
     pub async fn pages(
         &self,
-        chats: Vec<Jid>,
-        limit: i64,
+        wanted: Vec<(Jid, i64)>,
     ) -> Result<HashMap<String, Vec<StoredMessage>>> {
         use schema::messages::dsl;
-        let limit = limit.max(0);
         let device_id = self.device_id();
-        let chats: Vec<String> = chats.iter().map(Jid::to_string).collect();
+        let wanted: Vec<(String, i64)> = wanted
+            .iter()
+            .map(|(jid, limit)| (jid.to_string(), (*limit).max(0)))
+            .collect();
         let pages: HashMap<String, Vec<MessageRow>> = self
             .db()
             .read(move |conn| {
-                let mut pages = HashMap::with_capacity(chats.len());
-                for chat in chats {
+                let mut pages = HashMap::with_capacity(wanted.len());
+                for (chat, limit) in wanted {
                     let keys =
                         crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                     let rows: Vec<MessageRow> = dsl::messages

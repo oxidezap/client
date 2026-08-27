@@ -788,6 +788,66 @@ async fn handle_request(
             }
         }
         ClientRequest::ReloadHistory => acted(dispatch(hub, commands, Action::ReloadHistory).await),
+        // Answered with the page under this id, like a download and for the
+        // same reason: the rows are the answer rather than an
+        // acknowledgement, so only a refusal is answered here.
+        ClientRequest::LoadMessages { jid, before, limit } => {
+            let Some(id) = id else {
+                return Answer::frame(
+                    error_frame(
+                        None,
+                        ProtocolError::Malformed {
+                            detail: "a page needs an id to answer under".into(),
+                        },
+                    )
+                    .ok(),
+                );
+            };
+            match dispatch(
+                hub,
+                commands,
+                Action::LoadMessages {
+                    id,
+                    jid,
+                    before,
+                    limit,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+            {
+                Ok(()) => Answer::frame(None),
+                Err(error) => Answer::frame(error_frame(Some(id), error).ok()),
+            }
+        }
+        ClientRequest::LoadChats { after, limit } => {
+            let Some(id) = id else {
+                return Answer::frame(
+                    error_frame(
+                        None,
+                        ProtocolError::Malformed {
+                            detail: "a page needs an id to answer under".into(),
+                        },
+                    )
+                    .ok(),
+                );
+            };
+            match dispatch(
+                hub,
+                commands,
+                Action::LoadChats {
+                    id,
+                    after,
+                    limit,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+            {
+                Ok(()) => Answer::frame(None),
+                Err(error) => Answer::frame(error_frame(Some(id), error).ok()),
+            }
+        }
         ClientRequest::ForgetSession => acted(dispatch(hub, commands, Action::ForgetSession).await),
         ClientRequest::MarkRead {
             jid,

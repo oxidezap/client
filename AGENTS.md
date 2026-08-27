@@ -281,11 +281,22 @@ profile here repeats it deliberately.
   a backfill before the head, a notice stamped in the past and a message
   landing mid-history all raise it exactly as an arrival does, and only an
   arrival leaves the earlier rows alone. The row at the end of the measured
-  prefix is what answers it (`MessageListCache::row_id`), because that is the
-  row every one of those moves and an append does not. A row can also change
-  height with the count standing still — an image arrives, a reaction lands,
-  a send fails and grows a retry button — which the `build` number answers.
-  The three outcomes are splice, remeasure and reset.
+  prefix is what answers it — and the honest form of that question is which
+  of the rows it measured this frame still draws, and where
+  (`MessageListCache::common_prefix`/`common_suffix`): what they share at
+  either end is what may be kept, and the stretch between is one splice,
+  removal and insertion alike. Neither end is where a count would put it. The
+  encryption notice holds index 0 whatever arrives in front of the messages,
+  so a page of older history is an insertion in the *middle* and splicing it
+  at 0 slides the notice's height onto a message; the typing indicator holds
+  the last index whatever arrives behind them, so an arrival under it read as
+  a page and went to the top; and a page can swallow a divider its own newest
+  message now shares a day with. A row can also change height with the rows
+  standing still — an image arrives, a reaction lands, a send fails and grows
+  a retry button — which the `build` number answers: a rebuild with the rows
+  unchanged is a remeasure, never nothing, and an unchanged build is the frame
+  that keeps the diff off the hot path.
+  Only another conversation resets.
 - **What a frame leaves out, its reader fills in.** The wire is
   newline-delimited JSON and a history load is a hundred chats of fifty rows,
   most of whose fields are empty — no reaction, no quote, no media, nothing
@@ -296,6 +307,13 @@ profile here repeats it deliberately.
   `an_omitted_field_comes_back_as_what_it_was` is there to hold. It is also
   why these types travel one way only — nothing in `ClientRequest` carries a
   `ChatMessage` — so a sparse frame is never handed to an older reader.
+- **An answer nobody delivered is a request nobody answered.** A connection's
+  outbox is bounded, and a page or a download dropped into a full one leaves
+  the asking view waiting on it forever — the front end keeps the request in
+  `pending` and its list never asks again. Nothing may block on that queue
+  either, because the caller is the bridge and the session waits on it, so
+  `answer_now` hands a full outbox to a task that waits on the connection's
+  own writer. A frame is dropped only when the connection is gone.
 - **A daemon frame is either state or news, and they use different channels.**
   State carries a version and is recoverable from a snapshot; a window request
   or a failed send is neither, so it must not ride a channel a client stops
@@ -339,8 +357,49 @@ profile here repeats it deliberately.
   five thousand reads, most of them spent learning that a message has no
   reactions. `ChatStore::reactions_for` and `ChatStore::pages` are the batch
   shapes, and the single-row `reactions` is a page of one so there is one
-  statement to keep right. Measured by `history_hydration_costs`, which is
-  ignored by default because it is a stopwatch.
+  statement to keep right. `pages` takes a limit *per chat* rather than one
+  for all of them, because a load that serves a chat list wants the newest row
+  of most chats and the unread tail of a few. Measured by
+  `history_hydration_costs`, which is ignored by default because it is a
+  stopwatch.
+- **History is asked for, not pushed.** The attach load carries the chat list
+  and, per chat, only what the *daemon* needs of it: the newest row the list
+  previews from and the unread tail, which is the set of receipts a read owes
+  and the second it is bounded by (`attach_page`, floored so an ordinary
+  same-second burst is covered). A timeline is a page a front end asks for
+  when it has somewhere to draw it — `LoadMessages` on opening a conversation
+  and again as the reader nears its top, `LoadChats` as the sidebar nears its
+  end. WhatsApp Web sizes it the same way and preloads neither
+  (`web_preload_chat_messages`, `web_init_chat_batch_size`,
+  `history_sync_on_demand_message_count`).
+  A list that has reached its end has only reached the end of what the store
+  holds *now*: a history sync commits over minutes, so `Paging::Done` keeps
+  the cursor it last asked with and *any* history load reopens it
+  (`reopen_finished_pages`) — not a complete one, which is a load that
+  returned fewer chats than it asked for and so is a load an account of a
+  hundred chats never gets — the rows that arrive are older than everything
+  fetched, which is exactly where that cursor points. And an empty list is at
+  its end like any other, so the frame asks on the sidebar's behalf when a
+  filter matches nothing: the virtual list that would have asked is not built
+  when there is nothing to put in it.
+  Two rules keep it honest. A cursor is **opaque** — what a page is ordered by
+  is the store's business, and a front end that parsed one would be a second
+  implementation of that order — so `PageCursor` is a token the daemon writes
+  and reads, and `session/whatsapp.rs` is where it is spelled. And the daemon
+  **learns from what it serves**: a page of messages is folded into
+  `ReadTracker` and a page of chats into the hub *and* the tracker on the way
+  out, because a read is bounded by what this side has observed and a chat
+  past the attach window is otherwise in no snapshot — a window naming either
+  would be refused for naming something the daemon has never heard of. A page
+  is a frame like any other, so its media is externalized like any other
+  (`externalize_messages`) and read back on the client's own IPC thread; the
+  page of chats is sized exactly as the attach load sizes one (`attach_page`),
+  because a read owes a receipt per unread message rather than one for the
+  chat and the status broadcast is nobody's conversation to open; and a page's
+  rows carry each row's other half, since a PN/LID pair is collapsed over the rows
+  one hydration is given and a page boundary falls wherever the store's order
+  puts it — half a pair alone is a chat with half the pair's unread count,
+  merged over the whole one the window already had.
 - **The reload debounce is for bursts, not for askers.** A history sync commits
   many batches and each emits a change; the quiet window folds them into one
   load. A front end that asked outright is not a burst — it holds nothing, it
@@ -362,6 +421,12 @@ profile here repeats it deliberately.
 - **SQLite is bundled and trimmed** in `.cargo/config.toml`. FTS5 must stay:
   the `search` feature builds its index on it.
 - **No real PII in tests**, including fixtures derived from captures.
+
+A scrollbar belongs to whatever scrolls, and both lists have one: the sidebar
+hands `Scrollbar::vertical` its `VirtualListScrollHandle` and the conversation
+hands it the `ListState` itself, since a self-measuring list is the only thing
+that knows how tall its rows turned out. In both it is drawn over the scrolling
+region at its trailing edge, outside the rows' own gutter.
 
 ## Theme
 

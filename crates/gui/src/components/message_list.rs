@@ -17,6 +17,7 @@ use gpui::{
     list, prelude::FluentBuilder as _, px,
 };
 use gpui_component::ActiveTheme as _;
+use gpui_component::scroll::Scrollbar;
 
 use crate::app::{MessageListCache, TimelineItem, WhatsAppApp};
 use crate::components::message_bubble::render_encryption_notice;
@@ -70,31 +71,52 @@ pub fn render_message_list(
     let messages = Arc::clone(&cache.messages);
     let items = Arc::clone(&cache.items);
 
-    // The gutter is the container's, not the list's: `gpui::list` honours the
-    // vertical half of its own padding and lays every row out at the left
-    // edge of its bounds regardless of the horizontal half, which is why
-    // asking the list for `px` left the bubbles flush against the window.
     div()
         .flex_1()
         .min_h_0()
-        .overflow_hidden()
-        .px(layout.conversation_padding())
+        .relative()
+        // The gutter is the container's, not the list's: `gpui::list` honours
+        // the vertical half of its own padding and lays every row out at the
+        // left edge of its bounds regardless of the horizontal half, which is
+        // why asking the list for `px` left the bubbles flush against the
+        // window.
         .child(
-            list(state.clone(), move |ix, _window, cx| {
-                render_row(
-                    &items,
-                    &messages,
-                    ix,
-                    &entity,
-                    is_group,
-                    is_own_number,
-                    layout,
-                    metrics,
-                    cx,
-                )
-            })
-            .size_full()
-            .py(layout.conversation_gap()),
+            div()
+                .size_full()
+                .overflow_hidden()
+                .px(layout.conversation_padding())
+                .child(
+                    list(state.clone(), move |ix, _window, cx| {
+                        render_row(
+                            &items,
+                            &messages,
+                            ix,
+                            &entity,
+                            is_group,
+                            is_own_number,
+                            layout,
+                            metrics,
+                            cx,
+                        )
+                    })
+                    .size_full()
+                    .py(layout.conversation_gap()),
+                ),
+        )
+        // A conversation scrolls as much as the sidebar does and said so with
+        // nothing: how far back a reader is in a history that keeps growing
+        // upwards as they page through it is exactly what a scrollbar is for.
+        // The same placement as the chat list's — over the region that
+        // scrolls, at its trailing edge, outside the rows' own gutter — and
+        // the list's own state is the handle, because a self-measuring list
+        // is the only thing that knows how tall its rows turned out.
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .child(Scrollbar::vertical(state)),
         )
         .into_any_element()
 }

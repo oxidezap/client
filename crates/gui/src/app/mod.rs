@@ -15,6 +15,7 @@ mod events;
 mod media;
 mod media_ctl;
 mod messages;
+mod paging;
 mod recording;
 mod recovery;
 mod search;
@@ -27,7 +28,8 @@ pub use calls::CallCard;
 pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
 pub use chats::{ChatFilter, ChatListCache, Survival, survives_complete_load};
 pub use media::RecordingState;
-pub use messages::{MessageListCache, RowId, TimelineItem};
+pub use messages::{MessageListCache, TimelineItem};
+pub use paging::nearing_end;
 
 /// What the conversation list was last told about.
 /// What the audio sink is holding, and where it came from.
@@ -166,16 +168,92 @@ struct MeasuredAgainst {
 
 struct TimelineAnchor {
     jid: String,
-    count: usize,
-    /// The layout the measured prefix was measured against.
+    /// The layout the rows were measured against.
     measured: MeasuredAgainst,
-    /// The build of the rows the list last measured.
-    build: usize,
-    /// The row at `count - 1`: the last one whose measurement the list is
-    /// keeping. Anything that moves it — a backfill before the head, a
-    /// notice stamped in the past, a removal — moved everything the list
-    /// measured, and only an append leaves it alone.
-    boundary: Option<RowId>,
+    /// The rows themselves, as the list measured them.
+    ///
+    /// Kept rather than described: what the list holds is a height per row,
+    /// so the only honest question is which of *these* rows the next frame
+    /// still draws, and where. Cheap to keep — the rows and the messages
+    /// behind them are both `Arc`s — and cheap to ask, because the `build`
+    /// number says when they cannot have changed at all.
+    rows: MessageListCache,
+}
+
+/// What one frame's rows mean for the measurements the list is keeping.
+///
+/// The decision `sync_timeline` makes, apart from the list it makes it about,
+/// so it can be reasoned about — and tested — without a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineSync {
+    /// One stretch of rows replaced by another, and every measurement outside
+    /// it still describes the row it measured.
+    ///
+    /// Every ordinary change is this: an arrival replaces nothing at the end,
+    /// a page of older history replaces nothing *after the encryption notice*
+    /// — which is why the front is not index 0 — and a revoke or a run break
+    /// replaces a row with itself. One frame can carry several of those; the
+    /// answer is the stretch that covers them all.
+    Spliced {
+        at: usize,
+        removed: usize,
+        added: usize,
+    },
+    /// The same rows, against a layout that has moved under them.
+    Remeasure,
+    /// A different conversation. Nothing measured describes anything drawn.
+    Reset,
+    /// Nothing changed that the list has to hear about.
+    Nothing,
+}
+
+/// What to do with the measurements the list is keeping.
+///
+/// `previous` is the anchor from the last frame and `rows` the ones this
+/// frame will draw. The two questions are whether the rows the list measured
+/// are still those rows, and if not, whether what changed is something a
+/// splice can express.
+fn timeline_sync(
+    previous: Option<&TimelineAnchor>,
+    jid: &str,
+    rows: &MessageListCache,
+    measured: MeasuredAgainst,
+) -> TimelineSync {
+    let Some(anchor) = previous.filter(|anchor| anchor.jid == jid) else {
+        return TimelineSync::Reset;
+    };
+    let moved = anchor.measured != measured;
+
+    // The rows were never rebuilt, so they are the same rows: only the layout
+    // can have moved under them. This is the common frame, and it is what
+    // keeps the diff below off the hot path.
+    if anchor.rows.build == rows.build {
+        return if moved {
+            TimelineSync::Remeasure
+        } else {
+            TimelineSync::Nothing
+        };
+    }
+
+    // What the two have in common at either end, and therefore what changed
+    // between them. Asked of the rows rather than of their number, because a
+    // count cannot tell an arrival from a page from a removal — and because
+    // neither end is where a naive answer would put it: the encryption notice
+    // holds index 0 whatever arrives in front of the messages, and the typing
+    // indicator holds the last index whatever arrives behind them.
+    let at = anchor.rows.common_prefix(rows);
+    let kept = anchor.rows.common_suffix(rows, at);
+    let removed = anchor.rows.items.len() - at - kept;
+    let added = rows.items.len() - at - kept;
+
+    if removed + added > 0 {
+        return TimelineSync::Spliced { at, removed, added };
+    }
+    // The same rows, rebuilt: an image arrived, a reaction landed, a message
+    // was revoked or a send grew a retry button. Nothing moved and every
+    // height is suspect, which is what a rebuild means — `Nothing` here left
+    // the list drawing a bubble at the size it used to be.
+    TimelineSync::Remeasure
 }
 pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
@@ -602,6 +680,11 @@ pub struct WhatsAppApp {
     /// every row is a row without messages, so two of them can be opened
     /// before either load lands.
     owed_reads: std::collections::HashSet<String>,
+    /// Where each conversation's timeline continues, and whether it is
+    /// asking. See [`paging`].
+    timeline_pages: paging::TimelinePages,
+    /// Where the chat list continues.
+    chat_pages: paging::Paging,
     /// Status updates watched in this window. Local by design — there is no
     /// receipt to send — and therefore this window's job to remember across a
     /// hydration merge, which replaces those rows from the store.
@@ -814,6 +897,22 @@ impl WhatsAppApp {
                     // view that waits for a round trip flickers — so the
                     // correction is to put it back rather than to leave a
                     // watched update that returns new on the next start.
+                    // One page of a conversation, for the timeline that
+                    // asked. Folded in rather than replacing: the rows a
+                    // page brings sit before the ones the window already has.
+                    FromDaemon::Messages {
+                        jid,
+                        messages,
+                        next,
+                    } => entity.update(cx, |app, cx| {
+                        app.apply_message_page(jid, messages, next, cx);
+                    }),
+                    FromDaemon::Chats { chats, next } => entity.update(cx, |app, cx| {
+                        app.apply_chat_page(chats, next, cx);
+                    }),
+                    FromDaemon::PageLost { jid } => entity.update(cx, |app, _cx| {
+                        app.page_lost(jid);
+                    }),
                     FromDaemon::StatusViewLost(message_ids) => entity.update(cx, |app, cx| {
                         app.forget_status_views(&message_ids, cx);
                     }),
@@ -857,6 +956,8 @@ impl WhatsAppApp {
             visible_chat: None,
             departed_chats: std::collections::HashSet::new(),
             owed_reads: std::collections::HashSet::new(),
+            timeline_pages: paging::TimelinePages::new(),
+            chat_pages: paging::Paging::default(),
             watched_status: std::collections::HashSet::new(),
             viewer_focus: cx.focus_handle(),
             chat_search_input: None, // Created lazily when window is available
@@ -1204,6 +1305,14 @@ impl WhatsAppApp {
                 width: layout.message_list_width(),
             },
         );
+        // Asked from here rather than from a row's own render, because this is
+        // the frame's one pass over the timeline and it already holds the
+        // list. A conversation shorter than its viewport reports the top row
+        // as visible and so asks straight away, which is right: there is more
+        // behind it and nowhere to scroll to say so.
+        if paging::nearing_start(self.message_list.logical_scroll_top().item_ix) {
+            self.want_older_messages(chat_jid);
+        }
         rows
     }
 
@@ -1233,51 +1342,35 @@ impl WhatsAppApp {
         measured: MeasuredAgainst,
     ) {
         let count = rows.items.len();
-        let boundary = rows.row_id(count.saturating_sub(1));
         let previous = self.timeline_anchor.take();
 
-        // Same conversation, and the prefix the list measured is still that
-        // prefix: whatever changed happened after it.
-        let continued = previous.as_ref().filter(|anchor| {
-            anchor.jid == chat_jid
-                && count >= anchor.count
-                && rows.row_id(anchor.count.saturating_sub(1)) == anchor.boundary
-        });
-
-        match continued {
-            // Rows arrived at the end: keep the measurements taken for
-            // everything before them, and the reader's place with them — but
-            // only while they still describe those rows. A window resized in
-            // the same frame a message arrived in is one where the prefix is
-            // stale too, and splicing alone would keep every one of its
-            // heights.
-            Some(anchor) if count > anchor.count => {
-                self.message_list
-                    .splice(anchor.count..anchor.count, count - anchor.count);
-                if anchor.measured != measured {
+        match timeline_sync(previous.as_ref(), chat_jid, rows, measured) {
+            // One stretch of rows for another, leaving every measurement
+            // outside it in place — and the reader with it, since a
+            // bottom-anchored list is moved by neither a page arriving above
+            // nor a message arriving below. Reset instead, and a reader who
+            // scrolled back far enough to ask for more was thrown to the
+            // newest message for asking.
+            TimelineSync::Spliced { at, removed, added } => {
+                self.message_list.splice(at..at + removed, added);
+                // Only while the measurements outside it still describe those
+                // rows: a window resized in the same frame is one where they
+                // do not, and a splice keeps every one of them.
+                if previous.as_ref().is_some_and(|a| a.measured != measured) {
                     self.message_list.remeasure();
                 }
             }
-            // The same rows, rebuilt — or the same rows against a layout that
-            // has moved under them. Either way something is a different size
-            // now; remeasure rather than reset, which keeps the reader where
-            // they were reading.
-            Some(anchor) => {
-                if anchor.build != rows.build || anchor.measured != measured {
-                    self.message_list.remeasure();
-                }
-            }
-            // A different conversation, or rows that moved under the ones
-            // already measured.
-            None => self.message_list.reset(count),
+            // Something is a different size now; remeasure rather than reset,
+            // which keeps the reader where they were.
+            TimelineSync::Remeasure => self.message_list.remeasure(),
+            TimelineSync::Reset => self.message_list.reset(count),
+            TimelineSync::Nothing => {}
         }
 
         self.timeline_anchor = Some(TimelineAnchor {
             jid: chat_jid.to_string(),
-            count,
             measured,
-            build: rows.build,
-            boundary,
+            rows: rows.clone(),
         });
     }
 
@@ -1300,8 +1393,27 @@ impl WhatsAppApp {
 
     /// Record what this frame draws as the conversation. See
     /// [`Self::visible_chat`].
+    ///
+    /// Also where a conversation asks for its history: a chat is *on screen*
+    /// exactly when its timeline needs filling, and the frame that draws it
+    /// is the one place that knows which chat that is — the selection can
+    /// name a chat the window is not showing (Settings is up, the reader is
+    /// in Status).
     pub fn note_visible_conversation(&mut self, jid: Option<String>) {
+        if let Some(jid) = &jid {
+            self.ensure_timeline_page(jid);
+        }
         self.visible_chat = jid;
+    }
+
+    /// Whether the chat list this frame draws has no rows in it at all.
+    ///
+    /// Asked by the frame rather than by the list component: the virtual list
+    /// that pages the sidebar is not built when there is nothing to put in
+    /// it, so the one list that most needs another page — a filter matching
+    /// nothing yet — would be the one list that never asks for one.
+    pub fn chat_list_is_empty(&self) -> bool {
+        self.get_chat_list_cache().rows.is_empty()
     }
 
     /// Record which keyboard surfaces this frame drew. See
@@ -1347,6 +1459,10 @@ impl WhatsAppApp {
         self.selected_chat = None;
         self.visible_chat = None;
         self.departed_chats.clear();
+        // The cursors describe positions in one account's store; the next
+        // account's rows are not behind them.
+        self.forget_paging();
+        self.owed_reads.clear();
         // The reader is a selection too, and a JID-keyed one. Left alone, it
         // pointed the new account at the old account's contact: at their
         // updates if that contact exists there — watched by nobody in this
@@ -1630,6 +1746,10 @@ impl WhatsAppApp {
                 cache.remove(jid);
             }
         }
+        // For the same reason, and it is the stronger one here: a paging
+        // position outliving its chat is a conversation that never asks for
+        // its history again.
+        self.forget_chat_paging(&gone);
         self.forget_missing_selection();
         // The viewer names a chat and a message in it, and resolves them every
         // frame: one left open over a chat that has just gone draws nothing,
@@ -2862,6 +2982,221 @@ mod tests {
         let mut chat = Chat::new(jid.to_string());
         chat.last_message_time = secs.and_then(at);
         chat
+    }
+
+    fn timeline_of(ids: &[&str]) -> MessageListCache {
+        MessageListCache::new(&messages_of(ids), false, None)
+    }
+
+    /// Messages whose day comes from their *name*, not their position: the
+    /// rows a page brings are the rows that chat always had, so `["m3","m4"]`
+    /// and `["m1","m2","m3","m4"]` have to agree about m3 and m4 — dividers
+    /// included, since a divider is a row like any other.
+    fn messages_of(ids: &[&str]) -> Vec<ChatMessage> {
+        ids.iter()
+            .map(|id| {
+                let mut message = ChatMessage::new_incoming(
+                    (*id).to_string(),
+                    "a@s.whatsapp.net".into(),
+                    "olá".into(),
+                );
+                // One day apart, so every row also carries its own divider —
+                // the rows a page brings are never only messages.
+                let day: i64 = id.trim_start_matches('m').parse().unwrap();
+                message.timestamp =
+                    chrono::DateTime::from_timestamp(1_700_000_000 + day * 86_400, 0).unwrap();
+                message
+            })
+            .collect()
+    }
+
+    fn anchored(jid: &str, rows: &MessageListCache, measured: MeasuredAgainst) -> TimelineAnchor {
+        TimelineAnchor {
+            jid: jid.to_string(),
+            measured,
+            rows: rows.clone(),
+        }
+    }
+
+    fn same_layout() -> MeasuredAgainst {
+        MeasuredAgainst {
+            rem: 16.0,
+            width: 600.0,
+        }
+    }
+
+    /// A page of older history arrives in front of every message the list
+    /// has measured — but *not* in front of the encryption notice, which
+    /// holds index 0 whatever else happens. Spliced there rather than at the
+    /// top, the reader stays where they were reading and every measured row
+    /// keeps its own height; spliced at 0, the notice's height lands on a
+    /// message. Reset, and a reader who scrolled back far enough to ask for
+    /// more is thrown to the newest message for asking.
+    #[test]
+    fn a_page_of_older_history_is_spliced_after_the_notice() {
+        let before = timeline_of(&["m3", "m4"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = timeline_of(&["m1", "m2", "m3", "m4"]);
+
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout()),
+            TimelineSync::Spliced {
+                at: 1,
+                removed: 0,
+                added: after.items.len() - before.items.len(),
+            }
+        );
+    }
+
+    /// A page and an arrival between two frames. Both ends moved, so the
+    /// stretch that changed spans everything between them — which is still
+    /// one splice, and was a reset that threw the reader who had just asked
+    /// for older history to the newest message.
+    #[test]
+    fn a_page_and_an_arrival_in_one_frame_are_one_splice() {
+        let before = timeline_of(&["m3", "m4"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = timeline_of(&["m1", "m2", "m3", "m4", "m5"]);
+
+        let TimelineSync::Spliced { at, removed, added } =
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout())
+        else {
+            panic!("both ends moved, and the middle is still the middle");
+        };
+        // The notice is common to both, and so is nothing after it once rows
+        // arrived at either end.
+        assert_eq!(at, 1);
+        assert_eq!(removed, before.items.len() - 1);
+        assert_eq!(added, after.items.len() - 1);
+    }
+
+    /// An arrival is still an append: the rows the list measured are all
+    /// still where it measured them.
+    #[test]
+    fn an_arrival_is_still_spliced_at_the_end() {
+        let before = timeline_of(&["m1", "m2"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = timeline_of(&["m1", "m2", "m3"]);
+
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout()),
+            TimelineSync::Spliced {
+                at: before.items.len(),
+                removed: 0,
+                added: after.items.len() - before.items.len(),
+            }
+        );
+    }
+
+    /// The typing indicator is drawn after the last message and comes and
+    /// goes on its own. Anchored on it, the last row is still the last row
+    /// while a message lands in front of it — which reads as a page of older
+    /// history, and put the arrival at the top of the conversation.
+    #[test]
+    fn a_message_landing_under_the_typing_row_is_still_an_arrival() {
+        let typing = Some(TypingSummary {
+            typists: vec![oxidezap_core::Typist {
+                jid: "a@s.whatsapp.net".to_string(),
+                name: "A".to_string(),
+            }],
+            total: 1,
+            kind: oxidezap_core::ComposingKind::Text,
+        });
+        let before = MessageListCache::new(&messages_of(&["m1", "m2"]), false, typing.clone());
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = MessageListCache::new(&messages_of(&["m1", "m2", "m3"]), false, typing);
+
+        let TimelineSync::Spliced { at, removed, added } =
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout())
+        else {
+            panic!("a message arrived, whoever else is typing");
+        };
+        assert_eq!(removed, 0, "nothing left");
+        assert_eq!(added, after.items.len() - before.items.len());
+        // Straight after the last message, so the typing row is pushed down
+        // rather than the arrival landing under it.
+        assert_eq!(at, before.items.len() - 1);
+    }
+
+    /// Only a different conversation resets: within one, whatever changed is
+    /// a stretch of rows, and the ones outside it are still what they were.
+    #[test]
+    fn only_another_conversation_is_reset() {
+        let before = timeline_of(&["m1", "m2", "m3"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+
+        // Another conversation entirely.
+        assert_eq!(
+            timeline_sync(Some(&anchor), "b@s.whatsapp.net", &before, same_layout()),
+            TimelineSync::Reset
+        );
+        // And nothing at all to compare against.
+        assert_eq!(
+            timeline_sync(None, "a@s.whatsapp.net", &before, same_layout()),
+            TimelineSync::Reset
+        );
+    }
+
+    /// A message that leaves — revoked and pruned, or a chat trimmed — is
+    /// the same answer read the other way: the stretch it occupied is
+    /// replaced by nothing.
+    #[test]
+    fn a_message_that_leaves_is_the_stretch_it_occupied() {
+        let before = timeline_of(&["m1", "m2", "m3"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        let after = timeline_of(&["m1", "m2"]);
+
+        let TimelineSync::Spliced { removed, added, .. } =
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &after, same_layout())
+        else {
+            panic!("a row left, and the rest of them did not");
+        };
+        assert_eq!(removed - added, before.items.len() - after.items.len());
+    }
+
+    /// A rebuild with the rows unchanged is the other way a height goes
+    /// stale: something inside a bubble grew. Nothing to splice, and nothing
+    /// the list can be left believing either.
+    #[test]
+    fn a_rebuilt_row_is_remeasured_even_where_nothing_moved() {
+        let before = timeline_of(&["m1", "m2"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        // The same messages, built again — which is what an arriving image or
+        // a landing reaction does.
+        let rebuilt = timeline_of(&["m1", "m2"]);
+        assert_ne!(rebuilt.build, before.build);
+
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &rebuilt, same_layout()),
+            TimelineSync::Remeasure
+        );
+        // And the same rows, not rebuilt, are nothing to say at all.
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &before, same_layout()),
+            TimelineSync::Nothing
+        );
+    }
+
+    /// The same rows against a layout that has moved under them: every height
+    /// is stale, and none of the rows are.
+    #[test]
+    fn a_resize_remeasures_rather_than_resets() {
+        let rows = timeline_of(&["m1", "m2"]);
+        let anchor = anchored("a@s.whatsapp.net", &rows, same_layout());
+        let wider = MeasuredAgainst {
+            rem: 16.0,
+            width: 900.0,
+        };
+
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &rows, wider),
+            TimelineSync::Remeasure
+        );
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &rows, same_layout()),
+            TimelineSync::Nothing,
+            "and a frame that changed nothing tells the list nothing"
+        );
     }
 
     /// A row painted from the daemon's snapshot has a preview and no
