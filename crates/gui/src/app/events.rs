@@ -47,6 +47,7 @@ impl WhatsAppApp {
                     // comes back — unarchived elsewhere — is in `loaded` again
                     // and is no longer owed a removal.
                     let mut departed = std::collections::HashSet::new();
+                    let mut dropped: Vec<String> = Vec::new();
                     let mut cache = self.message_list_cache.borrow_mut();
                     self.chats.retain(|c| {
                         match survives_complete_load(c, &loaded, visible.as_deref()) {
@@ -67,11 +68,17 @@ impl WhatsAppApp {
                             // cross a chat lifetime.
                             Survival::Drop => {
                                 cache.remove(&c.jid);
+                                dropped.push(c.jid.clone());
                                 false
                             }
                         }
                     });
                     drop(cache);
+                    // And where its history continued: a position that
+                    // outlives its chat is one a recreated chat inherits, and
+                    // a conversation that believes it has everything asks for
+                    // nothing. See `forget_chat_paging`.
+                    self.forget_chat_paging(&dropped);
                     self.departed_chats = departed;
                 }
                 // The updates this load itself brought back already read:

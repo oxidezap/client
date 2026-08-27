@@ -790,7 +790,10 @@ impl Bridge {
                     )
                     .await;
                 let answer = match page {
-                    Ok(Ok(page)) => {
+                    Ok(Ok(mut page)) => {
+                        // The bytes travel the way they do everywhere else:
+                        // written to the media directory, named by a key.
+                        externalize_messages(crate::media::epoch(), &mut page.items);
                         // What this side served, it now knows. A read is
                         // bounded by the messages the daemon has observed, and
                         // the page a front end asked for is the history it is
@@ -827,11 +830,22 @@ impl Bridge {
                     )
                     .await;
                 let answer = match page {
-                    Ok(Ok(page)) => {
+                    Ok(Ok(mut page)) => {
+                        let epoch = crate::media::epoch();
                         // The same rule. A chat past the attach window is in
                         // no snapshot, and a read for one is refused with "no
                         // such chat" until this side has been told it exists.
-                        for chat in &page.items {
+                        // Its rows are learned as well as its summary: a
+                        // window opening such a chat names the message it can
+                        // see, and a read naming a message this side has never
+                        // observed is refused for having no boundary — which
+                        // is a badge that clears locally, sends no receipt and
+                        // comes straight back on the next hydration.
+                        for chat in &mut page.items {
+                            externalize_messages(epoch, &mut chat.messages);
+                            for message in &chat.messages {
+                                self.reads.observe_message(&chat.jid, message);
+                            }
                             self.hub.apply(chat_updated(chat, &mut self.reads));
                         }
                         Ok(DaemonMessage::Chats {
@@ -1179,13 +1193,25 @@ fn externalize_media(event: &mut UiEvent) {
         }
         UiEvent::HistoryLoaded { chats, .. } => {
             for chat in chats {
-                for message in &mut chat.messages {
-                    let id = message.id.clone();
-                    cache_media(epoch, &id, &mut message.media);
-                }
+                externalize_messages(epoch, &mut chat.messages);
             }
         }
         _ => {}
+    }
+}
+
+/// The same, for a page this daemon was asked for.
+///
+/// A page of history reaches a front end without passing through the event
+/// stream, and `MediaContent::data` is skipped by serde wherever it travels —
+/// so a page serialized straight out of the store carries neither the bytes
+/// nor a key to find them by, and older photos draw as download-only next to
+/// the identical rows the attach load externalized. Every frame that carries
+/// a `ChatMessage` goes through here.
+fn externalize_messages(epoch: usize, messages: &mut [ChatMessage]) {
+    for message in messages {
+        let id = message.id.clone();
+        cache_media(epoch, &id, &mut message.media);
     }
 }
 

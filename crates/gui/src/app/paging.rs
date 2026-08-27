@@ -181,6 +181,19 @@ impl WhatsAppApp {
         }
     }
 
+    /// Forget where these conversations continued.
+    ///
+    /// Called where a chat leaves the list. The cursors describe positions in
+    /// rows that are gone, and a JID is reused: a chat recreated under the
+    /// same name would otherwise inherit a `Done` and never ask for its own
+    /// history again — an empty conversation with nothing to fill it. Keyed
+    /// by JID alone, like the message cache evicted beside it.
+    pub(super) fn forget_chat_paging(&mut self, gone: &[String]) {
+        for jid in gone {
+            self.timeline_pages.remove(jid);
+        }
+    }
+
     /// Everything this window learned about where its lists continue.
     ///
     /// Dropped with the account: the cursors describe positions in one

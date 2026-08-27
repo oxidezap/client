@@ -1353,6 +1353,12 @@ impl WhatsAppApp {
             // scroll back far enough to ask for more.
             TimelineSync::Prepended { count: added } => {
                 self.message_list.splice(0..0, added);
+                // The same caveat as an append: a page landing in the frame
+                // that resized the window leaves every measured height stale,
+                // and a splice keeps all of them.
+                if previous.as_ref().is_some_and(|a| a.measured != measured) {
+                    self.message_list.remeasure();
+                }
             }
             // Something is a different size now; remeasure rather than reset,
             // which keeps the reader where they were.
@@ -1732,6 +1738,10 @@ impl WhatsAppApp {
                 cache.remove(jid);
             }
         }
+        // For the same reason, and it is the stronger one here: a paging
+        // position outliving its chat is a conversation that never asks for
+        // its history again.
+        self.forget_chat_paging(&gone);
         self.forget_missing_selection();
         // The viewer names a chat and a message in it, and resolves them every
         // frame: one left open over a chat that has just gone draws nothing,
