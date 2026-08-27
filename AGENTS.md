@@ -293,8 +293,9 @@ profile here repeats it deliberately.
   a page and went to the top; and a page can swallow a divider its own newest
   message now shares a day with. A row can also change height with the rows
   standing still — an image arrives, a reaction lands, a send fails and grows
-  a retry button — which the `build` number answers, and which is also what
-  keeps the diff off the hot path: same build, same rows, nothing to compare.
+  a retry button — which the `build` number answers: a rebuild with the rows
+  unchanged is a remeasure, never nothing, and an unchanged build is the frame
+  that keeps the diff off the hot path.
   Only another conversation resets.
 - **What a frame leaves out, its reader fills in.** The wire is
   newline-delimited JSON and a history load is a hundred chats of fifty rows,

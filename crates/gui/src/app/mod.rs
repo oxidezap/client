@@ -246,11 +246,14 @@ fn timeline_sync(
     let removed = anchor.rows.items.len() - at - kept;
     let added = rows.items.len() - at - kept;
 
-    match (removed + added > 0, moved) {
-        (true, _) => TimelineSync::Spliced { at, removed, added },
-        (false, true) => TimelineSync::Remeasure,
-        (false, false) => TimelineSync::Nothing,
+    if removed + added > 0 {
+        return TimelineSync::Spliced { at, removed, added };
     }
+    // The same rows, rebuilt: an image arrived, a reaction landed, a message
+    // was revoked or a send grew a retry button. Nothing moved and every
+    // height is suspect, which is what a rebuild means — `Nothing` here left
+    // the list drawing a bubble at the size it used to be.
+    TimelineSync::Remeasure
 }
 pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
@@ -3149,6 +3152,29 @@ mod tests {
             panic!("a row left, and the rest of them did not");
         };
         assert_eq!(removed - added, before.items.len() - after.items.len());
+    }
+
+    /// A rebuild with the rows unchanged is the other way a height goes
+    /// stale: something inside a bubble grew. Nothing to splice, and nothing
+    /// the list can be left believing either.
+    #[test]
+    fn a_rebuilt_row_is_remeasured_even_where_nothing_moved() {
+        let before = timeline_of(&["m1", "m2"]);
+        let anchor = anchored("a@s.whatsapp.net", &before, same_layout());
+        // The same messages, built again — which is what an arriving image or
+        // a landing reaction does.
+        let rebuilt = timeline_of(&["m1", "m2"]);
+        assert_ne!(rebuilt.build, before.build);
+
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &rebuilt, same_layout()),
+            TimelineSync::Remeasure
+        );
+        // And the same rows, not rebuilt, are nothing to say at all.
+        assert_eq!(
+            timeline_sync(Some(&anchor), "a@s.whatsapp.net", &before, same_layout()),
+            TimelineSync::Nothing
+        );
     }
 
     /// The same rows against a layout that has moved under them: every height
