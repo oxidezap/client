@@ -8,7 +8,16 @@
 
 mod audio;
 mod player;
+
+/// The real decoder: `mp4` for the container, `openh264` for the picture.
+#[cfg(not(target_family = "wasm"))]
 mod streaming;
+/// The same API where the second of those cannot be built.
+#[cfg(target_family = "wasm")]
+mod unsupported;
+
+#[cfg(target_family = "wasm")]
+use unsupported as streaming;
 
 // Memory-efficient streaming decoder (on-demand decoding, ~3MB vs ~48MB)
 pub use streaming::StreamingVideoDecoder;

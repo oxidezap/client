@@ -49,10 +49,8 @@ impl WhatsAppApp {
         if self.retry_at.is_some() {
             return;
         }
-        self.retry_at = Some(
-            wacore::time::now_utc()
-                + chrono::Duration::seconds(RETRY_AFTER_SECS as i64),
-        );
+        self.retry_at =
+            Some(wacore::time::now_utc() + chrono::Duration::seconds(RETRY_AFTER_SECS as i64));
 
         self.retry_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {

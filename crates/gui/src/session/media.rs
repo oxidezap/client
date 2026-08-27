@@ -97,10 +97,7 @@ impl Fetched {
 
     /// Forget whatever the last frame did not use.
     pub fn clear(&self) {
-        self.bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.bytes.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 

@@ -35,13 +35,18 @@ indexmap = "2"
 log = { workspace = true }
 mp4 = "0.14"
 
+oxidezap-audio = { workspace = true }
 oxidezap-core = { workspace = true }
 # The daemon's protocol, not the session itself: this front end has not owned
 # a WhatsApp connection since the daemon took it over.
 oxidezap-ipc = { workspace = true }
 portable-atomic = { workspace = true }
 qrcode = "0.14"
-rust-embed = "8"
+# `include-exclude` is not a default feature, and the icon set is selected
+# with `#[include]`. It resolves on the host through another crate in the
+# graph turning it on, and nothing does that for the web — where the same
+# attributes then fail to compile rather than being quietly ignored.
+rust-embed = { version = "8", features = ["include-exclude", "interpolate-folder-path"] }
 # theme.json: the palette is data, so it needs a schema and a parser.
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
@@ -78,7 +83,6 @@ env_logger = "0.11"
 smol = "2"
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 openh264 = "0.9" # H.264 software decoder
-oxidezap-audio = { workspace = true }
 
 # The same window as a page. `gpui_platform` picks the web backend by target,
 # so the dependency differs only in the features a browser has no use for —

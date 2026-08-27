@@ -30,7 +30,11 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
     let (reader, writer) = connect_or_start()?.split()?;
     let (events, rx) = sink::channel();
 
-    let session = Session::new(Link::over_stream(writer), events.clone(), Arc::new(Directory));
+    let session = Session::new(
+        Link::over_stream(writer),
+        events.clone(),
+        Arc::new(Directory),
+    );
 
     // Before the reader starts, because the daemon serves nothing until it
     // has one and answers it with the history this connection asked for.

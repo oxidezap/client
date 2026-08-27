@@ -778,10 +778,7 @@ pub struct WhatsAppApp {
 
 impl WhatsAppApp {
     /// Spawn the event handling task that processes UI events from the WhatsApp client
-    fn spawn_event_task(
-        mut ui_rx: tokio::sync::mpsc::Receiver<FromDaemon>,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
+    fn spawn_event_task(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(message) = ui_rx.recv().await {
                 let result = match message {

@@ -11,9 +11,45 @@ use std::borrow::Cow;
 #[include = "icons/**/*.svg"]
 pub struct CustomIcons;
 
+/// gpui-component's own icon set, embedded rather than fetched.
+///
+/// Only on the web, and only because its own asset source downloads them
+/// there — one request per icon, from an endpoint a static export does not
+/// have. `build.rs` copies them into `OUT_DIR` from where the crate says they
+/// are. On the desktop the fallback below is that crate's embedded copy and
+/// this is not built.
+#[cfg(target_family = "wasm")]
+#[derive(RustEmbed)]
+#[folder = "$OUT_DIR/component-icons"]
+#[include = "icons/**/*.svg"]
+struct ComponentIcons;
+
 /// Combined asset source that first checks our custom icons,
-/// then falls back to gpui-component-assets
+/// then falls back to gpui-component's set.
 pub struct Assets;
+
+/// The set to fall back to, however this build carries it.
+#[cfg(not(target_family = "wasm"))]
+fn fallback_load(path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+    gpui_component_assets::Assets.load(path)
+}
+
+#[cfg(target_family = "wasm")]
+fn fallback_load(path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+    Ok(ComponentIcons::get(path).map(|file| file.data))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn fallback_list(path: &str) -> Result<Vec<SharedString>> {
+    gpui_component_assets::Assets.list(path)
+}
+
+#[cfg(target_family = "wasm")]
+fn fallback_list(path: &str) -> Result<Vec<SharedString>> {
+    Ok(ComponentIcons::iter()
+        .filter_map(|p| p.starts_with(path).then(|| p.into()))
+        .collect())
+}
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
@@ -26,10 +62,8 @@ impl AssetSource for Assets {
             return Ok(Some(data.data));
         }
 
-        // Fall back to gpui-component-assets
-        gpui_component_assets::Assets
-            .load(path)
-            .map_err(|e| anyhow!("could not find asset at path \"{path}\": {e}"))
+        // Fall back to gpui-component's set
+        fallback_load(path).map_err(|e| anyhow!("could not find asset at path \"{path}\": {e}"))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
@@ -38,7 +72,7 @@ impl AssetSource for Assets {
             .filter_map(|p| p.starts_with(path).then(|| p.into()))
             .collect();
 
-        if let Ok(component_items) = gpui_component_assets::Assets.list(path) {
+        if let Ok(component_items) = fallback_list(path) {
             for item in component_items {
                 if !items.contains(&item) {
                     items.push(item);

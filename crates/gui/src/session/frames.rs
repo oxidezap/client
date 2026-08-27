@@ -239,10 +239,12 @@ impl<'a> Frames<'a> {
         for waiting in abandoned {
             waiting.failed("the daemon connection closed", Some(self.events));
         }
-        let _ = self.events.send(FromDaemon::Session(Box::new(UiEvent::Error(
-            self.reason
-                .unwrap_or_else(|| "Lost the connection to the daemon".to_string()),
-        ))));
+        let _ = self
+            .events
+            .send(FromDaemon::Session(Box::new(UiEvent::Error(
+                self.reason
+                    .unwrap_or_else(|| "Lost the connection to the daemon".to_string()),
+            ))));
     }
 }
 

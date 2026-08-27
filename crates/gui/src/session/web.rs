@@ -22,10 +22,10 @@ use oxidezap_ipc::web::{self, FromSocket};
 use oxidezap_ipc::{ClientRequest, DaemonMessage, PROTOCOL_VERSION};
 use wasm_bindgen_futures::spawn_local;
 
+use super::Session;
 use super::frames::{self, Frames};
 use super::media::Fetched;
 use super::sink::{self, Events};
-use super::{Pending, Session};
 
 /// Attach to whichever daemon this page was pointed at.
 ///
@@ -47,7 +47,8 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
     let (events, rx) = sink::channel();
     let fetched = Arc::new(Fetched::default());
 
-    let session = Session::new(link, events.clone(), Arc::clone(&fetched));
+    let cache: Arc<dyn super::media::MediaCache> = Arc::clone(&fetched) as Arc<_>;
+    let session = Session::new(link, events.clone(), cache);
     session.send(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
         session_events: true,

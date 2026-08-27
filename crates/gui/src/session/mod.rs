@@ -265,7 +265,8 @@ impl Session {
     /// the only thread that could empty it.
     fn report_status_view_lost(&self, message_ids: Vec<String>, reason: &str) {
         error!("a status view never left this process: {reason}");
-        self.events.try_send(FromDaemon::StatusViewLost(message_ids));
+        self.events
+            .try_send(FromDaemon::StatusViewLost(message_ids));
     }
 
     /// Send a request nobody is waiting on an answer for.
