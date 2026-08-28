@@ -7,6 +7,7 @@
 //! far better than the Rust that would compile to it.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // The library's clock rather than std's, like everywhere else in this tree:
@@ -23,6 +24,9 @@ use super::*;
 struct Recorder {
     sent: Mutex<Vec<(String, String, Option<String>)>>,
     answer: Outcome,
+    /// Held closed to park the plugin's thread inside a command, which is how
+    /// a test builds up a backlog it can then act on.
+    gate: AtomicBool,
 }
 
 impl Recorder {
@@ -30,16 +34,28 @@ impl Recorder {
         Arc::new(Self {
             sent: Mutex::new(Vec::new()),
             answer,
+            gate: AtomicBool::new(true),
         })
     }
 
     fn sent(&self) -> Vec<(String, String, Option<String>)> {
         self.sent.lock().expect("not poisoned").clone()
     }
+
+    fn close_gate(&self) {
+        self.gate.store(false, Ordering::SeqCst);
+    }
+
+    fn open_gate(&self) {
+        self.gate.store(true, Ordering::SeqCst);
+    }
 }
 
 impl Commands for Arc<Recorder> {
     fn send_text(&self, jid: &str, text: &str, quoted: Option<&str>) -> Outcome {
+        while !self.gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         self.sent.lock().expect("not poisoned").push((
             jid.to_owned(),
             text.to_owned(),
@@ -972,4 +988,159 @@ fn a_plugin_cannot_grow_its_timer_list_across_calls() {
     until("a refusal", || {
         commands.sent().iter().any(|(_, text, _)| text == "refused")
     });
+}
+
+/// A plugin that wants nothing but to draw: no account capability at all.
+fn draws_only() -> String {
+    let mut buf = vec![0u8; 512];
+    let mut w = abi::ui::Writer::new(&mut buf);
+    w.leaf(
+        abi::ui::kind::LABEL,
+        abi::ui::slot::SETTINGS,
+        abi::ui::flags::ENABLED,
+        "",
+        "Nada a pedir.",
+        "",
+    );
+    let n = w.finish().expect("fits");
+    versioned(&format!(
+        r#"(module
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_ui_set"       (func $ui_set (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{tree}")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $caps (i64.const 8))    ;; caps::UI, and nothing that reaches the account
+    (drop (call $ui_set (i32.const 0) (i32.const {len})))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param i32) (param i32) (result i32) (i32.const 0))
+)"#,
+        tree = wat_bytes(&buf[..n]),
+        len = n,
+    ))
+}
+
+/// A module that acts on the account from its *start section* — before the
+/// loader has read back its ABI version or checked its exports.
+const ACTS_WHILE_LOADING: &str = r#"(module
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "a@s.whatsapp.netsneaked")
+  (func $start
+    (call $caps (i64.const 1))
+    (drop (call $send (i32.const 0) (i32.const 16) (i32.const 16) (i32.const 7))))
+  (start $start)
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32) (i32.const 0))
+  (func (export "oxi_on_event") (param i32) (param i32) (result i32) (i32.const 0))
+)"#;
+
+/// The one moment a plugin runs before the host has accepted it. A start
+/// section, or a side-effecting `oxi_abi_version`, is code the loader has not
+/// agreed to run — and a module it goes on to refuse would otherwise have
+/// sent a message on its way out the door.
+#[test]
+fn a_module_cannot_act_on_the_account_before_it_is_loaded() {
+    let dir = TempDir::new("start-section");
+    dir.plugin("sneaky", &versioned(ACTS_WHILE_LOADING));
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    // Approved in advance, which is the hard case: the answer is on file, so
+    // nothing but the phase stands between this module and the account.
+    let _plugins = host(&dir, Arc::clone(&commands), &published);
+
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        commands.sent().is_empty(),
+        "its start section ran with every import refusing"
+    );
+}
+
+/// Two declarations, the second wider than the first — with an account action
+/// in between. The all-or-nothing rule is about a sentence, and a plugin that
+/// acts under a narrow one before widening it has already acted.
+const REDECLARES: &str = r#"(module
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "a@s.whatsapp.netsneaked")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $caps (i64.const 1))        ;; SEND, the mask it was approved for
+    (drop (call $send (i32.const 0) (i32.const 16) (i32.const 16) (i32.const 7)))
+    (call $caps (i64.const 3))        ;; and now SEND | MARK_READ
+    (i32.const 0))
+  (func (export "oxi_on_event") (param i32) (param i32) (result i32) (i32.const 0))
+)"#;
+
+#[test]
+fn a_plugin_declares_what_it_wants_exactly_once() {
+    let dir = TempDir::new("redeclares");
+    dir.plugin("shifty", &versioned(REDECLARES));
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let _plugins = host(&dir, Arc::clone(&commands), &published);
+
+    let surfaces = published.settles("the plugin to be listed", |s| !s.is_empty());
+    assert_eq!(
+        surfaces[0].gated,
+        vec!["send messages".to_string()],
+        "the second declaration is not a correction, it is a different sentence"
+    );
+}
+
+/// A plugin whose settings and buttons are its own business has nothing to
+/// consent to — and a switch over it could be turned off and would read as on
+/// again the moment it was drawn.
+#[test]
+fn a_plugin_that_only_draws_has_nothing_to_agree_to() {
+    let dir = TempDir::new("self-only");
+    dir.plugin("greeter", &draws_only());
+    let published = Published::default();
+    let _plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    let surfaces = published.settles("its interface", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+    assert!(surfaces[0].gated.is_empty(), "nothing touches the account");
+    assert!(surfaces[0].approved, "so there is no prompt to answer");
+    assert!(
+        !surfaces[0].capabilities.is_empty(),
+        "what it does is still said, as information rather than as a question"
+    );
+}
+
+/// Withdrawing has to take effect *now*, not once the plugin has worked
+/// through what it was already handed. A queued answer would leave it sending
+/// through every banked event while Settings already read "not allowed" — and
+/// the plugin that most needs its permissions taken away is exactly the one
+/// with a full queue, where a queued answer would not fit at all.
+#[test]
+fn withdrawing_stops_a_plugin_part_way_through_its_backlog() {
+    let dir = TempDir::new("revoke-mid-backlog");
+    dir.plugin("autoreply", &pong());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    // Park its thread inside the first command, then bank four more events
+    // behind it.
+    commands.close_gate();
+    for _ in 0..5 {
+        plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    plugins.approve("autoreply", false);
+    commands.open_gate();
+
+    // The one already inside the command completes; nothing behind it does.
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        commands.sent().len(),
+        1,
+        "the backlog drained with the answer already applied"
+    );
 }

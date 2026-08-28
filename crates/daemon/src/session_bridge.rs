@@ -337,11 +337,11 @@ pub async fn run(
         }
         // A plugin's own settings are this account's data too — an
         // autoreply's "already answered these people" is a list of people —
-        // and they sit in a directory beside the store rather than inside
-        // it. Nothing is writing them any more: the threads were joined
-        // above.
-        if let Some(dir) = oxidezap_ipc::state_dir()
-            && let Err(e) = std::fs::remove_dir_all(dir.join("plugins"))
+        // and they sit in their own directory beside the plugins rather than
+        // inside the store. Nothing is writing them any more: the threads
+        // were joined above.
+        if let Some(dir) = oxidezap_plugin_host::default_state_dir()
+            && let Err(e) = std::fs::remove_dir_all(&dir)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             log::error!("could not clear the plugins' stored settings: {e}");

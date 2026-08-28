@@ -10,6 +10,9 @@ repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+# A 64-bit capability mask, through portable-atomic rather than std
+# (see /clippy.toml).
+portable-atomic = { workspace = true }
 log = { workspace = true }
 oxidezap-core = { workspace = true }
 oxidezap-plugin-abi = { workspace = true, features = ["std"] }

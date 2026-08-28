@@ -33,6 +33,7 @@ mod kv;
 mod registry;
 mod runtime;
 
+use portable_atomic::AtomicI64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
@@ -54,6 +55,19 @@ use crate::runtime::Runtime;
 /// plugin a person is likely to run still fits in what the daemon can lose
 /// without noticing.
 const MEMORY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// How many table entries one plugin may declare, across all its tables.
+///
+/// A table is allocated at instantiation and holds a host-sized reference per
+/// element, so this is the second half of [`MEMORY_LIMIT`] rather than a
+/// separate policy: without it a module declaring an enormous initial table
+/// exhausts the daemon's memory before a fuel-metered instruction has run.
+/// Ten thousand is far past what an indirect-call table for a real plugin
+/// needs — `examples/autoreply` declares one entry.
+const MAX_TABLE_ELEMENTS: usize = 10_000;
+
+/// How many tables one plugin may declare. Rust and TinyGo emit one.
+const MAX_TABLES: usize = 4;
 
 /// How many events may wait for one plugin.
 ///
@@ -121,16 +135,21 @@ struct Worker {
     /// server routes actions into it while the bridge feeds it events — and
     /// there is no moment where one of them has it exclusively.
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// What the user has agreed to, read by the plugin's own thread on every
+    /// command it attempts.
+    ///
+    /// Shared and atomic rather than a job on the queue, because withdrawing
+    /// has to take effect *now*: a job queued behind a backlog would leave
+    /// the plugin sending and marking read through every event already
+    /// waiting, long after the registry had published it as unapproved — and
+    /// the plugin that most needs its permissions taken away is exactly the
+    /// one whose queue is full.
+    granted: Arc<AtomicI64>,
 }
 
 /// What arrives on a plugin's queue.
 enum Job {
     Event(Arc<Event>),
-    /// What the user has allowed this plugin to do, now that they have said.
-    ///
-    /// A job rather than a shared value, because the mask lives inside the
-    /// plugin's wasm store and only its own thread may touch that.
-    Capabilities(i64),
 }
 
 impl Plugins {
@@ -174,11 +193,20 @@ impl Plugins {
                 );
                 continue;
             };
-            let approved = registry.approved(&id);
-            match Runtime::load(&path, &id, state_dir, Arc::clone(&commands), approved) {
-                Ok(runtime) => {
-                    workers.push(start(runtime, Arc::clone(&registry), Arc::clone(&stopping)))
-                }
+            let granted = Arc::new(AtomicI64::new(registry.approved(&id)));
+            match Runtime::load(
+                &path,
+                &id,
+                state_dir,
+                Arc::clone(&commands),
+                Arc::clone(&granted),
+            ) {
+                Ok(runtime) => workers.push(start(
+                    runtime,
+                    granted,
+                    Arc::clone(&registry),
+                    Arc::clone(&stopping),
+                )),
                 // One plugin that will not load is one plugin, said plainly
                 // and once. A daemon that refused to serve an account because
                 // a file in a folder was stale would be a worse trade than
@@ -313,8 +341,11 @@ impl Plugins {
         let Some(worker) = self.workers.iter().find(|w| w.id == id) else {
             return;
         };
-        let granted = self.registry.approve(id, approved);
-        self.offer(worker, Job::Capabilities(granted));
+        // Stored before anything else observes the answer, so the very next
+        // command a draining backlog attempts is checked against it.
+        worker
+            .granted
+            .store(self.registry.approve(id, approved), Ordering::Relaxed);
     }
 
     /// Put a job on a plugin's queue, or take it out of service.
@@ -369,7 +400,12 @@ impl Worker {
 }
 
 /// Put a loaded plugin on its own thread.
-fn start(mut runtime: Runtime, registry: Arc<Registry>, stopping: Arc<AtomicBool>) -> Worker {
+fn start(
+    mut runtime: Runtime,
+    granted: Arc<AtomicI64>,
+    registry: Arc<Registry>,
+    stopping: Arc<AtomicBool>,
+) -> Worker {
     let id = runtime.id.clone();
     let subscription = runtime.subscription;
     registry.insert(&id, runtime.name.clone(), runtime.requested_caps);
@@ -381,17 +417,31 @@ fn start(mut runtime: Runtime, registry: Arc<Registry>, stopping: Arc<AtomicBool
     }
 
     let (queue, jobs) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
-    let thread = std::thread::Builder::new()
-        .name(format!("oxidezap-plugin-{id}"))
-        .spawn(move || run(&mut runtime, &jobs, &registry, &stopping))
-        .map_err(|e| log::error!("plugin {id}: cannot start its thread: {e}"))
-        .ok();
+    let thread = {
+        let registry = Arc::clone(&registry);
+        std::thread::Builder::new()
+            .name(format!("oxidezap-plugin-{id}"))
+            .spawn(move || run(&mut runtime, &jobs, &registry, &stopping))
+    };
+    let thread = match thread {
+        Ok(thread) => Some(thread),
+        // The entry and its interface are already published, so a plugin left
+        // merely un-spawned would sit in Settings drawing live controls that
+        // silently do nothing. Stopping it is what makes those widgets inert
+        // and puts the reason beside them.
+        Err(e) => {
+            log::error!("plugin {id}: cannot start its thread: {e}");
+            registry.stop(&id, format!("its thread could not be started: {e}"));
+            None
+        }
+    };
 
     Worker {
         id,
         subscription,
         queue: Mutex::new(Some(queue)),
         thread: Mutex::new(thread),
+        granted,
     }
 }
 
@@ -423,15 +473,7 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
             break;
         }
 
-        let event = match job {
-            Job::Event(event) => event,
-            // Not an event: what the user just allowed, applied to the store
-            // only its own thread may touch.
-            Job::Capabilities(granted) => {
-                runtime.set_capabilities(granted);
-                continue;
-            }
-        };
+        let Job::Event(event) = job;
 
         // What is already armed, so `MAX_TIMERS` bounds what this plugin
         // *holds* rather than what it asked for in one call. Counting per
@@ -548,6 +590,22 @@ pub fn default_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(dir));
     }
     data_dir().map(|d| d.join("oxidezap").join("plugins"))
+}
+
+/// Where a plugin's own settings and the user's permission answers live.
+///
+/// Beside the plugins themselves rather than in the daemon's `state_dir`,
+/// which on Linux prefers `XDG_RUNTIME_DIR` — a directory documented as
+/// cleared on logout. A socket belongs there; a permission answer recorded so
+/// it survives a restart, and a plugin's settings defined to outlive the
+/// daemon, do not: both would silently disappear on the next login and every
+/// prompt would be asked again.
+///
+/// A sibling of the plugin directory and never inside it: what a plugin may
+/// do is not a file a user drops in a folder.
+#[must_use]
+pub fn default_state_dir() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("oxidezap").join("plugin-state"))
 }
 
 fn data_dir() -> Option<PathBuf> {

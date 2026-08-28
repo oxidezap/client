@@ -6,6 +6,7 @@
 //! blocking synchronous call, so putting one on a runtime worker would stall
 //! the accept loop for as long as the plugin ran.
 
+use portable_atomic::AtomicI64;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use wasmi::{Config, Engine, Instance, Linker, Module, Store, StoreLimitsBuilder,
 use crate::event::Event;
 use crate::guest::{Guest, Phase};
 use crate::kv::Kv;
-use crate::{Commands, MEMORY_LIMIT};
+use crate::{Commands, MAX_TABLE_ELEMENTS, MAX_TABLES, MEMORY_LIMIT};
 
 /// How much work one `oxi_on_event` may do.
 ///
@@ -72,7 +73,7 @@ impl Runtime {
         // before it runs a single instruction — so whatever it declares
         // during `oxi_init`, what it *holds* there is already bounded by the
         // answer.
-        approved: i64,
+        approved: Arc<AtomicI64>,
     ) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
 
@@ -94,16 +95,28 @@ impl Runtime {
                 id: id.to_owned(),
                 limits: StoreLimitsBuilder::new()
                     .memory_size(MEMORY_LIMIT)
+                    // A linear memory is not the only thing a module can ask
+                    // the host to allocate up front. A declared table is
+                    // allocated at instantiation — before a single
+                    // fuel-metered instruction runs — so a module declaring
+                    // an enormous initial table, or a great many tables,
+                    // would exhaust the daemon's memory with the byte cap
+                    // untouched. These are what make MEMORY_LIMIT a bound on
+                    // the plugin rather than on one of its allocations.
+                    .table_elements(MAX_TABLE_ELEMENTS)
+                    .tables(MAX_TABLES)
+                    .memories(1)
+                    .instances(1)
                     // Refuse rather than answer a failed grow: a plugin that
                     // reads `memory.grow`'s -1 and carries on is a plugin
                     // running with a broken allocator, which fails later and
                     // somewhere less obvious.
                     .trap_on_grow_failure(true)
                     .build(),
-                phase: Phase::Init,
+                phase: Phase::Loading,
                 subscription: 0,
                 requested: 0,
-                caps: 0,
+                declared: false,
                 approved,
                 name: None,
                 event: None,
@@ -137,6 +150,13 @@ impl Runtime {
             .get_typed_func::<(i32, i32), i32>(&store, abi::exports::ON_EVENT)
             .map_err(|e| anyhow!("it exports no usable `{}`: {e}", abi::exports::ON_EVENT))?;
 
+        // Only now: the module is instantiated, its version answered, and the
+        // exports the host needs are all there. Everything that ran before
+        // this line — a start section, `oxi_abi_version` itself — ran with
+        // every import refusing, so a module the loader was about to turn
+        // away could not have sent a message on the way out.
+        store.data_mut().phase = Phase::Init;
+
         let answer = init
             .call(&mut store, ())
             .map_err(|e| anyhow!("its `{}` failed: {e}", abi::exports::INIT))?;
@@ -164,17 +184,6 @@ impl Runtime {
             store,
             on_event,
         })
-    }
-
-    /// Apply the user's answer.
-    ///
-    /// Only this thread may touch the store, which is why this is reached
-    /// through the plugin's own queue rather than written from wherever the
-    /// answer arrived.
-    pub fn set_capabilities(&mut self, approved: i64) {
-        let guest = self.store.data_mut();
-        guest.approved = approved;
-        guest.caps = crate::approvals::effective(guest.requested, approved);
     }
 
     /// The timers armed during `oxi_init`, if any.

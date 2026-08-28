@@ -42,6 +42,15 @@ pub struct Registry {
     /// so, and because the answer outlives any one plugin thread.
     approvals: Approvals,
     sink: Sink,
+    /// Held across taking a snapshot *and* handing it to the sink.
+    ///
+    /// Every plugin runs on its own thread, so without this two of them can
+    /// each snapshot, and the one that snapshotted first can publish last —
+    /// leaving the hub holding a set that is missing the other's change until
+    /// something unrelated publishes again. The entries lock cannot do it: it
+    /// has to be released before the sink is called, or a sink that reads
+    /// back through the registry would deadlock.
+    publishing: Mutex<()>,
 }
 
 impl Registry {
@@ -51,6 +60,7 @@ impl Registry {
             entries: Mutex::new(BTreeMap::new()),
             approvals,
             sink,
+            publishing: Mutex::new(()),
         }
     }
 
@@ -150,6 +160,7 @@ impl Registry {
                 id: id.clone(),
                 name: entry.name.clone(),
                 capabilities: describe(entry.requested),
+                gated: describe(entry.requested & abi::caps::NEEDS_APPROVAL),
                 approved: self.approvals.is_approved(id, entry.requested),
                 roots: entry.roots.clone(),
                 stopped: entry.stopped.clone(),
@@ -158,6 +169,10 @@ impl Registry {
     }
 
     fn publish(&self) {
+        let _order = self
+            .publishing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let surfaces = self.surfaces();
         (self.sink)(surfaces);
     }

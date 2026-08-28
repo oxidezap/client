@@ -105,31 +105,44 @@ impl Approvals {
     }
 
     /// Record the user's answer, and return the mask to hand the plugin.
+    ///
+    /// The lock is held across the change *and* the write, so what reaches
+    /// the file is what was decided last. Releasing it in between let two
+    /// clients' answers land out of order — an older grant finishing after a
+    /// newer revocation would leave the running daemon revoked and the file
+    /// saying the opposite, so the next start handed the capability back.
     pub fn set(&self, id: &str, requested: i64, approved: bool) -> i64 {
         let agreed = requested & abi::caps::NEEDS_APPROVAL;
-        {
-            let mut granted = self.lock();
-            if approved {
-                granted.insert(id.to_owned(), agreed);
-            } else {
-                granted.remove(id);
-            }
+        let mut granted = self.lock();
+        if approved {
+            granted.insert(id.to_owned(), agreed);
+        } else {
+            granted.remove(id);
         }
-        self.flush();
-        self.approved(id)
+        self.flush(&granted);
+        granted.get(id).copied().unwrap_or(0)
     }
 
     /// Write the whole map out, atomically — through a temporary file and a
     /// rename, so a daemon killed mid-write leaves the previous answers
     /// rather than a truncated file that reads as "nothing was allowed".
-    fn flush(&self) {
+    ///
+    /// Takes the guard rather than re-locking: the caller's mutation and this
+    /// write are one step, and the temporary name carries the process and
+    /// thread so a second daemon writing the same directory cannot land in
+    /// the middle of this one's rename.
+    fn flush(&self, granted: &BTreeMap<String, i64>) {
         if self.path.as_os_str().is_empty() {
             return;
         }
-        let Ok(json) = serde_json::to_vec(&*self.lock()) else {
+        let Ok(json) = serde_json::to_vec(granted) else {
             return;
         };
-        let temp = self.path.with_extension("json.tmp");
+        let temp = self.path.with_extension(format!(
+            "json.{}.{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         if let Err(e) =
             std::fs::write(&temp, &json).and_then(|()| std::fs::rename(&temp, &self.path))
         {

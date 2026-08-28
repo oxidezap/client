@@ -25,6 +25,14 @@ const ID_ON: &str = "enabled";
 const ID_KEYWORD: &str = "keyword";
 const ID_REPLY: &str = "reply";
 
+/// How much room every read of a setting makes.
+///
+/// One number for the reads and the write both, because two would mean a
+/// keyword stored whole and matched on its first 64 bytes — answering text
+/// nobody configured, and redrawing the truncated half into the field as
+/// though that were the setting.
+const SETTING: usize = 256;
+
 const DEFAULT_KEYWORD: &str = "ping";
 const DEFAULT_REPLY: &str = "pong";
 
@@ -66,7 +74,7 @@ fn handle_message(ev: &Event) {
     }
 
     let text = ev.text::<512>(abi::fields::TEXT);
-    let keyword = setting::<64>(KEYWORD, DEFAULT_KEYWORD);
+    let keyword = setting::<SETTING>(KEYWORD, DEFAULT_KEYWORD);
     if !contains_ignoring_case(text.as_str(), keyword.as_str()) {
         return;
     }
@@ -79,7 +87,7 @@ fn handle_message(ev: &Event) {
         return;
     }
     let message_id = ev.text::<128>(abi::fields::MESSAGE_ID);
-    let reply = setting::<256>(REPLY, DEFAULT_REPLY);
+    let reply = setting::<SETTING>(REPLY, DEFAULT_REPLY);
 
     // As a reply rather than a fresh message: an automatic answer that does
     // not say what it is answering is indistinguishable from a person
@@ -89,7 +97,7 @@ fn handle_message(ev: &Event) {
 
 fn handle_action(ev: &Event) {
     let id = ev.text::<32>(abi::fields::ACTION_ID);
-    let value = ev.text::<256>(abi::fields::ACTION_VALUE);
+    let value = ev.text::<SETTING>(abi::fields::ACTION_VALUE);
 
     // A value that did not fit is *not* a shorter value: storing it would
     // silently drop the end of somebody's keyword and then match on a word
@@ -123,8 +131,8 @@ fn handle_action(ev: &Event) {
 /// change costs a comparison rather than a frame.
 fn draw() {
     let enabled = enabled();
-    let keyword = setting::<64>(KEYWORD, DEFAULT_KEYWORD);
-    let reply = setting::<256>(REPLY, DEFAULT_REPLY);
+    let keyword = setting::<SETTING>(KEYWORD, DEFAULT_KEYWORD);
+    let reply = setting::<SETTING>(REPLY, DEFAULT_REPLY);
 
     let mut buf = [0u8; 1024];
     let mut w = abi::ui::Writer::new(&mut buf);

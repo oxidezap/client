@@ -26,7 +26,10 @@ pub fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
         log::debug!("no per-user data directory, so no plugins");
         return Arc::new(Plugins::none(sink));
     };
-    let state_dir = oxidezap_ipc::state_dir().map(|d| d.join("plugins"));
+    // Not the daemon's `state_dir`: that one prefers XDG_RUNTIME_DIR, which
+    // is cleared on logout, and a permission answer that does not survive a
+    // logout is a prompt asked forever.
+    let state_dir = oxidezap_plugin_host::default_state_dir();
     Arc::new(Plugins::load(
         &dir,
         state_dir.as_deref(),

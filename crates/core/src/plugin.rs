@@ -108,13 +108,26 @@ pub struct PluginSurface {
     /// do". A user consents to the sentence, not to the bit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
-    /// Whether the user has agreed to [`capabilities`](Self::capabilities).
+    /// The subset of [`capabilities`](Self::capabilities) that acts on the
+    /// *account* and so has to be agreed to.
     ///
-    /// Until they have, every command this plugin issues is refused — asking
-    /// is not being allowed, and copying a file into a folder is not consent.
-    /// A plugin that asked for nothing is approved by definition: there is no
-    /// sentence to agree to, and a prompt with nothing in it only teaches
-    /// people to dismiss prompts.
+    /// Separate because they are two different sentences to a user. Drawing,
+    /// keeping its own settings and running its own timer take effect on
+    /// declaration — a plugin that could not publish its settings panel
+    /// before being allowed would leave somebody agreeing to a name with
+    /// nothing to look at — so a plugin that wants only those has nothing to
+    /// consent to, and a consent control over it would be one that cannot be
+    /// switched off. Which half is which belongs to the ABI, for the same
+    /// reason the wording does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gated: Vec<String>,
+    /// Whether the user has agreed to [`gated`](Self::gated).
+    ///
+    /// Until they have, every gated command this plugin issues is refused —
+    /// asking is not being allowed, and copying a file into a folder is not
+    /// consent. A plugin whose `gated` list is empty is approved by
+    /// definition: there is no sentence to agree to, and a prompt with
+    /// nothing in it only teaches people to dismiss prompts.
     ///
     /// Not skipped when false, unlike most of this frame. A front end has to
     /// tell "this plugin is waiting on you" from "an older daemon does not

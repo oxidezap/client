@@ -122,7 +122,11 @@ profile here repeats it deliberately.
   isolation a process boundary would have been for — what wasm does *not*
   supply is a bound on time and on memory, which is why fuel metering and the
   resource limiter are not optional: a plugin that loops forever runs out and
-  traps, and the daemon loses a plugin rather than a thread. A `Store` is not
+  traps, and the daemon loses a plugin rather than a thread. The limiter
+  bounds tables and instance counts and not only the linear memory's bytes,
+  because a declared table is allocated at instantiation — before a
+  fuel-metered instruction has run — so a byte cap alone is a bound on one
+  allocation rather than on the plugin. A `Store` is not
   shareable and a wasm call is synchronous and blocking, so each plugin gets
   an OS thread of its own rather than a runtime task, which would stall the
   accept loop for as long as it ran. wasmi and not wasmtime: no JIT, so
@@ -145,18 +149,34 @@ profile here repeats it deliberately.
   answered: a plugin that comes back wanting more is not partly approved, it
   is unapproved again, because the sentence agreed to is no longer the
   sentence being asked. The mask is read before the plugin runs a single
-  instruction and applied *inside* `oxi_request_caps`, because `oxi_init` is
-  code the plugin chose too and granting for the length of one call is
-  granting. What a plugin does only to itself — draw, keep its own settings,
+  instruction and every check reads it live, because `oxi_init` is code the
+  plugin chose too and granting for the length of one call is granting — and
+  because withdrawing has to bite *now*: an answer queued behind a backlog
+  would let a plugin send through five hundred banked events while Settings
+  already read "not allowed", and the plugin that most needs stopping is the
+  one whose queue is full. Declaring is a single act, once, for the same
+  reason: a plugin that declares the narrow mask it was approved for, sends,
+  and *then* widens has already sent, and the wider surface reading as
+  unapproved afterwards is no use to the message. Nor does any of it start at
+  instantiation — a start section and `oxi_abi_version` are code the loader
+  has not accepted yet, so every import refuses until the module is
+  instantiated, its version answered and its exports found. Otherwise a
+  module the loader was about to turn away could send a message on its way
+  out. What a plugin does only to itself — draw, keep its own settings,
   run its own timer — takes effect on declaration, and has to: a plugin that
   could not publish its settings panel before being allowed would leave the
   user agreeing to a name and a list of phrases with nothing to look at. The
   answer travels as `ClientRequest::PluginApproval` rather than a reserved
   widget id, because an id comes from the plugin's own tree — one could
   publish a button labelled "OK" carrying that id and be granted by somebody
-  pressing the wrong thing. And the file lives beside the daemon's state,
-  never in the plugin's own key-value store: a plugin that can write its own
-  approval has none.
+  pressing the wrong thing. And a front end draws that switch only where there
+  is something to withhold: over a plugin that wants nothing but to draw, it
+  could be turned off and would read as on again, which is why
+  `PluginSurface` carries `gated` beside `capabilities` — two sentences, one
+  of them a question. And the file lives beside the plugins in a *persistent*
+  directory, never in the plugin's own key-value store and never in the
+  daemon's `state_dir`: a plugin that can write its own approval has none,
+  and an answer under `XDG_RUNTIME_DIR` is one the next login throws away.
 - **An event is a handle, not a payload.** Nothing is serialized for a plugin:
   it reads fields through four host functions against a table of constants, so
   a handler that looks at the text and the chat pays for two strings out of an

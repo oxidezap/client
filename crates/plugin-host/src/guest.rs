@@ -12,6 +12,7 @@
 //! the capabilities the plugin declared at init, so what a user was shown
 //! before enabling it is what it can actually do.
 
+use portable_atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use oxidezap_core::{PluginNode, PluginRoot, PluginSlot, PluginWidget};
@@ -46,6 +47,14 @@ const MIN_TIMER_MS: i64 = 100;
 /// thing the declaration exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// Instantiating, running the module's start section, and reading back
+    /// `oxi_abi_version`. Every import refuses here — declarations *and*
+    /// commands — because none of it is code the loader has accepted yet: a
+    /// module with a start section, or a side-effecting version export, would
+    /// otherwise act on the account before the host had established it can
+    /// even understand its calls, and a module the loader goes on to refuse
+    /// would have acted anyway.
+    Loading,
     Init,
     Running,
 }
@@ -59,14 +68,22 @@ pub struct Guest {
     pub subscription: i64,
     /// What the plugin asked for, whether or not it holds it.
     pub requested: i64,
-    /// What it actually holds — the request, minus anything gated that the
-    /// user has not agreed to. Computed when the request arrives rather than
-    /// after `oxi_init` returns: init is code the plugin chose too, and
-    /// granting for the length of one call is granting.
-    pub caps: i64,
-    /// The raw mask the user agreed to, as read from disk before this plugin
-    /// ran a single instruction.
-    pub approved: i64,
+    /// Whether the one capability declaration has already been made.
+    ///
+    /// Exactly one, because the all-or-nothing rule is about a *sentence*: a
+    /// plugin that declares the narrow mask it was approved for, acts on the
+    /// account, and then declares a wider one has already acted — the wider
+    /// surface correctly reads as unapproved afterwards, which is no use to
+    /// the message that has been sent.
+    pub declared: bool,
+    /// The raw mask the user agreed to.
+    ///
+    /// Shared and atomic rather than a plain field, because withdrawing has
+    /// to take effect *now*. A plugin with a backlog would otherwise keep the
+    /// old permissions for every event already queued — sending and marking
+    /// read through all of them while the registry had already published it
+    /// as unapproved.
+    pub approved: Arc<AtomicI64>,
     pub name: Option<String>,
     /// The event being handled, reachable through handle 0. `None` outside a
     /// call, which is what makes a stale handle read as absent rather than as
@@ -90,9 +107,18 @@ pub struct Guest {
 }
 
 impl Guest {
-    /// Whether this plugin declared `cap`.
+    /// What this plugin actually holds: what it asked for, minus anything
+    /// gated the user has not agreed to.
+    ///
+    /// Read on every check rather than cached, so an answer given while a
+    /// backlog is draining applies to the very next command.
+    fn caps(&self) -> i64 {
+        crate::approvals::effective(self.requested, self.approved.load(Ordering::Relaxed))
+    }
+
+    /// Whether this plugin may do `cap` right now.
     fn allows(&self, cap: i64) -> bool {
-        self.caps & cap != 0
+        self.phase != Phase::Loading && self.caps() & cap != 0
     }
 
     /// The value behind the event handle.
@@ -145,14 +171,16 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 return;
             }
             let guest = c.data_mut();
+            // One declaration only. A second is not a correction, it is a
+            // different sentence — and by then the first has already been
+            // acted on.
+            if guest.declared {
+                return;
+            }
+            guest.declared = true;
             // Masked to what exists, for the same reason, and because a bit
             // the host cannot name is one it could not have shown the user.
             guest.requested = mask & abi::caps::ALL;
-            // Asking is not being allowed. What it *holds* is decided here,
-            // inside the call that asked, so there is no window — not even
-            // the length of `oxi_init` — in which a plugin has what it merely
-            // declared.
-            guest.caps = crate::approvals::effective(guest.requested, guest.approved);
         },
     )?;
 

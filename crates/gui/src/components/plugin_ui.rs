@@ -65,12 +65,14 @@ fn widget(
     let metrics = ctx.metrics;
     // A plugin that has stopped keeps its widgets on screen and loses the
     // ability to act: a control that vanished tells nobody anything, while
-    // one drawn inert beside a reason says what happened. The same goes for
-    // one still waiting to be allowed — its buttons would be refused at the
-    // host, and drawing them live would be an invitation to press something
-    // that does nothing. This is also why the plugin's own flag is `&&`ed
-    // rather than replaced: a widget it disabled stays disabled.
-    let live = surface.is_running() && surface.approved && node.enabled;
+    // one drawn inert beside a reason says what happened. Approval is *not*
+    // part of this: drawing and keeping its own settings take effect on
+    // declaration, so the panel where somebody reads what a plugin does and
+    // configures it has to work before they decide whether it may touch the
+    // account — which the host goes on refusing either way. This is also why
+    // the plugin's own flag is `&&`ed rather than replaced: a widget it
+    // disabled stays disabled.
+    let live = surface.is_running() && node.enabled;
 
     match node.widget {
         PluginWidget::Button => {
@@ -245,21 +247,43 @@ pub fn settings_entry(
 ) -> impl IntoElement + use<> {
     let metrics = ctx.metrics;
     let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
-    let wants = surface.capabilities.join(", ");
-    let permissions = if surface.capabilities.is_empty() {
+    let permissions = if surface.gated.is_empty() {
         "Watches only. It cannot act on your account.".to_string()
     } else if surface.approved {
-        format!("Allowed to: {wants}")
+        format!("Allowed to: {}", surface.gated.join(", "))
     } else {
         // The sentence, before anything is granted rather than after. A
         // plugin that has not been allowed is running and refused: it can
-        // watch, and every command it issues comes back denied.
-        format!("Wants to: {wants}")
+        // watch, and every gated command it issues comes back denied.
+        format!("Wants to: {}", surface.gated.join(", "))
     };
+    // What it does only to itself, said plainly and never as a question. It
+    // holds these by declaring them, so offering a switch over them would be
+    // offering a choice that does not exist — but leaving them unsaid would
+    // hide half of what a downloaded file is doing.
+    let own: Vec<&String> = surface
+        .capabilities
+        .iter()
+        .filter(|c| !surface.gated.contains(c))
+        .collect();
+    let own = (!own.is_empty()).then(|| {
+        format!(
+            "Also: {}",
+            own.iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    });
     // Drawn by this window and not by the plugin, which is the whole point:
     // a widget id comes from the plugin's own tree, so a control it could
     // publish is a control it could disguise.
-    let approval = (!surface.capabilities.is_empty()).then(|| {
+    //
+    // Only where there is something to withhold. A plugin wanting nothing but
+    // to draw and keep its own settings holds those by declaring them, so a
+    // switch over it could be turned off and would immediately read as on
+    // again — a control that lies about what it does.
+    let approval = (!surface.gated.is_empty()).then(|| {
         let id = surface.id.clone();
         let entity = ctx.entity.clone();
         let approved = surface.approved;
@@ -322,6 +346,12 @@ pub fn settings_entry(
                         .text_color(subtle)
                         .child(permissions),
                 )
+                .children(own.map(|own| {
+                    div()
+                        .text_size(metrics.text_small())
+                        .text_color(subtle)
+                        .child(own)
+                }))
                 // Why it stopped, where the widgets it left behind are. A
                 // plugin that simply disappeared would give nobody anything
                 // to act on.

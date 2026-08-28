@@ -14,9 +14,13 @@ use std::path::PathBuf;
 /// malformed, so an upgraded window would draw a plugin's button that could
 /// never do anything; a v18 client ignores the surfaces and simply draws
 /// none, which is why the snapshot field is skipped when empty rather than
-/// versioned separately. `approved` is the one field in a surface that is
-/// *not* skipped when false: a front end has to tell "waiting on you" from
-/// "this daemon does not know about approval".
+/// versioned separately. `capabilities` is everything it asked for and
+/// `gated` the half that acts on the account, because those are two different
+/// sentences: drawing and keeping its own settings take effect on
+/// declaration, so a consent control over them would be one that cannot be
+/// switched off. `approved` is the one field in a surface that is *not*
+/// skipped when false: a front end has to tell "waiting on you" from "this
+/// daemon does not know about approval".
 ///
 /// 18: video calls. `DaemonMessage::CallVideo` carries a call's encoded
 /// frames in both directions, `DaemonMessage::CallVideoGap` says some were

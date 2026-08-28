@@ -6047,6 +6047,7 @@ dependencies = [
  "log",
  "oxidezap-core",
  "oxidezap-plugin-abi",
+ "portable-atomic",
  "serde_json",
  "wacore",
  "wasmi",
