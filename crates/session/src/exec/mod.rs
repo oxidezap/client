@@ -24,7 +24,17 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
-pub use platform::{Executor, Task, let_go, spawn, unblock};
+/// Where the session waits.
+///
+/// [`sleep`] and [`with_timeout`] are here rather than reached for from
+/// `tokio::time`, which is where a timeout would ordinarily come from and
+/// which does not work on a page: tokio's clock is `std::time::Instant::now`
+/// with no platform under it, so the first `sleep` or `timeout` on
+/// `wasm32-unknown-unknown` traps with "time not implemented on this
+/// platform". That the crate *compiles* for the target says nothing about the
+/// timer running on it — a distinction only running the page can make, and it
+/// made it.
+pub use platform::{Executor, Task, let_go, sleep, spawn, unblock, with_timeout};
 
 /// [`Send`], where the platform's executor asks for it.
 ///

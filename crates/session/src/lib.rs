@@ -12,7 +12,7 @@ mod store;
 mod video;
 mod whatsapp;
 
-pub use exec::{Cancelled, Task, spawn, unblock};
+pub use exec::{Cancelled, Task, sleep, spawn, unblock, with_timeout};
 pub use whatsapp::{
     ReadBoundary, WhatsAppClient, prepare_store, resolve_database_path, wipe_local_state,
 };

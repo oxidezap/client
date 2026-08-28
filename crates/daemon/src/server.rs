@@ -127,7 +127,7 @@ pub async fn run(
                 // Without this, an EMFILE that persists spins the loop at
                 // full speed; the descriptors it is waiting on are freed by
                 // other tasks, which need to be scheduled.
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                oxidezap_session::sleep(std::time::Duration::from_millis(50)).await;
                 continue;
             }
             Err(e) => return Err(e).context("accepting a client"),
@@ -446,17 +446,17 @@ where
     // a task and a descriptor and given nothing back. A peer that connects
     // and says nothing would otherwise sit here for as long as it liked, and
     // a reconnect loop doing it would take the listener down with it.
-    let attached = match tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
+    let attached = match oxidezap_session::with_timeout(
         handshake(&mut reader, &mut writer, &mut buf),
+        HANDSHAKE_TIMEOUT,
     )
     .await
     {
-        Ok(result) => match result? {
+        Some(result) => match result? {
             Some(attached) => attached,
             None => return Ok(()),
         },
-        Err(_) => {
+        None => {
             log::debug!("client never completed its handshake within {HANDSHAKE_TIMEOUT:?}");
             let frame = malformed("no hello within the handshake window")?;
             // Best effort: a peer that never spoke may not be reading either.

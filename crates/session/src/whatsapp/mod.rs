@@ -481,7 +481,12 @@ impl WhatsAppClient {
         let backend = match SqliteStore::new(&db_path).await {
             Ok(store) => store,
             Err(e) => {
-                error!("Failed to create SQLite backend: {}", e);
+                // With the chain, not just the head. `StoreError`'s own
+                // Display is a category ("database connection error") and
+                // what went wrong is always in its source — which on a page
+                // is the only thing there is to go on, since there is no
+                // database file anybody can open afterwards and look at.
+                error!("Failed to create SQLite backend: {}", because(&e));
                 let _ = ui_tx.send(UiEvent::Error(format!("Database error: {}", e)));
                 return;
             }
@@ -489,7 +494,7 @@ impl WhatsAppClient {
         let chat_store = match ChatStore::new(&backend).await {
             Ok(store) => store,
             Err(e) => {
-                error!("Failed to open chat store: {}", e);
+                error!("Failed to open chat store: {}", because(&e));
                 let _ = ui_tx.send(UiEvent::Error(format!("Database error: {}", e)));
                 return;
             }
@@ -2088,17 +2093,17 @@ impl WhatsAppClient {
                 // the asker waits out the whole sync.
                 while !asked {
                     tokio::select! {
-                        change = tokio::time::timeout(Self::RELOAD_DEBOUNCE, changes.recv()) => {
+                        change = crate::exec::with_timeout(changes.recv(), Self::RELOAD_DEBOUNCE) => {
                             match change {
-                                Ok(Ok(change)) => scope.widen(Some(&change)),
-                                Ok(Err(RecvError::Lagged(_))) => scope.widen(None),
-                                Ok(Err(RecvError::Closed)) => {
+                                Some(Ok(change)) => scope.widen(Some(&change)),
+                                Some(Err(RecvError::Lagged(_))) => scope.widen(None),
+                                Some(Err(RecvError::Closed)) => {
                                     // Reload once more: these changes were committed.
                                     open = false;
                                     break;
                                 }
                                 // The quiet window: flush what has piled up.
-                                Err(_) => break,
+                                None => break,
                             }
                         }
                         () = reload.notified() => {
@@ -3070,6 +3075,22 @@ impl Drop for WhatsAppClient {
     }
 }
 
+/// An error and everything under it, on one line.
+///
+/// The store's errors are categories with the cause hung off `source`, and a
+/// browser has no database file to open afterwards and inspect — so a report
+/// that stops at the category is a report nobody can act on.
+fn because(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        use std::fmt::Write as _;
+        let _ = write!(text, ": {cause}");
+        source = cause.source();
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -3644,3 +3665,4 @@ mod tests {
         assert_eq!(plain.jid, "5599000000001@s.whatsapp.net");
     }
 }
+

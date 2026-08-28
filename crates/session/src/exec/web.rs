@@ -112,7 +112,7 @@ impl Executor {
 /// Resolves immediately where no timer can be armed — a worker with no
 /// `window` — rather than never, because a future that never completes holds
 /// whatever is awaiting it for the life of the page.
-pub(crate) async fn sleep(duration: Duration) {
+pub async fn sleep(duration: Duration) {
     /// Disarms the timer when the sleep is dropped.
     ///
     /// A `setTimeout` left armed fires into a `Closure` that has already been
@@ -234,4 +234,19 @@ impl<T> Future for Task<T> {
 /// with a signature that matches.
 pub async fn let_go<T: MaybeSend + 'static>(value: T) {
     drop(value);
+}
+
+/// Whichever finishes first: the work, or the wait. `None` when the wait won.
+///
+/// Raced rather than driven by a timer wheel, because the timer here is the
+/// browser's own `setTimeout` and there is no wheel to put it in.
+pub async fn with_timeout<T>(
+    work: impl Future<Output = T>,
+    limit: std::time::Duration,
+) -> Option<T> {
+    futures_lite::future::or(async { Some(work.await) }, async {
+        sleep(limit).await;
+        None
+    })
+    .await
 }

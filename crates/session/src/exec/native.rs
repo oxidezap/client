@@ -173,3 +173,20 @@ impl<T> Future for Task<T> {
 pub async fn let_go<T: MaybeSend + 'static>(value: T) {
     let _ = unblock(move || drop(value)).await;
 }
+
+/// Wait, on the runtime that is already here.
+///
+/// The web half is `setTimeout`; this one is the timer wheel a Tokio runtime
+/// already carries. Both exist so that nothing above [`super`] reaches for
+/// `tokio::time` directly — that reaches a clock a browser does not have.
+pub async fn sleep(duration: std::time::Duration) {
+    tokio::time::sleep(duration).await;
+}
+
+/// Whichever finishes first: the work, or the wait. `None` when the wait won.
+pub async fn with_timeout<T>(
+    work: impl Future<Output = T>,
+    limit: std::time::Duration,
+) -> Option<T> {
+    tokio::time::timeout(limit, work).await.ok()
+}
