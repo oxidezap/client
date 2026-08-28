@@ -1326,7 +1326,20 @@ impl WhatsAppApp {
         // is missing whatever has not been laid out yet. Asked from here at
         // all because this is the frame's one pass over the timeline and it
         // already holds the list.
-        if self.timeline_nearing_start() {
+        //
+        // And only of a list that is already this conversation's. There is
+        // one of them for whichever chat is on screen, so on the frame a
+        // reader opens a new one it still holds the geometry of the one they
+        // left — and a chat left near its top would have every chat opened
+        // after it ask for a page of history nobody had scrolled to, on the
+        // frame it opened. The anchor is what the list describes; until it
+        // names this chat there is nothing here to ask about.
+        if self
+            .timeline_anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.jid == chat_jid)
+            && self.timeline_nearing_start()
+        {
             self.want_older_messages(chat_jid);
         }
 
@@ -1403,12 +1416,22 @@ impl WhatsAppApp {
                 // another: history unrolled under them for as long as the
                 // store had any. The row after the stretch is the one they
                 // were actually looking at, and it is where they belong.
+                //
+                // Only while there *is* one. A frame that carries a page and
+                // a change to the last row — someone starting to type, an
+                // arrival — has nothing in common at the end, so the stretch
+                // runs to the foot of the list and `at + added` is the row
+                // past it: the correction would land the reader at the newest
+                // message, which is further from where they were than gpui's
+                // own answer. Nothing here can say where they went, so
+                // nothing here overrides it.
                 let scrolled_to = self.message_list.logical_scroll_top();
-                let swallowed = (at..at + removed).contains(&scrolled_to.item_ix);
+                let survivor = (at + added < count).then_some(at + added);
+                let anchor = survivor.filter(|_| (at..at + removed).contains(&scrolled_to.item_ix));
                 self.message_list.splice(at..at + removed, added);
-                if swallowed {
+                if let Some(item_ix) = anchor {
                     self.message_list.scroll_to(gpui::ListOffset {
-                        item_ix: at + added,
+                        item_ix,
                         offset_in_item: gpui::px(0.),
                     });
                 }

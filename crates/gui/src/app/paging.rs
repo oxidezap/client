@@ -529,6 +529,41 @@ mod tests {
         assert!(nearing_end(0, 0), "an empty list is at its end");
     }
 
+    /// The two answers the predicate above is built on, read off a real list
+    /// state rather than off `gpui`'s documentation.
+    ///
+    /// A `Bottom` list has no scroll position until somebody scrolls it, and
+    /// says so by naming the row *past* the last one — which is the whole
+    /// reason the predicate cannot read the index alone. The second half is
+    /// the same fact in pixels: nothing to scroll, so no offset to scroll to.
+    /// Both are `gpui`'s behaviour rather than ours, which is exactly why
+    /// they are worth pinning here: a list that began answering `0` for the
+    /// first would turn this into a predicate that asks for history on every
+    /// frame, and neither end of that is visible from our own code.
+    #[test]
+    fn an_unscrolled_timeline_names_the_row_past_its_last() {
+        let state = crate::components::new_timeline_state(12);
+
+        assert_eq!(
+            state.logical_scroll_top().item_ix,
+            state.item_count(),
+            "pinned to the end reads as the row after the last one"
+        );
+        assert_eq!(
+            state.max_offset_for_scrollbar().y,
+            gpui::px(0.),
+            "and a list with nowhere to scroll offers no offset to scroll to"
+        );
+        assert!(
+            timeline_nearing_start(
+                state.logical_scroll_top().item_ix,
+                state.item_count(),
+                state.max_offset_for_scrollbar().y > gpui::px(0.),
+            ),
+            "which together is a conversation showing its whole head, and asking"
+        );
+    }
+
     #[test]
     fn a_timeline_that_cannot_scroll_is_at_its_start() {
         // What a bottom-anchored list reports while nobody has scrolled it:
