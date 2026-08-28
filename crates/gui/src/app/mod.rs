@@ -1320,6 +1320,29 @@ impl WhatsAppApp {
             built
         });
 
+        // Asked before the rows are handed over, because the question is
+        // about the frame that was drawn: a splice replaces measurements with
+        // unmeasured rows, and a list asked in between reports a height that
+        // is missing whatever has not been laid out yet. Asked from here at
+        // all because this is the frame's one pass over the timeline and it
+        // already holds the list.
+        //
+        // And only of a list that is already this conversation's. There is
+        // one of them for whichever chat is on screen, so on the frame a
+        // reader opens a new one it still holds the geometry of the one they
+        // left — and a chat left near its top would have every chat opened
+        // after it ask for a page of history nobody had scrolled to, on the
+        // frame it opened. The anchor is what the list describes; until it
+        // names this chat there is nothing here to ask about.
+        if self
+            .timeline_anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.jid == chat_jid)
+            && self.timeline_nearing_start()
+        {
+            self.want_older_messages(chat_jid);
+        }
+
         self.sync_timeline(
             chat_jid,
             &rows,
@@ -1328,15 +1351,22 @@ impl WhatsAppApp {
                 width: layout.message_list_width(),
             },
         );
-        // Asked from here rather than from a row's own render, because this is
-        // the frame's one pass over the timeline and it already holds the
-        // list. A conversation shorter than its viewport reports the top row
-        // as visible and so asks straight away, which is right: there is more
-        // behind it and nowhere to scroll to say so.
-        if paging::nearing_start(self.message_list.logical_scroll_top().item_ix) {
-            self.want_older_messages(chat_jid);
-        }
         rows
+    }
+
+    /// Whether the reader is close enough to the head of the timeline to want
+    /// the page before it.
+    ///
+    /// The decision is [`paging::timeline_nearing_start`]; this is where the
+    /// list is asked the three things it needs. "Can it scroll" is the one
+    /// `gpui` has no plainer name for: the largest offset the list will accept
+    /// is zero exactly when its rows fit inside it.
+    fn timeline_nearing_start(&self) -> bool {
+        paging::timeline_nearing_start(
+            self.message_list.logical_scroll_top().item_ix,
+            self.message_list.item_count(),
+            self.message_list.max_offset_for_scrollbar().y > gpui::px(0.),
+        )
     }
 
     /// Tell the list what its rows are now, in the way that preserves the
@@ -1375,7 +1405,36 @@ impl WhatsAppApp {
             // scrolled back far enough to ask for more was thrown to the
             // newest message for asking.
             TimelineSync::Spliced { at, removed, added } => {
+                // Where the reader is, before the splice moves them. `gpui`
+                // carries a scroll top *past* the replaced stretch along by
+                // what the splice did, but one that fell *inside* it has no
+                // row to be carried to and is pinned to the front of the new
+                // stretch instead — which for a page of older history is its
+                // oldest message. A reader who asked for one page by reaching
+                // the top of the last was thrown to the top of the new one,
+                // where they were near the start again and so asked for
+                // another: history unrolled under them for as long as the
+                // store had any. The row after the stretch is the one they
+                // were actually looking at, and it is where they belong.
+                //
+                // Only while there *is* one. A frame that carries a page and
+                // a change to the last row — someone starting to type, an
+                // arrival — has nothing in common at the end, so the stretch
+                // runs to the foot of the list and `at + added` is the row
+                // past it: the correction would land the reader at the newest
+                // message, which is further from where they were than gpui's
+                // own answer. Nothing here can say where they went, so
+                // nothing here overrides it.
+                let scrolled_to = self.message_list.logical_scroll_top();
+                let survivor = (at + added < count).then_some(at + added);
+                let anchor = survivor.filter(|_| (at..at + removed).contains(&scrolled_to.item_ix));
                 self.message_list.splice(at..at + removed, added);
+                if let Some(item_ix) = anchor {
+                    self.message_list.scroll_to(gpui::ListOffset {
+                        item_ix,
+                        offset_in_item: gpui::px(0.),
+                    });
+                }
                 // Only while the measurements outside it still describe those
                 // rows: a window resized in the same frame is one where they
                 // do not, and a splice keeps every one of them.

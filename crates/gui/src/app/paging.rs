@@ -337,6 +337,24 @@ pub(super) fn nearing_start(visible_start: usize) -> bool {
     visible_start <= LOOKAHEAD_ROWS
 }
 
+/// The same question, of the list a conversation actually uses.
+///
+/// A bottom-anchored list has no scroll position until somebody scrolls it,
+/// and answers "which row is at the top" with the row *past the last one*
+/// while it has none — its way of saying "pinned to the end". Read as a
+/// position, that is as far from the start as a list can be, so a
+/// conversation whose loaded rows do not fill the window never asked for a
+/// second page: the reader had nowhere to scroll to say they wanted one.
+///
+/// `can_scroll` is that missing half. It is consulted only for a list nobody
+/// has scrolled, because a reader who has one has a real position and it is
+/// the whole answer — and because a page's own rows are unmeasured until they
+/// are laid out, so a height asked in between would report a conversation
+/// that still fits when it no longer does.
+pub(super) fn timeline_nearing_start(visible_start: usize, rows: usize, can_scroll: bool) -> bool {
+    nearing_start(visible_start) || (visible_start >= rows && !can_scroll)
+}
+
 /// Where each conversation's timeline continues.
 pub(super) type TimelinePages = HashMap<String, Paging>;
 
@@ -509,6 +527,63 @@ mod tests {
         assert!(nearing_end(95, 100), "a screen from the end asks");
         assert!(!nearing_end(10, 100), "the middle does not");
         assert!(nearing_end(0, 0), "an empty list is at its end");
+    }
+
+    /// The two answers the predicate above is built on, read off a real list
+    /// state rather than off `gpui`'s documentation.
+    ///
+    /// A `Bottom` list has no scroll position until somebody scrolls it, and
+    /// says so by naming the row *past* the last one — which is the whole
+    /// reason the predicate cannot read the index alone. The second half is
+    /// the same fact in pixels: nothing to scroll, so no offset to scroll to.
+    /// Both are `gpui`'s behaviour rather than ours, which is exactly why
+    /// they are worth pinning here: a list that began answering `0` for the
+    /// first would turn this into a predicate that asks for history on every
+    /// frame, and neither end of that is visible from our own code.
+    #[test]
+    fn an_unscrolled_timeline_names_the_row_past_its_last() {
+        let state = crate::components::new_timeline_state(12);
+
+        assert_eq!(
+            state.logical_scroll_top().item_ix,
+            state.item_count(),
+            "pinned to the end reads as the row after the last one"
+        );
+        assert_eq!(
+            state.max_offset_for_scrollbar().y,
+            gpui::px(0.),
+            "and a list with nowhere to scroll offers no offset to scroll to"
+        );
+        assert!(
+            timeline_nearing_start(
+                state.logical_scroll_top().item_ix,
+                state.item_count(),
+                state.max_offset_for_scrollbar().y > gpui::px(0.),
+            ),
+            "which together is a conversation showing its whole head, and asking"
+        );
+    }
+
+    #[test]
+    fn a_timeline_that_cannot_scroll_is_at_its_start() {
+        // What a bottom-anchored list reports while nobody has scrolled it:
+        // the row past the last one.
+        assert!(
+            timeline_nearing_start(40, 40, false),
+            "a conversation that fits the window has its whole head on screen"
+        );
+        assert!(
+            !timeline_nearing_start(40, 40, true),
+            "one that does not fit is pinned to its end, which is not its start"
+        );
+        assert!(
+            timeline_nearing_start(3, 200, true),
+            "a reader near the top asks whatever the height says"
+        );
+        assert!(
+            !timeline_nearing_start(120, 200, true),
+            "and the middle of a conversation does not"
+        );
     }
 
     /// A conversation pages the other way: what it wants next is above what

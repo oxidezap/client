@@ -497,8 +497,14 @@ profile here repeats it deliberately.
   same-second burst is covered). A timeline is a page a front end asks for
   when it has somewhere to draw it — `LoadMessages` on opening a conversation
   and again as the reader nears its top, `LoadChats` as the sidebar nears its
-  end. WhatsApp Web sizes it the same way and preloads neither
-  (`web_preload_chat_messages`, `web_init_chat_batch_size`,
+  end. Near the top is two questions for a bottom-anchored list, because it
+  has no scroll position until somebody scrolls it and answers "which row is
+  at the top" with the row *past the last one* while it has none. Taken as a
+  position that is the far end, so a conversation whose rows do not fill the
+  window — the one with the most reason to ask — never asked, and had no
+  scrollbar to say so with either: `paging::timeline_nearing_start` reads that
+  second fact as the first. WhatsApp Web sizes it the same way and preloads
+  neither (`web_preload_chat_messages`, `web_init_chat_batch_size`,
   `history_sync_on_demand_message_count`).
   A list that has reached its end has only reached the end of what the store
   holds *now*: a history sync commits over minutes, so `Paging::Done` keeps
@@ -563,7 +569,12 @@ A scrollbar belongs to whatever scrolls, and both lists have one: the sidebar
 hands `Scrollbar::vertical` its `VirtualListScrollHandle` and the conversation
 hands it the `ListState` itself, since a self-measuring list is the only thing
 that knows how tall its rows turned out. In both it is drawn over the scrolling
-region at its trailing edge, outside the rows' own gutter.
+region at its trailing edge, outside the rows' own gutter — and *where* that is
+comes from the handle rather than from the element the bar was hung on: a
+`Scrollbar` paints itself over the bounds its handle reports, so the overlay
+around it only has to exist. Which is why a gutter belongs to the rows and
+never to a container wrapped around the list: padding there moves the list, and
+the bar with it, leaving it hanging a gutter's width inside the pane.
 
 ## Theme
 

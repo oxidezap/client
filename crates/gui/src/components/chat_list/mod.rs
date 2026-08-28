@@ -254,13 +254,16 @@ fn render_rows(
                 .size_full(),
             )
             // The scrollbar belongs to the region that scrolls and sits at
-            // its trailing edge, not inside the rows' padding.
+            // its trailing edge, not inside the rows' padding — which is why
+            // the rows carry their own `px` and the list itself runs to the
+            // edge of the sidebar. Where the bar lands is the *handle's*
+            // answer, not this overlay's: it paints over the bounds the scroll
+            // handle reports, so the overlay only has to be there, and the
+            // trailing edge comes from the list reaching one.
             .child(
                 div()
                     .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
+                    .inset_0()
                     .child(Scrollbar::vertical(scroll_handle)),
             )
         }
