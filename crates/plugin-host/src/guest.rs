@@ -510,6 +510,15 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if !c.data().allows(abi::caps::STORAGE) {
                 return abi::outcome::DENIED;
             }
+            // Refused from the *lengths*, before either string is copied. The
+            // store rejects an oversized entry anyway, but by then the host
+            // has already allocated and copied up to 64 KiB twice — a cost
+            // charged as one fixed-price wasm call, so a loop turns a fuel
+            // budget into allocation traffic the sandbox never sees.
+            let too_big = |len: i32| !(0..=(crate::kv::MAX_ENTRY as i32)).contains(&len);
+            if too_big(key_len) || too_big(val_len) {
+                return abi::outcome::REFUSED;
+            }
             let (Ok(key), Ok(value)) = (
                 read_str(&mut c, key, key_len),
                 read_str(&mut c, val, val_len),

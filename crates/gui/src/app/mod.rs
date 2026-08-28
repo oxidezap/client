@@ -1564,6 +1564,15 @@ impl WhatsAppApp {
         // the new one; `account_epoch` is what the detached task checks.
         self.storage_usage = None;
         self.account_epoch = self.account_epoch.wrapping_add(1);
+        // A plugin's boxes hold what somebody typed into them for the *old*
+        // account, and the entities carry live commit subscriptions. Left
+        // standing, a restarted plugin republishing the same default value it
+        // published before changes nothing that `sync_plugin_fields` compares
+        // — `published` is unchanged — so the half-typed text survives, and
+        // pressing Enter sends the old account's words into the new one's
+        // plugin. The next sync rebuilds whatever is still drawn.
+        self.plugins.clear();
+        self.plugin_fields.clear();
         self.chats.clear();
         self.selected_chat = None;
         self.visible_chat = None;

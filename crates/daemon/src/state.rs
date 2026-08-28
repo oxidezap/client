@@ -144,6 +144,9 @@ struct Inner {
 
 pub struct StateHub {
     inner: Mutex<Inner>,
+    /// Held from inside the state lock until a frame is on the channel, so
+    /// versions leave in the order they were assigned. See [`StateHub::apply`].
+    ordering: Mutex<()>,
     /// Pre-serialized frames. `Arc<str>` so fanning out to N clients costs N
     /// refcount bumps rather than N serializations.
     updates: broadcast::Sender<Arc<str>>,
@@ -207,6 +210,7 @@ impl StateHub {
             unread: 0,
         });
         Arc::new(Self {
+            ordering: Mutex::new(()),
             inner: Mutex::new(Inner {
                 version: StateVersion::INITIAL,
                 connection: ConnectionState::Connecting,
@@ -392,12 +396,17 @@ impl StateHub {
                 None
             } else {
                 inner.version = inner.version.next();
-                Some((inner.version, inner.calls.clone()))
+                // Taken before the state lock goes, like `apply` does it.
+                let order = self
+                    .ordering
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Some((inner.version, inner.calls.clone(), order))
             }
         };
 
-        if let Some((version, calls)) = published {
-            self.broadcast(version, DaemonEvent::CallsChanged(calls));
+        if let Some((version, calls, order)) = published {
+            self.broadcast(version, DaemonEvent::CallsChanged(calls), order);
         }
     }
 
@@ -409,12 +418,16 @@ impl StateHub {
     /// is logged and the phantom outgoing call stays on screen with no way
     /// to end it. Saying the state again is what takes it back.
     pub fn republish_calls(&self) {
-        let (version, calls) = {
+        let (version, calls, order) = {
             let mut inner = self.lock();
             inner.version = inner.version.next();
-            (inner.version, inner.calls.clone())
+            let order = self
+                .ordering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (inner.version, inner.calls.clone(), order)
         };
-        self.broadcast(version, DaemonEvent::CallsChanged(calls));
+        self.broadcast(version, DaemonEvent::CallsChanged(calls), order);
     }
 
     /// What is happening on the call front right now.
@@ -506,7 +519,18 @@ impl StateHub {
     /// observer can read a state whose version has not caught up.
     pub fn apply(&self, change: Change) -> StateVersion {
         let Change { event, from_store } = change;
-        let (version, tray) = {
+        // Taken before the state lock is released and held across the send, so
+        // frames leave in the order their versions were assigned. There is
+        // more than one writer now — a plugin publishes from its own thread
+        // while the session bridge publishes from its task — and a client
+        // drops any frame it has already passed, so version N broadcast after
+        // N+1 is not late, it is *lost*: the widget change or the approval in
+        // it would sit stale until something unrelated published again.
+        //
+        // Hand-over-hand rather than broadcasting under the state lock: the
+        // order is fixed here, and the serialization that follows happens with
+        // the state free.
+        let (version, tray, order) = {
             let mut inner = self.lock();
             inner.version = inner.version.next();
 
@@ -544,10 +568,14 @@ impl StateHub {
                 DaemonEvent::PluginsChanged(plugins) => inner.plugins = plugins.clone(),
             }
 
-            (inner.version, inner.tray_state())
+            let order = self
+                .ordering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (inner.version, inner.tray_state(), order)
         };
 
-        self.broadcast(version, event);
+        self.broadcast(version, event, order);
 
         // `send_if_modified` so an update that leaves the tray identical wakes
         // nothing: receipts and typing churn state constantly without changing
@@ -569,7 +597,12 @@ impl StateHub {
     /// Serializes once, and only when someone is listening: with no clients
     /// the daemon still tracks state for the tray, but pays nothing to format
     /// frames nobody reads.
-    fn broadcast(&self, version: StateVersion, event: DaemonEvent) {
+    fn broadcast(
+        &self,
+        version: StateVersion,
+        event: DaemonEvent,
+        _order: std::sync::MutexGuard<'_, ()>,
+    ) {
         if self.updates.receiver_count() == 0 {
             return;
         }

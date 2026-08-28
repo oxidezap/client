@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 const MAX_BYTES: usize = 256 * 1024;
 
 /// The longest key or value.
-const MAX_ENTRY: usize = 8 * 1024;
+pub(crate) const MAX_ENTRY: usize = 8 * 1024;
 
 /// One plugin's key-value pairs, mirrored to a file.
 ///

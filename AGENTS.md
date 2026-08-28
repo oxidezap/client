@@ -812,6 +812,14 @@ screen, with the title above the glass and the pair code below it.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
+- **A plugin's reply quotes an empty message.** `oxi_send_reply` names an id
+  and nothing else, which is all the ABI gives a plugin — but the session
+  does not re-read the original: `quote_context` puts the preview, the sender
+  and the kind straight on the wire, so the peer sees the reply's linkage
+  over a blank quote bar, and in a group it names no author. Resolving it
+  needs a lookup by id, which the daemon has no store to make and the session
+  has no method for; the alternative is widening the ABI, which is a decision
+  of its own.
 - **A front end cannot say what went wrong with a command.** `Accepted` means
   the session took it; per-request outcomes would need request ids on more
   than downloads. A failed send arrives as `SendFailed` against the chat, not

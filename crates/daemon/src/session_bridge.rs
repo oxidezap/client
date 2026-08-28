@@ -315,6 +315,24 @@ pub async fn run(
         log::error!("the publish thread did not finish: {e}");
     }
 
+    /// Whether the record of what the user allowed each plugin is gone.
+    ///
+    /// `true` when there was nothing to remove, which is the ordinary case: an
+    /// account with no plugins has no permissions to retire.
+    fn approvals_retired() -> bool {
+        let Some(dir) = oxidezap_plugin_host::default_state_dir() else {
+            return true;
+        };
+        match oxidezap_plugin_host::forget_approvals(&dir) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                log::error!("cannot remove the plugins' recorded permissions: {e}");
+                false
+            }
+        }
+    }
+
     // After the teardown, never before: the store is one file and the session
     // was holding it open. Unlinking it first leaves the closing session free
     // to write a fresh WAL beside a database that is already gone.
@@ -330,6 +348,21 @@ pub async fn run(
              from under it would leave a partial wipe. Start oxidezap again and repeat \
              \"clear data and pair again\"."
         );
+    } else if bridge.forget && !approvals_retired() {
+        // The same refusal as above and for the same reason. What must not
+        // outlive this account is the record of what its owner allowed: wipe
+        // the credentials first and fail this afterwards, and the next
+        // pairing inherits an `approvals.json` in which a plugin with the
+        // same id and mask is already allowed to act — consent given for an
+        // account that no longer exists. Leaving the old account intact is a
+        // state the user can act on again; a new account under the old one's
+        // permissions is not. Its *settings* are cleared below with the rest
+        // of the directory: those are data, and this is authority.
+        log::error!(
+            "local state was NOT wiped: the plugins' recorded permissions could not be \
+             cleared, and wiping now would let them outlive the account that granted them. \
+             Start oxidezap again and repeat \"clear data and pair again\"."
+        );
     } else if bridge.forget {
         match oxidezap_session::wipe_local_state() {
             Ok(()) => log::info!("local state wiped; pair again on the next start"),
@@ -344,22 +377,10 @@ pub async fn run(
             && let Err(e) = std::fs::remove_dir_all(&dir)
             && e.kind() != std::io::ErrorKind::NotFound
         {
+            // Only the settings are at stake here: the permissions were
+            // retired before the credentials went, so nothing that survives
+            // this can let a plugin act on whoever pairs next.
             log::error!("could not clear the plugins' stored settings: {e}");
-            // A partial removal is the dangerous outcome, not the failed one:
-            // whatever survives is inherited by whoever pairs next, and an
-            // approval that survives is a plugin acting on a new account
-            // under permission somebody gave for the old one. So the
-            // permissions are retired on their own, and loudly if even that
-            // will not go. A plugin's settings surviving is a privacy
-            // problem; its approval surviving is an authority one.
-            if let Err(e) = oxidezap_plugin_host::forget_approvals(&dir)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                log::error!(
-                    "and the plugins' recorded permissions could not be cleared either ({e}); \
-                     a plugin may still be allowed to act on the next account"
-                );
-            }
         }
         // The store is one file; the media is a directory beside it, and it
         // is just as much this account's data.
@@ -495,11 +516,6 @@ impl Bridge {
         // behind a message already covers it.
         self.reads.observe(&event);
 
-        // As early as the daemon itself hears it. A plugin is a front end
-        // that does not draw, and putting it after the publish would give
-        // every window a head start on an autoreply for no reason.
-        self.plugins.observe(&event);
-
         if let Some(frame) = passthrough(&event) {
             self.hub.signal(&frame);
         }
@@ -611,6 +627,9 @@ impl Bridge {
         // would refuse it as stale, after the client had cleared its own badge
         // and with nothing to make it ask again.
         let pending = self.hub.wants_session_events().then(|| event.clone());
+        // Kept for the plugins, which are told once the state below is
+        // written; `translate` consumes the event.
+        let observed = event.clone();
 
         for change in self.translate(event) {
             // A chat that left the store owes nothing and will never be read
@@ -621,6 +640,17 @@ impl Bridge {
             }
             self.hub.apply(change);
         }
+
+        // After the state, not before. A plugin is a front end that does not
+        // draw, so the instinct is to hand it the event as early as the
+        // daemon hears it — but a plugin runs on its own thread and may act
+        // immediately, and what it acts *through* reads the state this loop
+        // has just written. Told first, a plugin answering `CONNECTED` could
+        // have its send refused as `NoSession` because the hub still said
+        // "connecting"; and one answering a disconnect could slip a command
+        // past a check that still said connected. The head start a window
+        // gains is a frame, and it costs nothing.
+        self.plugins.observe(&observed);
 
         if let Some(event) = pending {
             // The receiver lives as long as the thread, which lives as long as

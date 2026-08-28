@@ -89,9 +89,13 @@ impl Commands for Bridge {
             // The daemon invents one. A plugin has no bubble to rename, so a
             // local id would be a token nobody holds.
             local_id: None,
-            // What a quote *shows* is the front end's business and the
-            // session re-reads the original anyway, so a plugin naming the
-            // message is naming everything it can honestly know.
+            // A plugin knows the id and nothing else, which is all the ABI
+            // gives it. The session does *not* re-read the original —
+            // `quote_context` serializes these fields straight onto the wire —
+            // so the quote bar the peer sees carries the reply's linkage and
+            // an empty body, and in a group it names no author. Filling that
+            // in means a lookup the daemon has no store to make; see the
+            // note in AGENTS.md under "Still to do".
             quoted: quoted.map(|id| oxidezap_core::QuotedMessage {
                 message_id: id.to_owned(),
                 sender: String::new(),
