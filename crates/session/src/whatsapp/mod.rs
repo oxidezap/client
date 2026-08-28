@@ -297,20 +297,30 @@ impl WhatsAppClient {
         self.shutdown.notify_one();
     }
 
-    /// Ask the session to stop and wait for it to finish closing.
+    /// Ask the session to stop, wait for it to finish closing, and let it go.
     ///
     /// The wait is what separates this from [`shutdown`](Self::shutdown): the
     /// session still has to disconnect the socket and close SQLite, and a
-    /// caller that exits without waiting can cut that short. Bounded, so a
-    /// wedged session delays exit rather than preventing it.
+    /// caller that walks away without waiting can cut that short. Bounded, so
+    /// a wedged session delays a teardown rather than preventing it.
     ///
-    /// Returns whether the session's loop finished within `timeout` — see
-    /// [`crate::exec::Executor::join`], which is where a browser's answer
-    /// differs, because a page has no thread to wait on and may not block the
-    /// one it has.
-    pub fn shutdown_and_join(&mut self, timeout: std::time::Duration) -> bool {
+    /// Takes the client, because letting go of it is part of the answer and
+    /// is itself a platform question: on a desktop the executor owns a Tokio
+    /// runtime, and tokio refuses to drop one inside an async context. That
+    /// drop happens where the wait does, which on a desktop is a blocking
+    /// thread and on a page is here.
+    ///
+    /// Returns whether it finished within `grace`. On the ordinary path that
+    /// is only worth logging; on the "clear data and pair again" path it
+    /// decides whether anything may be deleted at all.
+    pub async fn close(mut self, grace: std::time::Duration) -> bool {
         self.shutdown();
-        self.exec.join(timeout)
+        let finished = self.exec.join(grace).await;
+        if !finished {
+            warn!("session did not finish closing within {grace:?}");
+        }
+        crate::exec::let_go(self).await;
+        finished
     }
 
     /// Get the client handle for sending messages

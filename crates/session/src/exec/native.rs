@@ -80,18 +80,30 @@ impl Executor {
     /// and bounded *here* rather than by the caller, because `JoinHandle` has
     /// no timed join. A second thread does the untimed one and reports
     /// through a channel this side can give up on.
-    pub fn join(&mut self, timeout: Duration) -> bool {
+    ///
+    /// `async`, and the wait happens on a blocking thread: a runtime worker
+    /// parked in a join is a worker not driving anything else, including the
+    /// session that is trying to finish.
+    pub async fn join(&mut self, timeout: Duration) -> bool {
         let Some(handle) = self.worker.take() else {
             return true;
         };
+        oxidezap_session_join(handle, timeout).await
+    }
+}
 
+/// The blocking half of [`Executor::join`], off the runtime.
+async fn oxidezap_session_join(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+    unblock(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = handle.join();
             let _ = tx.send(());
         });
         rx.recv_timeout(timeout).is_ok()
-    }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// A handle that can spawn onto this executor later, from anywhere.
@@ -151,4 +163,13 @@ impl<T> Future for Task<T> {
             .poll(cx)
             .map(|r| r.map_err(|_| Cancelled))
     }
+}
+
+/// Drop something where dropping it is allowed.
+///
+/// The executor owns a Tokio runtime, and tokio refuses to drop one inside an
+/// async context — "Cannot drop a runtime in a context where blocking is not
+/// allowed" — so whatever owns one has to be released off the runtime.
+pub async fn let_go<T: MaybeSend + 'static>(value: T) {
+    let _ = unblock(move || drop(value)).await;
 }

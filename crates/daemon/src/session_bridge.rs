@@ -265,32 +265,22 @@ pub async fn run(
 
     // Reached whether the session ended on its own or a signal arrived.
     //
-    // On a blocking thread, for two reasons that both end in a panic
-    // otherwise: joining the session thread blocks, and dropping the client
-    // drops the tokio runtime it owns, which tokio refuses inside an async
-    // context ("Cannot drop a runtime in a context where blocking is not
-    // allowed").
+    // Both of the things that would panic here — a join that blocks and the
+    // drop of a tokio runtime inside an async context — belong to the client
+    // rather than to this loop, so it does them: see `WhatsAppClient::close`.
     let grace = if bridge.forget {
         FORGET_GRACE
     } else {
         SHUTDOWN_GRACE
     };
-    let closed = match oxidezap_session::unblock(move || close(client, grace)).await {
-        Ok(closed) => closed,
-        Err(e) => {
-            log::error!("session teardown did not complete: {e}");
-            false
-        }
-    };
+    let closed = client.close(grace).await;
 
     // Before anything is deleted, and on a blocking thread because joining
     // one is: the publisher writes this account's media, and a wipe that
     // starts while it is still draining its queue deletes a directory that
     // is about to be written into again.
-    if let Some(publisher) = bridge.stop_publishing()
-        && let Err(e) = tokio::task::spawn_blocking(move || publisher.join()).await
-    {
-        log::error!("the publish thread did not finish: {e}");
+    if let Some(publisher) = bridge.stop_publishing() {
+        publisher.join().await;
     }
 
     // After the teardown, never before: the store is one file and the session
@@ -339,20 +329,6 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// is to skip the wipe rather than to race it.
 const FORGET_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Stop the session and wait for its thread, so the socket is closed and
-/// SQLite is flushed before the process goes away.
-///
-/// Returns whether it actually finished. On the ordinary path that answer is
-/// only worth logging; on the forget path it decides whether anything may be
-/// deleted at all.
-pub fn close(mut client: WhatsAppClient, grace: std::time::Duration) -> bool {
-    let closed = client.shutdown_and_join(grace);
-    if !closed {
-        log::warn!("session did not finish closing within {grace:?}");
-    }
-    closed
-}
-
 /// Everything the event loop carries between one event and the next.
 struct Bridge {
     hub: Arc<StateHub>,
@@ -371,7 +347,7 @@ struct Bridge {
     /// The publisher, kept joinable rather than detached. It writes the media
     /// a session event carries, and forgetting the session deletes exactly
     /// the directory it writes into.
-    publisher: Option<std::thread::JoinHandle<()>>,
+    publisher: Option<crate::publisher::Handle>,
     reads: ReadTracker,
     in_flight: Arc<Semaphore>,
     /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
@@ -385,24 +361,8 @@ impl Bridge {
         // is the event loop draining the session's own unbounded channel, so a
         // limit here could only stall the loop this exists to unblock or drop
         // events no client could then recover.
-        let (publish, mut queue) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
-        let hub_for_publisher = Arc::clone(&hub);
-        let publisher = std::thread::Builder::new()
-            .name("oxidezap-publish".to_string())
-            .spawn(move || {
-                while let Some(mut event) = queue.blocking_recv() {
-                    externalize_media(&mut event);
-                    match serde_json::to_string(&DaemonMessage::Session {
-                        event: Box::new(event),
-                    }) {
-                        Ok(frame) => hub_for_publisher.publish_session(frame),
-                        Err(e) => log::error!("dropping unserializable session event: {e}"),
-                    }
-                }
-            })
-            // A daemon that cannot spawn a thread is a daemon that will not
-            // get far; failing here beats doing the writes on a worker.
-            .expect("spawning the publish thread");
+        let (publish, queue) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
+        let publisher = crate::publisher::start(Arc::clone(&hub), queue);
 
         Self {
             hub,
@@ -422,7 +382,7 @@ impl Bridge {
     /// be in there. Deleting the directory while that thread is working
     /// through the backlog recreates the very bytes the wipe exists to
     /// remove, moments after it finishes.
-    fn stop_publishing(&mut self) -> Option<std::thread::JoinHandle<()>> {
+    fn stop_publishing(&mut self) -> Option<crate::publisher::Handle> {
         // The thread ends when its last sender is gone, and this is it.
         self.publish = None;
         self.publisher.take()
@@ -1264,7 +1224,7 @@ fn too_busy() -> CommandOutcome {
 /// Writing is skipped for anything already cached, which is most of it after
 /// the first attach: a message's media is addressed by its message id, and a
 /// message's media does not change.
-fn externalize_media(event: &mut UiEvent) {
+pub(crate) fn externalize_media(event: &mut UiEvent) {
     // Read once for the whole event: this runs on the publish thread behind
     // an unbounded queue, so a clear can land between being handed the event
     // and writing its media. See `media::put_since`.

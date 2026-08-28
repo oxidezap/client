@@ -18,6 +18,7 @@
 
 pub mod embedded;
 pub mod media;
+mod publisher;
 pub mod server;
 pub mod session_bridge;
 pub mod state;

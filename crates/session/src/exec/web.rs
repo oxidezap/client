@@ -13,15 +13,22 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use wasm_bindgen::JsCast as _;
+use wasm_bindgen::prelude::Closure;
+
 use super::{Cancelled, MaybeSend};
 
 /// The page's loop, plus whether the session's own future is still on it.
 pub struct Executor {
     /// Set when [`start`](Executor::start)'s future returns.
-    ///
-    /// A page has no thread to join, so this is the only honest thing
-    /// [`join`](Executor::join) has to report.
     finished: Rc<Cell<bool>>,
+    /// Raised at the same moment, for whoever is waiting.
+    ///
+    /// The flag alone cannot be waited on, and waiting is the whole point:
+    /// the one caller decides whether an account's store may be deleted, and
+    /// a page that answered "still closing" because it had not yielded yet
+    /// would refuse every wipe there is.
+    done: Rc<tokio::sync::Notify>,
 }
 
 impl Executor {
@@ -32,6 +39,7 @@ impl Executor {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self {
             finished: Rc::new(Cell::new(false)),
+            done: Rc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -45,9 +53,11 @@ impl Executor {
         future: impl Future<Output = ()> + 'static,
     ) -> std::io::Result<()> {
         let finished = self.finished.clone();
+        let done = self.done.clone();
         wasm_bindgen_futures::spawn_local(async move {
             future.await;
             finished.set(true);
+            done.notify_waiters();
         });
         Ok(())
     }
@@ -72,18 +82,76 @@ impl Executor {
         Task(rx)
     }
 
-    /// Whether the session's future has already stopped.
+    /// Wait for the session's future to end, up to `timeout`.
     ///
-    /// It cannot wait, and the `timeout` is therefore ignored rather than
-    /// honoured: blocking the page's one thread is what stops it from
-    /// drawing, so a browser has no way to spend a timeout and still be a
-    /// browser at the end of it. A page's real teardown is the tab going
-    /// away, which takes the loop, the tasks and the memory with it — there
-    /// is no equivalent of a process that outlives its session thread, which
-    /// is the thing the desktop's wait exists to prevent.
-    pub fn join(&mut self, _timeout: Duration) -> bool {
+    /// A page cannot block, so this waits the way a page waits: the loop
+    /// keeps turning and this task is woken when the session's own future
+    /// returns, or when a `setTimeout` says the grace is spent.
+    ///
+    /// It used to answer without waiting at all, on the grounds that a tab
+    /// has no thread to join — which read as "already finished" to the one
+    /// caller that matters. That caller decides whether an account's store
+    /// may be deleted, and it is told to refuse when the session is still
+    /// closing: "clear data and pair again" would have refused every time,
+    /// left the dead credentials in place, and reopened them on the retry.
+    pub async fn join(&mut self, timeout: Duration) -> bool {
+        if self.finished.get() {
+            return true;
+        }
+        // Registered before the wait, so a session that ends between the
+        // check above and here is not missed: `notify_waiters` wakes whoever
+        // is already waiting and nobody else.
+        let ended = self.done.notified();
+        futures_lite::future::or(ended, sleep(timeout)).await;
         self.finished.get()
     }
+}
+
+/// `setTimeout`, as a future.
+///
+/// Resolves immediately where no timer can be armed — a worker with no
+/// `window` — rather than never, because a future that never completes holds
+/// whatever is awaiting it for the life of the page.
+pub(crate) async fn sleep(duration: Duration) {
+    /// Disarms the timer when the sleep is dropped.
+    ///
+    /// A `setTimeout` left armed fires into a `Closure` that has already been
+    /// freed, which is a wasm-bindgen panic rather than a missed wakeup — and
+    /// this is raced against something that routinely wins.
+    struct Timer {
+        handle: i32,
+        _fire: Closure<dyn FnMut()>,
+    }
+
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            if let Some(window) = web_sys::window() {
+                window.clear_timeout_with_handle(self.handle);
+            }
+        }
+    }
+
+    let (tx, rx) = futures_channel::oneshot::channel::<()>();
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let mut tx = Some(tx);
+    let fire = Closure::<dyn FnMut()>::new(move || {
+        if let Some(tx) = tx.take() {
+            let _ = tx.send(());
+        }
+    });
+    let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+        fire.as_ref().unchecked_ref(),
+        i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
+    ) else {
+        return;
+    };
+    let _timer = Timer {
+        handle,
+        _fire: fire,
+    };
+    let _ = rx.await;
 }
 
 /// A handle that can spawn onto the page's loop later.
@@ -157,4 +225,13 @@ impl<T> Future for Task<T> {
             .poll(cx)
             .map(|r| r.map_err(|_| Cancelled))
     }
+}
+
+/// Drop it here, because here is the only place there is.
+///
+/// The desktop half has to release a Tokio runtime somewhere blocking is
+/// allowed. A page owns no runtime and has nowhere else, so this is a drop
+/// with a signature that matches.
+pub async fn let_go<T: MaybeSend + 'static>(value: T) {
+    drop(value);
 }
