@@ -10,6 +10,7 @@
 mod audio;
 mod call;
 mod player;
+mod sps;
 mod streaming;
 
 // Memory-efficient streaming decoder (on-demand decoding, ~3MB vs ~48MB)

@@ -127,6 +127,14 @@ profile here repeats it deliberately.
   offer or the announcement did and its opening IDR was published nowhere.
   Without that ask the first frame a new decoder sees is a P-frame and the
   pane says "connecting" until the periodic IDR, seconds later.
+- **A peer's parameter set is read before a decoder sees it.** A decoder
+  allocates its reference and output buffers from the SPS — from numbers the
+  person on the other end of the call chose — so a pixel budget applied to
+  the decoded picture is applied after the allocation it exists to prevent.
+  `video::sps::coded_size` reads the geometry out of the access unit first.
+  It answers `None` for a unit with no parameter set (nothing new is being
+  declared) and for one it cannot follow, which is deliberate: refusing on a
+  reading nobody has checked would break a legitimate call over a parser bug.
 - **A decoded picture is a slot, not a place in a queue.** The window's event
   channel is hundreds of messages deep because the messages that may not be
   lost need it to be, and a decoded 720p frame is 3.5 MiB — so frames put

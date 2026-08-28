@@ -41,10 +41,16 @@ impl H264Encoder {
             .bitrate(BitRate::from_bps(quality.bitrate_kbps.saturating_mul(1000)))
             .max_frame_rate(FrameRate::from_hz(quality.fps as f32))
             .rate_control_mode(RateControlMode::Bitrate)
-            // A call is a live stream with a hard latency budget: overshooting
-            // the bitrate costs the peer's picture for seconds, and one
-            // skipped frame costs a frame.
-            .skip_frames(true)
+            // Off, though a live stream is exactly what it is for. What
+            // carries an access unit is an RTP clock advanced by one fixed
+            // stride per unit — `VideoSource::rtp_timestamp_stride`, which is
+            // a constant — so a frame the rate control declines to encode is
+            // not a frame skipped but a frame the clock never accounts for:
+            // the video timeline falls one stride behind wall time and stays
+            // there, and enough of them under load drift the picture away
+            // from the voice. Overshooting the bitrate for a moment is
+            // recovered from; a clock that has lost time is not.
+            .skip_frames(false)
             // Repeated SPS/PPS under one id, which is what a WhatsApp peer
             // expects to see in front of every IDR.
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)

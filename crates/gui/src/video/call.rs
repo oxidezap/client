@@ -228,6 +228,22 @@ fn decode_loop(
             }
             started = true;
         }
+        // Read before the decoder is handed it, because a decoder allocates
+        // its reference and output buffers from the parameter set — from
+        // numbers the *peer* chose. `Scratch` refuses an oversized picture,
+        // but it refuses one that has already been decoded, which is after
+        // the allocation the refusal is for. A unit carrying no parameter set
+        // declares no new geometry and is left alone.
+        if let Some((width, height)) = super::sps::coded_size(&unit.data)
+            && (width as usize).saturating_mul(height as usize) > MAX_PIXELS
+        {
+            log::warn!("refusing a {width}x{height} video stream on call {call_id}");
+            // Not a gap to recover from: every unit that follows references
+            // this picture, so the stream stays refused until the peer sends
+            // a parameter set describing one that fits.
+            started = false;
+            continue;
+        }
         let picture = match decoder.decode(&unit.data) {
             Ok(Some(yuv)) => yuv,
             // The decoder is buffering, which is normal.

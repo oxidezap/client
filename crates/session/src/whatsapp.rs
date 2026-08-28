@@ -2401,6 +2401,19 @@ impl WhatsAppClient {
             };
             match started {
                 Ok(()) => {
+                    // And asked once more, because signaling is another await
+                    // and the newest request is the only one that may speak.
+                    // Unlike the check before it this one has something to
+                    // undo: the direction is negotiated, so the peer is told
+                    // it stopped as well as the device being closed — an
+                    // "off" queued behind us would otherwise find a camera
+                    // that was never registered, no picture of its own to
+                    // stop, and a peer still holding a pane open.
+                    if lane.intent.lock().expect("video intent poisoned").seq != seq {
+                        local.stop().await;
+                        Self::stop_peer_video(&handle, &call_id).await;
+                        return;
+                    }
                     // The call is already live, so the self-view has had
                     // somewhere to land since before the camera opened — and
                     // it had nowhere to land while the announcement was on
