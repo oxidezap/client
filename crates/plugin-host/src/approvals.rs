@@ -119,12 +119,27 @@ impl Approvals {
     pub fn set(&self, id: &str, requested: i64, approved: bool) -> i64 {
         let agreed = requested & abi::caps::NEEDS_APPROVAL;
         let mut granted = self.lock();
+        let before = granted.get(id).copied();
         if approved {
             granted.insert(id.to_owned(), agreed);
         } else {
             granted.remove(id);
         }
-        self.flush(&granted);
+        if !Self::flush(&self.path, &granted) && approved {
+            // A grant that could not be written down is not a grant. The
+            // caller hands this mask straight to the running plugin, so
+            // returning it would show the capability as allowed while nothing
+            // recorded it — and the next start would ask again, which is the
+            // grant-before-enable ordering broken in the visible direction.
+            // A *withdrawal* keeps its in-memory effect whatever the disk
+            // did: failing closed is the point, and `flush` has already
+            // removed the file rather than leave a stale grant on it.
+            match before {
+                Some(mask) => granted.insert(id.to_owned(), mask),
+                None => granted.remove(id),
+            };
+            return granted.get(id).copied().unwrap_or(0);
+        }
         granted.get(id).copied().unwrap_or(0)
     }
 
@@ -136,20 +151,25 @@ impl Approvals {
     /// write are one step, and the temporary name carries the process and
     /// thread so a second daemon writing the same directory cannot land in
     /// the middle of this one's rename.
-    fn flush(&self, granted: &BTreeMap<String, i64>) {
-        if self.path.as_os_str().is_empty() {
-            return;
+    /// Whether what is held is now on disk.
+    ///
+    /// `true` for a store with nowhere to write: there is nothing it could
+    /// fail at. An associated function rather than a method, so the caller
+    /// can keep the guard it is holding.
+    fn flush(path: &Path, granted: &BTreeMap<String, i64>) -> bool {
+        if path.as_os_str().is_empty() {
+            return true;
         }
         let Ok(json) = serde_json::to_vec(granted) else {
-            return;
+            return false;
         };
-        let temp = self.path.with_extension(format!(
+        let temp = path.with_extension(format!(
             "json.{}.{:?}.tmp",
             std::process::id(),
             std::thread::current().id()
         ));
         if let Err(e) =
-            crate::write_private(&temp, &json).and_then(|()| std::fs::rename(&temp, &self.path))
+            crate::write_private(&temp, &json).and_then(|()| std::fs::rename(&temp, path))
         {
             // Fail closed. Leaving the previous file is the tempting answer
             // and it is the wrong one: the write that most matters is a
@@ -160,18 +180,21 @@ impl Approvals {
             // costs a permission nobody agreed to.
             log::warn!(
                 "cannot write {}: {e}. Every plugin permission will be asked for again.",
-                self.path.display()
+                path.display()
             );
             let _ = std::fs::remove_file(&temp);
-            if let Err(e) = std::fs::remove_file(&self.path)
+            if let Err(e) = std::fs::remove_file(path)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 log::error!(
                     "and {} could not be removed either ({e}); it may still grant what was \
                      just withdrawn",
-                    self.path.display()
+                    path.display()
                 );
             }
+            false
+        } else {
+            true
         }
     }
 
@@ -330,6 +353,24 @@ mod tests {
             0,
             "nothing survives a flush that could not land"
         );
+    }
+
+    /// The caller hands what this returns straight to the running plugin, so
+    /// a grant nobody could write down must not come back as one: Settings
+    /// would show the capability allowed while the next start asked again.
+    #[test]
+    fn a_grant_that_cannot_be_written_is_not_granted() {
+        let dir = TempDir::new("grant-unwritable");
+        let a = Approvals::open(Some(&dir.0));
+        // A directory where the file has to go, so the rename cannot land.
+        std::fs::create_dir(dir.0.join("approvals.json")).expect("writable");
+
+        assert_eq!(
+            a.set("autoreply", abi::caps::SEND, true),
+            0,
+            "nothing was recorded, so nothing is allowed"
+        );
+        assert!(!a.is_approved("autoreply", abi::caps::SEND));
     }
 
     #[test]

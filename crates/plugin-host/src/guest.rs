@@ -506,6 +506,13 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if !c.data().allows(abi::caps::STORAGE) {
                 return abi::ABSENT;
             }
+            // From the length, before the copy, exactly as `oxi_kv_set` does
+            // it: a key longer than an entry may be cannot name one, so
+            // allocating it to discover that is host work charged as one
+            // fixed-price call — and a loop is that work without a bound.
+            if !(0..=(crate::kv::MAX_ENTRY as i32)).contains(&key_len) {
+                return abi::ABSENT;
+            }
             let Ok(key) = read_str(&mut c, key, key_len) else {
                 return abi::ABSENT;
             };

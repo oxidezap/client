@@ -399,13 +399,21 @@ impl Plugins {
             log::warn!("plugin {id}: refusing an approval; the host is shutting down");
             return;
         }
+        let _order = lock(&self.approving);
+        // And again, now that the lock is held. Reading it only before was a
+        // gap: this task could see `false`, pause, and resume after shutdown
+        // had raised the flag, taken this same lock and finished — writing an
+        // approval the account reset had already declared gone.
+        if self.stopping.load(Ordering::Relaxed) {
+            log::warn!("plugin {id}: refusing an approval; the host is shutting down");
+            return;
+        }
         // One ordered step, because these are two answers to the same
         // question and they must not be able to disagree. Two clients acting
         // at once would otherwise let a grant compute its mask, pause while a
         // revocation persists and publishes a zero, and then store the stale
         // mask over it: Settings and `approvals.json` would read "not
         // allowed" while the plugin went on sending.
-        let _order = lock(&self.approving);
         if approved {
             // A grant is written down before it is handed over, so a
             // capability the plugin holds is one the file already records.
