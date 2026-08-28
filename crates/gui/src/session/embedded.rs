@@ -32,13 +32,15 @@ use super::sink::{self, Events};
 ///
 /// # Errors
 ///
-/// Only what writing the hello can fail with, which is nothing yet: the pipe
-/// is open before this returns. The signature matches the socket's so the
-/// caller has one shape.
-pub(super) fn connect() -> std::io::Result<(Session, Events)> {
+/// Another tab already holds this account — the browser's own lock says so,
+/// and the honest answer is to point the person at the tab that has it rather
+/// than open a second session over the same database.
+pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     log::info!("no daemon named; starting a session in this page");
 
-    let pipe = oxidezap_daemon::embedded::start();
+    let pipe = oxidezap_daemon::embedded::start()
+        .await
+        .map_err(std::io::Error::other)?;
     let (reader, mut writer) = tokio::io::split(pipe);
 
     // The write half, as a queue into the task that owns it — the same

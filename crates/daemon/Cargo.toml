@@ -67,6 +67,21 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["h
 # crate that depends on it can choose one.
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom_02 = { workspace = true }
+# The claim a page makes on the account, which is the Web Locks API — the
+# browser's own answer to "one of these at a time", and the same question the
+# binary answers with a file lock. Bound from Rust like every other browser
+# API in this tree.
+futures-channel = "0.3"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Lock",
+    "LockManager",
+    "LockOptions",
+    "Navigator",
+    "Window",
+] }
 
 [dev-dependencies]
 chrono = { workspace = true, features = ["std", "clock"] }

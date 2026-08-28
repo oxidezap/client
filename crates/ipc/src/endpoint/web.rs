@@ -504,6 +504,33 @@ fn parameter_of(search: &str, name: &str) -> Option<String> {
     })
 }
 
+/// Whether this page is a preview rather than the deployment.
+///
+/// Declared by the page itself — a `<meta name="oxidezap-build" content="preview">`
+/// the publisher puts there — and not guessed from the path, because the
+/// consequence is too sharp for a guess. A preview shares its origin with the
+/// deployment: same scheme, same host, same port, a different directory. That
+/// was harmless while the page held nothing, and it is not now. A page that
+/// runs its own session keeps the account in origin-scoped storage, and an
+/// origin is not a directory — so unmerged code served under `/pr/<n>/` can
+/// read the deployment's database, credentials and all, with no token
+/// anywhere in the way.
+///
+/// Absent means not a preview, which is the safe direction: a deployment that
+/// somehow lost the tag runs its own session as it should, and a preview that
+/// somehow lost it is a preview nobody should have been pointing at an
+/// account anyway.
+#[must_use]
+pub fn is_preview() -> bool {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return false;
+    };
+    let Ok(Some(meta)) = document.query_selector("meta[name='oxidezap-build']") else {
+        return false;
+    };
+    meta.get_attribute("content").as_deref() == Some("preview")
+}
+
 /// One query parameter off the page's own URL.
 fn query_parameter(name: &str) -> Option<String> {
     let location = web_sys::window()?.location();

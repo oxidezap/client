@@ -275,14 +275,14 @@ impl Session {
     /// # Errors
     ///
     /// Nothing is listening and nothing could be made to listen.
-    pub fn connect() -> std::io::Result<(Self, Events)> {
+    pub async fn connect() -> std::io::Result<(Self, Events)> {
         #[cfg(not(target_family = "wasm"))]
         {
             native::connect()
         }
         #[cfg(target_family = "wasm")]
         {
-            web::connect()
+            web::connect().await
         }
     }
 
@@ -312,12 +312,12 @@ impl Session {
         #[cfg(not(target_family = "wasm"))]
         {
             use gpui::AppContext as _;
-            cx.background_spawn(async { Self::connect() }).await
+            cx.background_spawn(Self::connect()).await
         }
         #[cfg(target_family = "wasm")]
         {
             let _ = cx;
-            Self::connect()
+            Self::connect().await
         }
     }
 

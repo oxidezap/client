@@ -38,13 +38,24 @@ use super::sink::{self, Events};
 /// Only a URL the browser refuses outright. A daemon that is not running
 /// arrives as a close on the event stream, which the front end already
 /// handles as a lost connection and retries.
-pub(super) fn connect() -> std::io::Result<(Session, Events)> {
+pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     // Nobody named a daemon, so there is nothing to attach to and no reason
     // to look: this page runs its own. Naming one is how somebody chooses the
     // other arrangement — a desktop daemon holds calls, survives the tab, and
     // keeps the account out of a browser's storage.
     let Some(url) = web::named_daemon() else {
-        return super::embedded::connect();
+        // A preview may not hold an account, and this is the one place that
+        // can refuse: it shares an origin with the deployment — same scheme,
+        // same host, a different directory — and origin-scoped storage does
+        // not know about directories. Unmerged code reading the deployment's
+        // database is not a risk worth a convenience, so a preview is an
+        // attach-only page and says so.
+        if web::is_preview() {
+            return Err(std::io::Error::other(
+                "this is a preview build, which will not hold an account: point it                  at a daemon with #daemon=ws://…",
+            ));
+        }
+        return super::embedded::connect().await;
     };
     let media_base = web::media_base_url();
     // Without its query, which carries the token. A browser console is the

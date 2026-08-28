@@ -56,6 +56,12 @@ rustflags = [
 # every build — including the native one, which is meant to stay on stable.
 [target.wasm32-unknown-unknown]
 rustflags = [
+    # Web Locks, which is how one tab claims the account the way a daemon
+    # claims a directory. The API is shipped in every browser that matters;
+    # what is unstable is `web-sys`'s binding for it, and this is the flag
+    # that crate asks for. Contained to this target, like everything else
+    # here.
+    "--cfg", "web_sys_unstable_apis",
     "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
     "-C", "link-arg=--shared-memory",
     "-C", "link-arg=--max-memory=1073741824",

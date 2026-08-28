@@ -33,6 +33,11 @@ const PIPE: usize = 1 << 18;
 
 /// Start a session and serve one client, in this process.
 ///
+/// # Errors
+///
+/// Something else already holds this account — another tab, on the web —
+/// which is the same refusal a second `oxidezapd` gets from the startup lock.
+///
 /// The returned stream is the client's end: write requests into it, read
 /// frames out of it, exactly as a socket. Dropping it ends the connection,
 /// which is the only way this one is closed — there is no accept loop to
@@ -42,7 +47,14 @@ const PIPE: usize = 1 << 18;
 /// the tray's Quit and an IPC `Shutdown` make. Nothing here ends a process,
 /// because on the side this exists for there is no process to end that is
 /// not the tab itself.
-pub fn start() -> DuplexStream {
+pub async fn start() -> Result<DuplexStream, String> {
+    // Before anything opens the store, and held for as long as this service
+    // is. Two of these on one origin would preload the same database, write
+    // it back independently, and advance the same Signal state from two
+    // places — the losing writer's chats gone, its ratchets no longer
+    // decrypting. See [`crate::claim`].
+    let claim = crate::claim::take().await?;
+
     let hub = StateHub::new();
 
     // The bridge must never be cancelled: it owns the session, and a future
@@ -65,7 +77,11 @@ pub fn start() -> DuplexStream {
         if let Err(e) = server::serve_client(server, hub, commands).await {
             log::error!("the in-process client ended badly: {e}");
         }
+        // Held until the connection ends, which is the life of this service:
+        // releasing it earlier would let a second tab in while this one is
+        // still holding the store open.
+        drop(claim);
     });
 
-    client
+    Ok(client)
 }

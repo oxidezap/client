@@ -207,6 +207,18 @@ else
         rm -rf "${work:?}/$target"
         mkdir -p "$work/$target"
         cp -R "$bundle_dir/." "$work/$target/"
+        # A preview says what it is, because the page has to know.
+        #
+        # It shares an origin with the deployment — same scheme, same host,
+        # one directory over — and a page that runs its own session keeps the
+        # account in storage scoped to that origin. Unmerged code one path
+        # segment away could read it, token or no token, so a preview refuses
+        # to hold an account at all and attaches to a named daemon instead.
+        # Declared here rather than guessed from the URL, because the page
+        # deciding by its own path is a rule that breaks the first time
+        # somebody serves this somewhere else.
+        sed -i'' -e 's|<head>|<head><meta name="oxidezap-build" content="preview" />|' \
+            "$work/$target/index.html"
     fi
     message="Publish $target from ${GITHUB_SHA:-a build}"
 fi
