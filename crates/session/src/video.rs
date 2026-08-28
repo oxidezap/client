@@ -126,6 +126,14 @@ pub(crate) struct LocalVideo {
     drawable: Arc<AtomicBool>,
     /// The fan-out task, stopped by dropping the camera's channel.
     pump: tokio::task::JoinHandle<()>,
+    /// Cleared by the pump *before* it reports the loss, so a caller still
+    /// wiring this camera up can ask whether the device is still there.
+    ///
+    /// The report is what a registered camera is torn down by, and it finds
+    /// nothing to tear down while the camera is still on its way into the
+    /// registry — seconds, on a path that waits for signaling. Whoever is
+    /// holding it asks here instead.
+    alive: Arc<AtomicBool>,
     id: CallIdSlot,
     camera_id: CameraId,
 }
@@ -157,6 +165,12 @@ impl LocalVideo {
     /// one does not take it down.
     pub(crate) fn camera_id(&self) -> CameraId {
         self.camera_id
+    }
+
+    /// Whether the device is still producing. False means its loss has
+    /// already been reported — to a registry this camera was not in yet.
+    pub(crate) fn alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 
     /// Address this call's frames by the name the server gave it.
@@ -231,6 +245,7 @@ pub(crate) async fn open(
     let stride = camera.quality().timestamp_stride();
     let camera_id = next_camera_id();
     let drawable = Arc::new(AtomicBool::new(false));
+    let alive = Arc::new(AtomicBool::new(true));
 
     // The encoder's own queue is upstream of this one; this pair is what the
     // media plane and the front end read.
@@ -246,6 +261,7 @@ pub(crate) async fn open(
         lost,
         camera_id,
         drawable: Arc::clone(&drawable),
+        alive: Arc::clone(&alive),
     }));
     tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publisher));
 
@@ -256,6 +272,7 @@ pub(crate) async fn open(
             id: call_id,
             camera_id,
             drawable,
+            alive,
         },
         Endpoints {
             source: CameraSource {
@@ -285,6 +302,7 @@ pub(crate) struct LocalPump {
     lost: CameraLost,
     camera_id: CameraId,
     drawable: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 }
 
 async fn pump_local(pump: LocalPump) {
@@ -297,6 +315,7 @@ async fn pump_local(pump: LocalPump) {
         lost,
         camera_id,
         drawable,
+        alive,
     } = pump;
     // Set by a drop, spent on the next frame that gets through — the one
     // whose references are the ones missing. See `CallVideoFrame::gap`.
@@ -345,6 +364,10 @@ async fn pump_local(pump: LocalPump) {
     debug!("local video for {call_id} ended");
     if !plane.is_closed() {
         warn!("the camera on call {call_id} stopped producing frames");
+        // Before the report, not after: the report tears down what the
+        // registry holds, and a camera still being wired into it is not
+        // there to be found. The flag is what that caller reads.
+        alive.store(false, Ordering::Relaxed);
         lost(call_id, camera_id);
     }
 }

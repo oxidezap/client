@@ -2088,14 +2088,24 @@ impl WhatsAppClient {
                 error!("Client not available for accepting call");
                 return;
             };
-            let Some(offer) = calls.pending.lock().await.remove(&call_id) else {
+            // From the moment the offer leaves `pending` there is neither an
+            // offer nor a handle for anything ending this call to act on, and
+            // this is what it acts on instead — marked *before* the offer is
+            // consumed, under the lock that consumes it. Two steps leave a
+            // moment where a remote termination finds no offer and no accept,
+            // leaves no note, and the accept goes on to answer a call nobody
+            // is on.
+            let offer = {
+                let mut pending = calls.pending.lock().await;
+                if pending.contains_key(&call_id) {
+                    calls.accepting.lock().await.insert(call_id.clone());
+                }
+                pending.remove(&call_id)
+            };
+            let Some(offer) = offer else {
                 warn!("No pending offer for call {}", call_id);
                 return;
             };
-            // From here to the registration below there is neither an offer
-            // nor a handle for anything ending this call to act on. This is
-            // what it acts on instead.
-            calls.accepting.lock().await.insert(call_id.clone());
             let _accepting = AcceptGuard {
                 calls: calls.clone(),
                 call_id: call_id.clone(),
@@ -2193,10 +2203,20 @@ impl WhatsAppClient {
                     }
                     info!("Call {} media live", handle.call_id());
                     if let Some(local) = local {
-                        // There is a call to draw into now.
-                        local.drawable();
-                        calls.cameras.lock().await.insert(call_id.clone(), local);
-                        Self::announce_video(&ui_sender, &call_id, VideoStream::Local, true).await;
+                        // Its loss, if it died while the accept was going out,
+                        // was reported to a registry this camera was not in
+                        // yet: nothing was torn down, and an entry made now is
+                        // one nothing will ever come back for.
+                        if local.alive() {
+                            // There is a call to draw into now.
+                            local.drawable();
+                            calls.cameras.lock().await.insert(call_id.clone(), local);
+                            Self::announce_video(&ui_sender, &call_id, VideoStream::Local, true)
+                                .await;
+                        } else {
+                            warn!("The camera on call {call_id} died as the call was answered");
+                            local.stop().await;
+                        }
                     }
                     // A call offered as video has the caller's camera on by
                     // definition; the peer's own `<video>` corrects this if
@@ -2244,8 +2264,7 @@ impl WhatsAppClient {
         // Before the spawn, because after it the order is gone. See
         // [`VideoLane`].
         let (lane, seq) = {
-            let mut lanes = calls.video.lock().expect("video lanes poisoned");
-            let lane = lanes.entry(call_id.clone()).or_default().clone();
+            let lane = Self::video_lane(&calls, &call_id);
             let mut intent = lane.intent.lock().expect("video intent poisoned");
             intent.seq += 1;
             intent.on = on;
@@ -2316,6 +2335,16 @@ impl WhatsAppClient {
                     return;
                 }
             };
+            // Asked again, because opening a device is where the time goes —
+            // tens of milliseconds, the first time a permission prompt — and
+            // the lane held whatever came after us off for all of it. Going
+            // on from here is not a word that can be taken back: it spends
+            // the peer's upgrade token and starts transmitting, which the
+            // "off" queued behind us would then have to undo.
+            if lane.intent.lock().expect("video intent poisoned").seq != seq {
+                local.stop().await;
+                return;
+            }
             // Consuming the token *is* the answer, so the question goes with
             // it — every window drawing it has to stop.
             let answering = calls.upgrades.lock().await.remove(&call_id);
@@ -2341,12 +2370,23 @@ impl WhatsAppClient {
                     // inserted after it is one nothing will ever remove —
                     // the device staying open, with its light on, until the
                     // daemon exits.
+                    //
+                    // The device is asked the same question for the same
+                    // reason: announcing video waits on the wire, its loss in
+                    // that window was reported to a registry it was not in
+                    // yet, and an entry made now would be a dead camera the
+                    // state calls on.
                     let mut cameras = calls.cameras.lock().await;
-                    if calls.active.lock().await.contains_key(&call_id) {
+                    let ended = !calls.active.lock().await.contains_key(&call_id);
+                    if !ended && local.alive() {
                         cameras.insert(call_id.clone(), local);
                     } else {
                         drop(cameras);
-                        info!("Call {} ended while its camera was opening", call_id);
+                        if ended {
+                            info!("Call {} ended while its camera was opening", call_id);
+                        } else {
+                            warn!("The camera on call {call_id} died while its video started");
+                        }
                         local.stop().await;
                     }
                 }
@@ -2397,6 +2437,16 @@ impl WhatsAppClient {
         call_id: &str,
         only: Option<crate::video::CameraId>,
     ) {
+        // On the call's own lane, like a request, and for the same reason a
+        // request is: closing a device and telling the peer are two awaits,
+        // and a camera turned on between them would have its media plane
+        // stopped and be published as off. The identity check below is what
+        // decides whether *this* cleanup still has something to do; the lane
+        // is what keeps that answer true for as long as it takes to act on
+        // it. Blocking here delays this one call's events and nothing else:
+        // the lane is per call, and the library's event queue is unbounded.
+        let lane = Self::video_lane(calls, call_id);
+        let _serialized = lane.lane.lock().await;
         let local = {
             let mut cameras = calls.cameras.lock().await;
             match cameras.get(call_id) {
@@ -2422,6 +2472,18 @@ impl WhatsAppClient {
             );
         }
         Self::announce_video(ui_sender, call_id, VideoStream::Local, false).await;
+    }
+
+    /// The lane serializing one call's camera transitions, made if nothing
+    /// has wanted it yet. Swept where it grows — see [`Self::set_call_video`].
+    fn video_lane(calls: &CallRegistry, call_id: &str) -> Arc<VideoLane> {
+        calls
+            .video
+            .lock()
+            .expect("video lanes poisoned")
+            .entry(call_id.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Drop a parked upgrade request and tell every window it is gone.
@@ -2594,9 +2656,24 @@ impl WhatsAppClient {
             match outgoing.start().await {
                 Ok(handle) => {
                     let call_id = handle.call_id().to_string();
-                    // Cancelled while still connecting: the UI only knew
-                    // the placeholder id, so honor it here.
-                    if calls.cancelled.lock().await.remove(&placeholder_id) {
+                    let handle = Arc::new(handle);
+                    // Cancelled while still connecting: the UI only knew the
+                    // placeholder id, so honor it here — and consume the
+                    // marker under the `active` lock, in the order
+                    // `cancel_call` takes them. As two steps there is a moment
+                    // where a cancel finds no handle and this finds no marker,
+                    // and what is left is a call ringing at the far end that
+                    // no window has ever been told the name of.
+                    let registered = {
+                        let mut active = calls.active.lock().await;
+                        if calls.cancelled.lock().await.remove(&placeholder_id) {
+                            false
+                        } else {
+                            active.insert(call_id.clone(), handle.clone());
+                            true
+                        }
+                    };
+                    if !registered {
                         info!("Outgoing call {} cancelled before start", call_id);
                         if let Some(local) = local {
                             local.stop().await;
@@ -2614,22 +2691,27 @@ impl WhatsAppClient {
                         call_id,
                         observe_str(&recipient_jid)
                     );
-                    let handle = Arc::new(handle);
-                    calls
-                        .active
-                        .lock()
-                        .await
-                        .insert(call_id.clone(), handle.clone());
                     if let Some(local) = local {
-                        // The frames were being addressed to the placeholder
-                        // the window drew; from here they carry the name the
-                        // server gave the call. A reader keeps one decoder
-                        // per call and cannot tell a rename from a different
-                        // call, so it starts a fresh one — which has nothing
-                        // to decode until a keyframe. This is that keyframe.
-                        local.rename(&call_id);
-                        local.request_keyframe();
-                        calls.cameras.lock().await.insert(call_id.clone(), local);
+                        // A camera that died while the offer was going out
+                        // reported its loss under the placeholder id, against
+                        // a registry it was never in: nothing was torn down,
+                        // and the entry made here would be the one nothing
+                        // ever comes back for.
+                        if local.alive() {
+                            // The frames were being addressed to the
+                            // placeholder the window drew; from here they
+                            // carry the name the server gave the call. A
+                            // reader keeps one decoder per call and cannot
+                            // tell a rename from a different call, so it
+                            // starts a fresh one — which has nothing to decode
+                            // until a keyframe. This is that keyframe.
+                            local.rename(&call_id);
+                            local.request_keyframe();
+                            calls.cameras.lock().await.insert(call_id.clone(), local);
+                        } else {
+                            warn!("The camera on call {call_id} died as the call was placed");
+                            local.stop().await;
+                        }
                     }
                     Self::watch_call(handle, calls.clone(), ui_sender.clone());
                     // The rename first: everything after it is addressed by
