@@ -627,6 +627,17 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Remove only the record of what the user allowed.
+///
+/// The fallback for an account reset whose directory removal did not go
+/// through. What survives a partial wipe is inherited by whoever pairs next,
+/// and the half that must not survive is this one: a plugin's leftover
+/// settings are the old account's data, but a leftover approval is a plugin
+/// acting on a *new* account under permission given for the old one.
+pub fn forget_approvals(state_dir: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(state_dir.join(approvals::FILE_NAME))
+}
+
 /// Make a directory only this user can enter.
 ///
 /// A plugin's store holds whatever it kept — an autoreply's list of who it

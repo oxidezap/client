@@ -1418,3 +1418,79 @@ fn a_plugins_stored_settings_are_not_readable_by_other_users() {
         "and the file itself is owner-only"
     );
 }
+
+/// Publishing a tree is copying, parsing and allocating — host work the
+/// sandbox does not measure, since only the instructions around the import
+/// burn fuel. A plugin calling it in a loop must run out of *this* rather
+/// than out of the daemon's memory.
+#[test]
+fn a_plugin_cannot_publish_an_unbounded_number_of_trees_in_one_call() {
+    let dir = TempDir::new("ui-flood");
+    dir.plugin("noisy", &publishes_repeatedly());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    // Its tree reaches the daemon, so the first publishes were taken.
+    let surfaces = published.settles("its interface", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+    assert!(surfaces[0].is_running());
+
+    plugins.observe(&message("a@s.whatsapp.net", "go"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        published
+            .latest()
+            .first()
+            .is_some_and(oxidezap_core::PluginSurface::is_running),
+        "the module traps unless the cap refused it, so surviving is the proof"
+    );
+}
+
+/// A tree published over and over inside one call, each one valid.
+fn publishes_repeatedly() -> String {
+    let mut buf = vec![0u8; 512];
+    let mut w = abi::ui::Writer::new(&mut buf);
+    w.leaf(
+        abi::ui::kind::LABEL,
+        abi::ui::slot::SETTINGS,
+        abi::ui::flags::ENABLED,
+        "",
+        "oi",
+        "",
+    );
+    let n = w.finish().expect("fits");
+    versioned(&format!(
+        r#"(module
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_ui_set"       (func $ui_set (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{tree}")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (global $refusals (mut i32) (i32.const 0))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))
+    (call $caps (i64.const 8))   ;; caps::UI
+    (drop (call $ui_set (i32.const 0) (i32.const {len})))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $i i32)
+    (block $done
+      (loop $again
+        (br_if $done (i32.ge_s (local.get $i) (i32.const 1000)))
+        (if (i32.ne (call $ui_set (i32.const 0) (i32.const {len})) (i32.const 0))
+          (then (global.set $refusals (i32.add (global.get $refusals) (i32.const 1)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $again)))
+    ;; The assertion, made from inside: if the cap never engaged, this traps
+    ;; and the host stops the plugin — so the test's "still running" below is
+    ;; evidence that a thousand publishes were refused rather than evidence
+    ;; that nothing interesting happened.
+    (if (i32.eqz (global.get $refusals)) (then (unreachable)))
+    (i32.const 0))
+)"#,
+        tree = wat_bytes(&buf[..n]),
+        len = n,
+    ))
+}

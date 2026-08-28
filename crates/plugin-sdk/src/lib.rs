@@ -70,6 +70,17 @@ pub enum Outcome {
     Denied,
     /// The arguments did not make sense.
     Invalid,
+    /// Right command, wrong moment.
+    ///
+    /// An account command attempted during `oxi_init`, or one more widget
+    /// tree than a single call may publish. Distinct from [`Invalid`] and
+    /// from [`Denied`] on purpose: nothing about the call was wrong and the
+    /// plugin may well be allowed to make it — it is too early, or too often,
+    /// and the same call from a handler is fine.
+    ///
+    /// [`Invalid`]: Self::Invalid
+    /// [`Denied`]: Self::Denied
+    State,
 }
 
 impl Outcome {
@@ -79,6 +90,7 @@ impl Outcome {
             abi::outcome::NO_SESSION => Self::NoSession,
             abi::outcome::DENIED => Self::Denied,
             abi::outcome::REFUSED => Self::Refused,
+            abi::outcome::STATE => Self::State,
             _ => Self::Invalid,
         }
     }

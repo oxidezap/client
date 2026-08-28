@@ -754,7 +754,7 @@ impl Answer {
 async fn handle_request(
     Request { id, request }: Request,
     hub: &StateHub,
-    plugins: &oxidezap_plugin_host::Plugins,
+    plugins: &Arc<oxidezap_plugin_host::Plugins>,
     commands: &Commands,
     outbox: &Outbox,
 ) -> Answer {
@@ -995,7 +995,14 @@ async fn handle_request(
         // with its new permissions is its own business and arrives as a
         // republished surface.
         ClientRequest::PluginApproval { plugin, approved } => {
-            plugins.approve(&plugin, approved);
+            // On a blocking thread, because answering one is a file written
+            // and renamed: on a single-worker runtime that stalls the session
+            // bridge and every other connection for as long as the disk takes,
+            // and on any runtime it spends a worker on I/O. Awaited rather
+            // than spawned loose, so the acknowledgement still means the
+            // answer is recorded.
+            let plugins = Arc::clone(plugins);
+            let _ = tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved)).await;
             acted(Ok(()))
         }
         // The acknowledgement goes out first; see the caller.
@@ -1224,8 +1231,8 @@ mod tests {
 
     /// A host with nothing loaded, for the requests that are not about
     /// plugins — which is every request but one.
-    fn no_plugins() -> oxidezap_plugin_host::Plugins {
-        oxidezap_plugin_host::Plugins::none(Arc::new(|_| {}))
+    fn no_plugins() -> Arc<oxidezap_plugin_host::Plugins> {
+        Arc::new(oxidezap_plugin_host::Plugins::none(Arc::new(|_| {})))
     }
 
     fn parse(frame: Option<String>) -> DaemonMessage {
@@ -1386,7 +1393,7 @@ mod tests {
         let served = tokio::spawn(serve_client(
             server,
             Arc::clone(&hub),
-            Arc::new(no_plugins()),
+            no_plugins(),
             commands,
         ));
         client
@@ -1614,7 +1621,7 @@ mod tests {
         let served = tokio::spawn(serve_client(
             server,
             Arc::clone(&hub),
-            Arc::new(no_plugins()),
+            no_plugins(),
             commands,
         ));
         client
@@ -1662,7 +1669,7 @@ mod tests {
         let served = tokio::spawn(serve_client(
             server,
             Arc::clone(&hub),
-            Arc::new(no_plugins()),
+            no_plugins(),
             commands,
         ));
         client
@@ -1757,7 +1764,7 @@ mod tests {
 
         // Returns rather than parking forever; the paused clock reaches the
         // handshake deadline as soon as nothing else can run.
-        serve_client(server, hub, Arc::new(no_plugins()), commands)
+        serve_client(server, hub, no_plugins(), commands)
             .await
             .unwrap();
 

@@ -46,6 +46,23 @@ const MAX_HANDLES: usize = 4096;
 /// one is a plugin filling the daemon's log at the speed of its own loop.
 const MAX_LOG_BYTES: i32 = 2048;
 
+/// How much a plugin may log across one wasm call.
+///
+/// The per-line cap alone bounded nothing: a loop calling it is millions of
+/// unpriced logger writes inside one fuel budget. A handler that says more
+/// than this about one event is not explaining itself, it is spending the
+/// daemon's disk.
+const MAX_LOG_BYTES_PER_CALL: usize = 64 * 1024;
+
+/// How many trees a plugin may publish in one call.
+///
+/// Each one is copied out of guest memory, parsed and turned into a host-side
+/// tree — work that fuel does not price, since only the instructions *around*
+/// the import are metered. Publishing twice in a call is already pointless
+/// (the last one wins, and it is applied after the call returns), so this is
+/// generous for anything honest.
+const MAX_UI_PER_CALL: usize = 16;
+
 /// The shortest timer a plugin may set.
 ///
 /// A floor rather than a fuel charge: fuel is spent inside a call, and a
@@ -118,6 +135,11 @@ pub struct Guest {
     /// plugin, and a handful of far-future timers per message would grow the
     /// worker's list without limit.
     pub pending_timers: usize,
+    /// What this call has already spent on host work the sandbox does not
+    /// measure. Reset by the runtime before every call, because these bound
+    /// one delivery rather than one plugin.
+    pub logged_bytes: usize,
+    pub trees_published: usize,
     pub kv: Kv,
     pub commands: Arc<dyn Commands>,
 }
@@ -424,6 +446,14 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if !c.data().allows(abi::caps::UI) {
                 return abi::outcome::DENIED;
             }
+            // Before the payload is read, let alone parsed: copying and
+            // parsing is the cost, and a plugin calling this in a loop spends
+            // it without spending fuel.
+            let published = &mut c.data_mut().trees_published;
+            if *published >= MAX_UI_PER_CALL {
+                return abi::outcome::STATE;
+            }
+            *published += 1;
             let Ok(len) = usize::try_from(len) else {
                 return abi::outcome::INVALID;
             };
@@ -531,6 +561,13 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if len > MAX_LOG_BYTES {
                 return;
             }
+            // And a budget across the whole call. Silently, past it: a line
+            // saying "you have logged too much" is another line.
+            let spent = &mut c.data_mut().logged_bytes;
+            if *spent >= MAX_LOG_BYTES_PER_CALL {
+                return;
+            }
+            *spent += len.max(0) as usize;
             let Ok(line) = read_str(&mut c, ptr, len) else {
                 return;
             };

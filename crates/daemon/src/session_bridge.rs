@@ -345,6 +345,21 @@ pub async fn run(
             && e.kind() != std::io::ErrorKind::NotFound
         {
             log::error!("could not clear the plugins' stored settings: {e}");
+            // A partial removal is the dangerous outcome, not the failed one:
+            // whatever survives is inherited by whoever pairs next, and an
+            // approval that survives is a plugin acting on a new account
+            // under permission somebody gave for the old one. So the
+            // permissions are retired on their own, and loudly if even that
+            // will not go. A plugin's settings surviving is a privacy
+            // problem; its approval surviving is an authority one.
+            if let Err(e) = oxidezap_plugin_host::forget_approvals(&dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log::error!(
+                    "and the plugins' recorded permissions could not be cleared either ({e}); \
+                     a plugin may still be allowed to act on the next account"
+                );
+            }
         }
         // The store is one file; the media is a directory beside it, and it
         // is just as much this account's data.

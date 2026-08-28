@@ -138,6 +138,8 @@ impl Runtime {
                 ui: None,
                 timers: Vec::new(),
                 pending_timers: 0,
+                logged_bytes: 0,
+                trees_published: 0,
                 kv,
                 commands,
             },
@@ -250,6 +252,14 @@ impl Runtime {
         // a plugin bank the fuel of every event it ignored and spend it on
         // one long loop later.
         self.store.set_fuel(FUEL_PER_CALL)?;
+        // The budgets fuel does not cover, reset alongside it and for the
+        // same reason: they bound one delivery, and one that carried over
+        // would let a plugin bank the quiet events and spend them at once.
+        {
+            let guest = self.store.data_mut();
+            guest.logged_bytes = 0;
+            guest.trees_published = 0;
+        }
 
         let outcome = self.on_event.call(&mut self.store, (kind, 0));
 

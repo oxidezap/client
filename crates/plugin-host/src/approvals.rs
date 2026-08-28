@@ -37,6 +37,11 @@ pub fn effective(requested: i64, approved: i64) -> i64 {
     }
 }
 
+/// What the file is called, in the one place that has to agree with the
+/// account reset's fallback and with the `kv-` prefix that keeps a plugin id
+/// from naming it.
+pub const FILE_NAME: &str = "approvals.json";
+
 /// The approved mask per plugin id, mirrored to a file.
 pub struct Approvals {
     path: PathBuf,
@@ -57,7 +62,7 @@ impl Approvals {
                 granted: Mutex::new(BTreeMap::new()),
             };
         };
-        let path = dir.join("approvals.json");
+        let path = dir.join(FILE_NAME);
         let granted = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 log::warn!(
