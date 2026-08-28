@@ -41,9 +41,10 @@ use crate::quoting::quoted_from;
 use crate::video::{self, CameraLost, VideoPublisher, VideoSenderSlot};
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
+use crate::store::settings as store_settings;
+
 /// Where the store lives on this platform. See [`crate::store`].
 pub use crate::store::{database_path as resolve_database_path, prepare as prepare_store};
-use crate::store::settings as store_settings;
 
 /// Delete the local session: device identity, Signal state and chat history
 /// all live in the one SQLite file.
@@ -3666,4 +3667,3 @@ mod tests {
         assert_eq!(plain.jid, "5599000000001@s.whatsapp.net");
     }
 }
-

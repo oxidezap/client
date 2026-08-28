@@ -337,8 +337,7 @@ use crate::views::pairing::generate_qr_png;
 use crate::views::{
     render_call_overlay, render_connected_view, render_connecting_view, render_error_view,
     render_loading_view, render_logged_out_view, render_pairing_view, render_refused_view,
-    render_settings_view,
-    render_syncing_view,
+    render_settings_view, render_syncing_view,
 };
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
