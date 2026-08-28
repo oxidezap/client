@@ -16,4 +16,4 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
-pub(crate) use platform::take;
+pub(crate) use platform::{Claim, take};

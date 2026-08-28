@@ -15,6 +15,7 @@
 //! It is not browser-only, though nothing else uses it yet. A test that wants
 //! the real protocol without a socket wants exactly this.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use tokio::io::DuplexStream;
@@ -48,12 +49,67 @@ const PIPE: usize = 1 << 18;
 /// because on the side this exists for there is no process to end that is
 /// not the tab itself.
 pub async fn start() -> Result<DuplexStream, StartFailed> {
-    // Before anything opens the store, and held for as long as this service
-    // is. Two of these on one origin would preload the same database, write
-    // it back independently, and advance the same Signal state from two
-    // places — the losing writer's chats gone, its ratchets no longer
-    // decrypting. See [`crate::claim`].
+    let (hub, commands) = service().await?;
+
+    let (client, server) = tokio::io::duplex(PIPE);
+    oxidezap_session::spawn(async move {
+        if let Err(e) = server::serve_client(server, hub, commands).await {
+            log::error!("the in-process client ended badly: {e}");
+        }
+        // Nothing is released here, and that is the fix rather than an
+        // omission. A connection ending is a *client* ending — a resync, a
+        // reload of the front end, a pipe closed — and on a desktop that
+        // leaves the daemon running with the account still open. Dropping the
+        // claim here did the opposite: it freed the lock while this page's
+        // session and its store were still live, so the front end's own retry
+        // took the lock straight back and opened a second session over the
+        // same database, with the first one still connected.
+    });
+
+    Ok(client)
+}
+
+// The service this page runs, started once.
+//
+// A page has one session, as a machine has one daemon, and a front end
+// reconnecting is not a reason to start another. Held per agent rather than
+// globally because that is the scope it is true in — and because the claim is
+// a browser object that belongs to the agent that took it.
+thread_local! {
+    static SERVICE: RefCell<Option<Service>> = const { RefCell::new(None) };
+}
+
+/// What one page's daemon consists of, minus the connections.
+struct Service {
+    hub: Arc<StateHub>,
+    commands: session_bridge::Commands,
+    /// The account, claimed. Released when the page goes, which the browser
+    /// does for us: a Web Lock does not outlive the agent that holds it.
+    _claim: crate::claim::Claim,
+}
+
+/// Start this page's session if it is not already running, and hand back what
+/// a connection needs to talk to it.
+async fn service() -> Result<(Arc<StateHub>, session_bridge::Commands), StartFailed> {
+    if let Some(running) = running() {
+        return Ok(running);
+    }
+
+    // Before anything opens the store, and held for as long as the page is.
+    // Two of these on one origin would preload the same database, write it
+    // back independently, and advance the same Signal state from two places —
+    // the losing writer's chats gone, its ratchets no longer decrypting. See
+    // [`crate::claim`].
     let claim = crate::claim::take().await.map_err(StartFailed::Claimed)?;
+
+    // Asked again, because the answer above took an await to get and this
+    // agent runs other tasks in the meantime. Two `start`s racing would
+    // otherwise both build a session, and the second would be the one every
+    // later connection got — over a store the first one has open.
+    if let Some(running) = running() {
+        drop(claim);
+        return Ok(running);
+    }
 
     let hub = StateHub::new();
 
@@ -63,8 +119,8 @@ pub async fn start() -> Result<DuplexStream, StartFailed> {
     let stopped = async { crate::shutdown::requested().await };
 
     // Bounded, and sized as the daemon sizes it: a connection waits for its
-    // command's answer before reading the next request, so at most one
-    // command per connection is ever outstanding.
+    // command's answer before reading the next request, so at most one command
+    // per connection is ever outstanding.
     let (commands, command_rx) = tokio::sync::mpsc::channel(server::MAX_CLIENTS);
 
     oxidezap_session::spawn({
@@ -72,18 +128,32 @@ pub async fn start() -> Result<DuplexStream, StartFailed> {
         async move { session_bridge::run(hub, command_rx, stopped).await }
     });
 
-    let (client, server) = tokio::io::duplex(PIPE);
-    oxidezap_session::spawn(async move {
-        if let Err(e) = server::serve_client(server, hub, commands).await {
-            log::error!("the in-process client ended badly: {e}");
-        }
-        // Held until the connection ends, which is the life of this service:
-        // releasing it earlier would let a second tab in while this one is
-        // still holding the store open.
-        drop(claim);
+    SERVICE.with(|cell| {
+        *cell.borrow_mut() = Some(Service {
+            hub: Arc::clone(&hub),
+            commands: commands.clone(),
+            _claim: claim,
+        });
     });
+    Ok((hub, commands))
+}
 
-    Ok(client)
+/// This page's session, if it has one that is still listening.
+///
+/// A bridge that has stopped — a shutdown, an account reset — leaves a sender
+/// nobody is reading. Reusing it would accept every command into a channel
+/// with no receiver, so the page would look connected and answer nothing.
+/// Forgetting it here also drops the claim, which is what lets the next
+/// session take one of its own.
+fn running() -> Option<(Arc<StateHub>, session_bridge::Commands)> {
+    SERVICE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_some_and(|s| s.commands.is_closed()) {
+            *slot = None;
+        }
+        slot.as_ref()
+            .map(|running| (Arc::clone(&running.hub), running.commands.clone()))
+    })
 }
 
 /// Why a session did not start here.
