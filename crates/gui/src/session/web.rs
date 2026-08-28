@@ -151,6 +151,21 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
 /// the renderer offers the download instead.
 const FRAME_MEDIA_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How many bytes of one frame's media may be held at once.
+///
+/// A time budget alone bounds the wrong thing. A history load names media
+/// across a hundred chats, the daemon it is attached to may hold 512 MiB of
+/// it, and every payload fetched stays in `Fetched` until the whole frame has
+/// been applied — after which applying it copies each one into the message it
+/// belongs to. Two of those at once, in a linear memory with a one-gigabyte
+/// ceiling, is a tab that stops rather than a page that is slow.
+///
+/// Sized against the *page's* own media budget rather than the daemon's,
+/// because this heap is the one that runs out. What is left out is not lost:
+/// a key that was not fetched is drawn as an offer to download, which is what
+/// the renderer already does for media the daemon never cached.
+const FRAME_MEDIA_CEILING: u64 = 48 * 1024 * 1024;
+
 /// Pull down every payload this frame names.
 ///
 /// Sequentially, and deliberately: a history load names a hundred photos, and
@@ -186,10 +201,29 @@ async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched, pending: 
     // transfer anyway, which is the same failure wearing a different hat.
     let each = i32::try_from(budget.as_millis()).unwrap_or(i32::MAX);
 
+    // A request somebody made is not optional and is one key, so it is not
+    // rationed; everything else is a frame's own media and is.
+    let ceiling = if matches!(message, DaemonMessage::Downloaded { .. }) {
+        u64::MAX
+    } else {
+        FRAME_MEDIA_CEILING
+    };
+
     let all = async {
+        let mut held: u64 = 0;
         for key in frames::media_keys(message, pending) {
+            if held >= ceiling {
+                // Not an error, and not worth a per-key line: the renderer
+                // draws media it does not have as an offer to download, which
+                // is exactly what it does for media the daemon never cached.
+                log::debug!("this frame's media passed its size budget; the rest is on demand");
+                break;
+            }
             match web::fetch_media_within(base, &key, each).await {
-                Ok(bytes) => into.put(key, bytes),
+                Ok(bytes) => {
+                    held = held.saturating_add(bytes.len() as u64);
+                    into.put(key, bytes);
+                }
                 Err(e) => log::debug!("media {key} is not available: {e}"),
             }
         }
