@@ -71,13 +71,17 @@ them usable at all.
 
 ## The web front end
 
-The same window builds to WebAssembly and runs in a browser. It is the front
-end only: it holds no session, opens no connection to WhatsApp and keeps no
-store, so it attaches to an `oxidezapd` on your own machine over a WebSocket,
-speaking the protocol the desktop window already speaks.
+The same window builds to WebAssembly and runs in a browser. By default it
+runs the whole client there — the session, the store and the window — under
+your account and nobody else's; the published bundle is still static, because
+nothing about that needs a server.
 
-That makes the published bundle static — nothing serves it but a file host —
-while the daemon it talks to stays yours.
+It can attach to an `oxidezapd` on your own machine instead, over a WebSocket
+and speaking the protocol the desktop window already speaks. That is worth
+preferring where you have one: a desktop daemon holds calls, survives the tab
+closing, and keeps your device keys in a `0700` directory rather than in a
+browser's storage. Naming one with `#daemon=` is how you choose it, and the
+rest of this section is how.
 
 ```bash
 # Nightly, because the standard library has to be rebuilt with the atomics
@@ -92,7 +96,8 @@ cargo install trunk
 TRUNK_ACTION=serve ./web/build.sh
 ```
 
-and, in another terminal, the daemon with its web endpoint turned on:
+The page will start its own session. To point it at a daemon instead, run one
+in another terminal with its web endpoint turned on:
 
 ```bash
 cargo run --bin oxidezapd -- --web
@@ -115,8 +120,9 @@ cat "$XDG_RUNTIME_DIR/oxidezap/web.token"
 
 Open `http://127.0.0.1:8080/#daemon=ws://127.0.0.1:9527/ws?token=<token>`
 with it pasted in. Without the token the page reaches the endpoint and is
-refused: it is the whole of the admission check, and a bare
-<http://127.0.0.1:8080> has nothing to present.
+refused: it is the whole of the admission check. A bare
+<http://127.0.0.1:8080> names no daemon at all, which is not a refusal — it
+is the default, and that page runs its own session.
 
 **After the `#`, not after a `?`, and that is not cosmetic.** A page's query
 string is part of the request line and reaches whoever served the page — for
