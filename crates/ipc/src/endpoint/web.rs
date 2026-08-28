@@ -520,6 +520,9 @@ fn parameter_of(search: &str, name: &str) -> Option<String> {
 /// somehow lost the tag runs its own session as it should, and a preview that
 /// somehow lost it is a preview nobody should have been pointing at an
 /// account anyway.
+///
+/// The refusal it drives is a default rather than a wall — see
+/// [`session_allowed_here`].
 #[must_use]
 pub fn is_preview() -> bool {
     let Some(document) = web_sys::window().and_then(|window| window.document()) else {
@@ -529,6 +532,43 @@ pub fn is_preview() -> bool {
         return false;
     };
     meta.get_attribute("content").as_deref() == Some("preview")
+}
+
+/// Whether this page may hold an account of its own.
+///
+/// Everything but a preview may. A preview may too, and only when somebody
+/// asks for it in the URL — `#preview-session` — because the person testing
+/// unmerged code on a preview is the one person who *wants* it to hold an
+/// account, and refusing them outright makes the preview useless for the
+/// thing it exists to preview.
+///
+/// The opt-in is what makes the default honest rather than absolute. Nobody
+/// reaches this by following a link: the account a preview would share the
+/// origin with is the deployment's, and someone who types the flag has said
+/// they know whose database is one directory over. What it does not do is
+/// make the two safe from each other — an origin is not a directory, and no
+/// flag changes that. It moves the decision to a person.
+#[must_use]
+pub fn session_allowed_here() -> bool {
+    !is_preview() || flag_present("preview-session")
+}
+
+/// A bare word in the fragment or the query, with no value after it.
+///
+/// [`find_parameter`] deliberately skips a pair it cannot split, because a
+/// valueless `daemon` is a typo rather than a request. A flag is the opposite:
+/// the word *is* the request, and `#preview-session=1` would be asking someone
+/// to type a value that means nothing.
+fn flag_present(name: &str) -> bool {
+    let Some(location) = web_sys::window().map(|window| window.location()) else {
+        return false;
+    };
+    let names = |text: String| {
+        text.trim_start_matches(['#', '?'])
+            .split('&')
+            .any(|pair| pair == name)
+    };
+    location.hash().is_ok_and(names) || location.search().is_ok_and(names)
 }
 
 /// One query parameter off the page's own URL.
