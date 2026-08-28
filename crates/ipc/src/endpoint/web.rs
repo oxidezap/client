@@ -557,6 +557,24 @@ fn decode_component(value: &str) -> Option<String> {
 ///
 /// A key the daemon does not hold, or a bridge that is not answering.
 pub async fn fetch_media(base: &str, key: &str) -> Result<Vec<u8>, String> {
+    fetch_media_within(base, key, MEDIA_TIMEOUT_MS).await
+}
+
+/// The same, under a deadline the caller chooses.
+///
+/// A frame's optional media and a download somebody asked for are not the
+/// same errand. The default here is the short one, for the history load whose
+/// thumbnails must not stall the stream; a requested attachment is promised a
+/// minute, and capping each individual transfer at thirty seconds meant the
+/// outer allowance was a fiction — the fetch was aborted, `Frames::apply`
+/// found no bytes, and the code waiting reported a failure for something the
+/// daemon had already cached.
+///
+/// # Errors
+///
+/// The browser refused the request, the bridge did not answer, or the
+/// deadline passed.
+pub async fn fetch_media_within(base: &str, key: &str, millis: i32) -> Result<Vec<u8>, String> {
     use wasm_bindgen_futures::JsFuture;
 
     let window = web_sys::window().ok_or("no window to fetch from")?;
@@ -575,7 +593,7 @@ pub async fn fetch_media(base: &str, key: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("could not arm a fetch timeout: {e:?}"))?;
     let options = web_sys::RequestInit::new();
     options.set_signal(Some(&abort.signal()));
-    let _timeout = FetchDeadline::arm(&window, &abort, MEDIA_TIMEOUT_MS)?;
+    let _timeout = FetchDeadline::arm(&window, &abort, millis)?;
 
     /// Aborts the request if this future is dropped before it finishes.
     ///

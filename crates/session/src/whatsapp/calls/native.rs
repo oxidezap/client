@@ -13,30 +13,243 @@ use super::super::*;
 use whatsapp_rust::voip::{CallHandle, CallTermination};
 
 /// Live call state shared between the event pump and the UI action methods.
+///
+/// One lock over all of it, and that is the whole point. A call moves
+/// *between* these collections — ringing to accepting to live, or to
+/// cancelled — and every invariant worth having spans two of them at once.
+/// With a mutex each, every transition was a check in one followed by an act
+/// in another, and the gap between them was reachable: a `<terminate>`
+/// landing there found the call in neither collection, recorded nothing, and
+/// the acceptance went on to file a live handle behind the `CallEnded` the
+/// window had already been sent. Narrowing that gap twice did not close it,
+/// because it cannot be closed from outside the lock.
 #[derive(Clone, Default)]
 pub struct CallRegistry {
-    /// Ringing offers by call id, consumed by accept/decline.
-    pending: Arc<Mutex<HashMap<String, Arc<WaIncomingCall>>>>,
-    /// Media-live calls by call id.
-    active: Arc<Mutex<HashMap<String, Arc<CallHandle>>>>,
-    /// Ids ended before any handle existed — the UI's placeholder id while
-    /// start_call is still connecting, or a peer's `<terminate>` arriving
-    /// while accept_call is opening the microphone. Whichever call is in
-    /// flight hangs these up on arrival.
-    cancelled: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// Acceptances in flight: the offer has left `pending` and no handle
-    /// exists yet.
-    ///
-    /// That gap is a real one — opening the audio devices and connecting the
-    /// relay both take time — and without it an ending has nowhere to be
-    /// recorded: `pending` no longer holds the call and `active` does not yet,
-    /// so a peer hanging up in that window removed nothing and the handle was
-    /// filed as live *after* the window had been told the call was over.
-    accepting: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// One mute lane per live call. Pruned against `active` where it grows,
-    /// so a call that ends takes its lane with it without every teardown
-    /// path having to remember.
+    calls: Arc<Mutex<Calls>>,
+    /// Apart, deliberately. A mute lane is a `std::sync::Mutex` because a
+    /// request is stamped on the caller's thread *before* its task exists —
+    /// see [`MuteLane`] — and it takes no part in the ringing/live/cancelled
+    /// invariants above.
     mute: Arc<std::sync::Mutex<HashMap<String, Arc<MuteLane>>>>,
+}
+
+/// What a cancel found to act on.
+pub(in crate::whatsapp) enum Cancelled {
+    /// A live call, handed back so the caller can terminate it.
+    Live(Arc<CallHandle>),
+    /// Nothing live yet, but a start is connecting and will honour this.
+    Deferred,
+    /// No such call.
+    Nothing,
+}
+
+/// Everything one lock covers.
+#[derive(Default)]
+struct Calls {
+    /// Ringing offers by call id, consumed by accept/decline.
+    pending: HashMap<String, Arc<WaIncomingCall>>,
+    /// Media-live calls by call id.
+    active: HashMap<String, Arc<CallHandle>>,
+    /// Ids ended before any handle existed — the UI's placeholder id while
+    /// `start_call` is still connecting, or a peer's `<terminate>` arriving
+    /// while `accept_call` is opening the microphone. Whichever call is in
+    /// flight hangs these up on arrival.
+    cancelled: HashSet<String>,
+    /// Acceptances in flight: the offer has left `pending` and no handle
+    /// exists yet. Opening the audio devices and connecting the relay both
+    /// take time, and an ending arriving in that window has nowhere else to
+    /// be written down.
+    in_flight: HashSet<String>,
+}
+
+impl CallRegistry {
+    /// Record a ringing offer, so accept and decline have something to act on.
+    pub(in crate::whatsapp) async fn offer(&self, call_id: String, call: Arc<WaIncomingCall>) {
+        self.calls.lock().await.pending.insert(call_id, call);
+    }
+
+    /// Forget a ringing offer, however it stopped ringing.
+    pub(in crate::whatsapp) async fn forget_offer(&self, call_id: &str) {
+        self.calls.lock().await.pending.remove(call_id);
+    }
+
+    /// Take a ringing offer for something that is *not* an acceptance.
+    ///
+    /// A decline needs the offer to reject it, and nothing about it is in
+    /// flight afterwards — so unlike [`Self::begin_accept`] there is no
+    /// window here for an ending to fall into.
+    pub(in crate::whatsapp) async fn forget_and_take_offer(
+        &self,
+        call_id: &str,
+    ) -> Option<Arc<WaIncomingCall>> {
+        self.calls.lock().await.pending.remove(call_id)
+    }
+
+    /// Take a ringing offer and mark its acceptance as in flight, together.
+    ///
+    /// One operation because they are one step: between leaving `pending` and
+    /// entering `in_flight` the call would be in nothing at all, which is the
+    /// state that has no answer for a peer hanging up.
+    pub(in crate::whatsapp) async fn begin_accept(
+        &self,
+        call_id: &str,
+    ) -> Option<Arc<WaIncomingCall>> {
+        let mut calls = self.calls.lock().await;
+        let offer = calls.pending.remove(call_id)?;
+        calls.in_flight.insert(call_id.to_string());
+        Some(offer)
+    }
+
+    /// File an accepted call as live — unless the peer ended it meanwhile.
+    ///
+    /// `false` means the window has already been told the call is over, so
+    /// the handle is not filed and the caller hangs it up locally. Both
+    /// answers leave `in_flight` empty for this id.
+    pub(in crate::whatsapp) async fn finish_accept(
+        &self,
+        call_id: &str,
+        handle: &Arc<CallHandle>,
+    ) -> bool {
+        let mut calls = self.calls.lock().await;
+        calls.in_flight.remove(call_id);
+        if calls.cancelled.remove(call_id) {
+            return false;
+        }
+        calls.active.insert(call_id.to_string(), Arc::clone(handle));
+        true
+    }
+
+    /// An acceptance that produced no handle. Says whether the peer had
+    /// already ended it, so a caller knows whether anyone is still ringing.
+    pub(in crate::whatsapp) async fn abandon_accept(&self, call_id: &str) -> bool {
+        let mut calls = self.calls.lock().await;
+        calls.in_flight.remove(call_id);
+        calls.cancelled.remove(call_id)
+    }
+
+    /// Mark an outgoing call as being placed, under the id the window drew.
+    pub(in crate::whatsapp) async fn begin_start(&self, placeholder: &str) {
+        self.calls
+            .lock()
+            .await
+            .in_flight
+            .insert(placeholder.to_string());
+    }
+
+    /// File a placed call as live under its real id — unless it was cancelled
+    /// while connecting, in which case the caller terminates it.
+    ///
+    /// The placeholder is what a cancel names, because it is the only id the
+    /// window had; the rename and the cancellation are answered together so a
+    /// cancel arriving between them cannot be lost.
+    pub(in crate::whatsapp) async fn finish_start(
+        &self,
+        placeholder: &str,
+        call_id: &str,
+        handle: &Arc<CallHandle>,
+    ) -> bool {
+        let mut calls = self.calls.lock().await;
+        calls.in_flight.remove(placeholder);
+        // Either name: the window cancels under the placeholder, and anything
+        // that learned the real id first cancels under that.
+        let cancelled = calls.cancelled.remove(placeholder) | calls.cancelled.remove(call_id);
+        if cancelled {
+            return false;
+        }
+        calls.active.insert(call_id.to_string(), Arc::clone(handle));
+        true
+    }
+
+    /// An outgoing call that never produced a handle.
+    pub(in crate::whatsapp) async fn abandon_start(&self, placeholder: &str) {
+        let mut calls = self.calls.lock().await;
+        calls.in_flight.remove(placeholder);
+        calls.cancelled.remove(placeholder);
+    }
+
+    /// The peer ended this call: drop the local side without answering.
+    ///
+    /// `hangup_local`, not `terminate`: they are the side that ended it, and
+    /// answering their `<terminate>` with one of our own says nothing they do
+    /// not already know. Only the local media task and the registry entry are
+    /// left to drop.
+    ///
+    /// Done here rather than by handing the handle back, so that a caller
+    /// never has to name a `CallHandle` — the type is the media stack's, and
+    /// the media stack is what a browser does not have.
+    ///
+    /// A call with no handle *yet* is the case the second half is for, and it
+    /// is decided under the same lock the handle would be filed under: an
+    /// acceptance in flight will produce one after this returns, so the news
+    /// is left where that acceptance is guaranteed to look for it.
+    pub(in crate::whatsapp) async fn ended_by_peer(&self, call_id: &str) {
+        let mut calls = self.calls.lock().await;
+        if let Some(handle) = calls.active.remove(call_id) {
+            tokio::spawn(async move { handle.hangup_local().await });
+            return;
+        }
+        if calls.in_flight.contains(call_id) {
+            calls.cancelled.insert(call_id.to_string());
+        }
+    }
+
+    /// Take a live call out, for a caller that is going to end it itself.
+    pub(in crate::whatsapp) async fn take_live(&self, call_id: &str) -> Option<Arc<CallHandle>> {
+        self.calls.lock().await.active.remove(call_id)
+    }
+
+    /// Ask for a live call without taking it.
+    pub(in crate::whatsapp) async fn live(&self, call_id: &str) -> Option<Arc<CallHandle>> {
+        self.calls.lock().await.active.get(call_id).cloned()
+    }
+
+    /// Cancel a call under whichever name the caller has for it.
+    ///
+    /// One operation, because the three answers are decided by the same
+    /// state: a live handle is taken and returned for the caller to
+    /// terminate; a call still connecting has the cancel written where
+    /// [`Self::finish_start`] will find it; anything else never existed. Done
+    /// separately, "no live handle" and "leave a note" were two lock
+    /// acquisitions with a gap between them — and a start filing its handle
+    /// in that gap consumed the note before it was written, so the abandoned
+    /// attempt rang on at the far end.
+    ///
+    /// A note is only left where something is in flight to receive it, or the
+    /// set would grow by one entry for every call that merely rang and
+    /// stopped.
+    pub(in crate::whatsapp) async fn cancel(&self, call_id: &str) -> Cancelled {
+        let mut calls = self.calls.lock().await;
+        calls.pending.remove(call_id);
+        if let Some(handle) = calls.active.remove(call_id) {
+            return Cancelled::Live(handle);
+        }
+        if calls.in_flight.contains(call_id) {
+            calls.cancelled.insert(call_id.to_string());
+            return Cancelled::Deferred;
+        }
+        Cancelled::Nothing
+    }
+
+    /// Mark an acceptance in flight without an offer, for tests.
+    ///
+    /// [`Self::begin_accept`] is the real entry and takes a `WaIncomingCall`,
+    /// which is `#[non_exhaustive]` upstream and so cannot be built here at
+    /// all. What these tests are about is where a call *is* — the transition
+    /// between in-flight and live-or-cancelled — rather than what its offer
+    /// said, and this reaches that state directly.
+    #[cfg(test)]
+    pub(in crate::whatsapp) async fn mark_accepting(&self, call_id: &str) {
+        self.calls
+            .lock()
+            .await
+            .in_flight
+            .insert(call_id.to_string());
+    }
+
+    /// Every id that currently names a live call, for pruning the mute lanes.
+    pub(in crate::whatsapp) async fn live_ids(&self) -> HashSet<String> {
+        self.calls.lock().await.active.keys().cloned().collect()
+    }
 }
 
 /// What keeps a call's mute requests in the order the daemon took them.
@@ -58,61 +271,6 @@ struct MuteLane {
     /// transitions, but it serializes them in arrival order, which is the
     /// order this exists to stop trusting.
     lane: Mutex<()>,
-}
-
-impl CallRegistry {
-    /// Record a ringing offer, so accept and decline have something to act on.
-    pub(in crate::whatsapp) async fn offer(&self, call_id: String, call: Arc<WaIncomingCall>) {
-        self.pending.lock().await.insert(call_id, call);
-    }
-
-    /// Forget a ringing offer, however it stopped ringing.
-    pub(in crate::whatsapp) async fn forget_offer(&self, call_id: &str) {
-        self.pending.lock().await.remove(call_id);
-    }
-
-    /// The peer ended this call: drop the local side without answering.
-    ///
-    /// `hangup_local`, not `terminate`: they are the side that ended it, and
-    /// answering their `<terminate>` with one of our own says nothing they do
-    /// not already know. Only the local media task and the registry entry are
-    /// left to drop.
-    ///
-    /// Done here rather than by handing the handle back, so that a caller
-    /// never has to name a `CallHandle` — the type is the media stack's, and
-    /// the media stack is what a browser does not have.
-    ///
-    /// A call with no handle *yet* is the case worth the second half: an
-    /// acceptance in flight will produce one after this returns, so the news
-    /// is left where that acceptance will look for it rather than dropped.
-    pub(in crate::whatsapp) async fn ended_by_peer(&self, call_id: &str) {
-        if let Some(handle) = self.active.lock().await.remove(call_id) {
-            tokio::spawn(async move { handle.hangup_local().await });
-            return;
-        }
-        // One lock at a time, and in this order everywhere: `accepting` is
-        // only ever read before `cancelled` is taken, never while holding it.
-        let in_flight = self.accepting.lock().await.contains(call_id);
-        if in_flight {
-            self.cancelled.lock().await.insert(call_id.to_string());
-        }
-    }
-
-    /// Note that an acceptance has begun, so an ending arriving mid-flight has
-    /// somewhere to be recorded.
-    pub(in crate::whatsapp) async fn accepting(&self, call_id: &str) {
-        self.accepting.lock().await.insert(call_id.to_string());
-    }
-
-    /// Note that an acceptance is over, and say whether the peer ended the
-    /// call while it was in flight.
-    ///
-    /// `true` means the window has already been told the call is over, so the
-    /// handle this answers for must not be filed as live.
-    pub(in crate::whatsapp) async fn accepted(&self, call_id: &str) -> bool {
-        self.accepting.lock().await.remove(call_id);
-        self.cancelled.lock().await.remove(call_id)
-    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -138,21 +296,20 @@ impl WhatsAppClient {
                 error!("Client not available for accepting call");
                 return;
             };
-            let Some(offer) = calls.pending.lock().await.remove(&call_id) else {
+            // Taken and marked in flight together: between leaving `pending`
+            // and being marked, the call would be in nothing at all, and a
+            // `<terminate>` landing there has nowhere to be written down.
+            let Some(offer) = calls.begin_accept(&call_id).await else {
                 warn!("No pending offer for call {}", call_id);
                 return;
             };
-            // From here until a handle exists the call is in neither map, so
-            // say so: a `<terminate>` landing in this window has nowhere else
-            // to be written down.
-            calls.accepting(&call_id).await;
             let (mic, speaker) = match open_call_audio().await {
                 Ok(audio) => audio,
                 Err(err) => {
                     error!("Audio device setup failed: {err}");
                     // Nothing was accepted, so there is nothing for a peer's
                     // ending to race any more.
-                    let ended_by_peer = calls.accepted(&call_id).await;
+                    let ended_by_peer = calls.abandon_accept(&call_id).await;
                     // The offer is consumed and no accept went out: reject
                     // so the caller stops ringing instead of waiting out
                     // the timeout. Unless they hung up first, in which case
@@ -176,7 +333,9 @@ impl WhatsAppClient {
             {
                 Ok(handle) => {
                     let handle = Arc::new(handle);
-                    if calls.accepted(&call_id).await {
+                    // Filed, or refused, under the one lock: there is no
+                    // moment where this call is neither in flight nor live.
+                    if !calls.finish_accept(&call_id, &handle).await {
                         // The peer hung up while this was connecting, and the
                         // window has already drawn the call as over. Filing
                         // the handle as live would leave a microphone open
@@ -192,16 +351,11 @@ impl WhatsAppClient {
                         return;
                     }
                     info!("Call {} media live", handle.call_id());
-                    calls
-                        .active
-                        .lock()
-                        .await
-                        .insert(call_id.clone(), handle.clone());
                     Self::watch_call_end(handle, calls.clone(), ui_sender.clone());
                 }
                 Err(e) => {
                     error!("Failed to start call media for {}: {}", call_id, e);
-                    calls.accepted(&call_id).await;
+                    calls.abandon_accept(&call_id).await;
                     Self::notify_call_ended(&ui_sender, &call_id).await;
                 }
             }
@@ -220,7 +374,7 @@ impl WhatsAppClient {
                 error!("Client not available for declining call");
                 return;
             };
-            let Some(offer) = calls.pending.lock().await.remove(&call_id) else {
+            let Some(offer) = calls.forget_and_take_offer(&call_id).await else {
                 warn!("No pending offer for call {}", call_id);
                 return;
             };
@@ -247,6 +401,10 @@ impl WhatsAppClient {
         }
 
         runtime.spawn(async move {
+            // Before the first await: a cancel arriving after this has
+            // somewhere to be written down, and one arriving before it finds
+            // nothing — which is right, because nothing has been placed.
+            calls.begin_start(&placeholder_id).await;
             let notify_failure = |error: String| {
                 let ui_sender = ui_sender.clone();
                 let recipient_jid = recipient_jid.clone();
@@ -255,7 +413,7 @@ impl WhatsAppClient {
                 let calls = calls.clone();
                 let placeholder_id = placeholder_id.clone();
                 async move {
-                    calls.cancelled.lock().await.remove(&placeholder_id);
+                    calls.abandon_start(&placeholder_id).await;
                     error!(
                         "Failed to start call to {}: {}",
                         observe_str(&recipient_jid),
@@ -292,9 +450,13 @@ impl WhatsAppClient {
             match client.voip().call(&jid).audio(mic, speaker).start().await {
                 Ok(handle) => {
                     let call_id = handle.call_id().to_string();
-                    // Cancelled while still connecting: the UI only knew
-                    // the placeholder id, so honor it here.
-                    if calls.cancelled.lock().await.remove(&placeholder_id) {
+                    let handle = Arc::new(handle);
+                    // The rename and the cancellation are one decision. The
+                    // window only ever knew the placeholder, so a cancel
+                    // names that — and answering it separately from filing
+                    // the handle left a gap where the cancel was consumed
+                    // before it was written and the call rang on.
+                    if !calls.finish_start(&placeholder_id, &call_id, &handle).await {
                         info!("Outgoing call {} cancelled before start", call_id);
                         // The offer is already out: every device it rang is
                         // ringing, and dropping our side silently would leave
@@ -309,12 +471,6 @@ impl WhatsAppClient {
                         call_id,
                         observe_str(&recipient_jid)
                     );
-                    let handle = Arc::new(handle);
-                    calls
-                        .active
-                        .lock()
-                        .await
-                        .insert(call_id.clone(), handle.clone());
                     Self::watch_call_end(handle, calls.clone(), ui_sender.clone());
                     if let Some(tx) = ui_sender.lock().await.as_ref() {
                         let _ = tx.send(UiEvent::OutgoingCallStarted {
@@ -336,15 +492,18 @@ impl WhatsAppClient {
         let runtime = self.runtime.clone();
 
         runtime.spawn(async move {
-            // Still ringing and never answered: nothing live to hang up.
-            calls.pending.lock().await.remove(&call_id);
-            if let Some(handle) = calls.active.lock().await.remove(&call_id) {
-                log_termination(&call_id, handle.terminate().await);
-            } else {
-                // No handle yet (start_call still connecting under a UI
-                // placeholder id): remember the cancel so it lands.
-                debug!("cancel_call: no live handle for {}, deferring", call_id);
-                calls.cancelled.lock().await.insert(call_id);
+            match calls.cancel(&call_id).await {
+                Cancelled::Live(handle) => {
+                    log_termination(&call_id, handle.terminate().await);
+                }
+                Cancelled::Deferred => {
+                    // `start_call` is still connecting under the placeholder
+                    // id the window drew; it honours this on arrival.
+                    debug!("cancel_call: no live handle for {}, deferring", call_id);
+                }
+                Cancelled::Nothing => {
+                    debug!("cancel_call: nothing to cancel for {}", call_id);
+                }
             }
         });
     }
@@ -397,15 +556,14 @@ impl WhatsAppClient {
             // answer-transition lane, and holding the registry across that
             // would stall every other call's bookkeeping behind one peer.
             let handle = {
-                let active = calls.active.lock().await;
-                let handle = active.get(&call_id).cloned();
+                let live = calls.live_ids().await;
                 // Where the lane map grows is where it is swept.
                 calls
                     .mute
                     .lock()
                     .expect("mute lanes poisoned")
-                    .retain(|id, _| active.contains_key(id));
-                handle
+                    .retain(|id, _| live.contains(id));
+                calls.live(&call_id).await
             };
             let Some(handle) = handle else {
                 debug!("set_call_muted: no live handle for {}", call_id);
@@ -461,7 +619,7 @@ impl WhatsAppClient {
         tokio::spawn(async move {
             handle.wait_ended().await;
             let call_id = handle.call_id().to_string();
-            calls.active.lock().await.remove(&call_id);
+            calls.take_live(&call_id).await;
             // Every call that ever had a handle drains through here, whatever
             // ended it, so this is where a lane is paid for. The sweep in
             // `set_call_muted` is not made redundant by it: a window that fell
@@ -553,37 +711,33 @@ mod tests {
     /// The window between an offer leaving `pending` and a handle reaching
     /// `active` is a real one — opening the audio devices and connecting the
     /// relay both take time — and a `<terminate>` landing inside it used to
-    /// find the call in neither map, remove nothing, and let the acceptance
-    /// file a live handle behind the `CallEnded` the window had already been
-    /// sent. A microphone open under a call nobody thought was happening.
+    /// find the call in neither collection, remove nothing, and let the
+    /// acceptance file a live handle behind the `CallEnded` the window had
+    /// already been sent. A microphone open under a call nobody thought was
+    /// happening.
     #[tokio::test]
     async fn a_peer_ending_a_call_mid_acceptance_is_not_lost() {
         let calls = CallRegistry::default();
-
-        // The offer has left `pending`; no handle exists yet.
-        calls.accepting("call-1").await;
-
-        // The peer hangs up in exactly that window.
+        calls.mark_accepting("call-1").await;
         calls.ended_by_peer("call-1").await;
 
-        // The acceptance finishes and asks. It has to hear about it.
         assert!(
-            calls.accepted("call-1").await,
+            calls.abandon_accept("call-1").await,
             "an ending that arrived mid-acceptance must reach the acceptance"
         );
     }
 
-    /// And it is spent once, so a later acceptance of a *different* call with
-    /// a reused id is not cancelled by a stale note.
+    /// And it is spent once, so a later acceptance of a call with a reused id
+    /// is not cancelled by a stale note.
     #[tokio::test]
     async fn a_peer_ending_is_reported_once() {
         let calls = CallRegistry::default();
-        calls.accepting("call-1").await;
+        calls.mark_accepting("call-1").await;
         calls.ended_by_peer("call-1").await;
 
-        assert!(calls.accepted("call-1").await);
+        assert!(calls.abandon_accept("call-1").await);
         assert!(
-            !calls.accepted("call-1").await,
+            !calls.abandon_accept("call-1").await,
             "the note is consumed by the acceptance that acted on it"
         );
     }
@@ -595,14 +749,44 @@ mod tests {
         let calls = CallRegistry::default();
         calls.ended_by_peer("call-1").await;
 
-        calls.accepting("call-1").await;
+        calls.mark_accepting("call-1").await;
         assert!(
-            !calls.accepted("call-1").await,
+            !calls.abandon_accept("call-1").await,
             "an ending before the acceptance began is not this acceptance's"
         );
     }
 
-    /// A lone request is nobody's stale task: it applies, and it is the one
+    /// A cancel for a call that is still connecting has to survive until the
+    /// handle exists.
+    ///
+    /// The window only ever knew the placeholder id, so that is what it
+    /// cancels under. Answering the cancel separately from filing the handle
+    /// left a gap where a start consumed the note before it was written —
+    /// and the abandoned attempt then rang at the far end until its transport
+    /// gave up.
+    #[tokio::test]
+    async fn a_cancel_while_connecting_reaches_the_start() {
+        let calls = CallRegistry::default();
+        calls.begin_start("placeholder-1").await;
+
+        assert!(
+            matches!(calls.cancel("placeholder-1").await, Cancelled::Deferred),
+            "nothing is live yet, so the cancel is left for the start"
+        );
+    }
+
+    /// And a cancel with nothing in flight is not remembered, for the same
+    /// reason an ending is not.
+    #[tokio::test]
+    async fn a_cancel_with_nothing_in_flight_is_not_remembered() {
+        let calls = CallRegistry::default();
+        assert!(matches!(
+            calls.cancel("placeholder-1").await,
+            Cancelled::Nothing
+        ));
+    }
+
+    /// A lone request is nobody's stale task    /// A lone request is nobody's stale task: it applies, and it is the one
     /// that answers for what the device really did.
     #[test]
     fn a_single_mute_request_is_the_newest_one() {

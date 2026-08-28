@@ -146,10 +146,14 @@ async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched, pending: 
     } else {
         FRAME_MEDIA_BUDGET
     };
+    // The per-fetch deadline as well as the one over the sequence. Raising
+    // only the outer one left an inner thirty-second timer aborting the
+    // transfer anyway, which is the same failure wearing a different hat.
+    let each = i32::try_from(budget.as_millis()).unwrap_or(i32::MAX);
 
     let all = async {
         for key in frames::media_keys(message, pending) {
-            match web::fetch_media(base, &key).await {
+            match web::fetch_media_within(base, &key, each).await {
                 Ok(bytes) => into.put(key, bytes),
                 Err(e) => log::debug!("media {key} is not available: {e}"),
             }
