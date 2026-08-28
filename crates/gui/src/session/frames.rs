@@ -189,7 +189,9 @@ impl<'a> Frames<'a> {
                     debug!("a download answer arrived for {id}, which nobody is waiting on");
                     return ControlFlow::Continue(());
                 };
-                let bytes = self.media.read(&key);
+                // Taken rather than read: this is the answer to one request
+                // and the page's only copy of it. See `MediaCache::read_once`.
+                let bytes = self.media.read_once(&key);
                 match waiting {
                     Awaiting::Download(tx) => {
                         let _ = tx.send(bytes);

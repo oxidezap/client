@@ -696,24 +696,34 @@ impl WhatsAppClient {
         let lost = self.camera_lost();
         let call_id = call_id.to_string();
 
+        // On the caller's thread, before the spawn, and it is the same reason
+        // `start_call` marks itself there: spawning is not sequencing. Accept
+        // followed straight by Hang Up produces two tasks, and the cancel's
+        // can run first — taking the offer out of `pending`, finding neither
+        // a live call nor one in flight, and answering `Nothing`. The accept
+        // would then find no offer and return having sent nothing at all: no
+        // accept, no reject, no terminate, and a caller left ringing until
+        // their own timeout with every window already showing the call gone.
+        //
+        // Taking the offer and marking the acceptance is one step under one
+        // lock, because between them the call would be in nothing at all —
+        // which is the state that has no answer for a peer hanging up.
+        let Some(offer) = self.calls.begin_accept(&call_id) else {
+            warn!("No pending offer for call {}", call_id);
+            return;
+        };
+
         self.exec.spawn(async move {
-            let Some(client) = client_handle.lock().await.clone() else {
-                error!("Client not available for accepting call");
-                return;
-            };
-            // From the moment the offer leaves `pending` there is neither an
-            // offer nor a handle for anything ending this call to act on, and
-            // the in-flight set is what it acts on instead — entered under
-            // the same lock that consumes the offer, because two steps leave
-            // a moment where a remote termination finds neither, leaves no
-            // note, and the accept goes on to answer a call nobody is on.
-            let Some(offer) = calls.begin_accept(&call_id) else {
-                warn!("No pending offer for call {}", call_id);
-                return;
-            };
+            // First, so that every path out of here clears the in-flight mark
+            // — including the one below, which is the only one that can fail
+            // before anything has been said to anybody.
             let _accepting = AcceptGuard {
                 calls: calls.clone(),
                 call_id: call_id.clone(),
+            };
+            let Some(client) = client_handle.lock().await.clone() else {
+                error!("Client not available for accepting call");
+                return;
             };
             let (mic, speaker) = match open_call_audio().await {
                 Ok(audio) => audio,

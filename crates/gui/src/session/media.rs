@@ -26,6 +26,23 @@ pub trait MediaCache: Send + Sync {
     /// before the frame reaches it.
     fn read(&self, key: &str) -> Result<Vec<u8>, String>;
 
+    /// The bytes answering a request somebody is waiting on.
+    ///
+    /// Separate from [`read`](Self::read) because the two have different
+    /// readers. A frame's media is content-addressed and one frame can name
+    /// the same key on several messages, so reading it must leave it there; a
+    /// download is the answer to one request, named once, and handing it over
+    /// is the last thing that happens to it. Where holding both copies costs
+    /// something — a page, whose only copy this is, and whose address space a
+    /// large attachment can fill twice over — that difference is the whole
+    /// point.
+    ///
+    /// Defaults to [`read`](Self::read), which is right wherever the bytes
+    /// live somewhere this side does not own.
+    fn read_once(&self, key: &str) -> Result<Vec<u8>, String> {
+        self.read(key)
+    }
+
     /// Put bytes where the daemon will look for them.
     ///
     /// The one direction that goes the other way: a voice note is recorded by
@@ -116,6 +133,21 @@ impl MediaCache for Fetched {
             .unwrap_or_else(|e| e.into_inner())
             .get(key)
             .cloned()
+            .ok_or_else(|| format!("media {key} was not fetched with its frame"))
+    }
+
+    /// Moved out, not copied.
+    ///
+    /// This map is the page's only copy, and a document can be hundreds of
+    /// megabytes: cloning it would hold two in a linear memory that has a
+    /// ceiling, for as long as it takes the next frame to clear the map.
+    /// Nothing else is going to ask for this key — a download answers one
+    /// request — so there is nothing to leave behind.
+    fn read_once(&self, key: &str) -> Result<Vec<u8>, String> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key)
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
     }
 
