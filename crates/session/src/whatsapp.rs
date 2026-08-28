@@ -381,6 +381,18 @@ pub struct CallRegistry {
     /// it. Turning the camera on while one is parked answers it; turning it
     /// on with none parked asks a question of our own.
     upgrades: Arc<Mutex<HashMap<String, VideoUpgradeToken>>>,
+    /// The camera an upgrade *we* asked for was opened with, until the peer
+    /// answers.
+    ///
+    /// A refusal arrives seconds later, and in those seconds the camera can
+    /// have been turned off and on again — so the answer names which camera
+    /// it was about, exactly as a camera's own loss does. Without it a
+    /// refusal tears down whichever camera happens to be held, which is the
+    /// replacement, belonging to a request nobody refused.
+    ///
+    /// A stale entry is inert rather than dangerous: camera ids are never
+    /// reused, so one naming a camera that has gone matches nothing.
+    upgrading: Arc<Mutex<HashMap<String, crate::video::CameraId>>>,
 }
 
 /// What keeps a call's mute requests in the order the daemon took them.
@@ -2463,13 +2475,26 @@ impl WhatsAppClient {
                     // which is otherwise the periodic one, seconds away.
                     local.drawable();
                     local.request_keyframe();
+                    // Read before the camera is handed over, because a
+                    // refusal for an upgrade of ours may be seconds away and
+                    // the device held by then may be a later one.
+                    let camera_id = local.camera_id();
+                    let ours_to_be_answered = answering.is_none();
                     // The announcement landed and the device may not have
                     // survived it: the peer has this direction enabled and is
                     // waiting on a picture, and `settle_video` below says off
                     // only on this side. A call that ended in the meantime has
                     // nobody to tell.
-                    if Self::hold_camera(&calls, &call_id, local).await == Camera::Died {
-                        Self::stop_peer_video(&handle, &call_id).await;
+                    match Self::hold_camera(&calls, &call_id, local).await {
+                        Camera::Died => Self::stop_peer_video(&handle, &call_id).await,
+                        Camera::Held if ours_to_be_answered => {
+                            calls
+                                .upgrading
+                                .lock()
+                                .await
+                                .insert(call_id.clone(), camera_id);
+                        }
+                        Camera::Held | Camera::CallEnded => {}
                     }
                 }
                 Err(e) => {
@@ -3086,6 +3111,8 @@ impl WhatsAppClient {
                 Self::announce_video_request(ui_sender, call_id, true).await;
             }
             VideoState::Enabled => {
+                // Whatever we were waiting on an answer for has had one.
+                calls.upgrading.lock().await.remove(call_id);
                 Self::announce_video(ui_sender, call_id, VideoStream::Remote, true).await;
             }
             // Paused is drawn the same as off, and deliberately: a peer whose
@@ -3107,7 +3134,20 @@ impl WhatsAppClient {
             // with every window saying our video was on.
             VideoState::UpgradeReject | VideoState::UpgradeRejectByTimeout => {
                 Self::withdraw_video_request(calls, ui_sender, call_id).await;
-                Self::stop_local_video(calls, ui_sender, call_id, None).await;
+                // Only the camera the refused request was opened with. A
+                // refusal is seconds of wire away from the ask, and a user
+                // who turned video off and on again in the meantime has a
+                // camera nobody has refused — one that would otherwise be
+                // torn down by its predecessor's answer.
+                let refused = calls.upgrading.lock().await.remove(call_id);
+                match refused {
+                    Some(camera_id) => {
+                        Self::stop_local_video(calls, ui_sender, call_id, Some(camera_id)).await;
+                    }
+                    // Nothing of ours was waiting on an answer: the camera in
+                    // the registry, if any, belongs to something else.
+                    None => debug!("Refused video upgrade on {call_id} names no camera of ours"),
+                }
             }
             // Their request, withdrawn or timed out. Nothing about either
             // camera changed; what has changed is that there is no longer a
@@ -3115,6 +3155,11 @@ impl WhatsAppClient {
             // be pointing at a peer who has stopped waiting.
             VideoState::UpgradeCancel | VideoState::UpgradeCancelByTimeout => {
                 Self::withdraw_video_request(calls, ui_sender, call_id).await;
+            }
+            // The peer took the upgrade, so there is no refusal coming for
+            // the camera it was asked with.
+            VideoState::UpgradeAccept => {
+                calls.upgrading.lock().await.remove(call_id);
             }
             // `UpgradeAccept` is answered by the `Enabled` that follows it,
             // which is the state that actually says a camera is on.
@@ -3134,6 +3179,7 @@ impl WhatsAppClient {
             // as long as the process lived.
             let camera = calls.cameras.lock().await.remove(&call_id);
             calls.upgrades.lock().await.remove(&call_id);
+            calls.upgrading.lock().await.remove(&call_id);
             calls
                 .video
                 .lock()
