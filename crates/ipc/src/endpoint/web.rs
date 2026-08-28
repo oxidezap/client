@@ -546,7 +546,14 @@ fn parameter_of(search: &str, name: &str) -> Option<String> {
 /// account anyway.
 ///
 /// The refusal it drives is a default rather than a wall — see
-/// [`session_allowed_here`].
+/// [`session_allowed_here`] — and it is worth being clear about what kind of
+/// thing it is. It stops somebody wandering into a preview and pairing an
+/// account there beside the deployment's. It is **not** a boundary: a preview
+/// is built from its own branch's source, so that branch is free to delete
+/// this check, and origin-scoped storage is readable by anything on the
+/// origin regardless. What bounds that is who may publish a preview at all —
+/// same-repository branches, which already require push access. See the
+/// header of `.github/workflows/pages.yml`.
 #[must_use]
 pub fn is_preview() -> bool {
     let Some(document) = web_sys::window().and_then(|window| window.document()) else {

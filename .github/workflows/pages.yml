@@ -1,9 +1,8 @@
 # The web front end, built to a static bundle and published to GitHub Pages.
 #
-# The bundle is the window and nothing else: it holds no session, opens no
-# socket of its own, and needs no server to be *hosted*. It attaches to an
-# `oxidezapd` the visitor runs themselves, which is what the deployed page
-# says on its loading screen.
+# The bundle needs no server to be *hosted*: it either attaches to an
+# `oxidezapd` the visitor runs themselves, or runs the whole client — session,
+# store and window — in the page.
 #
 # Two things are published from one branch, `gh-pages`:
 #
@@ -11,12 +10,25 @@
 #   /pr/<n>/     one preview per open pull request, removed when it closes
 #
 # A preview shares the site's *origin*: an `Origin` is scheme, host and port,
-# and a path is none of those. So `--web-allow`-ing the published site allows
-# every preview beside it, unmerged code included. What keeps that from being
-# a way in is that the origin is not the daemon's admission check — the token
-# is, and it reaches a page only by someone pasting it, which is the same act
-# as deciding to trust that page. Anyone who wants the two genuinely apart
-# wants a second Pages site, not a second directory.
+# and a path is none of those. That used to cost little, because the page held
+# nothing — the daemon's admission check is a token, and a token reaches a
+# page only by somebody pasting it, which is the same act as deciding to trust
+# that page.
+#
+# It costs more now. A page that runs its own session keeps the account in
+# origin-scoped storage, and origin-scoped storage does not know about
+# directories: code served under `/pr/<n>/` can read the deployed site's
+# database directly, credentials included, with no token anywhere in the way.
+# The published bundle refuses to *start* a session unless asked
+# (`#preview-session`), and that is worth having — but it is a guard against
+# somebody wandering in, not a boundary: a preview is built from its own
+# branch's source, so that branch's code is free to skip the check.
+#
+# What actually bounds it is who can publish one. Previews are same-repository
+# only (see the condition below), and opening such a branch already requires
+# push access — so preview code is written by someone who could put it on
+# `main`. Anyone who wants the two genuinely apart wants a second Pages site,
+# which is a second origin; a second directory can never be one.
 #
 # A branch rather than the Pages *artifact* deployment, because an artifact
 # replaces the whole site and there is no way to put a preview beside it. That
