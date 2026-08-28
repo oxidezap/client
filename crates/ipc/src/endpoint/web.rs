@@ -661,7 +661,7 @@ fn decode_component(value: &str) -> Option<String> {
 ///
 /// A key the daemon does not hold, or a bridge that is not answering.
 pub async fn fetch_media(base: &str, key: &str) -> Result<Vec<u8>, String> {
-    fetch_media_within(base, key, MEDIA_TIMEOUT_MS).await
+    fetch_media_within(base, key, MEDIA_TIMEOUT_MS, u64::MAX).await
 }
 
 /// The same, under a deadline the caller chooses.
@@ -678,7 +678,12 @@ pub async fn fetch_media(base: &str, key: &str) -> Result<Vec<u8>, String> {
 ///
 /// The browser refused the request, the bridge did not answer, or the
 /// deadline passed.
-pub async fn fetch_media_within(base: &str, key: &str, millis: i32) -> Result<Vec<u8>, String> {
+pub async fn fetch_media_within(
+    base: &str,
+    key: &str,
+    millis: i32,
+    most: u64,
+) -> Result<Vec<u8>, String> {
     use wasm_bindgen_futures::JsFuture;
 
     let window = web_sys::window().ok_or("no window to fetch from")?;
@@ -734,6 +739,29 @@ pub async fn fetch_media_within(base: &str, key: &str, millis: i32) -> Result<Ve
         return Err(format!(
             "the daemon has no media under {key} ({})",
             response.status()
+        ));
+    }
+    // Before the body is materialized, which is the only place the question
+    // can be asked usefully: `array_buffer` allocates the whole payload, so a
+    // caller that checks a budget *after* it has already spent what it was
+    // trying not to. Dropping out here aborts the request too, through
+    // `AbortOnDrop`.
+    //
+    // Best-effort by nature — a response may carry no `Content-Length`, and
+    // then this cannot know until it has read it. That is not a hole worth
+    // closing with a streaming reader here: the caller's own running total
+    // still stops the *next* fetch, so what an absent length costs is one
+    // payload of overshoot rather than an unbounded sequence.
+    if let Some(length) = response
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        && length > most
+    {
+        return Err(format!(
+            "media {key} is {length} bytes, past the {most} this frame has left"
         ));
     }
     let buffer = JsFuture::from(

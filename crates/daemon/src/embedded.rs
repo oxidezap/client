@@ -91,7 +91,7 @@ struct Service {
 /// Start this page's session if it is not already running, and hand back what
 /// a connection needs to talk to it.
 async fn service() -> Result<(Arc<StateHub>, session_bridge::Commands), StartFailed> {
-    if let Some(running) = running() {
+    if let Some(running) = running()? {
         return Ok(running);
     }
 
@@ -106,7 +106,7 @@ async fn service() -> Result<(Arc<StateHub>, session_bridge::Commands), StartFai
     // agent runs other tasks in the meantime. Two `start`s racing would
     // otherwise both build a session, and the second would be the one every
     // later connection got — over a store the first one has open.
-    if let Some(running) = running() {
+    if let Some(running) = running()? {
         drop(claim);
         return Ok(running);
     }
@@ -145,14 +145,36 @@ async fn service() -> Result<(Arc<StateHub>, session_bridge::Commands), StartFai
 /// with no receiver, so the page would look connected and answer nothing.
 /// Forgetting it here also drops the claim, which is what lets the next
 /// session take one of its own.
-fn running() -> Option<(Arc<StateHub>, session_bridge::Commands)> {
+fn running() -> Result<Option<(Arc<StateHub>, session_bridge::Commands)>, StartFailed> {
     SERVICE.with(|cell| {
         let mut slot = cell.borrow_mut();
+
+        // Gone: the bridge exited, so its receiver is dropped. Forgetting the
+        // entry is what releases the claim, and the next caller takes a fresh
+        // one for a fresh session.
         if slot.as_ref().is_some_and(|s| s.commands.is_closed()) {
             *slot = None;
         }
-        slot.as_ref()
-            .map(|running| (Arc::clone(&running.hub), running.commands.clone()))
+
+        // Going: `ForgetSession` has been accepted and the session is closing
+        // and wiping, which it does with its command channel still open. This
+        // is the window "clear data and pair again" runs in — the front end
+        // sends the command and reconnects at once — and handing back this
+        // service would serve the new pipe the account that is being deleted,
+        // out of a hub nothing will update again.
+        //
+        // Not forgotten, because the store is still open behind it: dropping
+        // the claim here would let a second session start over a database the
+        // first has not let go of. So the honest answer is neither the old
+        // service nor a new one, but "ask again in a moment" — which is what
+        // the front end's ordinary reconnect already does.
+        if slot.is_some() && session_bridge::stopping() {
+            return Err(StartFailed::Stopping);
+        }
+
+        Ok(slot
+            .as_ref()
+            .map(|running| (Arc::clone(&running.hub), running.commands.clone())))
     })
 }
 
@@ -170,12 +192,20 @@ pub enum StartFailed {
     /// Something else already holds this account. The string says who, as far
     /// as the platform can tell, and is written for the person reading it.
     Claimed(String),
+    /// This page's own session is closing — it has been told to forget the
+    /// account — and the next one cannot start until it has.
+    ///
+    /// The opposite of [`Claimed`](Self::Claimed) in the one way that
+    /// matters: asking again *is* what fixes it, so this must not reach the
+    /// window as a settled refusal.
+    Stopping,
 }
 
 impl std::fmt::Display for StartFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Claimed(who) => f.write_str(who),
+            Self::Stopping => f.write_str("the previous session is still closing"),
         }
     }
 }

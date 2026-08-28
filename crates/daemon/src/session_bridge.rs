@@ -200,11 +200,32 @@ enum Answer {
 /// session would be torn down by `Drop` with nobody waiting for its thread to
 /// disconnect and close SQLite. Owning the signal is what makes the teardown
 /// below reachable on every exit path.
+/// Whether the session is on its way out and must not be handed to anybody
+/// new.
+///
+/// `ForgetSession` is deferred rather than done where it is accepted — the
+/// file to delete is the one the session still has open — so between the
+/// command being taken and the loop ending, this bridge is alive, reading
+/// commands, and about to wipe the store. A caller that measured "alive" by
+/// the command channel being open would attach to it and be served the
+/// account it just asked to have deleted.
+///
+/// Process-global because a process has one session; the one reader is
+/// [`crate::embedded`], which cannot see this bridge's own state.
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the running session has begun going away.
+pub fn stopping() -> bool {
+    STOPPING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub async fn run(
     hub: Arc<StateHub>,
     mut commands: tokio::sync::mpsc::Receiver<SessionCommand>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    // This session is new, whatever the last one was doing.
+    STOPPING.store(false, std::sync::atomic::Ordering::SeqCst);
     let mut client = WhatsAppClient::new().context("opening the local store")?;
     let mut events = client
         .start()
@@ -901,6 +922,10 @@ impl Bridge {
             // that, and reusing that path is what makes the ordering hold.
             Action::ForgetSession => {
                 self.forget = true;
+                // Said out loud, because somebody else has to hear it: on a
+                // page a front end reconnects the instant it sends this, and
+                // whatever answers must not be the session that is leaving.
+                STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
                 CommandOutcome::Accepted
             }
         }

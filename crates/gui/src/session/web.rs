@@ -212,14 +212,18 @@ async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched, pending: 
     let all = async {
         let mut held: u64 = 0;
         for key in frames::media_keys(message, pending) {
-            if held >= ceiling {
+            let Some(left) = ceiling.checked_sub(held).filter(|left| *left > 0) else {
                 // Not an error, and not worth a per-key line: the renderer
                 // draws media it does not have as an offer to download, which
                 // is exactly what it does for media the daemon never cached.
                 log::debug!("this frame's media passed its size budget; the rest is on demand");
                 break;
-            }
-            match web::fetch_media_within(base, &key, each).await {
+            };
+            // What is left rather than the whole ceiling, and checked against
+            // the response's own length before its body is read: a total that
+            // is only consulted between fetches is one an oversized payload
+            // walks straight past.
+            match web::fetch_media_within(base, &key, each, left).await {
                 Ok(bytes) => {
                     held = held.saturating_add(bytes.len() as u64);
                     into.put(key, bytes);

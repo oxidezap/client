@@ -155,7 +155,17 @@ pub fn cache_usage() -> (u64, u64) {
 pub fn wipe(scope: Wipe) -> Result<()> {
     with(|cache| {
         cache.entries.retain(|name, entry| {
-            let taken = scope.takes(name);
+            // A pinned entry survives a *cache* clear, for the same reason it
+            // survives the sweep: somebody asked for these bytes, the request
+            // has already been answered `Ok`, and the reader is on its way.
+            // "Clear cached media" means the copies of things that can be
+            // fetched again; this one is a delivery in progress, and dropping
+            // it turns a download WhatsApp completed into a failure.
+            //
+            // `Wipe::Everything` takes it regardless: there the account
+            // itself is going, and nothing that was going to be shown to it
+            // has any business outliving it.
+            let taken = scope.takes(name) && !(entry.pinned && scope == Wipe::Cache);
             if taken {
                 cache.held = cache.held.saturating_sub(entry.bytes.len() as u64);
             }
