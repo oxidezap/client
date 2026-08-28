@@ -44,6 +44,8 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 bytes = "1"
 futures-channel = "0.3"
+# `or`, for racing a future against its own cancellation.
+futures-lite = "2"
 getrandom = { workspace = true }
 getrandom_02 = { workspace = true }
 js-sys = "0.3"

@@ -35,42 +35,41 @@ unsafe impl Send for BrowserRuntime {}
 unsafe impl Sync for BrowserRuntime {}
 
 impl Runtime for BrowserRuntime {
-    /// Spawned on the page's microtask queue, and cancellable through a flag
-    /// the task itself checks.
+    /// Spawned on the page's microtask queue, and cancellable.
     ///
-    /// `spawn_local` hands back nothing to cancel with, so the handle flips a
-    /// cell the wrapper reads before each poll. That stops the task at its
-    /// next suspension rather than instantly, which is the same guarantee
-    /// `tokio`'s abort gives.
+    /// `spawn_local` hands back nothing to cancel with, so the task races the
+    /// future against a channel the handle closes. A flag checked before the
+    /// await would not do: a future that returns `Pending` is not polled
+    /// again until something wakes it, so setting a flag would cancel
+    /// nothing and the future would go on to run its side effects whenever
+    /// it next woke. Dropping the sender wakes the receiver, which is what
+    /// makes this an abort rather than a wish.
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) -> AbortHandle {
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        let aborted = Rc::new(Cell::new(false));
-        let watched = Rc::clone(&aborted);
+        let (cancel, cancelled) = futures_channel::oneshot::channel::<()>();
         spawn_local(async move {
-            if watched.get() {
-                return;
-            }
-            future.await;
+            futures_lite::future::or(future, async move {
+                // Resolves when the handle is dropped or aborted, and never
+                // otherwise: the sender is only ever closed, never sent on.
+                let _ = cancelled.await;
+            })
+            .await;
         });
 
-        // The flag crosses into the handle, which upstream requires to be
-        // `Send`. It never leaves this thread — there is only one — and the
-        // pointer is moved rather than shared.
-        struct OneThread(Rc<Cell<bool>>);
+        // The sender crosses into the handle, which upstream requires to be
+        // `Send`. It never leaves this thread — there is only one — and it is
+        // moved rather than shared.
+        struct OneThread(futures_channel::oneshot::Sender<()>);
         unsafe impl Send for OneThread {}
         impl OneThread {
             /// A method rather than a field read at the call site: a closure
-            /// in edition 2021 captures the *field* it touches, so
-            /// `move || carried.0.set(true)` would capture the `Rc` and leave
-            /// this wrapper — and its `Send` — behind. Reaching through a
-            /// method captures the whole thing, which is the point.
-            fn abort(&self) {
-                self.0.set(true);
+            /// in edition 2021 captures the *field* it touches, so reaching
+            /// for `.0` directly would capture the sender and leave this
+            /// wrapper — and its `Send` — behind.
+            fn abort(self) {
+                drop(self.0);
             }
         }
-        let carried = OneThread(aborted);
+        let carried = OneThread(cancel);
         AbortHandle::new(move || carried.abort())
     }
 

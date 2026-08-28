@@ -5767,6 +5767,8 @@ dependencies = [
 name = "oxidezap-ipc"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
+ "futures-lite",
  "js-sys",
  "libc",
  "log",
@@ -5791,6 +5793,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-channel",
+ "futures-lite",
  "getrandom 0.2.17",
  "getrandom 0.4.3",
  "js-sys",

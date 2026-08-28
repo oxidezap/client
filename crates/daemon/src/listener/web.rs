@@ -81,6 +81,20 @@ const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// The most a request head may be before it is refused.
 const MAX_HEAD: usize = 16 * 1024;
 
+/// How many connections may be *waiting to say who they are*.
+///
+/// [`ClientSlots`] counts front ends, and a front end is something that has
+/// already presented a token and completed an upgrade. Before that, every
+/// accepted socket costs a task and a descriptor for up to [`HEAD_TIMEOUT`],
+/// and nothing had bounded how many of those there could be: a loop opening
+/// connections and saying nothing would take the process's descriptors down
+/// with it, and the IPC endpoint beside it with them.
+///
+/// Generous, because this is also the media path and a page fetching a
+/// screenful of photos opens several at once. It is a ceiling on a stall,
+/// not a rate limit.
+const MAX_PENDING: usize = 128;
+
 /// Serve until the future is dropped.
 ///
 /// # Errors
@@ -126,14 +140,26 @@ pub async fn run(
             config.allowed_origins.join(", ")
         }
     );
-    // The token is the whole of the admission check, so it is printed rather
-    // than left for the user to find: a page cannot read it off the disk, and
-    // the only way it reaches one is a person pasting it.
-    log::info!(
-        "point a page at it with ?daemon=ws://{}{WEB_SOCKET_PATH}?token={}",
-        config.addr,
-        config.token
-    );
+    // The path, not the token. It is a bearer credential: anything that has
+    // it is this user as far as the endpoint is concerned, and a log is the
+    // one artefact people paste into issues. The file it names is the
+    // restricted channel already — `0600`, in the user's own directory — so
+    // saying where it is tells the person who may read it everything and
+    // tells a log reader nothing.
+    if let Some(path) = oxidezap_ipc::web_token_path() {
+        log::info!(
+            "point a page at ?daemon=ws://{}{WEB_SOCKET_PATH}?token=<token>, \
+             where <token> is the contents of {}",
+            config.addr,
+            path.display()
+        );
+    }
+
+    // Held across the whole of `serve`, which covers the head, the token and
+    // the response — and, for a client that upgrades, the connection itself.
+    // A slot released at the upgrade would let the stall this bounds happen
+    // one upgrade later.
+    let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING));
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -144,6 +170,14 @@ pub async fn run(
                 continue;
             }
         };
+        // Taken before the task exists rather than inside it: a permit
+        // acquired in the spawned task would mean the task, and the socket it
+        // holds, already existed — which is the thing being bounded.
+        let Ok(permit) = Arc::clone(&pending).try_acquire_owned() else {
+            log::warn!("refusing a web connection: {MAX_PENDING} are already waiting to identify");
+            drop(stream);
+            continue;
+        };
         let config = config.clone();
         let hub = Arc::clone(&hub);
         let commands = commands.clone();
@@ -152,6 +186,7 @@ pub async fn run(
             if let Err(e) = serve(stream, &config, hub, commands, slots).await {
                 log::debug!("web client {peer} disconnected: {e}");
             }
+            drop(permit);
         });
     }
 }

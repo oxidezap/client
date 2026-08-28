@@ -207,9 +207,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "### Web preview" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.where.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Web preview"
+            echo ""
+            echo "${{ steps.where.outputs.url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # A preview is only worth having if it goes away. The directory is removed
   # when the pull request closes, merged or not.

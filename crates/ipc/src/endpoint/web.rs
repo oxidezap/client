@@ -122,6 +122,12 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
     // was up is sent rather than dropped.
     let is_open = Rc::new(Cell::new(false));
     let held = Rc::new(RefCell::new(Vec::<String>::new()));
+    // Closed by the `onclose` callback. The writer races its receive against
+    // this, because a socket that closes while the writer is parked would
+    // otherwise leave it parked: the next `send_line` would queue happily,
+    // the caller would record a request against it, and nothing would ever
+    // fail that request or answer it.
+    let (gone, closed) = futures_channel::oneshot::channel::<()>();
 
     // Held, not forgotten. `Closure::forget` hands a callback to the JS heap
     // for the life of the page, and the front end reconnects — so every
@@ -170,6 +176,7 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
 
     let close_callback = {
         let inbound = inbound.clone();
+        let mut gone = Some(gone);
         let closed = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
             let reason = event.reason();
             let detail = if reason.is_empty() {
@@ -178,6 +185,11 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
                 format!("the daemon connection closed: {reason}")
             };
             let _ = inbound.send(FromSocket::Closed(detail));
+            // Wakes the writer, which is what ends it. Without this it stays
+            // parked on its receive: the next `send_line` would queue
+            // happily, the caller would record a request against it, and
+            // nothing would ever answer or fail that request.
+            drop(gone.take());
         });
         socket.set_onclose(Some(closed.as_ref().unchecked_ref()));
         closed
@@ -196,7 +208,16 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
 
     // The one place the socket is written from. Everything else queues.
     spawn_local(async move {
-        while let Some(frame) = to_send.recv().await {
+        let mut closed = closed;
+        loop {
+            let next = futures_lite::future::or(async { to_send.recv().await }, async {
+                // Resolves when the socket closed; the sender is only
+                // ever dropped, never sent on.
+                let _ = (&mut closed).await;
+                None
+            })
+            .await;
+            let Some(frame) = next else { break };
             if is_open.get() {
                 if let Err(e) = socket.send_with_str(&frame) {
                     log::error!("could not reach the daemon: {e:?}");

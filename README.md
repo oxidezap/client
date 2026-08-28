@@ -94,16 +94,24 @@ and, in another terminal, the daemon with its web endpoint turned on:
 cargo run --bin oxidezapd -- --web
 ```
 
-It logs the line to open, token and all:
+It logs the line to open and where the token is — not the token itself, which
+is a bearer credential and a log is the one thing people paste into issues:
 
-```
+```text
 web bridge listening on http://127.0.0.1:9527/ws (origins: loopback only)
-point a page at it with ?daemon=ws://127.0.0.1:9527/ws?token=<token>
+point a page at ?daemon=ws://127.0.0.1:9527/ws?token=<token>, where <token>
+is the contents of /run/user/1000/oxidezap/web.token
 ```
 
-Open `http://127.0.0.1:8080/?daemon=ws://127.0.0.1:9527/ws?token=<token>`,
-pasting that query verbatim. Without it the page reaches the endpoint and is
-refused: the token is the whole of the admission check, and a bare
+That file is yours alone (`0600`, in your own runtime directory), so:
+
+```bash
+cat "$XDG_RUNTIME_DIR/oxidezap/web.token"
+```
+
+Open `http://127.0.0.1:8080/?daemon=ws://127.0.0.1:9527/ws?token=<token>`
+with it pasted in. Without the token the page reaches the endpoint and is
+refused: it is the whole of the admission check, and a bare
 <http://127.0.0.1:8080> has nothing to present.
 
 **That endpoint is off by default, and should stay off unless you want it.**
