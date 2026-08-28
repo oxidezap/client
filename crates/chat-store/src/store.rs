@@ -177,7 +177,7 @@ impl ChatStore {
             changes: changes.clone(),
             skip_hook_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
-        tokio::spawn(writer_loop(db, device_id, rx, changes));
+        crate::spawn::spawn(writer_loop(db, device_id, rx, changes));
         Ok(this)
     }
 

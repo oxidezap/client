@@ -35,6 +35,7 @@ mod lid;
 mod materialize;
 mod queries;
 mod schema;
+mod spawn;
 mod store;
 pub mod types;
 

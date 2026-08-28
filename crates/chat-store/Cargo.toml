@@ -50,6 +50,9 @@ whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rus
 # everywhere else in the workspace.
 getrandom = { workspace = true }
 getrandom_02 = { workspace = true }
+# The page's event loop, which is the only executor there is here. See
+# `src/spawn.rs`.
+wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 flate2 = { workspace = true }

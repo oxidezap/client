@@ -6121,6 +6121,7 @@ dependencies = [
  "wacore",
  "wacore-binary",
  "waproto",
+ "wasm-bindgen-futures",
  "whatsapp-rust-sqlite-storage",
 ]
 
