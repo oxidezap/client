@@ -168,6 +168,38 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    /// What the daemon's camera really did, as the answer to what was asked
+    /// for here.
+    ///
+    /// Folded into the call state the same way the daemon folds it into its
+    /// own, because the two channels are independent and this one can arrive
+    /// first: waiting for the state frame would draw the old value for a
+    /// moment, and where the settle agrees with what the daemon already held
+    /// there is no state frame at all.
+    pub(super) fn settle_call_video(
+        &mut self,
+        call_id: &String,
+        stream: VideoStream,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.call_state.holds(call_id) {
+            return;
+        }
+        self.call_state.set_video(call_id, stream, on);
+        self.call_pictures.follow(&self.call_state);
+        // Only this side's camera is anything anyone here asked for.
+        if stream == VideoStream::Local
+            && self
+                .call_video_asked
+                .as_ref()
+                .is_some_and(|(asked_for, _)| asked_for == call_id)
+        {
+            self.call_video_asked = None;
+        }
+        cx.notify();
+    }
+
     /// One decoded frame, straight onto the pane that draws it.
     pub(super) fn draw_call_frame(&mut self, frame: CallFrame, cx: &mut Context<Self>) {
         // Frames and state travel on different channels, so one can arrive

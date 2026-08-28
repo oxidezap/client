@@ -2203,19 +2203,23 @@ impl WhatsAppClient {
                     }
                     info!("Call {} media live", handle.call_id());
                     if let Some(local) = local {
-                        // Its loss, if it died while the accept was going out,
-                        // was reported to a registry this camera was not in
-                        // yet: nothing was torn down, and an entry made now is
-                        // one nothing will ever come back for.
-                        if local.alive() {
-                            // There is a call to draw into now.
-                            local.drawable();
-                            calls.cameras.lock().await.insert(call_id.clone(), local);
+                        // There is a call to draw into now — and the encoder
+                        // has been running since before the accept went out,
+                        // with its opening IDR published nowhere. The decoder
+                        // that starts on the first frame to arrive has
+                        // nothing to start from until the next one, seconds
+                        // away, so it is asked for here.
+                        local.drawable();
+                        local.request_keyframe();
+                        if Self::hold_camera(&calls, &call_id, local).await {
                             Self::announce_video(&ui_sender, &call_id, VideoStream::Local, true)
                                 .await;
                         } else {
-                            warn!("The camera on call {call_id} died as the call was answered");
-                            local.stop().await;
+                            // The accept said this call had video, so the peer
+                            // is holding a pane open for a device that is
+                            // gone. Nothing was announced here, so the state
+                            // already says what is true on this side.
+                            Self::stop_peer_video(&handle, &call_id).await;
                         }
                     }
                     // A call offered as video has the caller's camera on by
@@ -2307,12 +2311,7 @@ impl WhatsAppClient {
                     // failed stanza must not leave it running.
                     local.stop().await;
                 }
-                if let Err(e) = handle.stop_video().await {
-                    warn!(
-                        "Failed to tell the peer video stopped on {}: {}",
-                        call_id, e
-                    );
-                }
+                Self::stop_peer_video(&handle, &call_id).await;
                 Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
                 return;
             }
@@ -2362,32 +2361,27 @@ impl WhatsAppClient {
             match started {
                 Ok(()) => {
                     // The call is already live, so the self-view has had
-                    // somewhere to land since before the camera opened.
+                    // somewhere to land since before the camera opened — and
+                    // it had nowhere to land while the announcement was on
+                    // the wire, which is where the opening IDR went. Whoever
+                    // draws this starts a decoder on the first frame that
+                    // arrives and can do nothing with it until a keyframe,
+                    // which is otherwise the periodic one, seconds away.
                     local.drawable();
-                    // Under the same lock the teardown takes, and checked
-                    // against it: a call that ended while the camera was
-                    // opening has already run its one cleanup, and an entry
-                    // inserted after it is one nothing will ever remove —
-                    // the device staying open, with its light on, until the
-                    // daemon exits.
-                    //
-                    // The device is asked the same question for the same
-                    // reason: announcing video waits on the wire, its loss in
-                    // that window was reported to a registry it was not in
-                    // yet, and an entry made now would be a dead camera the
-                    // state calls on.
-                    let mut cameras = calls.cameras.lock().await;
-                    let ended = !calls.active.lock().await.contains_key(&call_id);
-                    if !ended && local.alive() {
-                        cameras.insert(call_id.clone(), local);
-                    } else {
-                        drop(cameras);
-                        if ended {
-                            info!("Call {} ended while its camera was opening", call_id);
-                        } else {
-                            warn!("The camera on call {call_id} died while its video started");
-                        }
+                    local.request_keyframe();
+                    // A call that ended while the camera was opening has
+                    // already run its one cleanup, and an entry made after it
+                    // is one nothing will ever remove — the device staying
+                    // open, with its light on, until the daemon exits.
+                    if !calls.active.lock().await.contains_key(&call_id) {
+                        info!("Call {} ended while its camera was opening", call_id);
                         local.stop().await;
+                    } else if !Self::hold_camera(&calls, &call_id, local).await {
+                        // The announcement landed and the device did not
+                        // survive it: the peer has this direction enabled and
+                        // is waiting on a picture, and `settle_video` below
+                        // says off only on this side.
+                        Self::stop_peer_video(&handle, &call_id).await;
                     }
                 }
                 Err(e) => {
@@ -2463,15 +2457,47 @@ impl WhatsAppClient {
         // bookkeeping behind one peer — the same reason `set_call_muted`
         // takes its handle this way.
         let handle = calls.active.lock().await.get(call_id).cloned();
-        if let Some(handle) = handle
-            && let Err(e) = handle.stop_video().await
-        {
+        if let Some(handle) = handle {
+            Self::stop_peer_video(&handle, call_id).await;
+        }
+        Self::announce_video(ui_sender, call_id, VideoStream::Local, false).await;
+    }
+
+    /// Put a camera in the registry, or take it straight back down if the
+    /// device died while it was being wired up. Says whether it is held.
+    ///
+    /// The device is asked *after* the insertion and under the same lock,
+    /// which is the whole point: asked before, there is a window in which the
+    /// loss runs against a registry this camera is not in yet — it finds
+    /// nothing to remove and returns, and the entry made a moment later is
+    /// the one nothing ever comes back for. The pump clears `alive` before it
+    /// reports, so by the time either could have happened a dead camera is
+    /// either already gone from the map or is visible right here.
+    async fn hold_camera(calls: &CallRegistry, call_id: &str, local: LocalVideo) -> bool {
+        let dead = {
+            let mut cameras = calls.cameras.lock().await;
+            cameras.insert(call_id.to_string(), local);
+            match cameras.get(call_id) {
+                Some(held) if held.alive() => None,
+                _ => cameras.remove(call_id),
+            }
+        };
+        let Some(dead) = dead else { return true };
+        warn!("The camera on call {call_id} died while it was being wired up");
+        dead.stop().await;
+        false
+    }
+
+    /// Tell the peer this side's video has stopped, and say so if it could
+    /// not be told: a direction they still believe is live is one they hold a
+    /// pane open for.
+    async fn stop_peer_video(handle: &CallHandle, call_id: &str) {
+        if let Err(e) = handle.stop_video().await {
             warn!(
                 "Failed to tell the peer video stopped on {}: {}",
                 call_id, e
             );
         }
-        Self::announce_video(ui_sender, call_id, VideoStream::Local, false).await;
     }
 
     /// The lane serializing one call's camera transitions, made if nothing
@@ -2697,21 +2723,18 @@ impl WhatsAppClient {
                         // a registry it was never in: nothing was torn down,
                         // and the entry made here would be the one nothing
                         // ever comes back for.
-                        if local.alive() {
-                            // The frames were being addressed to the
-                            // placeholder the window drew; from here they
-                            // carry the name the server gave the call. A
-                            // reader keeps one decoder per call and cannot
-                            // tell a rename from a different call, so it
-                            // starts a fresh one — which has nothing to decode
-                            // until a keyframe. This is that keyframe.
-                            local.rename(&call_id);
-                            local.request_keyframe();
-                            calls.cameras.lock().await.insert(call_id.clone(), local);
-                        } else {
-                            warn!("The camera on call {call_id} died as the call was placed");
-                            local.stop().await;
-                        }
+                        // The frames were being addressed to the placeholder
+                        // the window drew; from here they carry the name the
+                        // server gave the call. A reader keeps one decoder per
+                        // call and cannot tell a rename from a different call,
+                        // so it starts a fresh one — which has nothing to
+                        // decode until a keyframe. This is that keyframe.
+                        local.rename(&call_id);
+                        local.request_keyframe();
+                        // Nothing to tell the peer if it did not survive: the
+                        // call is ringing, and what it was offered as is
+                        // already out.
+                        Self::hold_camera(&calls, &call_id, local).await;
                     }
                     Self::watch_call(handle, calls.clone(), ui_sender.clone());
                     // The rename first: everything after it is addressed by

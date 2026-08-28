@@ -320,9 +320,13 @@ impl WhatsAppApp {
                 );
             }
             // What the camera really is, once the daemon has opened or closed
-            // it. Like the mute correction, what the window *draws* comes
-            // from the call state the daemon publishes beside this; the event
-            // is what says so out loud.
+            // it — and, unlike the mute correction, the *answer* to what this
+            // window asked for. The state published beside it is what a pane
+            // is drawn from, but a settle that agrees with the state changes
+            // nothing and so travels alone: a camera that would not open is
+            // announced off against a state that was already off, no frame
+            // goes out, and a button left waiting on one stays lit for the
+            // rest of the call. So the answer is taken from here.
             UiEvent::CallVideoChanged {
                 call_id,
                 stream,
@@ -332,6 +336,7 @@ impl WhatsAppApp {
                     "Call {call_id}: the {stream:?} camera is {}",
                     if on { "on" } else { "off" }
                 );
+                self.settle_call_video(&call_id, stream, on, cx);
             }
             // A question, and the answer is this side's camera coming on —
             // or the question being withdrawn, which is just as much news:

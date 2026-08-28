@@ -121,9 +121,12 @@ profile here repeats it deliberately.
   IDR, the peer's RTCP PLI asks for one through `CallEvent::RtcpReceived`,
   and the window's decoder, which can ask nobody, waits for the next one
   rather than rendering a second of torn macroblocks over the last good
-  picture. The two moments a decoder is *born* mid-stream are asked for too:
-  an outgoing call renamed off its placeholder, and one the peer has just
-  answered.
+  picture. Every moment a decoder is *born* mid-stream is asked for too — an
+  outgoing call renamed off its placeholder, one the peer has just answered,
+  and every camera that becomes drawable, since the encoder opened before the
+  offer or the announcement did and its opening IDR was published nowhere.
+  Without that ask the first frame a new decoder sees is a P-frame and the
+  pane says "connecting" until the periodic IDR, seconds later.
 - **A camera is a request, not a state, and requests arrive out of order.**
   Opening one is device work — tens of milliseconds, and a permission prompt
   the first time — so two toggles spawned in order routinely start in the
