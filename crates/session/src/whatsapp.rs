@@ -2482,6 +2482,25 @@ impl WhatsAppClient {
             if answering.is_some() {
                 Self::announce_video_request(&ui_sender, &call_id, false).await;
             }
+            // Whether the peer owes us an answer: an upgrade we asked for is
+            // accepted or refused seconds later, and what that answer means
+            // depends on a request of ours still being outstanding when it
+            // lands. Answering one of *theirs* owes nothing.
+            let ours_to_be_answered = answering.is_none();
+            // Recorded before the request goes out, for the reason every
+            // other intent here is stamped before its task exists: the reply
+            // is not ours to schedule. `start_video` puts `<video_state>` on
+            // the wire and the peer's refusal comes back on the event stream,
+            // which is a different task — so a fast peer, or a signaling
+            // error answered by return, lands its reject while this is still
+            // awaiting, finds nothing outstanding and lets the camera stand
+            // while the library has already released the plane under it.
+            // Registering late cannot be made safe by ordering; registering
+            // early can, because every path out of here that is not a camera
+            // held withdraws it again.
+            if ours_to_be_answered {
+                calls.upgrading.lock().await.insert(call_id.clone());
+            }
             let started = match answering {
                 Some(token) => {
                     handle
@@ -2503,6 +2522,7 @@ impl WhatsAppClient {
                     if lane.intent.lock().expect("video intent poisoned").seq != seq {
                         local.stop().await;
                         Self::stop_peer_video(&handle, &call_id).await;
+                        calls.upgrading.lock().await.remove(&call_id);
                         return;
                     }
                     // The call is already live, so the self-view has had
@@ -2514,27 +2534,31 @@ impl WhatsAppClient {
                     // which is otherwise the periodic one, seconds away.
                     local.drawable();
                     local.request_keyframe();
-                    // Whether the peer owes us an answer: an upgrade we asked
-                    // for is accepted or refused seconds later, and what that
-                    // answer means depends on a request of ours still being
-                    // outstanding when it lands.
-                    let ours_to_be_answered = answering.is_none();
                     // The announcement landed and the device may not have
                     // survived it: the peer has this direction enabled and is
                     // waiting on a picture, and `settle_video` below says off
                     // only on this side. A call that ended in the meantime has
                     // nobody to tell.
+                    //
+                    // Either way there is no camera left for a refusal to take
+                    // down, so the question we registered before asking it is
+                    // withdrawn — a reject arriving later belongs to nothing
+                    // of ours, which is exactly what its handler tests for.
                     match Self::hold_camera(&calls, &call_id, local).await {
-                        Camera::Died => Self::stop_peer_video(&handle, &call_id).await,
-                        Camera::Held if ours_to_be_answered => {
-                            calls.upgrading.lock().await.insert(call_id.clone());
+                        Camera::Died => {
+                            Self::stop_peer_video(&handle, &call_id).await;
+                            calls.upgrading.lock().await.remove(&call_id);
                         }
-                        Camera::Held | Camera::CallEnded => {}
+                        Camera::CallEnded => {
+                            calls.upgrading.lock().await.remove(&call_id);
+                        }
+                        Camera::Held => {}
                     }
                 }
                 Err(e) => {
                     error!("Failed to start video on call {}: {}", call_id, e);
                     local.stop().await;
+                    calls.upgrading.lock().await.remove(&call_id);
                 }
             }
             Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;

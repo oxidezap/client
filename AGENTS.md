@@ -137,10 +137,14 @@ profile here repeats it deliberately.
   allocates its reference and output buffers from the SPS — from numbers the
   person on the other end of the call chose — so a pixel budget applied to
   the decoded picture is applied after the allocation it exists to prevent.
-  `video::sps::coded_size` reads the geometry out of the access unit first.
-  It answers `None` for a unit with no parameter set (nothing new is being
-  declared) and for one it cannot follow, which is deliberate: refusing on a
-  reading nobody has checked would break a legitimate call over a parser bug.
+  `video::sps::coded_size` reads the geometry out of the access unit first —
+  out of *every* parameter set in it, answering the largest, because one unit
+  may carry several and the slice picks which one it is coded against: a
+  thumbnail-sized set in front of the one the picture really uses is a budget
+  walked straight past. It answers `None` for a unit with no parameter set
+  (nothing new is being declared) and for ones it cannot follow, which is
+  deliberate: refusing on a reading nobody has checked would break a
+  legitimate call over a parser bug.
 - **A decoded picture is a slot, not a place in a queue.** The window's event
   channel is hundreds of messages deep because the messages that may not be
   lost need it to be, and a decoded 720p frame is 3.5 MiB — so frames put
@@ -176,7 +180,15 @@ profile here repeats it deliberately.
   released its endpoints. Keying it on the camera the request went out with
   reads as more careful and is worse: a refusal landing after an off-and-on
   again tears down the replacement's plane in the library while leaving it
-  registered here, drawn as live, encoding into nothing.
+  registered here, drawn as live, encoding into nothing. The presence is
+  stamped *before* the request goes out, for the reason every intent here is
+  stamped before its task exists: the reply is not ours to schedule, and a
+  peer refusing while `start_video` is still awaiting would otherwise find
+  nothing outstanding and leave the camera standing over a plane the library
+  has already released. Registering early is the half that can be made safe —
+  every path out that is not a camera held withdraws it again, and the
+  refusal's own teardown queues on the call's video lane behind the enable it
+  is answering.
 - **What a call turned out to be is said by the side that opened the
   device.** The kind is drawn from the offer, because that is all anyone
   knows when the call is placed or answered — and a camera that will not open

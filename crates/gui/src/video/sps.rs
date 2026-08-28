@@ -20,38 +20,51 @@ const EMULATION_PREVENTION: u8 = 3;
 /// Macroblocks are 16x16, which is the unit both dimensions are counted in.
 const MACROBLOCK: u32 = 16;
 
-/// The coded size an access unit declares, if it declares one.
+/// The largest coded size an access unit declares, if it declares one.
 ///
-/// `None` when there is no sequence parameter set in it, or when the one
-/// there is says something this cannot follow.
+/// `None` when there is no sequence parameter set in it, or when the ones
+/// there are all say something this cannot follow.
+///
+/// The *largest*, because one access unit may carry several parameter sets
+/// and the slice that follows picks which one it is coded against. Reading
+/// only the first is a budget a sender walks straight past: a thumbnail-sized
+/// SPS in front of the one the picture actually uses, and the allocation this
+/// exists to bound is made from the second. Every set the decoder will see is
+/// a set that may size it, so the answer is the biggest of them.
 pub(super) fn coded_size(access_unit: &[u8]) -> Option<(u32, u32)> {
-    parse(&unescape(first_sps(access_unit)?))
+    sps_nals(access_unit)
+        .filter_map(|nal| parse(&unescape(nal)))
+        // A set this cannot follow is skipped rather than fatal, for the
+        // reason the module says: refusing on a reading nobody has checked
+        // would break a legitimate call over a parser bug. It is the ones
+        // that *are* readable that have to be bounded.
+        .max_by_key(|&(width, height)| u64::from(width) * u64::from(height))
 }
 
-/// The payload of the first SPS NAL in an Annex-B access unit, start code and
-/// NAL header removed.
-fn first_sps(access_unit: &[u8]) -> Option<&[u8]> {
-    let mut nal = None;
+/// The payload of every SPS NAL in an Annex-B access unit, start code and NAL
+/// header removed.
+fn sps_nals(access_unit: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut i = 0;
-    while i + 3 < access_unit.len() {
-        // Three-byte start codes are legal too, and a four-byte one is a
-        // three-byte one with a leading zero.
-        if access_unit[i] != 0 || access_unit[i + 1] != 0 || access_unit[i + 2] != 1 {
-            i += 1;
-            continue;
-        }
-        let header = access_unit[i + 3];
-        // `forbidden_zero_bit` set is a corrupt header; type 7 is the SPS.
-        if header & 0x80 == 0 && header & 0x1f == 7 {
+    std::iter::from_fn(move || {
+        while i + 3 < access_unit.len() {
+            // Three-byte start codes are legal too, and a four-byte one is a
+            // three-byte one with a leading zero.
+            if access_unit[i] != 0 || access_unit[i + 1] != 0 || access_unit[i + 2] != 1 {
+                i += 1;
+                continue;
+            }
+            let header = access_unit[i + 3];
             let start = i + 4;
             let end = next_start_code(&access_unit[start..])
                 .map_or(access_unit.len(), |offset| start + offset);
-            nal = Some(&access_unit[start..end]);
-            break;
+            i = end;
+            // `forbidden_zero_bit` set is a corrupt header; type 7 is the SPS.
+            if header & 0x80 == 0 && header & 0x1f == 7 {
+                return Some(&access_unit[start..end]);
+            }
         }
-        i += 3;
-    }
-    nal
+        None
+    })
 }
 
 fn next_start_code(rest: &[u8]) -> Option<usize> {
@@ -264,6 +277,44 @@ mod tests {
             coded_size(&unit),
             Some((width as u32, height as u32)),
             "the first access unit carries the parameter set"
+        );
+    }
+
+    /// A sender may put more than one parameter set in front of a picture,
+    /// and the small one first is how a budget is walked past.
+    ///
+    /// Both sets here are real — encoded, not hand-built — so what is being
+    /// checked is the choice between them rather than an agreement between a
+    /// writer and its parser.
+    #[test]
+    fn the_largest_parameter_set_in_a_unit_is_the_one_answered() {
+        let encode = |width: usize, height: usize| {
+            let mut encoder = Encoder::with_api_config(
+                openh264::OpenH264API::from_source(),
+                EncoderConfig::new(),
+            )
+            .expect("encoder");
+            let pixels = vec![0u8; width * height * 3];
+            let frame = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (width, height)));
+            encoder.encode(&frame).expect("encode").to_vec()
+        };
+        let small = encode(64, 48);
+        let large = encode(320, 240);
+
+        let mut unit = small.clone();
+        unit.extend_from_slice(&large);
+        assert_eq!(
+            coded_size(&unit),
+            Some((320, 240)),
+            "a small set in front of a large one must not hide it"
+        );
+
+        let mut reversed = large;
+        reversed.extend_from_slice(&small);
+        assert_eq!(
+            coded_size(&reversed),
+            Some((320, 240)),
+            "nor must a small one behind it lower the answer"
         );
     }
 
