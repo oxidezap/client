@@ -120,6 +120,18 @@ impl WhatsAppApp {
         self.call_pictures.of(stream)
     }
 
+    /// Whether this window's camera is on, or on its way there.
+    ///
+    /// What was asked for outranks what the state says while the ask is still
+    /// outstanding: a camera takes seconds to open, and a control that stayed
+    /// "off" for all of them reads as a click that did nothing.
+    pub fn call_video_showing(&self) -> bool {
+        match &self.call_video_asked {
+            Some((call_id, wanted)) if self.call_state.holds(call_id) => *wanted,
+            _ => self.call_state.video().local,
+        }
+    }
+
     /// Whether the peer is waiting on this side to turn its camera on.
     ///
     /// Read from the call state rather than remembered here: the request is
@@ -139,7 +151,17 @@ impl WhatsAppApp {
         let Some(call) = self.call_state.active() else {
             return;
         };
-        let (call_id, wanted) = (call.call_id.clone(), !call.video.local);
+        // Toggled against what was last *asked* for, where that is still
+        // outstanding: the state cannot have caught up with a camera that is
+        // still opening, and a second click means the opposite of the first
+        // rather than the same thing again.
+        let call_id = call.call_id.clone();
+        let showing = match &self.call_video_asked {
+            Some((asked_for, wanted)) if *asked_for == call_id => *wanted,
+            _ => call.video.local,
+        };
+        let wanted = !showing;
+        self.call_video_asked = Some((call_id.clone(), wanted));
         if let Some(client) = &self.client {
             client.set_call_video(&call_id, wanted);
         }
@@ -229,6 +251,7 @@ impl WhatsAppApp {
         info!("Ending call {call_id}");
         self.call_card.call_ended();
         self.call_pictures = CallPictures::default();
+        self.call_video_asked = None;
         // A ringing offer ended by this button was refused, not missed — the
         // same thing `decline_call` writes down, and the phone viewport routes
         // its Decline through here. Deriving the outcome from the stage alone
@@ -419,6 +442,17 @@ impl WhatsAppApp {
         // After the state, because what a picture may still be drawn for is
         // exactly what the new state says has a camera behind it.
         self.call_pictures.follow(&self.call_state);
+        // A request the daemon has answered is not outstanding any more, and
+        // one whose call is gone answers itself.
+        if self
+            .call_video_asked
+            .as_ref()
+            .is_none_or(|(call_id, wanted)| {
+                !self.call_state.holds(call_id) || self.call_state.video().local == *wanted
+            })
+        {
+            self.call_video_asked = None;
+        }
         // The duration on the card is a clock, and a clock nobody winds shows
         // the second it started at. Armed here rather than off `CallAccepted`,
         // because a call this window did not answer — the daemon accepted it,

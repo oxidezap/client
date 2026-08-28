@@ -41,11 +41,33 @@ pub type VideoFrameSender = tokio::sync::mpsc::Sender<CallVideoFrame>;
 /// a frame to drop and never a reason to stop pumping.
 pub type VideoPublisher = Arc<std::sync::Mutex<Option<VideoFrameSender>>>;
 
+/// What became of one frame handed to the publisher.
+///
+/// Three answers and not a `bool`, because only one of them is a *gap*:
+/// nobody watching is the ordinary state of a daemon holding a call with its
+/// window closed, and asking the encoder for a keyframe on every frame of it
+/// would emit IDRs forever for no reader.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Sent,
+    /// Nothing is drawing. Not a loss: there is nothing to recover.
+    NoSubscriber,
+    /// Somebody is drawing and could not keep up. The unit is gone, and what
+    /// follows it references what they never got.
+    Dropped,
+}
+
 /// Hand one frame to whoever is subscribed, if anyone is.
-fn publish(publisher: &VideoPublisher, frame: CallVideoFrame) {
+fn publish(publisher: &VideoPublisher, frame: CallVideoFrame) -> Delivery {
     let sender = publisher.lock().expect("video publisher poisoned").clone();
-    if let Some(sender) = sender {
-        let _ = sender.try_send(frame);
+    let Some(sender) = sender else {
+        return Delivery::NoSubscriber;
+    };
+    match sender.try_send(frame) {
+        Ok(()) => Delivery::Sent,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Delivery::Dropped,
+        // Between the clone and the send, the subscriber went away.
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Delivery::NoSubscriber,
     }
 }
 
@@ -244,7 +266,7 @@ async fn pump_local(
     camera_id: CameraId,
 ) {
     while let Ok(EncodedFrame { data, keyframe }) = frames.recv().await {
-        publish(
+        let drawn = publish(
             &publisher,
             CallVideoFrame::new(
                 read(&call_id),
@@ -254,6 +276,13 @@ async fn pump_local(
                 0,
             ),
         );
+        // The self-view lost a unit, and cannot say so itself: the window
+        // never sees what did not arrive. One extra IDR — on a stream that
+        // emits one every few seconds anyway — against a self-view frozen
+        // until the next.
+        if drawn == Delivery::Dropped {
+            camera.request_keyframe();
+        }
         if plane.try_send(data).is_err() {
             if plane.is_closed() {
                 break;

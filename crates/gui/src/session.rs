@@ -876,6 +876,15 @@ fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pend
                 };
                 decoders.accept(*frame);
             }
+            // The daemon skipped frames on the way here. Whatever the
+            // decoders hold no longer matches what the senders encoded
+            // against, so they wait for a keyframe rather than drawing on
+            // references that never arrived.
+            Ok(DaemonMessage::CallVideoGap) => {
+                if let Some(decoders) = &video {
+                    decoders.interrupted();
+                }
+            }
             Ok(DaemonMessage::ShowWindow) => {
                 if events.blocking_send(FromDaemon::ShowWindow).is_err() {
                     break;

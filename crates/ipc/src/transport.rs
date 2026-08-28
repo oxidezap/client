@@ -6,7 +6,8 @@ use std::path::PathBuf;
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
 /// 18: video calls. `DaemonMessage::CallVideo` carries a call's encoded
-/// frames in both directions, `ClientRequest::Call(SetVideo)` turns this
+/// frames in both directions, `DaemonMessage::CallVideoGap` says some were
+/// skipped, `ClientRequest::Call(SetVideo)` turns this
 /// side's camera on and off, and the call state says which of the two
 /// cameras are running. A v17 daemon refuses `SetVideo` as malformed, so an
 /// upgraded window would draw a camera button that could never do anything;

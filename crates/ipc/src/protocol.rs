@@ -381,6 +381,16 @@ pub enum DaemonMessage {
     /// process that owns the session, the same rule that puts the microphone
     /// there.
     CallVideo(Box<CallVideoFrame>),
+    /// The client fell behind on video and frames were skipped.
+    ///
+    /// Not a `Resync`: nothing about the *state* is stale, and asking for a
+    /// snapshot would throw a history away to recover a picture that has
+    /// already moved on. What a decoder needs after a gap is different — the
+    /// units it did not get are the ones the next ones reference, so it has
+    /// to stop and wait for a point it can start from. Which direction lagged
+    /// is not said because it is not known: the channel carries both, and a
+    /// gap in it is a gap in whatever was in flight.
+    CallVideoGap,
     /// The client fell too far behind and its stream was truncated. Whatever
     /// it holds is now untrustworthy, so it must snapshot again rather than
     /// keep applying.

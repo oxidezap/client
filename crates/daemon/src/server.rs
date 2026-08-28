@@ -531,6 +531,13 @@ where
                 Ok(frame) => write_line(&mut writer, &frame).await?,
                 Err(RecvError::Lagged(missed)) => {
                     log::trace!("client missed {missed} video frames");
+                    // Said out loud, unlike a state gap: the client's decoder
+                    // is holding references to units it will never get, and
+                    // the frames that follow are built on them. It has no
+                    // other way to know — what did not arrive leaves nothing
+                    // behind to notice.
+                    let frame = serde_json::to_string(&DaemonMessage::CallVideoGap)?;
+                    write_line(&mut writer, &frame).await?;
                 }
                 Err(RecvError::Closed) => return Ok(()),
             },

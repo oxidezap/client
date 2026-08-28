@@ -94,6 +94,7 @@ pub fn render_call_card(
                     focus_handle,
                     metrics,
                     app.call_video_requested(),
+                    app.call_video_showing(),
                     cx,
                 ))
                 .children(panes)
@@ -406,6 +407,7 @@ fn mobile_banner(
     focus_handle: &gpui::FocusHandle,
     metrics: Metrics,
     asked_for_video: bool,
+    showing_video: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let accept_entity = entity.clone();
@@ -414,9 +416,7 @@ fn mobile_banner(
     let action_entity = entity;
     // Only a live call has a camera to turn on; an offer's camera comes on
     // with the answer.
-    let camera = stage
-        .active()
-        .map(|call| (call.video.local, call.call_id.clone()));
+    let camera = stage.active().map(|_| showing_video);
     // Only an *incoming* call can be accepted. An outgoing one is ringing
     // too, and offering Accept for it produced a button that found no offer
     // and did nothing.
@@ -499,7 +499,7 @@ fn mobile_banner(
                     }),
             )
         })
-        .children(camera.map(|(on, _)| {
+        .children(camera.map(|on| {
             Button::new("call-camera")
                 .icon(if on {
                     ProductIcon::Video

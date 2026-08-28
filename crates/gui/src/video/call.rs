@@ -72,6 +72,17 @@ impl CallVideo {
         &self.call_id
     }
 
+    /// Something between here and the camera dropped units.
+    ///
+    /// Both directions, because the channel that lost them carries both and
+    /// a gap in it says nothing about which was in flight. Each decoder then
+    /// waits for a point it can start from rather than rendering frames built
+    /// on references it never received.
+    pub fn interrupted(&self) {
+        self.local.interrupted();
+        self.remote.interrupted();
+    }
+
     /// Hand one access unit to the decoder that owns its direction.
     ///
     /// Dropped rather than queued when that decoder is busy: the next unit is
@@ -120,6 +131,10 @@ impl Stream {
             log::error!("no thread for the {stream:?} video of a call: {e}");
         }
         Self { units, dropped }
+    }
+
+    fn interrupted(&self) {
+        self.dropped.store(true, Ordering::Relaxed);
     }
 
     fn accept(&self, frame: CallVideoFrame) {

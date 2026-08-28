@@ -250,7 +250,7 @@ fn video_controls(
     let camera_entity = entity.clone();
     let end_entity = entity;
     let muted = call.muted;
-    let camera_on = call.video.local;
+    let camera_on = app.call_video_showing();
     let asked = app.call_video_requested();
 
     let round = |id: &'static str, icon: Icon, tip: &'static str| {
