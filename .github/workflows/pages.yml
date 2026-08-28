@@ -205,6 +205,16 @@ jobs:
       - name: Write the still-current check
         run: |
           set -eu
+          # Exit codes, because the two reasons this can fail want opposite
+          # things done about them:
+          #
+          #   0  publish
+          #   1  superseded — a newer run is publishing; stand down and touch
+          #      nothing, because what is up there is *newer* than ours
+          #   2  closed — the preview should not exist at all
+          #
+          # Collapsing them is how an older superseded build would have
+          # deleted the newer revision's perfectly good preview.
           cat > "$RUNNER_TEMP/still-current.sh" <<'CHECK'
           set -eu
           api="https://api.github.com/repos/$REPO"
@@ -213,8 +223,8 @@ jobs:
           if [ "$EVENT" = 'pull_request' ]; then
             pr=$(curl -fsSL -H "$auth" -H "$json" "$api/pulls/$PR_NUMBER")
             [ "$(printf '%s' "$pr" | jq -r .state)" = 'open' ] || {
-              echo "pull request is closed; its preview is gone or going" >&2
-              exit 1
+              echo "pull request is closed; its preview should not exist" >&2
+              exit 2
             }
             [ "$(printf '%s' "$pr" | jq -r .head.sha)" = "$PR_HEAD" ] || {
               echo "head has moved; a newer run publishes it" >&2
@@ -278,8 +288,16 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -eu
-          if sh "$RUNNER_TEMP/still-current.sh"; then
-            echo "still open; the preview stays"
+          # Only on `2`, which is "closed". A `1` means a newer run of this
+          # same pull request published while we were working — what is on the
+          # branch is then *newer* than what we had, and removing it would be
+          # this run deleting a preview that is perfectly good.
+          set +e
+          sh "$RUNNER_TEMP/still-current.sh"
+          state=$?
+          set -e
+          if [ "$state" -ne 2 ]; then
+            echo "not closed (check said $state); leaving the branch alone"
             echo "removed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi

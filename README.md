@@ -128,6 +128,16 @@ says so in the console, because refusing it would not un-send it — but if
 you ever used one, the repair is a new token, which is `rm` on the token
 file and a restart.
 
+**Known gap: the daemon is not authenticated to the page.** The token proves
+the page to the daemon and nothing proves the daemon to the page. Another
+account on your machine could bind the port first, collect the token from a
+bookmark opened while the daemon was down, and reuse it afterwards — the
+`Origin` header is a string they control too. The native endpoint has no such
+gap, because a Unix socket has a peer uid to check and a TCP port does not.
+Closing it needs mutual authentication in the protocol; until then this is a
+reason to leave `--web` off on a machine you share with someone you do not
+trust. See the note on `endpoint_url` in `crates/ipc/src/endpoint/web.rs`.
+
 **That endpoint is off by default, and should stay off unless you want it.**
 A WebSocket is not subject to the same-origin policy, so any page open in
 your browser can try to reach `ws://127.0.0.1` — and this one carries your

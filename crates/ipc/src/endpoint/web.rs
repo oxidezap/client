@@ -296,6 +296,37 @@ pub fn endpoint_url() -> String {
     }
 }
 
+/// # Known gap: the daemon is not authenticated to the page
+///
+/// The token proves the *page* to the daemon. Nothing proves the daemon to
+/// the page, and on a loopback TCP port that asymmetry has teeth: another
+/// account on the machine can bind the predictable port first, and a
+/// bookmarked URL opened while the real daemon is down hands that process the
+/// token in its handshake. It can then release the port, wait, and use the
+/// token against the real daemon — `Origin` is a string it also controls.
+///
+/// The native endpoint has no such gap: a Unix socket has a peer uid, and the
+/// client checks who answered. A browser cannot ask that of a TCP port.
+///
+/// Closing it means mutual authentication, and the shapes trade against each
+/// other rather than one being obviously right:
+///
+/// - **Server-first challenge.** Connect carrying nothing, send a nonce, and
+///   let the daemon prove it holds the token before the page offers its own
+///   proof. Nothing is ever disclosed to an impostor. The cost is that the
+///   upgrade becomes unauthenticated, so the endpoint stops being able to
+///   answer `404` to strangers — the concealment described above is spent to
+///   buy this.
+/// - **Proof in the query.** Send `HMAC(token, nonce)` instead of the token.
+///   Keeps the `404`, but a proof replayed with its own nonce is as good as
+///   the token unless the daemon remembers nonces, which is state and a
+///   clock.
+///
+/// Both are a wire-protocol change on two ends plus the media path, which
+/// authenticates per request. Until one is chosen, `--web` carries this: it
+/// is off by default, and the threat is a hostile account on the same
+/// machine.
+
 /// A URL fit to be written down.
 ///
 /// The query is where the token lives, so it is what comes off: everything
