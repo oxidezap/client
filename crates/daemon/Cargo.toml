@@ -36,7 +36,11 @@ oxidezap-ipc = { workspace = true }
 oxidezap-session = { workspace = true }
 portable-atomic = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
+# `fs` is for the web bridge, which serves a cached payload straight off
+# disk. Declared rather than inherited: something else in the Linux-only half
+# of the graph turns it on, so a build there succeeded while macOS and
+# Windows failed on `tokio::fs` not existing.
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
 # The clock behind the pairing deadline and the local send id, through the
 # library's pluggable TimeProvider rather than std (see /clippy.toml).
 wacore = { workspace = true }

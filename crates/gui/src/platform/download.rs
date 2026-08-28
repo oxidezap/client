@@ -94,22 +94,15 @@ mod native {
             .map_err(|e| e.to_string())
     }
 
-    fn write(file_name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
-        let not_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(PathBuf::from(v));
-        let dir = std::env::var_os("XDG_DOWNLOAD_DIR")
-            .and_then(not_empty)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .and_then(not_empty)
-                    .or_else(|| std::env::var_os("USERPROFILE").and_then(not_empty))
-                    .map(|home| home.join("Downloads"))
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
-        std::fs::create_dir_all(&dir)?;
-
-        // The name comes off the wire: strip path separators (and `:`, which
-        // on Windows makes a drive-relative path) so a hostile sender can't
-        // traverse out of the directory.
+    /// A file name that cannot leave the directory it is joined to.
+    ///
+    /// The name comes off the wire, so a sender who calls their document
+    /// `../../.ssh/authorized_keys` must not reach outside Downloads. Pure,
+    /// so it can be tested without a filesystem or a process-wide
+    /// environment.
+    pub(super) fn safe_name(file_name: &str) -> String {
+        // Path separators, and `:`, which on Windows makes a drive-relative
+        // path.
         let sanitized: String = file_name
             .chars()
             .map(|c| {
@@ -136,11 +129,27 @@ mod native {
             || (stem.len() == 4
                 && (stem.starts_with("COM") || stem.starts_with("LPT"))
                 && stem.as_bytes()[3].is_ascii_digit());
-        let name = if reserved {
+        if reserved {
             format!("_{name}")
         } else {
             name.to_string()
-        };
+        }
+    }
+
+    fn write(file_name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+        let not_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(PathBuf::from(v));
+        let dir = std::env::var_os("XDG_DOWNLOAD_DIR")
+            .and_then(not_empty)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .and_then(not_empty)
+                    .or_else(|| std::env::var_os("USERPROFILE").and_then(not_empty))
+                    .map(|home| home.join("Downloads"))
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        std::fs::create_dir_all(&dir)?;
+
+        let name = safe_name(file_name);
 
         // create_new + " (n)" suffixing so a download never clobbers an
         // existing file of the same name.
@@ -180,23 +189,49 @@ mod native {
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::*;
+    use super::native::safe_name;
 
-    /// The name comes off the wire. A sender who names a file `../../.ssh/id`
-    /// must not reach outside the Downloads directory.
+    /// The name comes off the wire. A sender who names a file
+    /// `../../.ssh/authorized_keys` must not reach outside the directory it
+    /// is joined to.
+    ///
+    /// Asserted on the name rather than on a written file: the directory is
+    /// chosen from the environment, and mutating that is process-wide while
+    /// the rest of the suite runs beside this.
     #[test]
     fn a_hostile_name_cannot_leave_the_directory() {
-        let dir = std::env::temp_dir().join(format!("oxidezap-save-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        // SAFETY: single-threaded test process for this variable's lifetime.
-        unsafe { std::env::set_var("XDG_DOWNLOAD_DIR", &dir) };
+        for hostile in [
+            "../escaped.txt",
+            "../../.ssh/authorized_keys",
+            "sub/dir/file.txt",
+            "C:evil.txt",
+        ] {
+            let safe = safe_name(hostile);
+            assert!(
+                !safe.contains('/') && !safe.contains('\\') && !safe.contains(':'),
+                "{hostile} produced {safe}"
+            );
+            assert_ne!(safe, "..", "{hostile} produced a parent reference");
+        }
+    }
 
-        let where_it_went = save("../escaped.txt", b"nope").expect("a save");
-        assert!(
-            where_it_went.starts_with(&dir.display().to_string()),
-            "{where_it_went} left {}",
-            dir.display()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+    /// A name that is nothing but separators or dots still has to be a name.
+    #[test]
+    fn a_name_that_sanitizes_to_nothing_still_gets_one() {
+        for empty in ["", "   ", ".", ".."] {
+            assert_eq!(safe_name(empty), "document", "{empty:?}");
+        }
+    }
+
+    /// Windows resolves these to devices whatever the extension, so a save
+    /// under one would not be a save at all.
+    #[test]
+    fn a_reserved_device_name_is_moved_out_of_the_way() {
+        for reserved in ["CON", "nul.txt", "COM1.bin", "LPT9"] {
+            let safe = safe_name(reserved);
+            assert!(safe.starts_with('_'), "{reserved} produced {safe}");
+        }
+        // And an ordinary name is left alone.
+        assert_eq!(safe_name("report.pdf"), "report.pdf");
     }
 }
