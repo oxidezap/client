@@ -100,7 +100,7 @@ is a bearer credential and a log is the one thing people paste into issues:
 ```text
 web bridge listening on http://127.0.0.1:9527/ws (origins: loopback only)
 point a page at ?daemon=ws://127.0.0.1:9527/ws?token=<token>, where <token>
-is the contents of /run/user/1000/oxidezap/web.token
+is the contents of $XDG_RUNTIME_DIR/oxidezap/web.token
 ```
 
 That file is yours alone (`0600`, in your own runtime directory), so:

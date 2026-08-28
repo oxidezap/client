@@ -19,9 +19,20 @@ pub struct CallRegistry {
     pending: Arc<Mutex<HashMap<String, Arc<WaIncomingCall>>>>,
     /// Media-live calls by call id.
     active: Arc<Mutex<HashMap<String, Arc<CallHandle>>>>,
-    /// Ids cancelled before any handle existed (the UI's placeholder id while
-    /// start_call is still connecting); start_call hangs these up on arrival.
+    /// Ids ended before any handle existed — the UI's placeholder id while
+    /// start_call is still connecting, or a peer's `<terminate>` arriving
+    /// while accept_call is opening the microphone. Whichever call is in
+    /// flight hangs these up on arrival.
     cancelled: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Acceptances in flight: the offer has left `pending` and no handle
+    /// exists yet.
+    ///
+    /// That gap is a real one — opening the audio devices and connecting the
+    /// relay both take time — and without it an ending has nowhere to be
+    /// recorded: `pending` no longer holds the call and `active` does not yet,
+    /// so a peer hanging up in that window removed nothing and the handle was
+    /// filed as live *after* the window had been told the call was over.
+    accepting: Arc<Mutex<std::collections::HashSet<String>>>,
     /// One mute lane per live call. Pruned against `active` where it grows,
     /// so a call that ends takes its lane with it without every teardown
     /// path having to remember.
@@ -70,10 +81,37 @@ impl CallRegistry {
     /// Done here rather than by handing the handle back, so that a caller
     /// never has to name a `CallHandle` — the type is the media stack's, and
     /// the media stack is what a browser does not have.
+    ///
+    /// A call with no handle *yet* is the case worth the second half: an
+    /// acceptance in flight will produce one after this returns, so the news
+    /// is left where that acceptance will look for it rather than dropped.
     pub(in crate::whatsapp) async fn ended_by_peer(&self, call_id: &str) {
         if let Some(handle) = self.active.lock().await.remove(call_id) {
             tokio::spawn(async move { handle.hangup_local().await });
+            return;
         }
+        // One lock at a time, and in this order everywhere: `accepting` is
+        // only ever read before `cancelled` is taken, never while holding it.
+        let in_flight = self.accepting.lock().await.contains(call_id);
+        if in_flight {
+            self.cancelled.lock().await.insert(call_id.to_string());
+        }
+    }
+
+    /// Note that an acceptance has begun, so an ending arriving mid-flight has
+    /// somewhere to be recorded.
+    pub(in crate::whatsapp) async fn accepting(&self, call_id: &str) {
+        self.accepting.lock().await.insert(call_id.to_string());
+    }
+
+    /// Note that an acceptance is over, and say whether the peer ended the
+    /// call while it was in flight.
+    ///
+    /// `true` means the window has already been told the call is over, so the
+    /// handle this answers for must not be filed as live.
+    pub(in crate::whatsapp) async fn accepted(&self, call_id: &str) -> bool {
+        self.accepting.lock().await.remove(call_id);
+        self.cancelled.lock().await.remove(call_id)
     }
 }
 
@@ -104,14 +142,22 @@ impl WhatsAppClient {
                 warn!("No pending offer for call {}", call_id);
                 return;
             };
+            // From here until a handle exists the call is in neither map, so
+            // say so: a `<terminate>` landing in this window has nowhere else
+            // to be written down.
+            calls.accepting(&call_id).await;
             let (mic, speaker) = match open_call_audio().await {
                 Ok(audio) => audio,
                 Err(err) => {
                     error!("Audio device setup failed: {err}");
+                    // Nothing was accepted, so there is nothing for a peer's
+                    // ending to race any more.
+                    let ended_by_peer = calls.accepted(&call_id).await;
                     // The offer is consumed and no accept went out: reject
                     // so the caller stops ringing instead of waiting out
-                    // the timeout.
-                    if let Err(e) = client.voip().reject(&offer).await {
+                    // the timeout. Unless they hung up first, in which case
+                    // there is nobody left ringing to tell.
+                    if !ended_by_peer && let Err(e) = client.voip().reject(&offer).await {
                         error!(
                             "Failed to reject call {} after audio failure: {}",
                             call_id, e
@@ -129,8 +175,23 @@ impl WhatsAppClient {
                 .await
             {
                 Ok(handle) => {
-                    info!("Call {} media live", handle.call_id());
                     let handle = Arc::new(handle);
+                    if calls.accepted(&call_id).await {
+                        // The peer hung up while this was connecting, and the
+                        // window has already drawn the call as over. Filing
+                        // the handle as live would leave a microphone open
+                        // under a conversation nobody thinks is happening,
+                        // and a second `CallEnded` behind it when the watcher
+                        // eventually fired.
+                        //
+                        // `hangup_local`, because they are the side that
+                        // ended it: their `<terminate>` is already out and
+                        // one of ours would say nothing new.
+                        info!("Call {} was ended by the peer while connecting", call_id);
+                        handle.hangup_local().await;
+                        return;
+                    }
+                    info!("Call {} media live", handle.call_id());
                     calls
                         .active
                         .lock()
@@ -140,6 +201,7 @@ impl WhatsAppClient {
                 }
                 Err(e) => {
                     error!("Failed to start call media for {}: {}", call_id, e);
+                    calls.accepted(&call_id).await;
                     Self::notify_call_ended(&ui_sender, &call_id).await;
                 }
             }
@@ -485,6 +547,58 @@ mod tests {
         assert_ne!(
             newest.seq, unmute,
             "the superseded task yields instead of restoring its own value"
+        );
+    }
+
+    /// The window between an offer leaving `pending` and a handle reaching
+    /// `active` is a real one — opening the audio devices and connecting the
+    /// relay both take time — and a `<terminate>` landing inside it used to
+    /// find the call in neither map, remove nothing, and let the acceptance
+    /// file a live handle behind the `CallEnded` the window had already been
+    /// sent. A microphone open under a call nobody thought was happening.
+    #[tokio::test]
+    async fn a_peer_ending_a_call_mid_acceptance_is_not_lost() {
+        let calls = CallRegistry::default();
+
+        // The offer has left `pending`; no handle exists yet.
+        calls.accepting("call-1").await;
+
+        // The peer hangs up in exactly that window.
+        calls.ended_by_peer("call-1").await;
+
+        // The acceptance finishes and asks. It has to hear about it.
+        assert!(
+            calls.accepted("call-1").await,
+            "an ending that arrived mid-acceptance must reach the acceptance"
+        );
+    }
+
+    /// And it is spent once, so a later acceptance of a *different* call with
+    /// a reused id is not cancelled by a stale note.
+    #[tokio::test]
+    async fn a_peer_ending_is_reported_once() {
+        let calls = CallRegistry::default();
+        calls.accepting("call-1").await;
+        calls.ended_by_peer("call-1").await;
+
+        assert!(calls.accepted("call-1").await);
+        assert!(
+            !calls.accepted("call-1").await,
+            "the note is consumed by the acceptance that acted on it"
+        );
+    }
+
+    /// Nothing is recorded when no acceptance is in flight, or the set would
+    /// grow by one entry for every call that simply rang and stopped.
+    #[tokio::test]
+    async fn an_ending_with_nothing_in_flight_records_nothing() {
+        let calls = CallRegistry::default();
+        calls.ended_by_peer("call-1").await;
+
+        calls.accepting("call-1").await;
+        assert!(
+            !calls.accepted("call-1").await,
+            "an ending before the acceptance began is not this acceptance's"
         );
     }
 
