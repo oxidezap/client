@@ -91,6 +91,18 @@ fn handle_action(ev: &Event) {
     let id = ev.text::<32>(abi::fields::ACTION_ID);
     let value = ev.text::<256>(abi::fields::ACTION_VALUE);
 
+    // A value that did not fit is *not* a shorter value: storing it would
+    // silently drop the end of somebody's keyword and then match on a word
+    // they never typed. `Text::complete` is the whole reason the read reports
+    // the full length rather than only what it wrote.
+    if !id.complete() || !value.complete() {
+        oxidezap_plugin::log(
+            oxidezap_plugin::level::WARN,
+            "ignoring a setting longer than this plugin makes room for",
+        );
+        return;
+    }
+
     match id.as_str() {
         // A toggle's value is the state it is now in, not the one it was in:
         // the front end has already flipped it.

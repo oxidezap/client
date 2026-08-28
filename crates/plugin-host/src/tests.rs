@@ -162,6 +162,10 @@ fn message(chat: &str, text: &str) -> UiEvent {
 
 /// Subscribes to messages, asks for `send`, and answers every message with
 /// "pong" in the chat it arrived in.
+fn pong() -> String {
+    versioned(PONG)
+}
+
 const PONG: &str = r#"(module
   (import "oxidezap" "oxi_subscribe"     (func $subscribe (param i64)))
   (import "oxidezap" "oxi_request_caps"  (func $caps (param i64)))
@@ -169,7 +173,7 @@ const PONG: &str = r#"(module
   (import "oxidezap" "oxi_send_text"     (func $send (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "pong")
-  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
   (global $answer (mut i32) (i32.const 0))
   (func (export "oxi_init") (result i32)
     (call $subscribe (i64.const 2))   ;; 1 << kinds::MESSAGE
@@ -188,6 +192,10 @@ const PONG: &str = r#"(module
 )"#;
 
 /// The same, but never asks for the capability.
+fn pong_without_permission() -> String {
+    versioned(PONG_WITHOUT_PERMISSION)
+}
+
 const PONG_WITHOUT_PERMISSION: &str = r#"(module
   (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
   (import "oxidezap" "oxi_field_str" (func $field_str (param i32 i32 i32 i32) (result i32)))
@@ -195,7 +203,7 @@ const PONG_WITHOUT_PERMISSION: &str = r#"(module
   (import "oxidezap" "oxi_ui_set"    (func $ui_set (param i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "pong")
-  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
   (func (export "oxi_init") (result i32)
     (call $subscribe (i64.const 2))
     (i32.const 0))
@@ -209,23 +217,26 @@ const PONG_WITHOUT_PERMISSION: &str = r#"(module
 )"#;
 
 fn spins() -> String {
-    format!(
-        r#"(module
-  (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
-  (memory (export "memory") 1)
-  (func (export "oxi_abi_version") (result i32) (i32.const {version}))
-  (func (export "oxi_init") (result i32) (call $subscribe (i64.const 2)) (i32.const 0))
-  (func (export "oxi_on_event") (param i32 i32) (result i32) (loop (br 0)) (i32.const 0))
-)"#,
-        version = abi::VERSION
-    )
+    versioned(SPINS)
 }
 
+const SPINS: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
+  (memory (export "memory") 1)
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32) (call $subscribe (i64.const 2)) (i32.const 0))
+  (func (export "oxi_on_event") (param i32 i32) (result i32) (loop (br 0)) (i32.const 0))
+)"#;
+
 /// Asks for one page and then for far more than the limit allows.
+fn greedy() -> String {
+    versioned(GREEDY)
+}
+
 const GREEDY: &str = r#"(module
   (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
   (memory (export "memory") 1)
-  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
   (func (export "oxi_init") (result i32) (call $subscribe (i64.const 2)) (i32.const 0))
   (func (export "oxi_on_event") (param i32 i32) (result i32)
     (drop (memory.grow (i32.const 4096)))
@@ -247,7 +258,7 @@ const ARMS_TIMERS: &str = r#"(module
   (memory (export "memory") 1)
   (data (i32.const 0) "a@s.whatsapp.net")
   (data (i32.const 64) "refused")
-  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
   (func (export "oxi_init") (result i32)
     (call $subscribe (i64.const 2))         ;; messages
     (call $caps (i64.const 33))             ;; caps::SEND | caps::TIMERS
@@ -270,7 +281,17 @@ const ARMS_TIMERS: &str = r#"(module
 )"#;
 
 fn arms_timers() -> String {
-    ARMS_TIMERS.to_string()
+    versioned(ARMS_TIMERS)
+}
+
+/// Stamp a fixture with the ABI version this build speaks.
+///
+/// Every fixture goes through this rather than writing the number itself, so
+/// that bumping `abi::VERSION` renames one failure — the version test — rather
+/// than turning every other test into "nothing loaded", which reads like a
+/// discovery or entry-point bug and sends the reader to the wrong file.
+fn versioned(wat: &str) -> String {
+    wat.replace("$ABI_VERSION", &abi::VERSION.to_string())
 }
 
 fn wat_bytes(bytes: &[u8]) -> String {
@@ -290,7 +311,7 @@ fn draws() -> String {
         "",
     );
     let n = w.finish().expect("fits");
-    format!(
+    versioned(&format!(
         r#"(module
   (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
   (import "oxidezap" "oxi_set_name"     (func $set_name (param i32 i32) (result i32)))
@@ -301,7 +322,7 @@ fn draws() -> String {
   (data (i32.const 0) "{tree}")
   (data (i32.const 1024) "{name}")
   (data (i32.const 1100) "oi")
-  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
   (func (export "oxi_init") (result i32)
     (call $caps (i64.const 9))    ;; caps::SEND | caps::UI
     (drop (call $set_name (i32.const 1024) (i32.const {name_len})))
@@ -321,7 +342,7 @@ fn draws() -> String {
         // Bytes, not characters: the ABI counts what crosses it, and getting
         // this wrong is exactly how a name loses its last letter.
         name_len = NAME.len()
-    )
+    ))
 }
 
 // ---- what the host does --------------------------------------------------
@@ -351,7 +372,7 @@ fn unapproved_host(dir: &TempDir, commands: Arc<Recorder>, published: &Published
 #[test]
 fn a_plugin_sees_a_message_and_answers_it() {
     let dir = TempDir::new("pong");
-    dir.plugin("autoreply", PONG);
+    dir.plugin("autoreply", &pong());
     let commands = Recorder::new(Outcome::Accepted);
     let published = Published::default();
     let plugins = host(&dir, Arc::clone(&commands), &published);
@@ -370,7 +391,7 @@ fn a_plugin_sees_a_message_and_answers_it() {
 #[test]
 fn a_command_outside_the_declared_capabilities_never_reaches_the_daemon() {
     let dir = TempDir::new("denied");
-    dir.plugin("sneaky", PONG_WITHOUT_PERMISSION);
+    dir.plugin("sneaky", &pong_without_permission());
     let commands = Recorder::new(Outcome::Accepted);
     let published = Published::default();
     let plugins = host(&dir, Arc::clone(&commands), &published);
@@ -411,7 +432,7 @@ fn a_plugin_that_loops_forever_runs_out_of_fuel_and_is_stopped() {
 #[test]
 fn a_plugin_that_asks_for_more_memory_than_it_may_have_is_stopped() {
     let dir = TempDir::new("greedy");
-    dir.plugin("greedy", GREEDY);
+    dir.plugin("greedy", &greedy());
     let published = Published::default();
     let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
 
@@ -424,12 +445,13 @@ fn a_plugin_that_asks_for_more_memory_than_it_may_have_is_stopped() {
 #[test]
 fn a_module_built_for_another_abi_is_refused_before_it_runs() {
     let dir = TempDir::new("version");
+    // Stamped with a version this host does not speak. Written by
+    // substituting the placeholder directly rather than by patching what
+    // `versioned` rendered, so the two cannot disagree about what a fixture
+    // looks like.
     dir.plugin(
         "future",
-        &spins().replace(
-            &format!("(i32.const {})", abi::VERSION),
-            &format!("(i32.const {})", abi::VERSION + 1),
-        ),
+        &SPINS.replace("$ABI_VERSION", &(abi::VERSION + 1).to_string()),
     );
     let published = Published::default();
     let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
@@ -443,10 +465,12 @@ fn a_module_missing_the_entry_point_is_refused() {
     let dir = TempDir::new("no-entry");
     dir.plugin(
         "broken",
-        r#"(module
+        &versioned(
+            r#"(module
              (memory (export "memory") 1)
-             (func (export "oxi_abi_version") (result i32) (i32.const 1))
+             (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
              (func (export "oxi_init") (result i32) (i32.const 0)))"#,
+        ),
     );
     let published = Published::default();
     let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
@@ -457,7 +481,7 @@ fn a_module_missing_the_entry_point_is_refused() {
 #[test]
 fn one_unloadable_file_does_not_stop_the_others() {
     let dir = TempDir::new("mixed");
-    dir.plugin("autoreply", PONG);
+    dir.plugin("autoreply", &pong());
     std::fs::write(dir.0.join("junk.wasm"), b"not wasm at all").expect("writable");
     std::fs::write(dir.0.join("notes.txt"), b"ignored").expect("writable");
 
@@ -475,7 +499,7 @@ fn one_unloadable_file_does_not_stop_the_others() {
 #[test]
 fn a_plugin_is_handed_only_the_kinds_it_asked_for() {
     let dir = TempDir::new("subscription");
-    dir.plugin("autoreply", PONG);
+    dir.plugin("autoreply", &pong());
     let commands = Recorder::new(Outcome::Accepted);
     let published = Published::default();
     let plugins = host(&dir, Arc::clone(&commands), &published);
@@ -610,7 +634,7 @@ fn a_file_whose_name_is_not_a_usable_id_is_skipped() {
 #[test]
 fn a_refused_command_is_reported_back_into_the_sandbox() {
     let dir = TempDir::new("refused");
-    dir.plugin("autoreply", PONG);
+    dir.plugin("autoreply", &pong());
     let commands = Recorder::new(Outcome::NoSession);
     let published = Published::default();
     let plugins = host(&dir, Arc::clone(&commands), &published);
@@ -627,7 +651,7 @@ fn a_refused_command_is_reported_back_into_the_sandbox() {
 #[test]
 fn shutting_down_joins_every_plugin() {
     let dir = TempDir::new("shutdown");
-    dir.plugin("autoreply", PONG);
+    dir.plugin("autoreply", &pong());
     dir.plugin("greeter", &draws());
     let plugins = host(
         &dir,
@@ -746,7 +770,7 @@ fn the_example_plugin_loads_and_answers_its_own_widgets() {
 #[test]
 fn a_plugin_stopped_for_falling_behind_is_offered_nothing_more() {
     let dir = TempDir::new("overflow");
-    dir.plugin("autoreply", PONG);
+    dir.plugin("autoreply", &pong());
     let commands = Recorder::new(Outcome::Accepted);
     let published = Published::default();
     let plugins = host(&dir, Arc::clone(&commands), &published);
@@ -792,7 +816,7 @@ fn a_short_buffer_is_told_how_much_room_it_needed() {
     let dir = TempDir::new("short-buffer");
     dir.plugin(
         "reader",
-        &format!(
+        &versioned(&format!(
             r#"(module
   (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
   (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
@@ -800,7 +824,7 @@ fn a_short_buffer_is_told_how_much_room_it_needed() {
   (import "oxidezap" "oxi_send_text" (func $send (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{jid}")
-  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
   (func (export "oxi_init") (result i32)
     (call $subscribe (i64.const 2))
     (call $caps (i64.const 1))
@@ -820,7 +844,7 @@ fn a_short_buffer_is_told_how_much_room_it_needed() {
 )"#,
             jid = "a@s.whatsapp.net",
             jid_len = "a@s.whatsapp.net".len()
-        ),
+        )),
     );
 
     let commands = Recorder::new(Outcome::Accepted);
@@ -846,7 +870,7 @@ fn a_short_buffer_is_told_how_much_room_it_needed() {
 #[test]
 fn a_plugin_cannot_act_on_the_account_until_it_is_allowed() {
     let dir = TempDir::new("ungranted");
-    dir.plugin("autoreply", PONG);
+    dir.plugin("autoreply", &pong());
     let commands = Recorder::new(Outcome::Accepted);
     let published = Published::default();
     let plugins = unapproved_host(&dir, Arc::clone(&commands), &published);
@@ -902,7 +926,7 @@ fn an_unapproved_plugin_can_still_explain_itself() {
 #[test]
 fn shutting_down_finishes_even_with_a_saturated_queue() {
     let dir = TempDir::new("saturated");
-    dir.plugin("autoreply", PONG);
+    dir.plugin("autoreply", &pong());
     let plugins = host(
         &dir,
         Recorder::new(Outcome::Accepted),
