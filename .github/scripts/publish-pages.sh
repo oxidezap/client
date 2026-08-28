@@ -41,6 +41,22 @@ if [ "${1:-}" = "--remove" ]; then
     remove=true
     shift
 fi
+
+# Something to re-ask before each attempt, when "should this happen at all" is
+# a question the branch cannot answer.
+#
+# The lease below keeps two writers from losing each other's work; it says
+# nothing about whether the work is still wanted. A pull request that closes
+# while a publish is in flight is exactly that: the close job removes the
+# preview, this one re-reads the branch it just changed, and — with no second
+# question — puts the preview straight back. Asking once before the loop would
+# not close it either; the window is between the question and the push, so the
+# question belongs inside.
+precondition=''
+if [ "${1:-}" = "--only-if" ]; then
+    precondition="${2:?--only-if needs a command}"
+    shift 2
+fi
 target="${1:?a target directory is required}"
 
 : "${GH_TOKEN:?a token is required to push}"
@@ -59,6 +75,11 @@ bundle_dir=$(pwd)/bundle
 attempts=6
 attempt=1
 while [ "$attempt" -le "$attempts" ]; do
+
+if [ -n "$precondition" ] && ! sh -c "$precondition"; then
+    echo "no longer wanted; not publishing $target"
+    exit 0
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

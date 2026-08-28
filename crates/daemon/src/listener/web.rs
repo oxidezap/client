@@ -248,7 +248,12 @@ async fn serve(
 
     // A browser asks before it fetches media from another origin.
     if request.method == "OPTIONS" {
-        return respond(stream.get_mut(), 204, "text/plain", origin.as_deref(), b"").await;
+        return preflight(
+            stream.get_mut(),
+            origin.as_deref(),
+            request.wants_private_network,
+        )
+        .await;
     }
 
     if request.path == WEB_SOCKET_PATH {
@@ -489,6 +494,46 @@ async fn serve_media(stream: &mut TcpStream, key: &str, origin: Option<&str>) ->
 }
 
 /// One HTTP response, headers and all.
+/// Answer a preflight, including the one a page needs to reach loopback at all.
+///
+/// A hosted page is a *public* origin asking a *private* address, which Chrome
+/// gates behind Private Network Access: the preflight carries
+/// `Access-Control-Request-Private-Network`, and the fetch only follows if the
+/// answer carries `Access-Control-Allow-Private-Network: true`. Without it the
+/// socket attaches and every photo fails — the WebSocket is not subject to
+/// this and `fetch` is, so the failure looks like a working connection with no
+/// media in it.
+///
+/// Only when asked, and only after the token check above: this says "yes, a
+/// public page may reach this private address", which is exactly the sentence
+/// that should require the credential. Answering it unconditionally would
+/// advertise the opt-in to callers who have not authenticated.
+async fn preflight(
+    stream: &mut TcpStream,
+    origin: Option<&str>,
+    private_network: bool,
+) -> Result<()> {
+    let mut head = String::from(
+        "HTTP/1.1 204 No Content\r\n\
+         Content-Length: 0\r\n\
+         Connection: close\r\n",
+    );
+    if let Some(origin) = origin {
+        head.push_str(&format!(
+            "Access-Control-Allow-Origin: {origin}\r\n\
+             Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+             Vary: Origin\r\n"
+        ));
+    }
+    if private_network {
+        head.push_str("Access-Control-Allow-Private-Network: true\r\n");
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 async fn respond(
     stream: &mut TcpStream,
     status: u16,
@@ -562,6 +607,10 @@ struct Request {
     query: String,
     origin: Option<String>,
     websocket_key: Option<String>,
+    /// Whether this preflight is asking to reach a private address, which is
+    /// what a page served from a public origin has to ask before it may talk
+    /// to loopback at all.
+    wants_private_network: bool,
 }
 
 impl Request {
@@ -578,6 +627,7 @@ impl Request {
 
         let mut origin = None;
         let mut websocket_key = None;
+        let mut wants_private_network = false;
         for line in lines {
             let Some((name, value)) = line.split_once(':') else {
                 continue;
@@ -588,6 +638,9 @@ impl Request {
             match name.to_ascii_lowercase().as_str() {
                 "origin" => origin = Some(value),
                 "sec-websocket-key" => websocket_key = Some(value),
+                "access-control-request-private-network" => {
+                    wants_private_network = value.eq_ignore_ascii_case("true");
+                }
                 _ => {}
             }
         }
@@ -598,6 +651,7 @@ impl Request {
             query,
             origin,
             websocket_key,
+            wants_private_network,
         })
     }
 
@@ -738,6 +792,7 @@ mod tests {
             query: format!("token={TEST_TOKEN}"),
             origin: origin.map(str::to_string),
             websocket_key: None,
+            wants_private_network: false,
         }
     }
 
@@ -930,6 +985,7 @@ mod token_tests {
             query: query.to_string(),
             origin: None,
             websocket_key: None,
+            wants_private_network: false,
         }
     }
 
