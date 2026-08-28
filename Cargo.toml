@@ -36,7 +36,17 @@ disallowed_types = "deny"
 anyhow = "1.0"
 async-trait = "0.1"
 buffa = { version = "0.9.1", default-features = false, features = ["json"] }
-chrono = { version = "0.4", default-features = false }
+# `wasmbind` reads the clock from the browser's `Date` instead of
+# `SystemTime`, which on `wasm32-unknown-unknown` is the std function that
+# panics with "time not implemented on this platform" — and `Utc::now()` is
+# how every message, receipt and chat row here is stamped, so without it the
+# first thing a page does with a timestamp takes the whole task down. It is
+# one of chrono's own defaults; `default-features = false` above is what
+# switched it off. Named here rather than per-crate because the crates that
+# ask for a clock are the same ones on both sides, and chrono declares
+# `wasm-bindgen`/`js-sys` under a wasm-only target table, so a native build
+# picks up nothing from it.
+chrono = { version = "0.4", default-features = false, features = ["wasmbind"] }
 diesel = { version = "2.3.11", default-features = false, features = ["sqlite", "r2d2", "32-column-tables"] }
 diesel_migrations = { version = "2.3.2", default-features = false, features = ["sqlite"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
@@ -217,3 +227,4 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.serde_json]
 opt-level = "s"
+
