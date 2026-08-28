@@ -15,6 +15,24 @@ pub fn logging() {
     imp::logging();
 }
 
+/// Tell the library what time it is, where nothing else will.
+///
+/// `wacore` reads the wall clock through a provider it registers a default
+/// for — `chrono::Utc::now()` on a desktop, and on `wasm32` a stub that
+/// returns *epoch* and warns once, because there is no clock std can offer
+/// there. Nothing fails visibly under it: messages are stamped 1970, receipts
+/// sort against each other wrongly, and a history load looks like an account
+/// that has been quiet for fifty-six years.
+///
+/// It is registered here because it has to be first. The provider is a
+/// `OnceLock` behind `get_or_init`, so the *first read* installs the default
+/// permanently and every later `set` is refused — and the first read happens
+/// somewhere in the first frame. There is nothing earlier than this in the
+/// process on either platform.
+pub fn clocks() {
+    imp::clocks();
+}
+
 /// The application, before it is given anything to draw.
 #[must_use]
 pub fn application() -> gpui::Application {
@@ -57,6 +75,10 @@ mod imp {
         logger.init();
     }
 
+    /// Nothing to install: `wacore` defaults to `chrono` here, which has a
+    /// clock behind it.
+    pub(super) fn clocks() {}
+
     /// The application, before it is given anything to draw.
     ///
     /// A desktop window and a canvas differ in one thing the rest of this file
@@ -84,6 +106,46 @@ mod imp {
         // Setting the level afterwards is what actually needs saying.
         gpui_platform::web_init();
         log::set_max_level(log::LevelFilter::Info);
+    }
+
+    /// `Date.now()` for the wall clock, `performance.now()` for the
+    /// monotonic one.
+    ///
+    /// Two clocks because they answer different questions and fail
+    /// differently. The wall clock says when something happened and may jump
+    /// when the machine's time is corrected; the monotonic one measures how
+    /// long something took and may not. `wacore` would otherwise derive the
+    /// second from the first, which is only as monotonic as the user's time
+    /// zone changes let it be — and `performance.now()` is the browser's own
+    /// answer, in fractional milliseconds from the page's start.
+    pub(super) fn clocks() {
+        struct DateNow;
+        impl wacore::time::TimeProvider for DateNow {
+            fn now_millis(&self) -> i64 {
+                js_sys::Date::now() as i64
+            }
+        }
+
+        struct PerformanceNow;
+        impl wacore::time::MonotonicProvider for PerformanceNow {
+            fn now_nanos(&self) -> u64 {
+                let millis = web_sys::window()
+                    .and_then(|window| window.performance())
+                    .map_or(0.0, |performance| performance.now());
+                (millis.max(0.0) * 1_000_000.0) as u64
+            }
+        }
+
+        // A refusal means something read the clock before this ran, which is
+        // the one thing this function exists to be earlier than. Worth a line
+        // in the console, and not worth failing the page over: a wrong clock
+        // draws a wrong timestamp, and no clock at all draws nothing.
+        if wacore::time::set_time_provider(DateNow).is_err() {
+            log::warn!("the wall clock was already resolved before it could be set");
+        }
+        if wacore::time::set_monotonic_provider(PerformanceNow).is_err() {
+            log::warn!("the monotonic clock was already resolved before it could be set");
+        }
     }
 
     pub(super) fn application() -> gpui::Application {

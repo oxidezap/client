@@ -102,3 +102,26 @@ pub async fn wipe() -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// How the database is opened here, which is one setting away from the
+/// defaults and not a matter of taste.
+///
+/// `PRAGMA synchronous` is refused by this VFS at anything but `off` — it
+/// answers the file-control with "relaxed-idb vfs only supports
+/// synchronous=off" — and the store's default asks for `normal`, so the
+/// connection was rejected while being configured and the page opened no
+/// database at all.
+///
+/// Refusing it is the honest thing for the VFS to do rather than a limitation
+/// to work around: `synchronous` is a promise about when a write has reached
+/// the disk, and this store *has no disk at the moment of the write*. The
+/// database is memory and the changed blocks go to IndexedDB afterwards, so
+/// there is no ordering here for the pragma to describe. Saying `off` is
+/// saying what is already true; the durability window is the module's own
+/// subject, above.
+pub fn settings() -> whatsapp_rust_sqlite_storage::SqliteStoreConfig {
+    whatsapp_rust_sqlite_storage::SqliteStoreConfig {
+        synchronous: whatsapp_rust_sqlite_storage::Synchronous::Off,
+        ..Default::default()
+    }
+}

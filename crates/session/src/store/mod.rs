@@ -21,7 +21,7 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
-pub use platform::{database_path, prepare, wipe};
+pub use platform::{database_path, prepare, settings, wipe};
 
 /// The database's name, wherever it is kept.
 const DB_FILE: &str = "whatsapp.db";

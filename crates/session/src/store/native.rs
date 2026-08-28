@@ -85,3 +85,11 @@ fn database_dir() -> Option<std::path::PathBuf> {
     }
     Some(dir)
 }
+
+/// How the database is opened here: the crate's own defaults.
+///
+/// A real file under a real VFS, so every knob the store offers means what it
+/// says.
+pub fn settings() -> whatsapp_rust_sqlite_storage::SqliteStoreConfig {
+    whatsapp_rust_sqlite_storage::SqliteStoreConfig::default()
+}

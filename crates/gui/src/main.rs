@@ -32,6 +32,8 @@ use crate::app::{WhatsAppApp, init_app_bindings};
 /// it rather than two entry points that would drift.
 fn main() {
     crate::platform::logging();
+    // Before anything reads it: the first read is what settles the default.
+    crate::platform::clocks();
     open_the_window();
 }
 

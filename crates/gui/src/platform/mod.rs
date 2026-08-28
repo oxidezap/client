@@ -16,4 +16,4 @@ pub mod startup;
 pub use clock::{sleep, with_timeout};
 pub use identity::front_end_id;
 pub use launch::run;
-pub use startup::{application, logging};
+pub use startup::{application, clocks, logging};

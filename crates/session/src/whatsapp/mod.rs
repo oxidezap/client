@@ -43,6 +43,7 @@ use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
 /// Where the store lives on this platform. See [`crate::store`].
 pub use crate::store::{database_path as resolve_database_path, prepare as prepare_store};
+use crate::store::settings as store_settings;
 
 /// Delete the local session: device identity, Signal state and chat history
 /// all live in the one SQLite file.
@@ -478,7 +479,7 @@ impl WhatsAppClient {
             }
         };
         info!("Opening data database");
-        let backend = match SqliteStore::new(&db_path).await {
+        let backend = match SqliteStore::with_config(&db_path, store_settings()).await {
             Ok(store) => store,
             Err(e) => {
                 // With the chain, not just the head. `StoreError`'s own
