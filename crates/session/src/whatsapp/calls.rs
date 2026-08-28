@@ -10,6 +10,7 @@
 //! the same split the GUI already uses for `app/`.
 
 use super::*;
+use whatsapp_rust::voip::{CallHandle, CallTermination};
 
 /// Live call state shared between the event pump and the UI action methods.
 #[derive(Clone, Default)]
@@ -59,14 +60,20 @@ impl CallRegistry {
         self.pending.lock().await.remove(call_id);
     }
 
-    /// Take a live call out of the registry, if it is in it.
+    /// The peer ended this call: drop the local side without answering.
     ///
-    /// Handing the handle back rather than acting on it: what a caller does
-    /// with a call it has just removed differs — the peer ending it is not
-    /// the same as us ending it — and that difference belongs at the call
-    /// site, which is the one place that knows which happened.
-    pub(super) async fn take_live(&self, call_id: &str) -> Option<Arc<CallHandle>> {
-        self.active.lock().await.remove(call_id)
+    /// `hangup_local`, not `terminate`: they are the side that ended it, and
+    /// answering their `<terminate>` with one of our own says nothing they do
+    /// not already know. Only the local media task and the registry entry are
+    /// left to drop.
+    ///
+    /// Done here rather than by handing the handle back, so that a caller
+    /// never has to name a `CallHandle` — the type is the media stack's, and
+    /// the media stack is what a browser does not have.
+    pub(super) async fn ended_by_peer(&self, call_id: &str) {
+        if let Some(handle) = self.active.lock().await.remove(call_id) {
+            tokio::spawn(async move { handle.hangup_local().await });
+        }
     }
 }
 

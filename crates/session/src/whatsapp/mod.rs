@@ -14,7 +14,6 @@ use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::store::SqliteStore;
-use whatsapp_rust::voip::{CallHandle, CallTermination};
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
 use whatsapp_rust::wacore::types::events::Event;
@@ -694,14 +693,7 @@ impl WhatsAppClient {
                 CallAction::Terminate { call_id, .. } => {
                     info!("Call {} terminated by peer", call_id);
                     calls.forget_offer(call_id).await;
-                    if let Some(handle) = calls.take_live(call_id).await {
-                        // `hangup_local`, not `terminate`: the peer is the
-                        // side that ended this, and answering their
-                        // `<terminate>` with one of our own says nothing they
-                        // do not already know. Only the local media task and
-                        // the registry entry are left to drop.
-                        tokio::spawn(async move { handle.hangup_local().await });
-                    }
+                    calls.ended_by_peer(call_id).await;
                     let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                 }
                 _ => {}
