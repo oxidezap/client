@@ -250,8 +250,45 @@ jobs:
           bash .github/scripts/publish-pages.sh \
             --only-if "sh $RUNNER_TEMP/still-current.sh" "$TARGET"
 
-      - name: Say where it is
+      # If the pull request closed while we were publishing, undo it.
+      #
+      # The check runs before every attempt at the branch, and that still
+      # leaves one gap it cannot close: a preview being published for the
+      # *first* time has nothing on `gh-pages` yet, so the close job finds
+      # nothing to remove and exits without touching the branch — which means
+      # it does not invalidate our lease either, and the push that follows
+      # publishes a preview for a pull request nobody will ever close again.
+      #
+      # A lease cannot help there, because the two jobs are not both writing.
+      # So this is a compensation rather than a guard: publish, ask again, and
+      # take it back down if the answer changed. Either order converges — if
+      # the close job runs after us it finds the preview and removes it, and
+      # if it ran before us we remove it here.
+      - name: Take it down again if the pull request closed meanwhile
+        id: undone
         if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ steps.where.outputs.target }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          if sh "$RUNNER_TEMP/still-current.sh"; then
+            echo "still open; the preview stays"
+            echo "removed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "closed while publishing; removing $TARGET again" >&2
+          bash .github/scripts/publish-pages.sh --remove "$TARGET"
+          echo "removed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Say where it is
+        if: github.event_name == 'pull_request' && steps.undone.outputs.removed != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

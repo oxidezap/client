@@ -287,7 +287,10 @@ pub fn endpoint_url() -> String {
     match usable_endpoint(&asked) {
         Ok(()) => asked,
         Err(why) => {
-            log::error!("ignoring ?daemon={asked}: {why}");
+            // Redacted here too. A rejected URL is the *likeliest* one to be
+            // pasted into an issue — it is the one that did not work — and it
+            // carries the same token the accepted one does.
+            log::error!("ignoring #daemon={}: {why}", without_secrets(&asked));
             default()
         }
     }
