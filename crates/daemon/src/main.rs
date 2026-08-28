@@ -7,6 +7,7 @@
 
 mod listener;
 mod media;
+mod plugins;
 mod server;
 mod session_bridge;
 mod shutdown;
@@ -84,16 +85,28 @@ async fn run() -> Result<()> {
     // would let it queue payloads, and spawn session tasks, without limit.
     let (commands, command_rx) = tokio::sync::mpsc::channel(server::MAX_CLIENTS);
 
+    // After the command channel, because a plugin acts through it, and before
+    // the session, because a plugin subscribed to messages must not miss the
+    // ones that arrive while it is still loading.
+    let plugins = plugins::start(&hub, commands.clone());
+
     let mut session = {
         let hub = Arc::clone(&hub);
+        let plugins = Arc::clone(&plugins);
         let stop = Arc::clone(&stop);
         tokio::spawn(async move {
-            session_bridge::run(hub, command_rx, async move { stop.notified().await }).await
+            session_bridge::run(
+                hub,
+                plugins,
+                command_rx,
+                async move { stop.notified().await },
+            )
+            .await
         })
     };
 
     let server_outcome = tokio::select! {
-        result = server::run(&claim, Arc::clone(&hub), commands) => {
+        result = server::run(&claim, Arc::clone(&hub), Arc::clone(&plugins), commands) => {
             // Fatal, and it has to reach the exit code: a supervisor that sees
             // status zero treats a daemon nobody can connect to as a clean
             // stop and never restarts it.

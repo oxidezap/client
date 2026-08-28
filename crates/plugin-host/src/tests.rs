@@ -1,0 +1,779 @@
+//! The host's behaviour, against modules written for these tests.
+//!
+//! Fixtures are hand-written `.wat` assembled at test time rather than
+//! checked-in `.wasm`. A binary in the tree is a thing nobody reviews, and
+//! building one in CI would put a wasm toolchain there for the sake of these
+//! tests — while a twelve-line `.wat` says what misbehaviour it reproduces
+//! far better than the Rust that would compile to it.
+
+use std::sync::Mutex;
+use std::time::Duration;
+
+// The library's clock rather than std's, like everywhere else in this tree:
+// a test that moves time has to move what these read.
+use wacore::time::Instant;
+
+use oxidezap_core::{ChatMessage, MessageStatus, PluginSlot, PluginWidget};
+
+use super::*;
+
+// ---- doubles -------------------------------------------------------------
+
+/// A [`Commands`] that records what it was asked for.
+struct Recorder {
+    sent: Mutex<Vec<(String, String, Option<String>)>>,
+    answer: Outcome,
+}
+
+impl Recorder {
+    fn new(answer: Outcome) -> Arc<Self> {
+        Arc::new(Self {
+            sent: Mutex::new(Vec::new()),
+            answer,
+        })
+    }
+
+    fn sent(&self) -> Vec<(String, String, Option<String>)> {
+        self.sent.lock().expect("not poisoned").clone()
+    }
+}
+
+impl Commands for Arc<Recorder> {
+    fn send_text(&self, jid: &str, text: &str, quoted: Option<&str>) -> Outcome {
+        self.sent.lock().expect("not poisoned").push((
+            jid.to_owned(),
+            text.to_owned(),
+            quoted.map(str::to_owned),
+        ));
+        self.answer
+    }
+    fn mark_read(&self, _jid: &str, _message_id: Option<&str>) -> Outcome {
+        Outcome::Accepted
+    }
+    fn typing(&self, _jid: &str, _composing: bool) -> Outcome {
+        Outcome::Accepted
+    }
+}
+
+/// Every set of surfaces the host published, newest last.
+#[derive(Clone, Default)]
+struct Published(Arc<Mutex<Vec<Vec<PluginSurface>>>>);
+
+impl Published {
+    fn sink(&self) -> Sink {
+        let inner = Arc::clone(&self.0);
+        Arc::new(move |surfaces| inner.lock().expect("not poisoned").push(surfaces))
+    }
+
+    fn latest(&self) -> Vec<PluginSurface> {
+        self.0
+            .lock()
+            .expect("not poisoned")
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Wait for `predicate` to hold of the newest publication.
+    ///
+    /// Plugins run on their own threads, so every assertion about what one
+    /// did is an assertion about something that has not necessarily happened
+    /// yet. Polling with a deadline is what keeps these tests from being
+    /// either flaky or a fixed sleep.
+    fn settles(
+        &self,
+        what: &str,
+        predicate: impl Fn(&[PluginSurface]) -> bool,
+    ) -> Vec<PluginSurface> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let latest = self.latest();
+            if predicate(&latest) {
+                return latest;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// Wait for a condition on the recorder, with the same reasoning.
+fn until(what: &str, predicate: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !predicate() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A directory that removes itself.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "oxidezap-plugins-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("a writable temp dir");
+        Self(path)
+    }
+
+    /// Assemble a `.wat` fixture into the directory under `name`.
+    fn plugin(&self, name: &str, wat: &str) -> &Self {
+        let wasm = wat::parse_str(wat).expect("the fixture assembles");
+        std::fs::write(self.0.join(format!("{name}.wasm")), wasm).expect("writable");
+        self
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn message(chat: &str, text: &str) -> UiEvent {
+    UiEvent::MessageReceived {
+        chat_jid: chat.into(),
+        message: Box::new(ChatMessage {
+            id: "MSG1".into(),
+            sender: chat.into(),
+            sender_name: None,
+            content: text.into(),
+            timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("a valid instant"),
+            is_from_me: false,
+            is_read: false,
+            media: None,
+            reactions: Default::default(),
+            status: MessageStatus::Delivered,
+            quoted: None,
+            revoked: false,
+            system: None,
+        }),
+        sender_name: None,
+    }
+}
+
+// ---- fixtures ------------------------------------------------------------
+
+/// Subscribes to messages, asks for `send`, and answers every message with
+/// "pong" in the chat it arrived in.
+const PONG: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe"     (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps"  (func $caps (param i64)))
+  (import "oxidezap" "oxi_field_str"     (func $field_str (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text"     (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "pong")
+  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (global $answer (mut i32) (i32.const 0))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))   ;; 1 << kinds::MESSAGE
+    (call $caps      (i64.const 1))   ;; caps::SEND
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $n i32)
+    ;; fields::CHAT_JID into a scratch buffer well past the "pong" literal
+    (local.set $n (call $field_str (local.get $ev) (i32.const 1) (i32.const 256) (i32.const 256)))
+    (if (i32.gt_s (local.get $n) (i32.const 0))
+      (then
+        (global.set $answer
+          (call $send (i32.const 256) (local.get $n) (i32.const 0) (i32.const 4)))))
+    (i32.const 0))
+  (func (export "answer") (result i32) (global.get $answer))
+)"#;
+
+/// The same, but never asks for the capability.
+const PONG_WITHOUT_PERMISSION: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_field_str" (func $field_str (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text" (func $send (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_ui_set"    (func $ui_set (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "pong")
+  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $n i32)
+    (local.set $n (call $field_str (local.get $ev) (i32.const 1) (i32.const 256) (i32.const 256)))
+    (drop (call $send (i32.const 256) (local.get $n) (i32.const 0) (i32.const 4)))
+    ;; And a tree it also never asked to be allowed to draw.
+    (drop (call $ui_set (i32.const 0) (i32.const 4)))
+    (i32.const 0))
+)"#;
+
+fn spins() -> String {
+    format!(
+        r#"(module
+  (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
+  (memory (export "memory") 1)
+  (func (export "oxi_abi_version") (result i32) (i32.const {version}))
+  (func (export "oxi_init") (result i32) (call $subscribe (i64.const 2)) (i32.const 0))
+  (func (export "oxi_on_event") (param i32 i32) (result i32) (loop (br 0)) (i32.const 0))
+)"#,
+        version = abi::VERSION
+    )
+}
+
+/// Asks for one page and then for far more than the limit allows.
+const GREEDY: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
+  (memory (export "memory") 1)
+  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_init") (result i32) (call $subscribe (i64.const 2)) (i32.const 0))
+  (func (export "oxi_on_event") (param i32 i32) (result i32)
+    (drop (memory.grow (i32.const 4096)))
+    (i32.const 0))
+)"#;
+
+/// Deliberately not ASCII: a length in characters rather than bytes would
+/// truncate this, which is the mistake the ABI's snprintf convention exists
+/// to make visible.
+const NAME: &str = "Saudações";
+
+fn wat_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("\\{b:02x}")).collect()
+}
+
+/// A plugin whose whole interface is published from `oxi_init`.
+fn draws() -> String {
+    let mut buf = vec![0u8; 512];
+    let mut w = abi::ui::Writer::new(&mut buf);
+    w.leaf(
+        abi::ui::kind::BUTTON,
+        abi::ui::slot::CHAT_HEADER,
+        abi::ui::flags::ENABLED,
+        "greet",
+        "Cumprimentar",
+        "",
+    );
+    let n = w.finish().expect("fits");
+    format!(
+        r#"(module
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_set_name"     (func $set_name (param i32 i32) (result i32)))
+  (import "oxidezap" "oxi_ui_set"       (func $ui_set (param i32 i32) (result i32)))
+  (import "oxidezap" "oxi_field_str"    (func $field_str (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{tree}")
+  (data (i32.const 1024) "{name}")
+  (data (i32.const 1100) "oi")
+  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_init") (result i32)
+    (call $caps (i64.const 9))    ;; caps::SEND | caps::UI
+    (drop (call $set_name (i32.const 1024) (i32.const {name_len})))
+    (drop (call $ui_set (i32.const 0) (i32.const {len})))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $n i32)
+    ;; A UI action carries the chat the window had open: answer into it.
+    (local.set $n (call $field_str (local.get $ev) (i32.const 1) (i32.const 2048) (i32.const 256)))
+    (if (i32.gt_s (local.get $n) (i32.const 0))
+      (then (drop (call $send (i32.const 2048) (local.get $n) (i32.const 1100) (i32.const 2)))))
+    (i32.const 0))
+)"#,
+        tree = wat_bytes(&buf[..n]),
+        len = n,
+        name = NAME,
+        // Bytes, not characters: the ABI counts what crosses it, and getting
+        // this wrong is exactly how a name loses its last letter.
+        name_len = NAME.len()
+    )
+}
+
+// ---- what the host does --------------------------------------------------
+
+fn host(dir: &TempDir, commands: Arc<Recorder>, published: &Published) -> Plugins {
+    Plugins::load(&dir.0, None, Arc::new(commands), published.sink())
+}
+
+#[test]
+fn a_plugin_sees_a_message_and_answers_it() {
+    let dir = TempDir::new("pong");
+    dir.plugin("autoreply", PONG);
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    plugins.observe(&message("5511999@s.whatsapp.net", "ping"));
+    until("the reply", || commands.sent().len() == 1);
+
+    assert_eq!(
+        commands.sent()[0],
+        ("5511999@s.whatsapp.net".into(), "pong".into(), None)
+    );
+}
+
+/// The declaration is the contract. A plugin that never asked to send is
+/// refused at the import, not at the session.
+#[test]
+fn a_command_outside_the_declared_capabilities_never_reaches_the_daemon() {
+    let dir = TempDir::new("denied");
+    dir.plugin("sneaky", PONG_WITHOUT_PERMISSION);
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    // Nothing to wait *for*, so wait for the plugin to have run at all: it
+    // publishes no tree either, and both refusals are the same call.
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(commands.sent().is_empty(), "it may not send");
+    let surface = published.latest().remove(0);
+    assert!(surface.roots.is_empty(), "and it may not draw");
+    assert!(surface.capabilities.is_empty());
+    assert!(surface.is_running(), "but it is not stopped for trying");
+}
+
+/// The number that makes running a stranger's code in this process
+/// defensible.
+#[test]
+fn a_plugin_that_loops_forever_runs_out_of_fuel_and_is_stopped() {
+    let dir = TempDir::new("spin");
+    dir.plugin("spinner", &spins());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    plugins.observe(&message("a@s.whatsapp.net", "go"));
+    let surfaces = published.settles("the plugin to be stopped", |s| {
+        s.first().is_some_and(|p| !p.is_running())
+    });
+
+    let reason = surfaces[0].stopped.clone().expect("a reason");
+    assert!(
+        reason.to_lowercase().contains("fuel"),
+        "the reason should name what happened, got {reason:?}"
+    );
+}
+
+#[test]
+fn a_plugin_that_asks_for_more_memory_than_it_may_have_is_stopped() {
+    let dir = TempDir::new("greedy");
+    dir.plugin("greedy", GREEDY);
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    plugins.observe(&message("a@s.whatsapp.net", "go"));
+    published.settles("the plugin to be stopped", |s| {
+        s.first().is_some_and(|p| !p.is_running())
+    });
+}
+
+#[test]
+fn a_module_built_for_another_abi_is_refused_before_it_runs() {
+    let dir = TempDir::new("version");
+    dir.plugin(
+        "future",
+        &spins().replace(
+            &format!("(i32.const {})", abi::VERSION),
+            &format!("(i32.const {})", abi::VERSION + 1),
+        ),
+    );
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    assert!(plugins.is_empty());
+    assert!(published.latest().is_empty());
+}
+
+#[test]
+fn a_module_missing_the_entry_point_is_refused() {
+    let dir = TempDir::new("no-entry");
+    dir.plugin(
+        "broken",
+        r#"(module
+             (memory (export "memory") 1)
+             (func (export "oxi_abi_version") (result i32) (i32.const 1))
+             (func (export "oxi_init") (result i32) (i32.const 0)))"#,
+    );
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert!(plugins.is_empty());
+}
+
+/// A file that is not a plugin is one file, not a reason to serve no account.
+#[test]
+fn one_unloadable_file_does_not_stop_the_others() {
+    let dir = TempDir::new("mixed");
+    dir.plugin("autoreply", PONG);
+    std::fs::write(dir.0.join("junk.wasm"), b"not wasm at all").expect("writable");
+    std::fs::write(dir.0.join("notes.txt"), b"ignored").expect("writable");
+
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    assert_eq!(published.latest().len(), 1);
+    plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    until("the reply", || commands.sent().len() == 1);
+}
+
+/// The subscription mask is what keeps an account's whole traffic from being
+/// converted and queued for a plugin that wants none of it.
+#[test]
+fn a_plugin_is_handed_only_the_kinds_it_asked_for() {
+    let dir = TempDir::new("subscription");
+    dir.plugin("autoreply", PONG);
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    // It subscribed to messages only.
+    plugins.observe(&UiEvent::Connected);
+    plugins.observe(&UiEvent::Disconnected("bye".into()));
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(commands.sent().is_empty());
+
+    plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    until("the reply", || commands.sent().len() == 1);
+}
+
+#[test]
+fn a_plugin_publishes_its_interface_before_any_event() {
+    let dir = TempDir::new("draws");
+    dir.plugin("greeter", &draws());
+    let published = Published::default();
+    let _plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    let surfaces = published.settles("the interface", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+    let surface = &surfaces[0];
+    assert_eq!(surface.id, "greeter");
+    assert_eq!(surface.name, "Saudações");
+    assert_eq!(surface.roots[0].slot, PluginSlot::ChatHeader);
+    assert_eq!(surface.roots[0].node.widget, PluginWidget::Button);
+    assert_eq!(surface.roots[0].node.label, "Cumprimentar");
+    assert!(surface.roots[0].node.enabled);
+    assert_eq!(
+        surface.capabilities,
+        vec![
+            "send messages".to_string(),
+            "add buttons and settings".into()
+        ]
+    );
+}
+
+/// The whole loop the design turns on: a button drawn from daemon state, a
+/// click routed back into the sandbox, and a command out the other side.
+#[test]
+fn pressing_a_plugins_button_reaches_the_plugin_with_the_open_chat() {
+    let dir = TempDir::new("action");
+    dir.plugin("greeter", &draws());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+    published.settles("the interface", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: None,
+        chat_jid: Some("5511999@s.whatsapp.net".into()),
+    });
+
+    until("the greeting", || commands.sent().len() == 1);
+    assert_eq!(
+        commands.sent()[0],
+        ("5511999@s.whatsapp.net".into(), "oi".into(), None)
+    );
+}
+
+#[test]
+fn an_action_for_a_plugin_that_is_not_loaded_is_ignored() {
+    let dir = TempDir::new("stray");
+    dir.plugin("greeter", &draws());
+    let plugins = host(
+        &dir,
+        Recorder::new(Outcome::Accepted),
+        &Published::default(),
+    );
+    plugins.act(&PluginAction {
+        plugin: "nobody".into(),
+        action: "x".into(),
+        value: None,
+        chat_jid: None,
+    });
+}
+
+#[test]
+fn plugins_load_in_a_stable_order() {
+    let dir = TempDir::new("order");
+    dir.plugin("zeta", &draws());
+    dir.plugin("alpha", &draws());
+    let published = Published::default();
+    let _plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    let ids: Vec<String> = published.latest().into_iter().map(|s| s.id).collect();
+    assert_eq!(ids, vec!["alpha", "zeta"]);
+}
+
+#[test]
+fn an_absent_directory_is_not_an_error() {
+    let published = Published::default();
+    let plugins = Plugins::load(
+        Path::new("/nonexistent/oxidezap/plugins"),
+        None,
+        Arc::new(Recorder::new(Outcome::Accepted)),
+        published.sink(),
+    );
+    assert!(plugins.is_empty());
+}
+
+/// A plugin id is also the stem of its settings file, so one carrying a
+/// separator would name a path of its own choosing.
+#[test]
+fn a_file_whose_name_is_not_a_usable_id_is_skipped() {
+    assert_eq!(
+        plugin_id(Path::new("a/autoreply.wasm")).as_deref(),
+        Some("autoreply")
+    );
+    assert_eq!(
+        plugin_id(Path::new("a/auto-reply_2.wasm")).as_deref(),
+        Some("auto-reply_2")
+    );
+    assert_eq!(
+        plugin_id(Path::new("a/../escape.wasm")).as_deref(),
+        Some("escape")
+    );
+    assert_eq!(plugin_id(Path::new("a/with space.wasm")), None);
+    assert_eq!(plugin_id(Path::new("a/dots.in.name.wasm")), None);
+    assert_eq!(plugin_id(Path::new("a/.wasm")), None);
+}
+
+/// What a command answered reaches the plugin, which is the thing a socket
+/// front end cannot learn about its own.
+#[test]
+fn a_refused_command_is_reported_back_into_the_sandbox() {
+    let dir = TempDir::new("refused");
+    dir.plugin("autoreply", PONG);
+    let commands = Recorder::new(Outcome::NoSession);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    until("the attempt", || commands.sent().len() == 1);
+    // The plugin stashed the answer in a global; reading it back through the
+    // instance is not something the host exposes, so what this asserts is
+    // that a refusal is not a trap: it kept running.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(published.latest()[0].is_running());
+}
+
+#[test]
+fn shutting_down_joins_every_plugin() {
+    let dir = TempDir::new("shutdown");
+    dir.plugin("autoreply", PONG);
+    dir.plugin("greeter", &draws());
+    let plugins = host(
+        &dir,
+        Recorder::new(Outcome::Accepted),
+        &Published::default(),
+    );
+    assert_eq!(plugins.ids(), vec!["autoreply", "greeter"]);
+    plugins.shutdown();
+    // Idempotent: the daemon calls this on its way out and `Drop` calls it
+    // again.
+    plugins.shutdown();
+}
+
+/// The real SDK, against the real host.
+///
+/// Ignored by default because it needs the example built for wasm32, which
+/// means a target CI does not install:
+///
+/// ```text
+/// cd examples/autoreply && cargo build --release --target wasm32-unknown-unknown
+/// cargo test -p oxidezap-plugin-host -- --ignored
+/// ```
+///
+/// The `.wat` fixtures above test the host; this tests the *pair* — that what
+/// `oxidezap-plugin` emits is what this file expects, which is the one thing
+/// no hand-written module can check.
+#[test]
+#[ignore = "needs examples/autoreply built for wasm32-unknown-unknown"]
+fn the_example_plugin_loads_and_answers_its_own_widgets() {
+    let built = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/autoreply/target/wasm32-unknown-unknown/release/autoreply.wasm"
+    );
+    let bytes = std::fs::read(built).expect("build the example first; see this test's doc comment");
+
+    let dir = TempDir::new("example");
+    std::fs::write(dir.0.join("autoreply.wasm"), bytes).expect("writable");
+
+    // Its own storage, because this plugin is off until somebody turns it on
+    // and the toggle has to survive the call that flips it.
+    let state = TempDir::new("example-state");
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state.0),
+        Arc::new(Arc::clone(&commands)),
+        published.sink(),
+    );
+
+    // It draws its settings panel from `oxi_init`, before any event.
+    let surfaces = published.settles("its settings panel", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+    let surface = &surfaces[0];
+    assert_eq!(surface.id, "autoreply");
+    assert_eq!(surface.name, "Resposta automática");
+    assert_eq!(
+        surface.capabilities,
+        vec![
+            "send messages".to_string(),
+            "add buttons and settings".into(),
+            "keep its own settings".into(),
+        ]
+    );
+    assert_eq!(surface.roots[0].slot, PluginSlot::Settings);
+    let section = &surface.roots[0].node;
+    assert_eq!(section.widget, PluginWidget::Section);
+    assert!(!section.children[0].checked, "it starts switched off");
+
+    // Off, so it answers nothing.
+    plugins.observe(&message("5511999@s.whatsapp.net", "ping"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(commands.sent().is_empty());
+
+    // Turn it on the way the window would, and it redraws itself.
+    plugins.act(&PluginAction {
+        plugin: "autoreply".into(),
+        action: "enabled".into(),
+        value: Some("1".into()),
+        chat_jid: None,
+    });
+    published.settles("the toggle to come back on", |s| {
+        s.first()
+            .and_then(|p| p.roots.first())
+            .is_some_and(|r| r.node.children[0].checked)
+    });
+
+    // Now the keyword matches and it replies, as a reply.
+    plugins.observe(&message("5511999@s.whatsapp.net", "ping there"));
+    until("the reply", || commands.sent().len() == 1);
+    assert_eq!(
+        commands.sent()[0],
+        (
+            "5511999@s.whatsapp.net".into(),
+            "pong".into(),
+            Some("MSG1".into())
+        )
+    );
+
+    // A group is left alone, whatever it says.
+    plugins.observe(&message("120363@g.us", "ping"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(commands.sent().len(), 1, "groups are not answered");
+}
+
+/// A plugin that falls behind is stopped, and "stopped" has to mean it runs
+/// no more events — not that it keeps working through a backlog while the
+/// interface says it is off.
+#[test]
+fn a_plugin_stopped_for_falling_behind_is_offered_nothing_more() {
+    let dir = TempDir::new("overflow");
+    dir.plugin("autoreply", PONG);
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    // Far more than the queue holds, faster than one wasm call each can be
+    // made. The exact number that fits is not the point; the point is what
+    // happens after it does not.
+    for _ in 0..(QUEUE_DEPTH * 4) {
+        plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    }
+
+    let surfaces = published.settles("the plugin to be stopped", |s| {
+        s.first().is_some_and(|p| !p.is_running())
+    });
+    assert!(
+        surfaces[0]
+            .stopped
+            .as_deref()
+            .is_some_and(|r| r.contains("behind")),
+        "the reason should say what happened, got {:?}",
+        surfaces[0].stopped
+    );
+
+    // It drains what it already had and then answers nothing further.
+    std::thread::sleep(Duration::from_millis(300));
+    let settled = commands.sent().len();
+    for _ in 0..64 {
+        plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(commands.sent().len(), settled, "it is not still working");
+}
+
+/// The snprintf contract, both halves: the answer is the value's *full*
+/// length whether or not it fit, and exactly `min(cap, full)` bytes are
+/// written — no fewer, so a caller can tell what its buffer holds.
+#[test]
+fn a_short_buffer_is_told_how_much_room_it_needed() {
+    // Twelve bytes in ten characters, so the byte count and the character
+    // count disagree — which is the whole reason this contract is stated in
+    // bytes.
+    const NEEDS_TWELVE: &str = "ação legal";
+    let dir = TempDir::new("short-buffer");
+    dir.plugin(
+        "reader",
+        &format!(
+            r#"(module
+  (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_field_str" (func $field_str (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text" (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{jid}")
+  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))
+    (call $caps (i64.const 1))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $full i32)
+    (local $written i32)
+    ;; Ask for the text with room for 8 bytes only.
+    (local.set $full (call $field_str (local.get $ev) (i32.const 11) (i32.const 512) (i32.const 8)))
+    ;; Send back exactly what the buffer had room for, so the test can see
+    ;; that the host wrote all eight bytes rather than stopping short of them.
+    (local.set $written (i32.const 8))
+    (drop (call $send (i32.const 0) (i32.const {jid_len}) (i32.const 512) (local.get $written)))
+    ;; And a second send whose *length* is the full length the host answered.
+    (drop (call $send (i32.const 0) (i32.const {jid_len}) (i32.const 512) (local.get $full)))
+    (i32.const 0))
+)"#,
+            jid = "a@s.whatsapp.net",
+            jid_len = "a@s.whatsapp.net".len()
+        ),
+    );
+
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+    plugins.observe(&message("a@s.whatsapp.net", NEEDS_TWELVE));
+    until("both sends", || commands.sent().len() == 2);
+
+    let sent = commands.sent();
+    // The first is exactly the eight bytes the buffer had room for.
+    assert_eq!(sent[0].1.len(), 8);
+    assert_eq!(sent[0].1.as_bytes(), &NEEDS_TWELVE.as_bytes()[..8]);
+    // The second is as long as the host said the whole value was, which is
+    // the number a caller sizes its next buffer from.
+    assert_eq!(sent[1].1.len(), NEEDS_TWELVE.len());
+}

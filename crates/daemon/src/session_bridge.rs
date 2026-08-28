@@ -202,6 +202,7 @@ enum Answer {
 /// below reachable on every exit path.
 pub async fn run(
     hub: Arc<StateHub>,
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
     mut commands: tokio::sync::mpsc::Receiver<SessionCommand>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
@@ -213,7 +214,7 @@ pub async fn run(
     // camera and one call, and what decides whether a frame is *serialized*
     // is whether anybody is subscribed to the hub's video channel.
     let mut video = client.video_events();
-    let mut bridge = Bridge::new(hub);
+    let mut bridge = Bridge::new(hub, plugins);
 
     // Set when every sender is gone. A closed channel yields `None`
     // immediately and forever, so leaving the branch enabled would spin the
@@ -283,6 +284,18 @@ pub async fn run(
         }
     };
 
+    // Plugins first, and for exactly the reason the publisher is joined
+    // below: one still in a handler can write its settings file, and that
+    // file sits in a directory the wipe is about to remove. Joining is
+    // blocking, so it goes on a blocking thread like the rest of the
+    // teardown.
+    {
+        let plugins = Arc::clone(&bridge.plugins);
+        if let Err(e) = tokio::task::spawn_blocking(move || plugins.shutdown()).await {
+            log::error!("the plugin threads did not finish: {e}");
+        }
+    }
+
     // Before anything is deleted, and on a blocking thread because joining
     // one is: the publisher writes this account's media, and a wipe that
     // starts while it is still draining its queue deletes a directory that
@@ -312,6 +325,17 @@ pub async fn run(
         match oxidezap_session::wipe_local_state() {
             Ok(()) => log::info!("local state wiped; pair again on the next start"),
             Err(e) => log::error!("could not wipe local state: {e}"),
+        }
+        // A plugin's own settings are this account's data too — an
+        // autoreply's "already answered these people" is a list of people —
+        // and they sit in a directory beside the store rather than inside
+        // it. Nothing is writing them any more: the threads were joined
+        // above.
+        if let Some(dir) = oxidezap_ipc::state_dir()
+            && let Err(e) = std::fs::remove_dir_all(dir.join("plugins"))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::error!("could not clear the plugins' stored settings: {e}");
         }
         // The store is one file; the media is a directory beside it, and it
         // is just as much this account's data.
@@ -356,6 +380,13 @@ pub fn close(mut client: WhatsAppClient, grace: std::time::Duration) -> bool {
 /// Everything the event loop carries between one event and the next.
 struct Bridge {
     hub: Arc<StateHub>,
+    /// The plugins, fed the same events the front ends get.
+    ///
+    /// Held rather than reached for, because the bridge is also what tears
+    /// them down: a plugin writing its settings while the account's data is
+    /// being deleted is the same race the publish thread has, and it is
+    /// solved the same way.
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
     /// Events on their way to the front ends that asked for them.
     ///
     /// A thread of its own, because preparing one writes every photo it
@@ -380,7 +411,7 @@ struct Bridge {
 }
 
 impl Bridge {
-    fn new(hub: Arc<StateHub>) -> Self {
+    fn new(hub: Arc<StateHub>, plugins: Arc<oxidezap_plugin_host::Plugins>) -> Self {
         // Unbounded, and the bound that matters is upstream: the only producer
         // is the event loop draining the session's own unbounded channel, so a
         // limit here could only stall the loop this exists to unblock or drop
@@ -406,6 +437,7 @@ impl Bridge {
 
         Self {
             hub,
+            plugins,
             publish: Some(publish),
             publisher: Some(publisher),
             reads: ReadTracker::default(),
@@ -438,6 +470,11 @@ impl Bridge {
         // Before anything is published, so a `MarkRead` that arrives right
         // behind a message already covers it.
         self.reads.observe(&event);
+
+        // As early as the daemon itself hears it. A plugin is a front end
+        // that does not draw, and putting it after the publish would give
+        // every window a head start on an autoreply for no reason.
+        self.plugins.observe(&event);
 
         if let Some(frame) = passthrough(&event) {
             self.hub.signal(&frame);
@@ -1803,7 +1840,12 @@ mod tests {
     }
 
     fn bridge() -> Bridge {
-        Bridge::new(StateHub::new())
+        // Folding an event is a pure function of the event and the state;
+        // a host with nothing loaded keeps it that way.
+        Bridge::new(
+            StateHub::new(),
+            Arc::new(oxidezap_plugin_host::Plugins::none(Arc::new(|_| {}))),
+        )
     }
 
     /// What `mark_read` would record after issuing a read of `secs` covering

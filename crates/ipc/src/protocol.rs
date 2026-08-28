@@ -1,7 +1,8 @@
 //! Messages exchanged over the socket.
 
 use oxidezap_core::{
-    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, QuotedMessage, UiEvent,
+    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, PluginAction, PluginSurface,
+    QuotedMessage, UiEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -206,6 +207,15 @@ pub struct StateSnapshot {
     /// account row claimed "not linked" over a live session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<AccountIdentity>,
+    /// Every plugin the daemon loaded, and what each wants drawn.
+    ///
+    /// State like the calls are, and for the same reason: a plugin published
+    /// its interface when it started, once, and a window that attaches an
+    /// hour later never saw that. Skipped when empty, which is the ordinary
+    /// account — and which is also what lets an older client read this
+    /// snapshot unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<PluginSurface>,
 }
 
 /// The account this device is linked to.
@@ -268,6 +278,13 @@ pub enum DaemonEvent {
     /// nothing replayed the answer when it arrived. This is what "(You)" and
     /// the read ticks in your own chat compare against.
     AccountChanged(AccountIdentity),
+    /// The whole set of plugins, whenever any of them changes.
+    ///
+    /// All of them rather than the one that moved: a set of some plugins is
+    /// not a snapshot of the set, and a front end that had to merge deltas
+    /// would be a second implementation of what the registry already holds.
+    /// The set is small and changes when a person flips a toggle.
+    PluginsChanged(Vec<PluginSurface>),
 }
 
 /// A daemon-to-client frame.
@@ -633,6 +650,23 @@ pub enum ClientRequest {
     /// connected client as [`DaemonMessage::ShowWindow`] rather than acting on
     /// it: whoever owns a window is the only one that can raise it.
     ShowWindow,
+    /// Somebody used a widget a plugin published.
+    ///
+    /// Named rather than addressed: the daemon routes it to the plugin by id,
+    /// and a plugin that is not loaded gets nothing — which is the same
+    /// answer a window drawing a stale snapshot deserves.
+    ///
+    /// The open chat travels on the request because the daemon does not know
+    /// it: two windows can have different conversations open, and a plugin's
+    /// header button is about the one the person pressing it was looking at.
+    ///
+    /// A named field rather than a newtype variant, for the reason
+    /// [`DaemonMessage::Session`] carries one: this enum is internally
+    /// tagged, and a newtype's fields would be flattened into the same map as
+    /// `request`.
+    PluginAction {
+        action: PluginAction,
+    },
     /// Stop the daemon: disconnect the session, close the store, exit.
     Shutdown,
 }
@@ -730,6 +764,7 @@ mod tests {
             ],
             calls: CallState::default(),
             account: None,
+            plugins: Vec::new(),
         };
 
         assert_eq!(snapshot.total_unread(), 2);
@@ -824,6 +859,7 @@ mod tests {
             chats: vec![chat(u32::MAX), chat(5)],
             calls: CallState::default(),
             account: None,
+            plugins: Vec::new(),
         };
         assert_eq!(snapshot.total_unread(), u32::MAX);
     }
@@ -848,6 +884,7 @@ mod tests {
             chats: vec![chat.clone()],
             calls: CallState::default(),
             account: None,
+            plugins: Vec::new(),
         };
         assert_eq!(
             snapshot.total_unread(),

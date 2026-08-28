@@ -1,0 +1,255 @@
+//! What every plugin currently is, from the daemon's point of view.
+//!
+//! One place, because a plugin's surface is *state*: it goes into the
+//! daemon's snapshot, it is versioned, and a window that attaches later has
+//! to be handed the whole set rather than the changes it missed. Each plugin
+//! thread writes only its own entry; the sink is called with all of them,
+//! because a snapshot of some plugins is not a snapshot.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use oxidezap_core::{PluginRoot, PluginSurface};
+use oxidezap_plugin_abi as abi;
+
+/// Where a published set of surfaces goes.
+///
+/// A callback rather than a channel: the daemon's hub is what publishes
+/// state, and it wants the value, not a task to drain. A `Fn` so a plugin
+/// thread can call it directly under no lock of its own.
+pub type Sink = Arc<dyn Fn(Vec<PluginSurface>) + Send + Sync>;
+
+/// One plugin's mutable half.
+#[derive(Debug, Clone)]
+struct Entry {
+    name: String,
+    caps: i64,
+    roots: Vec<PluginRoot>,
+    stopped: Option<String>,
+}
+
+/// Every loaded plugin, ordered by id.
+///
+/// A `BTreeMap` rather than a `HashMap`: the order this is published in is
+/// the order a front end draws buttons in, and a set that reshuffled itself
+/// between two frames would move a button under somebody's cursor.
+pub struct Registry {
+    entries: Mutex<BTreeMap<String, Entry>>,
+    sink: Sink,
+}
+
+impl Registry {
+    #[must_use]
+    pub fn new(sink: Sink) -> Self {
+        Self {
+            entries: Mutex::new(BTreeMap::new()),
+            sink,
+        }
+    }
+
+    /// Record a plugin that has just been loaded, before it has drawn
+    /// anything.
+    ///
+    /// Published even with no widgets, because "which plugins are running"
+    /// is what the Settings screen lists, and one that draws nothing is
+    /// still something a user needs to be able to see is there.
+    pub fn insert(&self, id: &str, name: String, caps: i64) {
+        self.lock().insert(
+            id.to_owned(),
+            Entry {
+                name,
+                caps,
+                roots: Vec::new(),
+                stopped: None,
+            },
+        );
+        self.publish();
+    }
+
+    /// Replace what a plugin wants drawn.
+    ///
+    /// Whole, never a delta: a plugin republishes its tree when anything in
+    /// it changes, so applying this twice is harmless and nothing has to
+    /// reconstruct an intermediate state.
+    pub fn set_roots(&self, id: &str, roots: Vec<PluginRoot>) {
+        {
+            let mut entries = self.lock();
+            let Some(entry) = entries.get_mut(id) else {
+                return;
+            };
+            if entry.roots == roots {
+                // A tree that did not change is not news, and publishing it
+                // would consume a state version and wake every front end for
+                // a redraw of the same buttons. A plugin republishing on
+                // every message is the ordinary case, not the exception.
+                return;
+            }
+            entry.roots = roots;
+        }
+        self.publish();
+    }
+
+    /// Take a plugin out of service, with the reason a user will read.
+    ///
+    /// Its widgets stay in the surface and are drawn inert: a plugin that
+    /// simply vanished would leave nobody anything to act on, and the button
+    /// that stopped working is exactly the thing the reason has to be
+    /// attached to. Only the first reason sticks — what stopped a plugin is
+    /// the first thing that did, and whatever it fails at afterwards is a
+    /// consequence.
+    pub fn stop(&self, id: &str, reason: impl Into<String>) {
+        {
+            let mut entries = self.lock();
+            let Some(entry) = entries.get_mut(id) else {
+                return;
+            };
+            if entry.stopped.is_some() {
+                return;
+            }
+            entry.stopped = Some(reason.into());
+        }
+        self.publish();
+    }
+
+    /// Whether this plugin is still allowed to run.
+    #[must_use]
+    pub fn is_running(&self, id: &str) -> bool {
+        self.lock().get(id).is_some_and(|e| e.stopped.is_none())
+    }
+
+    /// Everything, as a front end sees it.
+    #[must_use]
+    pub fn surfaces(&self) -> Vec<PluginSurface> {
+        self.lock()
+            .iter()
+            .map(|(id, entry)| PluginSurface {
+                id: id.clone(),
+                name: entry.name.clone(),
+                capabilities: describe(entry.caps),
+                roots: entry.roots.clone(),
+                stopped: entry.stopped.clone(),
+            })
+            .collect()
+    }
+
+    fn publish(&self) {
+        let surfaces = self.surfaces();
+        (self.sink)(surfaces);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Entry>> {
+        // A poisoned lock means a plugin thread panicked while holding it.
+        // The map is a plain `BTreeMap` of owned values, so nothing inside it
+        // can be torn — taking the guard and carrying on is both safe and the
+        // only answer that does not take the daemon down with one plugin.
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Turn a capability mask into the sentences a user consents to.
+///
+/// The ABI owns the wording, because a bit whose consequence cannot be stated
+/// in a phrase is one nobody can agree to — and a front end deriving its own
+/// would be a second, drifting answer to what a plugin is allowed to do.
+fn describe(caps: i64) -> Vec<String> {
+    abi::caps::EACH
+        .iter()
+        .filter(|bit| caps & **bit != 0)
+        .map(|bit| abi::caps::describe(*bit).to_owned())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxidezap_core::{PluginNode, PluginSlot, PluginWidget};
+
+    fn recorder() -> (Registry, Arc<Mutex<Vec<Vec<PluginSurface>>>>) {
+        let log: Arc<Mutex<Vec<Vec<PluginSurface>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_log = Arc::clone(&log);
+        let registry = Registry::new(Arc::new(move |s| {
+            sink_log.lock().expect("not poisoned").push(s);
+        }));
+        (registry, log)
+    }
+
+    fn button(id: &str) -> Vec<PluginRoot> {
+        vec![PluginRoot {
+            slot: PluginSlot::ChatHeader,
+            node: PluginNode {
+                widget: PluginWidget::Button,
+                id: id.into(),
+                label: id.into(),
+                value: String::new(),
+                enabled: true,
+                checked: false,
+                children: Vec::new(),
+            },
+        }]
+    }
+
+    #[test]
+    fn a_loaded_plugin_is_published_before_it_draws() {
+        let (registry, log) = recorder();
+        registry.insert("autoreply", "Resposta automática".into(), abi::caps::SEND);
+
+        let published = log.lock().expect("not poisoned");
+        assert_eq!(published.len(), 1);
+        let surface = &published[0][0];
+        assert_eq!(surface.id, "autoreply");
+        assert!(surface.roots.is_empty());
+        assert_eq!(surface.capabilities, vec!["send messages".to_string()]);
+    }
+
+    /// A plugin republishing the same tree on every message is the ordinary
+    /// case. Waking every front end for it would be a redraw per message.
+    #[test]
+    fn an_unchanged_tree_publishes_nothing() {
+        let (registry, log) = recorder();
+        registry.insert("p", "p".into(), abi::caps::UI);
+        registry.set_roots("p", button("go"));
+        registry.set_roots("p", button("go"));
+        assert_eq!(log.lock().expect("not poisoned").len(), 2);
+
+        registry.set_roots("p", button("stop"));
+        assert_eq!(log.lock().expect("not poisoned").len(), 3);
+    }
+
+    #[test]
+    fn a_stopped_plugin_keeps_its_widgets_and_gains_a_reason() {
+        let (registry, _) = recorder();
+        registry.insert("p", "p".into(), abi::caps::UI);
+        registry.set_roots("p", button("go"));
+        registry.stop("p", "out of fuel");
+
+        let surface = registry.surfaces().remove(0);
+        assert_eq!(surface.stopped.as_deref(), Some("out of fuel"));
+        assert!(!surface.is_running());
+        assert_eq!(surface.roots.len(), 1, "the button stays, drawn inert");
+        assert!(!registry.is_running("p"));
+    }
+
+    /// What stopped a plugin is the first thing that did. Anything it then
+    /// fails at is a consequence, and overwriting the reason with it would
+    /// bury the cause.
+    #[test]
+    fn the_first_reason_is_the_one_kept() {
+        let (registry, _) = recorder();
+        registry.insert("p", "p".into(), 0);
+        registry.stop("p", "out of fuel");
+        registry.stop("p", "its queue overflowed");
+        assert_eq!(
+            registry.surfaces()[0].stopped.as_deref(),
+            Some("out of fuel")
+        );
+    }
+
+    #[test]
+    fn surfaces_come_back_in_a_stable_order() {
+        let (registry, _) = recorder();
+        registry.insert("zeta", "z".into(), 0);
+        registry.insert("alpha", "a".into(), 0);
+        let ids: Vec<_> = registry.surfaces().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["alpha", "zeta"]);
+    }
+}

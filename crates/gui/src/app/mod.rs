@@ -16,6 +16,7 @@ mod media;
 mod media_ctl;
 mod messages;
 mod paging;
+mod plugins_ctl;
 mod recording;
 mod recovery;
 mod search;
@@ -31,6 +32,7 @@ pub use chats::{ChatFilter, ChatListCache, Survival, survives_complete_load};
 pub use media::RecordingState;
 pub use messages::{MessageListCache, TimelineItem};
 pub use paging::nearing_end;
+pub use plugins_ctl::PluginFields;
 
 /// What the conversation list was last told about.
 /// What the audio sink is holding, and where it came from.
@@ -847,6 +849,17 @@ pub struct WhatsAppApp {
     /// The same account's LID. A chat with your own number can be keyed by
     /// either alias, and neither string matches the other.
     account_lid: Option<String>,
+    /// Every plugin the daemon loaded, and what each wants drawn.
+    ///
+    /// Daemon state, held whole and replaced whole. A plugin's interface is
+    /// not this window's memory of it: closing the window and opening
+    /// another brings the same buttons back, because they were never here in
+    /// the first place.
+    plugins: Vec<oxidezap_core::PluginSurface>,
+    /// Somewhere to hold what is being typed into a plugin's text field,
+    /// before anybody commits it. Keyed by plugin and widget id; see
+    /// [`plugins_ctl`].
+    plugin_fields: PluginFields,
     /// The Settings screen, when it is open. `None` is the conversation view.
     settings: Option<SettingsState>,
     /// What this account occupies on disk, as the daemon last measured it.
@@ -893,6 +906,14 @@ impl WhatsAppApp {
                     // and a call this account placed was never an event.
                     FromDaemon::Calls(calls) => entity.update(cx, |app, cx| {
                         app.adopt_calls(*calls, cx);
+                    }),
+                    // Whole every time. A plugin republishes its tree when
+                    // anything in it changes, and the daemon publishes
+                    // nothing when the set has not moved, so replacing is
+                    // both correct and no more work than merging.
+                    FromDaemon::Plugins(plugins) => entity.update(cx, |app, cx| {
+                        app.plugins = plugins;
+                        cx.notify();
                     }),
                     // Announced on connect, before this window existed, so it
                     // arrives with the snapshot rather than as an event.
@@ -1031,6 +1052,8 @@ impl WhatsAppApp {
             account_name: None,
             account_jid: None,
             account_lid: None,
+            plugins: Vec::new(),
+            plugin_fields: PluginFields::new(),
             settings: None,
             tick_task: None,
             status_tick: None,

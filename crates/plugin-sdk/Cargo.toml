@@ -1,0 +1,18 @@
+[package]
+name = "oxidezap-plugin"
+description = "Write an oxidezap plugin in Rust: typed events, commands and widgets over the raw wasm ABI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Nothing but the constant table, which compiles to no code at all. A plugin
+# built on this carries the bytes of its own logic and almost nothing else,
+# which is the point of the whole ABI.
+[dependencies]
+oxidezap-plugin-abi = { workspace = true }
+
+[lints]
+workspace = true

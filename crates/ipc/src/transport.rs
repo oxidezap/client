@@ -5,6 +5,15 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 19: plugins. The snapshot carries a `PluginSurface` per loaded plugin —
+/// what it is called, what it asked to be allowed to do, and the widgets it
+/// wants drawn — `DaemonEvent::PluginsChanged` republishes the set, and
+/// `ClientRequest::PluginAction` carries a widget's use back to the plugin
+/// that drew it. A v18 daemon refuses the action as malformed, so an upgraded
+/// window would draw a plugin's button that could never do anything; a v18
+/// client ignores the surfaces and simply draws none, which is why the
+/// snapshot field is skipped when empty rather than versioned separately.
+///
 /// 18: video calls. `DaemonMessage::CallVideo` carries a call's encoded
 /// frames in both directions, `DaemonMessage::CallVideoGap` says some were
 /// skipped, `ClientRequest::Call(SetVideo)` turns this
@@ -101,7 +110,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]

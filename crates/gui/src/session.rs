@@ -65,6 +65,13 @@ pub enum FromDaemon {
     Calls(Box<CallState>),
     /// Who this device is linked as, at the moment this client attached.
     Account(Option<oxidezap_ipc::AccountIdentity>),
+    /// Every plugin the daemon has loaded, and what each wants drawn.
+    ///
+    /// State, and whole every time: a plugin published its interface when it
+    /// started and nothing replays that, so a window attaching later has only
+    /// the set the daemon holds. Republished in full whenever any of them
+    /// changes, which is what spares this side from merging deltas.
+    Plugins(Vec<oxidezap_core::PluginSurface>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
     /// One page of a conversation, for the timeline that asked for it.
@@ -632,6 +639,33 @@ impl Session {
         self.tell(ClientRequest::Call(action));
     }
 
+    /// Tell a plugin somebody used one of its widgets.
+    ///
+    /// Fire and forget, like typing is: the daemon hands it to the plugin and
+    /// what the plugin makes of it comes back as a new interface, or as
+    /// nothing. There is no answer to wait for, because "the plugin took it"
+    /// is not a fact this window can do anything with.
+    ///
+    /// The open chat travels along because the daemon does not know it: a
+    /// header button is about the conversation the person pressing it was
+    /// looking at, and two windows can have different ones.
+    pub fn plugin_action(
+        &self,
+        plugin: &str,
+        action: &str,
+        value: Option<String>,
+        chat_jid: Option<String>,
+    ) {
+        self.tell(ClientRequest::PluginAction {
+            action: oxidezap_core::PluginAction {
+                plugin: plugin.to_string(),
+                action: action.to_string(),
+                value,
+                chat_jid,
+            },
+        });
+    }
+
     /// Wipe the local store and pair again.
     ///
     /// The daemon owns that file and stops itself once it is gone, so this is
@@ -959,6 +993,15 @@ fn read_frames(
             }
             Ok(DaemonMessage::Update {
                 version,
+                event: DaemonEvent::PluginsChanged(plugins),
+            }) => {
+                applied = version;
+                if events.blocking_send(FromDaemon::Plugins(plugins)).is_err() {
+                    break;
+                }
+            }
+            Ok(DaemonMessage::Update {
+                version,
                 event: DaemonEvent::CallsChanged(calls),
             }) => {
                 applied = version;
@@ -1053,6 +1096,12 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
             // name. The session's own load is what says where to continue.
             next: None,
         }));
+    }
+    // Before the connection state, like the chat list above it and for the
+    // same reason: a window that draws its first frame without them flashes
+    // a plugin's button into the header a moment after everything else.
+    if !snapshot.plugins.is_empty() {
+        events.push(FromDaemon::Plugins(snapshot.plugins.clone()));
     }
     match &snapshot.connection {
         ConnectionState::Connecting => events.push(session(UiEvent::InitComplete)),
@@ -1281,6 +1330,7 @@ mod tests {
             chats,
             calls: CallState::default(),
             account: None,
+            plugins: Vec::new(),
         }
     }
 

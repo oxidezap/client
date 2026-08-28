@@ -84,7 +84,12 @@ const OUTBOX_CAPACITY: usize = 64;
 /// and can be dropped while the session is still disconnecting, and the lock
 /// has to outlive that. Handing it over here would release it mid-teardown,
 /// which is exactly the window a second daemon must not find open.
-pub async fn run(claim: &Claim, hub: Arc<StateHub>, commands: Commands) -> Result<()> {
+pub async fn run(
+    claim: &Claim,
+    hub: Arc<StateHub>,
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
+    commands: Commands,
+) -> Result<()> {
     let path = claim.path.clone();
     let mut listener = Listener::bind(&path)?;
     log::info!("listening on {}", path.display());
@@ -116,11 +121,12 @@ pub async fn run(claim: &Claim, hub: Arc<StateHub>, commands: Commands) -> Resul
         };
 
         let hub = Arc::clone(&hub);
+        let plugins = Arc::clone(&plugins);
         let commands = commands.clone();
         // Per-connection task: one slow or malformed client cannot hold up
         // the accept loop or any other client.
         tokio::spawn(async move {
-            if let Err(e) = serve_client(stream, hub, commands).await {
+            if let Err(e) = serve_client(stream, hub, plugins, commands).await {
                 log::debug!("client disconnected: {e}");
             }
             drop(slot);
@@ -372,7 +378,12 @@ enum FrameRead {
     TooLong,
 }
 
-async fn serve_client<S>(stream: S, hub: Arc<StateHub>, commands: Commands) -> Result<()>
+async fn serve_client<S>(
+    stream: S,
+    hub: Arc<StateHub>,
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
+    commands: Commands,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -591,7 +602,7 @@ where
                         updates = hub.subscribe();
                         awaiting_resync = false;
                     }
-                    let answer = handle_request(request, &hub, &commands, &outbox).await;
+                    let answer = handle_request(request, &hub, &plugins, &commands, &outbox).await;
                     if let Some(frame) = answer.frame {
                         write_line(&mut writer, &frame).await?;
                     }
@@ -743,6 +754,7 @@ impl Answer {
 async fn handle_request(
     Request { id, request }: Request,
     hub: &StateHub,
+    plugins: &oxidezap_plugin_host::Plugins,
     commands: &Commands,
     outbox: &Outbox,
 ) -> Answer {
@@ -966,6 +978,16 @@ async fn handle_request(
         // thing however it was asked — including when there is none to raise.
         ClientRequest::ShowWindow => {
             crate::window::show(hub);
+            acted(Ok(()))
+        }
+        // Not dispatched to the session: a plugin action touches the account
+        // only if the plugin decides it should, and what it decides is its
+        // own business. Handing it over is the whole of the daemon's part,
+        // which is why this answers `Accepted` rather than waiting — the
+        // plugin's own answer reaches it inside the sandbox, where a socket
+        // front end's never could.
+        ClientRequest::PluginAction { action } => {
+            plugins.act(&action);
             acted(Ok(()))
         }
         // The acknowledgement goes out first; see the caller.
@@ -1192,6 +1214,12 @@ mod tests {
         tokio::sync::mpsc::channel(OUTBOX_CAPACITY).0
     }
 
+    /// A host with nothing loaded, for the requests that are not about
+    /// plugins — which is every request but one.
+    fn no_plugins() -> oxidezap_plugin_host::Plugins {
+        oxidezap_plugin_host::Plugins::none(Arc::new(|_| {}))
+    }
+
     fn parse(frame: Option<String>) -> DaemonMessage {
         serde_json::from_str(&frame.expect("every request gets an answer")).unwrap()
     }
@@ -1221,7 +1249,7 @@ mod tests {
             local_id: None,
             quoted: None,
         });
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Accepted { .. }
@@ -1248,7 +1276,7 @@ mod tests {
             jid: "a@s.whatsapp.net".into(),
             through_message_id: None,
         });
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error {
@@ -1272,7 +1300,7 @@ mod tests {
             local_id: None,
             quoted: None,
         });
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error {
@@ -1297,7 +1325,7 @@ mod tests {
             local_id: None,
             quoted: None,
         });
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error {
@@ -1322,8 +1350,14 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
-        let answer =
-            handle_request(bare(ClientRequest::Shutdown), &hub, &commands, &outbox()).await;
+        let answer = handle_request(
+            bare(ClientRequest::Shutdown),
+            &hub,
+            &no_plugins(),
+            &commands,
+            &outbox(),
+        )
+        .await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Accepted { .. }
@@ -1341,7 +1375,12 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
-        let served = tokio::spawn(serve_client(server, Arc::clone(&hub), commands));
+        let served = tokio::spawn(serve_client(
+            server,
+            Arc::clone(&hub),
+            Arc::new(no_plugins()),
+            commands,
+        ));
         client
             .write_all(format!("{}\n", hello(PROTOCOL_VERSION, false)).as_bytes())
             .await
@@ -1395,7 +1434,7 @@ mod tests {
         let mut signals = hub.subscribe_signals();
 
         let request = bare(ClientRequest::ShowWindow);
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Accepted { .. }
@@ -1564,7 +1603,12 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
-        let served = tokio::spawn(serve_client(server, Arc::clone(&hub), commands));
+        let served = tokio::spawn(serve_client(
+            server,
+            Arc::clone(&hub),
+            Arc::new(no_plugins()),
+            commands,
+        ));
         client
             .write_all(format!("{}\n", hello(PROTOCOL_VERSION, false)).as_bytes())
             .await
@@ -1607,7 +1651,12 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
-        let served = tokio::spawn(serve_client(server, Arc::clone(&hub), commands));
+        let served = tokio::spawn(serve_client(
+            server,
+            Arc::clone(&hub),
+            Arc::new(no_plugins()),
+            commands,
+        ));
         client
             .write_all(format!("{}\n", hello(PROTOCOL_VERSION, true)).as_bytes())
             .await
@@ -1679,7 +1728,7 @@ mod tests {
                 quoted: None,
             },
         };
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error {
@@ -1700,7 +1749,9 @@ mod tests {
 
         // Returns rather than parking forever; the paused clock reaches the
         // handshake deadline as soon as nothing else can run.
-        serve_client(server, hub, commands).await.unwrap();
+        serve_client(server, hub, Arc::new(no_plugins()), commands)
+            .await
+            .unwrap();
 
         let mut answer = String::new();
         BufReader::new(client).read_line(&mut answer).await.unwrap();

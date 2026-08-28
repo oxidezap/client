@@ -67,6 +67,10 @@ pub fn render_chat_header(
     // button that still looked live would place a call into nothing.
     can_send: bool,
     entity: Entity<WhatsAppApp>,
+    // What plugins want in this bar, already rendered. Elements rather than
+    // the trees they came from: this component knows where a plugin's button
+    // goes and nothing about what a plugin is.
+    plugin_actions: Vec<gpui::AnyElement>,
     layout: ResponsiveLayout,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -108,7 +112,15 @@ pub fn render_chat_header(
         .child(render_identity(
             chat, name, subtitle, presence, &entity, layout, metrics, cx,
         ))
-        .child(render_actions(chat, can_send, entity, layout, metrics, cx))
+        .child(render_actions(
+            chat,
+            can_send,
+            plugin_actions,
+            entity,
+            layout,
+            metrics,
+            cx,
+        ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -184,9 +196,11 @@ fn render_identity(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_actions(
     chat: &Chat,
     can_send: bool,
+    plugin_actions: Vec<gpui::AnyElement>,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     metrics: Metrics,
@@ -219,6 +233,10 @@ fn render_actions(
         .flex_shrink_0()
         .items_center()
         .gap(metrics.space_xxs())
+        // Before this window's own controls, so a plugin cannot push Call and
+        // the overflow menu off the edge of a narrow header: the buttons that
+        // are always there stay where a user learned they are.
+        .children(plugin_actions)
         .when(layout.show_call_buttons(), |el| {
             el.child(
                 action(

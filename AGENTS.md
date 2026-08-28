@@ -26,12 +26,24 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 - **oxidezap-daemon**: binary `oxidezapd`. The only process that opens the
   store or holds a WhatsApp connection. Serves front ends over a per-user Unix
   socket and carries a tray presence.
+- **oxidezap-plugin-abi**: the wasm ABI — its constants and the widget-tree
+  codec. No dependencies and `no_std`, because it is compiled into the daemon
+  *and* into every plugin, including ones with no allocator.
+- **oxidezap-plugin-host**: runs `.wasm` plugins inside the daemon. Discovery,
+  the sandbox, and the host half of the ABI. One OS thread, one wasmi `Store`
+  and one bounded queue per plugin.
+- **oxidezap-plugin**: the Rust SDK a plugin is written against. Not a
+  dependency of anything here; it exists to be built for wasm32.
 - **oxidezap-gui**: GPUI front end, binary `oxidezap`. Talks to the daemon and
   starts one if none is listening. Owns video decode, which writes straight
   into `gpui::RenderImage` and is not reusable off GPUI.
 
 A front end depends on ipc/core/audio and never on session: there is exactly
 one WhatsApp session per user, and it lives in the daemon.
+
+`examples/` holds plugins, and is excluded from the workspace: they build for
+`wasm32-unknown-unknown` and link imports only the daemon provides, so a
+`cargo build` at the root would try to link them for the host.
 
 ## Build & verify
 
@@ -42,6 +54,12 @@ cargo test --workspace
 
 # Running it: two binaries, and the window looks for the daemon beside itself.
 cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxidezap
+
+# A plugin. Its own workspace, its own target, and the file's name is its id.
+cd examples/autoreply && cargo build --release --target wasm32-unknown-unknown
+cp target/wasm32-unknown-unknown/release/autoreply.wasm ~/.local/share/oxidezap/plugins/
+# And the one test that exercises the real SDK against the real host:
+cargo test -p oxidezap-plugin-host -- --ignored
 ```
 
 Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is
@@ -96,6 +114,69 @@ profile here repeats it deliberately.
   speaker, so the process that owns the session owns the audio device. That
   follows from the split rather than being chosen, and it is why a call still
   works with the window closed.
+- **A plugin is a front end that does not draw, and it runs in the daemon.**
+  It sees the account's events and acts through the same command channel a
+  window's requests go onto, so it has no privileged path to the session. It
+  lives inside the daemon rather than behind the socket because the daemon is
+  the only process holding the session, and wasm already supplies the
+  isolation a process boundary would have been for — what wasm does *not*
+  supply is a bound on time and on memory, which is why fuel metering and the
+  resource limiter are not optional: a plugin that loops forever runs out and
+  traps, and the daemon loses a plugin rather than a thread. A `Store` is not
+  shareable and a wasm call is synchronous and blocking, so each plugin gets
+  an OS thread of its own rather than a runtime task, which would stall the
+  accept loop for as long as it ran. wasmi and not wasmtime: no JIT, so
+  nothing generates code inside the process that holds the account, and no
+  component model, which is the trade the ABI is built around.
+- **A plugin's whole outside world is the `oxidezap` import module.** There is
+  no WASI — not a restricted one, none — so a `.wasm` a user downloaded cannot
+  read the disk or open a socket because no function exists that would. That
+  is a structural guarantee rather than a policy, and it is the reason the ABI
+  has no `oxi_http_fetch`: adding one turns that sentence into a promise about
+  configuration, and half the interesting plugins want it, which is exactly
+  why it deserves to be decided on its own rather than as a nineteenth import.
+  What a plugin *may do* is a mask it declares during `oxi_init` and only
+  then, because that list is what a user is shown before enabling a file they
+  downloaded — one that could widen it afterwards would make the sentence stop
+  being true.
+- **An event is a handle, not a payload.** Nothing is serialized for a plugin:
+  it reads fields through four host functions against a table of constants, so
+  a handler that looks at the text and the chat pays for two strings out of an
+  event carrying a dozen, and the whole path is cheaper than the JSON one a
+  socket front end already uses. Field ids are constants rather than one
+  accessor each, which is what keeps the import surface fixed as the table
+  grows: an absent field reads back as its default — the same rule the wire
+  holds itself to with `skip_serializing_if` — so adding one is a non-event
+  for a plugin built against an older table. Commands go the other way as one
+  import each rather than one `oxi_request` taking a serialized
+  `ClientRequest`, which is what spares a plugin from carrying an encoder at
+  all; the one payload that *does* travel from a plugin is its widget tree,
+  and that has a fixed-width encoding written into a buffer the plugin already
+  owns. A plugin needs no allocator, and `examples/autoreply` is 6 KiB.
+- **A plugin's queue overflowing stops it; it does not skip.** The opposite of
+  the video path, and deliberately: a frame that cannot be delivered now is
+  worth nothing later, but a plugin's whole contract is having *seen* the
+  messages. An autoreply that answered some people and not others, with
+  nothing anywhere saying which, is worse than one that is off with a reason
+  attached. A trap ends it the same way and for the same reason — fuel gone,
+  memory refused, or the plugin running off the end of its own logic, none of
+  which the next event improves — and it is never restarted in a loop, which
+  would spend a CPU rediscovering that. Its widgets stay on screen, drawn
+  inert beside the reason: a control that vanished tells nobody anything.
+- **A plugin's interface is daemon state.** The plugin runs in the daemon and
+  the widgets are drawn in the window, which are two processes; the answer is
+  not a channel between them. A plugin *declares* a small tree pinned to a
+  named slot, the tree goes into `StateHub` like everything else, and the
+  press comes back as one more `ClientRequest`. So it survives the window
+  closing and reappears in the next window's snapshot, because it was never
+  the window's in the first place — and a front end that is not a window reads
+  the same tree and renders it its own way or ignores it. A slot is a promise
+  about *where*, never about how: nothing in a tree can express a colour, a
+  size or a position, so a plugin cannot put a literal outside the theme's
+  reach. The open chat travels on the action rather than being looked up,
+  because the daemon does not know it — two windows can have different
+  conversations open, and a header button is about the one the person pressing
+  it was looking at.
 - **The camera is where the microphone is, and the picture crosses encoded.**
   `oxidezap-session` opens both, because the process that owns the session
   owns the devices — so the window has no camera of its own and no way to
@@ -639,7 +720,19 @@ screen, with the title above the glass and the pair code below it.
 - **A front end cannot say what went wrong with a command.** `Accepted` means
   the session took it; per-request outcomes would need request ids on more
   than downloads. A failed send arrives as `SendFailed` against the chat, not
-  against the request that caused it.
+  against the request that caused it. A *plugin* does learn this, which is the
+  odd part: its call is synchronous, so there is nothing to correlate.
+- **A plugin cannot reach the network or the disk, and half the interesting
+  ones want to.** A translator, a webhook bridge, a conversation export. Each
+  is one import, and each turns the categorical sentence in the gotchas above
+  into a policy — so it wants a declared destination, a prompt at enable time,
+  and a decision of its own.
+- **Plugins are not reloadable, and there is no message interception.** A
+  plugin with state, reloaded under itself mid-conversation, is a separate
+  problem; restarting `oxidezapd` is the answer for now and it is cheap. And a
+  plugin that could alter or block an inbound message would sit between the
+  store and every front end, which the whole state model assumes it cannot —
+  plugins observe and act, they do not filter.
 
 Clickable `div`s that remain are deliberate: a chat row and a media thumbnail
 are surfaces, not commands, and have no semantic component to compose from.

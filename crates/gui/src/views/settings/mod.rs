@@ -347,6 +347,9 @@ fn description_for(section: SettingsSection) -> Option<&'static str> {
         }
         SettingsSection::Privacy => Some("This device's identity, and how to start over."),
         SettingsSection::Storage => Some("What this client keeps on disk."),
+        SettingsSection::Plugins => {
+            Some("Loaded from the plugins folder. Each one says what it may do.")
+        }
         _ => None,
     }
 }
@@ -359,6 +362,7 @@ fn icon_for(section: SettingsSection) -> Icon {
         SettingsSection::AudioVideo => Icon::new(ProductIcon::Volume),
         SettingsSection::Privacy => Icon::new(ProductIcon::Shield),
         SettingsSection::Storage => Icon::new(IconName::HardDrive),
+        SettingsSection::Plugins => Icon::new(IconName::LayoutDashboard),
         SettingsSection::Advanced => Icon::new(IconName::Settings2),
     }
 }
