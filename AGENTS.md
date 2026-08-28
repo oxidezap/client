@@ -609,15 +609,27 @@ by definition.
   guides want per-feature entities; that is a bigger change than moving code.
 - **Two large files outside the GUI**: `session/whatsapp.rs` (~2.3k) and
   `chat-store/store.rs` (~3.1k).
-- **The session does not run in the browser.** The page is the window; the
-  daemon still holds the account, which means the deployed bundle needs one
-  running on the visitor's machine to be useful. Moving the session in is
-  more plausible than it looks — `sqlite-wasm-rs` targets
-  `wasm32-unknown-unknown` and diesel links against it, so the chat store
-  could be reused rather than rewritten, and `oxidezap/whatsapp-rust-bridge`
-  already runs the library in wasm. What it needs is a transport and an HTTP
-  client built on `web-sys` instead of Tokio's, which the library takes as
-  plugins.
+- **The session does not run in the browser**, and less of it is missing than
+  it looks. The page is the window; the daemon still holds the account, which
+  means the deployed bundle needs one running on the visitor's machine to be
+  useful. But the chat store already builds for wasm — `sqlite-wasm-rs`
+  targets `wasm32-unknown-unknown`, diesel links against it, FTS5 and all —
+  `oxidezap/whatsapp-rust-bridge` already runs the library there, and all
+  three plugins the library takes are written: `session/net/web.rs` is the
+  browser's `WebSocket` as a `Transport`, `fetch` as an `HttpClient`, and the
+  page's own event loop as a `Runtime`.
+  WhatsApp does not refuse the socket over origin either. `wss://web.whatsapp.com/ws/chat`
+  opens from a page served off `https://oxidezap.github.io`, which is a public
+  origin and not WhatsApp's own — a WebSocket upgrade is not subject to the
+  same-origin policy, and the server declines to make it one. That is the
+  upgrade and nothing above it: the Noise handshake, pairing, and whether an
+  account is content to be used this way are all still unmeasured.
+  What stands in the way is on our side. `oxidezap-session` is written against
+  threads — seven of its methods hand back a `tokio::task::JoinHandle` and
+  three of those carry a result somebody awaits — so the wasm errors that
+  remain are all `Send`/`Sync`. It needs a platform-neutral awaitable
+  `Task<T>`, which is an API change reaching the daemon's call sites rather
+  than a backend swap.
 - **Video is not decoded on the web, and voice notes are not recorded there.**
   Both are the same cause — the decoder and the encoder are C — and both have
   a browser-native answer that is a Rust binding: `web_sys::VideoDecoder` and
