@@ -31,12 +31,14 @@ use whatsapp_rust_sqlite_storage::SqliteStore;
 
 use crate::exec::{Executor, Task};
 use oxidezap_core::{
-    Availability, Chat, ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, MediaContent,
-    MediaType, MessageStatus, SystemNotice, UiEvent, fallback_chat_name,
+    Availability, CallVideoFrame, Chat, ChatMessage, ComposingKind, DownloadableMedia,
+    IncomingCall, MediaContent, MediaType, MessageStatus, SystemNotice, UiEvent, VideoStream,
+    fallback_chat_name,
 };
 
 use crate::names::NameBook;
 use crate::quoting::quoted_from;
+use crate::video::{self, CameraLost, VideoPublisher, VideoSenderSlot};
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
 /// Resolve a stable per-user path for the SQLite database. A CWD-relative
@@ -299,6 +301,20 @@ pub struct WhatsAppClient {
     ui_sender: UiEventSender,
     /// Live/ringing calls
     calls: CallRegistry,
+    /// Where a call's video frames are published, once somebody has asked
+    /// for them. Read per frame rather than captured, so a front end that
+    /// resubscribes mid-call does not leave the pumps talking to a receiver
+    /// that has gone.
+    ///
+    /// Its own channel rather than a `UiEvent`: an event is news that a
+    /// reader which missed one has missed for good, and this is a stream
+    /// whose newest frame is the only one worth having. It is also bounded,
+    /// which the event channel is not — a camera that outran a stalled
+    /// reader would otherwise grow the queue for as long as the call lasted.
+    video_tx: VideoSenderSlot,
+    /// Whether anybody is drawing what the cameras produce. See
+    /// [`Self::set_video_publishing`].
+    video_publishing: Arc<portable_atomic::AtomicBool>,
     /// Durable chat history (same SQLite file as the device store)
     chat_store: ChatStoreHandle,
     /// The session's address book, so a page served on request names people
@@ -330,6 +346,10 @@ impl WhatsAppClient {
             client_handle: Arc::new(Mutex::new(None)),
             ui_sender: Arc::new(Mutex::new(None)),
             calls: CallRegistry::default(),
+            video_tx: Arc::new(std::sync::Mutex::new(None)),
+            // Closed until a window says otherwise: a daemon that starts with
+            // nobody attached has nobody to publish to.
+            video_publishing: Arc::new(portable_atomic::AtomicBool::new(false)),
             chat_store: Arc::new(Mutex::new(None)),
             names: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -371,6 +391,72 @@ impl WhatsAppClient {
     #[allow(dead_code)]
     pub fn chat_store(&self) -> ChatStoreHandle {
         self.chat_store.clone()
+    }
+
+    /// Subscribe to the video of whatever call is up.
+    ///
+    /// Asked for rather than always produced: publishing costs a clone of
+    /// every access unit, and a caller with nowhere to draw one (a tray, a
+    /// notifier) should not pay for it. Calling this again replaces the
+    /// previous subscriber, which is what a reconnecting front end wants.
+    pub fn video_events(&mut self) -> mpsc::Receiver<CallVideoFrame> {
+        let (tx, rx) = mpsc::channel(video::PUBLISH_DEPTH);
+        *self.video_tx.lock().expect("video sender poisoned") = Some(tx);
+        rx
+    }
+
+    /// Where a camera's finished frames go.
+    ///
+    /// Unused where there is no camera: the callers are the call methods, and
+    /// a page's are refusals. The same is true of [`Self::camera_lost`] below.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn video_publisher(&self) -> VideoPublisher {
+        VideoPublisher {
+            sender: Arc::clone(&self.video_tx),
+            watched: Arc::clone(&self.video_publishing),
+        }
+    }
+
+    /// Publish frames, or stop: the daemon says when anybody is drawing.
+    ///
+    /// A call runs whether or not a window is open — the peer is receiving
+    /// our camera either way — so the pumps would otherwise go on copying
+    /// every access unit out of the encoder's buffer and handing it to a
+    /// daemon that discards it. The gate is read before the frame is built,
+    /// so what it saves is the copy as well as the hop.
+    ///
+    /// Not the sender itself, which the daemon owns and must not lose: this
+    /// is a door in front of it.
+    pub fn set_video_publishing(&self, on: bool) {
+        self.video_publishing
+            .store(on, portable_atomic::Ordering::Relaxed);
+    }
+
+    /// What to do when a camera stops being a camera.
+    ///
+    /// Built per call rather than held, because it is a closure over the two
+    /// things the teardown needs and a runtime to run it on — and because the
+    /// only caller is the one opening a device.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn camera_lost(&self) -> CameraLost {
+        let calls = self.calls.clone();
+        let ui_sender = self.ui_sender.clone();
+        // A spawner rather than the executor: this is reported from whichever
+        // thread noticed the device go, which is not one the executor knows
+        // about, so there is no ambient one to find.
+        let spawner = self.exec.spawner();
+        Arc::new(move |call_id: String, camera_id| {
+            let calls = calls.clone();
+            let ui_sender = ui_sender.clone();
+            spawner.spawn(async move {
+                // The device is already gone; what is left is to stop
+                // claiming otherwise — and to name the camera that died,
+                // because this runs on a spawned task and a user who turned
+                // video off and on again meanwhile must not have the
+                // replacement torn down by its predecessor's failure.
+                Self::stop_local_video(&calls, &ui_sender, &call_id, Some(camera_id)).await;
+            });
+        })
     }
 
     /// Start the WhatsApp client in a background thread
@@ -663,6 +749,25 @@ impl WhatsAppClient {
                 CallAction::Accept { call_id, .. } => {
                     info!("Call {} accepted by peer", call_id);
                     let _ = ui_tx.send(UiEvent::CallAccepted(call_id.clone()));
+                    // And what our camera is doing, which nothing has been
+                    // able to say until now: a call this side placed as video
+                    // opened its camera while the call was still *ringing*,
+                    // and a ringing call has no live state for a camera to be
+                    // recorded against. This is the first moment it does —
+                    // after the acceptance above, which is what creates it.
+                    // The call has somewhere to be drawn, and needs a point
+                    // to start decoding from. Until this moment it was
+                    // ringing: no window had a live call to put either
+                    // direction in, so nothing was published and the next
+                    // unit alone references frames no decoder starting now
+                    // has ever seen.
+                    if calls.camera_became_drawable(call_id).await {
+                        let _ = ui_tx.send(UiEvent::CallVideoChanged {
+                            call_id: call_id.clone(),
+                            stream: VideoStream::Local,
+                            on: true,
+                        });
+                    }
                 }
                 CallAction::Reject { call_id, .. } => {
                     info!("Call {} rejected by peer", call_id);

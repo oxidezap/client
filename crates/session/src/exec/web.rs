@@ -52,6 +52,12 @@ impl Executor {
         Ok(())
     }
 
+    /// A handle for spawning onto the page's loop from somewhere else later.
+    #[allow(dead_code)]
+    pub fn spawner(&self) -> Spawner {
+        Spawner
+    }
+
     /// Spawn a task on the page's loop.
     pub fn spawn<T: MaybeSend + 'static>(
         &self,
@@ -77,6 +83,29 @@ impl Executor {
     /// is the thing the desktop's wait exists to prevent.
     pub fn join(&mut self, _timeout: Duration) -> bool {
         self.finished.get()
+    }
+}
+
+/// A handle that can spawn onto the page's loop later.
+///
+/// Unused on this target, because the one thing that needs a spawner rather
+/// than the executor is a camera reporting that it died, and a page has no
+/// camera. Present so the interface is one interface.
+///
+/// Carries nothing, because there is nothing to carry: a page has one loop
+/// and `spawn_local` finds it from anywhere on the agent. See the desktop
+/// half, where a runtime has to be named.
+#[derive(Clone, Default)]
+#[allow(dead_code)]
+pub struct Spawner;
+
+#[allow(dead_code)]
+impl Spawner {
+    pub fn spawn<T: MaybeSend + 'static>(
+        &self,
+        future: impl Future<Output = T> + MaybeSend + 'static,
+    ) -> Task<T> {
+        spawn(future)
     }
 }
 

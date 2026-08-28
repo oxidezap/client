@@ -118,6 +118,12 @@ pub enum UiEvent {
         /// nobody was ringing under, while the abandoned one rang on with
         /// nothing on this side holding it.
         placeholder_id: CallId,
+        /// What the offer that went out actually was.
+        ///
+        /// Not what was asked for: a video call whose camera would not open
+        /// is placed as a voice call rather than not placed at all, and this
+        /// is the first moment anything knows which of the two happened.
+        is_video: bool,
     },
     OutgoingCallFailed {
         recipient_jid: String,
@@ -125,6 +131,18 @@ pub enum UiEvent {
     },
     #[allow(dead_code)]
     CallAccepted(CallId),
+    /// What an incoming call was actually answered *as*.
+    ///
+    /// The offer says what kind of call it is and the state is built from
+    /// that the moment the answer is given — but a camera that will not open
+    /// answers it as a voice call rather than refusing it, and only this side
+    /// knows which of the two happened. Without it every window keeps the
+    /// video layout open on a call with no picture in it and writes the
+    /// conversation's record as a video call.
+    CallAnswered {
+        call_id: CallId,
+        is_video: bool,
+    },
     CallEnded(CallId),
     /// What the microphone really is, once the newest request has reached it.
     ///
@@ -146,6 +164,35 @@ pub enum UiEvent {
     CallMuteChanged {
         call_id: CallId,
         muted: bool,
+    },
+    /// One of a call's two cameras went on or off.
+    ///
+    /// Said for both directions and by the same rule mute follows: the side
+    /// that owns the device reports what it *did*, rather than a front end
+    /// deriving it from frames arriving or stopping. Frames are lossy and a
+    /// pause looks exactly like a peer who has turned their camera off, so a
+    /// state read off the stream would flicker.
+    CallVideoChanged {
+        call_id: CallId,
+        stream: crate::VideoStream,
+        on: bool,
+    },
+    /// The peer asked to turn this call into a video one — or stopped
+    /// asking.
+    ///
+    /// Distinct from [`CallVideoChanged`](Self::CallVideoChanged) because
+    /// nothing has changed yet: it is a question, and the answer is a person
+    /// turning their own camera on (or not). The token that binds an answer
+    /// to *this* request stays in the session, which is the only place that
+    /// can use it.
+    ///
+    /// `pending: false` withdraws it. A request can be cancelled or time out
+    /// at the peer's end, and a question nobody is asking any more must stop
+    /// being drawn: without this the camera control would go on claiming
+    /// somebody was waiting for the rest of the call.
+    CallVideoRequested {
+        call_id: CallId,
+        pending: bool,
     },
     /// The call is over here because another of this account's devices
     /// answered or refused it. Not a missed call: the device that took it has

@@ -79,6 +79,8 @@ pub fn active_audio(
     call: &ActiveCall,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
+    asked_for_video: bool,
+    camera_coming_on: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
     div()
@@ -148,7 +150,14 @@ pub fn active_audio(
                         })
                         .child(mic_state(call.muted, metrics, cx)),
                 )
-                .child(controls(call, entity, metrics, cx)),
+                .child(controls(
+                    call,
+                    entity,
+                    metrics,
+                    asked_for_video,
+                    camera_coming_on,
+                    cx,
+                )),
         )
 }
 
@@ -189,9 +198,12 @@ fn controls(
     call: &ActiveCall,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
+    asked: bool,
+    coming_on: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let mute_entity = entity.clone();
+    let camera_entity = entity.clone();
     let end_entity = entity;
     let muted = call.muted;
 
@@ -244,6 +256,15 @@ fn controls(
             )
             .disabled(true),
         ))
+        // The one gesture that turns an audio call into a video one: the
+        // camera coming on is what the peer is told, and it is also how their
+        // own request is answered.
+        //
+        // Selected while the camera is *coming* on as well as while a request
+        // is on the table: opening a device is seconds, and the first time a
+        // permission prompt, and a control that stayed unlit for all of it
+        // reads as a click that did nothing — so the next click cancels the
+        // enable it was meant to repeat.
         .child(labelled(
             "Video",
             metrics,
@@ -251,9 +272,18 @@ fn controls(
             round(
                 "call-video",
                 ProductIcon::Video.into(),
-                "Video calls are not supported yet",
+                if coming_on {
+                    "Turning the camera on…"
+                } else if asked {
+                    "They asked for video — turn the camera on"
+                } else {
+                    "Turn the camera on"
+                },
             )
-            .disabled(true),
+            .selected(asked || coming_on)
+            .on_click(move |_, _window, cx| {
+                camera_entity.update(cx, |app, cx| app.toggle_call_video(cx));
+            }),
         ))
         .child(labelled(
             "Add",

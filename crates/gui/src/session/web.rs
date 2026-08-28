@@ -74,8 +74,9 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
     })?;
 
     let pending = Arc::clone(&session.pending);
+    let pictures = session.call_frames().clone();
     spawn_local(async move {
-        let mut frames = Frames::new(&events, &pending, fetched.as_ref());
+        let mut frames = Frames::new(&events, &pending, fetched.as_ref(), &pictures);
         while let Some(from_socket) = socket.recv().await {
             match from_socket {
                 FromSocket::Open => log::info!("the daemon answered"),

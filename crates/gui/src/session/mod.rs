@@ -97,6 +97,13 @@ pub enum FromDaemon {
         /// The conversation, or `None` for a page of the chat list.
         jid: Option<String>,
     },
+    /// A picture is waiting in [`Session::call_frames`].
+    ///
+    /// A nudge rather than the frame itself: pictures are held in a slot per
+    /// direction, where the newest replaces the last, and this channel is
+    /// deep enough that carrying them would let a stalled window accumulate
+    /// gigabytes of obsolete video ahead of the state frames behind it.
+    CallFrames,
     /// A status view the daemon did not record after all.
     ///
     /// The ring was taken down the moment the update was opened, before the
@@ -248,6 +255,9 @@ pub struct Session {
     /// drawn the message. Without a way to say so from here those failures had
     /// nowhere to go, and the bubble sat pending for good with no retry.
     events: EventSink,
+    /// The newest decoded picture of each direction, written where the frames
+    /// are read and taken by the window. See [`FromDaemon::CallFrames`].
+    frames: crate::video::LatestFrames,
 }
 
 impl Session {
@@ -317,7 +327,17 @@ impl Session {
             next_id: AtomicU64::new(1),
             media,
             events,
+            frames: crate::video::LatestFrames::default(),
         }
+    }
+
+    /// The newest decoded picture of each direction of the live call.
+    ///
+    /// Taken by the window when [`FromDaemon::CallFrames`] says one is
+    /// waiting; the reader has been overwriting the slot in the meantime,
+    /// which is exactly what should happen to a picture nobody drew.
+    pub fn call_frames(&self) -> &crate::video::LatestFrames {
+        &self.frames
     }
 
     /// Report a send that failed before it ever left this process.
@@ -623,6 +643,19 @@ impl Session {
         self.call(CallAction::SetMuted {
             call_id: call_id.to_string(),
             muted,
+        });
+    }
+
+    /// Turn this window's camera on or off during a live call.
+    ///
+    /// Only ever our own direction: the peer's camera is theirs. Turning it
+    /// on is also how the peer's request to go to video is answered — an
+    /// acceptance *is* a camera coming on — so there is no second request for
+    /// that.
+    pub fn set_call_video(&self, call_id: &str, enabled: bool) {
+        self.call(CallAction::SetVideo {
+            call_id: call_id.to_string(),
+            enabled,
         });
     }
 

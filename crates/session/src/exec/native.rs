@@ -60,6 +60,11 @@ impl Executor {
         Ok(())
     }
 
+    /// A handle for spawning onto this executor from somewhere else later.
+    pub fn spawner(&self) -> Spawner {
+        Spawner(self.runtime.handle().clone())
+    }
+
     /// Spawn a task on the runtime.
     pub fn spawn<T: MaybeSend + 'static>(
         &self,
@@ -86,6 +91,25 @@ impl Executor {
             let _ = tx.send(());
         });
         rx.recv_timeout(timeout).is_ok()
+    }
+}
+
+/// A handle that can spawn onto this executor later, from anywhere.
+///
+/// For the callbacks: a camera's pump reports that it died from whichever
+/// thread noticed, which is not a thread the runtime knows about, so
+/// [`spawn`] would find no runtime to attach to. A `Handle` is what carries
+/// one across — cheap to clone, `Send + Sync`, and valid for as long as the
+/// runtime it names.
+#[derive(Clone)]
+pub struct Spawner(tokio::runtime::Handle);
+
+impl Spawner {
+    pub fn spawn<T: MaybeSend + 'static>(
+        &self,
+        future: impl Future<Output = T> + MaybeSend + 'static,
+    ) -> Task<T> {
+        Task(self.0.spawn(future))
     }
 }
 

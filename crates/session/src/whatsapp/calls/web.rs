@@ -39,11 +39,20 @@ impl CallRegistry {
     /// hanging up is the same event here, and it is the removal above that
     /// does the work.
     pub(in crate::whatsapp) async fn ended_by_peer(&self, _call_id: &str) {}
+
+    /// Always false: a page opens no camera, so a call becoming live has none
+    /// to make drawable and nothing to announce.
+    pub(in crate::whatsapp) async fn camera_became_drawable(&self, _call_id: &str) -> bool {
+        false
+    }
 }
 
 impl WhatsAppClient {
     /// Refused: answering a call needs the codec.
-    pub fn accept_call(&self, call_id: &str) {
+    ///
+    /// With or without video, and the second is not a near miss: the picture
+    /// would need an encoder as much as the voice needs one, and both are C.
+    pub fn accept_call(&self, call_id: &str, _with_video: bool) {
         self.refuse_call(call_id, "answered");
     }
 
@@ -70,6 +79,42 @@ impl WhatsAppClient {
     /// Refused: there is no live call here to mute.
     pub fn set_call_muted(&self, call_id: &str, _muted: bool) {
         self.refuse_call(call_id, "muted");
+    }
+
+    /// Refused: there is no live call here to put a camera on.
+    ///
+    /// `getUserMedia` would give a page the device, and `VideoEncoder` would
+    /// give it H.264 — but neither is bound yet, and a call this side cannot
+    /// answer has no direction to turn on in any case.
+    pub fn set_call_video(&self, call_id: &str, _on: bool) {
+        self.refuse_call(call_id, "shown on camera");
+    }
+
+    /// Nothing to ask: no camera here has ever encoded anything.
+    ///
+    /// Silent rather than refused, unlike everything above it. This is not a
+    /// person asking for something — it is a window attaching mid-call and
+    /// saying it has never seen a keyframe — so there is nothing to tell them
+    /// they cannot have.
+    pub fn request_video_keyframe(&self) {}
+
+    /// Nothing to stop: a page never opened a camera to lose.
+    ///
+    /// Unused for that reason, and kept for the same one as everything else
+    /// in [`crate::video`]'s browser half.
+    ///
+    /// Reached from the same place as on a desktop — the callback a camera
+    /// reports its death through — and that callback is built here too,
+    /// because building it is what `video::open` is handed. Since `open`
+    /// always refuses, nothing ever calls this; it exists so the session's
+    /// own code has one shape.
+    #[allow(dead_code)]
+    pub(in crate::whatsapp) async fn stop_local_video(
+        _calls: &CallRegistry,
+        _ui_sender: &UiEventSender,
+        _call_id: &str,
+        _only: Option<crate::video::CameraId>,
+    ) {
     }
 
     /// Say no, once, in the terms the caller understands.

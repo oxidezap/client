@@ -6,7 +6,7 @@ use gpui::{
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_component::{Disableable as _, Icon, IconName};
+use gpui_component::{Icon, IconName};
 
 use crate::app::WhatsAppApp;
 use crate::components::avatar::Presence;
@@ -198,8 +198,10 @@ fn render_actions(
     // group: both mean the button would do nothing.
     let callable = is_callable_user(&chat.jid) && can_send;
     let call_jid = chat.jid.clone();
+    let video_jid = chat.jid.clone();
     let overflow_jid = chat.jid.clone();
     let call_entity = entity.clone();
+    let video_entity = entity.clone();
     let overflow_entity = entity.clone();
     let search_entity = entity;
 
@@ -238,17 +240,13 @@ fn render_actions(
                     },
                 ),
             )
-            // Drawn but inert: the VoIP facade is audio-only, and an enabled
-            // camera button that silently places a voice call would misdescribe
-            // itself to both sides. The tooltip says why rather than leaving
-            // the reader to guess.
             .child(
-                action(
-                    "video-call",
-                    ProductIcon::Video.into(),
-                    "Video calls are not supported yet",
-                )
-                .disabled(true),
+                action("video-call", ProductIcon::Video.into(), "Video call").on_click(
+                    move |_, _window, cx| {
+                        video_entity
+                            .update(cx, |app, cx| app.start_call(video_jid.clone(), true, cx));
+                    },
+                ),
             )
         })
         .child(render_overflow_menu(
@@ -272,6 +270,7 @@ fn render_overflow_menu(
     layout: ResponsiveLayout,
 ) -> impl IntoElement + use<> {
     let search_entity = entity.clone();
+    let video_entity = entity.clone();
     let call_entity = entity;
 
     Button::new("chat-menu")
@@ -283,6 +282,8 @@ fn render_overflow_menu(
         .dropdown_menu(move |menu, _window, _cx| {
             let search_entity = search_entity.clone();
             let call_entity = call_entity.clone();
+            let video_entity = video_entity.clone();
+            let video_jid = jid.clone();
             let jid = jid.clone();
 
             let menu = menu.item(
@@ -306,12 +307,13 @@ fn render_overflow_menu(
                                 .update(cx, |app, cx| app.start_call(jid.clone(), false, cx));
                         }),
                 )
-                // Present and disabled for the same reason as in the toolbar:
-                // the shape of the menu should not change the day video lands.
                 .item(
                     PopupMenuItem::new("Video call")
                         .icon(Icon::from(ProductIcon::Video))
-                        .disabled(true),
+                        .on_click(move |_, _window, cx| {
+                            video_entity
+                                .update(cx, |app, cx| app.start_call(video_jid.clone(), true, cx));
+                        }),
                 )
         })
 }

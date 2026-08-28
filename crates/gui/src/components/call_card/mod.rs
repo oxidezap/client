@@ -19,13 +19,13 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Icon, IconName, Sizable as _};
+use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 
 use crate::app::{AcceptCall, CALL_CONTEXT, CallCard, DeclineCall, ToggleMute, WhatsAppApp};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use gpui::AppContext as _;
-use oxidezap_core::{CallState, Stage};
+use oxidezap_core::{ActiveCall, CallState, Stage};
 
 use super::ProductIcon;
 
@@ -52,6 +52,7 @@ pub fn render_call_card(
     entity: Entity<WhatsAppApp>,
     focus_handle: &gpui::FocusHandle,
     layout: ResponsiveLayout,
+    app: &WhatsAppApp,
     cx: &App,
 ) -> Option<AnyElement> {
     let stage = state.stage()?;
@@ -63,6 +64,21 @@ pub fn render_call_card(
         let waiting = state
             .waiting()
             .map(|waiting| waiting_strip(waiting.caller_name(), entity.clone(), metrics, cx));
+        // A video call on a phone is the picture: the banner names who it is
+        // with and the panes are what the call actually is, so they hang
+        // under it rather than being left off for want of a card to float.
+        let panes = stage
+            .active()
+            .filter(|call| call.shows_video())
+            .map(|call| {
+                div().w_full().bg(cx.theme().secondary).child(video::panes(
+                    call,
+                    app,
+                    metrics,
+                    layout.viewport().height * 0.4,
+                    cx,
+                ))
+            });
         return Some(
             div()
                 .absolute()
@@ -72,7 +88,16 @@ pub fn render_call_card(
                 .flex()
                 .flex_col()
                 .items_center()
-                .child(mobile_banner(stage, entity, focus_handle, metrics, cx))
+                .child(mobile_banner(
+                    stage,
+                    entity,
+                    focus_handle,
+                    metrics,
+                    app.call_video_requested(),
+                    app.call_video_showing(),
+                    cx,
+                ))
+                .children(panes)
                 .children(waiting)
                 .into_any_element(),
         );
@@ -88,7 +113,7 @@ pub fn render_call_card(
     let body = if card.is_minimized() {
         minimized_pill(stage, entity.clone(), metrics, cx).into_any_element()
     } else {
-        expanded_card(stage, card, entity.clone(), layout, metrics, cx).into_any_element()
+        expanded_card(stage, card, entity.clone(), layout, metrics, app, cx).into_any_element()
     };
     // A second caller gets their own strip and their own Decline. Routing the
     // card's Decline at them instead would refuse someone the user cannot see
@@ -191,11 +216,16 @@ fn expanded_card(
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     metrics: Metrics,
+    app: &WhatsAppApp,
     cx: &App,
 ) -> impl IntoElement + use<> {
     // Video and the group grid need room for pictures; audio does not, and a
-    // card padded out to the same width would read as missing something.
-    let wide = stage.is_video() || matches!(stage, Stage::Active(_) if stage.is_video());
+    // card padded out to the same width would read as missing something. A
+    // call that *gains* a camera mid-way widens with it: what decides is
+    // whether there is a picture to draw, not what the offer said.
+    let wide = stage
+        .active()
+        .map_or_else(|| stage.is_video(), ActiveCall::shows_video);
     let width = if wide {
         metrics.call_card_width_wide()
     } else {
@@ -209,12 +239,22 @@ fn expanded_card(
         Stage::Outgoing(call) => {
             ringing::outgoing(call, entity.clone(), metrics, cx).into_any_element()
         }
-        Stage::Active(call) if call.is_video => {
-            video::active_video(call, entity.clone(), metrics, cx).into_any_element()
+        Stage::Active(call) if call.shows_video() => {
+            video::active_video(call, entity.clone(), metrics, app, cx).into_any_element()
         }
-        Stage::Active(call) => {
-            active::active_audio(call, entity.clone(), metrics, cx).into_any_element()
-        }
+        Stage::Active(call) => active::active_audio(
+            call,
+            entity.clone(),
+            metrics,
+            app.call_video_requested(),
+            // What this window asked for, which the state cannot have caught
+            // up with yet: the card is the audio one precisely because no
+            // camera is on, and the seconds a device takes to open are the
+            // ones the control has to account for.
+            app.call_video_showing(),
+            cx,
+        )
+        .into_any_element(),
     };
 
     div()
@@ -371,11 +411,17 @@ fn mobile_banner(
     entity: Entity<WhatsAppApp>,
     focus_handle: &gpui::FocusHandle,
     metrics: Metrics,
+    asked_for_video: bool,
+    showing_video: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let accept_entity = entity.clone();
+    let camera_entity = entity.clone();
     let end_entity = entity.clone();
     let action_entity = entity;
+    // Only a live call has a camera to turn on; an offer's camera comes on
+    // with the answer.
+    let camera = stage.active().map(|_| showing_video);
     // Only an *incoming* call can be accepted. An outgoing one is ringing
     // too, and offering Accept for it produced a button that found no offer
     // and did nothing.
@@ -458,6 +504,27 @@ fn mobile_banner(
                     }),
             )
         })
+        .children(camera.map(|on| {
+            Button::new("call-camera")
+                .icon(if on {
+                    ProductIcon::Video
+                } else {
+                    ProductIcon::VideoOff
+                })
+                .ghost()
+                .selected(on || asked_for_video)
+                .tooltip(if on {
+                    "Turn the camera off"
+                } else if asked_for_video {
+                    "They asked for video — turn the camera on"
+                } else {
+                    "Turn the camera on"
+                })
+                .h(metrics.touch_target())
+                .on_click(move |_, _window, cx| {
+                    camera_entity.update(cx, |app, cx| app.toggle_call_video(cx));
+                })
+        }))
         .child(
             Button::new("call-hang-up")
                 .icon(ProductIcon::PhoneOff)

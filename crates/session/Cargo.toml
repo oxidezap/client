@@ -15,6 +15,8 @@ log = { workspace = true }
 oxidezap-audio = { workspace = true }
 oxidezap-chat-store = { workspace = true, features = ["search"] }
 oxidezap-core = { workspace = true }
+# A 64-bit counter, through portable-atomic rather than std (see /clippy.toml).
+portable-atomic = { workspace = true }
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
 
 # The library, twice, because the two targets need different halves of it.
@@ -27,6 +29,11 @@ tokio = { workspace = true, features = ["macros", "sync", "time"] }
 # takes none of them and supplies its own through the library's own plugin
 # traits.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+# The camera and the encoder, which are a platform each: nokhwa is V4L2,
+# AVFoundation and Media Foundation, and OpenH264 is C. A browser has a camera
+# too, and reaches it through `getUserMedia` and `VideoEncoder` — a binding
+# rather than a build, which is why this is not a feature flag on one crate.
+oxidezap-video = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 whatsapp-rust = { workspace = true }
 

@@ -1,6 +1,8 @@
 //! Messages exchanged over the socket.
 
-use oxidezap_core::{CallState, Chat, ChatMessage, DownloadableMedia, QuotedMessage, UiEvent};
+use oxidezap_core::{
+    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, QuotedMessage, UiEvent,
+};
 use serde::{Deserialize, Serialize};
 
 /// Monotonic counter over daemon state.
@@ -366,6 +368,29 @@ pub enum DaemonMessage {
     /// front end reports it against the chat, which is where a user is
     /// looking when they wonder whether their message went out.
     SendFailed { jid: String, reason: String },
+    /// One encoded frame of a live call's video.
+    ///
+    /// The third kind of frame, beside state and news, and it obeys neither's
+    /// rules. It carries no version, because no snapshot could ever restore
+    /// it; and unlike a window request, losing one is *correct* — a frame
+    /// that could not be delivered now is worth nothing later, so a client
+    /// that falls behind on these is skipped rather than told to resync.
+    ///
+    /// Both directions travel. The peer's is the call; ours is the self-view,
+    /// which has nowhere else to come from — the camera is opened by the
+    /// process that owns the session, the same rule that puts the microphone
+    /// there.
+    CallVideo(Box<CallVideoFrame>),
+    /// The client fell behind on video and frames were skipped.
+    ///
+    /// Not a `Resync`: nothing about the *state* is stale, and asking for a
+    /// snapshot would throw a history away to recover a picture that has
+    /// already moved on. What a decoder needs after a gap is different — the
+    /// units it did not get are the ones the next ones reference, so it has
+    /// to stop and wait for a point it can start from. Which direction lagged
+    /// is not said because it is not known: the channel carries both, and a
+    /// gap in it is a gap in whatever was in flight.
+    CallVideoGap,
     /// The client fell too far behind and its stream was truncated. Whatever
     /// it holds is now untrustworthy, so it must snapshot again rather than
     /// keep applying.
@@ -642,6 +667,17 @@ pub enum CallAction {
     SetMuted {
         call_id: String,
         muted: bool,
+    },
+    /// Turn this side's camera on or off during a live call.
+    ///
+    /// Only ever about *our* direction: the peer's camera is theirs, and what
+    /// this asks the daemon to do is open a device and tell them about it.
+    /// Answering their request to go to video is the same gesture — turning
+    /// our camera on is what an acceptance *is* — so there is no separate
+    /// accept request.
+    SetVideo {
+        call_id: String,
+        enabled: bool,
     },
 }
 

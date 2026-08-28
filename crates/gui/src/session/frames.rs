@@ -44,6 +44,14 @@ pub(super) struct Frames<'a> {
     /// a daemon that simply went away, and wrong for every case this side
     /// actually diagnosed.
     reason: Option<String>,
+    /// The decoders for whatever call is up, made when its first frame
+    /// arrives and dropped when the call state says there is no call: a
+    /// decoder held past its call keeps its reference frames for a picture
+    /// nobody is looking at, and whatever it decodes on with them.
+    video: Option<crate::video::CallVideo>,
+    /// Where a decoded picture goes: into the slot for its direction, and a
+    /// nudge behind it.
+    decoded: crate::video::FrameSink,
 }
 
 impl<'a> Frames<'a> {
@@ -51,13 +59,30 @@ impl<'a> Frames<'a> {
         events: &'a EventSink,
         pending: &'a Pending,
         media: &'a dyn MediaCache,
+        pictures: &crate::video::LatestFrames,
     ) -> Self {
+        let decoded: crate::video::FrameSink = {
+            let events = events.clone();
+            let pictures = pictures.clone();
+            std::sync::Arc::new(move |frame| {
+                // Into the slot, replacing whatever that direction was
+                // holding: this is the same bargain the daemon makes one hop
+                // earlier, and the window is where the backlog would actually
+                // be seen. The nudge may be dropped as well — a full channel
+                // already has one in it, and the slot holds the newest
+                // picture either way.
+                pictures.put(frame);
+                events.try_send(FromDaemon::CallFrames);
+            })
+        };
         Self {
             events,
             pending,
             media,
             applied: StateVersion::INITIAL,
             reason: None,
+            video: None,
+            decoded,
         }
     }
 
@@ -245,7 +270,37 @@ impl<'a> Frames<'a> {
                 event: DaemonEvent::CallsChanged(calls),
             } => {
                 self.applied = version;
+                // The call the decoders belong to is over, or a different one
+                // is up. Either way theirs has ended.
+                if !calls.holds(self.video.as_ref().map_or("", |v| v.call_id())) {
+                    self.video = None;
+                }
                 self.publish(FromDaemon::Calls(Box::new(calls)))?;
+            }
+            // A stream rather than an event: fed to the decoder that owns its
+            // direction, which drops it if it is still busy with the one
+            // before. Nothing here waits, and nothing recovers a frame.
+            DaemonMessage::CallVideo(frame) => {
+                let decoders = match &self.video {
+                    Some(decoders) if decoders.call_id() == frame.call_id => decoders,
+                    // A different call: the old decoders are mid-bitstream on
+                    // a stream that has ended, and feeding them this one would
+                    // produce nothing either could use.
+                    _ => self.video.insert(crate::video::CallVideo::new(
+                        frame.call_id.clone(),
+                        std::sync::Arc::clone(&self.decoded),
+                    )),
+                };
+                decoders.accept(*frame);
+            }
+            // The daemon skipped frames on the way here. Whatever the decoders
+            // hold no longer matches what the senders encoded against, so they
+            // wait for a keyframe rather than drawing on references that never
+            // arrived.
+            DaemonMessage::CallVideoGap => {
+                if let Some(decoders) = &self.video {
+                    decoders.interrupted();
+                }
             }
             // Chat summaries, which this front end derives from the session
             // stream instead. The version still advances: it describes how far

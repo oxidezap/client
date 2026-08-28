@@ -14,9 +14,17 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   messages, receipts and an FTS5 search index. Owns its schema and migrations;
   consumes only the library's public event surface. Extracted from
   whatsapp-rust, where it was application logic living in a protocol repo.
+- **oxidezap-video**: camera capture and H.264 encoding for calls. cpal's
+  opposite number: a capture backend per platform behind one crate, and the
+  encoder the GUI already decodes with. No UI, and no decode — decoding
+  belongs to whoever draws.
 - **oxidezap-session**: the WhatsApp connection: events, sends, store hydration.
   Knows nothing about how anything is drawn, and nothing about IPC either —
-  the daemon translates requests onto its methods.
+  the daemon translates requests onto its methods. Three of its modules are
+  platform splits rather than logic — `net/` is the transport and HTTP client
+  a page has to supply, `exec/` is where its tasks run, and `video/` is the
+  camera — and the calls are a fourth, in `whatsapp/calls/`. Above them the
+  session names no platform.
 - **oxidezap-ipc**: the wire protocol between the daemon and its front ends,
   plus the blocking client end of the transport (`Endpoint`). No runtime: a
   front end needs one thread to read and a lock to serialize writes, and the
@@ -78,6 +86,14 @@ Type-checking the web build without the whole bundle:
 
 ```bash
 cargo +nightly check -p oxidezap-gui --target wasm32-unknown-unknown -Z build-std=std,panic_abort
+```
+
+The session builds for that target too, and is checked separately because
+nothing in the page depends on it yet — a break there would otherwise go
+unnoticed until something does:
+
+```bash
+cargo +nightly check -p oxidezap-session --target wasm32-unknown-unknown -Z build-std=std,panic_abort
 ```
 
 Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is
@@ -172,6 +188,120 @@ profile here repeats it deliberately.
   speaker, so the process that owns the session owns the audio device. That
   follows from the split rather than being chosen, and it is why a call still
   works with the window closed.
+- **The camera is where the microphone is, and the picture crosses encoded.**
+  `oxidezap-session` opens both, because the process that owns the session
+  owns the devices — so the window has no camera of its own and no way to
+  draw what it is sending. What crosses the socket is therefore *both*
+  directions of the call, as H.264 access units: 16 KiB a frame against 3.5
+  MiB of pixels, and the front end already carries a decoder for the video it
+  plays in a conversation. Sending the self-view as the very stream the peer
+  receives costs one more decode and no second encode, and is the only form
+  of it that cannot lie about what they are seeing. Frames are a third kind
+  of daemon frame beside state and news (`StateHub::publish_video`), because
+  they obey neither's rules: no version, nothing recovers them, and a client
+  that falls behind is *right* to skip — sharing the session channel would
+  turn a slow window into a `Resync` and throw its history away to catch up
+  on a picture that had already moved on. It is gated on `has_window` rather
+  than on wanting events: a notifier asks for events and has nowhere to put a
+  picture, and subscribing it would spend a call's whole bitrate on frames it
+  parses and discards. And the *session* stops producing them when the last
+  window goes: nothing announces a subscriber leaving, so the first frame
+  that finds nobody drawing is what notices, and `set_video_publishing`
+  closes the door in front of the sender until a window subscribes again. The
+  gate is read before a frame is built, because building one copies an access
+  unit out of the encoder's buffer — for a call that runs, and a peer that is
+  receiving it, whether or not anybody here is looking.
+- **Everything on the video path drops, and every drop asks for a keyframe.**
+  A frame that cannot be delivered now is worth nothing later, so every queue
+  from the encoder to the pane is short and every send is a `try_send`. What
+  a drop costs is the reference chain — each unit after it points at one the
+  far side never received — so the sender's queue asks its own encoder for an
+  IDR, the peer's RTCP PLI asks for one through `CallEvent::RtcpReceived`,
+  and the window's decoder, which can ask nobody, waits for the next one
+  rather than rendering a second of torn macroblocks over the last good
+  picture. Every moment a decoder is *born* mid-stream is asked for too — an
+  outgoing call renamed off its placeholder, one the peer has just answered,
+  and every camera that becomes drawable, since the encoder opened before the
+  offer or the announcement did and its opening IDR was published nowhere.
+  Without that ask the first frame a new decoder sees is a P-frame and the
+  pane says "connecting" until the periodic IDR, seconds later.
+- **A peer's parameter set is read before a decoder sees it.** A decoder
+  allocates its reference and output buffers from the SPS — from numbers the
+  person on the other end of the call chose — so a pixel budget applied to
+  the decoded picture is applied after the allocation it exists to prevent.
+  `video::sps::coded_size` reads the geometry out of the access unit first —
+  out of *every* parameter set in it, answering the largest, because one unit
+  may carry several and the slice picks which one it is coded against: a
+  thumbnail-sized set in front of the one the picture really uses is a budget
+  walked straight past. It answers `None` for a unit with no parameter set
+  (nothing new is being declared) and for ones it cannot follow, which is
+  deliberate: refusing on a reading nobody has checked would break a
+  legitimate call over a parser bug.
+- **A decoded picture is a slot, not a place in a queue.** The window's event
+  channel is hundreds of messages deep because the messages that may not be
+  lost need it to be, and a decoded 720p frame is 3.5 MiB — so frames put
+  there would let a stalled window bank gigabytes of obsolete video *and* park
+  every state frame behind ten seconds of it. `LatestFrames` holds one picture
+  per direction, the newest overwriting the last, and the channel carries only
+  a nudge; a dropped nudge costs nothing, because the slot still holds the
+  newest picture and the next frame nudges again.
+- **A peer's orientation describes their device, not their picture.** The
+  camera encodes in the sensor's orientation whatever the phone is doing, so a
+  frame arrives already turned by however it is held and `device_orientation`
+  is the *description* of that turn. Drawing it upright means undoing it —
+  `Rotation::to_upright`, not the turn itself. Applying it again is the one
+  mistake that looks deliberate: at one quarter turn it is 180° out, which
+  reads as a peer standing on their head rather than as a sign error.
+- **A camera is a request, not a state, and requests arrive out of order.**
+  Opening one is device work — tens of milliseconds, and a permission prompt
+  the first time — so two toggles spawned in order routinely start in the
+  other, and `VideoLane` is the mute lane's twin for exactly that: the intent
+  is stamped on the caller's thread before its task exists, the newest
+  request is the only one that may speak, and what it publishes is read back
+  from the registry rather than from what was asked for. A camera that will
+  not open, a call hung up while it was opening, an announcement the peer
+  never got, and a device unplugged mid-call all end the same way — the
+  registry entry is what "our video is on" *means*, and `settle_video` says
+  what is in it.
+- **A refusal is answered by whether one is outstanding, not by which camera
+  asked.** The library does not match a refused upgrade to the request it
+  refuses: its handler tears the local plane down whenever *some* request of
+  ours is pending — whichever camera is attached by then — and ignores the
+  stanza when none is. So `CallRegistry::upgrading` holds presence rather
+  than identity, and the camera goes off exactly when the library has
+  released its endpoints. Keying it on the camera the request went out with
+  reads as more careful and is worse: a refusal landing after an off-and-on
+  again tears down the replacement's plane in the library while leaving it
+  registered here, drawn as live, encoding into nothing. The presence is
+  stamped *before* the request goes out, for the reason every intent here is
+  stamped before its task exists: the reply is not ours to schedule, and a
+  peer refusing while `start_video` is still awaiting would otherwise find
+  nothing outstanding and leave the camera standing over a plane the library
+  has already released. Registering early is the half that can be made safe —
+  every path out that is not a camera held withdraws it again, and the
+  refusal's own teardown queues on the call's video lane behind the enable it
+  is answering.
+- **What a call turned out to be is said by the side that opened the
+  device.** The kind is drawn from the offer, because that is all anyone
+  knows when the call is placed or answered — and a camera that will not open
+  downgrades it to voice rather than failing it, on both paths. So
+  `OutgoingCallStarted::is_video` carries what the offer actually went out
+  as, and `UiEvent::CallAnswered` what the accept actually attached; without
+  them a window holds a video layout open on a call with no picture in it and
+  the conversation records a video call that never was one.
+- **A video call is offered as one, and answered as one.** The endpoints have
+  to be attached before the offer or the accept goes out, which is why the
+  camera opens first and why a camera that fails downgrades the call to voice
+  rather than failing it. It is also why the daemon reads `is_video` off the
+  ringing offer rather than taking a front end's word: the library refuses
+  `.video()` on an audio offer. The peer's mid-call request to add video gets
+  no dialog of its own — turning our camera on *is* the acceptance, and the
+  token that binds it to that request never leaves the session — but the
+  *question* is state (`CallVideo::requested`) rather than one window's
+  memory of an event: a window that attached after it was asked never saw the
+  event, and would draw an ordinary camera button while somebody waited on
+  it. It clears when a camera comes on, which is the answer, and when the
+  peer withdraws it.
 - **Ending a call is something you say, and muting is something you may fail
   to say.** A hangup is `CallHandle::terminate`, which sends `<terminate>` to
   every device a still-ringing call rang and then tears the local side down
@@ -200,6 +330,16 @@ profile here repeats it deliberately.
   live in the same SQLite database, and chat rows are keyed by device id. A
   partial wipe orphans everything behind the new device, so
   `wipe_local_state` deletes the file (plus `-wal`/`-shm`).
+- **A call's pictures are the call's, and the state says which are live.**
+  `CallVideo` is two independent flags because either side may turn its
+  camera on and off mid-call, and a call where only one is on is the ordinary
+  case. A pane draws the newest frame it has and the *state* decides whether
+  it draws at all: a camera switched off simply stops sending, so a pane left
+  holding its last frame is a photograph of somebody who has gone. Frames and
+  state travel on different channels, so both ends check both — a frame for a
+  call that has ended would put the last person's face on this one, and a
+  frame for a direction just turned off would light a pane nothing will come
+  to clear again.
 - **Decoded images are cached by message id**, because GPUI tracks animation
   state per `Arc<Image>` and rebuilding one re-decodes the bytes. Whoever
   replaces a preview with real bytes must evict the entry.
@@ -607,35 +747,43 @@ by definition.
 - **`WhatsAppApp` still owns all state**, though it is now split across
   `app/{events,recording,calls_ctl,media_ctl}.rs` rather than one file. The
   guides want per-feature entities; that is a bigger change than moving code.
-- **Two large files outside the GUI**: `session/whatsapp.rs` (~2.3k) and
-  `chat-store/store.rs` (~3.1k).
-- **The session does not run in the browser**, and less of it is missing than
-  it looks. The page is the window; the daemon still holds the account, which
-  means the deployed bundle needs one running on the visitor's machine to be
-  useful. But the chat store already builds for wasm — `sqlite-wasm-rs`
-  targets `wasm32-unknown-unknown`, diesel links against it, FTS5 and all —
-  `oxidezap/whatsapp-rust-bridge` already runs the library there, and all
-  three plugins the library takes are written: `session/net/web.rs` is the
-  browser's `WebSocket` as a `Transport`, `fetch` as an `HttpClient`, and the
-  page's own event loop as a `Runtime`.
-  WhatsApp does not refuse the socket over origin either. `wss://web.whatsapp.com/ws/chat`
+- **Two large files outside the GUI**: `session/whatsapp/mod.rs` (~3.7k) and
+  `chat-store/store.rs` (~3.2k). The calls came out of the first one and the
+  video plane never went in, so what is left is the event pump, hydration and
+  the paged reads — three things rather than one file.
+- **The session compiles for the browser; nothing runs one there yet.** The
+  page is the window and the daemon still holds the account, so the deployed
+  bundle needs one running on the visitor's machine to be useful. Every piece
+  under that, though, is now built for a page. The chat store needs no
+  rewrite — `sqlite-wasm-rs` targets `wasm32-unknown-unknown`, diesel links
+  against it, FTS5 and all — `oxidezap/whatsapp-rust-bridge` already runs the
+  library there, all three plugins the library takes are written
+  (`session/net/web.rs`), and `oxidezap-session` itself builds for that
+  target: `session/exec/` is where its threading went, one interface with a
+  Tokio runtime behind it on a desktop and the page's event loop behind it in
+  a browser.
+  WhatsApp does not refuse a page's origin either. `wss://web.whatsapp.com/ws/chat`
   opens from a page served off `https://oxidezap.github.io`, which is a public
   origin and not WhatsApp's own — a WebSocket upgrade is not subject to the
-  same-origin policy, and the server declines to make it one. That is the
-  upgrade and nothing above it: the Noise handshake, pairing, and whether an
-  account is content to be used this way are all still unmeasured.
-  What stands in the way is on our side. `oxidezap-session` is written against
-  threads — seven of its methods hand back a `tokio::task::JoinHandle` and
-  three of those carry a result somebody awaits — so the wasm errors that
-  remain are all `Send`/`Sync`. It needs a platform-neutral awaitable
-  `Task<T>`, which is an API change reaching the daemon's call sites rather
-  than a backend swap.
-- **Video is not decoded on the web, and voice notes are not recorded there.**
-  Both are the same cause — the decoder and the encoder are C — and both have
-  a browser-native answer that is a Rust binding: `web_sys::VideoDecoder` and
-  `MediaRecorder`. Each is an API change rather than a backend swap, because
-  one is asynchronous where `StreamingVideoDecoder` is pulled by index, and
-  the other hands back encoded bytes where `RecordedAudio` is samples.
+  same-origin policy, and the server declines to make it one.
+  What is left is no longer a port. It is the upgrade and nothing above it
+  that has been measured, so the Noise handshake and pairing are still
+  unmeasured; `resolve_database_path` names a filesystem a page does not have,
+  and the store would have to open on OPFS instead; and the front end
+  deliberately does not depend on the session at all, because one session per
+  user is what the daemon split protects — a page holding its own is a
+  different answer to that question, not a missing call.
+- **Video is not decoded on the web**, in a message or in a call, **and voice
+  notes are not recorded there.** All three are the same cause — the decoder
+  and the encoder are C — and each has a browser-native answer that is a Rust
+  binding: `web_sys::VideoDecoder` and `MediaRecorder`. Each is an API change
+  rather than a backend swap, because one is asynchronous where
+  `StreamingVideoDecoder` is pulled by index, and the other hands back encoded
+  bytes where `RecordedAudio` is samples. `video/call_unsupported.rs` is what
+  a page has meanwhile: the names, and frames dropped where they arrive.
+- **Group video is drawn but not reachable.** `call_card/video.rs` carries a
+  participant grid the library's group calls would fill; 1:1 is what the card
+  routes to today.
 - **A front end cannot say what went wrong with a command.** `Accepted` means
   the session took it; per-request outcomes would need request ids on more
   than downloads. A failed send arrives as `SendFailed` against the chat, not

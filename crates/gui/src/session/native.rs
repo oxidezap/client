@@ -48,17 +48,23 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
     })?;
 
     let pending = Arc::clone(&session.pending);
+    let pictures = session.call_frames().clone();
     std::thread::Builder::new()
         .name("oxidezap-ipc".to_string())
-        .spawn(move || read_frames(reader, &events, &pending))?;
+        .spawn(move || read_frames(reader, &events, &pending, &pictures))?;
 
     Ok((session, rx))
 }
 
 /// Read frames until the daemon goes away.
-fn read_frames(stream: oxidezap_ipc::Reader, events: &EventSink, pending: &Pending) {
+fn read_frames(
+    stream: oxidezap_ipc::Reader,
+    events: &EventSink,
+    pending: &Pending,
+    pictures: &crate::video::LatestFrames,
+) {
     let cache = Directory;
-    let mut frames = Frames::new(events, pending, &cache);
+    let mut frames = Frames::new(events, pending, &cache, pictures);
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {

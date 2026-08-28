@@ -8,6 +8,7 @@ mod group_notice;
 mod names;
 mod net;
 mod quoting;
+mod video;
 mod whatsapp;
 
 pub use exec::{Cancelled, Task};

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.oxidezap.daemon</string>
+	<key>CFBundleName</key>
+	<string>oxidezapd</string>
+	<key>NSCameraUsageDescription</key>
+	<string>oxidezap needs the camera so you can be seen on a video call.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>oxidezap needs the microphone so you can be heard on a call and record voice messages.</string>
+</dict>
+</plist>

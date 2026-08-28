@@ -71,6 +71,10 @@ pub enum Action {
     /// Reload the whole history, for a front end that has just attached and
     /// holds nothing.
     ReloadHistory,
+    /// A front end that draws video has attached: let the session publish
+    /// again, and ask the cameras for a point its decoders can start from.
+    /// See [`WhatsAppClient::set_video_publishing`].
+    RefreshVideo,
     /// One page of a chat's messages, answered on `answer_to`.
     ///
     /// Addressed like a download rather than published: a page is a position
@@ -115,6 +119,7 @@ impl Action {
         !matches!(
             self,
             Self::ReloadHistory
+                | Self::RefreshVideo
                 | Self::ForgetSession
                 | Self::MarkStatusWatched { .. }
                 | Self::LoadMessages { .. }
@@ -204,6 +209,10 @@ pub async fn run(
     let mut events = client
         .start()
         .map_err(|e| anyhow::anyhow!("starting the session: {e}"))?;
+    // Asked for once, here, rather than per front end: the session has one
+    // camera and one call, and what decides whether a frame is *serialized*
+    // is whether anybody is subscribed to the hub's video channel.
+    let mut video = client.video_events();
     let mut bridge = Bridge::new(hub);
 
     // Set when every sender is gone. A closed channel yields `None`
@@ -224,6 +233,21 @@ pub async fn run(
                 // further event can arrive.
                 None => break,
             },
+            // Not folded into daemon state and not published as an event: a
+            // frame is neither. It goes straight out to whoever is drawing —
+            // and when nobody is, the session is told to stop producing them
+            // rather than being left to hand over frames this drops. That is
+            // the only place the *last* window leaving can be noticed:
+            // nothing announces a subscriber going away, and one frame is
+            // what it costs to find out.
+            Some(frame) = video.recv() => {
+                if bridge.hub.wants_video() {
+                    bridge.hub.publish_video(frame);
+                } else {
+                    client.set_video_publishing(false);
+                }
+            }
+
             command = commands.recv(), if !commands_closed => match command {
                 Some(command) => {
                     bridge.execute(&client, command).await;
@@ -439,6 +463,7 @@ impl Bridge {
                 call_id,
                 recipient_jid: _,
                 placeholder_id,
+                is_video,
             } => {
                 // Renamed *and* advanced: the placeholder id was ours, and the
                 // server answering with the real one is also what says the
@@ -450,7 +475,7 @@ impl Bridge {
                 // `CallState::update_outgoing_call_id`.
                 let mut adopted = false;
                 self.hub.calls(|s| {
-                    adopted = s.update_outgoing_call_id(placeholder_id, call_id.clone());
+                    adopted = s.update_outgoing_call_id(placeholder_id, call_id.clone(), *is_video);
                     if adopted {
                         s.set_outgoing_ringing(call_id);
                     }
@@ -462,6 +487,14 @@ impl Bridge {
             UiEvent::CallAccepted(id) => self.hub.calls(|s| {
                 s.connect(id);
             }),
+            // The kind an incoming call was answered as, which the accept
+            // decides and the offer only proposed: a camera that would not
+            // open answers a video offer as a voice call. Nothing is
+            // published when it agrees with the offer, which is the ordinary
+            // case.
+            UiEvent::CallAnswered { call_id, is_video } => self.hub.calls(|s| {
+                s.answered_as(call_id, *is_video);
+            }),
             UiEvent::CallEnded(id) => self.hub.calls(|s| {
                 s.end(id);
             }),
@@ -469,6 +502,20 @@ impl Bridge {
             // The front end drew what it asked for; this is what the device
             // is actually doing. Nothing is published when the two agree, so
             // the ordinary mute costs no frame.
+            UiEvent::CallVideoChanged {
+                call_id,
+                stream,
+                on,
+            } => self.hub.calls(|s| {
+                s.set_video(call_id, *stream, *on);
+            }),
+            // A question the peer asked, kept as state rather than left as an
+            // event: a window that attaches after it was asked never saw it,
+            // and would draw an ordinary camera button while somebody waited
+            // on it.
+            UiEvent::CallVideoRequested { call_id, pending } => self.hub.calls(|s| {
+                s.set_video_requested(call_id, *pending);
+            }),
             UiEvent::CallMuteChanged { call_id, muted } => self.hub.calls(|s| {
                 s.set_muted(call_id, *muted);
             }),
@@ -723,10 +770,22 @@ impl Bridge {
                     // for the *other* direction left the daemon publishing a
                     // ringing offer over a connected call.
                     CallAction::Accept { call_id } => {
+                        // Answering a video call answers it with video: the
+                        // offer said what kind of call this is, and the
+                        // camera has to be attached before the accept goes
+                        // out. A window that wants to answer with the camera
+                        // off turns it off once the call is up, which is what
+                        // a phone does too.
+                        let with_video = self
+                            .hub
+                            .call_state()
+                            .incoming()
+                            .filter(|call| call.call_id == call_id)
+                            .is_some_and(|call| call.is_video);
                         self.hub.calls(|calls| {
                             calls.connect(&call_id);
                         });
-                        client.accept_call(&call_id);
+                        client.accept_call(&call_id, with_video);
                     }
                     // A decline is the one ending only the declining side
                     // knows about. Every other window watches the same stage
@@ -758,6 +817,14 @@ impl Bridge {
                         });
                         client.set_call_muted(&call_id, muted);
                     }
+                    // Not mirrored optimistically, unlike mute: opening a
+                    // camera can fail and takes long enough to notice, and a
+                    // state that said the camera was on before the device
+                    // agreed would be published to every other window too.
+                    // The session announces what the device actually did.
+                    CallAction::SetVideo { call_id, enabled } => {
+                        client.set_call_video(&call_id, enabled);
+                    }
                 }
                 CommandOutcome::Accepted
             }
@@ -768,6 +835,14 @@ impl Bridge {
             } => self.download(client, id, *media, answer_to),
             Action::ReloadHistory => {
                 client.reload_history();
+                CommandOutcome::Accepted
+            }
+            Action::RefreshVideo => {
+                // A window is drawing again — or for the first time. The gate
+                // opens before the keyframe is asked for, so the frame that
+                // answers the ask has somewhere to go.
+                client.set_video_publishing(true);
+                client.request_video_keyframe();
                 CommandOutcome::Accepted
             }
             // Awaited here rather than spawned, unlike a download: this is a
@@ -2144,6 +2219,7 @@ mod tests {
             call_id: "call-1".into(),
             recipient_jid: "1@s.whatsapp.net".into(),
             placeholder_id: "ui-call-1".into(),
+            is_video: false,
         });
         bridge.observe(UiEvent::CallAccepted("call-1".into()));
 
@@ -2177,6 +2253,7 @@ mod tests {
             call_id: "call-1".into(),
             recipient_jid: "1@s.whatsapp.net".into(),
             placeholder_id: "ui-call-1".into(),
+            is_video: false,
         });
 
         let calls = bridge.hub.call_state();
