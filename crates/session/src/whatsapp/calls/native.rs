@@ -142,6 +142,26 @@ pub(in crate::whatsapp) enum Ending {
     Remote,
 }
 
+/// What a decline found to act on.
+///
+/// Four answers rather than "the offer or nothing", because a decline can
+/// arrive at any moment of a call's short life and three of those moments
+/// are not a ringing offer. A second window's Decline can land after this
+/// one's Accept has taken the offer, or after it has a live handle; reading
+/// only `pending` there found nothing and left the acceptance to register a
+/// call every window had already cleared.
+pub(in crate::whatsapp) enum Declined {
+    /// Still ringing: reject it, and the caller stops.
+    Ringing(Arc<WaIncomingCall>),
+    /// An acceptance is in flight and has been told to stop. It sends the
+    /// rejection itself, because it is the one holding the offer.
+    Accepting,
+    /// Already live: this is a hangup wearing a decline's name.
+    Live(Arc<CallHandle>),
+    /// No such call.
+    Nothing,
+}
+
 /// What a cancel found to act on.
 pub(in crate::whatsapp) enum Cancelled {
     /// A live call, handed back so the caller can terminate it.
@@ -207,22 +227,6 @@ impl CallRegistry {
             .insert(call_id, call);
     }
 
-    /// Take a ringing offer for something that is *not* an acceptance.
-    ///
-    /// A decline needs the offer to reject it, and nothing about it is in
-    /// flight afterwards — so unlike [`Self::begin_accept`] there is no
-    /// window here for an ending to fall into.
-    pub(in crate::whatsapp) fn forget_and_take_offer(
-        &self,
-        call_id: &str,
-    ) -> Option<Arc<WaIncomingCall>> {
-        self.calls
-            .lock()
-            .expect("call registry poisoned")
-            .pending
-            .remove(call_id)
-    }
-
     /// Take a ringing offer and mark its acceptance as in flight, together.
     ///
     /// One operation because they are one step: between leaving `pending` and
@@ -263,19 +267,21 @@ impl CallRegistry {
         calls.cancelled.remove(call_id).is_some()
     }
 
-    /// Whether this call has already been ended by somebody else.
+    /// Why this call ended, if somebody ended it while the acceptance was
+    /// still opening its devices.
     ///
-    /// A look rather than a take: what consumes the note is the registration
-    /// that follows, under the same lock. This is only about not spending
-    /// seconds of device setup, or a stanza, on a call nobody is on — and a
-    /// call that ends between this answer and that registration is exactly
-    /// what the registration is there to catch.
-    pub(in crate::whatsapp) fn ended_meanwhile(&self, call_id: &str) -> bool {
+    /// Consumed, because the caller acts on it and returns: a note left
+    /// behind would be one the guard clears without anybody having answered
+    /// it. What the answer *is* differs by cause and neither is nothing —
+    /// ours means the offer was taken out of `pending` and no accept ever
+    /// went out, so every device it rang is still ringing until it is
+    /// rejected; theirs means they already know.
+    pub(in crate::whatsapp) fn ended_meanwhile(&self, call_id: &str) -> Option<Ending> {
         self.calls
             .lock()
             .expect("call registry poisoned")
             .cancelled
-            .contains_key(call_id)
+            .remove(call_id)
     }
 
     /// Mark an outgoing call as being placed, under the id the window drew.
@@ -424,6 +430,28 @@ impl CallRegistry {
             .cancelled
             .get(call_id)
             .copied()
+    }
+
+    /// Decline a call, whatever stage it has reached.
+    ///
+    /// One operation, because the four answers are decided by the same state
+    /// and a decline that read them one at a time would miss the call moving
+    /// between two reads — which is exactly how a stale Decline from a second
+    /// window used to find nothing and let an acceptance go on to register a
+    /// live handle behind a cleared card.
+    pub(in crate::whatsapp) fn decline(&self, call_id: &str) -> Declined {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
+        if let Some(offer) = calls.pending.remove(call_id) {
+            return Declined::Ringing(offer);
+        }
+        if let Some(handle) = calls.active.remove(call_id) {
+            return Declined::Live(handle);
+        }
+        if calls.in_flight.contains(call_id) {
+            calls.cancelled.insert(call_id.to_string(), Ending::Local);
+            return Declined::Accepting;
+        }
+        Declined::Nothing
     }
 
     /// Mark an acceptance in flight without an offer, for tests.
@@ -803,10 +831,23 @@ impl WhatsAppClient {
             // a permission prompt, and the `<accept>` below would answer a
             // call nobody is on any more. The registration consumes the same
             // note under the lock; this is only about not sending the stanza.
-            if calls.ended_meanwhile(&call_id) {
+            if let Some(ending) = calls.ended_meanwhile(&call_id) {
                 info!("Call {} ended before its media came up", call_id);
                 if let Some(local) = local {
                     local.stop().await;
+                }
+                // Ours, and no accept ever went out: the offer left `pending`
+                // when this started, so nothing else is going to answer it and
+                // every device it rang is still ringing. Rejecting is what
+                // stops them, and it is the same thing the audio-failure path
+                // above does for the same reason.
+                if ending == Ending::Local
+                    && let Err(e) = client.voip().reject(&offer).await
+                {
+                    error!(
+                        "Failed to reject call {} after a local hangup: {}",
+                        call_id, e
+                    );
                 }
                 Self::notify_call_ended(&ui_sender, &call_id).await;
                 return;
@@ -1244,13 +1285,23 @@ impl WhatsAppClient {
                 error!("Client not available for declining call");
                 return;
             };
-            let Some(offer) = calls.forget_and_take_offer(&call_id) else {
-                warn!("No pending offer for call {}", call_id);
-                return;
-            };
-            match client.voip().reject(&offer).await {
-                Ok(()) => info!("Call {} declined", call_id),
-                Err(e) => error!("Failed to decline call {}: {}", call_id, e),
+            match calls.decline(&call_id) {
+                Declined::Ringing(offer) => match client.voip().reject(&offer).await {
+                    Ok(()) => info!("Call {} declined", call_id),
+                    Err(e) => error!("Failed to decline call {}: {}", call_id, e),
+                },
+                // The acceptance holds the offer and will reject it: it is
+                // the only side that can, and it now knows to.
+                Declined::Accepting => {
+                    info!("Call {} declined while it was being answered", call_id);
+                }
+                // A decline that arrived after somebody answered. The card is
+                // gone from every window either way, so the honest reading is
+                // a hangup.
+                Declined::Live(handle) => {
+                    log_termination(&call_id, handle.terminate().await);
+                }
+                Declined::Nothing => warn!("No pending offer for call {}", call_id),
             }
         });
     }
@@ -1364,7 +1415,11 @@ impl WhatsAppClient {
             // can change their mind. Checked *before* the offer goes out: the
             // peer would otherwise ring for a call that was called off, and
             // be told to stop moments later.
-            if calls.ended_meanwhile(&placeholder_id) {
+            // Consumed here, which is why `abandon_start` below has nothing
+            // left to clear: an outgoing call that was called off has no
+            // second reader for the note, unlike an acceptance whose guard
+            // runs on every exit.
+            if calls.ended_meanwhile(&placeholder_id).is_some() {
                 info!(
                     "Outgoing call to {} cancelled while its camera opened",
                     observe_str(&recipient_jid)
@@ -1853,6 +1908,36 @@ mod tests {
             !calls.abandon_accept("call-1"),
             "the note is consumed by the acceptance that acted on it"
         );
+    }
+
+    /// A decline that lands after the accept has taken the offer still stops
+    /// the call.
+    ///
+    /// Two windows on one account: one answers, the other declines before it
+    /// has seen the call go live. Reading `pending` alone found nothing there
+    /// — the acceptance had it — and the accept went on to register a live
+    /// handle behind a card every window had already cleared: audible call,
+    /// no controls.
+    #[test]
+    fn a_decline_reaches_an_acceptance_already_in_flight() {
+        let calls = CallRegistry::default();
+        calls.mark_accepting("call-1");
+
+        assert!(matches!(calls.decline("call-1"), Declined::Accepting));
+        assert_eq!(
+            calls.ending_for("call-1"),
+            Some(Ending::Local),
+            "the acceptance holds the offer, so the rejection is its to send"
+        );
+    }
+
+    /// And one with nothing at any stage is nothing, rather than a note that
+    /// outlives every call that merely rang.
+    #[test]
+    fn a_decline_for_a_call_nobody_has_records_nothing() {
+        let calls = CallRegistry::default();
+        assert!(matches!(calls.decline("call-1"), Declined::Nothing));
+        assert_eq!(calls.ending_for("call-1"), None);
     }
 
     /// Which side ended it survives the wait, because the two endings are
