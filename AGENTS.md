@@ -734,12 +734,24 @@ nightly for `wasm32-unknown-unknown` rather than assumed:
 
 | | wasm |
 |---|---|
-| `tokio` `sync`/`rt`/`time`/`macros`/`io-util` | yes |
+| `tokio` `sync`/`rt`/`macros`/`io-util` | yes |
+| `tokio` `time` | compiles, traps — see below |
 | `tokio` `net` (mio) | no |
 | `smol` | no — `async-io` is an epoll loop, via `rustix`/`errno` |
 | `cpal` | yes |
 | `opus`, `openh264` (both C) | no |
 | `symphonia` (aac/mp4), `mp4`, `ogg`, `ringbuf` | yes |
+
+`time` is the row worth reading twice, because it is the one that says
+compiling is not the question. `tokio::time`'s clock is
+`std::time::Instant::now()` with nothing under it on this target, so a `sleep`
+or a `timeout` links, loads, and traps the first time it is awaited — "time
+not implemented on this platform", taking the task with it. The session's own
+waiting goes through `exec::sleep` and `exec::with_timeout` instead, and
+nothing above them names a clock. The same fact reaches chrono, whose
+`wasmbind` feature is what puts `Utc::now()` on the browser's `Date`; it is
+one of chrono's defaults and this workspace turns defaults off, so it is named
+at the root.
 
 So voice notes play and video does not; recording is refused where it starts
 rather than where it would fail; calls stay in the daemon, which is where the
