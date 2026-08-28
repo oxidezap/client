@@ -163,14 +163,23 @@ jobs:
             echo "url=https://${{ github.repository_owner }}.github.io/$repo/" >> "$GITHUB_OUTPUT"
           fi
 
-      # The script comes from the *base* branch, never from the pull request.
+      # From the revision being published, and pinning it to the base branch
+      # would not buy what it looks like it buys.
       #
-      # This job holds `contents: write`, and the head of a pull request is
-      # code its author controls: checking the script out from there would let
-      # a contributor rewrite it to ignore `TARGET` and replace the published
-      # site, or push to any other ref the token can reach. What the pull
-      # request is allowed to influence is the bundle it built, and only where
-      # this workflow — the base branch's copy of it — decides to put it.
+      # This job holds `contents: write` and the script it runs comes from the
+      # pull request — but so does *this file*. A `pull_request` run uses the
+      # workflow from the merge ref, so anyone who could rewrite the script to
+      # ignore `TARGET` could equally rewrite the job that calls it; that is
+      # the whole reason `pull_request_target` exists and the whole reason it
+      # is not used here. Pinning the script to the base would move the
+      # problem, not close it, and it also cannot work: a script added *by* a
+      # pull request is not on the base branch yet, which is exactly how this
+      # was found.
+      #
+      # What bounds it is who can open such a branch. A fork can be opened by
+      # anyone, gets a read-only token, and is refused by the guard above; a
+      # same-repository branch already required push access, which is the
+      # ability to change this file directly and without a pull request.
       #
       # Only the publishing script, too: this job builds nothing, and a full
       # checkout would just be another tree to keep out of the way of the
@@ -179,7 +188,6 @@ jobs:
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -212,13 +220,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      # From the base branch, for the same reason the publish job does: this
-      # one holds `contents: write` too.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
-          ref: ${{ github.event.pull_request.base.sha }}
       - name: Remove the preview
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
