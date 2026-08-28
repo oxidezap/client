@@ -825,8 +825,14 @@ by definition.
   upgrade succeeds from a page served off `https://oxidezap.github.io`, which
   is a public origin and not WhatsApp's own — a WebSocket upgrade is not
   subject to the same-origin policy, and the server declines to make it one.
-  What is past the upgrade has not been seen: the Noise handshake, the QR, and
-  a phone answering it.
+  The handshake's first message is measured too, against a stubbed endpoint:
+  the page puts 43 bytes on the wire — `WA` `06 03 00 00` and then a
+  `HandshakeMessage` whose `client_hello.ephemeral` is 32 bytes — which is a
+  well-formed ClientHello and means the X25519 keypair, the protobuf and the
+  transport all work in wasm. What is past it cannot be measured anywhere but
+  against WhatsApp: the client pins the server's static key, so a stub can
+  answer the upgrade and nothing after it. The QR, and a phone answering it,
+  are what is left.
   Durability is the other half. The window's VFS is relaxed-IndexedDB, which
   writes changed blocks after the commit rather than during it, so a tab killed
   in that window loses the commit — a message that comes back on the next
