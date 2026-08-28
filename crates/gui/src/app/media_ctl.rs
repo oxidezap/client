@@ -308,6 +308,13 @@ impl WhatsAppApp {
             return;
         }
 
+        // Here, in the gesture, and not where the sound starts. A browser
+        // grants an audio context permission to play only under a transient
+        // user activation, and this path downloads the note first — so by the
+        // time anything is decoded the click that authorised it has expired.
+        // Free where a sound card needs no permission.
+        self.audio_player.unlock();
+
         // A second tap while the first is still in flight downloads the note
         // twice, and both answers still match `pending_media_request` — so the
         // later one calls `play_audio` again and restarts the note from the

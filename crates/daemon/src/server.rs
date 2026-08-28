@@ -1719,9 +1719,24 @@ mod tests {
     /// Two daemons starting together can both see a stale socket; the lock is
     /// what stops the second from unlinking the first's freshly bound one.
     ///
-    /// Not while another test is forking: a child caught between the fork and
-    /// its exec holds a copy of this lock's descriptor, and closing ours then
-    /// releases nothing. See [`crate::one_at_a_time`].
+    /// # Why the release is waited for rather than asserted outright
+    ///
+    /// `flock` is released when the *last* descriptor on the open file
+    /// description closes, and a `fork` anywhere in this process duplicates
+    /// every one of them: between the fork and the exec that clears them,
+    /// a child holds a copy of this lock and closing ours releases nothing.
+    /// Measured outside the suite at ~5% of attempts against a single
+    /// spawning thread, and it is what failed this test on macOS while Linux
+    /// got away with it.
+    ///
+    /// [`crate::one_at_a_time`] keeps this away from the tests that spawn,
+    /// which is worth doing on its own — but it cannot cover a fork this
+    /// crate does not make, and a test that fails when some library forks
+    /// beside it is testing the wrong thing. The property is that the lock
+    /// does not *outlive its holder*: a copy in a child that is microseconds
+    /// from exec is not the holder, so the wait is what separates the two.
+    /// A lock genuinely never released still fails, which is the bug this
+    /// test exists for.
     #[test]
     fn the_startup_lock_is_exclusive() {
         let _exclusive = crate::one_at_a_time();
@@ -1738,9 +1753,22 @@ mod tests {
 
         // Released with the handle, so a restart is not blocked by the last run.
         drop(first);
+        let mut last = None;
+        let mut released = false;
+        for _ in 0..100 {
+            match acquire_startup_lock(&socket) {
+                Ok(_) => {
+                    released = true;
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
-            acquire_startup_lock(&socket).is_ok(),
-            "lock outlived its holder"
+            released,
+            "lock outlived its holder: {}",
+            last.map_or_else(|| "no reason given".to_string(), |e| e.to_string())
         );
 
         let _ = std::fs::remove_dir_all(&dir);

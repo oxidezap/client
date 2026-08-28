@@ -119,6 +119,10 @@ mod cpal_output {
             false
         }
 
+        /// Nothing to take: a sound card needs no gesture to be allowed to
+        /// make sound. The web player's own explains why the call exists.
+        pub fn unlock(&mut self) {}
+
         /// How far through the clip playback is, in `0.0..=1.0`.
         ///
         /// Zero when nothing is loaded, so a caller can render a progress bar

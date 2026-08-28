@@ -74,16 +74,22 @@ struct Playing {
     /// note paused when the speed changed would otherwise start playing by
     /// itself once the decode landed.
     pending_pause: bool,
+    /// Whether a decode is in flight.
+    ///
+    /// Recorded rather than inferred. It was read off "no buffer, not
+    /// finished, and something has run" — which every one of those is true of
+    /// a player that has simply been *stopped*, so the predicate stayed true
+    /// for the rest of the tab: a pause was banked for a clip nobody was
+    /// loading, and the repaint tick that follows playback never wound down.
+    /// The honest question has one answer and it is this flag.
+    decoding: bool,
     completion: Option<oneshot::Sender<()>>,
 }
 
 impl Playing {
     /// Whether a decode is in flight — nothing loaded, but a run underway.
-    ///
-    /// What tells "still decoding" from "stopped": both have no buffer, and
-    /// only one of them is going to get one.
     fn is_loading(&self) -> bool {
-        self.buffer.is_none() && !self.finished && self.generation > 0
+        self.decoding
     }
 }
 
@@ -171,6 +177,25 @@ impl AudioPlayer {
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.state.borrow().finished
+    }
+
+    /// Take the browser's permission to make sound, while it is still being
+    /// offered.
+    ///
+    /// An `AudioContext` starts suspended and a browser only resumes one
+    /// under a *transient user activation* — the moment after a click, which
+    /// expires in seconds. A voice note that is not cached yet is downloaded
+    /// first, so by the time `play` ran the activation was long gone: the
+    /// context stayed suspended, the node was still marked playing, and the
+    /// note was silent with an `ended` that never came.
+    ///
+    /// So the gesture calls this, synchronously, before it awaits anything.
+    /// The context is created once and kept, and resuming an already-running
+    /// one is free.
+    pub fn unlock(&mut self) {
+        if let Ok(context) = self.context() {
+            let _ = context.resume();
+        }
     }
 
     #[must_use]
@@ -271,6 +296,9 @@ impl AudioPlayer {
             .decode_audio_data(&array.buffer())
             .map_err(|e| PlayerError::DecodeError(format!("{e:?}")))?;
 
+        // After `stop` above, which cleared it: this run is the one decoding.
+        self.state.borrow_mut().decoding = true;
+
         let state = Rc::clone(&self.state);
         let context = context.clone();
         let speed = self.speed;
@@ -299,6 +327,7 @@ impl AudioPlayer {
                     // anything to put back.
                     let (offset, stay_paused) = {
                         let mut state = state.borrow_mut();
+                        state.decoding = false;
                         state.duration = buffer.duration();
                         state.finished = false;
                         state.buffer = Some(buffer.clone());
@@ -383,6 +412,7 @@ impl AudioPlayer {
         let mut state = self.state.borrow_mut();
         // Anything still decoding was for the clip being forgotten.
         state.generation = state.generation.wrapping_add(1);
+        state.decoding = false;
         state.buffer = None;
         state.offset = 0.0;
         state.duration = 0.0;
@@ -465,6 +495,7 @@ fn give_up(state: &Rc<RefCell<Playing>>) {
     let completion = {
         let mut state = state.borrow_mut();
         state.is_playing = false;
+        state.decoding = false;
         state.finished = true;
         state.buffer = None;
         state.pending_seek = None;

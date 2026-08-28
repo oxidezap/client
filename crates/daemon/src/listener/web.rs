@@ -587,13 +587,25 @@ fn is_loopback_origin(origin: &str) -> bool {
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))
         .unwrap_or(origin);
-    let host = without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme)
-        .rsplit_once(':')
-        .map_or(without_scheme, |(host, _)| host);
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    // A bracketed IPv6 literal is full of colons, so the port cannot be split
+    // off from the right without cutting the address itself: `http://[::1]`
+    // has no port at all — a browser omits the default — and splitting it
+    // produced the host `[:`, which refused the page its own daemon was
+    // serving. The bracket is where the address ends.
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inside, _port)) => inside,
+            // No closing bracket: not an authority we can read, so not one we
+            // will call loopback.
+            None => return false,
+        }
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// The little decoding a media key can need.
@@ -883,6 +895,34 @@ mod token_tests {
                 asking(query).token_matches(&config()),
                 "{query:?} was refused"
             );
+        }
+    }
+
+    /// Every shape a browser writes for this machine talking to itself,
+    /// including the two an IPv6 literal takes: a browser omits the default
+    /// port, so `http://[::1]` arrives with no port to strip and brackets
+    /// that a right-hand split walks straight into.
+    #[test]
+    fn a_loopback_origin_is_recognised_in_every_shape_a_browser_writes_it() {
+        for origin in [
+            "http://localhost",
+            "http://localhost:8080",
+            "https://127.0.0.1",
+            "http://127.0.0.1:8080",
+            "http://[::1]",
+            "http://[::1]:8080",
+        ] {
+            assert!(is_loopback_origin(origin), "{origin} was not recognised");
+        }
+        for elsewhere in [
+            "https://localhost.example.com",
+            "https://example.com",
+            "http://127.0.0.1.example.com",
+            // Unreadable rather than loopback: an unclosed bracket is not an
+            // authority, and guessing at one is how `[::1].evil.com` gets in.
+            "http://[::1",
+        ] {
+            assert!(!is_loopback_origin(elsewhere), "{elsewhere} was admitted");
         }
     }
 

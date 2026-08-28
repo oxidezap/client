@@ -10,6 +10,14 @@
 #   /            main, the live site
 #   /pr/<n>/     one preview per open pull request, removed when it closes
 #
+# A preview shares the site's *origin*: an `Origin` is scheme, host and port,
+# and a path is none of those. So `--web-allow`-ing the published site allows
+# every preview beside it, unmerged code included. What keeps that from being
+# a way in is that the origin is not the daemon's admission check — the token
+# is, and it reaches a page only by someone pasting it, which is the same act
+# as deciding to trust that page. Anyone who wants the two genuinely apart
+# wants a second Pages site, not a second directory.
+#
 # A branch rather than the Pages *artifact* deployment, because an artifact
 # replaces the whole site and there is no way to put a preview beside it. That
 # is a repository setting: Settings → Pages → Build and deployment → Deploy
