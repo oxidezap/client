@@ -29,11 +29,14 @@ pub async fn prepare() -> Result<(), String> {
 /// Delete the local session: device identity, Signal state and chat history
 /// all live in the one SQLite file.
 ///
+/// `async` for the browser's sake, where the deletion has to be awaited to
+/// the flush; here it is ready before it is polled.
+///
 /// Called after the server ends the session, where reconnecting is pointless
 /// — the credentials are dead and pairing mints a new device. A partial wipe
 /// is not an option: chat rows are keyed by device id, so keeping them would
 /// orphan every one of them behind the new device anyway.
-pub fn wipe() -> std::io::Result<()> {
+pub async fn wipe() -> std::io::Result<()> {
     let Some(dir) = database_dir() else {
         return Ok(());
     };

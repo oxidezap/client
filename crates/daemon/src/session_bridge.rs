@@ -309,7 +309,7 @@ pub async fn run(
              \"clear data and pair again\"."
         );
     } else if bridge.forget {
-        match oxidezap_session::wipe_local_state() {
+        match oxidezap_session::wipe_local_state().await {
             Ok(()) => log::info!("local state wiped; pair again on the next start"),
             Err(e) => log::error!("could not wipe local state: {e}"),
         }
