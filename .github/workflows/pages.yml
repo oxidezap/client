@@ -36,14 +36,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  # Serialized on the branch being published to, not on the ref being built:
-  # two runs pushing to `gh-pages` at once is a lost update, and a preview and
-  # a release can finish at the same moment. Not `cancel-in-progress`, because
-  # a half-finished publish is a broken site.
-  group: pages-publish
-  cancel-in-progress: false
-
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -135,6 +127,19 @@ jobs:
           retention-days: 1
 
   publish:
+    # Serialized on the branch being published to, not on the ref being built:
+    # two runs pushing to `gh-pages` at once is a lost update, and a preview
+    # and a release can finish at the same moment. Not `cancel-in-progress`,
+    # because a half-finished publish is a broken site.
+    #
+    # On the jobs that push, not on the workflow: at workflow scope a build
+    # held this lock too, so one pull request's wasm build — twenty minutes of
+    # it — stalled every other build, every deployment and every preview
+    # removal, including for fork pull requests that are refused the push
+    # anyway. Nothing but these two touches the shared branch.
+    concurrency:
+      group: pages-publish
+      cancel-in-progress: false
     name: Publish
     needs: build
     # Same-repository only. A pull request from a fork is given a read-only
@@ -216,6 +221,19 @@ jobs:
   # A preview is only worth having if it goes away. The directory is removed
   # when the pull request closes, merged or not.
   take-down:
+    # Serialized on the branch being published to, not on the ref being built:
+    # two runs pushing to `gh-pages` at once is a lost update, and a preview
+    # and a release can finish at the same moment. Not `cancel-in-progress`,
+    # because a half-finished publish is a broken site.
+    #
+    # On the jobs that push, not on the workflow: at workflow scope a build
+    # held this lock too, so one pull request's wasm build — twenty minutes of
+    # it — stalled every other build, every deployment and every preview
+    # removal, including for fork pull requests that are refused the push
+    # anyway. Nothing but these two touches the shared branch.
+    concurrency:
+      group: pages-publish
+      cancel-in-progress: false
     name: Take the preview down
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest

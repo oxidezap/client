@@ -269,8 +269,7 @@ async fn serve(
         // every one of their own media requests, and one in flight could take
         // the last slot from a real client.
         let Ok(slot) = slots.try_acquire_owned() else {
-            server::reject(stream.into_inner()).await;
-            return Ok(());
+            return refuse_full(stream, &key).await;
         };
         let served = attach(stream, &key, hub, commands).await;
         drop(slot);
@@ -292,12 +291,15 @@ async fn serve(
 }
 
 /// Complete the upgrade, then let the ordinary server do the talking.
-async fn attach(
+/// Answer the handshake and take over the socket.
+///
+/// Separate from [`attach`] because refusing a client has to get this far
+/// too: the refusal is a protocol frame, and a protocol frame is only
+/// readable by a page once the upgrade has completed.
+async fn upgrade(
     mut stream: BufReader<TcpStream>,
     key: &str,
-    hub: Arc<StateHub>,
-    commands: Commands,
-) -> Result<()> {
+) -> Result<WebSocketStream<TcpStream>> {
     let accept = {
         let mut hasher = Sha1::new();
         hasher.update(key.as_bytes());
@@ -330,8 +332,42 @@ async fn attach(
     let config = WebSocketConfig::default()
         .max_message_size(Some(server::MAX_REQUEST_BYTES))
         .max_frame_size(Some(server::MAX_REQUEST_BYTES));
-    let socket =
-        WebSocketStream::from_raw_socket(stream.into_inner(), Role::Server, Some(config)).await;
+    Ok(WebSocketStream::from_raw_socket(stream.into_inner(), Role::Server, Some(config)).await)
+}
+
+/// Tell a page the daemon is full, in a way it can actually read.
+///
+/// The obvious refusal — writing the protocol's own error frame onto the
+/// stream, as the socket listener does — is bytes on a connection the browser
+/// still believes is an HTTP request awaiting its `101`. It reads them as a
+/// malformed handshake and reports the opaque failure it reports for every
+/// other one, so the page retries forever against a daemon that will keep
+/// saying no.
+///
+/// An HTTP `503` would be well-formed and no more use: the WebSocket API
+/// deliberately hides a failed handshake's status and body from the page.
+/// What a page *can* read is a message on an open socket, so the upgrade is
+/// completed for the sole purpose of saying one word and hanging up.
+async fn refuse_full(stream: BufReader<TcpStream>, key: &str) -> Result<()> {
+    log::warn!(
+        "refusing a web client: already serving {}",
+        server::MAX_CLIENTS
+    );
+    let mut socket = upgrade(stream, key).await?;
+    if let Ok(frame) = server::too_many_clients_frame() {
+        let _ = socket.send(Message::Text(frame.into())).await;
+    }
+    let _ = socket.close(None).await;
+    Ok(())
+}
+
+async fn attach(
+    stream: BufReader<TcpStream>,
+    key: &str,
+    hub: Arc<StateHub>,
+    commands: Commands,
+) -> Result<()> {
+    let socket = upgrade(stream, key).await?;
     let (mut outbound, mut inbound) = socket.split();
 
     // The server's end of a byte stream, so `serve_client` is untouched: it
@@ -467,10 +503,17 @@ async fn respond(
         403 => "Forbidden",
         _ => "Not Found",
     };
+    // `no-store`, because the media directory is meant to be the whole of
+    // what "clear cached media" and "forget this account" have to delete.
+    // A browser allowed to keep a copy of a decrypted photo in its own HTTP
+    // cache puts it somewhere neither `Wipe::Cache` nor `Wipe::Everything`
+    // can reach, on a disk the daemon does not manage — so the deletion
+    // boundary would quietly stop being one.
     let mut head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
          Connection: close\r\n",
         body.len()
     );

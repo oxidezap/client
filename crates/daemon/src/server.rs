@@ -171,6 +171,19 @@ const ENFILE: i32 = 23;
 /// peer. The task is still bounded — one small frame into a socket nobody has
 /// had a chance to fill, then done — so a refused client costs a write, not a
 /// slot.
+/// The refusal, as a frame, for a transport that has to deliver it itself.
+///
+/// The socket listener writes it onto the stream; the web bridge has to
+/// complete a WebSocket upgrade first, so it needs the frame rather than the
+/// writing.
+///
+/// # Errors
+///
+/// The frame could not be serialized.
+pub(crate) fn too_many_clients_frame() -> Result<String> {
+    error_frame(None, ProtocolError::TooManyClients { limit: MAX_CLIENTS })
+}
+
 pub(crate) async fn reject<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
     log::warn!("refusing a client: already serving {MAX_CLIENTS}");
     let (_, mut writer) = tokio::io::split(stream);
