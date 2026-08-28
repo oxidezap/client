@@ -11,7 +11,7 @@
 //! different number and not the same one.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
@@ -28,7 +28,10 @@ const CACHE_BUDGET_BYTES: u64 = 48 * 1024 * 1024;
 
 /// One entry, and when it was last useful.
 struct Entry {
-    bytes: Vec<u8>,
+    /// Shared, because the front end is this process and one payload can be
+    /// named by a hundred rows of one frame. Handing each of them a copy is
+    /// how a 10 MiB photo becomes a gigabyte.
+    bytes: Arc<Vec<u8>>,
     /// Bumped on every write and every read, so the sweep drops what has gone
     /// longest without being wanted. A clock rather than a timestamp: there
     /// is no time here that a test would not have to fake.
@@ -70,6 +73,17 @@ fn with<T>(f: impl FnOnce(&mut Cache) -> T) -> T {
 /// Never, here. A map does not fail to be written to, and the signature is
 /// the desktop's, where a disk does.
 pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
+    store(key, bytes.to_vec(), true)
+}
+
+/// The same, for a caller that already owns the only copy.
+///
+/// A download hands back a `Vec` and then hands it to the cache, which used
+/// to copy it — so for the moment before the caller's own dropped, the heap
+/// held the attachment twice. On a desktop that is a copy into a file and
+/// unavoidable; here both are the same linear memory, with a ceiling, and a
+/// large document can be a meaningful fraction of it.
+pub fn put_owned(key: &str, bytes: Vec<u8>) -> Result<String> {
     store(key, bytes, true)
 }
 
@@ -79,10 +93,10 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
 /// on and which can be fetched again on demand. See [`super::put_since`],
 /// whose whole subject is that this write is the one allowed to lose.
 pub fn put_evictable(key: &str, bytes: &[u8]) -> Result<String> {
-    store(key, bytes, false)
+    store(key, bytes.to_vec(), false)
 }
 
-fn store(key: &str, bytes: &[u8], pinned: bool) -> Result<String> {
+fn store(key: &str, bytes: Vec<u8>, pinned: bool) -> Result<String> {
     with(|cache| {
         // Content-addressed: the same key is the same bytes, so an entry that
         // is already there is already right — and re-storing it would be a
@@ -102,7 +116,7 @@ fn store(key: &str, bytes: &[u8], pinned: bool) -> Result<String> {
         cache.entries.insert(
             key.to_string(),
             Entry {
-                bytes: bytes.to_vec(),
+                bytes: Arc::new(bytes),
                 touched,
                 pinned,
             },
@@ -120,7 +134,12 @@ pub fn take(key: &str) -> Option<Vec<u8>> {
     with(|cache| {
         let entry = cache.entries.remove(key)?;
         cache.held = cache.held.saturating_sub(entry.bytes.len() as u64);
-        Some(entry.bytes)
+        // Moved out where this was the only handle, which is the ordinary
+        // case for the two callers: a staged upload nobody else read, and a
+        // download answering one request. A clone only where some reader is
+        // still holding the same payload, which is the case that was going to
+        // cost a copy anyway.
+        Some(Arc::try_unwrap(entry.bytes).unwrap_or_else(|shared| (*shared).clone()))
     })
 }
 
@@ -128,12 +147,12 @@ pub fn take(key: &str) -> Option<Vec<u8>> {
 ///
 /// The desktop has no such call: its front end opens the file itself. Here
 /// the front end is this process, so this is how a frame's media reaches it.
-pub fn read(key: &str) -> Option<Vec<u8>> {
+pub fn read(key: &str) -> Option<Arc<Vec<u8>>> {
     with(|cache| {
         let entry = cache.entries.get_mut(key)?;
         cache.clock += 1;
         entry.touched = cache.clock;
-        Some(entry.bytes.clone())
+        Some(Arc::clone(&entry.bytes))
     })
 }
 

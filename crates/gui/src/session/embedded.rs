@@ -121,7 +121,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
 struct InProcess;
 
 impl MediaCache for InProcess {
-    fn read(&self, key: &str) -> Result<Vec<u8>, String> {
+    fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
         oxidezap_daemon::media::read(key).ok_or_else(|| format!("media {key} is not cached"))
     }
 

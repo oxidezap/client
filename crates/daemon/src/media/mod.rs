@@ -27,7 +27,7 @@ pub use platform::wipe;
 /// Read without removing, where the front end is this process. See `web.rs`.
 #[cfg(target_family = "wasm")]
 pub use platform::read;
-pub use platform::{cache_usage, has, put, take};
+pub use platform::{cache_usage, has, put, put_owned, take};
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};

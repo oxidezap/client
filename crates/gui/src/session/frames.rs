@@ -11,7 +11,6 @@
 //! be got wrong about the protocol is written once.
 
 use std::ops::ControlFlow;
-use std::sync::Arc;
 
 use chrono::DateTime;
 use log::{debug, error, info, warn};
@@ -662,7 +661,7 @@ fn fill(media: &mut Option<MediaContent>, cache: &dyn MediaCache) {
         // cache is it — including when the row arrived carrying a fallback
         // thumbnail, which is the shape a reload takes. The metadata beside
         // the bytes described that thumbnail, and has to move with them.
-        Ok(bytes) => media.adopt_full_bytes(Arc::new(bytes)),
+        Ok(bytes) => media.adopt_full_bytes(bytes),
         // The renderer falls back to offering the download, which is the same
         // thing it does for media that was never cached.
         Err(e) => debug!("media {key} is not available: {e}"),

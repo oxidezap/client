@@ -63,8 +63,20 @@ struct Playing {
     /// and outlives any one clip. A video's audio always starts at 1×, so
     /// with a 2× voice-note setting still in force the elapsed arithmetic
     /// below counted every second of video twice — pausing five seconds in
-    /// recorded ten, and the resume put the sound ahead of the picture.
+    /// recorded ten.
     rate: f64,
+    /// Whether this clip is one the speed control applies to.
+    ///
+    /// A voice note is; a video's soundtrack is not, because the picture it
+    /// belongs to plays at one speed and nothing here can change that.
+    ///
+    /// It is a property of the clip rather than a number snapshotted at
+    /// start, and that distinction is load-bearing: a seek and a resume both
+    /// *restart* the node, and asking `rate` what to restart at would replay
+    /// a voice note at whatever it was going at when it stopped, ignoring a
+    /// speed the person changed while it was paused. Asking this instead
+    /// gives the voice note the current setting and the video its 1×.
+    follows_speed: bool,
     duration: f64,
     is_playing: bool,
     finished: bool,
@@ -107,6 +119,7 @@ impl Default for Playing {
             started_at: 0.0,
             offset: 0.0,
             rate: 1.0,
+            follows_speed: true,
             duration: 0.0,
             is_playing: false,
             finished: false,
@@ -174,6 +187,12 @@ impl AudioPlayer {
         }
         self.speed = speed.clamp(0.5, 3.0);
         let mut state = self.state.borrow_mut();
+        // A video's soundtrack keeps its 1× while this is playing, the same
+        // as it keeps it across a restart. The setting is still recorded, and
+        // still applies to the next voice note.
+        if !state.follows_speed {
+            return;
+        }
         if let Some(node) = state.node.as_ref() {
             node.playback_rate().set_value(self.speed);
             state.rate = f64::from(self.speed);
@@ -183,6 +202,20 @@ impl AudioPlayer {
     #[must_use]
     pub fn speed(&self) -> f32 {
         self.speed
+    }
+
+    /// What a clip should be started or restarted at.
+    ///
+    /// The speed control where it applies, and 1× where it does not. Every
+    /// `start` goes through this rather than through `self.speed`, which is
+    /// what stops a video's soundtrack from being restarted at a voice note's
+    /// rate by a seek or a resume.
+    fn rate_now(&self) -> f32 {
+        if self.state.borrow().follows_speed {
+            self.speed
+        } else {
+            1.0
+        }
     }
 
     /// A receiver that fires when the clip runs to its end.
@@ -313,7 +346,7 @@ impl AudioPlayer {
         stop_node(&self.state);
         self.state.borrow_mut().offset = offset;
         if was_playing {
-            start(context, &buffer, &self.state, self.speed, offset);
+            start(context, &buffer, &self.state, self.rate_now(), offset);
         }
         true
     }
@@ -446,6 +479,9 @@ impl AudioPlayer {
             state.offset = 0.0;
             state.finished = false;
             state.buffer = Some(buffer.clone());
+            // Not the speed control's business, now and on every later seek
+            // and resume: see `follows_speed`.
+            state.follows_speed = false;
         }
         // 1×, not `self.speed`: see the doc comment.
         start(&context, &buffer, &self.state, 1.0, 0.0);
@@ -465,6 +501,11 @@ impl AudioPlayer {
         state.finished = false;
         state.pending_seek = None;
         state.pending_pause = false;
+        // Back to the default, because both entry points come through here
+        // first: whatever the last clip was, the next one is a voice note
+        // unless it says otherwise.
+        state.follows_speed = true;
+        state.rate = 1.0;
     }
 
     /// Stop making sound, keeping the position.
@@ -520,7 +561,7 @@ impl AudioPlayer {
             return;
         };
         let _ = context.resume();
-        start(context, &buffer, &self.state, self.speed, offset);
+        start(context, &buffer, &self.state, self.rate_now(), offset);
     }
 
     /// The one context this player uses, made on first need.

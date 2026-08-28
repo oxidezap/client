@@ -12,6 +12,8 @@
 //! served over HTTP, already fetched (see [`super::web`]), because a frame is
 //! applied synchronously and a fetch is not.
 
+use std::sync::Arc;
+
 /// Where a front end finds the bytes a frame only named.
 ///
 /// `Send + Sync` because the native reader thread holds one while the UI
@@ -24,7 +26,13 @@ pub trait MediaCache: Send + Sync {
     /// Never blocking: a frame is applied without awaiting anything, so an
     /// implementation whose bytes arrive over the network has to have them
     /// before the frame reaches it.
-    fn read(&self, key: &str) -> Result<Vec<u8>, String>;
+    /// Shared, not copied. One frame can name the same payload on many
+    /// messages — media is content-addressed, so a photo forwarded into a
+    /// hundred chats is one payload — and every reader here puts what it gets
+    /// straight into an `Arc`. Handing back a `Vec` meant a hundred rows
+    /// allocated a hundred copies of it, so a 10 MiB photo could cost a
+    /// gigabyte against a budget that had counted it once.
+    fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String>;
 
     /// The bytes answering a request somebody is waiting on.
     ///
@@ -40,7 +48,12 @@ pub trait MediaCache: Send + Sync {
     /// Defaults to [`read`](Self::read), which is right wherever the bytes
     /// live somewhere this side does not own.
     fn read_once(&self, key: &str) -> Result<Vec<u8>, String> {
-        self.read(key)
+        self.read(key).map(|shared| {
+            // Unwrapped where nobody else holds it, which is the ordinary
+            // case: a download is named once. A clone only where some other
+            // reader is still holding the same payload.
+            Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
+        })
     }
 
     /// Put bytes where the daemon will look for them.
@@ -68,10 +81,11 @@ pub struct Directory;
 
 #[cfg(not(target_family = "wasm"))]
 impl MediaCache for Directory {
-    fn read(&self, key: &str) -> Result<Vec<u8>, String> {
+    fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
         oxidezap_ipc::media_path(key)
             .ok_or_else(|| format!("the daemon named an unusable cache key: {key}"))
             .and_then(|path| std::fs::read(path).map_err(|e| e.to_string()))
+            .map(Arc::new)
     }
 
     fn stage(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
@@ -99,7 +113,7 @@ impl MediaCache for Directory {
 #[cfg(target_family = "wasm")]
 #[derive(Default)]
 pub struct Fetched {
-    bytes: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    bytes: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -109,7 +123,7 @@ impl Fetched {
         self.bytes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, bytes);
+            .insert(key, Arc::new(bytes));
     }
 
     /// Forget whatever the last frame did not use.
@@ -127,12 +141,12 @@ impl MediaCache for Fetched {
     /// taking it would leave every message after the first drawing a download
     /// offer for bytes that are already here. `clear` is what bounds the map,
     /// once per frame.
-    fn read(&self, key: &str) -> Result<Vec<u8>, String> {
+    fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
         self.bytes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(key)
-            .cloned()
+            .map(Arc::clone)
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
     }
 
@@ -148,6 +162,7 @@ impl MediaCache for Fetched {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key)
+            .map(|shared| Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone()))
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
     }
 

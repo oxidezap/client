@@ -957,7 +957,7 @@ impl Bridge {
         let bytes = client.download_downloadable_media(media);
         oxidezap_session::spawn(async move {
             let result = match bytes.await {
-                Ok(Ok(bytes)) => crate::media::put(&key, &bytes).map_err(|e| e.to_string()),
+                Ok(Ok(bytes)) => crate::media::put_owned(&key, bytes).map_err(|e| e.to_string()),
                 Ok(Err(e)) => Err(e),
                 // The session went away mid-download.
                 Err(_) => Err("the session stopped before the download finished".to_string()),

@@ -35,6 +35,16 @@ const CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// quadratic in the size of the account.
 const SWEEP_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
 
+/// The same as [`put`], for a caller that already owns the only copy.
+///
+/// Nothing to save here — the bytes are written to a file either way — so
+/// this simply forwards. It exists because on the page both copies live in
+/// one linear memory with a ceiling, and a large download can be a
+/// meaningful fraction of it.
+pub fn put_owned(key: &str, bytes: Vec<u8>) -> Result<String> {
+    put(key, &bytes)
+}
+
 /// Cache `bytes` under `key`, droppable from the moment they land.
 ///
 /// The same call as [`put`] here. The distinction exists for the page, whose
