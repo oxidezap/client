@@ -6027,6 +6027,7 @@ dependencies = [
  "oxidezap-chat-store",
  "oxidezap-core",
  "oxidezap-video",
+ "portable-atomic",
  "tokio",
  "whatsapp-rust",
 ]

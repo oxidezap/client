@@ -57,7 +57,24 @@ fn publish(publisher: &VideoPublisher, frame: CallVideoFrame) {
 /// direction that will never produce another frame. A deliberate stop does
 /// not come through here — that path aborts the pump before the channel
 /// closes — so this means exactly "the device is gone".
-pub(crate) type CameraLost = Arc<dyn Fn(String) + Send + Sync>;
+///
+/// Carries which camera died, not only which call it was on. The cleanup is
+/// spawned, so a user who turns video off and on again in that window would
+/// otherwise have the *replacement* torn down by the failure of the one
+/// before it.
+pub(crate) type CameraLost = Arc<dyn Fn(String, CameraId) + Send + Sync>;
+
+/// One opened camera, told apart from the next one on the same call.
+///
+/// A counter rather than the device's own name: two opens of one webcam are
+/// two cameras as far as a call is concerned, and what has to be answerable
+/// is "is the thing in the registry still the thing that failed".
+pub(crate) type CameraId = u64;
+
+fn next_camera_id() -> CameraId {
+    static NEXT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, portable_atomic::Ordering::Relaxed)
+}
 
 /// How many frames may wait for the daemon. Small: a backlog here is latency
 /// the person on screen can see.
@@ -79,6 +96,7 @@ pub(crate) struct LocalVideo {
     /// The fan-out task, stopped by dropping the camera's channel.
     pump: tokio::task::JoinHandle<()>,
     id: CallIdSlot,
+    camera_id: CameraId,
 }
 
 /// Which call the frames belong to, as a slot rather than a value.
@@ -99,6 +117,12 @@ fn read(id: &CallIdSlot) -> String {
 }
 
 impl LocalVideo {
+    /// Which opened camera this is, so a teardown scheduled for an earlier
+    /// one does not take it down.
+    pub(crate) fn camera_id(&self) -> CameraId {
+        self.camera_id
+    }
+
     /// Address this call's frames by the name the server gave it.
     pub(crate) fn rename(&self, call_id: &str) {
         *self.id.lock().expect("call id slot poisoned") = call_id.to_string();
@@ -169,6 +193,7 @@ pub(crate) async fn open(
         .map_err(|e| format!("camera task failed: {e}"))?
         .map_err(|e| format!("{e:#}"))?;
     let stride = camera.quality().timestamp_stride();
+    let camera_id = next_camera_id();
 
     // The encoder's own queue is upstream of this one; this pair is what the
     // media plane and the front end read.
@@ -182,6 +207,7 @@ pub(crate) async fn open(
         source_tx,
         Arc::clone(&publisher),
         lost,
+        camera_id,
     ));
     tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publisher));
 
@@ -190,6 +216,7 @@ pub(crate) async fn open(
             camera,
             pump,
             id: call_id,
+            camera_id,
         },
         Endpoints {
             source: CameraSource {
@@ -214,6 +241,7 @@ async fn pump_local(
     plane: async_channel::Sender<Vec<u8>>,
     publisher: VideoPublisher,
     lost: CameraLost,
+    camera_id: CameraId,
 ) {
     while let Ok(EncodedFrame { data, keyframe }) = frames.recv().await {
         publish(
@@ -244,7 +272,7 @@ async fn pump_local(
     debug!("local video for {call_id} ended");
     if !plane.is_closed() {
         warn!("the camera on call {call_id} stopped producing frames");
-        lost(call_id);
+        lost(call_id, camera_id);
     }
 }
 

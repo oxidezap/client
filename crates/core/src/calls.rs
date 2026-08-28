@@ -79,8 +79,17 @@ impl ActiveCall {
     }
 }
 
+/// Whether a call's video state is the empty one, and so may be left out of
+/// the frame.
+///
+/// Compared against the default rather than asked whether a camera is on: a
+/// peer's *request* is video state too, and a predicate that only counted
+/// cameras skipped the field of an audio call somebody had just asked to add
+/// video to — which is exactly the state the field was widened to carry. The
+/// rule the pairing has to hold is that an omitted field reads back as what
+/// was skipped, and only equality with the default says that.
 fn is_no_video(video: &CallVideo) -> bool {
-    !video.any()
+    *video == CallVideo::default()
 }
 
 /// Where a call is in its life.
@@ -1270,5 +1279,21 @@ mod tests {
         assert!(!state.set_video(&"OTHER".to_string(), VideoStream::Remote, true));
         assert!(!state.set_video_requested(&"OTHER".to_string(), true));
         assert_eq!(state.video(), CallVideo::default());
+    }
+
+    /// A field is skipped only when its absence reads back as what was
+    /// skipped — and a question with no camera behind it is not nothing.
+    #[test]
+    fn a_request_alone_still_crosses_the_wire() {
+        let mut state = CallState::new();
+        let call_id = "CALL".to_string();
+        state.set_outgoing(outgoing("CALL"));
+        state.connect(&call_id);
+        state.set_video_requested(&call_id, true);
+
+        let json = serde_json::to_string(&state).expect("serializable");
+        let back: CallState = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back, state);
+        assert!(back.video().requested, "the question survived the frame");
     }
 }

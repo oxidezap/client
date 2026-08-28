@@ -510,7 +510,7 @@ impl WhatsAppClient {
         let calls = self.calls.clone();
         let ui_sender = self.ui_sender.clone();
         let runtime = self.runtime.clone();
-        Arc::new(move |call_id: String| {
+        Arc::new(move |call_id: String, camera_id| {
             let calls = calls.clone();
             let ui_sender = ui_sender.clone();
             runtime.spawn(async move {
@@ -518,9 +518,22 @@ impl WhatsAppClient {
                 // claiming otherwise. The peer is told, because a camera that
                 // has died sends exactly what a camera that was switched off
                 // sends, and only this side knows which it was.
-                let Some(local) = calls.cameras.lock().await.remove(&call_id) else {
+                //
+                // Only if the registry still holds *that* camera: this runs
+                // on a spawned task, and a user who turned video off and on
+                // again meanwhile would otherwise have the replacement torn
+                // down by its predecessor's failure.
+                let mut cameras = calls.cameras.lock().await;
+                if cameras
+                    .get(&call_id)
+                    .is_none_or(|held| held.camera_id() != camera_id)
+                {
+                    return;
+                }
+                let Some(local) = cameras.remove(&call_id) else {
                     return;
                 };
+                drop(cameras);
                 local.stop().await;
                 // Cloned out from under the lock: telling the peer is a
                 // stanza on the wire, and holding the registry across it

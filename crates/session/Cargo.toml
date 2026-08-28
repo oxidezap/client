@@ -16,6 +16,8 @@ oxidezap-audio = { workspace = true }
 oxidezap-chat-store = { workspace = true, features = ["search"] }
 oxidezap-core = { workspace = true }
 oxidezap-video = { workspace = true }
+# A 64-bit counter, through portable-atomic rather than std (see /clippy.toml).
+portable-atomic = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 whatsapp-rust = { workspace = true }

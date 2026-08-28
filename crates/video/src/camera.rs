@@ -136,15 +136,7 @@ impl Drop for CameraStream {
 /// to answer a video call learns *here* that there is no camera — rather than
 /// accepting one and then having nothing to send.
 pub fn open(quality: VideoQuality) -> Result<CameraStream> {
-    // macOS will not hand out a camera until the user has been asked, and the
-    // ask is a callback that has to run before the first open. Idempotent, so
-    // a second call is free.
-    #[cfg(target_os = "macos")]
-    nokhwa::nokhwa_initialize(|granted| {
-        if !granted {
-            log::error!("camera access was refused");
-        }
-    });
+    authorize()?;
 
     let (frames_tx, frames_rx) = async_channel::bounded(QUEUE_DEPTH);
     let control = CameraControl::default();
@@ -178,6 +170,48 @@ pub fn open(quality: VideoQuality) -> Result<CameraStream> {
         }
     }
 }
+
+/// Ask for camera access, and wait for the answer.
+///
+/// macOS will not hand out a camera until the user has been asked, and the
+/// ask is asynchronous: the prompt is raised and the result arrives on a
+/// callback. Continuing straight into the open runs it while permission is
+/// still undetermined, which fails — so a video call placed the first time
+/// the app ever used the camera was downgraded to voice, moments before the
+/// user granted it. Blocking is safe here: the only caller runs [`open`] on a
+/// thread of its own.
+///
+/// Bounded, because the answer is a person: a prompt nobody dismisses must
+/// not hold a call's setup open forever.
+#[cfg(target_os = "macos")]
+fn authorize() -> Result<()> {
+    use anyhow::bail;
+
+    if nokhwa::nokhwa_check() {
+        return Ok(());
+    }
+    // A rendezvous rather than a plain channel: the callback must be `Sync`,
+    // which `SyncSender` is and `Sender` is not.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    nokhwa::nokhwa_initialize(move |granted| {
+        let _ = tx.send(granted);
+    });
+    match rx.recv_timeout(AUTHORIZATION_TIMEOUT) {
+        Ok(true) => Ok(()),
+        Ok(false) => bail!("camera access was refused"),
+        Err(_) => bail!("camera access was not answered within {AUTHORIZATION_TIMEOUT:?}"),
+    }
+}
+
+/// Every other platform answers at open time, through the open itself.
+#[cfg(not(target_os = "macos"))]
+fn authorize() -> Result<()> {
+    Ok(())
+}
+
+/// How long to wait for somebody to answer the permission prompt.
+#[cfg(target_os = "macos")]
+const AUTHORIZATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 type Ready = std::sync::mpsc::SyncSender<Result<VideoQuality>>;
 
