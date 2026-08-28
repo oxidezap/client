@@ -19,10 +19,12 @@ use tokio::io::{
 };
 use tokio::sync::broadcast::error::RecvError;
 
+#[cfg(not(target_family = "wasm"))]
 use crate::listener::Listener;
 use crate::session_bridge::{Action, CommandOutcome, Commands, Outbox, SessionCommand};
 use crate::state::StateHub;
 
+#[cfg(not(target_family = "wasm"))]
 /// This process's claim on being *the* daemon for this user.
 ///
 /// Taken before anything touches the account. Holding it is what makes a
@@ -32,6 +34,7 @@ pub struct Claim {
     _lock: StartupLock,
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Prepare the socket directory and take the per-user lock.
 ///
 /// Separate from [`run`], and called first, for two reasons that both come
@@ -92,6 +95,7 @@ pub fn client_slots() -> ClientSlots {
 /// bytes are already in the cache.
 const OUTBOX_CAPACITY: usize = 64;
 
+#[cfg(not(target_family = "wasm"))]
 /// Serve until the future is dropped.
 ///
 /// Borrows the claim rather than taking it: this future is a `select!` branch
@@ -145,6 +149,7 @@ pub async fn run(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Whether an `accept` failure describes one connection rather than the
 /// listener.
 fn is_transient_accept_error(e: &std::io::Error) -> bool {
@@ -254,6 +259,7 @@ fn acquire_startup_lock(_path: &Path) -> Result<StartupLock> {
     anyhow::bail!("no way to take a startup lock on this platform")
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Create the socket directory, or verify an existing one is safe to use.
 ///
 /// The socket carries control of a WhatsApp session. Under `XDG_RUNTIME_DIR`
@@ -308,6 +314,7 @@ fn prepare_state_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[cfg(unix)]
 fn current_uid() -> u32 {
     rustix::process::getuid().as_raw()

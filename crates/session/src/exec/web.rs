@@ -124,6 +124,22 @@ pub fn spawn<T: MaybeSend + 'static>(
     Task(rx)
 }
 
+/// Run it here, because there is nowhere else.
+///
+/// A page has one thread and no pool to hand work to, so this is a call. That
+/// is not a compromise for the one caller: what it runs is a bounded wait on
+/// a session's loop finishing, and on this platform that wait does not block
+/// — see [`Executor::join`], which cannot and does not try.
+///
+/// It stays `async` so that the callers read the same on both platforms, and
+/// so this can become a real hand-off if a page ever gets somewhere to hand
+/// work to.
+pub async fn unblock<T: MaybeSend + 'static>(
+    work: impl FnOnce() -> T + MaybeSend + 'static,
+) -> Result<T, Cancelled> {
+    Ok(work())
+}
+
 /// A spawned task's answer, carried by a channel the task sends on.
 ///
 /// `spawn_local` hands back nothing to wait on, so the wait is built rather

@@ -24,7 +24,7 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
-pub use platform::{Executor, Task, spawn};
+pub use platform::{Executor, Task, spawn, unblock};
 
 /// [`Send`], where the platform's executor asks for it.
 ///

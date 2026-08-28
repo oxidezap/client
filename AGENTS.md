@@ -31,9 +31,20 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   daemon is the side with thousands of things happening at once. The domain
   types in `oxidezap-core` *are* the wire format; this crate adds the framing
   around them.
-- **oxidezap-daemon**: binary `oxidezapd`. The only process that opens the
-  store or holds a WhatsApp connection. Serves front ends over a per-user Unix
-  socket and carries a tray presence.
+- **oxidezap-daemon**: a library and the binary `oxidezapd` around it. The
+  library is everything the daemon *does* — the state every front end
+  observes, the bridge that turns their requests into session calls, and the
+  protocol spoken down a byte stream — and it builds for
+  `wasm32-unknown-unknown`. The binary is the process: the socket, the tray,
+  the signals, the directory it claims, all gated to the platforms that have
+  them.
+  The split is not tidiness. A page has the first half and none of the
+  second, but it can run a dedicated worker — and a worker holding a session
+  and speaking this protocol down a port *is* a daemon by every definition
+  that matters here: one session per user, in one place, and a front end that
+  holds none. It is also the only way to keep the store: SQLite's persistent
+  VFS on the web is OPFS through a synchronous access handle, which exists in
+  a dedicated worker and nowhere else.
 - **oxidezap-gui**: GPUI front end, binary `oxidezap`. Talks to the daemon and
   starts one if none is listening. Owns video decode, which writes straight
   into `gpui::RenderImage` and is not reusable off GPUI.

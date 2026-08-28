@@ -275,7 +275,7 @@ pub async fn run(
     } else {
         SHUTDOWN_GRACE
     };
-    let closed = match tokio::task::spawn_blocking(move || close(client, grace)).await {
+    let closed = match oxidezap_session::unblock(move || close(client, grace)).await {
         Ok(closed) => closed,
         Err(e) => {
             log::error!("session teardown did not complete: {e}");

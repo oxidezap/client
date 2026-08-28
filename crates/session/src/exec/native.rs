@@ -124,6 +124,19 @@ pub fn spawn<T: MaybeSend + 'static>(
     Task(tokio::spawn(future))
 }
 
+/// Run something that blocks, somewhere blocking is allowed.
+///
+/// A join with a timeout is the caller here, and a runtime thread is not
+/// allowed to sit in one: everything else that runtime is driving would stop
+/// with it.
+pub async fn unblock<T: MaybeSend + 'static>(
+    work: impl FnOnce() -> T + MaybeSend + 'static,
+) -> Result<T, Cancelled> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| Cancelled)
+}
+
 /// A spawned task's answer.
 ///
 /// Awaiting it yields what the future returned, or [`Cancelled`] if the task
