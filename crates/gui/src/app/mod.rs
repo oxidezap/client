@@ -336,7 +336,8 @@ use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
 use crate::views::pairing::generate_qr_png;
 use crate::views::{
     render_call_overlay, render_connected_view, render_connecting_view, render_error_view,
-    render_loading_view, render_logged_out_view, render_pairing_view, render_settings_view,
+    render_loading_view, render_logged_out_view, render_pairing_view, render_refused_view,
+    render_settings_view,
     render_syncing_view,
 };
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
@@ -2139,7 +2140,9 @@ impl WhatsAppApp {
                         // timer behind it, because the next attempt would get
                         // the same answer and the one after that would take an
                         // account the moment somebody else's tab closed.
-                        app.app_state = AppState::Error(e.to_string());
+                        app.app_state = AppState::Refused {
+                            reason: e.to_string(),
+                        };
                     }
                     Err(e) => {
                         app.app_state = AppState::Error(format!("Failed to reach the daemon: {e}"));
@@ -2942,6 +2945,9 @@ impl Render for WhatsAppApp {
                 cx,
             )
             .into_any_element(),
+            AppState::Refused { reason } => {
+                render_refused_view(reason, self.error_detail_open, entity, cx).into_any_element()
+            }
             AppState::LoggedOut { message } => {
                 render_logged_out_view(message, entity, cx).into_any_element()
             }
