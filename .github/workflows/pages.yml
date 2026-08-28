@@ -4,27 +4,36 @@
 # socket of its own, and needs no server to be *hosted*. It attaches to an
 # `oxidezapd` the visitor runs themselves, which is what the deployed page
 # says on its loading screen.
+#
+# Two things are published from one branch, `gh-pages`:
+#
+#   /            main, the live site
+#   /pr/<n>/     one preview per open pull request, removed when it closes
+#
+# A branch rather than the Pages *artifact* deployment, because an artifact
+# replaces the whole site and there is no way to put a preview beside it. That
+# is a repository setting: Settings → Pages → Build and deployment → Deploy
+# from a branch → `gh-pages` / `(root)`.
 name: Pages
 
 on:
   push:
     branches: ["main"]
-  # Buildable from a pull request too, without publishing: the build is the
-  # part that breaks, and finding out at merge time is finding out late.
+  # Buildable and previewable from a pull request: the build is the part that
+  # breaks, and finding out at merge time is finding out late.
   pull_request:
+    types: [opened, synchronize, reopened, closed]
   workflow_dispatch:
 
-# `pages: write` and `id-token: write` are what the deploy step needs and are
-# scoped to the job that deploys; the build job below stays read-only, so a
-# compromised dependency in the much larger build cannot reach a token that
-# publishes.
 permissions:
   contents: read
 
 concurrency:
-  # Not `cancel-in-progress`: a half-finished deployment is a broken site, and
-  # this build is long enough that a second push during one is likely.
-  group: pages-${{ github.ref }}
+  # Serialized on the branch being published to, not on the ref being built:
+  # two runs pushing to `gh-pages` at once is a lost update, and a preview and
+  # a release can finish at the same moment. Not `cancel-in-progress`, because
+  # a half-finished publish is a broken site.
+  group: pages-publish
   cancel-in-progress: false
 
 env:
@@ -34,6 +43,9 @@ env:
 jobs:
   build:
     name: Build
+    # A closed pull request has nothing to build; it only has a preview to
+    # take down.
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -68,13 +80,24 @@ jobs:
           cache-on-failure: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # A project page is served from `/<repo>/`, so the generated glue has to
-      # be told where it is loading from or it fetches the wasm from the
-      # account root and gets a 404. A user or organisation page is served
-      # from `/`, which is what the fallback below produces.
+      # Where this build will be served from, which the generated glue has to
+      # be told or it fetches the wasm from the account root and gets a 404.
+      # A preview lives one directory deeper than the site.
+      - name: Work out where this will be served from
+        id: where
+        run: |
+          repo='${{ github.event.repository.name }}'
+          if [ '${{ github.event_name }}' = 'pull_request' ]; then
+            echo "public_url=/$repo/pr/${{ github.event.number }}/" >> "$GITHUB_OUTPUT"
+            echo "target=pr/${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "public_url=/$repo/" >> "$GITHUB_OUTPUT"
+            echo "target=." >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build the bundle
         env:
-          PUBLIC_URL: /${{ github.event.repository.name }}/
+          PUBLIC_URL: ${{ steps.where.outputs.public_url }}
         run: ./web/build.sh
 
       # Proof the artifact is the one the page will ask for: trunk rewrites
@@ -97,31 +120,85 @@ jobs:
           echo "bundle contents:"
           ls -lh web/dist
 
-      # Pages will not serve a path segment beginning with an underscore, and
-      # it will not serve anything at all from a `.nojekyll`-less tree that
-      # Jekyll decides to reinterpret. Neither applies to what trunk emits
-      # today, and both would be silent 404s if it ever did.
-      - name: Disable Jekyll
-        run: touch web/dist/.nojekyll
-
-      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
+          name: bundle
           path: web/dist
+          retention-days: 1
 
-  deploy:
-    name: Deploy
-    # Only from main, and the branch is checked as well as the event: a
-    # `workflow_dispatch` can be started on any ref, and excluding pull
-    # requests alone would let one publish unmerged code to the live site.
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+  publish:
+    name: Publish
     needs: build
+    # Same-repository only. A pull request from a fork is given a read-only
+    # token, and the way around that — `pull_request_target` — runs the base
+    # branch's workflow with write access against the fork's code, which is
+    # how a preview becomes a supply-chain hole. A fork's build still runs;
+    # it just has nowhere to publish to.
+    if: |
+      github.event.action != 'closed' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name == 'pull_request' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      contents: write
     steps:
-      - id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+      - name: Work out where this goes
+        id: where
+        run: |
+          repo='${{ github.event.repository.name }}'
+          if [ '${{ github.event_name }}' = 'pull_request' ]; then
+            echo "target=pr/${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+            echo "url=https://${{ github.repository_owner }}.github.io/$repo/pr/${{ github.event.number }}/" >> "$GITHUB_OUTPUT"
+          else
+            echo "target=." >> "$GITHUB_OUTPUT"
+            echo "url=https://${{ github.repository_owner }}.github.io/$repo/" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only the publishing script: this job does not build anything, and a
+      # full checkout would just be another copy of the tree to keep out of
+      # the way of the branch it is about to rewrite.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bundle
+          path: bundle
+
+      - name: Publish to gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ steps.where.outputs.target }}
+        run: |
+          set -eu
+          bash .github/scripts/publish-pages.sh "$TARGET"
+
+      - name: Say where it is
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "### Web preview" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.where.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # A preview is only worth having if it goes away. The directory is removed
+  # when the pull request closes, merged or not.
+  take-down:
+    name: Take the preview down
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Remove the preview
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/publish-pages.sh --remove "pr/${{ github.event.number }}"
