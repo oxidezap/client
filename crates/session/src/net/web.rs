@@ -60,8 +60,18 @@ impl Runtime for BrowserRuntime {
         // pointer is moved rather than shared.
         struct OneThread(Rc<Cell<bool>>);
         unsafe impl Send for OneThread {}
+        impl OneThread {
+            /// A method rather than a field read at the call site: a closure
+            /// in edition 2021 captures the *field* it touches, so
+            /// `move || carried.0.set(true)` would capture the `Rc` and leave
+            /// this wrapper — and its `Send` — behind. Reaching through a
+            /// method captures the whole thing, which is the point.
+            fn abort(&self) {
+                self.0.set(true);
+            }
+        }
         let carried = OneThread(aborted);
-        AbortHandle::new(move || carried.0.set(true))
+        AbortHandle::new(move || carried.abort())
     }
 
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()>>> {

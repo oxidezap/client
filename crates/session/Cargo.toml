@@ -32,6 +32,11 @@ whatsapp-rust = { workspace = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+# Directly, because the library no longer re-exports it: `sqlite-storage` is
+# one of the defaults dropped above. Same crate the chat store opens, and
+# without the `bundled-sqlite` that wants a C toolchain — diesel supplies
+# SQLite itself on this target.
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
 # The browser, bound from Rust: the WebSocket, `fetch` and `setTimeout` that
 # stand in for the transport, the HTTP client and the runtime the defaults
 # would have supplied.

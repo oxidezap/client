@@ -9,7 +9,7 @@
 //! The methods are still `WhatsAppClient`'s; only the file changed. That is
 //! the same split the GUI already uses for `app/`.
 
-use super::*;
+use super::super::*;
 use whatsapp_rust::voip::{CallHandle, CallTermination};
 
 /// Live call state shared between the event pump and the UI action methods.
@@ -51,12 +51,12 @@ struct MuteLane {
 
 impl CallRegistry {
     /// Record a ringing offer, so accept and decline have something to act on.
-    pub(super) async fn offer(&self, call_id: String, call: Arc<WaIncomingCall>) {
+    pub(in crate::whatsapp) async fn offer(&self, call_id: String, call: Arc<WaIncomingCall>) {
         self.pending.lock().await.insert(call_id, call);
     }
 
     /// Forget a ringing offer, however it stopped ringing.
-    pub(super) async fn forget_offer(&self, call_id: &str) {
+    pub(in crate::whatsapp) async fn forget_offer(&self, call_id: &str) {
         self.pending.lock().await.remove(call_id);
     }
 
@@ -70,7 +70,7 @@ impl CallRegistry {
     /// Done here rather than by handing the handle back, so that a caller
     /// never has to name a `CallHandle` — the type is the media stack's, and
     /// the media stack is what a browser does not have.
-    pub(super) async fn ended_by_peer(&self, call_id: &str) {
+    pub(in crate::whatsapp) async fn ended_by_peer(&self, call_id: &str) {
         if let Some(handle) = self.active.lock().await.remove(call_id) {
             tokio::spawn(async move { handle.hangup_local().await });
         }

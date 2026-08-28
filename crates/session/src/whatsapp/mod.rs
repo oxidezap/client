@@ -13,6 +13,10 @@ use oxidezap_chat_store::{ChatEntry, ChatStore, StoreChange};
 use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
+// The same type either way; only the road to it differs. On a desktop the
+// library re-exports it, and in a browser that re-export is behind a default
+// feature the wasm build drops — so it is named at its own crate there.
+#[cfg(not(target_family = "wasm"))]
 use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
@@ -22,6 +26,8 @@ use whatsapp_rust::wacore::types::presence::{
 };
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 use whatsapp_rust::waproto::whatsapp as wa;
+#[cfg(target_family = "wasm")]
+use whatsapp_rust_sqlite_storage::SqliteStore;
 
 use oxidezap_audio::{spawn_mic, spawn_speaker};
 use oxidezap_core::{
@@ -522,9 +528,10 @@ impl WhatsAppClient {
         let ui_sender_clone = ui_sender.clone();
         let names_clone = names.clone();
 
-        // Transport, HTTP client and runtime come from the default cargo
-        // features (Tokio WebSocket, ureq, Tokio).
-        let bot = match Bot::builder()
+        // Transport, HTTP client and runtime come from whichever platform
+        // this is: the library's default features on a desktop, `web-sys`
+        // bindings in a page. See `crate::net`.
+        let bot = match crate::net::with_platform_plugins(Bot::builder())
             .with_backend(backend)
             .on_event(move |event, client| {
                 let ui_tx = ui_tx_clone.clone();
