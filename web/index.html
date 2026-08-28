@@ -13,8 +13,19 @@
     <title>oxidezap</title>
 
     <!-- The window itself. `data-bin` names the binary; wasm-bindgen turns
-         its `main` into the module's start function. -->
-    <link data-trunk rel="rust" data-bin="oxidezap" data-bindgen-target="web" />
+         its `main` into the module's start function.
+
+         `href` because trunk looks for a manifest beside this file and there
+         is none: the page is not a crate, it is how the front end is
+         packaged. Pointing at the crate keeps the bundle's own files in one
+         directory instead of scattering them through the workspace root. -->
+    <link
+      data-trunk
+      rel="rust"
+      href="../crates/gui/Cargo.toml"
+      data-bin="oxidezap"
+      data-bindgen-target="web"
+    />
 
     <!-- Cross-origin isolation, which GitHub Pages cannot give us.
          `gpui_web` runs its background executor on real workers, and workers

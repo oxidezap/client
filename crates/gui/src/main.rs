@@ -88,51 +88,73 @@ fn start_logging() {
 }
 
 fn open_the_window() {
-    application()
-        .with_assets(assets::Assets)
-        .run(|cx: &mut App| {
-            gpui_component::init(cx);
-            // Reads ~/.config/oxidezap/theme.json over a preset. Cannot fail: a
-            // missing or malformed file resolves to the product default and
-            // reports what it could not honour in Settings.
-            theme::init(cx);
-            init_app_bindings(cx);
+    let launch = |cx: &mut App| {
+        gpui_component::init(cx);
+        // Reads ~/.config/oxidezap/theme.json over a preset. Cannot fail: a
+        // missing or malformed file resolves to the product default and
+        // reports what it could not honour in Settings.
+        theme::init(cx);
+        init_app_bindings(cx);
 
-            let bounds = Bounds::centered(None, opening_size(cx), cx);
+        let bounds = Bounds::centered(None, opening_size(cx), cx);
 
-            if let Err(error) = cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(gpui::TitlebarOptions {
-                        title: Some(SharedString::from("WhatsApp")),
-                        ..Default::default()
-                    }),
+        if let Err(error) = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some(SharedString::from("WhatsApp")),
                     ..Default::default()
-                },
-                |window, cx| {
-                    let view = cx.new(WhatsAppApp::new);
-                    // The theme file is watched for the window's whole life,
-                    // not for the part of it that is pairing. Armed from the
-                    // pairing screen alone, a window that opened onto an
-                    // already-linked daemon — the ordinary case, since the
-                    // daemon outlives the window — never polled it at all,
-                    // and edits to an existing `theme.json` did nothing until
-                    // the next restart.
-                    view.update(cx, |app, cx| {
-                        app.watch_theme_file(cx);
-                        // After the window exists, so the ten seconds a cold
-                        // start can spend waiting for a daemon to come up are
-                        // spent under the loading screen rather than in front
-                        // of nothing.
-                        app.start(cx);
-                    });
-                    cx.new(|cx| Root::new(view, window, cx))
-                },
-            ) {
-                log::error!("Failed to open main window: {error}");
-                cx.quit();
-            }
-        });
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                let view = cx.new(WhatsAppApp::new);
+                // The theme file is watched for the window's whole life,
+                // not for the part of it that is pairing. Armed from the
+                // pairing screen alone, a window that opened onto an
+                // already-linked daemon — the ordinary case, since the
+                // daemon outlives the window — never polled it at all,
+                // and edits to an existing `theme.json` did nothing until
+                // the next restart.
+                view.update(cx, |app, cx| {
+                    app.watch_theme_file(cx);
+                    // After the window exists, so the ten seconds a cold
+                    // start can spend waiting for a daemon to come up are
+                    // spent under the loading screen rather than in front
+                    // of nothing.
+                    app.start(cx);
+                });
+                cx.new(|cx| Root::new(view, window, cx))
+            },
+        ) {
+            log::error!("Failed to open main window: {error}");
+            cx.quit();
+        }
+    };
+
+    let application = application().with_assets(assets::Assets);
+
+    // Two ways to start, and the difference is who owns the run loop.
+    //
+    // On a desktop `Platform::run` blocks for the life of the process, and
+    // `Application::run`'s own stack frame is what keeps the app alive. In a
+    // browser the run loop is the browser's: `run` invokes the launch
+    // callback and returns immediately, so the app would be dropped on the
+    // way out of this function — which showed up as a canvas that never
+    // appeared and one line reading "app was released". `run_embedded` is
+    // gpui's answer for exactly that shape, and the handle it returns is what
+    // holds the app.
+    #[cfg(not(target_family = "wasm"))]
+    application.run(launch);
+
+    #[cfg(target_family = "wasm")]
+    {
+        // Leaked deliberately: the page *is* the process here, so the app
+        // lives until the tab closes and there is nothing left to hand it
+        // back to. Dropping the handle would release the app, which is the
+        // bug this replaced.
+        std::mem::forget(application.run_embedded(launch));
+    }
 }
 
 /// The application, before it is given anything to draw.

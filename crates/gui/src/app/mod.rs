@@ -396,6 +396,31 @@ async fn download_with_timeout(
 /// ($XDG_DOWNLOAD_DIR, then $HOME or %USERPROFILE% + /Downloads, then the CWD
 /// like the database fallback when no home is known) and return the path
 /// written.
+/// Open the connection, on whichever thread can open one.
+///
+/// Off the UI thread on a desktop: connecting there can mean starting a
+/// daemon and waiting for it to listen, which is a spinner rather than a
+/// frozen window only if it happens somewhere else.
+///
+/// On the *window's own* thread in a browser, and that is not a preference.
+/// gpui's background executor is a real worker there, and a worker has no
+/// `window` — so the socket's URL would silently ignore the page's
+/// `?daemon=`, and every media fetch afterwards would fail for want of
+/// something to fetch from. There is nothing to move off the thread anyway:
+/// a page cannot start a daemon, and its socket opens asynchronously, so
+/// this returns immediately.
+async fn attach(cx: &mut gpui::AsyncApp) -> std::io::Result<(Session, crate::session::Events)> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        cx.background_spawn(async { Session::connect() }).await
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = cx;
+        Session::connect()
+    }
+}
+
 /// What distinguishes this front end from another one on the same daemon.
 ///
 /// A process id on the desktop, where two windows are two processes. Two tabs
@@ -2078,12 +2103,10 @@ impl WhatsAppApp {
         self.client.take();
         self.event_task.take();
 
-        // Off the UI thread: connecting can mean starting a daemon and
-        // waiting for it to listen, which is a spinner rather than a frozen
-        // window only if it happens somewhere else. A failure routes back to
-        // the error screen, where retry stays available.
+        // A failure routes back to the error screen, where retry stays
+        // available.
         self.reconnect_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let connected = cx.background_spawn(async { Session::connect() }).await;
+            let connected = attach(cx).await;
             let _ = entity.update(cx, |app, cx| {
                 match connected {
                     Ok((client, ui_rx)) => {
