@@ -81,6 +81,15 @@ pub mod kind {
     /// A titled group. Its label is the title.
     pub const SECTION: u8 = 7;
 
+    /// Whether this kind is drawn with whatever it holds inside it.
+    ///
+    /// The three containers, and nothing else: a front end renders children
+    /// only for these, so children anywhere else are children nobody draws.
+    #[must_use]
+    pub fn holds_children(kind: u8) -> bool {
+        matches!(kind, ROW | COLUMN | SECTION)
+    }
+
     /// Whether a byte names a widget this format defines.
     #[must_use]
     pub const fn is_known(kind: u8) -> bool {
@@ -345,6 +354,8 @@ mod parse {
         Anonymous,
         /// Past [`MAX_DEPTH`], [`MAX_NODES`] or [`MAX_TEXT`].
         TooBig,
+        /// Children hung off a widget that is drawn without any.
+        Childless(u8),
         /// The padding byte was not zero.
         ///
         /// Refused rather than ignored, so the byte stays free to mean
@@ -361,6 +372,9 @@ mod parse {
                 Self::Truncated => f.write_str("the ui tree ends mid-node"),
                 Self::Trailing => f.write_str("bytes after the last root node"),
                 Self::Reserved(v) => write!(f, "reserved byte {v}, expected 0"),
+                Self::Childless(kind) => {
+                    write!(f, "widget kind {kind} is drawn without children")
+                }
                 Self::Unknown { kind, slot } => {
                     write!(f, "unknown widget {kind} or slot {slot}")
                 }
@@ -431,6 +445,15 @@ mod parse {
                 return Err(ParseError::Reserved(reserved));
             }
             let children = self.u16()?;
+            // A leaf is a leaf. Only a row, a column and a section are drawn
+            // with anything inside them, so children hung off a button or a
+            // field are children a front end silently never renders — and a
+            // plugin whose control disappeared with an `ACCEPTED` in hand has
+            // nothing to go on. The same reason a slot nobody draws is
+            // refused rather than dropped.
+            if children != 0 && !kind::holds_children(kind) {
+                return Err(ParseError::Childless(kind));
+            }
             let id = self.string()?;
             let label = self.string()?;
             let value = self.string()?;
@@ -711,14 +734,44 @@ mod tests {
 
     #[test]
     fn a_child_count_that_lies_is_truncation_not_a_panic() {
+        // A section, because a leaf claiming a child is now refused for
+        // *being* a leaf — which would answer this test with the wrong error
+        // and stop it saying anything about truncation.
         let mut bytes = write(|w| {
-            w.leaf(kind::LABEL, slot::SETTINGS, 0, "", "x", "");
+            w.begin(kind::SECTION, slot::SETTINGS, 0, "", "t", "");
+            w.end();
         })
         .expect("fits");
         // Claim a child that is not there: the node head is at offset 5,
         // and its child count is the two bytes after the four-byte head.
         bytes[5 + 4] = 1;
         assert_eq!(parse(&bytes), Err(ParseError::Truncated));
+    }
+
+    /// Only the three containers are drawn with anything inside them, so a
+    /// child hung off a button is a control a front end silently never
+    /// renders — with an `ACCEPTED` handed back to whoever wrote it.
+    #[test]
+    fn children_on_a_leaf_are_refused() {
+        let mut bytes = write(|w| {
+            w.begin(kind::SECTION, slot::SETTINGS, flags::ENABLED, "", "t", "");
+            w.leaf(kind::BUTTON, slot::NONE, flags::ENABLED, "b", "B", "");
+            w.end();
+        })
+        .expect("fits");
+        // The button is the second node; give it a child it does not have.
+        // Its head follows the header, the section's head and child count,
+        // and the section's three strings — an empty id, a one-byte title
+        // and an empty value, each behind a four-byte length.
+        let header = 5;
+        let section_head = 4 + 2;
+        // Three strings, each a four-byte length and its bytes: an empty
+        // id, a one-byte title, an empty value.
+        let section_strings = 4 + 4 + 1 + 4;
+        let button = header + section_head + section_strings;
+        assert_eq!(bytes[button], kind::BUTTON, "found the button's head");
+        bytes[button + 4] = 1;
+        assert_eq!(parse(&bytes), Err(ParseError::Childless(kind::BUTTON)));
     }
 
     #[test]

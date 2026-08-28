@@ -355,19 +355,17 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             let Some(Value::List(items)) = c.data().read_field(ev, field) else {
                 return abi::ABSENT;
             };
+            // Before the clone, not after. Checking the cap on the way out
+            // still allocated the string first, so a handler past its budget
+            // could go on cloning for the rest of its fuel and `MAX_HANDLES`
+            // bounded the arena while bounding nothing that mattered.
+            if c.data().arena.len() >= MAX_HANDLES {
+                return abi::ABSENT;
+            }
             let Some(item) = items.get(index).cloned() else {
                 return abi::ABSENT;
             };
             let guest = c.data_mut();
-            // Bounded, because this is a *host* allocation and wasmi's
-            // limiter does not see it. Nothing stops a plugin asking for the
-            // same element of the same list until its fuel runs out, and each
-            // ask clones a string into the daemon's own memory — fifty
-            // million instructions' worth of that is far past the 4 MiB the
-            // sandbox advertises. A list nobody has is not worth a handle.
-            if guest.arena.len() >= MAX_HANDLES {
-                return abi::ABSENT;
-            }
             // The arena only grows within one call and is emptied when it
             // returns, so a handle can never outlive the event it names —
             // which is what makes handles free of any lifetime bookkeeping

@@ -812,6 +812,15 @@ screen, with the title above the glass and the pair code below it.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
+- **A withdrawal does not reach a command already in flight.** The mask is
+  read live, so the *next* command a plugin attempts is checked against the
+  answer — but the check and the send are two steps, and the send parks on a
+  bounded channel. A revocation landing in between does not stop the command
+  that is already waiting there, so one send, read receipt or typing update
+  can still act after Settings says "not allowed". The window is bounded by
+  the session's own draining, and closing it means carrying the plugin's
+  authorization into `SessionCommand` so the executing side can check it
+  again — a change to the command shape, decided on its own.
 - **A plugin cannot tell "cleared" from "not carried".** The ABI's absence
   rule is that a field's absence reads back as its default, and a string's
   default is empty — which is exactly what makes adding a field a non-event,
