@@ -5706,6 +5706,7 @@ dependencies = [
  "chrono",
  "env_logger",
  "futures-util",
+ "getrandom 0.4.3",
  "ksni",
  "log",
  "oxidezap-core",

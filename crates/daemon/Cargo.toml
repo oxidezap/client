@@ -21,6 +21,8 @@ async-trait = { workspace = true }
 # understand — which is why SHA-1 is the right and only answer here.
 base64 = "0.22"
 env_logger = "0.11"
+# The web bridge's token, which is the whole of its admission check.
+getrandom = { workspace = true }
 # `SinkExt`/`StreamExt` over the WebSocket, which is a sink of messages
 # rather than a byte stream.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

@@ -99,9 +99,14 @@ Then open <http://127.0.0.1:8080>.
 **That endpoint is off by default, and should stay off unless you want it.**
 A WebSocket is not subject to the same-origin policy, so any page open in
 your browser can try to reach `ws://127.0.0.1` — and this one carries your
-message history and can send. It therefore refuses to bind anywhere but
-loopback, and it refuses every browser origin except the ones you name and
-`localhost`, which is built in:
+message history and can send.
+
+So it requires a token, which the daemon prints on startup and keeps in your
+own state directory. A loopback port is reachable by every account on the
+machine, unlike the Unix socket, which lives in a directory only you can read
+— the token is what carries that guarantee across. It also refuses to bind
+anywhere but loopback, and refuses every browser origin except the ones you
+name and `localhost`, which is built in:
 
 ```bash
 # Serve a page published somewhere else — a Pages deployment, say.
@@ -109,9 +114,10 @@ oxidezapd --web --web-allow https://oxidezap.github.io
 ```
 
 `localhost` and `127.0.0.1` are served without being named, because that is
-`trunk serve` on your own machine. Pass `?daemon=ws://host:port/ws` to point
-a page at a daemon other than the default one; it is honoured only for this
-machine or the origin the page itself came from.
+`trunk serve` on your own machine. Point a page at a daemon with
+`?daemon=ws://host:port/ws?token=…` — the whole line the daemon logs when it
+starts. The URL is honoured only for this machine or the origin the page
+itself came from, and the token has to match either way.
 
 Reaching the bridge from another machine is a tunnel's job — `ssh -L
 9527:127.0.0.1:9527`, or a reverse proxy that terminates TLS and

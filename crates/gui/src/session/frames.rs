@@ -324,10 +324,28 @@ pub(super) fn parse(line: &str) -> Option<DaemonMessage> {
 /// inside the frame and never calls this.
 #[cfg(target_family = "wasm")]
 pub(super) fn media_keys(message: &DaemonMessage) -> Vec<String> {
+    use oxidezap_core::MediaType;
+
     fn key_of(media: &Option<MediaContent>, into: &mut Vec<String>) {
-        if let Some(key) = media.as_ref().and_then(|m| m.cache_key.clone()) {
-            into.push(key);
+        let Some(media) = media else { return };
+        let Some(key) = media.cache_key.clone() else {
+            return;
+        };
+        // A key this build could not use if it had the bytes. The daemon
+        // caches a downloaded clip by its content and hands a hydrated row
+        // *that* key in place of the thumbnail's, so a web window attaching
+        // beside a desktop one that had played a video would pull the whole
+        // MP4 down — ahead of the frame it belongs to, to decode it with a
+        // decoder that does not exist here. The thumbnail key (`f-`) is a
+        // different thing and is still worth having: it is what the row draws
+        // next to "video is not supported here".
+        if media.media_type == MediaType::Video
+            && !crate::video::CAN_DECODE
+            && key.starts_with("d-")
+        {
+            return;
         }
+        into.push(key);
     }
 
     let mut keys = Vec::new();
@@ -361,6 +379,13 @@ pub(super) fn media_keys(message: &DaemonMessage) -> Vec<String> {
         DaemonMessage::Downloaded { key, .. } => keys.push(key.clone()),
         _ => {}
     }
+    // A download key is the media's *content*, so one photo forwarded into
+    // five chats is one key five times over — and the fetches are sequential,
+    // so that is the same megabytes transferred five times with the frame
+    // waiting behind all of them. Order is kept: the first mention of a key
+    // is where the fetch belongs.
+    let mut seen = std::collections::HashSet::new();
+    keys.retain(|key| seen.insert(key.clone()));
     keys
 }
 

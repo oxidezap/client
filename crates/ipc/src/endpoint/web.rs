@@ -346,12 +346,41 @@ pub fn media_base_url() -> String {
         "http:"
     });
     parsed.set_pathname(crate::WEB_MEDIA_PATH);
-    // Neither belongs on a media request: the query was for the socket, and a
-    // fragment never leaves the browser anyway.
+    // No query and no fragment: the key is joined onto this, so anything
+    // here would land in the middle of the path. The token the media endpoint
+    // also requires is appended after the key instead — see
+    // [`media_token`].
     parsed.set_search("");
     parsed.set_hash("");
     // No trailing slash: `fetch_media` joins the key with one.
     parsed.href().trim_end_matches('/').to_string()
+}
+
+/// The token the media endpoint requires, as a query ready to append.
+///
+/// It is the *daemon's* token rather than the socket's, and the media
+/// endpoint is behind the same check — so a request without it is a `404`
+/// and every photo draws as a download nobody asked for. Empty when the page
+/// was pointed at a daemon without one, which is a daemon that will refuse
+/// the socket too: the failure belongs there, said once, rather than here per
+/// photo.
+#[must_use]
+pub fn media_token() -> String {
+    let Ok(parsed) = web_sys::Url::new(&endpoint_url()) else {
+        return String::new();
+    };
+    parameter_of(&parsed.search(), "token")
+        .map_or_else(String::new, |token| format!("?token={token}"))
+}
+
+/// One query parameter out of a query string.
+///
+/// The value is left encoded: it goes straight back into a URL.
+fn parameter_of(search: &str, name: &str) -> Option<String> {
+    search.trim_start_matches('?').split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then(|| value.to_string())
+    })
 }
 
 /// One query parameter off the page's own URL.
@@ -396,7 +425,11 @@ pub async fn fetch_media(base: &str, key: &str) -> Result<Vec<u8>, String> {
     use wasm_bindgen_futures::JsFuture;
 
     let window = web_sys::window().ok_or("no window to fetch from")?;
-    let url = format!("{base}/{}", js_sys::encode_uri_component(key));
+    let url = format!(
+        "{base}/{}{}",
+        js_sys::encode_uri_component(key),
+        media_token()
+    );
 
     // Bounded, because the caller resolves a frame's media before it hands
     // the frame on: a bridge that accepts the connection and never answers

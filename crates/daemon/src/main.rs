@@ -124,7 +124,23 @@ async fn run() -> Result<()> {
     // reconnect loop can hold open.
     let slots = server::client_slots();
 
-    let web = Options::from_args().web;
+    // The token is read (or drawn) here rather than inside the bridge, so a
+    // per-user directory that cannot be written stops the endpoint from
+    // existing at all instead of producing one nobody can be admitted to.
+    let web = match Options::from_args().web {
+        Some(options) => match listener::web::token() {
+            Ok(token) => Some(listener::web::Config {
+                addr: options.addr,
+                allowed_origins: options.allowed_origins,
+                token,
+            }),
+            Err(e) => {
+                log::error!("the web bridge is off: {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
     let mut bridge = web.map(|config| {
         let hub = Arc::clone(&hub);
         let commands = commands.clone();
@@ -244,7 +260,20 @@ impl Termination {
 #[derive(Debug, Default)]
 struct Options {
     /// The web bridge, where one was asked for.
-    web: Option<listener::web::Config>,
+    web: Option<WebOptions>,
+}
+
+/// What the command line says about the bridge.
+///
+/// Not [`listener::web::Config`] itself, which also carries the token: that
+/// is read from disk or drawn, which is I/O, and parsing arguments is not the
+/// place for it. Keeping them apart is also what stops a token from being
+/// defaulted — an empty one would compare equal to an empty one, which is the
+/// admission check answering yes to everybody.
+#[derive(Debug)]
+struct WebOptions {
+    addr: std::net::SocketAddr,
+    allowed_origins: Vec<String>,
 }
 
 impl Options {
@@ -306,7 +335,7 @@ impl Options {
         let addr = addr.unwrap_or_else(|| format!("127.0.0.1:{}", oxidezap_ipc::DEFAULT_WEB_PORT));
         match addr.parse() {
             Ok(addr) => Self {
-                web: Some(listener::web::Config {
+                web: Some(WebOptions {
                     addr,
                     allowed_origins,
                 }),

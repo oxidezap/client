@@ -59,6 +59,11 @@ pub struct Config {
     pub addr: SocketAddr,
     /// Browser origins allowed to attach, beyond the loopback ones.
     pub allowed_origins: Vec<String>,
+    /// The shared secret every request has to carry.
+    ///
+    /// See [`token`]: this is what makes a machine-wide port as private as
+    /// the per-user socket beside it.
+    pub token: String,
 }
 
 /// The magic string RFC 6455 mixes into the accept key. Not a secret: it
@@ -121,6 +126,14 @@ pub async fn run(
             config.allowed_origins.join(", ")
         }
     );
+    // The token is the whole of the admission check, so it is printed rather
+    // than left for the user to find: a page cannot read it off the disk, and
+    // the only way it reaches one is a person pasting it.
+    log::info!(
+        "point a page at it with ?daemon=ws://{}{WEB_SOCKET_PATH}?token={}",
+        config.addr,
+        config.token
+    );
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -180,6 +193,22 @@ async fn serve(
     // A browser asks before it fetches media from another origin.
     if request.method == "OPTIONS" {
         return respond(stream.get_mut(), 204, "text/plain", origin.as_deref(), b"").await;
+    }
+
+    // Before either route, and before the origin is even consulted: this is
+    // what makes the port as private as the socket beside it. A `404` rather
+    // than a `403` — an endpoint another account on this machine cannot open
+    // has no reason to confirm it is there.
+    if !request.token_matches(config) {
+        log::warn!("refusing a web request with no valid token");
+        return respond(
+            stream.get_mut(),
+            404,
+            "text/plain",
+            origin.as_deref(),
+            b"nothing here",
+        )
+        .await;
     }
 
     if request.path == WEB_SOCKET_PATH {
@@ -446,6 +475,8 @@ async fn read_head(stream: &mut BufReader<TcpStream>) -> Result<String> {
 struct Request {
     method: String,
     path: String,
+    /// Everything after the `?`, which is where the token rides.
+    query: String,
     origin: Option<String>,
     websocket_key: Option<String>,
 }
@@ -455,10 +486,12 @@ impl Request {
         let mut lines = head.split("\r\n");
         let mut start = lines.next()?.split(' ');
         let method = start.next()?.to_string();
-        // The query is not part of any route here, and a client is free to
-        // add one — a cache buster, a token it thinks we want.
+        // The query is not part of any route, but it is where the token is,
+        // so it is kept rather than discarded.
         let target = start.next()?;
-        let path = target.split('?').next().unwrap_or(target).to_string();
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let path = path.to_string();
+        let query = query.to_string();
 
         let mut origin = None;
         let mut websocket_key = None;
@@ -479,6 +512,7 @@ impl Request {
         Some(Self {
             method,
             path,
+            query,
             origin,
             websocket_key,
         })
@@ -486,14 +520,15 @@ impl Request {
 
     /// Whether this origin is one the user said to serve.
     ///
-    /// See the module documentation: this is the only thing standing between
-    /// the session and any page that knows the port number.
+    /// Not on its own an admission check — [`Self::token_matches`] is — but
+    /// still worth keeping: a page the user never named has no business
+    /// reaching this endpoint even holding a token, and refusing it here is
+    /// what stops one from being probed for.
     fn origin_allowed(&self, config: &Config) -> bool {
         let Some(origin) = &self.origin else {
             // Not a browser: a page cannot suppress `Origin`. So this is
             // something else on this machine — `run` refuses to bind anywhere
-            // else — and anything that can reach a loopback port could
-            // equally have opened the Unix socket beside it.
+            // else — and it still has to know the token.
             return config.addr.ip().is_loopback();
         };
         if is_loopback_origin(origin) {
@@ -504,6 +539,42 @@ impl Request {
             .iter()
             .any(|allowed| allowed == origin)
     }
+
+    /// Whether this request carries the daemon's own token.
+    ///
+    /// The admission check. A Unix socket is inside a `0700` directory and
+    /// answers a peer's uid, so reaching it *is* proof of being this user; a
+    /// loopback TCP port is none of those things — every account on the
+    /// machine can connect to it, and every one of them can write
+    /// `Origin: http://localhost`, which is a string. The token is the piece
+    /// that carries the socket's guarantee across: it lives in that same
+    /// per-user directory, so knowing it is proof of being able to read it.
+    ///
+    /// Compared without an early return, so the number of leading bytes that
+    /// matched is not something a caller can time.
+    fn token_matches(&self, config: &Config) -> bool {
+        let Some(offered) = parameter(&self.query, "token") else {
+            return false;
+        };
+        let expected = config.token.as_bytes();
+        let offered = offered.as_bytes();
+        if offered.len() != expected.len() {
+            return false;
+        }
+        let mut difference = 0u8;
+        for (a, b) in expected.iter().zip(offered) {
+            difference |= a ^ b;
+        }
+        difference == 0
+    }
+}
+
+/// One parameter out of a query string, percent-decoded.
+fn parameter(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then(|| percent_decode(value))
+    })
 }
 
 /// Whether an origin is this machine talking to itself.
@@ -554,10 +625,14 @@ fn percent_decode(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A token the tests can also write into a request.
+    pub(super) const TEST_TOKEN: &str = "0123456789abcdef";
+
     fn config(origins: &[&str]) -> Config {
         Config {
             addr: "127.0.0.1:0".parse().expect("a literal address"),
             allowed_origins: origins.iter().map(|o| (*o).to_string()).collect(),
+            token: TEST_TOKEN.to_string(),
         }
     }
 
@@ -565,6 +640,7 @@ mod tests {
         Request {
             method: "GET".into(),
             path: WEB_SOCKET_PATH.into(),
+            query: format!("token={TEST_TOKEN}"),
             origin: origin.map(str::to_string),
             websocket_key: None,
         }
@@ -636,6 +712,7 @@ mod tests {
         let exposed = Config {
             addr: "0.0.0.0:0".parse().expect("a literal address"),
             allowed_origins: vec!["https://oxidezap.github.io".to_string()],
+            token: TEST_TOKEN.to_string(),
         };
         let hub = StateHub::new();
         let (commands, _rx) = tokio::sync::mpsc::channel(1);
@@ -683,5 +760,142 @@ mod tests {
         hasher.update(WS_MAGIC.as_bytes());
         let accept = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+}
+
+/// The bridge's shared secret, created on first use and reused after.
+///
+/// Reused rather than redrawn per run so a bookmarked URL keeps working
+/// across restarts — a token nobody can remember is one that gets turned off.
+/// Written into the same per-user directory as the socket and the lock, with
+/// no access for anyone else, because the whole point of it is that another
+/// account on this machine cannot read it.
+///
+/// # Errors
+///
+/// No per-user directory, or the file could not be read or written.
+pub fn token() -> Result<String> {
+    let path = oxidezap_ipc::web_token_path().context("no per-user directory for the web token")?;
+
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+
+    // 192 bits, hex. Not a password: nobody types it, it is pasted, so it is
+    // sized to be unguessable rather than to be short.
+    let mut bytes = [0u8; 24];
+    getrandom::fill(&mut bytes).context("no randomness for the web token")?;
+    let mut drawn = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(drawn, "{byte:02x}");
+    }
+
+    write_private(&path, &drawn)
+        .with_context(|| format!("writing the web token to {}", path.display()))?;
+    Ok(drawn)
+}
+
+/// Create the token file readable by nobody else.
+///
+/// The mode is set as the file is created rather than after: a token that is
+/// briefly world-readable is a token another account had a moment to read.
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+/// The same, where the directory is already inside the user's own profile.
+#[cfg(not(unix))]
+fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::tests::TEST_TOKEN;
+    use super::*;
+
+    fn asking(query: &str) -> Request {
+        Request {
+            method: "GET".into(),
+            path: WEB_SOCKET_PATH.into(),
+            query: query.to_string(),
+            origin: None,
+            websocket_key: None,
+        }
+    }
+
+    fn config() -> Config {
+        Config {
+            addr: "127.0.0.1:0".parse().expect("a literal address"),
+            allowed_origins: Vec::new(),
+            token: TEST_TOKEN.to_string(),
+        }
+    }
+
+    /// The check the whole endpoint stands on. Reaching a loopback port is
+    /// not proof of anything — every account on the machine can — so without
+    /// this another local user has the message history and the ability to
+    /// send.
+    #[test]
+    fn a_request_without_the_token_is_refused() {
+        for query in [
+            "",
+            "token=",
+            "token=wrong",
+            // A prefix of the real one, and one that extends it: neither is
+            // it.
+            "token=0123456789abcde",
+            "token=0123456789abcdef0",
+            "tokens=0123456789abcdef",
+            "daemon=ws://127.0.0.1:9527/ws",
+        ] {
+            assert!(
+                !asking(query).token_matches(&config()),
+                "{query:?} was admitted"
+            );
+        }
+    }
+
+    /// And the one that carries it is let through, wherever in the query it
+    /// sits.
+    #[test]
+    fn a_request_with_the_token_is_admitted() {
+        for query in [
+            "token=0123456789abcdef",
+            "daemon=x&token=0123456789abcdef",
+            "token=0123456789abcdef&cache=1",
+        ] {
+            assert!(
+                asking(query).token_matches(&config()),
+                "{query:?} was refused"
+            );
+        }
+    }
+
+    /// The token is pasted into a URL, so it arrives percent-encoded when it
+    /// has to be. It is hex today and would not need decoding; relying on
+    /// that is what makes a later change to the alphabet a silent lockout.
+    #[test]
+    fn a_percent_encoded_token_is_decoded_before_it_is_compared() {
+        let config = Config {
+            addr: "127.0.0.1:0".parse().expect("a literal address"),
+            allowed_origins: Vec::new(),
+            token: "a b".to_string(),
+        };
+        assert!(asking("token=a%20b").token_matches(&config));
     }
 }

@@ -263,6 +263,17 @@ fn user_suffix() -> Option<String> {
     None
 }
 
+/// Where the web bridge's shared secret lives.
+///
+/// In the same per-user directory as the socket, and for the same reason: a
+/// loopback TCP port is reachable by every account on the machine, while that
+/// directory is the user's own. The token is what carries the socket's
+/// per-user guarantee onto a port that has none. See `daemon/listener/web.rs`.
+#[must_use]
+pub fn web_token_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("web.token"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

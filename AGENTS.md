@@ -121,13 +121,23 @@ profile here repeats it deliberately.
   `ws://127.0.0.1` and would otherwise be handed the message history and the
   ability to send. Hence: off unless asked for (`--web`), loopback unless told
   otherwise, and every browser origin refused unless named (`--web-allow`),
-  excepting localhost, which is the developer's own `trunk serve`. A request
-  with no `Origin` is not a browser — a page cannot suppress the header — so
-  it is served only on a loopback bind, where anything that could connect
-  could equally have opened the Unix socket — which is what makes that rule
-  safe, and why a non-loopback bind is an error rather than a warning: there
-  the header is a string the client picks and the traffic is cleartext, so
-  remote access is a tunnel's job. Both endpoints draw on one admission
+  excepting localhost, which is the developer's own `trunk serve`. But an
+  origin is not the admission check and could not be: a loopback port is
+  reachable by *every account on the machine*, while the socket sits in a
+  `0700` directory and answers a peer uid — so reaching the socket proves
+  being this user and reaching the port proves nothing, and any local account
+  can write `Origin: http://localhost`, which is a string. A token in that
+  same per-user directory is what carries the guarantee across: drawn once and
+  kept, so a bookmarked URL survives a restart; required on the upgrade and on
+  media alike, since a photo is as much the account's as a frame is; compared
+  without an early return, so the matching prefix is not something a caller
+  can time; and answered with a `404` rather than a `403`, because an endpoint
+  the caller may not open has no reason to confirm it is there. A request with
+  no `Origin` is not a browser — a page cannot suppress the header — so it is
+  served on a loopback bind, and still only with the token. A non-loopback
+  bind is an error rather than a warning: there the header is a string the
+  client picks and the traffic is cleartext, so remote access is a tunnel's
+  job. Both endpoints draw on one admission
   count, because a client costs the same descriptors and tasks however it
   arrived; the web one claims its slot at the upgrade rather than at accept,
   since the same port serves media and a photo is not a front end.
