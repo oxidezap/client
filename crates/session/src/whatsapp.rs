@@ -2949,6 +2949,11 @@ impl WhatsAppClient {
         state: VideoState,
         upgrade_token: Option<VideoUpgradeToken>,
     ) {
+        if peer_can_receive_video(state)
+            && let Some(local) = calls.cameras.lock().await.get(call_id)
+        {
+            local.request_keyframe();
+        }
         match state {
             // A request rather than a change: the answer is a person turning
             // their own camera on, and the token is what binds that answer to
@@ -3060,6 +3065,26 @@ const RTCP_FMT_FIR: u8 = 4;
 fn reports_loss(feedback: &whatsapp_rust::wacore::voip::rtcp::RtcpFeedback) -> bool {
     feedback.packet_type == RTCP_PAYLOAD_FEEDBACK
         && matches!(feedback.fmt, RTCP_FMT_PLI | RTCP_FMT_FIR)
+}
+
+/// Whether this peer state is a decoder of theirs being born on *our*
+/// stream.
+///
+/// The same rule the window's own decoders follow, applied to the one on the
+/// far side: an upgrade holds our video off the wire until the peer accepts,
+/// so the accept is the first moment they have anywhere to put it — and what
+/// they receive from there references units encoded while nobody was
+/// listening. Our encoder emits an IDR every few seconds on its own, so
+/// without this the picture arrives when it arrives, which is a peer looking
+/// at a blank pane for up to a GOP after answering.
+///
+/// `Enabled` as well as `UpgradeAccept`, because either can be the stanza that
+/// ungates us: the library takes an `Enabled` from a peer who skipped the
+/// accept as the answer to our request. It is also what a peer sends for their
+/// own camera and their own rotations, so this asks for a keyframe more often
+/// than strictly needed — one extra frame against a picture that never starts.
+fn peer_can_receive_video(state: VideoState) -> bool {
+    matches!(state, VideoState::UpgradeAccept | VideoState::Enabled)
 }
 
 /// Say what a hangup achieved.
@@ -4234,9 +4259,9 @@ mod tests {
 
     use super::{
         ChatEntry, ChatStore, Client, MuteLane, NameBook, ReadBoundary, ReloadScope, SqliteStore,
-        StoreChange, WhatsAppClient, apply_status_views, chat_cursor, media_metadata,
+        StoreChange, VideoState, WhatsAppClient, apply_status_views, chat_cursor, media_metadata,
         merge_alias_history_messages, message_cursor, parse_chat_cursor, parse_message_cursor,
-        read_message_range,
+        peer_can_receive_video, read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
     use std::sync::Arc;
@@ -4244,6 +4269,33 @@ mod tests {
     use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
     use whatsapp_rust::wacore_binary::Jid;
     use whatsapp_rust::waproto::whatsapp as wa;
+
+    /// The states that mean the peer now has somewhere to put our video, and
+    /// so has a decoder that has never seen a keyframe.
+    ///
+    /// An upgrade we initiated is held off the wire until they accept, so
+    /// everything encoded before that accept is a reference they do not have.
+    #[test]
+    fn a_peer_that_can_receive_is_asked_for_a_fresh_start() {
+        assert!(peer_can_receive_video(VideoState::UpgradeAccept));
+        assert!(peer_can_receive_video(VideoState::Enabled));
+        // Nothing on the far side is waiting for a picture in any of these.
+        for quiet in [
+            VideoState::Stopped,
+            VideoState::Disabled,
+            VideoState::Paused,
+            VideoState::UpgradeRequest,
+            VideoState::UpgradeRequestV2,
+            VideoState::UpgradeReject,
+            VideoState::UpgradeRejectByTimeout,
+            VideoState::UpgradeCancel,
+            VideoState::UpgradeCancelByTimeout,
+            VideoState::UnknownPeer,
+            VideoState::Error,
+        ] {
+            assert!(!peer_can_receive_video(quiet), "{quiet:?}");
+        }
+    }
 
     /// Stamp a request the way `set_call_muted` does, on the caller's thread.
     fn request(lane: &MuteLane, muted: bool) -> u64 {

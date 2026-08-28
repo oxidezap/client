@@ -119,6 +119,12 @@ pub struct CallVideoFrame {
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub gap: bool,
     /// The sender's device rotation in quarter turns, clockwise.
+    ///
+    /// Their *device*, not their picture: a camera encodes in its sensor's
+    /// orientation whatever the phone is doing, so the frame arrives already
+    /// turned by this much and whoever draws it turns it back. Repeating the
+    /// turn instead of undoing it is 180° out at one quarter turn, which
+    /// looks like a peer standing on their head rather than like a sign.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub orientation: u8,
 }

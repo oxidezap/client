@@ -56,14 +56,36 @@ impl Rotation {
         }
     }
 
-    /// The same turn as a count of quarter turns clockwise, which is how a
-    /// call's peer states its device orientation. Anything outside `0..=3` is
-    /// not a rotation, and is drawn as none rather than guessed at.
+    /// A count of quarter turns clockwise. How a call's peer states the
+    /// rotation of their *device* — which is not the turn that draws their
+    /// picture; see [`Rotation::to_upright`]. Anything outside `0..=3` is not
+    /// a rotation, and is left alone rather than guessed at.
+    #[cfg(test)]
     pub(super) fn from_quarter_turns(turns: u8) -> Self {
         match turns {
             1 => Self::Cw90,
             2 => Self::Cw180,
             3 => Self::Cw270,
+            _ => Self::None,
+        }
+    }
+
+    /// The turn that draws a peer's frame the right way up, given the
+    /// `device_orientation` they announced.
+    ///
+    /// Their rotation *undone*, not repeated. A camera encodes in its sensor's
+    /// orientation whatever the device is doing, so the picture arrives
+    /// already turned by however the phone is held, and
+    /// `device_orientation` is the description of that turn rather than a
+    /// correction for it. Applying it again is what put a peer holding their
+    /// phone sideways on their head: one quarter turn the wrong way is 180°
+    /// out, which is the one error a wrong sign can make look like a
+    /// deliberate choice.
+    pub(super) fn to_upright(device_orientation: u8) -> Self {
+        match device_orientation {
+            1 => Self::Cw270,
+            2 => Self::Cw180,
+            3 => Self::Cw90,
             _ => Self::None,
         }
     }
@@ -802,6 +824,48 @@ mod tests {
         assert_eq!(Rotation::from_quarter_turns(3), Rotation::Cw270);
         // Not a rotation: drawn as it arrived rather than turned by a guess.
         assert_eq!(Rotation::from_quarter_turns(9), Rotation::None);
+    }
+
+    /// `device_orientation` says how the *sender* is held, so drawing it
+    /// upright means turning the picture back by that much — the other way.
+    /// Turning it the same way lands a phone on its side at 180°, which is a
+    /// peer standing on their head.
+    #[test]
+    fn a_peers_orientation_is_undone_rather_than_repeated() {
+        assert_eq!(Rotation::to_upright(0), Rotation::None);
+        assert_eq!(Rotation::to_upright(1), Rotation::Cw270);
+        assert_eq!(Rotation::to_upright(2), Rotation::Cw180);
+        assert_eq!(Rotation::to_upright(3), Rotation::Cw90);
+        // Not a rotation: drawn as it arrived rather than turned by a guess.
+        assert_eq!(Rotation::to_upright(9), Rotation::None);
+    }
+
+    /// The property the two of them have to have: a frame turned by the
+    /// sender's own rotation and then by the correction is the frame again.
+    #[test]
+    fn undoing_a_senders_rotation_restores_the_picture() {
+        for turns in 0..4u8 {
+            let (width, height) = (3usize, 2usize);
+            let src = tagged(width, height);
+            let sent = Rotation::from_quarter_turns(turns);
+            let mut once = vec![0u8; src.len()];
+            write_bgra_rotated(&src, width, height, sent, &mut once);
+            let (turned_width, turned_height) = if sent.transposes() {
+                (height, width)
+            } else {
+                (width, height)
+            };
+            let mut back = vec![0u8; src.len()];
+            // Two passes swap the channels twice, so this is the source again.
+            write_bgra_rotated(
+                &once,
+                turned_width,
+                turned_height,
+                Rotation::to_upright(turns),
+                &mut back,
+            );
+            assert_eq!(back, src, "a peer at {turns} quarter turns");
+        }
     }
 
     #[test]

@@ -202,8 +202,7 @@ fn decode_loop(
                 continue;
             }
         };
-        let Some(image) = scratch.render(&picture, Rotation::from_quarter_turns(unit.orientation))
-        else {
+        let Some(image) = scratch.render(&picture, Rotation::to_upright(unit.orientation)) else {
             continue;
         };
         // Whether it is drawn is the window's decision: a stale frame drawn

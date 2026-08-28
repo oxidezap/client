@@ -127,6 +127,13 @@ profile here repeats it deliberately.
   offer or the announcement did and its opening IDR was published nowhere.
   Without that ask the first frame a new decoder sees is a P-frame and the
   pane says "connecting" until the periodic IDR, seconds later.
+- **A peer's orientation describes their device, not their picture.** The
+  camera encodes in the sensor's orientation whatever the phone is doing, so a
+  frame arrives already turned by however it is held and `device_orientation`
+  is the *description* of that turn. Drawing it upright means undoing it —
+  `Rotation::to_upright`, not the turn itself. Applying it again is the one
+  mistake that looks deliberate: at one quarter turn it is 180° out, which
+  reads as a peer standing on their head rather than as a sign error.
 - **A camera is a request, not a state, and requests arrive out of order.**
   Opening one is device work — tens of milliseconds, and a permission prompt
   the first time — so two toggles spawned in order routinely start in the
