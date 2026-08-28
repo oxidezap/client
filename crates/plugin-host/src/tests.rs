@@ -1239,3 +1239,45 @@ fn a_plugin_cannot_name_the_file_that_holds_its_own_approval() {
         "a plugin's settings did not land on everybody's permissions"
     );
 }
+
+/// The filter that decides whether an event is worth building must admit
+/// exactly the events the conversion handles. Two matches that disagree is
+/// the one way this optimisation becomes a plugin silently missing events.
+#[test]
+fn every_converted_event_is_one_the_filter_admits() {
+    let cases: Vec<UiEvent> = vec![
+        message("a@s.whatsapp.net", "hi"),
+        UiEvent::Connected,
+        UiEvent::Disconnected("because".into()),
+        UiEvent::PairSuccess,
+        UiEvent::ChatPresence {
+            chat_jid: "a@s.whatsapp.net".into(),
+            sender_jid: "a@s.whatsapp.net".into(),
+            sender_name: None,
+            composing: None,
+        },
+        UiEvent::CallEnded("c1".into()),
+        UiEvent::CallAccepted("c1".into()),
+    ];
+    for case in cases {
+        assert_eq!(
+            crate::event::kind_of(&case),
+            crate::event::from_session(&case).map(|e| e.kind),
+            "the filter and the conversion disagree about {case:?}"
+        );
+    }
+}
+
+/// A call the peer accepted is a call that was answered. Without it a plugin
+/// watching an outgoing call sees it start and end with nothing in between,
+/// and cannot tell one that connected from one nobody picked up.
+#[test]
+fn a_peer_accepting_our_call_reaches_a_plugin_as_answered() {
+    let event = crate::event::from_session(&UiEvent::CallAccepted("c1".into()))
+        .expect("a call event a plugin can act on");
+    assert_eq!(event.kind, abi::kinds::CALL);
+    assert_eq!(
+        event.get(abi::fields::CALL_EVENT),
+        Some(&crate::event::Value::Int(abi::fields::call::ANSWERED))
+    );
+}

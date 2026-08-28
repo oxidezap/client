@@ -27,6 +27,14 @@ pub struct PluginField {
     _commit: gpui::Subscription,
 }
 
+/// How much text one plugin setting may carry.
+///
+/// Well under the megabyte the daemon caps a request at, because exceeding
+/// that is not a rejected value: the daemon closes the connection, so one
+/// oversized setting would disconnect the window. A plugin setting is a
+/// keyword or a sentence; anything of this size is a mistake either way.
+const MAX_FIELD_BYTES: usize = 64 * 1024;
+
 /// A field's address. Two plugins may both call a widget `keyword`, and one
 /// plugin may draw the same id in two slots.
 ///
@@ -99,6 +107,20 @@ impl WhatsAppApp {
                         // being given.
                         if matches!(event, InputEvent::PressEnter { .. }) {
                             let value = state.read(cx).value().to_string();
+                            // Refused here rather than sent. The daemon caps
+                            // a request at a megabyte and *closes the
+                            // connection* on one that is longer, so somebody
+                            // pasting a document into a plugin's settings
+                            // box would take the whole window's session down
+                            // rather than have one setting rejected.
+                            if value.len() > MAX_FIELD_BYTES {
+                                log::warn!(
+                                    "plugin {commit_plugin}: refusing a {} byte value for `{commit_id}`; \
+                                     the limit is {MAX_FIELD_BYTES}",
+                                    value.len()
+                                );
+                                return;
+                            }
                             app.send_plugin_action(
                                 &commit_plugin,
                                 &commit_id,

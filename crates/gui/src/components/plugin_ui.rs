@@ -107,12 +107,15 @@ fn widget(
                 )))
                 .checked(checked)
                 .disabled(!live)
-                .on_click(move |_, _window, cx| {
+                .on_click(move |now: &bool, _window, cx| {
                     let (plugin, action) = (plugin.clone(), action.clone());
-                    // What the toggle is *now*, which is what the plugin has
-                    // to store: sending back the old state would make every
-                    // press a no-op the second time.
-                    let value = if checked { "0" } else { "1" }.to_string();
+                    // What the switch is *now*, taken from the press rather
+                    // than from the tree it was drawn against. Nothing here
+                    // updates optimistically — the plugin republishes and
+                    // that is the state — so two presses before the answer
+                    // came back both read the same stale `checked` and sent
+                    // the same value twice, and the second click vanished.
+                    let value = if *now { "1" } else { "0" }.to_string();
                     entity.update(cx, |app, cx| {
                         app.send_plugin_action(&plugin, &action, Some(value), slot, cx);
                     });

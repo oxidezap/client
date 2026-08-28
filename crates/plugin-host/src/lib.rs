@@ -286,13 +286,26 @@ impl Plugins {
     /// attached is one conversion and five refcount bumps, not five
     /// conversions — and with none attached, nothing at all.
     pub fn observe(&self, event: &UiEvent) {
-        if self.workers.is_empty() {
+        // Asked before anything is built, because converting is the expensive
+        // half: a receipt clones its whole list of message ids, and an
+        // account's ordinary traffic is receipts and presence. A plugin
+        // subscribed to messages alone paid for every one of them and the
+        // loop then threw the result away — and went on paying after every
+        // plugin had stopped, since a stopped worker stays in this list.
+        let Some(kind) = event::kind_of(event) else {
+            return;
+        };
+        if !self
+            .workers
+            .iter()
+            .any(|w| w.wants(kind) && self.registry.is_running(&w.id))
+        {
             return;
         }
         let Some(event) = event::from_session(event) else {
             return;
         };
-        let kind = event.kind;
+        debug_assert_eq!(event.kind, kind, "the filter and the conversion agree");
         let event = Arc::new(event);
         for worker in &self.workers {
             if !worker.wants(kind) {

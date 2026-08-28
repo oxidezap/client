@@ -247,6 +247,17 @@ pub fn from_session(event: &UiEvent) -> Option<Event> {
             .str(fields::CALL_ID, call_id.clone())
             .int(fields::CALL_EVENT, call::ANSWERED)
             .flag(fields::CALL_IS_VIDEO, *is_video),
+        // The other way a call becomes one people are talking through: the
+        // peer accepted the one *this* side placed. Without it a plugin
+        // watching an outgoing call sees it start and end with nothing in
+        // between, and can never tell a call that connected from one nobody
+        // picked up. It carries no `CALL_IS_VIDEO`, deliberately: what an
+        // outgoing call went out as was said by `OUTGOING`, under the same
+        // id, and answering here from a stanza that does not say would be
+        // inventing it.
+        UiEvent::CallAccepted(call_id) => Event::new(abi::kinds::CALL)
+            .str(fields::CALL_ID, call_id.clone())
+            .int(fields::CALL_EVENT, call::ANSWERED),
         // Both ways a call can stop being one. `CallEndedElsewhere` is the
         // same fact to a plugin, which has no local record to correct.
         UiEvent::CallEnded(call_id) | UiEvent::CallEndedElsewhere(call_id) => {
@@ -255,6 +266,40 @@ pub fn from_session(event: &UiEvent) -> Option<Event> {
                 .int(fields::CALL_EVENT, call::ENDED)
         }
 
+        _ => return None,
+    })
+}
+
+/// Which kind an event will become, without building it.
+///
+/// Asked first, because converting is the expensive half: a receipt clones
+/// its whole list of message ids, and an account's ordinary traffic is
+/// receipts and presence. A plugin subscribed to messages alone would
+/// otherwise pay for every one of them, only for the loop to throw the
+/// result away — and go on paying after every plugin had stopped.
+///
+/// It must answer for exactly the events [`from_session`] converts. The one
+/// test that matters is that they agree, which
+/// `every_converted_event_is_one_the_filter_admits` holds.
+#[must_use]
+pub fn kind_of(event: &UiEvent) -> Option<i32> {
+    Some(match event {
+        UiEvent::MessageReceived { .. } => abi::kinds::MESSAGE,
+        UiEvent::Connected
+        | UiEvent::Disconnected(_)
+        | UiEvent::LoggedOut(_)
+        | UiEvent::QrCode { .. }
+        | UiEvent::PairCode { .. }
+        | UiEvent::PairSuccess => abi::kinds::CONNECTION,
+        UiEvent::ReceiptReceived { .. } => abi::kinds::RECEIPT,
+        UiEvent::ReactionReceived { .. } => abi::kinds::REACTION,
+        UiEvent::ChatPresence { .. } => abi::kinds::PRESENCE,
+        UiEvent::IncomingCall(_)
+        | UiEvent::OutgoingCallStarted { .. }
+        | UiEvent::CallAnswered { .. }
+        | UiEvent::CallAccepted(_)
+        | UiEvent::CallEnded(_)
+        | UiEvent::CallEndedElsewhere(_) => abi::kinds::CALL,
         _ => return None,
     })
 }

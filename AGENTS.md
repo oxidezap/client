@@ -132,7 +132,10 @@ profile here repeats it deliberately.
   (`MAX_MODULE_BYTES`, asked of the file rather than of its contents), and the
   strings an event handle clones into the *host* (`MAX_HANDLES`) — a plugin
   asking for one list element until its fuel runs out would otherwise grow
-  the daemon by far more than the sandbox advertises. A `Store` is not
+  the daemon by far more than the sandbox advertises. `oxi_log` is bounded
+  for the same reason and refused while loading for the other one: writing a
+  line is host I/O that fuel does not price, and a module the loader is about
+  to turn away should leave nothing behind. A `Store` is not
   shareable and a wasm call is synchronous and blocking, so each plugin gets
   an OS thread of its own rather than a runtime task, which would stall the
   accept loop for as long as it ran. wasmi and not wasmtime: no JIT, so
@@ -196,7 +199,13 @@ profile here repeats it deliberately.
   it reads fields through four host functions against a table of constants, so
   a handler that looks at the text and the chat pays for two strings out of an
   event carrying a dozen, and the whole path is cheaper than the JSON one a
-  socket front end already uses. Field ids are constants rather than one
+  socket front end already uses. What a plugin is *handed* is decided before
+  any of it is built, though — `event::kind_of` answers from the session
+  event alone, so a plugin watching messages does not pay for an account's
+  receipts and presence, which are most of its traffic. Two matches that
+  disagree would be a plugin silently missing events, which is what
+  `every_converted_event_is_one_the_filter_admits` exists to refuse. Field
+  ids are constants rather than one
   accessor each, which is what keeps the import surface fixed as the table
   grows: an absent field reads back as its default — the same rule the wire
   holds itself to with `skip_serializing_if` — so adding one is a non-event

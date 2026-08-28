@@ -39,6 +39,13 @@ const MAX_TIMERS: usize = 16;
 /// event carries — the longest is a receipt's message ids.
 const MAX_HANDLES: usize = 4096;
 
+/// How long one line from a plugin may be.
+///
+/// Far under [`abi::MAX_STR`], because a log line is something a person
+/// reads. Writing one is host I/O that fuel does not price, so an unbounded
+/// one is a plugin filling the daemon's log at the speed of its own loop.
+const MAX_LOG_BYTES: i32 = 2048;
+
 /// The shortest timer a plugin may set.
 ///
 /// A floor rather than a fuel charge: fuel is spent inside a call, and a
@@ -509,6 +516,21 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         m,
         abi::imports::LOG,
         |mut c: Caller<'_, Guest>, level: i32, ptr: i32, len: i32| {
+            // Logging is a host effect like any other, so it waits for the
+            // loader to accept the module: a start section calling this
+            // writes into the daemon's log before anything has established
+            // the module is even loadable, and a module the loader goes on to
+            // refuse would leave its lines behind.
+            if c.data().phase == Phase::Loading {
+                return;
+            }
+            // And bounded well below what a string may be. A log line is read
+            // by a person; sixty-four kilobytes of it is not a message, it is
+            // a way to fill a disk the sandbox does not measure — writing it
+            // costs the host I/O that no amount of fuel accounts for.
+            if len > MAX_LOG_BYTES {
+                return;
+            }
             let Ok(line) = read_str(&mut c, ptr, len) else {
                 return;
             };
