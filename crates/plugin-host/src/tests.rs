@@ -1250,18 +1250,45 @@ fn a_plugin_cannot_name_the_file_that_holds_its_own_approval() {
 /// the one way this optimisation becomes a plugin silently missing events.
 #[test]
 fn every_converted_event_is_one_the_filter_admits() {
+    // Every variant `kind_of` admits, because a case it omits is one where
+    // the two matches may drift and a plugin silently stops being told.
     let cases: Vec<UiEvent> = vec![
         message("a@s.whatsapp.net", "hi"),
         UiEvent::Connected,
         UiEvent::Disconnected("because".into()),
+        UiEvent::LoggedOut("because".into()),
+        UiEvent::QrCode {
+            code: "q".into(),
+            timeout_secs: 60,
+        },
+        UiEvent::PairCode {
+            code: "p".into(),
+            timeout_secs: 60,
+        },
         UiEvent::PairSuccess,
+        UiEvent::ReceiptReceived {
+            chat_jid: "a@s.whatsapp.net".into(),
+            message_ids: vec!["MSG1".into()],
+            receipt_type: oxidezap_core::ReceiptType::Read,
+        },
+        UiEvent::ReactionReceived {
+            chat_jid: "a@s.whatsapp.net".into(),
+            message_id: "MSG1".into(),
+            sender: "a@s.whatsapp.net".into(),
+            emoji: "\u{1f44d}".into(),
+        },
         UiEvent::ChatPresence {
             chat_jid: "a@s.whatsapp.net".into(),
             sender_jid: "a@s.whatsapp.net".into(),
             sender_name: None,
             composing: None,
         },
+        UiEvent::CallAnswered {
+            call_id: "c1".into(),
+            is_video: false,
+        },
         UiEvent::CallEnded("c1".into()),
+        UiEvent::CallEndedElsewhere("c1".into()),
         UiEvent::CallAccepted("c1".into()),
     ];
     for case in cases {
@@ -1302,6 +1329,14 @@ fn two_files_cannot_claim_one_plugin_id() {
         wat::parse_str(pong()).expect("valid"),
     )
     .expect("writable");
+    // Two files, or there is nothing here to guard against. On a
+    // case-insensitive filesystem — macOS and Windows, both of which CI runs
+    // — that second write replaced the first, and one id from one file proves
+    // nothing. The collision cannot be built any other way: `plugin_id` does
+    // not fold case, so `Foo.wasm` and `foo.wasm` are already two ids.
+    if std::fs::read_dir(&dir.0).expect("readable").count() < 2 {
+        return;
+    }
 
     let published = Published::default();
     let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);

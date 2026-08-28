@@ -580,16 +580,22 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // by a person; sixty-four kilobytes of it is not a message, it is
             // a way to fill a disk the sandbox does not measure — writing it
             // costs the host I/O that no amount of fuel accounts for.
-            if len > MAX_LOG_BYTES {
+            let Ok(line) = usize::try_from(len) else {
+                return;
+            };
+            if line > MAX_LOG_BYTES as usize {
                 return;
             }
-            // And a budget across the whole call. Silently, past it: a line
-            // saying "you have logged too much" is another line.
+            // And a budget across the whole call, checked against what this
+            // line *needs* rather than against what is already spent: the
+            // latter is a threshold, not a limit, and lets the line that
+            // crosses it through in full. Silently, past it: a line saying
+            // "you have logged too much" is another line.
             let spent = &mut c.data_mut().logged_bytes;
-            if *spent >= MAX_LOG_BYTES_PER_CALL {
+            if line > MAX_LOG_BYTES_PER_CALL.saturating_sub(*spent) {
                 return;
             }
-            *spent += len.max(0) as usize;
+            *spent += line;
             let Ok(line) = read_str(&mut c, ptr, len) else {
                 return;
             };

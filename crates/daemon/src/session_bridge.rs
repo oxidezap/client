@@ -628,8 +628,11 @@ impl Bridge {
         // and with nothing to make it ask again.
         let pending = self.hub.wants_session_events().then(|| event.clone());
         // Kept for the plugins, which are told once the state below is
-        // written; `translate` consumes the event.
-        let observed = event.clone();
+        // written; `translate` consumes the event. Cloned only when there is
+        // somebody to tell: a history load carries every chat with its
+        // messages, a receipt carries a whole list of ids, and the ordinary
+        // account has no plugins at all.
+        let observed = (!self.plugins.is_empty()).then(|| event.clone());
 
         for change in self.translate(event) {
             // A chat that left the store owes nothing and will never be read
@@ -650,7 +653,9 @@ impl Bridge {
         // "connecting"; and one answering a disconnect could slip a command
         // past a check that still said connected. The head start a window
         // gains is a frame, and it costs nothing.
-        self.plugins.observe(&observed);
+        if let Some(observed) = &observed {
+            self.plugins.observe(observed);
+        }
 
         if let Some(event) = pending {
             // The receiver lives as long as the thread, which lives as long as

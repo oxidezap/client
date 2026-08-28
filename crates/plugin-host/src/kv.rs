@@ -145,8 +145,12 @@ impl Kv {
     /// plugin can ask for: it may set a key a million times and still cost
     /// one file.
     pub fn commit(&mut self) {
-        if std::mem::take(&mut self.dirty) {
-            self.flush();
+        if self.dirty {
+            // Cleared only by a write that landed. Taking the flag first
+            // meant a full disk lost the change silently: the map held it,
+            // nothing was dirty any more, and the next restart read back the
+            // older file.
+            self.dirty = !self.flush();
         }
     }
 
@@ -160,12 +164,16 @@ impl Kv {
     /// otherwise leave a truncated file, which is the one case the "start
     /// empty" recovery above turns into silently losing every setting rather
     /// than the last one.
-    fn flush(&mut self) {
+    /// Whether what is held is now on disk.
+    ///
+    /// `true` for a memory-only store: there is nothing it could fail to
+    /// write, so nothing stays pending.
+    fn flush(&mut self) -> bool {
         if self.path.as_os_str().is_empty() {
-            return;
+            return true;
         }
         let Ok(json) = serde_json::to_vec(&self.entries) else {
-            return;
+            return false;
         };
         // Unique per process and thread, like the approvals file's. A fixed
         // name is one two daemons sharing a state directory both write, so
@@ -187,8 +195,10 @@ impl Kv {
                 );
             }
             let _ = std::fs::remove_file(&temp);
+            false
         } else {
             self.complained = false;
+            true
         }
     }
 }
