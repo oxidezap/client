@@ -147,6 +147,9 @@ pub struct Guest {
     /// Set when a subscription named a kind this host does not define, which
     /// the loader turns into a refusal once `oxi_init` returns.
     pub unknown_kinds: bool,
+    /// Set when a declaration named a capability this host does not define,
+    /// which the loader turns into a refusal once `oxi_init` returns.
+    pub unknown_caps: bool,
     pub logged_bytes: usize,
     pub trees_published: usize,
     pub kv: Kv,
@@ -249,8 +252,16 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 return;
             }
             guest.declared = true;
-            // Masked to what exists, for the same reason, and because a bit
-            // the host cannot name is one it could not have shown the user.
+            // Refused, not masked — `caps::ALL` says so: "The host refuses a
+            // request with a bit outside it." Adding a capability does not
+            // bump `VERSION` either, so masking would leave a plugin loaded
+            // and Settings showing only the older subset of the authority it
+            // asked for, which is a consent prompt about the wrong sentence.
+            // Recorded like an unknown kind, and refused by the loader.
+            if mask & !abi::caps::ALL != 0 {
+                guest.unknown_caps = true;
+                return;
+            }
             guest.requested = mask & abi::caps::ALL;
         },
     )?;
@@ -534,10 +545,12 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             let Ok(key) = read_str(&mut c, key, key_len) else {
                 return abi::ABSENT;
             };
-            let Some(value) = c.data().kv.get(&key).map(str::to_owned) else {
-                return abi::ABSENT;
-            };
-            write_str(&mut c, ptr, cap, &value)
+            // Borrowed rather than cloned, the same way a field is read: the
+            // copy would land in host memory, which the limiter does not see
+            // and fuel does not price by size, so a loop over one stored
+            // value — even with `cap == 0`, which copies nothing into the
+            // plugin — is allocation traffic nothing bounds.
+            write_stored(&mut c, &key, ptr, cap)
         },
     )?;
 
@@ -771,30 +784,6 @@ fn write_field(caller: &mut Caller<'_, Guest>, ev: i32, field: i32, ptr: i32, ca
     if cap == 0 {
         return full;
     }
-    let end = cap.min(value.len());
-    let Some(target) = bytes.get_mut(offset..offset + end) else {
-        return abi::outcome::INVALID;
-    };
-    target.copy_from_slice(&value.as_bytes()[..end]);
-    full
-}
-
-fn write_str(caller: &mut Caller<'_, Guest>, ptr: i32, cap: i32, value: &str) -> i32 {
-    let full = i32::try_from(value.len()).unwrap_or(i32::MAX);
-    let Ok(cap) = usize::try_from(cap) else {
-        return abi::outcome::INVALID;
-    };
-    if cap == 0 {
-        // Asking how long it is without a buffer is legitimate, and the one
-        // call a plugin makes when it means to allocate exactly.
-        return full;
-    }
-    let Some(memory) = memory(caller) else {
-        return abi::outcome::INVALID;
-    };
-    let Ok(offset) = usize::try_from(ptr) else {
-        return abi::outcome::INVALID;
-    };
     // Cut at a byte, deliberately, and left to the caller to trim.
     //
     // Stopping at a character boundary here reads as the more careful choice
@@ -804,11 +793,38 @@ fn write_str(caller: &mut Caller<'_, Guest>, ptr: i32, cap: i32, value: &str) ->
     // snprintf contract is that `min(cap, full)` bytes are written; trimming
     // a character the cut split is the reader's job, and the SDK does it.
     let end = cap.min(value.len());
-    if memory
-        .write(&mut *caller, offset, &value.as_bytes()[..end])
-        .is_err()
-    {
+    let Some(target) = bytes.get_mut(offset..offset + end) else {
         return abi::outcome::INVALID;
+    };
+    target.copy_from_slice(&value.as_bytes()[..end]);
+    full
+}
+
+/// Write one of this plugin's stored values into it, copying it only into
+/// the plugin's memory. [`write_field`]'s twin; see it for why.
+fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -> i32 {
+    let Ok(cap) = usize::try_from(cap) else {
+        return abi::outcome::INVALID;
+    };
+    let Some(memory) = memory(caller) else {
+        return abi::outcome::INVALID;
+    };
+    let Ok(offset) = usize::try_from(ptr) else {
+        return abi::outcome::INVALID;
+    };
+
+    let (bytes, guest) = memory.data_and_store_mut(&mut *caller);
+    let Some(value) = guest.kv.get(key) else {
+        return abi::ABSENT;
+    };
+    let full = i32::try_from(value.len()).unwrap_or(i32::MAX);
+    if cap == 0 {
+        return full;
     }
+    let end = cap.min(value.len());
+    let Some(target) = bytes.get_mut(offset..offset + end) else {
+        return abi::outcome::INVALID;
+    };
+    target.copy_from_slice(&value.as_bytes()[..end]);
     full
 }

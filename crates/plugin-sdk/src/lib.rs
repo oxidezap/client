@@ -136,8 +136,15 @@ impl<const N: usize> Text<N> {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
 
-    /// Whether the field was there at all, which is not the same as it being
-    /// non-empty.
+    /// Whether the host answered with a value rather than `ABSENT`.
+    ///
+    /// Not a way to tell a present empty string from an absent one: the ABI's
+    /// absence rule is that a field's absence reads back as its default, and
+    /// a string's default *is* empty — so the host reports both the same way,
+    /// deliberately, which is what makes adding a field a non-event for a
+    /// plugin built against an older table. This says only that something was
+    /// there to copy; where a plugin needs "cleared" told apart from "not
+    /// carried", the event has to say so in a field of its own.
     #[must_use]
     pub fn present(&self) -> bool {
         self.present

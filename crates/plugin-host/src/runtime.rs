@@ -139,6 +139,7 @@ impl Runtime {
                 timers: Vec::new(),
                 pending_timers: 0,
                 unknown_kinds: false,
+                unknown_caps: false,
                 logged_bytes: 0,
                 trees_published: 0,
                 kv,
@@ -213,6 +214,16 @@ impl Runtime {
             return Err(anyhow!(
                 "it subscribed to an event kind this host does not define; it was built \
                  against a newer ABI"
+            ));
+        }
+        // And the same for a capability. Refusing matters more here: the
+        // masked-off remainder is what Settings would show somebody, so a
+        // plugin loaded this way asks for consent to a sentence shorter than
+        // the one it wrote.
+        if store.data().unknown_caps {
+            return Err(anyhow!(
+                "it asked for a capability this host does not define; it was built against \
+                 a newer ABI"
             ));
         }
 

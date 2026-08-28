@@ -36,6 +36,8 @@ pub struct Kv {
     /// Set once a write has failed, so a full disk is reported once rather
     /// than on every key a plugin touches afterwards.
     complained: bool,
+    /// What the entries weigh, kept as a running total. See [`Kv::size`].
+    bytes: usize,
     /// Whether anything has changed since the last write.
     ///
     /// A `set` no longer writes; [`commit`](Self::commit) does, once, after
@@ -75,6 +77,7 @@ impl Kv {
         };
         Self {
             path,
+            bytes: Self::size(&entries),
             entries,
             complained: false,
             dirty: false,
@@ -91,6 +94,7 @@ impl Kv {
         Self {
             path: PathBuf::new(),
             entries: BTreeMap::new(),
+            bytes: 0,
             complained: false,
             dirty: false,
         }
@@ -116,25 +120,31 @@ impl Kv {
             return false;
         }
         if value.is_empty() {
-            if self.entries.remove(key).is_some() {
+            if let Some(old) = self.entries.remove(key) {
+                self.bytes = self.bytes.saturating_sub(old.len() + key.len());
                 self.dirty = true;
             }
             return true;
         }
+        // Asked first, and cheaply: writing a value that is already there
+        // would rewrite the file for nothing, and a toggle redrawn on every
+        // event does exactly that. Before the budget, because the budget used
+        // to walk the whole map — so a plugin storing the same value in a
+        // loop paid a full scan per call, which for a store of thousands of
+        // small keys is host work no fuel accounts for.
+        if self.entries.get(key).is_some_and(|v| v == value) {
+            return true;
+        }
         // Measured against what the store would become, not what it is: a
         // plugin at the limit must not be able to grow one more key past it.
+        // Kept incrementally rather than recomputed, for the same reason.
         let replacing = self.entries.get(key).map_or(0, |v| v.len() + key.len());
-        let after = self.size().saturating_sub(replacing) + key.len() + value.len();
+        let after = self.bytes.saturating_sub(replacing) + key.len() + value.len();
         if after > MAX_BYTES {
             return false;
         }
-        if self.entries.get(key).is_some_and(|v| v == value) {
-            // Writing a value that is already there would rewrite the file
-            // for nothing, and a toggle redrawn on every event does exactly
-            // that.
-            return true;
-        }
         self.entries.insert(key.to_owned(), value.to_owned());
+        self.bytes = after;
         self.dirty = true;
         true
     }
@@ -154,8 +164,14 @@ impl Kv {
         }
     }
 
-    fn size(&self) -> usize {
-        self.entries.iter().map(|(k, v)| k.len() + v.len()).sum()
+    /// What the entries weigh, computed once when the store is opened.
+    ///
+    /// Kept as a running total afterwards. Recomputing it per write was a
+    /// walk of the whole map on a path a plugin controls: the budget allows
+    /// tens of thousands of small keys, so a short loop turned a handful of
+    /// fixed-price imports into billions of host-side iterations.
+    fn size(entries: &BTreeMap<String, String>) -> usize {
+        entries.iter().map(|(k, v)| k.len() + v.len()).sum()
     }
 
     /// Write the whole map out, atomically.

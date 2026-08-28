@@ -1601,3 +1601,32 @@ fn a_subscription_to_a_kind_this_host_lacks_is_refused() {
         "refused, and its neighbour still loads"
     );
 }
+
+/// `caps::ALL` promises the host refuses a bit outside it, and adding a
+/// capability does not bump `VERSION` — so masking would leave a plugin
+/// loaded with Settings showing a shorter sentence than the one it wrote.
+const ASKS_FOR_THE_FUTURE: &str = r#"(module
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (memory (export "memory") 1)
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    ;; A bit far above anything this ABI defines, beside one that exists.
+    (call $caps (i64.const 1099511627784))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param i32) (param i32) (result i32) (i32.const 0))
+)"#;
+
+#[test]
+fn a_capability_this_host_lacks_is_refused() {
+    let dir = TempDir::new("future-cap");
+    dir.plugin("ahead", &versioned(ASKS_FOR_THE_FUTURE));
+    dir.plugin("autoreply", &pong());
+
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(
+        plugins.ids(),
+        vec!["autoreply"],
+        "refused rather than loaded asking for less than it wrote"
+    );
+}

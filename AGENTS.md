@@ -812,6 +812,13 @@ screen, with the title above the glass and the pair code below it.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
+- **A plugin cannot tell "cleared" from "not carried".** The ABI's absence
+  rule is that a field's absence reads back as its default, and a string's
+  default is empty — which is exactly what makes adding a field a non-event,
+  and exactly why a reaction that was *removed* (an empty emoji) and a text
+  field committed empty arrive indistinguishable from a field the event never
+  had. Smuggling the difference into string presence would break the rule for
+  every reader; carrying it needs a field that says so.
 - **A plugin never sees what this process sends.** `kinds::MESSAGE` is what
   *arrives*, including a message this account wrote on another device — but a
   send made through this daemon is announced as an id assignment, not as a
