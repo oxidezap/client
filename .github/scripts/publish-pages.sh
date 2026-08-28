@@ -34,12 +34,36 @@
 # is no longer where we found it, and the whole read-modify-write runs again
 # against the new tip. Nothing is serialized, nothing is cancelled, and the
 # last writer wins by re-reading rather than by overwriting.
+#
+# # Why the last writer is not necessarily the newest build
+#
+# The lease answers "has anyone else written here", and that is a different
+# question from "is what I am about to write still the newest thing to say".
+# A run whose source ref advanced while it was building holds a stale bundle;
+# it will happily fetch the newer run's tip, build its tree on it, and push
+# with that very tip as its lease. Every check passes and the live site rolls
+# back — and stays rolled back, because nothing after it is wrong.
+#
+# Asking an API "am I still the tip" cannot close that: the answer is read
+# before the push and can go out of date in between. Narrowing the gap is not
+# closing it. So the ordering is written into the branch instead, one number
+# per target under `.publish/`, and read from the same tree the lease is taken
+# on: a publish that finds a *higher* number there is looking at work newer
+# than its own and stands down. The decision and the compare-and-swap then
+# see the same state, which is what makes it a decision rather than a guess.
+#
+# The number is `GITHUB_RUN_NUMBER`, which is monotonic per workflow, and
+# every publisher here is the same workflow. Re-running an old run keeps its
+# number, so a deliberate re-run of a superseded build stands down rather than
+# republishing — which is the behaviour worth having by default, and the
+# reason a rollback is a revert rather than a re-run.
 set -euo pipefail
 
 # Flags in any order, because two of the three call sites pass both and the
 # positional version silently ignored whichever came second.
 remove=false
 precondition=''
+ordinal=''
 while [ $# -gt 0 ]; do
     case "$1" in
         --remove)
@@ -55,6 +79,12 @@ while [ $# -gt 0 ]; do
         # one reopened while its teardown is in flight. Asking once before the
         # loop would not close either window — the gap is between the question
         # and the push — so the question belongs inside.
+        # Which publish this is, in the order they were started. See the
+        # note on the marker below.
+        --ordinal)
+            ordinal="${2:?--ordinal needs a number}"
+            shift 2
+            ;;
         --only-if)
             precondition="${2:?--only-if needs a command}"
             shift 2
@@ -66,6 +96,12 @@ while [ $# -gt 0 ]; do
 done
 
 target="${1:?a target directory is required}"
+: "${ordinal:?--ordinal is required: without it there is no way to tell an older publish from a newer one}"
+
+# What this target is called in the marker: `site` for the page itself,
+# `pr-12` for a preview. One claim per target, because the site and every
+# preview are separate subtrees of one branch and none of them orders another.
+slug=$(printf '%s' "$target" | sed -e 's:/*$::' -e 's:^\.$:site:' -e 's:/:-:g')
 
 : "${GH_TOKEN:?a token is required to push}"
 : "${GITHUB_REPOSITORY:?}"
@@ -129,6 +165,25 @@ else
     had=''
 fi
 
+# Read from the tree we just fetched, which is the tree the lease is taken
+# against: whatever is here is what the push would replace. A higher number
+# is somebody else's newer work, and overwriting it is the rollback this
+# exists to prevent.
+#
+# An unreadable or absent claim is no claim — the first publish makes one, and
+# a corrupted one should not wedge publishing for good.
+held=0
+if [ -f "$work/.publish/$slug" ]; then
+    held=$(cat "$work/.publish/$slug")
+    case "$held" in
+        '' | *[!0-9]*) held=0 ;;
+    esac
+fi
+if [ "$held" -gt "$ordinal" ]; then
+    echo "a newer publish ($held) already holds $target; standing down"
+    exit 0
+fi
+
 if [ "$remove" = true ]; then
     if [ ! -d "$work/$target" ]; then
         echo "nothing to remove at $target"
@@ -146,7 +201,7 @@ else
         # down with it. `rm -rf .` is refused by `rm` anyway, which is what
         # first made this case visible.
         find "$work" -mindepth 1 -maxdepth 1 \
-            ! -name .git ! -name pr -exec rm -rf {} +
+            ! -name .git ! -name pr ! -name .publish -exec rm -rf {} +
         cp -R "$bundle_dir/." "$work/"
     else
         rm -rf "${work:?}/$target"
@@ -167,6 +222,16 @@ if [ -z "$(git -C "$work" status --porcelain)" ] \
     exit 0
 fi
 
+# Claimed after the tree is built and only when the tree actually differs, so
+# that a run which had nothing to say leaves the previous claim standing: what
+# orders these is the newest *content*, not the newest run to look.
+#
+# A removal claims too. Without it a publish still in flight from before the
+# pull request closed would find no claim, put the preview back, and leave it
+# there for good — the teardown is a single event and does not come again.
+mkdir -p "$work/.publish"
+printf '%s\n' "$ordinal" > "$work/.publish/$slug"
+
 # One commit, no parent: see the note at the top.
 git -C "$work" checkout -q --orphan published
 git -C "$work" add -A
@@ -175,7 +240,11 @@ git -C "$work" commit -q -m "$message"
 if git -C "$work" push -q \
     --force-with-lease="refs/heads/$branch${had:+:$had}" \
     origin "published:$branch"; then
-    echo "published $target to $branch"
+    if [ "$remove" = true ]; then
+        echo "removed $target from $branch"
+    else
+        echo "published $target to $branch"
+    fi
     exit 0
 fi
 

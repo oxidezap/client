@@ -258,6 +258,7 @@ jobs:
         run: |
           set -eu
           bash .github/scripts/publish-pages.sh \
+            --ordinal "$GITHUB_RUN_NUMBER" \
             --only-if "sh $RUNNER_TEMP/still-current.sh" "$TARGET"
 
       # If the pull request closed while we were publishing, undo it.
@@ -342,6 +343,7 @@ jobs:
           esac
           CLOSED
           bash .github/scripts/publish-pages.sh \
+            --ordinal "$GITHUB_RUN_NUMBER" \
             --only-if "sh $RUNNER_TEMP/still-closed-now.sh" \
             --remove "$TARGET"
           echo "removed=true" >> "$GITHUB_OUTPUT"
@@ -400,5 +402,6 @@ jobs:
         run: |
           set -eu
           bash .github/scripts/publish-pages.sh \
+            --ordinal "$GITHUB_RUN_NUMBER" \
             --only-if "sh $RUNNER_TEMP/still-closed.sh" \
             --remove "pr/$PR_NUMBER"
