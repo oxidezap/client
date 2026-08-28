@@ -173,8 +173,12 @@ What the web build cannot do, and reports rather than pretends:
   `wasm32-unknown-unknown`. Clips keep their thumbnail and say so.
 * **No recording voice notes.** A voice note is Opus, and libopus is C too.
   Playback works, because the browser decodes Opus itself.
-* **No calls.** They ring in the daemon, which is where the microphone was
-  already — a call still works with the window closed, on the desktop.
+* **No picture on a call.** Calls themselves work: they ring in the daemon,
+  which is where the microphone and the codec already were, so a page can
+  place one and answer one like any other front end — and a call still runs
+  with every window closed. What a page cannot do is *decode* the picture, for
+  the same reason it cannot decode a clip, so a video call's panes say the
+  picture needs the desktop app instead of waiting on one that is not coming.
 
 ## Data
 

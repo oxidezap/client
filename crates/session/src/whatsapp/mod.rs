@@ -713,13 +713,12 @@ impl WhatsAppClient {
                 }
                 CallAction::Reject { call_id, .. } => {
                     info!("Call {} rejected by peer", call_id);
-                    calls.forget_offer(call_id);
+                    calls.ended_remotely(call_id);
                     let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                 }
                 CallAction::Terminate { call_id, .. } => {
                     info!("Call {} terminated by peer", call_id);
-                    calls.forget_offer(call_id);
-                    calls.ended_by_peer(call_id);
+                    calls.ended_remotely(call_id);
                     let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                 }
                 _ => {}
@@ -730,12 +729,12 @@ impl WhatsAppClient {
                     missed.call_id,
                     missed.from.observe()
                 );
-                calls.forget_offer(&missed.call_id);
+                calls.ended_remotely(&missed.call_id);
                 let _ = ui_tx.send(UiEvent::CallEnded(missed.call_id.clone()));
             }
             Event::CallEndedElsewhere(ended) => {
                 info!("Call {} handled on another device", ended.call_id);
-                calls.forget_offer(&ended.call_id);
+                calls.ended_remotely(&ended.call_id);
                 let _ = ui_tx.send(UiEvent::CallEndedElsewhere(ended.call_id.clone()));
             }
             Event::Messages(batch) => {

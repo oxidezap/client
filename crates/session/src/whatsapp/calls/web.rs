@@ -41,12 +41,12 @@ impl CallRegistry {
             .remove(call_id);
     }
 
-    /// Nothing to end: a call that was never answered has no local side.
-    ///
-    /// Present so the event pump reads the same on both platforms — the peer
-    /// hanging up is the same event here, and it is the removal above that
-    /// does the work.
-    pub(in crate::whatsapp) fn ended_by_peer(&self, _call_id: &str) {}
+    /// A call that ended without us, which here is only ever a ringing offer
+    /// to forget: a page never answered one, so there is no local side and
+    /// nothing in flight to leave a note for.
+    pub(in crate::whatsapp) fn ended_remotely(&self, call_id: &str) {
+        self.forget_offer(call_id);
+    }
 
     /// Always false: a page opens no camera, so a call becoming live has none
     /// to make drawable and nothing to announce.

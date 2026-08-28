@@ -795,6 +795,15 @@ by definition.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
+- **A failed save says nothing to the person who asked.** On the web a
+  document is fetched before it is handed over, and the browser's transient
+  activation can expire while that happens — the second tap works, because the
+  bytes are cached by then, but the first one just stops. It is logged and
+  nowhere else, because the only user-visible error state the app has is
+  `AppState::Error`, which leaves the connected view and schedules a reconnect:
+  far worse than silence for something this small. What is missing is a
+  transient surface — a toast, a line on the row — and it should be designed
+  once rather than invented for this.
 - **A front end cannot say what went wrong with a command.** `Accepted` means
   the session took it; per-request outcomes would need request ids on more
   than downloads. A failed send arrives as `SendFailed` against the chat, not

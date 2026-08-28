@@ -128,6 +128,20 @@ pub struct CallRegistry {
     video: Arc<std::sync::Mutex<HashMap<String, Arc<VideoLane>>>>,
 }
 
+/// Which side ended a call that had no handle yet.
+///
+/// A handle produced after the fact has to be torn down either way, and the
+/// difference is what goes on the wire: the peer already knows when it was
+/// theirs, and nobody knows when it was ours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::whatsapp) enum Ending {
+    /// Ours: hung up here, so every device the offer rang has to be told.
+    Local,
+    /// Theirs, or another of our devices: saying it again tells nobody
+    /// anything.
+    Remote,
+}
+
 /// What a cancel found to act on.
 pub(in crate::whatsapp) enum Cancelled {
     /// A live call, handed back so the caller can terminate it.
@@ -145,11 +159,14 @@ struct Calls {
     pending: HashMap<String, Arc<WaIncomingCall>>,
     /// Media-live calls by call id.
     active: HashMap<String, Arc<CallHandle>>,
-    /// Ids ended before any handle existed — the UI's placeholder id while
+    /// Calls ended before any handle existed — the UI's placeholder id while
     /// `start_call` is still connecting, or a peer's `<terminate>` arriving
     /// while `accept_call` is opening the microphone. Whichever call is in
     /// flight hangs these up on arrival.
-    cancelled: HashSet<String>,
+    ///
+    /// Keyed to *who* ended it, because the two want different endings and a
+    /// handle that arrives late still has to send one of them. See [`Ending`].
+    cancelled: HashMap<String, Ending>,
     /// Acceptances and placements in flight: no handle exists yet. Opening
     /// the audio devices, opening a camera and connecting the relay all take
     /// time, and an ending arriving in that window has nowhere else to be
@@ -190,15 +207,6 @@ impl CallRegistry {
             .insert(call_id, call);
     }
 
-    /// Forget a ringing offer, however it stopped ringing.
-    pub(in crate::whatsapp) fn forget_offer(&self, call_id: &str) {
-        self.calls
-            .lock()
-            .expect("call registry poisoned")
-            .pending
-            .remove(call_id);
-    }
-
     /// Take a ringing offer for something that is *not* an acceptance.
     ///
     /// A decline needs the offer to reject it, and nothing about it is in
@@ -227,31 +235,32 @@ impl CallRegistry {
         Some(offer)
     }
 
-    /// File an accepted call as live — unless the peer ended it meanwhile.
+    /// File an accepted call as live — unless it ended meanwhile.
     ///
-    /// `false` means the window has already been told the call is over, so
-    /// the handle is not filed and the caller hangs it up locally. Both
-    /// answers leave `in_flight` empty for this id.
+    /// `Some(ending)` means the window has already been told the call is
+    /// over, so the handle is not filed and the caller ends it — in the way
+    /// that ending calls for. Both answers leave `in_flight` empty for this
+    /// id.
     pub(in crate::whatsapp) fn finish_accept(
         &self,
         call_id: &str,
         handle: &Arc<CallHandle>,
-    ) -> bool {
+    ) -> Option<Ending> {
         let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.in_flight.remove(call_id);
-        if calls.cancelled.remove(call_id) {
-            return false;
+        if let Some(ending) = calls.cancelled.remove(call_id) {
+            return Some(ending);
         }
         calls.active.insert(call_id.to_string(), Arc::clone(handle));
-        true
+        None
     }
 
-    /// An acceptance that produced no handle. Says whether the peer had
+    /// An acceptance that produced no handle. Says whether somebody had
     /// already ended it, so a caller knows whether anyone is still ringing.
     pub(in crate::whatsapp) fn abandon_accept(&self, call_id: &str) -> bool {
         let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.in_flight.remove(call_id);
-        calls.cancelled.remove(call_id)
+        calls.cancelled.remove(call_id).is_some()
     }
 
     /// Whether this call has already been ended by somebody else.
@@ -266,7 +275,7 @@ impl CallRegistry {
             .lock()
             .expect("call registry poisoned")
             .cancelled
-            .contains(call_id)
+            .contains_key(call_id)
     }
 
     /// Mark an outgoing call as being placed, under the id the window drew.
@@ -294,7 +303,8 @@ impl CallRegistry {
         calls.in_flight.remove(placeholder);
         // Either name: the window cancels under the placeholder, and anything
         // that learned the real id first cancels under that.
-        let cancelled = calls.cancelled.remove(placeholder) | calls.cancelled.remove(call_id);
+        let cancelled = calls.cancelled.remove(placeholder).is_some()
+            | calls.cancelled.remove(call_id).is_some();
         if cancelled {
             return false;
         }
@@ -324,14 +334,24 @@ impl CallRegistry {
     /// is decided under the same lock the handle would be filed under: an
     /// acceptance in flight will produce one after this returns, so the news
     /// is left where that acceptance is guaranteed to look for it.
-    pub(in crate::whatsapp) fn ended_by_peer(&self, call_id: &str) {
+    ///
+    /// One method for every event that means "this call is over and it was
+    /// not us": a peer's `<terminate>` or `<reject>`, an offer that stopped
+    /// ringing, another of our devices taking it. They differ in what the
+    /// window is told and in nothing else, and each of them used to say only
+    /// half of this — the offer forgotten, the acceptance in flight not — so
+    /// an accept still opening its microphone would file a live handle behind
+    /// a card every window had already cleared, leaving audible call with
+    /// nothing to end it.
+    pub(in crate::whatsapp) fn ended_remotely(&self, call_id: &str) {
         let mut calls = self.calls.lock().expect("call registry poisoned");
+        calls.pending.remove(call_id);
         if let Some(handle) = calls.active.remove(call_id) {
             tokio::spawn(async move { handle.hangup_local().await });
             return;
         }
         if calls.in_flight.contains(call_id) {
-            calls.cancelled.insert(call_id.to_string());
+            calls.cancelled.insert(call_id.to_string(), Ending::Remote);
         }
     }
 
@@ -385,10 +405,25 @@ impl CallRegistry {
             return Cancelled::Live(handle);
         }
         if calls.in_flight.contains(call_id) {
-            calls.cancelled.insert(call_id.to_string());
+            calls.cancelled.insert(call_id.to_string(), Ending::Local);
             return Cancelled::Deferred;
         }
         Cancelled::Nothing
+    }
+
+    /// What a pending ending says, for tests.
+    ///
+    /// The real reader is [`Self::finish_accept`], which consumes it and
+    /// needs a `CallHandle` to be given one — a type nothing outside the
+    /// media stack can build.
+    #[cfg(test)]
+    pub(in crate::whatsapp) fn ending_for(&self, call_id: &str) -> Option<Ending> {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .cancelled
+            .get(call_id)
+            .copied()
     }
 
     /// Mark an acceptance in flight without an offer, for tests.
@@ -794,12 +829,23 @@ impl WhatsAppClient {
                     // one nobody could see or end. The check and the
                     // registration are one operation under one lock; as two
                     // steps there is a gap in which a hangup does neither.
-                    if !calls.finish_accept(&call_id, &handle) {
+                    if let Some(ending) = calls.finish_accept(&call_id, &handle) {
                         info!("Call {} was hung up while its media came up", call_id);
                         if let Some(local) = local {
                             local.stop().await;
                         }
-                        log_termination(&call_id, handle.terminate().await);
+                        match ending {
+                            // Ours: the offer rang somewhere, and every device
+                            // it rang is still ringing until it is told.
+                            Ending::Local => {
+                                log_termination(&call_id, handle.terminate().await);
+                            }
+                            // Theirs, or another of our devices. Answering a
+                            // `<terminate>` with one of our own says nothing
+                            // they do not already know; only the local media
+                            // task and this handle are left to drop.
+                            Ending::Remote => handle.hangup_local().await,
+                        }
                         return;
                     }
                     info!("Call {} media live", handle.call_id());
@@ -1786,7 +1832,7 @@ mod tests {
     fn a_peer_ending_a_call_mid_acceptance_is_not_lost() {
         let calls = CallRegistry::default();
         calls.mark_accepting("call-1");
-        calls.ended_by_peer("call-1");
+        calls.ended_remotely("call-1");
 
         assert!(
             calls.abandon_accept("call-1"),
@@ -1800,7 +1846,7 @@ mod tests {
     fn a_peer_ending_is_reported_once() {
         let calls = CallRegistry::default();
         calls.mark_accepting("call-1");
-        calls.ended_by_peer("call-1");
+        calls.ended_remotely("call-1");
 
         assert!(calls.abandon_accept("call-1"));
         assert!(
@@ -1809,12 +1855,28 @@ mod tests {
         );
     }
 
+    /// Which side ended it survives the wait, because the two endings are
+    /// different words on the wire: a call the peer ended needs no
+    /// `<terminate>` back, and one we ended has devices still ringing.
+    #[test]
+    fn an_ending_remembers_whose_it_was() {
+        let ours = CallRegistry::default();
+        ours.mark_accepting("call-1");
+        assert!(matches!(ours.cancel("call-1"), Cancelled::Deferred));
+        assert_eq!(ours.ending_for("call-1"), Some(Ending::Local));
+
+        let theirs = CallRegistry::default();
+        theirs.mark_accepting("call-2");
+        theirs.ended_remotely("call-2");
+        assert_eq!(theirs.ending_for("call-2"), Some(Ending::Remote));
+    }
+
     /// Nothing is recorded when no acceptance is in flight, or the set would
     /// grow by one entry for every call that simply rang and stopped.
     #[test]
     fn an_ending_with_nothing_in_flight_records_nothing() {
         let calls = CallRegistry::default();
-        calls.ended_by_peer("call-1");
+        calls.ended_remotely("call-1");
 
         calls.mark_accepting("call-1");
         assert!(

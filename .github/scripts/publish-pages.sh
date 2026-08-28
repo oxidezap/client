@@ -216,21 +216,27 @@ fi
 # looks for it.
 touch "$work/.nojekyll"
 
-if [ -z "$(git -C "$work" status --porcelain)" ] \
-    && git -C "$work" rev-parse --verify -q HEAD >/dev/null; then
-    echo "nothing changed"
-    exit 0
-fi
-
-# Claimed after the tree is built and only when the tree actually differs, so
-# that a run which had nothing to say leaves the previous claim standing: what
-# orders these is the newest *content*, not the newest run to look.
+# Claimed before anything asks whether this publish is a no-op, and that
+# order is the point. Claiming only when the bundle differs looked thriftier
+# and left a hole: a newer run that happens to build byte-identical output —
+# a revert, a rebuild — would exit with the *old* number still standing, and
+# a slower run from before it, carrying different output, would then read that
+# old claim, pass the check, and publish over the newer one. The claim is
+# content, and it has to move whenever the run that owns the branch moves.
 #
 # A removal claims too. Without it a publish still in flight from before the
 # pull request closed would find no claim, put the preview back, and leave it
 # there for good — the teardown is a single event and does not come again.
 mkdir -p "$work/.publish"
 printf '%s\n' "$ordinal" > "$work/.publish/$slug"
+
+# Nothing to say *and* nothing to claim: the same run publishing the same
+# bundle again, which is a re-run rather than a race.
+if [ -z "$(git -C "$work" status --porcelain)" ] \
+    && git -C "$work" rev-parse --verify -q HEAD >/dev/null; then
+    echo "nothing changed"
+    exit 0
+fi
 
 # One commit, no parent: see the note at the top.
 git -C "$work" checkout -q --orphan published
