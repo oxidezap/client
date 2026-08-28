@@ -163,13 +163,23 @@ jobs:
             echo "url=https://${{ github.repository_owner }}.github.io/$repo/" >> "$GITHUB_OUTPUT"
           fi
 
-      # Only the publishing script: this job does not build anything, and a
-      # full checkout would just be another copy of the tree to keep out of
-      # the way of the branch it is about to rewrite.
+      # The script comes from the *base* branch, never from the pull request.
+      #
+      # This job holds `contents: write`, and the head of a pull request is
+      # code its author controls: checking the script out from there would let
+      # a contributor rewrite it to ignore `TARGET` and replace the published
+      # site, or push to any other ref the token can reach. What the pull
+      # request is allowed to influence is the bundle it built, and only where
+      # this workflow — the base branch's copy of it — decides to put it.
+      #
+      # Only the publishing script, too: this job builds nothing, and a full
+      # checkout would just be another tree to keep out of the way of the
+      # branch it is about to rewrite.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -202,10 +212,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # From the base branch, for the same reason the publish job does: this
+      # one holds `contents: write` too.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
+          ref: ${{ github.event.pull_request.base.sha }}
       - name: Remove the preview
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

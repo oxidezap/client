@@ -190,15 +190,15 @@ async fn serve(
     }
     let origin = request.origin.clone();
 
-    // A browser asks before it fetches media from another origin.
-    if request.method == "OPTIONS" {
-        return respond(stream.get_mut(), 204, "text/plain", origin.as_deref(), b"").await;
-    }
-
-    // Before either route, and before the origin is even consulted: this is
-    // what makes the port as private as the socket beside it. A `404` rather
-    // than a `403` — an endpoint another account on this machine cannot open
-    // has no reason to confirm it is there.
+    // Before every route and before the preflight, which is a route like any
+    // other: a `204` to an `OPTIONS` nobody could have authenticated is this
+    // endpoint confirming it is here to an account that may not open it. A
+    // browser sends the preflight to the same URL as the request it is
+    // asking about, token and all, so there is nothing to exempt.
+    //
+    // This is what makes the port as private as the socket beside it. A `404`
+    // rather than a `403`: an endpoint the caller may not open has no reason
+    // to say it exists.
     if !request.token_matches(config) {
         log::warn!("refusing a web request with no valid token");
         return respond(
@@ -209,6 +209,11 @@ async fn serve(
             b"nothing here",
         )
         .await;
+    }
+
+    // A browser asks before it fetches media from another origin.
+    if request.method == "OPTIONS" {
+        return respond(stream.get_mut(), 204, "text/plain", origin.as_deref(), b"").await;
     }
 
     if request.path == WEB_SOCKET_PATH {

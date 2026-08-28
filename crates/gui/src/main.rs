@@ -134,27 +134,10 @@ fn open_the_window() {
 
     let application = application().with_assets(assets::Assets);
 
-    // Two ways to start, and the difference is who owns the run loop.
-    //
-    // On a desktop `Platform::run` blocks for the life of the process, and
-    // `Application::run`'s own stack frame is what keeps the app alive. In a
-    // browser the run loop is the browser's: `run` invokes the launch
-    // callback and returns immediately, so the app would be dropped on the
-    // way out of this function — which showed up as a canvas that never
-    // appeared and one line reading "app was released". `run_embedded` is
-    // gpui's answer for exactly that shape, and the handle it returns is what
-    // holds the app.
-    #[cfg(not(target_family = "wasm"))]
-    application.run(launch);
-
-    #[cfg(target_family = "wasm")]
-    {
-        // Leaked deliberately: the page *is* the process here, so the app
-        // lives until the tab closes and there is nothing left to hand it
-        // back to. Dropping the handle would release the app, which is the
-        // bug this replaced.
-        std::mem::forget(application.run_embedded(launch));
-    }
+    // Who owns the run loop is a platform question, and it is answered
+    // beneath `platform/` like every other one: a desktop blocks here for the
+    // life of the process and a page hands the loop back to the browser.
+    crate::platform::run(application, launch);
 }
 
 /// The application, before it is given anything to draw.

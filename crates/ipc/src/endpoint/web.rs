@@ -207,9 +207,17 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
             } else {
                 // A daemon that accepts the connection and never completes
                 // the handshake would otherwise have this grow for as long as
-                // the front end kept asking. The connection is already broken
-                // by this point; dropping is what lets it be noticed.
-                log::warn!("dropping a frame: the daemon socket has not opened");
+                // the front end kept asking. The connection is over, and it
+                // ends here rather than losing frames one at a time: the
+                // caller was already told the frame was sent, and a request
+                // it is tracking would then wait for an answer nothing can
+                // produce. Ending it is what runs `Frames::finish`, which
+                // fails every one of them at once and lets the views that
+                // asked ask again.
+                let _ = inbound.send(FromSocket::Closed(
+                    "the daemon accepted the connection but never opened it".to_string(),
+                ));
+                break;
             }
         }
         // The sender was dropped, or a write failed: either way this
