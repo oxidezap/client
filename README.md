@@ -100,7 +100,8 @@ Then open <http://127.0.0.1:8080>.
 A WebSocket is not subject to the same-origin policy, so any page open in
 your browser can try to reach `ws://127.0.0.1` — and this one carries your
 message history and can send. It therefore refuses to bind anywhere but
-loopback, and it refuses every browser origin you have not named:
+loopback, and it refuses every browser origin except the ones you name and
+`localhost`, which is built in:
 
 ```bash
 # Serve a page published somewhere else — a Pages deployment, say.
@@ -139,8 +140,9 @@ local history, which is exactly what the in-app "pair again" action does.
 * Voice calls only. The library's call facade is 1:1 audio, so video calls,
   group calls and output-device selection are drawn but disabled.
 * Spacing does not yet follow the rem scale, so the UI ignores base-font zoom.
-* The web build is the window only, and needs a daemon running on the same
-  machine; see [the web front end](#the-web-front-end) for what it drops.
+* The web build is the window only. It reaches a daemon on your own machine
+  directly, and one elsewhere only through a tunnel you set up; see [the web
+  front end](#the-web-front-end) for what it drops.
 
 ## License
 

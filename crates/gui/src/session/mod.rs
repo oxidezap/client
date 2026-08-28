@@ -274,6 +274,41 @@ impl Session {
         }
     }
 
+    /// [`Self::connect`], on whichever thread can carry it.
+    ///
+    /// Off the UI thread on a desktop: connecting there can mean starting a
+    /// daemon and waiting for it to listen, which is a spinner rather than a
+    /// frozen window only if it happens somewhere else.
+    ///
+    /// On the *window's own* thread in a browser, and that is not a
+    /// preference. gpui's background executor is a real worker there, and a
+    /// worker has no `window` — so the socket's URL would silently ignore the
+    /// page's `?daemon=`, and every media fetch afterwards would fail for
+    /// want of somewhere to fetch from. There is nothing to move off the
+    /// thread anyway: a page cannot start a daemon, and its socket opens
+    /// asynchronously, so this returns immediately.
+    ///
+    /// Here rather than at the call site, because *where a connection opens*
+    /// is the same question as *how* one opens and belongs in the same
+    /// module: a second platform decision in the app is a second place every
+    /// new target has to be taught about.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect`].
+    pub async fn attach(cx: &mut gpui::AsyncApp) -> std::io::Result<(Self, Events)> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            use gpui::AppContext as _;
+            cx.background_spawn(async { Self::connect() }).await
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = cx;
+            Self::connect()
+        }
+    }
+
     /// The parts every transport supplies, assembled.
     fn new(link: Link, events: EventSink, media: Arc<dyn MediaCache>) -> Self {
         Self {

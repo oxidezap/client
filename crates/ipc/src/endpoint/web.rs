@@ -127,10 +127,11 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
     // for the life of the page, and the front end reconnects — so every
     // dropped connection would leave four more behind. These live exactly as
     // long as the task below, which is exactly as long as the socket.
+    // Each is bound to what its own block produces rather than declared
+    // empty and filled in: a binding that is written before it is ever read
+    // is one the compiler is right to call out, and there is no second
+    // assignment for these to be waiting on.
     let mut callbacks: Vec<Closure<dyn FnMut()>> = Vec::new();
-    let mut message_callback: Option<Closure<dyn FnMut(MessageEvent)>> = None;
-    let mut close_callback: Option<Closure<dyn FnMut(CloseEvent)>> = None;
-    let mut error_callback: Option<Closure<dyn FnMut(web_sys::Event)>> = None;
 
     {
         let held_socket = socket.clone();
@@ -150,7 +151,7 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
         callbacks.push(opened);
     }
 
-    {
+    let message_callback = {
         let inbound = inbound.clone();
         let message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             // Text only. The daemon speaks JSON and a binary frame would be
@@ -164,10 +165,10 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
             }
         });
         socket.set_onmessage(Some(message.as_ref().unchecked_ref()));
-        message_callback = Some(message);
-    }
+        message
+    };
 
-    {
+    let close_callback = {
         let inbound = inbound.clone();
         let closed = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
             let reason = event.reason();
@@ -179,10 +180,10 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
             let _ = inbound.send(FromSocket::Closed(detail));
         });
         socket.set_onclose(Some(closed.as_ref().unchecked_ref()));
-        close_callback = Some(closed);
-    }
+        closed
+    };
 
-    {
+    let error_callback = {
         // `onerror` carries nothing useful in a browser — the event is
         // deliberately opaque, so a page cannot probe the network with it —
         // and `onclose` always follows. Logging it is all there is to do.
@@ -190,8 +191,8 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
             log::warn!("the daemon socket reported an error; waiting for the close");
         });
         socket.set_onerror(Some(failed.as_ref().unchecked_ref()));
-        error_callback = Some(failed);
-    }
+        failed
+    };
 
     // The one place the socket is written from. Everything else queues.
     spawn_local(async move {

@@ -157,6 +157,17 @@ impl AudioPlayer {
         self.state.borrow().is_playing
     }
 
+    /// Whether a clip has been accepted but is not making sound yet.
+    ///
+    /// `play` returns while `decodeAudioData` is still a promise, so there is
+    /// a stretch where the user has pressed play and `is_playing` is false.
+    /// Anything that follows playback has to treat that as active or it
+    /// stops before the clip it was following has begun.
+    #[must_use]
+    pub fn is_loading(&self) -> bool {
+        self.state.borrow().is_loading()
+    }
+
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.state.borrow().finished
@@ -309,6 +320,15 @@ impl AudioPlayer {
                 }
                 Err(e) => {
                     warn!("the browser could not decode this clip: {e:?}");
+                    // The same check the success path makes, and for a
+                    // sharper reason: `give_up` finishes the run and takes
+                    // the completion sender, so an abandoned clip's failure
+                    // would end the clip playing *now* and leave its node
+                    // running with nothing holding a handle to it.
+                    if state.borrow().generation != generation {
+                        log::debug!("dropping a failed decode the user moved on from");
+                        return;
+                    }
                     give_up(&state);
                 }
             }

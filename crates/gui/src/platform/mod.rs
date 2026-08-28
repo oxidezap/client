@@ -8,6 +8,8 @@
 
 pub mod clock;
 pub mod download;
+pub mod identity;
 pub mod prefs;
 
 pub use clock::{sleep, with_timeout};
+pub use identity::front_end_id;

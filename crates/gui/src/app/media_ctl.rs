@@ -163,7 +163,12 @@ impl WhatsAppApp {
     ///
     /// Position is read from the player rather than counted here, so a late
     /// or dropped frame costs smoothness and never accuracy. Stops as soon as
-    /// nothing is playing.
+    /// nothing is playing — or is *about* to be: on the web a clip is handed
+    /// to the browser to decode and `play` returns before there is any sound,
+    /// so a tick that asked only whether audio was playing ended on its first
+    /// pass and left the button, the clock and the waveform frozen for the
+    /// whole note. `is_loading` is that gap, and it is false everywhere the
+    /// decoder is synchronous.
     pub(super) fn ensure_playback_tick(&mut self, cx: &mut Context<Self>) {
         if self.playback_tick.is_some() {
             return;
@@ -173,14 +178,14 @@ impl WhatsAppApp {
                 // ~15fps: the playhead only has to look continuous, and a
                 // voice note is not worth a frame-rate repaint of the list.
                 crate::platform::sleep(std::time::Duration::from_millis(66)).await;
-                let playing = entity.update(cx, |app, cx| {
+                let running = entity.update(cx, |app, cx| {
                     let playing = app.audio_player.is_playing();
                     if playing {
                         cx.notify();
                     }
-                    playing
+                    playing || app.audio_player.is_loading()
                 });
-                match playing {
+                match running {
                     Ok(true) => continue,
                     Ok(false) | Err(_) => break,
                 }

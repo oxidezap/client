@@ -88,6 +88,16 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
     Ok((session, rx))
 }
 
+/// How long a frame's whole media sideband may take.
+///
+/// Per frame rather than per key, which is the only bound that holds: each
+/// fetch carries a timeout of its own, and a history load names a hundred
+/// photos, so a stalled sideband would otherwise spend a hundred of those in
+/// a row — the better part of an hour with every state frame behind it
+/// waiting in the channel. What is not here by then is not lost, only late:
+/// the renderer offers the download instead.
+const FRAME_MEDIA_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Pull down every payload this frame names.
 ///
 /// Sequentially, and deliberately: a history load names a hundred photos, and
@@ -95,11 +105,22 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
 /// pool rather than one that draws sooner. A key that will not come is not an
 /// error — the renderer falls back to offering the download, which is what it
 /// does for media the daemon never cached either.
+///
+/// Under one deadline for all of them, so the sequence cannot multiply a
+/// stall by the number of keys; see [`FRAME_MEDIA_BUDGET`].
 async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched) {
-    for key in frames::media_keys(message) {
-        match web::fetch_media(base, &key).await {
-            Ok(bytes) => into.put(key, bytes),
-            Err(e) => log::debug!("media {key} is not available: {e}"),
+    let all = async {
+        for key in frames::media_keys(message) {
+            match web::fetch_media(base, &key).await {
+                Ok(bytes) => into.put(key, bytes),
+                Err(e) => log::debug!("media {key} is not available: {e}"),
+            }
         }
+    };
+    if crate::platform::with_timeout(all, FRAME_MEDIA_BUDGET)
+        .await
+        .is_none()
+    {
+        log::debug!("this frame's media did not arrive within its budget");
     }
 }

@@ -392,76 +392,6 @@ async fn download_with_timeout(
     .ok_or_else(|| "Download timed out".to_string())?
 }
 
-/// Open the connection, on whichever thread can open one.
-///
-/// Off the UI thread on a desktop: connecting there can mean starting a
-/// daemon and waiting for it to listen, which is a spinner rather than a
-/// frozen window only if it happens somewhere else.
-///
-/// On the *window's own* thread in a browser, and that is not a preference.
-/// gpui's background executor is a real worker there, and a worker has no
-/// `window` — so the socket's URL would silently ignore the page's
-/// `?daemon=`, and every media fetch afterwards would fail for want of
-/// something to fetch from. There is nothing to move off the thread anyway:
-/// a page cannot start a daemon, and its socket opens asynchronously, so
-/// this returns immediately.
-async fn attach(cx: &mut gpui::AsyncApp) -> std::io::Result<(Session, crate::session::Events)> {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        cx.background_spawn(async { Session::connect() }).await
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        let _ = cx;
-        Session::connect()
-    }
-}
-
-/// What distinguishes this front end from another one on the same daemon.
-///
-/// A process id on the desktop, where two windows are two processes. Two tabs
-/// are *one* process — and on the web, one that reports the same id in every
-/// tab — so a random number stands in there: without it two tabs starting
-/// their counters at zero would mint the same optimistic id within a
-/// millisecond of each other, and the daemon broadcasts every assignment to
-/// both, so one tab's send would rename or dedup the other's bubble.
-///
-/// Drawn once and kept, because it names the tab rather than the message.
-fn front_end_id() -> u64 {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        u64::from(std::process::id())
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        use portable_atomic::AtomicU64;
-        use std::sync::atomic::Ordering;
-
-        static TAB: AtomicU64 = AtomicU64::new(0);
-        let known = TAB.load(Ordering::Relaxed);
-        if known != 0 {
-            return known;
-        }
-        // The browser's own generator: seeded properly, and already reached
-        // for by everything under `wacore` that needs randomness.
-        let mut bytes = [0u8; 8];
-        // A tab that cannot be told apart from another is worse than one
-        // whose number is a clock reading, so a refused draw still produces
-        // something rather than zero.
-        let drawn = match getrandom::fill(&mut bytes) {
-            Ok(()) => u64::from_le_bytes(bytes),
-            Err(e) => {
-                log::warn!("no randomness for this tab's id ({e}); using the clock");
-                wacore::time::now_millis().cast_unsigned()
-            }
-        };
-        // Never zero, which is the "not drawn yet" marker.
-        let drawn = drawn | 1;
-        TAB.store(drawn, Ordering::Relaxed);
-        drawn
-    }
-}
-
 /// A name for media the sender never named.
 ///
 /// The message id keeps two photos from the same conversation out of each
@@ -2102,7 +2032,7 @@ impl WhatsAppApp {
         // A failure routes back to the error screen, where retry stays
         // available.
         self.reconnect_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let connected = attach(cx).await;
+            let connected = Session::attach(cx).await;
             let _ = entity.update(cx, |app, cx| {
                 match connected {
                     Ok((client, ui_rx)) => {
@@ -2201,7 +2131,7 @@ impl WhatsAppApp {
     /// could rename the wrong one), and a timestamp plus a counter collides
     /// across processes: two windows on the same daemon each start their
     /// counter at zero, and the daemon broadcasts every assignment to both.
-    /// [`front_end_id`] is what keeps them apart, and it also namespaces the
+    /// [`crate::platform::front_end_id`] is what keeps them apart, and it also namespaces the
     /// media-cache file a voice note is staged in.
     fn next_local_id(prefix: &str) -> String {
         use portable_atomic::AtomicU64;
@@ -2209,7 +2139,7 @@ impl WhatsAppApp {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         format!(
             "{prefix}_{}_{}_{}",
-            front_end_id(),
+            crate::platform::front_end_id(),
             wacore::time::now_millis(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         )

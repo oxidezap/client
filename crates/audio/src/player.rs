@@ -111,6 +111,14 @@ mod cpal_output {
             self.is_playing.load(Ordering::Relaxed)
         }
 
+        /// Never here: this decoder is synchronous, so `play` returns with the
+        /// clip already loaded or not at all. The browser's is a promise, and
+        /// the callers that follow playback need one question rather than a
+        /// `cfg` — see the web player's own.
+        pub fn is_loading(&self) -> bool {
+            false
+        }
+
         /// How far through the clip playback is, in `0.0..=1.0`.
         ///
         /// Zero when nothing is loaded, so a caller can render a progress bar

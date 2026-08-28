@@ -212,7 +212,14 @@ impl WhatsAppApp {
             observe_str(&recipient_jid)
         );
 
-        let placeholder_call_id = format!("ui-call-{}", wacore::time::now_millis());
+        // Named the way an optimistic bubble is, and for the same reason: a
+        // clock reading alone is one id per millisecond for the whole
+        // machine, and two tabs are one process. Both would draw the same
+        // placeholder, the daemon would accept one call and refuse the other
+        // as busy — against an id it had already given the live one — and the
+        // refusal would erase the surviving call's record while its own
+        // rename became impossible to tell from the rejected attempt's.
+        let placeholder_call_id = Self::next_local_id("ui-call");
         let call = OutgoingCall::new(
             placeholder_call_id.clone(),
             recipient_jid.clone(),
