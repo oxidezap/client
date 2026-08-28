@@ -41,11 +41,33 @@ const QUEUE_DEPTH: usize = 2;
 /// say to it.
 pub struct CameraStream {
     frames: async_channel::Receiver<EncodedFrame>,
-    control: Arc<Control>,
+    control: CameraControl,
     /// Kept so a caller can wait for the device to be released. Dropping the
     /// stream asks the thread to stop; joining is what proves it has.
     thread: Option<std::thread::JoinHandle<()>>,
     quality: VideoQuality,
+}
+
+/// The two things a caller can say to a running camera, detached from the
+/// camera itself.
+///
+/// A handle rather than an `Arc<CameraStream>`, because the stream is what
+/// *owns* the capture thread: a second owner would mean closing the device is
+/// a matter of dropping the last reference, and nothing could then wait for
+/// the thread to let go of it. This is the half that can be shared with a
+/// task freely.
+#[derive(Clone, Default)]
+pub struct CameraControl(Arc<Control>);
+
+impl CameraControl {
+    /// Ask for the next frame to be a keyframe.
+    ///
+    /// The peer says so through RTCP when it has lost the stream, and the
+    /// only useful answer is an IDR — resending the same P-frames it could
+    /// not decode is not one.
+    pub fn request_keyframe(&self) {
+        self.0.keyframe.store(true, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -73,13 +95,10 @@ impl CameraStream {
         self.quality
     }
 
-    /// Ask for the next frame to be a keyframe.
-    ///
-    /// The peer says so through RTCP when it has lost the stream, and the
-    /// only useful answer is an IDR — resending the same P-frames it could
-    /// not decode is not one.
-    pub fn request_keyframe(&self) {
-        self.control.keyframe.store(true, Ordering::Relaxed);
+    /// The shareable half: what a task driving the call may say to the
+    /// device without owning it.
+    pub fn control(&self) -> CameraControl {
+        self.control.clone()
     }
 
     /// Stop the camera and wait for the device to be closed.
@@ -93,7 +112,7 @@ impl CameraStream {
     }
 
     fn shut_down(&mut self) {
-        self.control.stop.store(true, Ordering::Relaxed);
+        self.control.0.stop.store(true, Ordering::Relaxed);
         // The producer selects on nothing: closing the channel is what stops
         // it blocking on a send to a receiver that is going away.
         self.frames.close();
@@ -128,14 +147,14 @@ pub fn open(quality: VideoQuality) -> Result<CameraStream> {
     });
 
     let (frames_tx, frames_rx) = async_channel::bounded(QUEUE_DEPTH);
-    let control = Arc::new(Control::default());
+    let control = CameraControl::default();
     // The open happens on the capture thread — some backends bind the device
     // to the thread that opened it — so the result comes back over a
     // rendezvous rather than being returned directly.
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
     let thread = {
-        let control = Arc::clone(&control);
+        let control = Arc::clone(&control.0);
         std::thread::Builder::new()
             .name("oxidezap-camera".to_string())
             .spawn(move || run(quality, &control, &frames_tx, &ready_tx))
@@ -233,7 +252,43 @@ struct Opened {
     quality: VideoQuality,
 }
 
+/// A mode every webcam has had for twenty years, for a camera whose closest
+/// match to what was asked for is one a peer could not decode.
+const FALLBACK: VideoQuality = VideoQuality {
+    width: 640,
+    height: 480,
+    fps: 15,
+    bitrate_kbps: 600,
+};
+
+/// Open the camera at something a video call may actually offer.
+///
+/// The mode a backend picks is *near* what was asked for, not what was asked
+/// for: a camera with no 720p20 answers with whatever it does have, and that
+/// can be 1080p — past the Level 3.1 a call is bounded by — or a frame rate
+/// that does not divide the RTP clock, which would silently truncate the
+/// timestamp stride and drift the stream against its own timestamps. So the
+/// mode that came back is checked like any other input, and a camera that
+/// cannot meet it is asked again for something every device has.
 fn start(wanted: VideoQuality) -> Result<Opened> {
+    match start_at(wanted) {
+        Ok(opened) => Ok(opened),
+        Err(first) => {
+            log::warn!(
+                "reopening the camera at {}x{}: {first:#}",
+                FALLBACK.width,
+                FALLBACK.height
+            );
+            start_at(VideoQuality {
+                bitrate_kbps: wanted.bitrate_kbps.min(FALLBACK.bitrate_kbps),
+                ..FALLBACK
+            })
+            .map_err(|second| second.context(format!("{first:#}")))
+        }
+    }
+}
+
+fn start_at(wanted: VideoQuality) -> Result<Opened> {
     let index = configured_device();
     let requested =
         RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(CameraFormat::new(
@@ -262,12 +317,18 @@ fn start(wanted: VideoQuality) -> Result<Opened> {
         FrameFormat::YUYV | FrameFormat::NV12 | FrameFormat::GRAY => Frames::planar(width, height)?,
         _ => Frames::rgb(width, height)?,
     };
+    // What the device actually settled on, held to the same bounds the
+    // requested numbers were: this is what the encoder is configured with and
+    // what the RTP stride is derived from, and neither is a place to discover
+    // that a camera answered with 1080p.
     let quality = VideoQuality {
         width: format.resolution().width(),
         height: format.resolution().height(),
-        fps: format.frame_rate().max(1),
+        fps: format.frame_rate(),
         bitrate_kbps: wanted.bitrate_kbps,
-    };
+    }
+    .checked()
+    .with_context(|| format!("camera {index} opened at a mode a call cannot carry"))?;
     let encoder = H264Encoder::new(quality)?;
     log::info!(
         "camera {index} open: {}x{} @ {} fps, {} in, H.264 out at {} kbps",

@@ -15,7 +15,7 @@ mod camera;
 mod convert;
 mod encoder;
 
-pub use camera::{CameraStream, is_available, open};
+pub use camera::{CameraControl, CameraStream, is_available, open};
 pub use encoder::EncodedFrame;
 
 use nokhwa::utils::FrameFormat;

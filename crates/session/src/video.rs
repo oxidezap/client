@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use log::{debug, warn};
 use oxidezap_core::{CallVideoFrame, VideoStream};
-use oxidezap_video::{CameraStream, EncodedFrame, VideoQuality};
+use oxidezap_video::{CameraControl, CameraStream, EncodedFrame, VideoQuality};
 use whatsapp_rust::voip::{VideoFrame, VideoSource};
 
 /// Where finished frames go on their way to whoever draws them.
@@ -31,6 +31,16 @@ use whatsapp_rust::voip::{VideoFrame, VideoSource};
 /// Bounded and dropped from rather than blocked on: this is a stream, and the
 /// only frame worth having is the newest one.
 pub type VideoFrameSender = tokio::sync::mpsc::Sender<CallVideoFrame>;
+
+/// What is called when the device itself goes away.
+///
+/// A camera can be unplugged, or its backend can fail for good, and the
+/// capture thread then ends on its own. Nothing else notices: the call runs
+/// on, the registry still holds a camera, and every window goes on drawing a
+/// direction that will never produce another frame. A deliberate stop does
+/// not come through here — that path aborts the pump before the channel
+/// closes — so this means exactly "the device is gone".
+pub(crate) type CameraLost = Arc<dyn Fn(String) + Send + Sync>;
 
 /// How many frames may wait for the daemon. Small: a backlog here is latency
 /// the person on screen can see.
@@ -45,7 +55,10 @@ const PLANE_DEPTH: usize = 2;
 /// Held for as long as the local direction is on: dropping it stops the
 /// device.
 pub(crate) struct LocalVideo {
-    camera: Arc<CameraStream>,
+    /// Owned outright, not shared: closing the device is a matter of waiting
+    /// for its thread, and a second owner would leave nothing able to wait.
+    /// What the pump needs is the *control*, which is shareable.
+    camera: CameraStream,
     /// The fan-out task, stopped by dropping the camera's channel.
     pump: tokio::task::JoinHandle<()>,
     id: CallIdSlot,
@@ -76,7 +89,7 @@ impl LocalVideo {
 
     /// Tell the encoder the peer has lost the stream.
     pub(crate) fn request_keyframe(&self) {
-        self.camera.request_keyframe();
+        self.camera.control().request_keyframe();
     }
 
     /// Close the device and wait for the thread to let go of it.
@@ -84,11 +97,14 @@ impl LocalVideo {
     /// Waited for because the next call opens the same camera, and a backend
     /// that still holds it fails that open rather than queueing behind it.
     pub(crate) async fn stop(self) {
+        // Aborting the pump is a request, not a fact — the task may not have
+        // been polled yet — so the device is closed by the owner rather than
+        // by whoever happens to drop the last reference.
         self.pump.abort();
         let camera = self.camera;
-        // On a blocking thread: joining the capture thread waits for the
-        // frame it is asleep in.
-        let _ = tokio::task::spawn_blocking(move || drop(camera)).await;
+        // On a blocking thread: closing waits for the frame the capture
+        // thread is asleep in.
+        let _ = tokio::task::spawn_blocking(move || camera.stop()).await;
     }
 }
 
@@ -128,6 +144,7 @@ impl VideoSource for CameraSource {
 pub(crate) async fn open(
     call_id: CallIdSlot,
     publish: Option<VideoFrameSender>,
+    lost: CameraLost,
 ) -> Result<(LocalVideo, Endpoints), String> {
     let quality = VideoQuality::from_environment();
     let camera = tokio::task::spawn_blocking(move || oxidezap_video::open(quality))
@@ -135,7 +152,6 @@ pub(crate) async fn open(
         .map_err(|e| format!("camera task failed: {e}"))?
         .map_err(|e| format!("{e:#}"))?;
     let stride = camera.quality().timestamp_stride();
-    let camera = Arc::new(camera);
 
     // The encoder's own queue is upstream of this one; this pair is what the
     // media plane and the front end read.
@@ -144,9 +160,11 @@ pub(crate) async fn open(
 
     let pump = tokio::spawn(pump_local(
         Arc::clone(&call_id),
-        Arc::clone(&camera),
+        camera.frames(),
+        camera.control(),
         source_tx,
         publish.clone(),
+        lost,
     ));
     tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publish));
 
@@ -174,11 +192,12 @@ pub(crate) async fn open(
 /// that misses a frame recovers on the next one it does get.
 async fn pump_local(
     call_id: CallIdSlot,
-    camera: Arc<CameraStream>,
+    frames: async_channel::Receiver<EncodedFrame>,
+    camera: CameraControl,
     plane: async_channel::Sender<Vec<u8>>,
     publish: Option<VideoFrameSender>,
+    lost: CameraLost,
 ) {
-    let frames = camera.frames();
     while let Ok(EncodedFrame { data, keyframe }) = frames.recv().await {
         if let Some(publish) = &publish {
             let frame = CallVideoFrame::new(
@@ -200,7 +219,16 @@ async fn pump_local(
             camera.request_keyframe();
         }
     }
-    debug!("local video for {} ended", read(&call_id));
+    // Reached only by the camera's own channel closing, which is the device
+    // ending the stream rather than anyone asking it to: a deliberate stop
+    // aborts this task first. The plane going away is the other way out, and
+    // that one is the call ending, which has its own teardown.
+    let call_id = read(&call_id);
+    debug!("local video for {call_id} ended");
+    if !plane.is_closed() {
+        warn!("the camera on call {call_id} stopped producing frames");
+        lost(call_id);
+    }
 }
 
 /// The peer's picture, on its way to whoever draws it.

@@ -10,12 +10,16 @@
 //! and reads every photo they name off disk, and a call would otherwise put a
 //! frame's decode in front of the conversation the user is scrolling.
 //!
-//! Every queue on the path is one deep and every send is a `try_send`. A
-//! decoder that has fallen behind should skip to the newest unit, not walk a
-//! backlog it will never draw — and a skip is recoverable, because the sender
-//! asks its encoder for a keyframe whenever anything is lost.
+//! The queue in front of each decoder is short and dropped from rather than
+//! blocked on: a decoder that has fallen behind should skip to the newest
+//! unit, not walk a backlog it will never draw. What a drop costs is the
+//! reference chain — every unit after it points at one this decoder never
+//! saw — so a drop is recorded, and the decoder then waits for a keyframe
+//! rather than rendering a second of torn macroblocks over the last good
+//! picture.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};
@@ -81,14 +85,27 @@ impl CallVideo {
     }
 }
 
-/// One direction: a thread, its decoder, and the one-deep queue in front.
+/// How many access units may wait for a decoder.
+///
+/// Deep enough that an ordinary hitch — a frame the window spent long on, a
+/// scheduler that looked elsewhere — costs nothing, and shallow enough that
+/// what waits here is never old enough to be worth less than the next one.
+const QUEUE_DEPTH: usize = 4;
+
+/// One direction: a thread, its decoder, and the short queue in front.
 struct Stream {
     units: std::sync::mpsc::SyncSender<CallVideoFrame>,
+    /// Set when a unit was dropped, read by the decoder. The two are on
+    /// different threads and the drop is what the *decoder* has to know
+    /// about: it is the one whose next unit references something it will
+    /// never have.
+    dropped: Arc<AtomicBool>,
 }
 
 impl Stream {
     fn spawn(call_id: String, stream: VideoStream, frames: FrameSink) -> Self {
-        let (units, queue) = std::sync::mpsc::sync_channel::<CallVideoFrame>(1);
+        let (units, queue) = std::sync::mpsc::sync_channel::<CallVideoFrame>(QUEUE_DEPTH);
+        let dropped = Arc::new(AtomicBool::new(false));
         let name = match stream {
             VideoStream::Local => "oxidezap-selfview",
             VideoStream::Remote => "oxidezap-callvideo",
@@ -96,17 +113,24 @@ impl Stream {
         // A thread that cannot be spawned leaves the queue's receiver dropped,
         // which makes every `accept` a no-op: the call runs without a picture
         // rather than not running.
-        if let Err(e) = std::thread::Builder::new()
-            .name(name.to_string())
-            .spawn(move || decode_loop(&call_id, stream, &queue, &frames))
-        {
+        if let Err(e) = std::thread::Builder::new().name(name.to_string()).spawn({
+            let dropped = Arc::clone(&dropped);
+            move || decode_loop(&call_id, stream, &queue, &frames, &dropped)
+        }) {
             log::error!("no thread for the {stream:?} video of a call: {e}");
         }
-        Self { units }
+        Self { units, dropped }
     }
 
     fn accept(&self, frame: CallVideoFrame) {
-        let _ = self.units.try_send(frame);
+        if self.units.try_send(frame).is_err() {
+            // Not silent: what follows this unit references it, and a
+            // decoder fed the remainder produces a second of torn picture
+            // over the last good one. Waiting for a keyframe instead is a
+            // freeze, which is at least honest — and a short one, because
+            // the sender emits one every few seconds.
+            self.dropped.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -115,6 +139,7 @@ fn decode_loop(
     stream: VideoStream,
     queue: &std::sync::mpsc::Receiver<CallVideoFrame>,
     frames: &FrameSink,
+    dropped: &AtomicBool,
 ) {
     let mut decoder = match Decoder::new() {
         Ok(decoder) => decoder,
@@ -130,6 +155,11 @@ fn decode_loop(
     let mut scratch = Scratch::default();
 
     while let Ok(unit) = queue.recv() {
+        // Something never reached this decoder, so what it holds no longer
+        // matches what the sender encoded against.
+        if dropped.swap(false, Ordering::Relaxed) {
+            started = false;
+        }
         if !started {
             if !unit.keyframe {
                 continue;

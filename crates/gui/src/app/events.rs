@@ -333,10 +333,19 @@ impl WhatsAppApp {
                     if on { "on" } else { "off" }
                 );
             }
-            // A question, and the answer is this side's camera coming on.
-            UiEvent::CallVideoRequested { call_id } => {
-                info!("Call {call_id}: the peer asked to add video");
-                self.call_video_request = Some(call_id);
+            // A question, and the answer is this side's camera coming on —
+            // or the question being withdrawn, which is just as much news:
+            // a request the peer cancelled is one no camera can still answer.
+            UiEvent::CallVideoRequested { call_id, pending } => {
+                info!(
+                    "Call {call_id}: the peer {} video",
+                    if pending {
+                        "asked to add"
+                    } else {
+                        "is no longer asking for"
+                    }
+                );
+                self.note_video_request(call_id, pending);
                 cx.notify();
             }
             UiEvent::OutgoingCallStarted {

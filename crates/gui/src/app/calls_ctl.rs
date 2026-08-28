@@ -120,6 +120,15 @@ impl WhatsAppApp {
         self.call_pictures.of(stream)
     }
 
+    /// The peer asked to add video, or stopped asking.
+    pub(super) fn note_video_request(&mut self, call_id: String, pending: bool) {
+        if pending {
+            self.call_video_request = Some(call_id);
+        } else if self.call_video_request.as_deref() == Some(call_id.as_str()) {
+            self.call_video_request = None;
+        }
+    }
+
     /// Whether the peer is waiting on this side to turn its camera on.
     pub fn call_video_requested(&self) -> bool {
         self.call_video_request.is_some()
@@ -148,10 +157,14 @@ impl WhatsAppApp {
 
     /// One decoded frame, straight onto the pane that draws it.
     pub(super) fn draw_call_frame(&mut self, frame: CallFrame, cx: &mut Context<Self>) {
-        // The socket is one hop behind the state, so a frame can outlive the
-        // call it belongs to. Drawing it into the next call would put the
-        // last person's face on this one.
-        if !self.call_state.holds(&frame.call_id) {
+        // Frames and state travel on different channels, so one can arrive
+        // after the state that ended what it belongs to. Both halves of that
+        // are checked: the call, because drawing it into the next one would
+        // put the last person's face on this one; and the direction, because
+        // `follow` has already cleared the pane for a camera that went off
+        // and a frame still in flight would light it again — for good, since
+        // no later state change would come to clear it a second time.
+        if !self.call_state.holds(&frame.call_id) || !self.call_state.video().is_on(frame.stream) {
             return;
         }
         self.call_pictures.accept(frame);

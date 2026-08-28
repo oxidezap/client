@@ -146,15 +146,22 @@ pub enum UiEvent {
         stream: crate::VideoStream,
         on: bool,
     },
-    /// The peer asked to turn this call into a video one.
+    /// The peer asked to turn this call into a video one — or stopped
+    /// asking.
     ///
     /// Distinct from [`CallVideoChanged`](Self::CallVideoChanged) because
     /// nothing has changed yet: it is a question, and the answer is a person
     /// turning their own camera on (or not). The token that binds an answer
     /// to *this* request stays in the session, which is the only place that
     /// can use it.
+    ///
+    /// `pending: false` withdraws it. A request can be cancelled or time out
+    /// at the peer's end, and a question nobody is asking any more must stop
+    /// being drawn: without this the camera control would go on claiming
+    /// somebody was waiting for the rest of the call.
     CallVideoRequested {
         call_id: CallId,
+        pending: bool,
     },
     /// The call is over here because another of this account's devices
     /// answered or refused it. Not a missed call: the device that took it has

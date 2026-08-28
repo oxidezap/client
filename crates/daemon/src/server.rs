@@ -427,10 +427,14 @@ where
     // already gone, because that looks exactly like a closed channel and the
     // branch below ends the connection on one.
     let mut sessions = attached.session_events.then(|| hub.subscribe_sessions());
-    // The same gate, for the same reason: the count of these receivers is
-    // what tells the session whether to publish video at all, so a client
-    // that draws nothing must not hold one.
-    let mut video = attached.session_events.then(|| hub.subscribe_video());
+    // Gated on having a window, not on wanting events. This is the one
+    // channel whose cost is measured in megabits: a notifier or a tray asks
+    // for session events and has nowhere to put a picture, and subscribing it
+    // would spend a call's whole bitrate serializing frames it parses and
+    // throws away — while delaying the events it did ask for. The count of
+    // these receivers is also what tells the session whether to publish at
+    // all, so a client that draws nothing must not hold one.
+    let mut video = attached.has_window.then(|| hub.subscribe_video());
 
     // Held for the connection's whole life, so the count falls again however
     // this task ends. What it answers is "is there a window to raise": see
