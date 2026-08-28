@@ -32,7 +32,6 @@ use crate::player::PlayerError;
 /// and the node's `ended` — which is why it is an `Rc<RefCell<_>>` rather
 /// than fields on the player: those callbacks outlive the call that armed
 /// them, and one of them fires after the user has already moved on.
-#[derive(Default)]
 struct Playing {
     /// The node that is making sound, if any. Kept so pausing, stopping and
     /// seeking have something to act on.
@@ -58,6 +57,14 @@ struct Playing {
     /// we" without the node being asked, which it cannot be.
     started_at: f64,
     offset: f64,
+    /// What the node that is playing is *actually* running at.
+    ///
+    /// Not `Player::speed`, which is the voice-note speed the person chose
+    /// and outlives any one clip. A video's audio always starts at 1×, so
+    /// with a 2× voice-note setting still in force the elapsed arithmetic
+    /// below counted every second of video twice — pausing five seconds in
+    /// recorded ten, and the resume put the sound ahead of the picture.
+    rate: f64,
     duration: f64,
     is_playing: bool,
     finished: bool,
@@ -84,6 +91,31 @@ struct Playing {
     /// The honest question has one answer and it is this flag.
     decoding: bool,
     completion: Option<oneshot::Sender<()>>,
+}
+
+impl Default for Playing {
+    /// Hand-written for one field. `rate` is a multiplier, and a derived
+    /// `0.0` would make every elapsed calculation return the offset it
+    /// started from — a progress bar that never moves — for the window
+    /// between construction and the first `start`.
+    fn default() -> Self {
+        Self {
+            node: None,
+            ended: None,
+            buffer: None,
+            generation: 0,
+            started_at: 0.0,
+            offset: 0.0,
+            rate: 1.0,
+            duration: 0.0,
+            is_playing: false,
+            finished: false,
+            pending_seek: None,
+            pending_pause: false,
+            decoding: false,
+            completion: None,
+        }
+    }
 }
 
 impl Playing {
@@ -137,12 +169,14 @@ impl AudioPlayer {
                 .as_ref()
                 .map_or(0.0, AudioContext::current_time);
             let mut state = self.state.borrow_mut();
-            state.offset += (now - state.started_at) * f64::from(self.speed);
+            state.offset += (now - state.started_at) * state.rate;
             state.started_at = now;
         }
         self.speed = speed.clamp(0.5, 3.0);
-        if let Some(node) = self.state.borrow().node.as_ref() {
+        let mut state = self.state.borrow_mut();
+        if let Some(node) = state.node.as_ref() {
             node.playback_rate().set_value(self.speed);
+            state.rate = f64::from(self.speed);
         }
     }
 
@@ -227,7 +261,7 @@ impl AudioPlayer {
                 .context
                 .as_ref()
                 .map_or(0.0, AudioContext::current_time);
-            state.offset + (now - state.started_at) * f64::from(self.speed)
+            state.offset + (now - state.started_at) * state.rate
         } else {
             state.offset
         };
@@ -451,7 +485,7 @@ impl AudioPlayer {
             .map_or(0.0, AudioContext::current_time);
         let resume_at = {
             let state = self.state.borrow();
-            (state.offset + (now - state.started_at) * f64::from(self.speed)).min(state.duration)
+            (state.offset + (now - state.started_at) * state.rate).min(state.duration)
         };
         stop_node(&self.state);
         self.state.borrow_mut().offset = resume_at;
@@ -551,6 +585,7 @@ fn start(
     };
     node.set_buffer(Some(buffer));
     node.playback_rate().set_value(speed);
+    state.borrow_mut().rate = f64::from(speed);
     if node
         .connect_with_audio_node(&context.destination())
         .is_err()

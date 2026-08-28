@@ -281,34 +281,58 @@ pub fn endpoint_url() -> String {
             crate::WEB_SOCKET_PATH
         )
     };
-    let Some(asked) = named_daemon() else {
-        return default();
-    };
-    asked
+    match named_daemon() {
+        NamedDaemon::Named(asked) => asked,
+        // A rejected one falls back here on purpose: this function answers
+        // "where would a daemon be", and the caller that must not proceed on a
+        // rejection is the one that matches on [`named_daemon`] itself.
+        NamedDaemon::Nobody | NamedDaemon::Rejected(_) => default(),
+    }
+}
+
+/// What this page was told to attach to.
+///
+/// Three answers, and the third is why this is not an `Option`. "Nobody named
+/// one" is a page that runs its own session; "named one we will not use" is a
+/// configuration error, and collapsing it into the first silently opens a
+/// *different* session — against this origin's own store — for somebody whose
+/// only mistake was a typo in a URL, or whose daemon was refused for exactly
+/// the reason the check exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedDaemon {
+    /// No `daemon` parameter at all.
+    Nobody,
+    /// One named, and usable.
+    Named(String),
+    /// One named, and refused. The string is for a person, and carries no
+    /// token.
+    Rejected(String),
 }
 
 /// The daemon this page was pointed at, if it was pointed at one.
-///
-/// `None` is not an error and not a default: it is a page nobody told to
-/// attach to anything, which is a page that runs its own session. Saying so
-/// separately from [`endpoint_url`] is what lets a front end tell the two
-/// apart — the URL alone cannot, because "nothing named" and "named the
-/// usual place" are the same string.
 #[must_use]
-pub fn named_daemon() -> Option<String> {
-    let asked = query_parameter("daemon")?;
+pub fn named_daemon() -> NamedDaemon {
+    let Some(asked) = query_parameter("daemon") else {
+        return NamedDaemon::Nobody;
+    };
     // A query parameter is whatever put the user on this page, which may be a
     // link somebody sent them. The daemon it names is handed the message
     // history and can be told to send, so an unchecked one turns a link into
     // a way to point the window at somebody else's server.
     match usable_endpoint(&asked) {
-        Ok(()) => Some(asked),
+        Ok(()) => NamedDaemon::Named(asked),
         Err(why) => {
-            // Redacted here too. A rejected URL is the *likeliest* one to be
-            // pasted into an issue — it is the one that did not work — and it
-            // carries the same token the accepted one does.
-            log::error!("ignoring #daemon={}: {why}", without_secrets(&asked));
-            None
+            // Redacted, here and in what is shown. A rejected URL is the
+            // *likeliest* one to be pasted into an issue — it is the one that
+            // did not work — and it carries the same token the accepted one
+            // does.
+            let named = without_secrets(&asked);
+            log::error!("ignoring #daemon={named}: {why}");
+            NamedDaemon::Rejected(format!(
+                "This page was pointed at {named}, which it will not use: {why}. \
+                 Correct the #daemon in the address, or remove it to let this \
+                 page run its own session."
+            ))
         }
     }
 }

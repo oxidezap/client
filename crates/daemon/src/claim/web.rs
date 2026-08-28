@@ -58,19 +58,31 @@ pub(crate) async fn take() -> Result<Claim, String> {
         .navigator();
     let locks = navigator.locks();
 
-    // Granted or refused, decided inside the callback: the lock exists only
-    // for as long as the promise it returns is pending, so holding it means
-    // handing back one that settles when this side lets go.
+    // Granted, refused, or never asked — three answers, because the third one
+    // happens: `navigator.locks.request` can reject *before* it ever calls the
+    // callback (a document that is not fully active, a browser that refuses
+    // lock access at all), and the callback is the only thing that speaks
+    // here. A rejection swallowed there leaves this function waiting on a
+    // sender the closure still holds, for the life of the page — and what the
+    // person sees is a window that never finishes starting, with nothing in
+    // the console and no retry.
     let (release, released) = futures_channel::oneshot::channel::<()>();
-    let (granted, was_granted) = futures_channel::oneshot::channel::<bool>();
+    let (granted, was_granted) = futures_channel::oneshot::channel::<Answer>();
+    // Shared with the rejection path below, so whichever of the two happens
+    // first is the one that answers and the other finds the sender gone.
     let granted = Rc::new(RefCell::new(Some(granted)));
+    let rejected = Rc::clone(&granted);
     let released = Rc::new(RefCell::new(Some(released)));
 
     let callback = Closure::<dyn FnMut(wasm_bindgen::JsValue) -> js_sys::Promise>::new(
         move |lock: wasm_bindgen::JsValue| {
             let held = !lock.is_null() && !lock.is_undefined();
             if let Some(tell) = granted.borrow_mut().take() {
-                let _ = tell.send(held);
+                let _ = tell.send(if held {
+                    Answer::Granted
+                } else {
+                    Answer::Refused
+                });
             }
             let released = released.borrow_mut().take();
             wasm_bindgen_futures::future_to_promise(async move {
@@ -90,19 +102,27 @@ pub(crate) async fn take() -> Result<Claim, String> {
     let options = web_sys::LockOptions::new();
     options.set_if_available(true);
     let request = locks.request_with_options(LOCK, &options, callback.as_ref().unchecked_ref());
-    // The request's own promise settles when the callback's does, so it is
-    // not what says whether we were granted; the callback is, and it has
-    // already spoken by the time the browser has decided.
+    // The request's promise settles when the callback's does, so on the happy
+    // path the callback has already spoken by the time this resolves and the
+    // sender is gone. What is watched for here is the other path: a rejection
+    // that means the callback will never run at all.
     wasm_bindgen_futures::spawn_local(async move {
-        let _ = JsFuture::from(request).await;
+        if let Err(e) = JsFuture::from(request).await
+            && let Some(tell) = rejected.borrow_mut().take()
+        {
+            let _ = tell.send(Answer::Failed(format!("{e:?}")));
+        }
     });
 
     match was_granted.await {
-        Ok(true) => Ok(Claim {
+        Ok(Answer::Granted) => Ok(Claim {
             release: Some(release),
             _held: callback,
         }),
-        Ok(false) => Err(
+        Ok(Answer::Failed(detail)) => Err(format!(
+            "The browser would not give this page a lock on the account: {detail}"
+        )),
+        Ok(Answer::Refused) => Err(
             // A sentence, because it is drawn as one: this is the whole body
             // text of the screen a second tab shows, not a fragment appended
             // after a colon.
@@ -112,4 +132,15 @@ pub(crate) async fn take() -> Result<Claim, String> {
         ),
         Err(_) => Err("The browser did not answer the claim for this account.".to_string()),
     }
+}
+
+/// What the browser said about the claim.
+///
+/// Three, not two. `Refused` is another tab holding it, which is an ordinary
+/// answer with a screen of its own; `Failed` is the request itself rejecting,
+/// which used to be no answer at all.
+enum Answer {
+    Granted,
+    Refused,
+    Failed(String),
 }

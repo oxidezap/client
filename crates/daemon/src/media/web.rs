@@ -77,7 +77,17 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
                 touched,
             },
         );
-        sweep(cache);
+        // Everything but what was just written. A download somebody asked
+        // for can be a document larger than the whole budget, and it is the
+        // newest entry — so a sweep that may take it necessarily takes *it*,
+        // while `put` still returns the key. The bridge then sends a
+        // `Downloaded` naming bytes that are already gone, and the front end
+        // reports a failed download for a file WhatsApp delivered.
+        //
+        // Keeping it does not leak: it still counts toward `reclaimable`, so
+        // it presses older entries out, and the next write sweeps again with
+        // it no longer exempt.
+        sweep(cache, Some(key));
         Ok(key.to_string())
     })
 }
@@ -142,7 +152,7 @@ pub fn wipe(scope: Wipe) -> Result<()> {
 /// send. They are excluded from what is *counted* too — a cache cannot
 /// reclaim what it may not touch, and counting it would make the sweep spin
 /// against a budget it can never reach.
-fn sweep(cache: &mut Cache) {
+fn sweep(cache: &mut Cache, keep: Option<&str>) {
     let reclaimable: u64 = cache
         .entries
         .iter()
@@ -156,7 +166,7 @@ fn sweep(cache: &mut Cache) {
     let mut oldest: Vec<(String, u64, u64)> = cache
         .entries
         .iter()
-        .filter(|(name, _)| !is_staged_upload(name))
+        .filter(|(name, _)| !is_staged_upload(name) && Some(name.as_str()) != keep)
         .map(|(name, entry)| (name.clone(), entry.touched, entry.bytes.len() as u64))
         .collect();
     oldest.sort_by_key(|(_, touched, _)| *touched);

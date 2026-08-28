@@ -43,23 +43,36 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     // to look: this page runs its own. Naming one is how somebody chooses the
     // other arrangement — a desktop daemon holds calls, survives the tab, and
     // keeps the account out of a browser's storage.
-    let Some(url) = web::named_daemon() else {
-        // A preview may not hold an account, and this is the one place that
-        // can refuse: it shares an origin with the deployment — same scheme,
-        // same host, a different directory — and origin-scoped storage does
-        // not know about directories. Unmerged code reading the deployment's
-        // database is not a risk worth a convenience, so a preview is an
-        // attach-only page and says so.
-        if !web::session_allowed_here() {
+    let url = match web::named_daemon() {
+        web::NamedDaemon::Named(url) => url,
+        // Named and refused. Settled like the two below, and for the same
+        // reason: a URL this page will not use is not going to become usable
+        // by being asked again, and starting a session of our own instead
+        // would answer a question nobody asked.
+        web::NamedDaemon::Rejected(why) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "This is a preview build, which does not hold an account by \
+                why,
+            ));
+        }
+        web::NamedDaemon::Nobody => {
+            // A preview may not hold an account, and this is the one place that
+            // can refuse: it shares an origin with the deployment — same scheme,
+            // same host, a different directory — and origin-scoped storage does
+            // not know about directories. Unmerged code reading the deployment's
+            // database is not a risk worth a convenience, so a preview is an
+            // attach-only page and says so.
+            if !web::session_allowed_here() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "This is a preview build, which does not hold an account by \
                  default. Point it at a daemon with #daemon=ws://…, or add \
                  #preview-session to let it keep one in this origin's storage \
                  — the same origin the deployment uses.",
-            ));
+                ));
+            }
+            return super::embedded::connect().await;
         }
-        return super::embedded::connect().await;
     };
     let media_base = web::media_base_url();
     // Without its query, which carries the token. A browser console is the

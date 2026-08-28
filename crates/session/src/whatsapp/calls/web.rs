@@ -55,6 +55,10 @@ impl CallRegistry {
     }
 }
 
+/// Why every call action here says no.
+const CALLS_NEED_THE_DESKTOP: &str =
+    "Calls need the desktop app: a browser has no audio codec for them.";
+
 impl WhatsAppClient {
     /// Refused: answering a call needs the codec.
     ///
@@ -75,8 +79,25 @@ impl WhatsAppClient {
     }
 
     /// Refused: placing a call needs the microphone and the codec.
-    pub fn start_call(&self, _recipient_jid_str: &str, _is_video: bool, placeholder_id: String) {
-        self.refuse_call(&placeholder_id, "placed");
+    ///
+    /// Answered with `OutgoingCallFailed` rather than the shared refusal,
+    /// because that is the event for exactly this: it names the recipient, it
+    /// carries the reason, and the daemon's `fail_outgoing_to` clears the
+    /// stage and brings a parked caller forward. A `CallEnded` would say the
+    /// call finished, which is a different thing from never having been
+    /// placed — and the conversation records the two differently.
+    pub fn start_call(&self, recipient_jid_str: &str, _is_video: bool, _placeholder_id: String) {
+        warn!("a call cannot be placed in a browser: there is no audio codec here");
+        let ui_sender = self.ui_sender.clone();
+        let recipient_jid = recipient_jid_str.to_string();
+        self.exec.spawn(async move {
+            if let Some(tx) = ui_sender.lock().await.as_ref() {
+                let _ = tx.send(UiEvent::OutgoingCallFailed {
+                    recipient_jid,
+                    error: CALLS_NEED_THE_DESKTOP.to_string(),
+                });
+            }
+        });
     }
 
     /// Refused, and harmless: nothing was ever placed to cancel.
@@ -131,16 +152,25 @@ impl WhatsAppClient {
     /// card the moment it asks and watches the state for it to go away. A
     /// refusal that only logged would leave that card up with nothing behind
     /// it and no way to dismiss it.
+    ///
+    /// What it must **not** send is `UiEvent::Error`. The bridge translates
+    /// that one variant into `ConnectionState::Disconnected` — it is the
+    /// session's own "this is over" — so pressing Decline on a call the page
+    /// cannot take used to leave the connected view, drop the chat list and
+    /// start the reconnect path, over a WhatsApp session that was perfectly
+    /// healthy. The refusal is about one call, and the only honest thing to
+    /// end is that call.
+    ///
+    /// The reason therefore reaches the log and nowhere else, which is the
+    /// same gap `AGENTS.md` records for a failed save: this app has no
+    /// transient surface, and the only visible error state it has is the one
+    /// that tears the session down.
     fn refuse_call(&self, call_id: &str, verb: &str) {
         warn!("a call cannot be {verb} in a browser: there is no audio codec here");
         let ui_sender = self.ui_sender.clone();
         let call_id = call_id.to_string();
         self.exec.spawn(async move {
             if let Some(tx) = ui_sender.lock().await.as_ref() {
-                let _ = tx.send(UiEvent::Error(
-                    "Calls need the desktop app: a browser has no audio codec for them."
-                        .to_string(),
-                ));
                 let _ = tx.send(UiEvent::CallEnded(call_id));
             }
         });

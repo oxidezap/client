@@ -930,7 +930,7 @@ impl Bridge {
             return too_busy();
         };
         let bytes = client.download_downloadable_media(media);
-        tokio::spawn(async move {
+        oxidezap_session::spawn(async move {
             let result = match bytes.await {
                 Ok(Ok(bytes)) => crate::media::put(&key, &bytes).map_err(|e| e.to_string()),
                 Ok(Err(e)) => Err(e),
@@ -1201,7 +1201,7 @@ impl Bridge {
 /// handle has resolved. `JoinHandle` errors are the session's runtime going
 /// away, which is a shutdown, not something to report.
 fn hold<const N: usize>(permit: OwnedSemaphorePermit, work: [oxidezap_session::Task<()>; N]) {
-    tokio::spawn(async move {
+    oxidezap_session::spawn(async move {
         for handle in work {
             let _ = handle.await;
         }
@@ -1316,7 +1316,7 @@ fn answer_now(answer_to: &Outbox, frame: String) {
     use tokio::sync::mpsc::error::TrySendError;
     if let Err(TrySendError::Full(frame)) = answer_to.try_send(frame) {
         let outbox = answer_to.clone();
-        tokio::spawn(async move {
+        oxidezap_session::spawn(async move {
             let _ = outbox.send(frame).await;
         });
     }
