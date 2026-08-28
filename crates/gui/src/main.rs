@@ -31,60 +31,8 @@ use crate::app::{WhatsAppApp, init_app_bindings};
 /// function — which is why the platform differences below are `cfg`s inside
 /// it rather than two entry points that would drift.
 fn main() {
-    start_logging();
+    crate::platform::logging();
     open_the_window();
-}
-
-/// Quiet the crates that narrate, and turn on whichever logger this platform
-/// has.
-///
-/// The renderer, the bus and the text shaper all narrate at debug level, and
-/// none of it is about this app. `cosmic_text` in particular reports every
-/// family it walks past while looking for a glyph — "failed to find family
-/// 'FreeSans'" is it working, not it failing, and one message with an unusual
-/// script produces a dozen. Turning `RUST_LOG=debug` on to look at *our* logs
-/// should not bury them.
-#[cfg(not(target_family = "wasm"))]
-fn start_logging() {
-    // An explicit `RUST_LOG` still wins: these are floors for modules the
-    // user did not ask about.
-    let mut logger = env_logger::Builder::new();
-    // Floors first, environment second. A later directive replaces an earlier
-    // one for the same target, so parsing `RUST_LOG` before these turned
-    // `RUST_LOG=cosmic_text=debug` back into `warn` — the one request that
-    // could only have been deliberate was the one that was ignored.
-    for quiet in [
-        "blade_graphics",
-        "naga",
-        "zbus",
-        "tracing",
-        "gpui",
-        "cosmic_text",
-        "wgpu_core",
-        "wgpu_hal",
-        "font_kit",
-    ] {
-        logger.filter_module(quiet, log::LevelFilter::Warn);
-    }
-    logger.parse_env(env_logger::Env::default().default_filter_or("info"));
-    logger.init();
-}
-
-/// The same, for a page.
-///
-/// There is no environment to read a filter out of and no stderr to write to,
-/// so the level is fixed and the destination is the browser's console.
-/// `web_init` also installs the panic hook that turns a Rust panic into a
-/// readable trace rather than "unreachable executed".
-#[cfg(target_family = "wasm")]
-fn start_logging() {
-    // One initializer, not two. `web_init` installs the panic hook that turns
-    // a Rust panic into a readable trace *and* a `log` implementation that
-    // writes to the browser console — and `log` accepts only one, so a second
-    // one after it silently fails and leaves the first one's level in force.
-    // Setting the level afterwards is what actually needs saying.
-    gpui_platform::web_init();
-    log::set_max_level(log::LevelFilter::Info);
 }
 
 fn open_the_window() {
@@ -132,52 +80,12 @@ fn open_the_window() {
         }
     };
 
-    let application = application().with_assets(assets::Assets);
+    let application = crate::platform::application().with_assets(assets::Assets);
 
     // Who owns the run loop is a platform question, and it is answered
     // beneath `platform/` like every other one: a desktop blocks here for the
     // life of the process and a page hands the loop back to the browser.
     crate::platform::run(application, launch);
-}
-
-/// The application, before it is given anything to draw.
-///
-/// A desktop window and a canvas differ in one thing the rest of this file
-/// would rather not know about: the web backend has to be chosen, and it is
-/// worth being able to choose it from the URL when a machine's WebGPU is the
-/// thing that is broken.
-#[cfg(not(target_family = "wasm"))]
-fn application() -> gpui::Application {
-    gpui_platform::application()
-}
-
-#[cfg(target_family = "wasm")]
-fn application() -> gpui::Application {
-    gpui_platform::application_with_web_backend(requested_backend())
-}
-
-/// WebGPU, WebGL, or whichever the browser prefers.
-///
-/// `?backend=webgl` forces the fallback. A page is served to machines nobody
-/// has tested on, and "the window is black" is otherwise unactionable.
-#[cfg(target_family = "wasm")]
-fn requested_backend() -> gpui_platform::WebBackendPreference {
-    let search = web_sys::window()
-        .and_then(|window| window.location().search().ok())
-        .unwrap_or_default();
-    let asked = |name: &str| {
-        search
-            .trim_start_matches('?')
-            .split('&')
-            .any(|parameter| parameter == format!("backend={name}"))
-    };
-    if asked("webgpu") {
-        gpui_platform::WebBackendPreference::WebGpu
-    } else if asked("webgl") {
-        gpui_platform::WebBackendPreference::WebGl
-    } else {
-        gpui_platform::WebBackendPreference::Auto
-    }
 }
 
 /// How big the window opens.

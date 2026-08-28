@@ -41,7 +41,11 @@ use super::sink::{self, Events};
 pub(super) fn connect() -> std::io::Result<(Session, Events)> {
     let url = web::endpoint_url();
     let media_base = web::media_base_url();
-    log::info!("attaching to the daemon at {url}");
+    // Without its query, which carries the token. A browser console is the
+    // one place a person copies output from when they open an issue, and the
+    // daemon already goes to the trouble of never printing this — logging it
+    // here would put it back, on the machine of whoever is asking for help.
+    log::info!("attaching to the daemon at {}", web::without_secrets(&url));
 
     let (link, mut socket) = web::connect(&url).map_err(std::io::Error::other)?;
     let (events, rx) = sink::channel();

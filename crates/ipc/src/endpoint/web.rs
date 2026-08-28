@@ -293,6 +293,17 @@ pub fn endpoint_url() -> String {
     }
 }
 
+/// A URL fit to be written down.
+///
+/// The query is where the token lives, so it is what comes off: everything
+/// that identifies *which* daemon survives, and the credential that admits
+/// you to it does not. Not a parser — a token is only ever in the query, and
+/// splitting there cannot accidentally keep one.
+#[must_use]
+pub fn without_secrets(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
+}
+
 /// Whether a page may attach to this URL without being asked again.
 ///
 /// Two rules. It has to be a WebSocket URL, because anything else is a

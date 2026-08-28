@@ -16,8 +16,24 @@
 # orphan commit holding the whole tree: the previous commit becomes
 # unreachable and its blobs are collectable, and the branch stays one commit
 # deep. Nothing reads `gh-pages` history — it is a publishing surface, not a
-# record — and the workflow serializes on one concurrency group, so there is
-# no second writer whose commit a force-push could drop.
+# record.
+#
+# # Why the push is a compare-and-swap, and not a lock
+#
+# An orphan commit replaces the whole tree, so a plain force-push drops
+# whatever another writer put there between our fetch and our push — a
+# preview published, or one taken down — with no error and no trace.
+#
+# This used to lean on an Actions concurrency group, and that is not a queue:
+# `cancel-in-progress: false` protects the job that is *running*, and a third
+# member joining the group cancels the one that was pending. A deployment
+# could be discarded, and a preview's only close event could be dropped for
+# good. Actions has no FIFO to borrow.
+#
+# So the branch itself is the lock. `--force-with-lease` fails if `gh-pages`
+# is no longer where we found it, and the whole read-modify-write runs again
+# against the new tip. Nothing is serialized, nothing is cancelled, and the
+# last writer wins by re-reading rather than by overwriting.
 set -euo pipefail
 
 remove=false
@@ -35,6 +51,15 @@ branch=gh-pages
 remote="${GITHUB_SERVER_URL#https://}"
 remote="https://x-access-token:${GH_TOKEN}@${remote}/${GITHUB_REPOSITORY}.git"
 
+bundle_dir=$(pwd)/bundle
+
+# Bounded: a retry only happens when somebody else published in the seconds
+# we took, and each attempt makes that less likely rather than more. A run
+# that loses six times in a row is a symptom, not a race to keep running.
+attempts=6
+attempt=1
+while [ "$attempt" -le "$attempts" ]; do
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -44,11 +69,16 @@ git -C "$work" config user.email "41898282+github-actions[bot]@users.noreply.git
 git -C "$work" remote add origin "$remote"
 
 # The branch may not exist yet: the first publish creates it.
+#
+# `had` is what the push is allowed to overwrite. Empty means we found no
+# branch, and the lease then says the ref must still not exist.
 if git -C "$work" fetch -q --depth 1 origin "$branch" 2>/dev/null; then
     git -C "$work" checkout -q FETCH_HEAD
+    had=$(git -C "$work" rev-parse FETCH_HEAD)
     # Detached, and deliberately: the commit below is an orphan either way.
 else
     echo "no $branch yet; creating it"
+    had=''
 fi
 
 if [ "$remove" = true ]; then
@@ -61,7 +91,7 @@ if [ "$remove" = true ]; then
     rmdir "$work/$(dirname "$target")" 2>/dev/null || true
     message="Remove the preview at $target"
 else
-    [ -d bundle ] || { echo "no ./bundle to publish" >&2; exit 1; }
+    [ -d "$bundle_dir" ] || { echo "no ./bundle to publish" >&2; exit 1; }
     if [ "$target" = "." ]; then
         # The site itself. Clear what the last build left, and *keep* `pr/`:
         # publishing main must not take every open pull request's preview
@@ -69,11 +99,11 @@ else
         # first made this case visible.
         find "$work" -mindepth 1 -maxdepth 1 \
             ! -name .git ! -name pr -exec rm -rf {} +
-        cp -R bundle/. "$work/"
+        cp -R "$bundle_dir/." "$work/"
     else
         rm -rf "${work:?}/$target"
         mkdir -p "$work/$target"
-        cp -R bundle/. "$work/$target/"
+        cp -R "$bundle_dir/." "$work/$target/"
     fi
     message="Publish $target from ${GITHUB_SHA:-a build}"
 fi
@@ -83,15 +113,28 @@ fi
 # looks for it.
 touch "$work/.nojekyll"
 
-cd "$work"
-if [ -z "$(git status --porcelain)" ] && git rev-parse --verify -q HEAD >/dev/null; then
+if [ -z "$(git -C "$work" status --porcelain)" ] \
+    && git -C "$work" rev-parse --verify -q HEAD >/dev/null; then
     echo "nothing changed"
     exit 0
 fi
 
 # One commit, no parent: see the note at the top.
-git checkout -q --orphan published
-git add -A
-git commit -q -m "$message"
-git push -q --force origin "published:$branch"
-echo "published $target to $branch"
+git -C "$work" checkout -q --orphan published
+git -C "$work" add -A
+git -C "$work" commit -q -m "$message"
+
+if git -C "$work" push -q \
+    --force-with-lease="refs/heads/$branch${had:+:$had}" \
+    origin "published:$branch"; then
+    echo "published $target to $branch"
+    exit 0
+fi
+
+echo "$branch moved while we were building the tree; re-reading (attempt $attempt)" >&2
+rm -rf "$work"
+attempt=$((attempt + 1))
+done
+
+echo "gave up after $attempts attempts: $branch is changing faster than a publish takes" >&2
+exit 1

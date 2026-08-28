@@ -126,20 +126,15 @@ jobs:
           path: web/dist
           retention-days: 1
 
+  # No concurrency group, deliberately. Actions concurrency is not a queue:
+  # `cancel-in-progress: false` protects the job that is running, and a third
+  # member joining cancels the one that was pending — which for a preview's
+  # single close event means it is never taken down at all. The serialization
+  # lives in `publish-pages.sh` instead, as a `--force-with-lease` against the
+  # tip it read, retried against the new one. Two publishes racing cost a
+  # retry; none of them cost a lost update, and nothing is ever cancelled for
+  # having waited.
   publish:
-    # Serialized on the branch being published to, not on the ref being built:
-    # two runs pushing to `gh-pages` at once is a lost update, and a preview
-    # and a release can finish at the same moment. Not `cancel-in-progress`,
-    # because a half-finished publish is a broken site.
-    #
-    # On the jobs that push, not on the workflow: at workflow scope a build
-    # held this lock too, so one pull request's wasm build — twenty minutes of
-    # it — stalled every other build, every deployment and every preview
-    # removal, including for fork pull requests that are refused the push
-    # anyway. Nothing but these two touches the shared branch.
-    concurrency:
-      group: pages-publish
-      cancel-in-progress: false
     name: Publish
     needs: build
     # Same-repository only. A pull request from a fork is given a read-only
@@ -275,19 +270,6 @@ jobs:
   # A preview is only worth having if it goes away. The directory is removed
   # when the pull request closes, merged or not.
   take-down:
-    # Serialized on the branch being published to, not on the ref being built:
-    # two runs pushing to `gh-pages` at once is a lost update, and a preview
-    # and a release can finish at the same moment. Not `cancel-in-progress`,
-    # because a half-finished publish is a broken site.
-    #
-    # On the jobs that push, not on the workflow: at workflow scope a build
-    # held this lock too, so one pull request's wasm build — twenty minutes of
-    # it — stalled every other build, every deployment and every preview
-    # removal, including for fork pull requests that are refused the push
-    # anyway. Nothing but these two touches the shared branch.
-    concurrency:
-      group: pages-publish
-      cancel-in-progress: false
     name: Take the preview down
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
