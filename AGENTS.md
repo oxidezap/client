@@ -55,7 +55,12 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   reason it never learns that small screens do.
 
 A front end depends on ipc/core/audio and never on session: there is exactly
-one WhatsApp session per user, and it lives in the daemon.
+one WhatsApp session per user, and it lives in the daemon. On the web it
+depends on the *daemon* as well, and that is the same rule rather than an
+exception to it — a page has no process to reach one in, so it starts one in
+its own address space through `daemon::embedded`. The session is still the
+daemon's, the window still owns none of it, and the protocol between them is
+the protocol a socket carries everywhere else.
 
 ## Build & verify
 

@@ -6188,6 +6188,7 @@ dependencies = [
  "openh264",
  "oxidezap-audio",
  "oxidezap-core",
+ "oxidezap-daemon",
  "oxidezap-ipc",
  "portable-atomic",
  "qrcode",

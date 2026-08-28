@@ -35,6 +35,13 @@ enum Inner {
     /// A queue into the task that owns the socket. See [`crate::web`].
     #[cfg(target_family = "wasm")]
     Socket(tokio::sync::mpsc::UnboundedSender<String>),
+    /// A queue into the task that owns a pipe to a daemon in this process.
+    ///
+    /// The same shape as the socket above and a different framing: a pipe is
+    /// a byte stream and carries the terminator, a WebSocket is messages and
+    /// already has one.
+    #[cfg(target_family = "wasm")]
+    Pipe(tokio::sync::mpsc::UnboundedSender<String>),
 }
 
 impl Link {
@@ -52,6 +59,13 @@ impl Link {
     #[must_use]
     pub fn over_socket(outgoing: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
         Self(Inner::Socket(outgoing))
+    }
+
+    /// A link over the queue feeding a pipe to a daemon in this process.
+    #[cfg(target_family = "wasm")]
+    #[must_use]
+    pub fn over_pipe(outgoing: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
+        Self(Inner::Pipe(outgoing))
     }
 
     /// Send one frame.
@@ -82,6 +96,19 @@ impl Link {
                     std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "the daemon connection is closed",
+                    )
+                })
+            }
+            #[cfg(target_family = "wasm")]
+            Inner::Pipe(outgoing) => {
+                let mut line = std::str::from_utf8(frame)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                    .to_string();
+                line.push('\n');
+                outgoing.send(line).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "the session in this page has stopped",
                     )
                 })
             }

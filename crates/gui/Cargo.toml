@@ -88,6 +88,13 @@ openh264 = "0.9" # H.264 software decoder
 # so the dependency differs only in the features a browser has no use for —
 # there is no font-kit, no X11 and no Wayland behind a canvas.
 [target.'cfg(target_family = "wasm")'.dependencies]
+# The daemon, as a library, because in a page it is not a process: there is no
+# socket to reach one over and nothing to start. `embedded::start` is the same
+# state hub, bridge and protocol a desktop front end talks to across a socket,
+# running in this address space — so the rule this looks like it breaks holds
+# exactly as before. There is one session per user, and the window owns none
+# of it.
+oxidezap-daemon = { workspace = true }
 # One tab has to be able to tell itself apart from another; see `front_end_id`.
 getrandom = { workspace = true }
 js-sys = "0.3"

@@ -21,6 +21,8 @@
 //! come from. Everything a caller of this module touches — every method on
 //! [`Session`] — is written once and never learns which side it is on.
 
+#[cfg(target_family = "wasm")]
+mod embedded;
 mod frames;
 mod media;
 #[cfg(not(target_family = "wasm"))]

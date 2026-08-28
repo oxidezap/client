@@ -39,7 +39,13 @@ use super::sink::{self, Events};
 /// arrives as a close on the event stream, which the front end already
 /// handles as a lost connection and retries.
 pub(super) fn connect() -> std::io::Result<(Session, Events)> {
-    let url = web::endpoint_url();
+    // Nobody named a daemon, so there is nothing to attach to and no reason
+    // to look: this page runs its own. Naming one is how somebody chooses the
+    // other arrangement — a desktop daemon holds calls, survives the tab, and
+    // keeps the account out of a browser's storage.
+    let Some(url) = web::named_daemon() else {
+        return super::embedded::connect();
+    };
     let media_base = web::media_base_url();
     // Without its query, which carries the token. A browser console is the
     // one place a person copies output from when they open an issue, and the

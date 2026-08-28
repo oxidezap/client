@@ -55,6 +55,7 @@ log = "0.4"
 oxidezap-audio = { path = "crates/audio" }
 oxidezap-chat-store = { path = "crates/chat-store" }
 oxidezap-core = { path = "crates/core" }
+oxidezap-daemon = { path = "crates/daemon" }
 oxidezap-ipc = { path = "crates/ipc" }
 oxidezap-session = { path = "crates/session" }
 oxidezap-video = { path = "crates/video" }

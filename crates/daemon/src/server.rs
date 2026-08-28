@@ -5,14 +5,16 @@
 //! through [`StateHub`], which is what keeps two clients from racing each
 //! other into an inconsistent view.
 
+#[cfg(not(target_family = "wasm"))]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use oxidezap_ipc::{
     CallAction, ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, Request, RequestId,
-    endpoint_path, lock_path, state_dir,
 };
+#[cfg(not(target_family = "wasm"))]
+use oxidezap_ipc::{endpoint_path, lock_path, state_dir};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf,
     WriteHalf,
@@ -160,12 +162,15 @@ fn is_transient_accept_error(e: &std::io::Error) -> bool {
     ) || matches!(e.raw_os_error(), Some(EMFILE | ENFILE))
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Out of descriptors, for this process and for the machine. Spelled out
 /// because neither has an `std::io::ErrorKind`: both land in
 /// `Uncategorized`, which is unstable to match on.
 const EMFILE: i32 = 24;
+#[cfg(not(target_family = "wasm"))]
 const ENFILE: i32 = 23;
 
+#[cfg(not(target_family = "wasm"))]
 /// Tell a client we are full, then close.
 ///
 /// Public because the web bridge refuses the same way and for the same
@@ -189,6 +194,7 @@ pub(crate) fn too_many_clients_frame() -> Result<String> {
     error_frame(None, ProtocolError::TooManyClients { limit: MAX_CLIENTS })
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) async fn reject<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
     log::warn!("refusing a client: already serving {MAX_CLIENTS}");
     let (_, mut writer) = tokio::io::split(stream);
@@ -197,6 +203,7 @@ pub(crate) async fn reject<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// An exclusive lock on this user's daemon, released when the file closes.
 struct StartupLock {
     _file: std::fs::File,
@@ -254,7 +261,7 @@ fn acquire_startup_lock(path: &Path) -> Result<StartupLock> {
     Ok(StartupLock { _file: file })
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(not(any(unix, windows)), not(target_family = "wasm")))]
 fn acquire_startup_lock(_path: &Path) -> Result<StartupLock> {
     anyhow::bail!("no way to take a startup lock on this platform")
 }
@@ -320,7 +327,7 @@ fn current_uid() -> u32 {
     rustix::process::getuid().as_raw()
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_family = "wasm")))]
 fn prepare_state_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
 }

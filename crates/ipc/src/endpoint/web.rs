@@ -281,21 +281,34 @@ pub fn endpoint_url() -> String {
             crate::WEB_SOCKET_PATH
         )
     };
-    let Some(asked) = query_parameter("daemon") else {
+    let Some(asked) = named_daemon() else {
         return default();
     };
+    asked
+}
+
+/// The daemon this page was pointed at, if it was pointed at one.
+///
+/// `None` is not an error and not a default: it is a page nobody told to
+/// attach to anything, which is a page that runs its own session. Saying so
+/// separately from [`endpoint_url`] is what lets a front end tell the two
+/// apart — the URL alone cannot, because "nothing named" and "named the
+/// usual place" are the same string.
+#[must_use]
+pub fn named_daemon() -> Option<String> {
+    let asked = query_parameter("daemon")?;
     // A query parameter is whatever put the user on this page, which may be a
     // link somebody sent them. The daemon it names is handed the message
     // history and can be told to send, so an unchecked one turns a link into
     // a way to point the window at somebody else's server.
     match usable_endpoint(&asked) {
-        Ok(()) => asked,
+        Ok(()) => Some(asked),
         Err(why) => {
             // Redacted here too. A rejected URL is the *likeliest* one to be
             // pasted into an issue — it is the one that did not work — and it
             // carries the same token the accepted one does.
             log::error!("ignoring #daemon={}: {why}", without_secrets(&asked));
-            default()
+            None
         }
     }
 }
