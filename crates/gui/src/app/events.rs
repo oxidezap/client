@@ -17,7 +17,11 @@ impl WhatsAppApp {
                 self.ensure_heartbeat(cx);
                 cx.notify();
             }
-            UiEvent::HistoryLoaded { chats, complete } => {
+            UiEvent::HistoryLoaded {
+                chats,
+                complete,
+                next,
+            } => {
                 // Debug, not info: a store invalidation reloads history, and
                 // acks and receipts make several of those per message.
                 debug!(
@@ -43,6 +47,12 @@ impl WhatsAppApp {
                 // hundred chats never is — see `reopen_finished_pages`.
                 let reloaded: Vec<String> = chats.iter().map(|c| c.jid.clone()).collect();
                 self.reopen_finished_pages(&reloaded);
+                // And this load says where the list stands, which is the one
+                // answer that beats anything inferred from it: `next` is the
+                // position it stopped at, and a complete load is the whole
+                // list. Applied after the reopen above, so the load's own
+                // answer is the one that survives.
+                self.note_chat_list_end(complete, next);
                 if complete {
                     let loaded: std::collections::HashSet<&str> =
                         chats.iter().map(|c| c.jid.as_str()).collect();

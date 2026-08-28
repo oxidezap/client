@@ -27,6 +27,19 @@ pub enum UiEvent {
         /// back under its limit). Only then can absence from the list mean
         /// archived/deleted; a truncated load says nothing about the tail.
         complete: bool,
+        /// Where the chat list continues, when this load stopped at its limit.
+        ///
+        /// The same opaque token a page request answers with — a string here
+        /// because what it *is* belongs to the side that writes it, and this
+        /// crate is the one both sides share. A front end holds it and hands
+        /// it back; it is the position this load ended at, so the next page
+        /// is the one after these rows rather than these rows again.
+        ///
+        /// `None` says nothing about the end of the list: a complete load has
+        /// no position after it, and a load about named chats is not a
+        /// position in anything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
     },
     QrCode {
         code: String,

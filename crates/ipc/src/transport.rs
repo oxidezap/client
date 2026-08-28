@@ -22,6 +22,11 @@ use std::path::PathBuf;
 /// malformed, which would leave an upgraded window with a list it can never
 /// open.
 ///
+/// A history load also carries where the chat list continues, which needs no
+/// version of its own for the same reason `has_window` did not: a v17 daemon
+/// omits the field, a v17 client ignores it, and both read as the answer that
+/// was true before it existed — no position, so ask from the top.
+///
 /// 16: a frame leaves out what it does not have. The empty half of a
 /// message — no reaction, no quote, no media, nothing revoked — and the
 /// optional half of a `MediaContent` are skipped on the way out and read back

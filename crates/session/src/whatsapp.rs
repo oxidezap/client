@@ -194,6 +194,32 @@ struct Shared {
     reload: Arc<tokio::sync::Notify>,
 }
 
+/// What a history load has to say: the chats, whether they are the whole
+/// list, and where the list continues.
+///
+/// The third is what makes a front end's first "load more" a page it does not
+/// already have. A load has already walked the store's order to its limit, so
+/// the position it stopped at costs nothing to carry; asking for it instead
+/// is a hundred rows re-read, re-serialized and re-merged to learn one
+/// string.
+struct LoadedHistory {
+    chats: Vec<oxidezap_core::Chat>,
+    complete: bool,
+    next: Option<String>,
+}
+
+impl LoadedHistory {
+    /// The event a front end reads this as. One place, so a load cannot reach
+    /// a window having quietly dropped where it ended.
+    fn into_event(self) -> UiEvent {
+        UiEvent::HistoryLoaded {
+            chats: self.chats,
+            complete: self.complete,
+            next: self.next,
+        }
+    }
+}
+
 /// One page of something, and where to continue.
 ///
 /// `next` is a token this crate writes and this crate reads. Nothing outside
@@ -728,11 +754,11 @@ impl WhatsAppClient {
         // (bot.run() is what connects). The client is needed here so hydrated
         // JIDs normalize through the same PN->LID mapping live events use.
         match Self::load_history(&chat_store, &bot.client(), &names).await {
-            Ok((chats, complete)) if !chats.is_empty() => {
+            Ok(loaded) if !loaded.chats.is_empty() => {
                 // The one hydration worth an info line: the reloads that
                 // follow are routine and say so at debug.
-                info!("Hydrated {} chats from durable history", chats.len());
-                let _ = ui_tx.send(UiEvent::HistoryLoaded { chats, complete });
+                info!("Hydrated {} chats from durable history", loaded.chats.len());
+                let _ = ui_tx.send(loaded.into_event());
             }
             Ok(_) => {}
             Err(e) => warn!("Failed to load chat history: {e}"),
@@ -3414,12 +3440,9 @@ impl WhatsAppClient {
                 // one names nothing the list shows (an archived chat, or one
                 // past the window) and has nothing to say.
                 match Self::load_history_scoped(&chat_store, &client, scope.chats(), &names).await {
-                    Ok((chats, complete)) if chats.is_empty() && !complete => {}
-                    Ok((chats, complete)) => {
-                        if ui_tx
-                            .send(UiEvent::HistoryLoaded { chats, complete })
-                            .is_err()
-                        {
+                    Ok(loaded) if loaded.chats.is_empty() && !loaded.complete => {}
+                    Ok(loaded) => {
+                        if ui_tx.send(loaded.into_event()).is_err() {
                             break;
                         }
                     }
@@ -3439,7 +3462,7 @@ impl WhatsAppClient {
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
         names: &NameBook,
-    ) -> Result<(Vec<oxidezap_core::Chat>, bool), oxidezap_chat_store::ChatStoreError> {
+    ) -> Result<LoadedHistory, oxidezap_chat_store::ChatStoreError> {
         Self::load_history_scoped(chat_store, client, None, names).await
     }
 
@@ -3457,7 +3480,7 @@ impl WhatsAppClient {
         client: &Arc<Client>,
         only: Option<&HashSet<String>>,
         names: &NameBook,
-    ) -> Result<(Vec<oxidezap_core::Chat>, bool), oxidezap_chat_store::ChatStoreError> {
+    ) -> Result<LoadedHistory, oxidezap_chat_store::ChatStoreError> {
         // A whole-list load is the pass that re-reads the address book, so it
         // is the one that drops what the book remembers: a contact renamed on
         // the phone appears under its new name without a restart, and the
@@ -3469,6 +3492,16 @@ impl WhatsAppClient {
         // A narrowed load says nothing about the chats it left out, so it is
         // never the whole display list and must never drive the UI's prune.
         let complete = only.is_none() && (entries.len() as i64) < Self::HISTORY_CHAT_LIMIT;
+        // Where this load stopped, so the front end's first "load more" is a
+        // page it does not have rather than the page it was just handed. Taken
+        // from the raw entries, before the alias filter below and before the
+        // PN/LID collapse: a cursor is a position in the store's own order,
+        // and both of those change what the list looks like without moving
+        // that position. A complete load has nothing after it, and a narrowed
+        // one is not a position in the list at all.
+        let next = (only.is_none() && !complete)
+            .then(|| entries.last().map(chat_cursor))
+            .flatten();
         if let Some(only) = only {
             let wanted = Self::alias_closure(client, &entries, only, names).await;
             entries.retain(|entry| wanted.contains(&entry.jid.to_non_ad_string()));
@@ -3500,9 +3533,28 @@ impl WhatsAppClient {
                 }
             }
         }
+        // The other half of every row this load carries. A PN/LID pair is one
+        // conversation and the collapse below is what makes its unread count
+        // the pair's sum — but only over the rows it is given, and the window
+        // above ends wherever the store's order puts it. Half a pair alone is
+        // a chat with half the pair's unread count, and now that a front end
+        // continues *past* this window rather than re-fetching it, nothing
+        // else would go back for the other half. The cursor is already taken
+        // from the raw boundary, so this cannot move where the list continues.
+        let entries = if only.is_none() {
+            Self::with_alias_rows(chat_store, client, names, entries).await
+        } else {
+            // A narrowed load has its own closure, which starts from the
+            // chats somebody named rather than from a page.
+            entries
+        };
         let chats =
             Self::hydrate_entries(chat_store, client, names, entries, Self::attach_page).await?;
-        Ok((chats, complete))
+        Ok(LoadedHistory {
+            chats,
+            complete,
+            next,
+        })
     }
 
     /// Turn store rows into the chats a front end draws.
@@ -3673,19 +3725,26 @@ impl WhatsAppClient {
         entries: Vec<ChatEntry>,
     ) -> Vec<ChatEntry> {
         let mut have: HashSet<String> = entries.iter().map(|e| e.jid.to_string()).collect();
+        let mut wanted: Vec<Jid> = Vec::new();
+        for entry in &entries {
+            let identity = names.identity(client, &entry.jid).await;
+            for alias in &identity.contact_jids {
+                // `have` is what this page holds plus what has already been
+                // asked for, so a pair whose halves are both on the page
+                // costs nothing and neither half is asked for twice.
+                if have.insert(alias.to_string()) {
+                    wanted.push(alias.clone());
+                }
+            }
+        }
         let mut entries = entries;
-        for ix in 0..entries.len() {
-            let identity = names.identity(client, &entries[ix].jid).await;
-            for alias in identity.contact_jids.iter() {
-                if !have.insert(alias.to_string()) {
-                    continue;
-                }
-                match chat_store.chat(alias).await {
-                    Ok(Some(row)) => entries.push(row),
-                    // No row under that alias, which is the ordinary case.
-                    Ok(None) => {}
-                    Err(e) => log::warn!("could not read an alias of a paged chat: {e}"),
-                }
+        if !wanted.is_empty() {
+            // One read for the page, not one per alias: most people have a
+            // single row, and finding that out a hundred times over is a
+            // hundred permits and transactions spent on nothing.
+            match chat_store.chats_by_jids(wanted).await {
+                Ok(rows) => entries.extend(rows),
+                Err(e) => log::warn!("could not read the aliases of a page of chats: {e}"),
             }
         }
         // Display order again, because that is what decides which half of a
@@ -4343,10 +4402,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ChatEntry, ChatStore, Client, MuteLane, NameBook, ReadBoundary, ReloadScope, SqliteStore,
-        StoreChange, VideoState, WhatsAppClient, apply_status_views, chat_cursor, media_metadata,
-        merge_alias_history_messages, message_cursor, parse_chat_cursor, parse_message_cursor,
-        peer_can_receive_video, read_message_range,
+        ChatEntry, ChatStore, Client, LoadedHistory, MuteLane, NameBook, ReadBoundary, ReloadScope,
+        SqliteStore, StoreChange, VideoState, WhatsAppClient, apply_status_views, chat_cursor,
+        media_metadata, merge_alias_history_messages, message_cursor, parse_chat_cursor,
+        parse_message_cursor, peer_can_receive_video, read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
     use std::sync::Arc;
@@ -4451,7 +4510,9 @@ mod tests {
         };
         feed(&chat_store, incoming(photo, "MSG-IMG", 1_700_000_000)).await;
 
-        let (chats, complete) = WhatsAppClient::load_history(&chat_store, &client, &book())
+        let LoadedHistory {
+            chats, complete, ..
+        } = WhatsAppClient::load_history(&chat_store, &client, &book())
             .await
             .expect("history loads");
         assert!(complete);
@@ -4482,9 +4543,10 @@ mod tests {
         };
         feed(&chat_store, incoming(revoke, "MSG-R2", 1_700_000_010)).await;
 
-        let (chats, _) = WhatsAppClient::load_history(&chat_store, &client, &book())
-            .await
-            .expect("history loads");
+        let LoadedHistory { chats, .. } =
+            WhatsAppClient::load_history(&chat_store, &client, &book())
+                .await
+                .expect("history loads");
         assert_eq!(chats[0].last_message.as_deref(), Some("[Message deleted]"));
     }
 
@@ -4498,9 +4560,10 @@ mod tests {
         )
         .await;
 
-        let (chats, _) = WhatsAppClient::load_history(&chat_store, &client, &book())
-            .await
-            .expect("history loads");
+        let LoadedHistory { chats, .. } =
+            WhatsAppClient::load_history(&chat_store, &client, &book())
+                .await
+                .expect("history loads");
         assert_eq!(chats[0].last_message.as_deref(), Some("bom dia"));
     }
 
@@ -4529,6 +4592,15 @@ mod tests {
         id: &str,
         ts_secs: i64,
     ) -> whatsapp_rust::wacore::types::events::Event {
+        incoming_in(TEST_PEER, message, id, ts_secs)
+    }
+
+    fn incoming_in(
+        chat: &str,
+        message: wa::Message,
+        id: &str,
+        ts_secs: i64,
+    ) -> whatsapp_rust::wacore::types::events::Event {
         use whatsapp_rust::wacore::types::events::{
             BatchOrigin, Event, InboundMessage, MessageBatch,
         };
@@ -4536,8 +4608,8 @@ mod tests {
 
         let info = MessageInfo {
             source: MessageSource {
-                chat: TEST_PEER.parse().expect("test JID"),
-                sender: TEST_PEER.parse().expect("test JID"),
+                chat: chat.parse().expect("test JID"),
+                sender: chat.parse().expect("test JID"),
                 ..Default::default()
             },
             id: id.to_string(),
@@ -4825,10 +4897,17 @@ mod tests {
         .await;
 
         let only = std::collections::HashSet::from([target.to_string()]);
-        let (chats, complete) =
-            WhatsAppClient::load_history_scoped(&chat_store, &client, Some(&only), &book())
-                .await
-                .expect("history loads");
+        let LoadedHistory {
+            chats,
+            complete,
+            next,
+        } = WhatsAppClient::load_history_scoped(&chat_store, &client, Some(&only), &book())
+            .await
+            .expect("history loads");
+        assert!(
+            next.is_none(),
+            "a narrowed load is not a position in the list"
+        );
 
         assert!(!complete, "a narrowed load is never the whole list");
         assert_eq!(
@@ -4882,6 +4961,54 @@ mod tests {
 
     /// The address goes last and is not split on: a device JID carries a
     /// colon of its own, and a cursor that lost the tail of one would page
+    /// A load that stopped at its limit knows where it stopped, and saying so
+    /// is what stops a window's first "load more" from being the page it was
+    /// just handed: the attach load left no cursor, so the only way to obtain
+    /// one was to ask for those hundred rows all over again.
+    #[tokio::test]
+    async fn a_truncated_load_says_where_the_list_continues() {
+        let (chat_store, client) = test_session("history-cursor").await;
+        let rows = WhatsAppClient::HISTORY_CHAT_LIMIT + 5;
+        for n in 0..rows {
+            let chat = format!("5599{n:09}@s.whatsapp.net");
+            chat_store.handler().handle_event(Arc::new(incoming_in(
+                &chat,
+                wa::Message::text("olá"),
+                &format!("MSG-{n:04}"),
+                1_700_000_000 + n,
+            )));
+        }
+        chat_store.flush().await.expect("flush");
+
+        let LoadedHistory {
+            chats,
+            complete,
+            next,
+        } = WhatsAppClient::load_history(&chat_store, &client, &book())
+            .await
+            .expect("history loads");
+        assert!(!complete, "more chats than the load carries");
+        let token = next.expect("a load that stopped at its limit stopped somewhere");
+
+        // What continues from there is rows this load did not carry, which is
+        // the whole point: the page after a load is not the load.
+        let after = parse_chat_cursor(&token).expect("this crate reads its own token");
+        let page = chat_store
+            .chats_page(false, Some(after), 5)
+            .await
+            .expect("a page after the load");
+        assert!(!page.is_empty(), "there is more behind a truncated load");
+        let carried: std::collections::HashSet<String> =
+            chats.iter().map(|chat| chat.jid.clone()).collect();
+        for entry in &page {
+            assert!(
+                !carried.contains(&entry.jid.to_string()),
+                "{} was in the load and in the page after it",
+                entry.jid
+            );
+        }
+    }
+
     /// from a chat that does not exist.
     #[test]
     fn a_chat_cursor_keeps_an_address_with_a_colon_in_it() {
