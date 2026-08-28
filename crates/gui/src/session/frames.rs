@@ -117,6 +117,48 @@ impl<'a> Frames<'a> {
                 load_media(&mut event, self.media);
                 self.publish(FromDaemon::Session(Box::new(event)))?;
             }
+            DaemonMessage::Messages {
+                id,
+                jid,
+                mut messages,
+                next,
+            } => {
+                if take_pending(self.pending, id).is_none() {
+                    debug!("a page arrived for {id}, which nobody is waiting on");
+                    return ControlFlow::Continue(());
+                }
+                // Here rather than on the window's side, for the same reason
+                // a history load fills its media here: a page names photos,
+                // and getting them is I/O.
+                for message in &mut messages {
+                    fill(&mut message.media, self.media);
+                }
+                self.publish(FromDaemon::Messages {
+                    jid,
+                    messages,
+                    next,
+                })?;
+            }
+            DaemonMessage::Chats {
+                id,
+                mut chats,
+                next,
+            } => {
+                if take_pending(self.pending, id).is_none() {
+                    debug!("a chat page arrived for {id}, which nobody is waiting on");
+                    return ControlFlow::Continue(());
+                }
+                // A chat page carries one message per row and that row is the
+                // list's preview: its media is externalized like any other, so
+                // it has to be read back here like any other. Skipping it drew
+                // a photo the daemon had cached as a download-only bubble.
+                for chat in &mut chats {
+                    for message in &mut chat.messages {
+                        fill(&mut message.media, self.media);
+                    }
+                }
+                self.publish(FromDaemon::Chats { chats, next })?;
+            }
             DaemonMessage::Downloaded { id, key } => {
                 let Some(waiting) = take_pending(self.pending, id) else {
                     debug!("a download answer arrived for {id}, which nobody is waiting on");
@@ -128,7 +170,7 @@ impl<'a> Frames<'a> {
                         let _ = tx.send(bytes);
                     }
                     // Nothing but a download asks for one.
-                    waiting => waiting.failed("unexpected download answer", Some(self.events)),
+                    waiting => self.fail(waiting, "unexpected download answer"),
                 }
             }
             // Every command is answered under the id it was asked with, which
@@ -141,7 +183,7 @@ impl<'a> Frames<'a> {
             }
             DaemonMessage::Error { id, error } => {
                 match id.and_then(|id| take_pending(self.pending, id)) {
-                    Some(waiting) => waiting.failed(&error.to_string(), Some(self.events)),
+                    Some(waiting) => self.fail(waiting, &error.to_string()),
                     // A refusal for nothing in particular: a malformed frame,
                     // or a request sent without an id.
                     None => error!("daemon refused a request: {error}"),
@@ -177,7 +219,7 @@ impl<'a> Frames<'a> {
                         media_files,
                     });
                 }
-                Some(waiting) => waiting.failed("unexpected storage answer", Some(self.events)),
+                Some(waiting) => self.fail(waiting, "unexpected storage answer"),
                 None => debug!("a storage answer arrived for {id}, which nobody is waiting on"),
             },
             // Already inside the snapshot this connection started from. The
@@ -216,6 +258,20 @@ impl<'a> Frames<'a> {
         ControlFlow::Continue(())
     }
 
+    /// Fail a request the daemon is never going to run.
+    ///
+    /// Every post-send failure goes through here rather than calling
+    /// [`Awaiting::failed`] directly, because a refused `SendAudio` also has a
+    /// staged voice note to drop: nothing will ever read those bytes, and a
+    /// retry stages another copy under a new local id. `Session::ask` does the
+    /// same for the failures that happen before a request leaves.
+    fn fail(&self, waiting: Awaiting, detail: &str) {
+        if let Some(key) = waiting.staged_key() {
+            self.media.discard(key);
+        }
+        waiting.failed(detail, Some(self.events));
+    }
+
     /// A front end that has gone is the one reason to stop mid-frame.
     fn publish(&self, event: FromDaemon) -> ControlFlow<()> {
         match self.events.send(event) {
@@ -237,7 +293,7 @@ impl<'a> Frames<'a> {
             .map(|(_, waiting)| waiting)
             .collect();
         for waiting in abandoned {
-            waiting.failed("the daemon connection closed", Some(self.events));
+            self.fail(waiting, "the daemon connection closed");
         }
         let _ = self
             .events
@@ -286,6 +342,21 @@ pub(super) fn media_keys(message: &DaemonMessage) -> Vec<String> {
             }
             _ => {}
         },
+        // A page is media-bearing exactly like a load is, and is answered on
+        // the same path — a page whose photos were not fetched with it draws
+        // every one of them as a download nobody asked for.
+        DaemonMessage::Messages { messages, .. } => {
+            for message in messages {
+                key_of(&message.media, &mut keys);
+            }
+        }
+        DaemonMessage::Chats { chats, .. } => {
+            for chat in chats {
+                for message in &chat.messages {
+                    key_of(&message.media, &mut keys);
+                }
+            }
+        }
         DaemonMessage::Downloaded { key, .. } => keys.push(key.clone()),
         _ => {}
     }
@@ -336,6 +407,10 @@ pub(super) fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
             // messages in it, so this load is not the store's whole truth
             // and must not prune anything.
             complete: false,
+            // And no position either: these rows are the daemon's list, not
+            // a walk of the store's order, so there is nothing after them to
+            // name. The session's own load is what says where to continue.
+            next: None,
         }));
     }
     match &snapshot.connection {
@@ -523,10 +598,19 @@ mod tests {
         let Some(FromDaemon::Session(first)) = events.first() else {
             panic!("the list is not the first event");
         };
-        let UiEvent::HistoryLoaded { chats, complete } = first.as_ref() else {
+        let UiEvent::HistoryLoaded {
+            chats,
+            complete,
+            next,
+        } = first.as_ref()
+        else {
             panic!("the list does not come first: {first:?}");
         };
         assert!(!complete, "a summary is never the store's whole truth");
+        assert!(
+            next.is_none(),
+            "these rows are the daemon's list, not a walk of the store's order"
+        );
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].name, "Alguém");
         assert_eq!(chats[0].unread_count, 3);

@@ -34,8 +34,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use log::error;
-use oxidezap_core::{CallState, DownloadableMedia, QuotedMessage, UiEvent};
-use oxidezap_ipc::{CallAction, ClientRequest, Link, Request, RequestId};
+use oxidezap_core::{CallState, Chat, ChatMessage, DownloadableMedia, QuotedMessage, UiEvent};
+use oxidezap_ipc::{CallAction, ClientRequest, Link, PageCursor, Request, RequestId};
 use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
 
@@ -71,6 +71,32 @@ pub enum FromDaemon {
     Account(Option<oxidezap_ipc::AccountIdentity>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
+    /// One page of a conversation, for the timeline that asked for it.
+    ///
+    /// Older rows than the window holds, or the first ones it has: which of
+    /// the two is the *window's* business, because the cursor it asked with
+    /// is the position it is filling in.
+    Messages {
+        jid: String,
+        messages: Vec<ChatMessage>,
+        /// Where to continue, or `None` at the start of the conversation.
+        next: Option<PageCursor>,
+    },
+    /// One page of the chat list, for the list that asked for it.
+    Chats {
+        chats: Vec<Chat>,
+        /// Where to continue, or `None` at the end of the list.
+        next: Option<PageCursor>,
+    },
+    /// A page that never arrived, so whoever is waiting can stop waiting.
+    ///
+    /// Named by what was asked for rather than carrying an error: a timeline
+    /// that keeps a request in flight forever is one that never asks again,
+    /// which is worse than an empty page.
+    PageLost {
+        /// The conversation, or `None` for a page of the chat list.
+        jid: Option<String>,
+    },
     /// A status view the daemon did not record after all.
     ///
     /// The ring was taken down the moment the update was opened, before the
@@ -111,6 +137,12 @@ enum Awaiting {
     StatusView {
         message_ids: Vec<String>,
     },
+    /// A page of history. The timeline holds a request in flight so it does
+    /// not ask twice for the same one, and a refusal is what releases it.
+    Page {
+        /// The conversation, or `None` for a page of the chat list.
+        jid: Option<String>,
+    },
 }
 
 impl Awaiting {
@@ -125,6 +157,9 @@ impl Awaiting {
             // A drawn message is never abandoned: the bubble stays on screen
             // until something resolves it.
             Self::Send { .. } => false,
+            // Nor is a page: the view that asked for it is holding a request
+            // open and only an answer closes it.
+            Self::Page { .. } => false,
         }
     }
 
@@ -158,6 +193,14 @@ impl Awaiting {
                         message_id: local_id,
                         reason: detail.to_string(),
                     })));
+                }
+            }
+            // The view that asked is waiting on this and will not ask again
+            // until it hears something.
+            Self::Page { jid } => {
+                log::warn!("a page of history did not arrive: {detail}");
+                if let Some(events) = events {
+                    let _ = events.send(FromDaemon::PageLost { jid });
                 }
             }
             // The ring is already down over these. Nothing durable exists, so
@@ -269,6 +312,14 @@ impl Session {
             .try_send(FromDaemon::StatusViewLost(message_ids));
     }
 
+    /// Report a page request that never left this process.
+    ///
+    /// `try_send` for the same reason as the two above.
+    fn report_page_lost(&self, jid: Option<String>, reason: &str) {
+        error!("a page request never left this process: {reason}");
+        self.events.try_send(FromDaemon::PageLost { jid });
+    }
+
     /// Send a request nobody is waiting on an answer for.
     fn send(&self, request: ClientRequest) -> std::io::Result<()> {
         self.send_frame(&Request::bare(request))
@@ -338,6 +389,12 @@ impl Session {
                     Awaiting::StatusView { message_ids } => {
                         self.report_status_view_lost(message_ids, &detail);
                     }
+                    // And the same rule again, for the same reason it is a
+                    // rule: a view waiting on a page asks for nothing until it
+                    // hears, so a request that never left has to say so — the
+                    // reconnect keeps the chats and the paging state, and a
+                    // list left `Loading` never asks again.
+                    Awaiting::Page { jid } => self.report_page_lost(jid, &detail),
                     waiting => waiting.failed(&detail, None),
                 }
             }
@@ -437,12 +494,6 @@ impl Session {
         });
     }
 
-    /// Tell the daemon these status updates have been watched.
-    ///
-    /// Not `mark_chat_read` on the broadcast: that clears one chat, and the
-    /// broadcast holds every contact's updates. Nothing goes to the network —
-    /// this is the local half of a status view, and the daemon is where it has
-    /// to live to outlast the window.
     /// Ask the daemon to republish the history it holds.
     ///
     /// Only used to settle a disagreement this side cannot settle on its own:
@@ -453,12 +504,48 @@ impl Session {
         self.tell(ClientRequest::ReloadHistory);
     }
 
+    /// Tell the daemon these status updates have been watched.
+    ///
+    /// Not `mark_chat_read` on the broadcast: that clears one chat, and the
+    /// broadcast holds every contact's updates. Nothing goes to the network —
+    /// this is the local half of a status view, and the daemon is where it has
+    /// to live to outlast the window.
+    ///
     /// Tracked rather than told, unlike the other one-way requests: the
     /// window takes the ring down before the daemon has answered, so a
     /// refusal — a read-only store, a full disk, a socket that is gone — has
     /// to find its way back to the update it was about. Without an id the
     /// daemon's answer is an uncorrelated log line, and the ring stays down
     /// over a view nothing recorded.
+    /// Ask for one page of a conversation, older than `before`.
+    ///
+    /// `None` asks for the newest page, which is what opening a chat wants;
+    /// the cursor from the last answer asks for what came before it. The page
+    /// arrives as [`FromDaemon::Messages`], and a refusal as
+    /// [`FromDaemon::PageLost`] — the view is holding a request open either
+    /// way, and only an answer releases it.
+    pub fn load_messages(&self, jid: String, before: Option<PageCursor>) {
+        self.ask(
+            ClientRequest::LoadMessages {
+                jid: jid.clone(),
+                before,
+                // The daemon's own page size, which is the one number that
+                // has to match the store's indexes: a front end with an
+                // opinion about it would be guessing.
+                limit: None,
+            },
+            Awaiting::Page { jid: Some(jid) },
+        );
+    }
+
+    /// Ask for one page of the chat list, after `after`.
+    pub fn load_chats(&self, after: Option<PageCursor>) {
+        self.ask(
+            ClientRequest::LoadChats { after, limit: None },
+            Awaiting::Page { jid: None },
+        );
+    }
+
     pub fn mark_status_watched(&self, message_ids: Vec<String>) {
         if message_ids.is_empty() {
             return;
@@ -516,11 +603,6 @@ impl Session {
         self.tell(ClientRequest::ForgetSession);
     }
 
-    /// Fetch media, answered when the bytes are on disk.
-    ///
-    /// The same signature the old client had, so the callers that thread this
-    /// receiver through a timeout did not change. The bytes come back rather
-    /// than a path because that is what every caller wanted anyway.
     /// Ask what the store and the media cache occupy.
     ///
     /// The daemon measures, because it is the only process that owns either
@@ -536,6 +618,12 @@ impl Session {
         self.tell(ClientRequest::ClearMediaCache);
     }
 
+    /// Fetch media, answered when the bytes are available.
+    ///
+    /// The same signature the old client had, so the callers that thread this
+    /// receiver through a timeout did not change. The bytes come back rather
+    /// than a path because that is what every caller wanted anyway — and
+    /// because one of the two front ends has no paths.
     pub fn download_downloadable_media(
         &self,
         media: DownloadableMedia,

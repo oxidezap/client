@@ -70,6 +70,20 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// silently dropped connection, so the client can tell why.
 pub const MAX_CLIENTS: usize = 32;
 
+/// The admission cap, shared by every transport that serves front ends.
+///
+/// One count across all of them, not one each: the descriptors, the tasks and
+/// the per-connection buffers come out of the same process however a client
+/// arrived. A second endpoint with a cap of its own would double what a
+/// reconnect loop can hold open.
+pub type ClientSlots = Arc<tokio::sync::Semaphore>;
+
+/// A fresh set of them.
+#[must_use]
+pub fn client_slots() -> ClientSlots {
+    Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS))
+}
+
 /// How many frames may queue for one connection's own answers.
 ///
 /// Only downloads land here, and a front end asks for as many as it has
@@ -84,12 +98,15 @@ const OUTBOX_CAPACITY: usize = 64;
 /// and can be dropped while the session is still disconnecting, and the lock
 /// has to outlive that. Handing it over here would release it mid-teardown,
 /// which is exactly the window a second daemon must not find open.
-pub async fn run(claim: &Claim, hub: Arc<StateHub>, commands: Commands) -> Result<()> {
+pub async fn run(
+    claim: &Claim,
+    hub: Arc<StateHub>,
+    commands: Commands,
+    slots: ClientSlots,
+) -> Result<()> {
     let path = claim.path.clone();
     let mut listener = Listener::bind(&path)?;
     log::info!("listening on {}", path.display());
-
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
 
     loop {
         let stream = match listener.accept().await {
@@ -146,11 +163,15 @@ const ENFILE: i32 = 23;
 
 /// Tell a client we are full, then close.
 ///
+/// Public because the web bridge refuses the same way and for the same
+/// reason: a refused client should learn why rather than watch its
+/// connection drop.
+///
 /// Spawned rather than written inline: the accept loop must not wait on a
 /// peer. The task is still bounded — one small frame into a socket nobody has
 /// had a chance to fill, then done — so a refused client costs a write, not a
 /// slot.
-async fn reject<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
+pub(crate) async fn reject<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
     log::warn!("refusing a client: already serving {MAX_CLIENTS}");
     let (_, mut writer) = tokio::io::split(stream);
     if let Ok(frame) = error_frame(None, ProtocolError::TooManyClients { limit: MAX_CLIENTS }) {
@@ -798,6 +819,66 @@ async fn handle_request(
             }
         }
         ClientRequest::ReloadHistory => acted(dispatch(hub, commands, Action::ReloadHistory).await),
+        // Answered with the page under this id, like a download and for the
+        // same reason: the rows are the answer rather than an
+        // acknowledgement, so only a refusal is answered here.
+        ClientRequest::LoadMessages { jid, before, limit } => {
+            let Some(id) = id else {
+                return Answer::frame(
+                    error_frame(
+                        None,
+                        ProtocolError::Malformed {
+                            detail: "a page needs an id to answer under".into(),
+                        },
+                    )
+                    .ok(),
+                );
+            };
+            match dispatch(
+                hub,
+                commands,
+                Action::LoadMessages {
+                    id,
+                    jid,
+                    before,
+                    limit,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+            {
+                Ok(()) => Answer::frame(None),
+                Err(error) => Answer::frame(error_frame(Some(id), error).ok()),
+            }
+        }
+        ClientRequest::LoadChats { after, limit } => {
+            let Some(id) = id else {
+                return Answer::frame(
+                    error_frame(
+                        None,
+                        ProtocolError::Malformed {
+                            detail: "a page needs an id to answer under".into(),
+                        },
+                    )
+                    .ok(),
+                );
+            };
+            match dispatch(
+                hub,
+                commands,
+                Action::LoadChats {
+                    id,
+                    after,
+                    limit,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+            {
+                Ok(()) => Answer::frame(None),
+                Err(error) => Answer::frame(error_frame(Some(id), error).ok()),
+            }
+        }
         ClientRequest::ForgetSession => acted(dispatch(hub, commands, Action::ForgetSession).await),
         ClientRequest::MarkRead {
             jid,

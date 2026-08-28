@@ -153,6 +153,70 @@ mod opus_ogg {
         let seed = wacore::time::now_millis() as u32;
         seed.wrapping_mul(1103515245).wrapping_add(12345)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_opus_id_header() {
+            let header = create_opus_id_header();
+            assert_eq!(&header[0..8], b"OpusHead");
+            assert_eq!(header[8], 1); // version
+            assert_eq!(header[9], 1); // channels
+        }
+
+        #[test]
+        fn test_opus_comment_header() {
+            let header = create_opus_comment_header();
+            assert_eq!(&header[0..8], b"OpusTags");
+        }
+
+        #[test]
+        fn test_encode_simple_audio() {
+            // Generate 1 second of silence
+            let audio = RecordedAudio {
+                samples: vec![0.0f32; 16000],
+                sample_rate: 16000,
+                duration_secs: 1,
+            };
+
+            let result = encode_to_opus_ogg(&audio);
+            assert!(result.is_ok());
+
+            let ogg_data = result.unwrap();
+            // Check OGG magic number
+            assert_eq!(&ogg_data[0..4], b"OggS");
+        }
+
+        #[test]
+        fn test_exact_frame_multiple_keeps_full_duration() {
+            // 16000 samples = exactly 50 frames: no zero-padding to absorb the
+            // pre-skip, so a capped EOS granule would clip ~6.5ms of real audio.
+            let samples = 16000u64;
+            let audio = RecordedAudio {
+                samples: vec![0.0f32; samples as usize],
+                sample_rate: 16000,
+                duration_secs: 1,
+            };
+
+            let ogg_data = encode_to_opus_ogg(&audio).unwrap();
+
+            // The EOS granule lives in the header of the last OGG page
+            // (byte offset 6, 8 bytes LE after the "OggS" capture pattern).
+            let last_page = ogg_data
+                .windows(4)
+                .rposition(|w| w == b"OggS")
+                .expect("no OGG page found");
+            let granule_bytes: [u8; 8] =
+                ogg_data[last_page + 6..last_page + 14].try_into().unwrap();
+            let eos_granule = u64::from_le_bytes(granule_bytes);
+            assert_eq!(
+                eos_granule,
+                PRE_SKIP as u64 + samples * (GRANULE_RATE / SAMPLE_RATE) as u64
+            );
+        }
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -191,66 +255,3 @@ impl std::fmt::Display for EncoderError {
 }
 
 impl std::error::Error for EncoderError {}
-
-#[cfg(all(test, not(target_family = "wasm")))]
-mod tests {
-    use super::opus_ogg::*;
-
-    #[test]
-    fn test_opus_id_header() {
-        let header = create_opus_id_header();
-        assert_eq!(&header[0..8], b"OpusHead");
-        assert_eq!(header[8], 1); // version
-        assert_eq!(header[9], 1); // channels
-    }
-
-    #[test]
-    fn test_opus_comment_header() {
-        let header = create_opus_comment_header();
-        assert_eq!(&header[0..8], b"OpusTags");
-    }
-
-    #[test]
-    fn test_encode_simple_audio() {
-        // Generate 1 second of silence
-        let audio = RecordedAudio {
-            samples: vec![0.0f32; 16000],
-            sample_rate: 16000,
-            duration_secs: 1,
-        };
-
-        let result = encode_to_opus_ogg(&audio);
-        assert!(result.is_ok());
-
-        let ogg_data = result.unwrap();
-        // Check OGG magic number
-        assert_eq!(&ogg_data[0..4], b"OggS");
-    }
-
-    #[test]
-    fn test_exact_frame_multiple_keeps_full_duration() {
-        // 16000 samples = exactly 50 frames: no zero-padding to absorb the
-        // pre-skip, so a capped EOS granule would clip ~6.5ms of real audio.
-        let samples = 16000u64;
-        let audio = RecordedAudio {
-            samples: vec![0.0f32; samples as usize],
-            sample_rate: 16000,
-            duration_secs: 1,
-        };
-
-        let ogg_data = encode_to_opus_ogg(&audio).unwrap();
-
-        // The EOS granule lives in the header of the last OGG page
-        // (byte offset 6, 8 bytes LE after the "OggS" capture pattern).
-        let last_page = ogg_data
-            .windows(4)
-            .rposition(|w| w == b"OggS")
-            .expect("no OGG page found");
-        let granule_bytes: [u8; 8] = ogg_data[last_page + 6..last_page + 14].try_into().unwrap();
-        let eos_granule = u64::from_le_bytes(granule_bytes);
-        assert_eq!(
-            eos_granule,
-            PRE_SKIP as u64 + samples * (GRANULE_RATE / SAMPLE_RATE) as u64
-        );
-    }
-}

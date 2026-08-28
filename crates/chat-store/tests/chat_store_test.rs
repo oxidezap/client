@@ -6744,12 +6744,24 @@ async fn history_hydration_costs() {
     let started = wacore::time::Instant::now();
     let batched_pages = chat_store
         .pages(
-            entries.iter().map(|entry| entry.jid.clone()).collect(),
-            MESSAGES as i64,
+            entries
+                .iter()
+                .map(|entry| (entry.jid.clone(), MESSAGES as i64))
+                .collect(),
         )
         .await
         .unwrap();
     let one_read_pages = started.elapsed();
+
+    // What an attach reads now: the newest rows the daemon needs of each
+    // chat, rather than a page of timeline nobody has asked to see.
+    let started = wacore::time::Instant::now();
+    let attach = chat_store
+        .pages(entries.iter().map(|entry| (entry.jid.clone(), 8)).collect())
+        .await
+        .unwrap();
+    let attach_read = started.elapsed();
+    assert_eq!(attach.len(), batched_pages.len(), "the same chats");
     assert_eq!(batched_pages.len(), pages.len(), "the same chats");
     for (chat, page) in &pages {
         assert_eq!(
@@ -6786,7 +6798,8 @@ async fn history_hydration_costs() {
     println!(
         "{CHATS} chats x {MESSAGES} messages\n  \
          reactions: per-message {per_message:?} -> per-chat {per_chat:?}\n  \
-         pages:     per-chat {per_chat_pages:?} -> one read {one_read_pages:?}"
+         pages:     per-chat {per_chat_pages:?} -> one read {one_read_pages:?}\n  \
+         attach:    8 per chat in one read {attach_read:?}"
     );
 }
 
@@ -6854,7 +6867,7 @@ async fn batched_reads_answer_what_the_single_ones_do() {
     );
 
     let pages = chat_store
-        .pages(vec![chat.clone(), other.clone()], 10)
+        .pages(vec![(chat.clone(), 10), (other.clone(), 10)])
         .await
         .unwrap();
     assert_eq!(pages[&chat.to_string()].len(), 2);
@@ -6872,8 +6885,29 @@ async fn batched_reads_answer_what_the_single_ones_do() {
     // A chat with nothing in it is absent rather than empty, which is what
     // `unwrap_or_default` on the caller's side reads as "no page".
     let empty = chat_store
-        .pages(vec![jid("559900000003@s.whatsapp.net")], 10)
+        .pages(vec![(jid("559900000003@s.whatsapp.net"), 10)])
         .await
         .unwrap();
     assert!(empty.is_empty());
+
+    // And the rows themselves, by the keys a caller already holds: a key that
+    // names nothing is absent rather than an error, which is what makes this
+    // the read for "the other half of a pair, if there is one".
+    let rows = chat_store
+        .chats_by_jids(vec![
+            chat.clone(),
+            other.clone(),
+            jid("559900000003@s.whatsapp.net"),
+        ])
+        .await
+        .unwrap();
+    let found: std::collections::HashSet<String> =
+        rows.iter().map(|row| row.jid.to_string()).collect();
+    assert_eq!(found.len(), 2, "two rows exist, the third does not");
+    assert!(found.contains(&chat.to_string()));
+    assert!(found.contains(&other.to_string()));
+    assert!(
+        chat_store.chats_by_jids(vec![]).await.unwrap().is_empty(),
+        "nothing asked for is nothing read"
+    );
 }

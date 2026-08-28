@@ -5,6 +5,9 @@ use std::sync::Arc;
 use oxidezap_core::Chat;
 
 use super::chat_row::ChatRow;
+use super::{WhatsAppApp, newest_shared_message};
+use log::info;
+use wacore_binary::jid::observe_str;
 
 /// Which conversations the sidebar is showing.
 ///
@@ -100,6 +103,60 @@ pub struct ChatListCache {
     /// Chat count the snapshot was taken at, for invalidation.
     pub chat_count: usize,
     pub rows: Arc<[ChatRow]>,
+}
+
+impl WhatsAppApp {
+    /// Fold hydrated chats into the list.
+    ///
+    /// The shared half of every read that produces chats — a store load, a
+    /// page of the list, the rows a snapshot painted — because all three
+    /// arrive at a list that may already hold the same conversation. Merging
+    /// rather than replacing is what keeps a live bubble that has not reached
+    /// the store yet, and what spends the reads a row without messages could
+    /// not bound.
+    ///
+    /// Never prunes: absence is a claim only a complete load may make, and
+    /// only the caller knows whether this was one.
+    pub(super) fn merge_chats(&mut self, chats: Vec<Chat>) {
+        for chat in chats {
+            match self.chats.iter_mut().find(|c| c.jid == chat.jid) {
+                Some(existing) => {
+                    let jid = chat.jid.clone();
+                    existing.merge_history(chat);
+                    // The chat *on screen* was read locally the moment the
+                    // message arrived; the store row commits with the unread
+                    // bump before our receipt lands, so the hydrated counter
+                    // must not resurrect the badge. On screen, not selected —
+                    // the same distinction the live arrival makes, and for the
+                    // same reason: a reload while the reader is in Status
+                    // would otherwise clear the badge of a conversation nobody
+                    // was looking at.
+                    if self.visible_chat.as_deref() == Some(jid.as_str()) {
+                        existing.mark_as_read();
+                    }
+                    // The read a row without messages could not bound. Spent
+                    // here because this is what gave it a message to name; see
+                    // `owed_reads`.
+                    if self.owed_reads.contains(&jid)
+                        && let Some(newest) = newest_shared_message(existing)
+                    {
+                        self.owed_reads.remove(&jid);
+                        if let Some(client) = &self.client {
+                            info!(
+                                "Marking {} read, now that it has messages",
+                                observe_str(&jid)
+                            );
+                            client.mark_chat_read(&jid, Some(newest));
+                        }
+                    }
+                    self.invalidate_message_cache(&jid);
+                }
+                None => self.chats.push(chat),
+            }
+        }
+        self.chats
+            .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
+    }
 }
 
 #[cfg(test)]

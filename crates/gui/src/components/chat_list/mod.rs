@@ -223,7 +223,15 @@ fn render_rows(
             let entity_for_rows = entity.clone();
             el.child(
                 v_virtual_list(entity, "chat-list", item_sizes, {
-                    move |_view, visible_range, _scroll_handle, cx| {
+                    move |view, visible_range, _scroll_handle, cx| {
+                        // The reader is near the end of what has been loaded,
+                        // so there had better be more behind it. Asked from
+                        // here because this closure is the one place that
+                        // knows which rows are on screen; asking twice for the
+                        // same page is what the paging state prevents.
+                        if crate::app::nearing_end(visible_range.end, rows.len()) {
+                            view.want_more_chats();
+                        }
                         visible_range
                             .map(|ix| {
                                 let row = rows[ix].clone();

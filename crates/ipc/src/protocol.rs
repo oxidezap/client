@@ -1,6 +1,6 @@
 //! Messages exchanged over the socket.
 
-use oxidezap_core::{CallState, DownloadableMedia, QuotedMessage, UiEvent};
+use oxidezap_core::{CallState, Chat, ChatMessage, DownloadableMedia, QuotedMessage, UiEvent};
 use serde::{Deserialize, Serialize};
 
 /// Monotonic counter over daemon state.
@@ -100,6 +100,34 @@ pub struct MessagePreview {
     pub text: String,
     pub from_me: bool,
     pub timestamp_ms: i64,
+}
+
+/// Where a paged list left off.
+///
+/// Opaque on purpose. What a page is ordered by — a pin time, an arrival
+/// number, the row a message landed on — is the store's business, and a front
+/// end that parsed this would be a second implementation of that order,
+/// kept in step by hand. A client holds the last one it was given and hands
+/// it back to ask for what follows; nothing else is defined about it.
+///
+/// `None` where a page ends the list: there is no cursor for "after the
+/// last one", so absence is the only honest way to say a list is finished.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PageCursor(String);
+
+impl PageCursor {
+    /// Wrap what the side that owns the ordering produced.
+    #[must_use]
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    /// Hand it back to that side. No other caller has any use for the inside.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// One chat, reduced to what a list or a tray tooltip needs.
@@ -281,6 +309,30 @@ pub enum DaemonMessage {
     /// happens to round-trip today and would stop the day an event named a
     /// field `type`. Nesting it under a key of its own cannot collide.
     Session { event: Box<UiEvent> },
+    /// One page of a chat's messages, answering
+    /// [`ClientRequest::LoadMessages`].
+    ///
+    /// Addressed to the client that asked rather than published: a page is a
+    /// position in one front end's view of one conversation, and another
+    /// window scrolled somewhere else has no use for it.
+    Messages {
+        id: RequestId,
+        jid: String,
+        /// Oldest first, the order a conversation is drawn in.
+        messages: Vec<ChatMessage>,
+        /// Where to continue, or `None` at the start of the conversation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<PageCursor>,
+    },
+    /// One page of the chat list, answering [`ClientRequest::LoadChats`].
+    Chats {
+        id: RequestId,
+        /// In the list's own order: pinned first, then by activity.
+        chats: Vec<Chat>,
+        /// Where to continue, or `None` at the end of the list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<PageCursor>,
+    },
     /// The bytes a [`ClientRequest::Download`] asked for are in the cache.
     ///
     /// A cache key rather than bytes, for the same reason media never travels
@@ -503,6 +555,39 @@ pub enum ClientRequest {
     MarkStatusWatched {
         message_ids: Vec<String>,
     },
+    /// One page of a chat's messages, older than `before`.
+    ///
+    /// Answered with [`DaemonMessage::Messages`] under the request's id. This
+    /// is how a timeline is filled: the daemon publishes the chat *list* and
+    /// the newest rows its own bookkeeping needs, and a front end asks for
+    /// history when it has somewhere to draw it — opening a conversation,
+    /// then scrolling back through it.
+    ///
+    /// `before` is the cursor the previous page came back with; `None` asks
+    /// for the newest page. A front end that asks twice with the same cursor
+    /// gets the same page: the cursor names a position, not a state.
+    LoadMessages {
+        jid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<PageCursor>,
+        /// How many, at most. The daemon clamps it; a client with no opinion
+        /// leaves it out and takes the default page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// One page of the chat list, after `after`.
+    ///
+    /// Answered with [`DaemonMessage::Chats`] under the request's id. The
+    /// same shape as [`LoadMessages`](Self::LoadMessages) and for the same
+    /// reason: an account with a thousand conversations has nine hundred a
+    /// window will never draw, and shipping them all on attach is a cost paid
+    /// before anything is on screen.
+    LoadChats {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<PageCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
     /// Ask what this account is taking up on disk.
     ///
     /// Answered with [`DaemonMessage::Storage`] under the request's id. The
@@ -616,6 +701,45 @@ mod tests {
             snapshot.chats[1].has_unread(),
             "the row itself still has one; it is drawn on its own screen"
         );
+    }
+
+    /// A page is asked for with a cursor and answered with the next one, and
+    /// both directions have to survive the wire: a cursor that came back
+    /// changed would page from somewhere the daemon never was.
+    #[test]
+    fn a_page_request_and_its_answer_round_trip() {
+        let ask = ClientRequest::LoadMessages {
+            jid: "559900000001@s.whatsapp.net".into(),
+            before: Some(PageCursor::new("m1:1700000000123:4242")),
+            limit: None,
+        };
+        let line = serde_json::to_string(&Request::bare(ask.clone())).unwrap();
+        assert!(line.contains(r#""request":"load_messages""#), "{line}");
+        assert!(!line.contains("limit"), "an absent limit is absent: {line}");
+        assert_eq!(serde_json::from_str::<Request>(&line).unwrap().request, ask);
+
+        let answer = DaemonMessage::Messages {
+            id: 7,
+            jid: "559900000001@s.whatsapp.net".into(),
+            messages: Vec::new(),
+            next: Some(PageCursor::new("m1:1699999999000:4100")),
+        };
+        let line = serde_json::to_string(&answer).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            answer
+        );
+
+        // The end of a list is a missing cursor, and it has to read back as
+        // one rather than as an empty string.
+        let ended = DaemonMessage::Chats {
+            id: 8,
+            chats: Vec::new(),
+            next: None,
+        };
+        let line = serde_json::to_string(&ended).unwrap();
+        assert!(!line.contains("next"), "{line}");
+        assert_eq!(serde_json::from_str::<DaemonMessage>(&line).unwrap(), ended);
     }
 
     #[test]

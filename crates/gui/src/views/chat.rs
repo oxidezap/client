@@ -76,6 +76,15 @@ pub fn render_connected_view(
         search_input: chat_search_input.as_ref(),
         account: app.account_summary(),
     };
+    // A filter that matches none of the chats this window holds is not the
+    // same as one that matches nothing: the rest of the list has not been
+    // asked for yet, and the row that would answer a search — or the only
+    // unread chat — can be on a page nobody has fetched. An empty list is at
+    // its end by definition, so it asks like any other list that is; the
+    // paging state is what stops it asking twice, and `Done` is what ends it.
+    if app.chat_list_is_empty() {
+        app.want_more_chats();
+    }
 
     // Everything the conversation pane needs, read before the borrow of `app`
     // ends — the render helpers keep nothing borrowed.

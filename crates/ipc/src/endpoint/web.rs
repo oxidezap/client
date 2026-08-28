@@ -207,7 +207,12 @@ pub fn media_base_url() -> String {
 fn query_parameter(name: &str) -> Option<String> {
     let search = web_sys::window()?.location().search().ok()?;
     for pair in search.trim_start_matches('?').split('&') {
-        let (key, value) = pair.split_once('=')?;
+        // `continue`, not `?`. Returning from the whole function on the first
+        // parameter without a value made `?debug&daemon=…` resolve to nothing
+        // and fall silently back to the loopback default.
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
         if key == name {
             return decode_component(value);
         }

@@ -18,11 +18,11 @@ use crate::types::{
     MessageStatus, ReactionEntry, ReceiptEntry, StoredMessage,
 };
 
-/// How many message ids one reaction lookup may bind at a time.
+/// How many keys one batched lookup may bind at a time.
 ///
 /// SQLite's compiled-in parameter ceiling is 999 on older builds; a page well
 /// under it costs one extra statement per fifty chats at most.
-const REACTION_ID_CHUNK: usize = 400;
+const BIND_CHUNK: usize = 400;
 
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(ms)
@@ -354,6 +354,40 @@ impl ChatStore {
         Ok(row.map(Into::into))
     }
 
+    /// The stored rows for these exact keys, in one read.
+    ///
+    /// Not a batched [`chat`](Self::chat): that resolves an *addressed* JID to
+    /// the row a thread is stored under, which is a question with a per-JID
+    /// answer. This is for a caller that already holds one half of a PN/LID
+    /// pair and names the other — it wants the row under that key, or nothing.
+    ///
+    /// One read because the callers ask about a page at a time: a hundred
+    /// chats asking per alias is a hundred permits, blocking tasks and
+    /// snapshot transactions spent mostly learning that a person has one row.
+    /// Keys that name no row are simply absent from the answer, and a key
+    /// naming a row twice cannot happen — `jid` is the primary key.
+    pub async fn chats_by_jids(&self, jids: Vec<Jid>) -> Result<Vec<ChatEntry>> {
+        use schema::chats::dsl;
+        let device_id = self.device_id();
+        let keys: Vec<String> = jids.iter().map(ToString::to_string).collect();
+        let rows: Vec<ChatRow> = self
+            .db()
+            .read(move |conn| {
+                let mut rows = Vec::new();
+                for page in keys.chunks(BIND_CHUNK) {
+                    rows.extend(
+                        dsl::chats
+                            .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq_any(page)))
+                            .load::<ChatRow>(conn)
+                            .map_err(db_err)?,
+                    );
+                }
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     /// One page of a chat's messages, newest first. Pass the cursor of the
     /// oldest message you already have to get the page before it.
     ///
@@ -410,20 +444,26 @@ impl ChatStore {
     /// can look its own page back up. A chat with no rows is absent rather
     /// than empty; both mean the same thing to a caller using
     /// `unwrap_or_default`.
+    ///
+    /// A limit per chat rather than one for all of them, because the caller
+    /// does not want the same number from each: a load that exists to serve a
+    /// chat list wants the newest row of most chats and the unread tail of a
+    /// few.
     pub async fn pages(
         &self,
-        chats: Vec<Jid>,
-        limit: i64,
+        wanted: Vec<(Jid, i64)>,
     ) -> Result<HashMap<String, Vec<StoredMessage>>> {
         use schema::messages::dsl;
-        let limit = limit.max(0);
         let device_id = self.device_id();
-        let chats: Vec<String> = chats.iter().map(Jid::to_string).collect();
+        let wanted: Vec<(String, i64)> = wanted
+            .iter()
+            .map(|(jid, limit)| (jid.to_string(), (*limit).max(0)))
+            .collect();
         let pages: HashMap<String, Vec<MessageRow>> = self
             .db()
             .read(move |conn| {
-                let mut pages = HashMap::with_capacity(chats.len());
-                for chat in chats {
+                let mut pages = HashMap::with_capacity(wanted.len());
+                for (chat, limit) in wanted {
                     let keys =
                         crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                     let rows: Vec<MessageRow> = dsl::messages
@@ -623,7 +663,7 @@ impl ChatStore {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 let mut rows = Vec::new();
-                for page in msg_ids.chunks(REACTION_ID_CHUNK) {
+                for page in msg_ids.chunks(BIND_CHUNK) {
                     rows.extend(
                         dsl::reactions
                             .filter(

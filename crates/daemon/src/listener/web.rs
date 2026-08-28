@@ -48,6 +48,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
+use crate::server::{self, ClientSlots};
 use crate::session_bridge::Commands;
 use crate::state::StateHub;
 
@@ -81,7 +82,12 @@ const MAX_HEAD: usize = 16 * 1024;
 ///
 /// The port could not be bound. Per-connection failures are logged and
 /// dropped, exactly as the IPC listener treats them.
-pub async fn run(config: Config, hub: Arc<StateHub>, commands: Commands) -> Result<()> {
+pub async fn run(
+    config: Config,
+    hub: Arc<StateHub>,
+    commands: Commands,
+    slots: ClientSlots,
+) -> Result<()> {
     let listener = TcpListener::bind(config.addr)
         .await
         .with_context(|| format!("binding the web bridge to {}", config.addr))?;
@@ -94,6 +100,18 @@ pub async fn run(config: Config, hub: Arc<StateHub>, commands: Commands) -> Resu
             config.allowed_origins.join(", ")
         }
     );
+    if !config.addr.ip().is_loopback() {
+        // Said once, loudly. Off the loopback there is nothing between this
+        // endpoint and the network but the `Origin` header, which only a
+        // browser is obliged to send truthfully — see the module
+        // documentation. Anything without one is refused there.
+        log::warn!(
+            "the web bridge is bound to {}, which is not loopback: anything that can \
+             reach that address can reach this session, and only a browser's own \
+             origin check stands in the way",
+            config.addr
+        );
+    }
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -104,6 +122,15 @@ pub async fn run(config: Config, hub: Arc<StateHub>, commands: Commands) -> Resu
                 continue;
             }
         };
+        // The same cap the local endpoint honours, from the same count: a
+        // page that reconnects in a loop would otherwise open connections
+        // without limit, each with its own tasks, subscription and duplex
+        // buffer.
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            tokio::spawn(server::reject(stream));
+            continue;
+        };
+
         let config = config.clone();
         let hub = Arc::clone(&hub);
         let commands = commands.clone();
@@ -111,6 +138,7 @@ pub async fn run(config: Config, hub: Arc<StateHub>, commands: Commands) -> Resu
             if let Err(e) = serve(stream, &config, hub, commands).await {
                 log::debug!("web client {peer} disconnected: {e}");
             }
+            drop(slot);
         });
     }
 }
@@ -217,72 +245,85 @@ async fn attach(
     // The server's end of a byte stream, so `serve_client` is untouched: it
     // reads lines and writes lines, and this moves them across as messages.
     // Sized for one frame of a history load rather than one message.
-    let (server_side, mut bridge_side) = tokio::io::duplex(256 * 1024);
+    let (server_side, bridge_side) = tokio::io::duplex(256 * 1024);
     let serving = tokio::spawn(async move {
         if let Err(e) = crate::server::serve_client(server_side, hub, commands).await {
             log::debug!("web client disconnected: {e}");
         }
     });
 
-    let (from_server, mut to_bridge) = tokio::io::split(&mut bridge_side);
-    let mut from_server = BufReader::new(from_server);
-    let mut line = String::new();
+    let (from_server, mut to_server) = tokio::io::split(bridge_side);
 
-    loop {
-        tokio::select! {
-            // The server has a frame for the client.
-            read = from_server.read_line(&mut line) => {
-                match read {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        // The newline is the byte stream's framing; a
-                        // WebSocket message is already a frame, and sending
-                        // it would put a stray newline inside the JSON.
-                        let frame = line.trim_end_matches(['\r', '\n']).to_string();
-                        line.clear();
-                        if frame.is_empty() {
-                            continue;
-                        }
-                        if outbound.send(Message::Text(frame.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        log::debug!("the server's end closed: {e}");
+    // Two pumps rather than one `select!` over both directions.
+    //
+    // `read_line` is not cancellation safe: dropped part-way it can lose what
+    // it had already taken out of the stream, and the next read would then
+    // send the remainder of a frame as a whole message — a truncated JSON
+    // object arriving at the page as if it were complete. A `select!` drops
+    // exactly that future every time the other branch wins, which on a busy
+    // connection is often. Each direction gets a task of its own instead, and
+    // neither is ever cancelled mid-read.
+    let mut to_client = tokio::spawn(async move {
+        let mut from_server = BufReader::new(from_server);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match from_server.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    log::debug!("the server's end closed: {e}");
+                    break;
+                }
+            }
+            // The newline is the byte stream's framing; a WebSocket message
+            // is already a frame, and sending it would put a stray newline
+            // inside the JSON.
+            let frame = line.trim_end_matches(['\r', '\n']);
+            if frame.is_empty() {
+                continue;
+            }
+            if outbound.send(Message::Text(frame.into())).await.is_err() {
+                break;
+            }
+        }
+        let _ = outbound.close().await;
+    });
+
+    let mut to_daemon = tokio::spawn(async move {
+        while let Some(message) = inbound.next().await {
+            match message {
+                Ok(Message::Text(text)) => {
+                    let mut framed = text.as_bytes().to_vec();
+                    framed.push(b'\n');
+                    if to_server.write_all(&framed).await.is_err() {
                         break;
                     }
                 }
-            }
-            // The client has a request for the server.
-            message = inbound.next() => {
-                match message {
-                    Some(Ok(Message::Text(text))) => {
-                        let mut framed = text.as_bytes().to_vec();
-                        framed.push(b'\n');
-                        if to_bridge.write_all(&framed).await.is_err() {
-                            break;
-                        }
-                    }
-                    // Ping/pong are answered by the library; a binary frame
-                    // is not something this protocol has, and a close is the
-                    // end.
-                    Some(Ok(Message::Binary(_))) => {
-                        log::warn!("ignoring a binary frame from a web client");
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => {
-                        log::debug!("web client framing error: {e}");
-                        break;
-                    }
-                    None => break,
+                // Ping and pong are answered by the library; a binary frame
+                // is not something this protocol has.
+                Ok(Message::Binary(_)) => {
+                    log::warn!("ignoring a binary frame from a web client");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::debug!("web client framing error: {e}");
+                    break;
                 }
             }
         }
-    }
+        // Dropping this end closes the server's, which ends its connection
+        // task and in turn ends the pump above.
+        drop(to_server);
+    });
 
-    // Dropping our end closes the server's, which ends its connection task.
-    drop(to_bridge);
-    let _ = outbound.close().await;
+    // Whichever direction ends first ends the connection: a client that has
+    // stopped reading is one the server cannot answer, and a server that has
+    // finished has nothing left to say.
+    tokio::select! {
+        _ = &mut to_client => to_daemon.abort(),
+        _ = &mut to_daemon => to_client.abort(),
+    }
     serving.abort();
     Ok(())
 }
@@ -426,11 +467,14 @@ impl Request {
     /// the session and any page that knows the port number.
     fn origin_allowed(&self, config: &Config) -> bool {
         let Some(origin) = &self.origin else {
-            // Not a browser, or a browser that was told not to say. Held to
-            // the same rule as one that does say, and served only where the
-            // user allowed something explicitly — otherwise omitting a header
-            // would be a way around the check.
-            return !config.allowed_origins.is_empty();
+            // Not a browser: a page cannot suppress `Origin`. So this is
+            // something else on the machine, and it is served only where the
+            // machine is the whole of the reach — a loopback bind, where
+            // anything that can connect could equally have opened the Unix
+            // socket. Off the loopback it is refused outright, because there
+            // the header is the only check there is and a client that does
+            // not send one cannot be subject to it.
+            return config.addr.ip().is_loopback();
         };
         if is_loopback_origin(origin) {
             return true;
@@ -557,13 +601,25 @@ mod tests {
         }
     }
 
-    /// Omitting the header must not be a way around the check: a page cannot
-    /// suppress `Origin`, so anything that does is not a page — and is held
-    /// to the same rule rather than trusted for being unusual.
+    /// A client that sends no `Origin` is not a page — a page cannot suppress
+    /// it — so it is served only where the reach is the machine itself.
     #[test]
-    fn no_origin_is_not_a_free_pass() {
-        assert!(!request(None).origin_allowed(&config(&[])));
+    fn a_client_with_no_origin_is_served_only_on_loopback() {
+        assert!(request(None).origin_allowed(&config(&[])));
         assert!(request(None).origin_allowed(&config(&["https://oxidezap.github.io"])));
+    }
+
+    /// Off the loopback the header is the only check there is, and a client
+    /// that sends none cannot be subject to it. Refused rather than trusted.
+    #[test]
+    fn a_client_with_no_origin_is_refused_off_the_loopback() {
+        let exposed = Config {
+            addr: "0.0.0.0:9527".parse().expect("a literal address"),
+            allowed_origins: vec!["https://oxidezap.github.io".to_string()],
+        };
+        assert!(!request(None).origin_allowed(&exposed));
+        // A named origin still is, which is the whole point of naming one.
+        assert!(request(Some("https://oxidezap.github.io")).origin_allowed(&exposed));
     }
 
     #[test]

@@ -117,7 +117,7 @@ mod capture {
     ///
     /// The bare RMS of a voice sits around 0.05–0.2, which would leave the meter
     /// looking dead; the gain is the difference between a meter and a decoration.
-    pub(super) fn rms(samples: &[f32]) -> f32 {
+    fn rms(samples: &[f32]) -> f32 {
         if samples.is_empty() {
             return 0.0;
         }
@@ -353,6 +353,94 @@ mod capture {
             )
             .map_err(|e| RecorderError::StreamError(e.to_string()))
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::rms;
+
+        #[test]
+        fn silence_reads_as_nothing() {
+            assert_eq!(rms(&[]), 0.0);
+            assert_eq!(rms(&[0.0; 128]), 0.0);
+        }
+
+        #[test]
+        fn a_speaking_level_lands_in_the_middle_of_the_meter() {
+            // ~0.12 RMS is an ordinary speaking voice off a laptop microphone.
+            let level = rms(&[0.12; 512]);
+            assert!(
+                (0.3..0.7).contains(&level),
+                "expected a mid-meter reading, got {level}"
+            );
+        }
+
+        #[test]
+        fn a_loud_burst_pins_the_meter_without_passing_it() {
+            assert_eq!(rms(&[1.0; 512]), 1.0);
+            assert_eq!(rms(&[-1.0; 512]), 1.0);
+        }
+
+        use super::*;
+
+        #[test]
+        fn resample_interpolates_between_source_samples() {
+            // A linear ramp resamples to exact fractional positions; the old
+            // nearest-neighbor drop would return [0.0, 1.0, 3.0, 4.0].
+            let audio = RecordedAudio {
+                samples: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+                sample_rate: 24_000,
+                duration_secs: 0,
+            };
+            assert_eq!(audio.resample_to_16khz(), vec![0.0, 1.5, 3.0, 4.5]);
+        }
+
+        #[test]
+        fn resample_decimation_has_unity_dc_gain() {
+            // The FIR taps are normalized to unity DC gain: a constant signal
+            // must come out at the same level (edges included — they clamp to
+            // the boundary sample, so even they see pure DC).
+            let audio = RecordedAudio {
+                samples: vec![0.5; 4800],
+                sample_rate: 48_000,
+                duration_secs: 0,
+            };
+            let out = audio.resample_to_16khz();
+            assert_eq!(out.len(), 1600);
+            for &s in &out {
+                assert!((s - 0.5).abs() < 1e-3, "DC gain drifted: {s}");
+            }
+        }
+
+        #[test]
+        fn resample_decimation_attenuates_aliasing_band() {
+            // 12kHz at 48k folds to 4kHz after naive 3:1 decimation — squarely
+            // in the voice band. The low-pass must crush it while passing 1kHz
+            // essentially untouched.
+            let rate = 48_000u32;
+            let tone = |freq: f32| -> RecordedAudio {
+                RecordedAudio {
+                    samples: (0..rate as usize)
+                        .map(|i| (std::f32::consts::TAU * freq * i as f32 / rate as f32).sin())
+                        .collect(),
+                    sample_rate: rate,
+                    duration_secs: 1,
+                }
+            };
+            let rms = |samples: &[f32]| -> f32 {
+                (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+            };
+            let low = tone(1_000.0).resample_to_16khz();
+            let high = tone(12_000.0).resample_to_16khz();
+            // Skip the clamped edges; a full-scale sine has ~0.707 rms.
+            let low_rms = rms(&low[100..low.len() - 100]);
+            let high_rms = rms(&high[100..high.len() - 100]);
+            assert!(low_rms > 0.65, "1kHz should pass through, rms {low_rms}");
+            assert!(
+                high_rms < 0.02,
+                "12kHz should alias-filter to near silence, rms {high_rms}"
+            );
+        }
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -384,91 +472,3 @@ impl std::fmt::Display for RecorderError {
 }
 
 impl std::error::Error for RecorderError {}
-
-#[cfg(all(test, not(target_family = "wasm")))]
-mod tests {
-    use super::capture::rms;
-
-    #[test]
-    fn silence_reads_as_nothing() {
-        assert_eq!(rms(&[]), 0.0);
-        assert_eq!(rms(&[0.0; 128]), 0.0);
-    }
-
-    #[test]
-    fn a_speaking_level_lands_in_the_middle_of_the_meter() {
-        // ~0.12 RMS is an ordinary speaking voice off a laptop microphone.
-        let level = rms(&[0.12; 512]);
-        assert!(
-            (0.3..0.7).contains(&level),
-            "expected a mid-meter reading, got {level}"
-        );
-    }
-
-    #[test]
-    fn a_loud_burst_pins_the_meter_without_passing_it() {
-        assert_eq!(rms(&[1.0; 512]), 1.0);
-        assert_eq!(rms(&[-1.0; 512]), 1.0);
-    }
-
-    use super::*;
-
-    #[test]
-    fn resample_interpolates_between_source_samples() {
-        // A linear ramp resamples to exact fractional positions; the old
-        // nearest-neighbor drop would return [0.0, 1.0, 3.0, 4.0].
-        let audio = RecordedAudio {
-            samples: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
-            sample_rate: 24_000,
-            duration_secs: 0,
-        };
-        assert_eq!(audio.resample_to_16khz(), vec![0.0, 1.5, 3.0, 4.5]);
-    }
-
-    #[test]
-    fn resample_decimation_has_unity_dc_gain() {
-        // The FIR taps are normalized to unity DC gain: a constant signal
-        // must come out at the same level (edges included — they clamp to
-        // the boundary sample, so even they see pure DC).
-        let audio = RecordedAudio {
-            samples: vec![0.5; 4800],
-            sample_rate: 48_000,
-            duration_secs: 0,
-        };
-        let out = audio.resample_to_16khz();
-        assert_eq!(out.len(), 1600);
-        for &s in &out {
-            assert!((s - 0.5).abs() < 1e-3, "DC gain drifted: {s}");
-        }
-    }
-
-    #[test]
-    fn resample_decimation_attenuates_aliasing_band() {
-        // 12kHz at 48k folds to 4kHz after naive 3:1 decimation — squarely
-        // in the voice band. The low-pass must crush it while passing 1kHz
-        // essentially untouched.
-        let rate = 48_000u32;
-        let tone = |freq: f32| -> RecordedAudio {
-            RecordedAudio {
-                samples: (0..rate as usize)
-                    .map(|i| (std::f32::consts::TAU * freq * i as f32 / rate as f32).sin())
-                    .collect(),
-                sample_rate: rate,
-                duration_secs: 1,
-            }
-        };
-        let rms = |samples: &[f32]| -> f32 {
-            (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
-        };
-        let low = tone(1_000.0).resample_to_16khz();
-        let high = tone(12_000.0).resample_to_16khz();
-        // Skip the clamped edges; a full-scale sine has ~0.707 rms.
-        let low_rms = rms(&low[100..low.len() - 100]);
-        let high_rms = rms(&high[100..high.len() - 100]);
-        assert!(low_rms > 0.65, "1kHz should pass through, rms {low_rms}");
-        assert!(
-            high_rms < 0.02,
-            "12kHz should alias-filter to near silence, rms {high_rms}"
-        );
-    }
-}

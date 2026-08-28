@@ -5,7 +5,6 @@
 //! meet at [`state::StateHub`], which is the only thing that mutates, and each
 //! observes it through the channel that suits it.
 
-mod bridge;
 mod listener;
 mod media;
 mod server;
@@ -96,15 +95,21 @@ async fn run() -> Result<()> {
     // Off unless asked for. The local endpoint is protected by the
     // filesystem and a peer uid check; a TCP port is protected by neither,
     // so it exists only where somebody said it should. See `bridge`.
+    // One cap across both endpoints: a client costs the same descriptors and
+    // tasks however it arrived, so a second allowance would double what a
+    // reconnect loop can hold open.
+    let slots = server::client_slots();
+
     let web = Options::from_args().web;
     let mut bridge = web.map(|config| {
         let hub = Arc::clone(&hub);
         let commands = commands.clone();
-        tokio::spawn(async move { bridge::run(config, hub, commands).await })
+        let slots = Arc::clone(&slots);
+        tokio::spawn(async move { listener::web::run(config, hub, commands, slots).await })
     });
 
     let server_outcome = tokio::select! {
-        result = server::run(&claim, Arc::clone(&hub), commands) => {
+        result = server::run(&claim, Arc::clone(&hub), commands, Arc::clone(&slots)) => {
             // Fatal, and it has to reach the exit code: a supervisor that sees
             // status zero treats a daemon nobody can connect to as a clean
             // stop and never restarts it.
@@ -215,7 +220,7 @@ impl Termination {
 #[derive(Debug, Default)]
 struct Options {
     /// The web bridge, where one was asked for.
-    web: Option<bridge::Config>,
+    web: Option<listener::web::Config>,
 }
 
 impl Options {
@@ -242,8 +247,18 @@ impl Options {
                 }
                 "--web-allow" => {
                     enabled = true;
-                    if let Some(origin) = args.next() {
-                        allowed_origins.push(origin);
+                    // A flag is not an origin. Swallowing one would both lose
+                    // the flag and put `--web` in the allow list — and an
+                    // allow list with anything in it is what lets a client
+                    // that sends no `Origin` at all attach, so a typo here
+                    // would quietly widen who may reach the session.
+                    match args.peek() {
+                        Some(next) if !next.starts_with("--") => {
+                            if let Some(origin) = args.next() {
+                                allowed_origins.push(origin);
+                            }
+                        }
+                        _ => log::warn!("--web-allow needs an origin after it; ignoring it"),
                     }
                 }
                 other => {
@@ -267,7 +282,7 @@ impl Options {
         let addr = addr.unwrap_or_else(|| format!("127.0.0.1:{}", oxidezap_ipc::DEFAULT_WEB_PORT));
         match addr.parse() {
             Ok(addr) => Self {
-                web: Some(bridge::Config {
+                web: Some(listener::web::Config {
                     addr,
                     allowed_origins,
                 }),
@@ -344,6 +359,24 @@ mod option_tests {
         assert_eq!(
             config.allowed_origins,
             ["https://a.example", "https://b.example"]
+        );
+    }
+
+    /// `--web-allow` takes an origin, and a flag is not one. Swallowing the
+    /// next flag would lose it *and* put it in the allow list — and a
+    /// non-empty allow list is what lets an `Origin`-less client attach.
+    #[test]
+    fn a_following_flag_is_not_mistaken_for_an_origin() {
+        let config = parse(&["--web-allow", "--web"]).web.expect("a bridge");
+        assert!(
+            config.allowed_origins.is_empty(),
+            "a flag was taken for an origin: {:?}",
+            config.allowed_origins
+        );
+        assert_eq!(
+            config.addr.to_string(),
+            format!("127.0.0.1:{}", oxidezap_ipc::DEFAULT_WEB_PORT),
+            "the swallowed flag was lost"
         );
     }
 

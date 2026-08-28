@@ -25,6 +25,7 @@ fn every_shape_of_session_event_survives_a_frame() {
         UiEvent::HistoryLoaded {
             chats: vec![oxidezap_core::Chat::new("1@s.whatsapp.net".into())],
             complete: true,
+            next: None,
         },
     ] {
         let frame = DaemonMessage::Session {
@@ -47,6 +48,37 @@ fn every_shape_of_session_event_survives_a_frame() {
 /// while every one of them reads back as its default, so this is the test
 /// that says so: the empty message must round-trip unchanged, and the full
 /// one must not lose anything on the way.
+/// A load with nowhere to continue says so by leaving the field out, and an
+/// older daemon says the same thing by not knowing the field at all. Both
+/// have to read back as "no position", or a window would take a load's
+/// silence for a place in the list.
+#[test]
+fn a_load_with_no_cursor_reads_back_without_one() {
+    let ended = UiEvent::HistoryLoaded {
+        chats: vec![oxidezap_core::Chat::new("1@s.whatsapp.net".into())],
+        complete: true,
+        next: None,
+    };
+    let line = serde_json::to_string(&ended).expect("serializes");
+    assert!(!line.contains("next"), "an absent cursor is absent: {line}");
+    assert_eq!(
+        serde_json::from_str::<UiEvent>(&line).expect("parses back"),
+        ended
+    );
+
+    // And a daemon that does carry one hands back the same token.
+    let paged = UiEvent::HistoryLoaded {
+        chats: vec![oxidezap_core::Chat::new("1@s.whatsapp.net".into())],
+        complete: false,
+        next: Some("c1:-:1700000000123:1@s.whatsapp.net".into()),
+    };
+    let line = serde_json::to_string(&paged).expect("serializes");
+    assert_eq!(
+        serde_json::from_str::<UiEvent>(&line).expect("parses back"),
+        paged
+    );
+}
+
 #[test]
 fn an_omitted_field_comes_back_as_what_it_was() {
     use oxidezap_core::{ChatMessage, MediaContent, MediaType};
@@ -100,7 +132,8 @@ fn an_omitted_field_comes_back_as_what_it_was() {
 }
 
 /// A stopwatch rather than an assertion: what an attaching front end's first
-/// load costs to write and to read at the limits the session loads to.
+/// load costs to write and to read, at the shape the session sends it in and
+/// at the one it used to.
 ///
 /// Run it with `cargo test -p oxidezap-ipc -- --ignored --nocapture wire_cost`.
 #[test]
@@ -112,35 +145,50 @@ fn an_omitted_field_comes_back_as_what_it_was() {
 fn history_load_wire_cost() {
     use oxidezap_core::{Chat, ChatMessage};
 
-    let mut chats = Vec::new();
-    for c in 0..100 {
-        let mut chat = Chat::new(format!("55990000{c:04}@s.whatsapp.net"));
-        for m in 0..50 {
-            let mut message = ChatMessage::new_incoming(
-                format!("3EB0{c:04}{m:04}ABCDEF"),
-                format!("55990000{c:04}@s.whatsapp.net"),
-                "uma mensagem de tamanho tipico numa conversa".to_string(),
-            );
-            message.is_read = true;
-            chat.messages.push(message);
+    fn load(chats: usize, per_chat: usize) -> UiEvent {
+        let mut list = Vec::new();
+        for c in 0..chats {
+            let mut chat = Chat::new(format!("55990000{c:04}@s.whatsapp.net"));
+            for m in 0..per_chat {
+                let mut message = ChatMessage::new_incoming(
+                    format!("3EB0{c:04}{m:04}ABCDEF"),
+                    format!("55990000{c:04}@s.whatsapp.net"),
+                    "uma mensagem de tamanho tipico numa conversa".to_string(),
+                );
+                message.is_read = true;
+                chat.messages.push(message);
+            }
+            list.push(chat);
         }
-        chats.push(chat);
+        UiEvent::HistoryLoaded {
+            chats: list,
+            complete: true,
+            next: None,
+        }
     }
 
-    let event = UiEvent::HistoryLoaded {
-        chats,
-        complete: true,
-    };
-    let started = std::time::Instant::now();
-    let line = serde_json::to_string(&event).expect("serializes");
-    let write = started.elapsed();
-    let started = std::time::Instant::now();
-    let back: UiEvent = serde_json::from_str(&line).expect("parses back");
-    let read = started.elapsed();
-    assert!(matches!(back, UiEvent::HistoryLoaded { .. }));
+    fn cost(label: &str, event: &UiEvent) {
+        let started = std::time::Instant::now();
+        let line = serde_json::to_string(event).expect("serializes");
+        let write = started.elapsed();
+        let started = std::time::Instant::now();
+        let back: UiEvent = serde_json::from_str(&line).expect("parses back");
+        let read = started.elapsed();
+        assert!(matches!(back, UiEvent::HistoryLoaded { .. }));
+        println!(
+            "  {label:34} {:>6} KiB  serialize {write:>12?}  parse {read:>12?}",
+            line.len() / 1024
+        );
+    }
 
-    println!(
-        "100 chats x 50 messages: {} KiB, serialize {write:?}, parse {read:?}",
-        line.len() / 1024
-    );
+    println!("one attach, 100 chats:");
+    // What the load used to carry: a page of timeline per chat, whether or
+    // not anybody was going to look at it.
+    cost("50 messages each (before)", &load(100, 50));
+    // What it carries now: the newest rows this side needs of a chat. A
+    // conversation's timeline is a page a front end asks for when it opens
+    // one — 50 messages of one chat, not of a hundred.
+    cost("8 messages each (attach floor)", &load(100, 8));
+    println!("one conversation, opened:");
+    cost("50 messages of one chat (a page)", &load(1, 50));
 }

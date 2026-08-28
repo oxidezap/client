@@ -6,7 +6,13 @@
 //! here rather than spread through the server, which is written once against
 //! [`Listener`] and never mentions either.
 //!
-//! The client half lives in `oxidezap_ipc::Endpoint`, where a front end can
+//! A third endpoint lives in [`web`]: a page can open neither of the above,
+//! so it gets a loopback TCP port speaking the same protocol over a
+//! WebSocket. It is here rather than beside the server for the same reason
+//! the other two are — /AGENTS.md keeps every server-side transport in this
+//! directory, so the protocol above them is written once.
+//!
+//! The client half lives in `oxidezap_ipc::endpoint`, where a front end can
 //! reach it.
 
 use anyhow::{Context, Result};
@@ -15,6 +21,9 @@ use anyhow::{Context, Result};
 mod security;
 #[cfg(test)]
 mod transport_tests;
+/// The endpoint a browser can reach. Off unless asked for; see its own
+/// documentation for why that matters.
+pub mod web;
 
 /// One accepted connection.
 #[cfg(unix)]

@@ -17,7 +17,11 @@ impl WhatsAppApp {
                 self.ensure_heartbeat(cx);
                 cx.notify();
             }
-            UiEvent::HistoryLoaded { chats, complete } => {
+            UiEvent::HistoryLoaded {
+                chats,
+                complete,
+                next,
+            } => {
                 // Debug, not info: a store invalidation reloads history, and
                 // acks and receipts make several of those per message.
                 debug!(
@@ -37,6 +41,18 @@ impl WhatsAppApp {
                 // a store-originated chat missing from a complete load really
                 // was deleted/archived. (Skipping empty loads instead would
                 // break clearing the last chat deleted on another device.)
+                // Whatever else this load says, it says the store answered:
+                // a list that ended before a history sync did has more behind
+                // it now. Not gated on `complete`, which an account of a
+                // hundred chats never is — see `reopen_finished_pages`.
+                let reloaded: Vec<String> = chats.iter().map(|c| c.jid.clone()).collect();
+                self.reopen_finished_pages(&reloaded);
+                // And this load says where the list stands, which is the one
+                // answer that beats anything inferred from it: `next` is the
+                // position it stopped at, and a complete load is the whole
+                // list. Applied after the reopen above, so the load's own
+                // answer is the one that survives.
+                self.note_chat_list_end(complete, next);
                 if complete {
                     let loaded: std::collections::HashSet<&str> =
                         chats.iter().map(|c| c.jid.as_str()).collect();
@@ -47,6 +63,7 @@ impl WhatsAppApp {
                     // comes back — unarchived elsewhere — is in `loaded` again
                     // and is no longer owed a removal.
                     let mut departed = std::collections::HashSet::new();
+                    let mut dropped: Vec<String> = Vec::new();
                     let mut cache = self.message_list_cache.borrow_mut();
                     self.chats.retain(|c| {
                         match survives_complete_load(c, &loaded, visible.as_deref()) {
@@ -67,11 +84,17 @@ impl WhatsAppApp {
                             // cross a chat lifetime.
                             Survival::Drop => {
                                 cache.remove(&c.jid);
+                                dropped.push(c.jid.clone());
                                 false
                             }
                         }
                     });
                     drop(cache);
+                    // And where its history continued: a position that
+                    // outlives its chat is one a recreated chat inherits, and
+                    // a conversation that believes it has everything asks for
+                    // nothing. See `forget_chat_paging`.
+                    self.forget_chat_paging(&dropped);
                     self.departed_chats = departed;
                 }
                 // The updates this load itself brought back already read:
@@ -86,45 +109,7 @@ impl WhatsAppApp {
                     .filter(|message| message.is_read)
                     .map(|message| message.id.clone())
                     .collect();
-                for chat in chats {
-                    // Later loads (post-HistorySync re-hydration) fold into
-                    // chats the UI already shows instead of being dropped.
-                    match self.chats.iter_mut().find(|c| c.jid == chat.jid) {
-                        Some(existing) => {
-                            let jid = chat.jid.clone();
-                            existing.merge_history(chat);
-                            // The chat *on screen* was read locally the
-                            // moment the message arrived; the store row
-                            // commits with the unread bump before our receipt
-                            // lands, so the hydrated counter must not
-                            // resurrect the badge. On screen, not selected —
-                            // the same distinction the live arrival makes, and
-                            // for the same reason: a reload while the reader
-                            // is in Status would otherwise clear the badge of
-                            // a conversation nobody was looking at.
-                            if self.visible_chat.as_deref() == Some(jid.as_str()) {
-                                existing.mark_as_read();
-                            }
-                            // The read a snapshot row could not bound. Spent
-                            // here because this is the load that gave it a
-                            // message to name; see `owed_reads`.
-                            if self.owed_reads.contains(&jid)
-                                && let Some(newest) = newest_shared_message(existing)
-                            {
-                                self.owed_reads.remove(&jid);
-                                if let Some(client) = &self.client {
-                                    info!(
-                                        "Marking {} read, now that it has messages",
-                                        observe_str(&jid)
-                                    );
-                                    client.mark_chat_read(&jid, Some(newest));
-                                }
-                            }
-                            self.invalidate_message_cache(&jid);
-                        }
-                        None => self.chats.push(chat),
-                    }
-                }
+                self.merge_chats(chats);
                 self.chats
                     .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
                 // A selection that no longer names a chat is a selection of

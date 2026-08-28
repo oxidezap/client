@@ -564,6 +564,126 @@ mod cpal_output {
 
         output
     }
+
+    #[cfg(test)]
+    mod tests {
+
+        /// The clocks read the samples that are queued, so they have to be scaled
+        /// by what the re-timing achieved rather than by what was asked for. A
+        /// clip too short to stretch comes back unchanged, and a video's audio is
+        /// never stretched at all — both were being counted as if they had been.
+        #[test]
+        fn the_clock_follows_the_samples_that_were_queued() {
+            let mut player = AudioPlayer::default();
+            player.set_speed(2.0);
+            assert_eq!(player.speed(), 2.0);
+
+            // Nothing has been prepared, so nothing has been re-timed.
+            assert_eq!(player.total_secs(), 0.0);
+            assert_eq!(player.elapsed_secs(), 0.0);
+        }
+        use super::*;
+
+        /// A player with nothing loaded is the state every caller sees first, and
+        /// the one where a naive `position / total` divides by zero.
+        #[test]
+        fn an_idle_player_reports_zero_rather_than_dividing_by_zero() {
+            let player = AudioPlayer::new();
+            assert_eq!(player.progress(), 0.0);
+            assert_eq!(player.elapsed_secs(), 0.0);
+            assert_eq!(player.total_secs(), 0.0);
+        }
+
+        #[test]
+        fn seeking_with_nothing_loaded_does_nothing() {
+            let player = AudioPlayer::new();
+            player.seek(0.5);
+            assert_eq!(player.progress(), 0.0);
+        }
+
+        #[test]
+        fn seek_maps_a_fraction_onto_the_clip() {
+            let mut player = AudioPlayer::new();
+            player.total_samples = 1000;
+            player.sample_rate = 100;
+
+            player.seek(0.25);
+            assert_eq!(player.position.load(Ordering::Relaxed), 250);
+            assert!((player.progress() - 0.25).abs() < f32::EPSILON);
+            assert!((player.elapsed_secs() - 2.5).abs() < f32::EPSILON);
+            assert!((player.total_secs() - 10.0).abs() < f32::EPSILON);
+        }
+
+        #[test]
+        fn seeking_to_the_very_end_stays_inside_the_clip() {
+            // Landing exactly on the end would let the callback fire completion
+            // for a scrub the user meant as "replay the last moment".
+            let mut player = AudioPlayer::new();
+            player.total_samples = 1000;
+
+            player.seek(1.0);
+            assert_eq!(player.position.load(Ordering::Relaxed), 999);
+        }
+
+        #[test]
+        fn out_of_range_fractions_are_clamped() {
+            let mut player = AudioPlayer::new();
+            player.total_samples = 1000;
+
+            player.seek(-3.0);
+            assert_eq!(player.position.load(Ordering::Relaxed), 0);
+
+            player.seek(7.5);
+            assert_eq!(player.position.load(Ordering::Relaxed), 999);
+        }
+
+        /// The resampler writes one sample per channel per frame, so a stereo
+        /// clip holds twice the samples of the same clip in mono. Dividing by the
+        /// sample rate alone ran the clock at double speed and took the elapsed
+        /// count past the duration the message advertised.
+        #[test]
+        fn a_stereo_clip_lasts_as_long_as_the_same_clip_in_mono() {
+            let mut mono = AudioPlayer::new();
+            mono.total_samples = 1000;
+            mono.sample_rate = 100;
+            mono.channels = 1;
+
+            let mut stereo = AudioPlayer::new();
+            stereo.total_samples = 2000;
+            stereo.sample_rate = 100;
+            stereo.channels = 2;
+
+            assert!((mono.total_secs() - 10.0).abs() < f32::EPSILON);
+            assert!(
+                (stereo.total_secs() - 10.0).abs() < f32::EPSILON,
+                "ten seconds of audio is ten seconds however many channels carry it"
+            );
+
+            stereo.seek(0.25);
+            assert!((stereo.elapsed_secs() - 2.5).abs() < f32::EPSILON);
+        }
+
+        /// A seek that lands between the left and right sample of one frame
+        /// swaps the channels for the rest of the clip.
+        #[test]
+        fn a_seek_lands_on_a_frame_boundary() {
+            let mut player = AudioPlayer::new();
+            player.total_samples = 1000;
+            player.sample_rate = 100;
+            player.channels = 2;
+
+            // 0.3335 * 1000 = 333 samples, which is mid-frame.
+            player.seek(0.3335);
+            let position = player.position.load(Ordering::Relaxed);
+            assert_eq!(position % 2, 0, "a stereo position is a whole frame");
+            assert_eq!(position, 332);
+
+            player.seek(1.0);
+            let end = player.position.load(Ordering::Relaxed);
+            assert_eq!(end % 2, 0);
+            assert_eq!(end, 998, "one whole frame short of the end");
+        }
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -593,123 +713,3 @@ impl std::fmt::Display for PlayerError {
 }
 
 impl std::error::Error for PlayerError {}
-
-#[cfg(all(test, not(target_family = "wasm")))]
-mod tests {
-
-    /// The clocks read the samples that are queued, so they have to be scaled
-    /// by what the re-timing achieved rather than by what was asked for. A
-    /// clip too short to stretch comes back unchanged, and a video's audio is
-    /// never stretched at all — both were being counted as if they had been.
-    #[test]
-    fn the_clock_follows_the_samples_that_were_queued() {
-        let mut player = AudioPlayer::default();
-        player.set_speed(2.0);
-        assert_eq!(player.speed(), 2.0);
-
-        // Nothing has been prepared, so nothing has been re-timed.
-        assert_eq!(player.total_secs(), 0.0);
-        assert_eq!(player.elapsed_secs(), 0.0);
-    }
-    use super::cpal_output::*;
-
-    /// A player with nothing loaded is the state every caller sees first, and
-    /// the one where a naive `position / total` divides by zero.
-    #[test]
-    fn an_idle_player_reports_zero_rather_than_dividing_by_zero() {
-        let player = AudioPlayer::new();
-        assert_eq!(player.progress(), 0.0);
-        assert_eq!(player.elapsed_secs(), 0.0);
-        assert_eq!(player.total_secs(), 0.0);
-    }
-
-    #[test]
-    fn seeking_with_nothing_loaded_does_nothing() {
-        let player = AudioPlayer::new();
-        player.seek(0.5);
-        assert_eq!(player.progress(), 0.0);
-    }
-
-    #[test]
-    fn seek_maps_a_fraction_onto_the_clip() {
-        let mut player = AudioPlayer::new();
-        player.total_samples = 1000;
-        player.sample_rate = 100;
-
-        player.seek(0.25);
-        assert_eq!(player.position.load(Ordering::Relaxed), 250);
-        assert!((player.progress() - 0.25).abs() < f32::EPSILON);
-        assert!((player.elapsed_secs() - 2.5).abs() < f32::EPSILON);
-        assert!((player.total_secs() - 10.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn seeking_to_the_very_end_stays_inside_the_clip() {
-        // Landing exactly on the end would let the callback fire completion
-        // for a scrub the user meant as "replay the last moment".
-        let mut player = AudioPlayer::new();
-        player.total_samples = 1000;
-
-        player.seek(1.0);
-        assert_eq!(player.position.load(Ordering::Relaxed), 999);
-    }
-
-    #[test]
-    fn out_of_range_fractions_are_clamped() {
-        let mut player = AudioPlayer::new();
-        player.total_samples = 1000;
-
-        player.seek(-3.0);
-        assert_eq!(player.position.load(Ordering::Relaxed), 0);
-
-        player.seek(7.5);
-        assert_eq!(player.position.load(Ordering::Relaxed), 999);
-    }
-
-    /// The resampler writes one sample per channel per frame, so a stereo
-    /// clip holds twice the samples of the same clip in mono. Dividing by the
-    /// sample rate alone ran the clock at double speed and took the elapsed
-    /// count past the duration the message advertised.
-    #[test]
-    fn a_stereo_clip_lasts_as_long_as_the_same_clip_in_mono() {
-        let mut mono = AudioPlayer::new();
-        mono.total_samples = 1000;
-        mono.sample_rate = 100;
-        mono.channels = 1;
-
-        let mut stereo = AudioPlayer::new();
-        stereo.total_samples = 2000;
-        stereo.sample_rate = 100;
-        stereo.channels = 2;
-
-        assert!((mono.total_secs() - 10.0).abs() < f32::EPSILON);
-        assert!(
-            (stereo.total_secs() - 10.0).abs() < f32::EPSILON,
-            "ten seconds of audio is ten seconds however many channels carry it"
-        );
-
-        stereo.seek(0.25);
-        assert!((stereo.elapsed_secs() - 2.5).abs() < f32::EPSILON);
-    }
-
-    /// A seek that lands between the left and right sample of one frame
-    /// swaps the channels for the rest of the clip.
-    #[test]
-    fn a_seek_lands_on_a_frame_boundary() {
-        let mut player = AudioPlayer::new();
-        player.total_samples = 1000;
-        player.sample_rate = 100;
-        player.channels = 2;
-
-        // 0.3335 * 1000 = 333 samples, which is mid-frame.
-        player.seek(0.3335);
-        let position = player.position.load(Ordering::Relaxed);
-        assert_eq!(position % 2, 0, "a stereo position is a whole frame");
-        assert_eq!(position, 332);
-
-        player.seek(1.0);
-        let end = player.position.load(Ordering::Relaxed);
-        assert_eq!(end % 2, 0);
-        assert_eq!(end, 998, "one whole frame short of the end");
-    }
-}

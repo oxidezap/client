@@ -37,7 +37,22 @@ struct Playing {
     /// The node that is making sound, if any. Kept so pausing, stopping and
     /// seeking have something to act on.
     node: Option<AudioBufferSourceNode>,
+    /// The `ended` listener for that node, held so it dies with it.
+    ///
+    /// `Closure::forget` would hand it to the JS heap for the life of the
+    /// page, and a node is replaced on every play, seek and resume — so the
+    /// count would grow with how much the user scrubs.
+    ended: Option<Closure<dyn FnMut()>>,
     buffer: Option<AudioBuffer>,
+    /// Which run of the player the state describes.
+    ///
+    /// Bumped by everything that supersedes what came before. A decode is a
+    /// promise: a second `play` inside its window would otherwise have the
+    /// first one's buffer install itself on top when it resolved, leaving two
+    /// nodes connected to the destination and only the last one reachable
+    /// through `stop`. The `ended` listener compares it too, so the node a
+    /// seek replaced cannot report the clip finished.
+    generation: u64,
     /// Where the context's clock stood when the current run started, and how
     /// far into the clip that run began. Together they answer "how far in are
     /// we" without the node being asked, which it cannot be.
@@ -83,6 +98,19 @@ impl AudioPlayer {
     /// between the two, and it is the browser's own control rather than a
     /// second implementation of one.
     pub fn set_speed(&mut self, speed: f32) {
+        // Bank what has played at the old rate before the new one applies.
+        // `offset` is measured in the clip's own seconds, so without this the
+        // time already played would be re-scaled by a rate it was not played
+        // at, and the progress bar would jump on every speed change.
+        if self.state.borrow().is_playing {
+            let now = self
+                .context
+                .as_ref()
+                .map_or(0.0, AudioContext::current_time);
+            let mut state = self.state.borrow_mut();
+            state.offset += (now - state.started_at) * f64::from(self.speed);
+            state.started_at = now;
+        }
         self.speed = speed.clamp(0.5, 3.0);
         if let Some(node) = self.state.borrow().node.as_ref() {
             node.playback_rate().set_value(self.speed);
@@ -135,9 +163,17 @@ impl AudioPlayer {
         (elapsed.clamp(0.0, state.duration)) as f32
     }
 
+    /// How long the clip is, in its own seconds.
+    ///
+    /// Not divided by the speed. `elapsed_secs` already reports a position on
+    /// the clip's timeline — it scales wall time *up* by the rate — and
+    /// `seek` maps its fraction onto the same one. Dividing here made
+    /// `progress` reach 1.0 halfway through a note played at 2×, and handed
+    /// the scrub bar a fraction that meant something different from the one
+    /// the seek would read.
     #[must_use]
     pub fn total_secs(&self) -> f32 {
-        (self.state.borrow().duration / f64::from(self.speed).max(0.001)) as f32
+        self.state.borrow().duration as f32
     }
 
     /// Jump to a fraction of the clip.
@@ -197,9 +233,19 @@ impl AudioPlayer {
         let state = Rc::clone(&self.state);
         let context = context.clone();
         let speed = self.speed;
+        // The run this decode belongs to. `stop` above has already bumped it,
+        // so anything armed before this call is superseded.
+        let generation = self.state.borrow().generation;
         spawn_local(async move {
             match JsFuture::from(decoding).await {
                 Ok(decoded) => {
+                    // The user moved on: a different note, or none at all.
+                    // Installing this buffer now would start a node nothing
+                    // holds a handle to, audible until it ran out.
+                    if state.borrow().generation != generation {
+                        log::debug!("dropping a decode the user moved on from");
+                        return;
+                    }
                     let Ok(buffer) = decoded.dyn_into::<AudioBuffer>() else {
                         warn!("the browser decoded something that is not an audio buffer");
                         return;
@@ -265,6 +311,8 @@ impl AudioPlayer {
     pub fn stop(&mut self) {
         stop_node(&self.state);
         let mut state = self.state.borrow_mut();
+        // Anything still decoding was for the clip being forgotten.
+        state.generation = state.generation.wrapping_add(1);
         state.buffer = None;
         state.offset = 0.0;
         state.duration = 0.0;
@@ -348,16 +396,23 @@ fn start(
         return;
     }
 
-    {
-        // Fires on a natural end *and* on a stop we asked for, so the handler
-        // checks whether the node it is about is still the one on the player:
-        // a seek replaces the node, and its predecessor's `ended` would
-        // otherwise report the clip as finished a moment after it restarted.
+    // This run, as of now. A seek and a fresh play both replace the node, and
+    // the old node's `ended` fires *after* the new one is already playing —
+    // so the listener has to know which run it belongs to. Comparing the
+    // shared "is playing" flag is not enough: it is true again by then, and
+    // scrubbing would report the clip finished.
+    let generation = {
+        let mut state = state.borrow_mut();
+        state.generation = state.generation.wrapping_add(1);
+        state.generation
+    };
+
+    let ended = {
         let state = Rc::clone(state);
-        let ended = Closure::<dyn FnMut()>::new(move || {
+        Closure::<dyn FnMut()>::new(move || {
             let completion = {
                 let mut state = state.borrow_mut();
-                if !state.is_playing {
+                if state.generation != generation || !state.is_playing {
                     return;
                 }
                 state.is_playing = false;
@@ -369,18 +424,15 @@ fn start(
             if let Some(tx) = completion {
                 let _ = tx.send(());
             }
-        });
-        // `addEventListener` rather than the `onended` property, which
-        // web-sys deprecates.
-        if node
-            .add_event_listener_with_callback("ended", ended.as_ref().unchecked_ref())
-            .is_err()
-        {
-            warn!("the browser refused an ended listener");
-        }
-        // Dropped when the node is: the browser holds the only other
-        // reference, and a freed callback on a live node is a crash.
-        ended.forget();
+        })
+    };
+    // `addEventListener` rather than the `onended` property, which web-sys
+    // deprecates.
+    if node
+        .add_event_listener_with_callback("ended", ended.as_ref().unchecked_ref())
+        .is_err()
+    {
+        warn!("the browser refused an ended listener");
     }
 
     if let Err(e) = node.start_with_when_and_grain_offset(0.0, offset) {
@@ -394,14 +446,16 @@ fn start(
     state.is_playing = true;
     state.finished = false;
     state.node = Some(node);
+    // Held rather than forgotten, so it dies with the node it listens to.
+    state.ended = Some(ended);
 }
 
 /// Silence whatever is playing, without touching the position.
 fn stop_node(state: &Rc<RefCell<Playing>>) {
-    let node = {
+    let (node, listener) = {
         let mut state = state.borrow_mut();
         state.is_playing = false;
-        state.node.take()
+        (state.node.take(), state.ended.take())
     };
     if let Some(node) = node {
         // The listener checks `is_playing` and this cleared it, so the stop
@@ -412,7 +466,14 @@ fn stop_node(state: &Rc<RefCell<Playing>>) {
         // `AudioScheduledSourceNode`, and web-sys deprecates the copies it
         // generated onto the subclasses.
         let scheduled: &web_sys::AudioScheduledSourceNode = node.as_ref();
+        // Unregistered before the stop, so the closure can be dropped below
+        // without the browser holding a reference to freed memory.
+        if let Some(listener) = &listener {
+            let _ = node
+                .remove_event_listener_with_callback("ended", listener.as_ref().unchecked_ref());
+        }
         let _ = scheduled.stop();
         let _ = node.disconnect();
     }
+    drop(listener);
 }

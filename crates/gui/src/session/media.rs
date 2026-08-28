@@ -103,11 +103,19 @@ impl Fetched {
 
 #[cfg(target_family = "wasm")]
 impl MediaCache for Fetched {
+    /// Read without consuming.
+    ///
+    /// One frame can name the same key on more than one message — media is
+    /// content-addressed, so a photo forwarded twice is one payload — and
+    /// taking it would leave every message after the first drawing a download
+    /// offer for bytes that are already here. `clear` is what bounds the map,
+    /// once per frame.
     fn read(&self, key: &str) -> Result<Vec<u8>, String> {
         self.bytes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(key)
+            .get(key)
+            .cloned()
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
     }
 
