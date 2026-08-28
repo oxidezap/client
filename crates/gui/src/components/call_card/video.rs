@@ -1,12 +1,17 @@
 //! The video and group layouts.
 //!
-//! Neither is reachable today: the VoIP facade is audio 1:1. They exist
-//! because the card is one object across every kind of call, and the shape a
-//! group call takes is a decision worth making now rather than the week the
-//! library gains it. Every surface here is a placeholder that says what it is
-//! waiting for — none of it pretends to carry a picture.
+//! The video one is what a call with a camera on either side is drawn as; the
+//! group grid is still a placeholder, because the card is one object across
+//! every kind of call and the shape a group call takes is a decision worth
+//! making before the week the library gains it.
+//!
+//! A pane draws the newest frame it has and nothing else. There is no
+//! "connecting" spinner over a picture and no last frame kept after a camera
+//! goes off: the call state says which cameras are running, and a pane with
+//! no frame for a camera that is on is a camera whose first frame has not
+//! arrived — which is a second, not a state worth naming.
 
-use gpui::{App, Entity, IntoElement, ParentElement, Styled, div};
+use gpui::{App, Entity, IntoElement, ParentElement, Styled, StyledImage as _, div, img};
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, Selectable as _};
@@ -14,7 +19,7 @@ use gpui_component::{Disableable as _, Icon, Selectable as _};
 use crate::app::WhatsAppApp;
 use crate::components::{Avatar, ProductIcon};
 use crate::theme::{ActiveProductTheme as _, Metrics};
-use oxidezap_core::ActiveCall;
+use oxidezap_core::{ActiveCall, VideoStream};
 
 use super::active::live_header;
 
@@ -23,6 +28,7 @@ pub fn active_video(
     call: &ActiveCall,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
+    app: &WhatsAppApp,
     cx: &App,
 ) -> impl IntoElement + use<> {
     div()
@@ -34,39 +40,114 @@ pub fn active_video(
             metrics,
             cx,
         ))
+        .child(panes(
+            call,
+            app,
+            metrics,
+            metrics.call_card_width() * 0.62,
+            cx,
+        ))
+        .child(video_controls(call, entity, metrics, app))
+}
+
+/// The peer's picture with ours inset in the corner, which is how every
+/// video client lays a 1:1 call out.
+///
+/// Shared with the phone layout rather than rebuilt there: the panes *are*
+/// the call, and a second copy of them would be a second set of decisions
+/// about what an absent frame says.
+pub(super) fn panes(
+    call: &ActiveCall,
+    app: &WhatsAppApp,
+    metrics: Metrics,
+    height: gpui::Pixels,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let remote = app.call_picture(VideoStream::Remote).cloned();
+    let local = app.call_picture(VideoStream::Local).cloned();
+    div()
+        .relative()
+        .m(metrics.space_lg())
+        .h(height)
+        .rounded(metrics.radius_lg())
+        .bg(cx.theme().background)
+        .border_1()
+        .border_color(cx.theme().border)
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(match remote {
+            // `object_fit` is deliberately not `cover`: a call is faces, and
+            // cropping one to fill a pane is how you cut somebody's head off.
+            // The letterbox is the theme's deepest surface, so the picture
+            // reads as the lit thing.
+            Some(picture) => img(picture)
+                .size_full()
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element(),
+            None => waiting_for(call, VideoStream::Remote, metrics, cx).into_any_element(),
+        })
+        // Our own picture sits over the peer's, small and in the corner.
         .child(
             div()
-                .relative()
-                .m(metrics.space_lg())
-                .h(metrics.call_card_width() * 0.62)
-                .rounded(metrics.radius_lg())
-                .bg(cx.theme().background)
+                .absolute()
+                .bottom(metrics.space_md())
+                .right(metrics.space_md())
+                .w(metrics.avatar_call())
+                .h(metrics.avatar_call() * 0.75)
+                .rounded(metrics.radius_sm())
+                .bg(cx.theme().secondary)
                 .border_1()
                 .border_color(cx.theme().border)
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(placeholder("remote video", metrics, cx))
-                // Our own picture sits over the peer's, small and in the
-                // corner, which is where every video client puts it.
-                .child(
-                    div()
-                        .absolute()
-                        .bottom(metrics.space_md())
-                        .right(metrics.space_md())
-                        .w(metrics.avatar_call())
-                        .h(metrics.avatar_call() * 0.75)
-                        .rounded(metrics.radius_sm())
-                        .bg(cx.theme().secondary)
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(placeholder("you", metrics, cx)),
-                ),
+                .child(match local {
+                    Some(picture) => img(picture)
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .into_any_element(),
+                    None => waiting_for(call, VideoStream::Local, metrics, cx).into_any_element(),
+                }),
         )
-        .child(video_controls(call, entity, metrics))
+}
+
+/// What a pane says when it has no frame.
+///
+/// Three different sentences, because the three are different situations: a
+/// camera that is off is a decision somebody made, a camera that is on with
+/// no frame yet is a moment, and our own camera being off during a video call
+/// is the one the user can do something about.
+fn waiting_for(
+    call: &ActiveCall,
+    stream: VideoStream,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let label = match (stream, call.video.is_on(stream)) {
+        (_, true) => "connecting…",
+        (VideoStream::Local, false) => "camera off",
+        (VideoStream::Remote, false) => "no camera",
+    };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(metrics.space_sm())
+        .children(match stream {
+            VideoStream::Remote => Some(
+                Avatar::new(
+                    call.peer_jid.clone(),
+                    &call.peer_name,
+                    metrics.avatar_inline(),
+                )
+                .on(cx.theme().background),
+            ),
+            VideoStream::Local => None,
+        })
+        .child(placeholder(label, metrics, cx))
 }
 
 /// A group call: a grid of participants, the speaker ringed.
@@ -80,6 +161,7 @@ pub fn active_group(
     participants: &[(String, String)],
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
+    app: &WhatsAppApp,
     cx: &App,
 ) -> impl IntoElement + use<> {
     div()
@@ -108,7 +190,7 @@ pub fn active_group(
                         .map(|(jid, name)| participant_tile(jid, name, metrics, cx)),
                 ),
         )
-        .child(video_controls(call, entity, metrics))
+        .child(video_controls(call, entity, metrics, app))
 }
 
 fn participant_tile(jid: &str, name: &str, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
@@ -135,6 +217,15 @@ fn participant_tile(jid: &str, name: &str, metrics: Metrics, cx: &App) -> impl I
         )
 }
 
+/// What the camera button says it will do.
+fn camera_tooltip(on: bool, asked: bool) -> &'static str {
+    match (on, asked) {
+        (true, _) => "Turn the camera off",
+        (false, true) => "They asked for video — turn the camera on",
+        (false, false) => "Turn the camera on",
+    }
+}
+
 fn placeholder(label: &str, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     div()
         .font_family(cx.theme().mono_font_family.clone())
@@ -145,17 +236,22 @@ fn placeholder(label: &str, metrics: Metrics, cx: &App) -> impl IntoElement + us
 
 /// The control row a video or group call carries.
 ///
-/// Camera, screen share and add-participant are disabled for the same reason
-/// the layout exists at all: the library does not do them yet, and a control
-/// that silently does nothing is worse than one that says why.
+/// The camera is the one control here that does something. Screen share and
+/// add-participant are drawn disabled for the same reason the group layout
+/// exists: the library does not do them yet, and a control that silently does
+/// nothing is worse than one that says why.
 fn video_controls(
     call: &ActiveCall,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
+    app: &WhatsAppApp,
 ) -> impl IntoElement + use<> {
     let mute_entity = entity.clone();
+    let camera_entity = entity.clone();
     let end_entity = entity;
     let muted = call.muted;
+    let camera_on = call.video.local;
+    let asked = app.call_video_requested();
 
     let round = |id: &'static str, icon: Icon, tip: &'static str| {
         Button::new(id)
@@ -191,10 +287,20 @@ fn video_controls(
         .child(
             round(
                 "call-camera",
-                ProductIcon::VideoOff.into(),
-                "Video calls are not supported yet",
+                if camera_on {
+                    ProductIcon::Video.into()
+                } else {
+                    ProductIcon::VideoOff.into()
+                },
+                camera_tooltip(camera_on, asked),
             )
-            .disabled(true),
+            // Lit while the camera is on, and lit while somebody is waiting
+            // on it: the peer's request has no dialog of its own, because
+            // turning this on *is* the answer.
+            .selected(camera_on || asked)
+            .on_click(move |_, _window, cx| {
+                camera_entity.update(cx, |app, cx| app.toggle_call_video(cx));
+            }),
         )
         .child(
             round(

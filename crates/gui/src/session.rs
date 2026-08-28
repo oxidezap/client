@@ -93,6 +93,13 @@ pub enum FromDaemon {
         /// The conversation, or `None` for a page of the chat list.
         jid: Option<String>,
     },
+    /// One decoded picture of the live call.
+    ///
+    /// Not a `UiEvent`: the session says what happened to the account, and
+    /// this is a stream. It is also the one message here that may be dropped
+    /// — a frame the window is too busy to take is worth nothing by the time
+    /// it would be free.
+    CallFrame(Box<crate::video::CallFrame>),
     /// A status view the daemon did not record after all.
     ///
     /// The ring was taken down the moment the update was opened, before the
@@ -588,6 +595,19 @@ impl Session {
         });
     }
 
+    /// Turn this window's camera on or off during a live call.
+    ///
+    /// Only ever our own direction: the peer's camera is theirs. Turning it
+    /// on is also how the peer's request to go to video is answered — an
+    /// acceptance *is* a camera coming on — so there is no second request for
+    /// that.
+    pub fn set_call_video(&self, call_id: &str, enabled: bool) {
+        self.call(CallAction::SetVideo {
+            call_id: call_id.to_string(),
+            enabled,
+        });
+    }
+
     fn call(&self, action: CallAction) {
         self.tell(ClientRequest::Call(action));
     }
@@ -652,6 +672,20 @@ fn sanitize(id: &str) -> String {
 /// Read frames until the daemon goes away.
 fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pending) {
     let mut reader = BufReader::new(stream);
+    // The decoders for whatever call is up, made when its first frame arrives
+    // and dropped when the call state says there is no call: a decoder held
+    // past its call keeps its reference frames for a picture nobody is
+    // looking at, and its threads with them.
+    let mut video: Option<crate::video::CallVideo> = None;
+    let decoded: crate::video::FrameSink = {
+        let events = events.clone();
+        Arc::new(move |frame| {
+            // Dropped rather than queued: this is the same bargain the daemon
+            // makes one hop earlier, and the window is where the backlog
+            // would actually be seen.
+            let _ = events.try_send(FromDaemon::CallFrame(Box::new(frame)));
+        })
+    };
     let mut line = String::new();
     // How far the state this side holds has been carried.
     //
@@ -826,6 +860,22 @@ fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pend
                 );
                 break;
             }
+            // A stream rather than an event: fed to the decoder that owns
+            // its direction, which drops it if it is still busy with the one
+            // before. Nothing here waits, and nothing recovers a frame.
+            Ok(DaemonMessage::CallVideo(frame)) => {
+                let decoders = match &video {
+                    Some(decoders) if decoders.call_id() == frame.call_id => decoders,
+                    // A different call: the old decoders are mid-bitstream on
+                    // a stream that has ended, and feeding them this one
+                    // would produce nothing either could use.
+                    _ => video.insert(crate::video::CallVideo::new(
+                        frame.call_id.clone(),
+                        Arc::clone(&decoded),
+                    )),
+                };
+                decoders.accept(*frame);
+            }
             Ok(DaemonMessage::ShowWindow) => {
                 if events.blocking_send(FromDaemon::ShowWindow).is_err() {
                     break;
@@ -874,6 +924,11 @@ fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pend
                 event: DaemonEvent::CallsChanged(calls),
             }) => {
                 applied = version;
+                // The call the decoders belong to is over, or a different one
+                // is up. Either way theirs has ended.
+                if !calls.holds(video.as_ref().map_or("", |v| v.call_id())) {
+                    video = None;
+                }
                 if events
                     .blocking_send(FromDaemon::Calls(Box::new(calls)))
                     .is_err()

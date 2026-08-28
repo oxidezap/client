@@ -319,6 +319,26 @@ impl WhatsAppApp {
                     if muted { "muted" } else { "open" }
                 );
             }
+            // What the camera really is, once the daemon has opened or closed
+            // it. Like the mute correction, what the window *draws* comes
+            // from the call state the daemon publishes beside this; the event
+            // is what says so out loud.
+            UiEvent::CallVideoChanged {
+                call_id,
+                stream,
+                on,
+            } => {
+                info!(
+                    "Call {call_id}: the {stream:?} camera is {}",
+                    if on { "on" } else { "off" }
+                );
+            }
+            // A question, and the answer is this side's camera coming on.
+            UiEvent::CallVideoRequested { call_id } => {
+                info!("Call {call_id}: the peer asked to add video");
+                self.call_video_request = Some(call_id);
+                cx.notify();
+            }
             UiEvent::OutgoingCallStarted {
                 call_id,
                 recipient_jid,

@@ -334,6 +334,7 @@ pub fn render_call_overlay(
         cx.entity().clone(),
         &call_focus,
         layout,
+        app,
         cx,
     )
 }

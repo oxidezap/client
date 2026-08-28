@@ -72,7 +72,7 @@ impl I420Buffer {
         for row in 0..height {
             let src_row = &src[row * stride..row * stride + stride];
             let dst_row = &mut y_plane[row * width..row * width + width];
-            for (pair, quad) in src_row.chunks_exact(4).enumerate() {
+            for (pair, quad) in src_row.as_chunks::<4>().0.iter().enumerate() {
                 dst_row[pair * 2] = quad[0];
                 dst_row[pair * 2 + 1] = quad[2];
             }
@@ -104,7 +104,12 @@ impl I420Buffer {
         }
         let (y_plane, u_plane, v_plane) = self.planes_mut();
         y_plane.copy_from_slice(&src[..luma]);
-        for (index, pair) in src[luma..luma * 3 / 2].chunks_exact(2).enumerate() {
+        for (index, pair) in src[luma..luma * 3 / 2]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+        {
             u_plane[index] = pair[0];
             v_plane[index] = pair[1];
         }

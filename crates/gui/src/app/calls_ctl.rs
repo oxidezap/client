@@ -1,8 +1,72 @@
 //! Call controls, one level above `client.voip()`.
 
-use gpui::{Pixels, Point};
+use std::sync::Arc;
+
+use gpui::{Pixels, Point, RenderImage};
+use oxidezap_core::VideoStream;
 
 use super::*;
+use crate::video::CallFrame;
+
+/// The newest picture of each direction of the call on screen.
+///
+/// One frame per direction and nothing behind it. A queue here would be
+/// latency between the person talking and the person watching, and the frame
+/// that is late is exactly the one worth dropping.
+///
+/// Keyed by call, because a picture belongs to the call it was taken in: a
+/// frame that arrives after the call it came from has ended — the socket is
+/// one hop behind the state — would otherwise be drawn into the next one.
+#[derive(Default)]
+pub struct CallPictures {
+    call_id: Option<String>,
+    local: Option<Arc<RenderImage>>,
+    remote: Option<Arc<RenderImage>>,
+}
+
+impl CallPictures {
+    fn accept(&mut self, frame: CallFrame) {
+        if self.call_id.as_deref() != Some(frame.call_id.as_str()) {
+            *self = Self {
+                call_id: Some(frame.call_id),
+                ..Self::default()
+            };
+        }
+        match frame.stream {
+            VideoStream::Local => self.local = Some(frame.image),
+            VideoStream::Remote => self.remote = Some(frame.image),
+        }
+    }
+
+    /// Drop what no longer has a camera behind it.
+    ///
+    /// Driven off the call state rather than off the frames stopping: a
+    /// camera that is switched off simply stops sending, and a pane left
+    /// holding its last frame is a photograph of somebody who has gone.
+    fn follow(&mut self, calls: &CallState) {
+        let Some(call) = calls.active() else {
+            *self = Self::default();
+            return;
+        };
+        if self.call_id.as_deref() != Some(call.call_id.as_str()) {
+            *self = Self::default();
+            return;
+        }
+        if !call.video.local {
+            self.local = None;
+        }
+        if !call.video.remote {
+            self.remote = None;
+        }
+    }
+
+    pub fn of(&self, stream: VideoStream) -> Option<&Arc<RenderImage>> {
+        match stream {
+            VideoStream::Local => self.local.as_ref(),
+            VideoStream::Remote => self.remote.as_ref(),
+        }
+    }
+}
 
 impl WhatsAppApp {
     pub fn call_state(&self) -> &CallState {
@@ -47,6 +111,50 @@ impl WhatsAppApp {
         client.accept_call(call.call_id.as_str());
         self.call_state.connect_accepted(&call);
         self.ensure_tick(cx);
+        cx.notify();
+    }
+
+    /// The newest picture of one direction of the live call, when there is
+    /// one to draw.
+    pub fn call_picture(&self, stream: VideoStream) -> Option<&Arc<RenderImage>> {
+        self.call_pictures.of(stream)
+    }
+
+    /// Whether the peer is waiting on this side to turn its camera on.
+    pub fn call_video_requested(&self) -> bool {
+        self.call_video_request.is_some()
+    }
+
+    /// Turn this window's camera on or off.
+    ///
+    /// Asked for rather than applied: the daemon owns the device, and what
+    /// comes back is what it managed to do. A camera that will not open would
+    /// otherwise leave the button showing a picture nobody is being sent —
+    /// the same reason mute is asked for rather than computed here.
+    pub fn toggle_call_video(&mut self, cx: &mut Context<Self>) {
+        let Some(call) = self.call_state.active() else {
+            return;
+        };
+        let (call_id, wanted) = (call.call_id.clone(), !call.video.local);
+        // The ask is answered by the gesture, whichever way it goes: turning
+        // the camera on accepts it, and turning it off is not something to be
+        // asked about twice.
+        self.call_video_request = None;
+        if let Some(client) = &self.client {
+            client.set_call_video(&call_id, wanted);
+        }
+        cx.notify();
+    }
+
+    /// One decoded frame, straight onto the pane that draws it.
+    pub(super) fn draw_call_frame(&mut self, frame: CallFrame, cx: &mut Context<Self>) {
+        // The socket is one hop behind the state, so a frame can outlive the
+        // call it belongs to. Drawing it into the next call would put the
+        // last person's face on this one.
+        if !self.call_state.holds(&frame.call_id) {
+            return;
+        }
+        self.call_pictures.accept(frame);
         cx.notify();
     }
 
@@ -116,6 +224,8 @@ impl WhatsAppApp {
         let call_id = stage.call_id().to_string();
         info!("Ending call {call_id}");
         self.call_card.call_ended();
+        self.call_pictures = CallPictures::default();
+        self.call_video_request = None;
         // A ringing offer ended by this button was refused, not missed — the
         // same thing `decline_call` writes down, and the phone viewport routes
         // its Decline through here. Deriving the outcome from the stage alone
@@ -303,6 +413,18 @@ impl WhatsAppApp {
         self.name_callers(&mut calls);
         let live = calls.active().is_some();
         self.call_state = calls;
+        // After the state, because what a picture may still be drawn for is
+        // exactly what the new state says has a camera behind it.
+        self.call_pictures.follow(&self.call_state);
+        // A question outlives neither its call nor its answer.
+        if self
+            .call_video_request
+            .as_ref()
+            .is_none_or(|call_id| !self.call_state.holds(call_id))
+            || self.call_state.video().local
+        {
+            self.call_video_request = None;
+        }
         // The duration on the card is a clock, and a clock nobody winds shows
         // the second it started at. Armed here rather than off `CallAccepted`,
         // because a call this window did not answer — the daemon accepted it,

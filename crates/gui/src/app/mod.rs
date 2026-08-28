@@ -25,6 +25,7 @@ mod timeline_ctl;
 mod viewer;
 
 pub use calls::CallCard;
+pub use calls_ctl::CallPictures;
 pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
 pub use chats::{ChatFilter, ChatListCache, Survival, survives_complete_load};
 pub use media::RecordingState;
@@ -790,6 +791,20 @@ pub struct WhatsAppApp {
     call_state: CallState,
     /// Where *this* window puts the card for it.
     call_card: CallCard,
+    /// The newest decoded picture of each of the call's two directions.
+    ///
+    /// One frame per direction and no history: this is a stream, and a
+    /// backlog of pictures is latency between the person talking and the
+    /// person watching. Cleared with the call, because the last frame of a
+    /// call that has ended is not something to keep drawing.
+    call_pictures: CallPictures,
+    /// The call the peer has asked to add video to, while the ask stands.
+    ///
+    /// A question rather than a state: nothing has changed until somebody's
+    /// camera comes on, and the answer *is* turning ours on. Kept so the card
+    /// can say who is waiting on it rather than leaving the request to be
+    /// guessed from a peer who has suddenly gone quiet.
+    call_video_request: Option<String>,
     /// Cache of JID -> display name mappings (from notify/pushname attribute)
     name_cache: HashMap<String, String>,
     /// System notices whose conversation has not arrived yet.
@@ -910,6 +925,11 @@ impl WhatsAppApp {
                     FromDaemon::Chats { chats, next } => entity.update(cx, |app, cx| {
                         app.apply_chat_page(chats, next, cx);
                     }),
+                    // A stream, not an event: the newest picture replaces
+                    // the one before it and nothing is queued.
+                    FromDaemon::CallFrame(frame) => entity.update(cx, |app, cx| {
+                        app.draw_call_frame(*frame, cx);
+                    }),
                     FromDaemon::PageLost { jid } => entity.update(cx, |app, _cx| {
                         app.page_lost(jid);
                     }),
@@ -990,6 +1010,8 @@ impl WhatsAppApp {
             downloads_in_flight: std::collections::HashSet::new(),
             call_state: CallState::new(),
             call_card: CallCard::default(),
+            call_pictures: CallPictures::default(),
+            call_video_request: None,
             name_cache: HashMap::new(),
             pending_notices: HashMap::new(),
             video_players: HashMap::new(),
@@ -1449,6 +1471,10 @@ impl WhatsAppApp {
         // recreating a chat for the old account's peer to hold it.
         self.call_state = CallState::new();
         self.call_card.call_ended();
+        // Including the pictures: a frame of the old account's peer left in
+        // a pane is exactly the kind of thing a reset exists to remove.
+        self.call_pictures = CallPictures::default();
+        self.call_video_request = None;
         // What the *old* account occupied, and the query that is still
         // measuring it. Settings survives the reset, so a completion landing
         // after it would show the previous account's database and media under

@@ -33,7 +33,7 @@ const MAX_VIDEO_PIXELS: usize = 7680 * 4320;
 /// portrait clip decodes as landscape and only the matrix says which way is
 /// up. Angles are clockwise, as applied when drawing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Rotation {
+pub(super) enum Rotation {
     None,
     Cw90,
     Cw180,
@@ -56,8 +56,20 @@ impl Rotation {
         }
     }
 
+    /// The same turn as a count of quarter turns clockwise, which is how a
+    /// call's peer states its device orientation. Anything outside `0..=3` is
+    /// not a rotation, and is drawn as none rather than guessed at.
+    pub(super) fn from_quarter_turns(turns: u8) -> Self {
+        match turns {
+            1 => Self::Cw90,
+            2 => Self::Cw180,
+            3 => Self::Cw270,
+            _ => Self::None,
+        }
+    }
+
     /// Whether the rotation exchanges width and height.
-    fn transposes(self) -> bool {
+    pub(super) fn transposes(self) -> bool {
         matches!(self, Self::Cw90 | Self::Cw270)
     }
 }
@@ -68,7 +80,13 @@ impl Rotation {
 /// RGBA, and the frame has to be turned by the track matrix. `dst` holds the
 /// same bytes laid out in the destination geometry, which is the source's
 /// transposed for a quarter turn.
-fn write_bgra_rotated(src: &[u8], width: usize, height: usize, rotation: Rotation, dst: &mut [u8]) {
+pub(super) fn write_bgra_rotated(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    rotation: Rotation,
+    dst: &mut [u8],
+) {
     debug_assert_eq!(src.len(), width * height * 4);
     debug_assert_eq!(dst.len(), src.len());
 
@@ -774,6 +792,16 @@ mod tests {
         assert_eq!(Rotation::from_matrix(ONE, 0, 0, ONE), Rotation::None);
         // A horizontal flip is not a quarter turn and must not be mistaken for one.
         assert_eq!(Rotation::from_matrix(NEG_ONE, 0, 0, ONE), Rotation::None);
+    }
+
+    #[test]
+    fn a_peers_orientation_is_read_as_a_quarter_turn() {
+        assert_eq!(Rotation::from_quarter_turns(0), Rotation::None);
+        assert_eq!(Rotation::from_quarter_turns(1), Rotation::Cw90);
+        assert_eq!(Rotation::from_quarter_turns(2), Rotation::Cw180);
+        assert_eq!(Rotation::from_quarter_turns(3), Rotation::Cw270);
+        // Not a rotation: drawn as it arrived rather than turned by a guess.
+        assert_eq!(Rotation::from_quarter_turns(9), Rotation::None);
     }
 
     #[test]

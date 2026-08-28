@@ -79,6 +79,7 @@ pub fn active_audio(
     call: &ActiveCall,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
+    asked_for_video: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
     div()
@@ -148,7 +149,7 @@ pub fn active_audio(
                         })
                         .child(mic_state(call.muted, metrics, cx)),
                 )
-                .child(controls(call, entity, metrics, cx)),
+                .child(controls(call, entity, metrics, asked_for_video, cx)),
         )
 }
 
@@ -189,9 +190,11 @@ fn controls(
     call: &ActiveCall,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
+    asked: bool,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let mute_entity = entity.clone();
+    let camera_entity = entity.clone();
     let end_entity = entity;
     let muted = call.muted;
 
@@ -244,6 +247,9 @@ fn controls(
             )
             .disabled(true),
         ))
+        // The one gesture that turns an audio call into a video one: the
+        // camera coming on is what the peer is told, and it is also how their
+        // own request is answered.
         .child(labelled(
             "Video",
             metrics,
@@ -251,9 +257,16 @@ fn controls(
             round(
                 "call-video",
                 ProductIcon::Video.into(),
-                "Video calls are not supported yet",
+                if asked {
+                    "They asked for video — turn the camera on"
+                } else {
+                    "Turn the camera on"
+                },
             )
-            .disabled(true),
+            .selected(asked)
+            .on_click(move |_, _window, cx| {
+                camera_entity.update(cx, |app, cx| app.toggle_call_video(cx));
+            }),
         ))
         .child(labelled(
             "Add",
