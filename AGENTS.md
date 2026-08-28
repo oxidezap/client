@@ -112,7 +112,13 @@ profile here repeats it deliberately.
   on a picture that had already moved on. It is gated on `has_window` rather
   than on wanting events: a notifier asks for events and has nowhere to put a
   picture, and subscribing it would spend a call's whole bitrate on frames it
-  parses and discards.
+  parses and discards. And the *session* stops producing them when the last
+  window goes: nothing announces a subscriber leaving, so the first frame
+  that finds nobody drawing is what notices, and `set_video_publishing`
+  closes the door in front of the sender until a window subscribes again. The
+  gate is read before a frame is built, because building one copies an access
+  unit out of the encoder's buffer — for a call that runs, and a peer that is
+  receiving it, whether or not anybody here is looking.
 - **Everything on the video path drops, and every drop asks for a keyframe.**
   A frame that cannot be delivered now is worth nothing later, so every queue
   from the encoder to the pane is short and every send is a `try_send`. What

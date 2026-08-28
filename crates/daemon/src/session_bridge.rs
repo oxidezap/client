@@ -71,9 +71,9 @@ pub enum Action {
     /// Reload the whole history, for a front end that has just attached and
     /// holds nothing.
     ReloadHistory,
-    /// A front end that draws video has attached; ask the cameras for a point
-    /// its decoders can start from. See
-    /// [`WhatsAppClient::request_video_keyframe`].
+    /// A front end that draws video has attached: let the session publish
+    /// again, and ask the cameras for a point its decoders can start from.
+    /// See [`WhatsAppClient::set_video_publishing`].
     RefreshVideo,
     /// One page of a chat's messages, answered on `answer_to`.
     ///
@@ -234,9 +234,19 @@ pub async fn run(
                 None => break,
             },
             // Not folded into daemon state and not published as an event: a
-            // frame is neither. It goes straight out to whoever is drawing,
-            // and is dropped when nobody is.
-            Some(frame) = video.recv() => bridge.hub.publish_video(frame),
+            // frame is neither. It goes straight out to whoever is drawing —
+            // and when nobody is, the session is told to stop producing them
+            // rather than being left to hand over frames this drops. That is
+            // the only place the *last* window leaving can be noticed:
+            // nothing announces a subscriber going away, and one frame is
+            // what it costs to find out.
+            Some(frame) = video.recv() => {
+                if bridge.hub.wants_video() {
+                    bridge.hub.publish_video(frame);
+                } else {
+                    client.set_video_publishing(false);
+                }
+            }
 
             command = commands.recv(), if !commands_closed => match command {
                 Some(command) => {
@@ -828,6 +838,10 @@ impl Bridge {
                 CommandOutcome::Accepted
             }
             Action::RefreshVideo => {
+                // A window is drawing again — or for the first time. The gate
+                // opens before the keyframe is asked for, so the frame that
+                // answers the ask has somewhere to go.
+                client.set_video_publishing(true);
                 client.request_video_keyframe();
                 CommandOutcome::Accepted
             }

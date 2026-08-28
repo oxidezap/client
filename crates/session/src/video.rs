@@ -33,14 +33,26 @@ use whatsapp_rust::voip::{VideoFrame, VideoSource};
 /// only frame worth having is the newest one.
 pub type VideoFrameSender = tokio::sync::mpsc::Sender<CallVideoFrame>;
 
-/// The publisher as the pumps see it: a slot, read per frame.
+/// Where a finished frame goes, and the door in front of it.
 ///
-/// Not a captured `VideoFrameSender`, because subscribing replaces it — and a
-/// pump holding the old one would find its receiver closed and conclude that
-/// nobody is watching, for the rest of the call, while a window sat in front
-/// of it. Absent or closed means exactly "nobody is watching *now*", which is
-/// a frame to drop and never a reason to stop pumping.
-pub type VideoPublisher = Arc<std::sync::Mutex<Option<VideoFrameSender>>>;
+/// The sender is a slot read per frame rather than a captured
+/// `VideoFrameSender`, because subscribing replaces it — and a pump holding
+/// the old one would find its receiver closed and conclude that nobody is
+/// watching, for the rest of the call, while a window sat in front of it.
+/// Absent or closed means exactly "nobody is watching *now*", which is a
+/// frame to drop and never a reason to stop pumping.
+#[derive(Clone)]
+pub struct VideoPublisher {
+    pub(crate) sender: VideoSenderSlot,
+    /// Whether anybody is drawing at all, which the daemon owns: the sender
+    /// belongs to the process and outlives every window, so the slot alone
+    /// cannot say. Read before the frame is built, because building one
+    /// copies an access unit out of the encoder's buffer.
+    pub(crate) watched: Arc<AtomicBool>,
+}
+
+/// The sender the daemon installs once and keeps.
+pub type VideoSenderSlot = Arc<std::sync::Mutex<Option<VideoFrameSender>>>;
 
 /// What became of one frame handed to the publisher.
 ///
@@ -65,7 +77,14 @@ enum Delivery {
 /// buffer to travel, and nobody watching is the ordinary state of a daemon
 /// holding a call with its window closed.
 fn publish(publisher: &VideoPublisher, frame: impl FnOnce() -> CallVideoFrame) -> Delivery {
-    let sender = publisher.lock().expect("video publisher poisoned").clone();
+    if !publisher.watched.load(Ordering::Relaxed) {
+        return Delivery::NoSubscriber;
+    }
+    let sender = publisher
+        .sender
+        .lock()
+        .expect("video publisher poisoned")
+        .clone();
     let Some(sender) = sender else {
         return Delivery::NoSubscriber;
     };
@@ -262,7 +281,7 @@ pub(crate) async fn open(
         frames: camera.frames(),
         camera: camera.control(),
         plane: source_tx,
-        publisher: Arc::clone(&publisher),
+        publisher: publisher.clone(),
         lost,
         camera_id,
         drawable: Arc::clone(&drawable),

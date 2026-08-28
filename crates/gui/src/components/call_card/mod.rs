@@ -247,6 +247,11 @@ fn expanded_card(
             entity.clone(),
             metrics,
             app.call_video_requested(),
+            // What this window asked for, which the state cannot have caught
+            // up with yet: the card is the audio one precisely because no
+            // camera is on, and the seconds a device takes to open are the
+            // ones the control has to account for.
+            app.call_video_showing(),
             cx,
         )
         .into_any_element(),

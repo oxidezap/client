@@ -28,7 +28,7 @@ use oxidezap_core::{
 
 use crate::names::NameBook;
 use crate::quoting::quoted_from;
-use crate::video::{self, CameraLost, LocalVideo, VideoPublisher};
+use crate::video::{self, CameraLost, LocalVideo, VideoPublisher, VideoSenderSlot};
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
 /// Resolve a stable per-user path for the SQLite database. A CWD-relative
@@ -482,7 +482,10 @@ pub struct WhatsAppClient {
     /// whose newest frame is the only one worth having. It is also bounded,
     /// which the event channel is not — a camera that outran a stalled
     /// reader would otherwise grow the queue for as long as the call lasted.
-    video_tx: VideoPublisher,
+    video_tx: VideoSenderSlot,
+    /// Whether anybody is drawing what the cameras produce. See
+    /// [`Self::set_video_publishing`].
+    video_publishing: Arc<portable_atomic::AtomicBool>,
     /// Durable chat history (same SQLite file as the device store)
     chat_store: ChatStoreHandle,
     /// The session's address book, so a page served on request names people
@@ -527,6 +530,9 @@ impl WhatsAppClient {
             ui_sender: Arc::new(Mutex::new(None)),
             calls: CallRegistry::default(),
             video_tx: Arc::new(std::sync::Mutex::new(None)),
+            // Closed until a window says otherwise: a daemon that starts with
+            // nobody attached has nobody to publish to.
+            video_publishing: Arc::new(portable_atomic::AtomicBool::new(false)),
             chat_store: Arc::new(Mutex::new(None)),
             names: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -599,7 +605,25 @@ impl WhatsAppClient {
     }
 
     fn video_publisher(&self) -> VideoPublisher {
-        Arc::clone(&self.video_tx)
+        VideoPublisher {
+            sender: Arc::clone(&self.video_tx),
+            watched: Arc::clone(&self.video_publishing),
+        }
+    }
+
+    /// Publish frames, or stop: the daemon says when anybody is drawing.
+    ///
+    /// A call runs whether or not a window is open — the peer is receiving
+    /// our camera either way — so the pumps would otherwise go on copying
+    /// every access unit out of the encoder's buffer and handing it to a
+    /// daemon that discards it. The gate is read before the frame is built,
+    /// so what it saves is the copy as well as the hop.
+    ///
+    /// Not the sender itself, which the daemon owns and must not lose: this
+    /// is a door in front of it.
+    pub fn set_video_publishing(&self, on: bool) {
+        self.video_publishing
+            .store(on, portable_atomic::Ordering::Relaxed);
     }
 
     /// What to do when a camera stops being a camera.
