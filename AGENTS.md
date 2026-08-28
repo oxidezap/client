@@ -58,8 +58,10 @@ cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxideza
 # A plugin. Its own workspace, its own target, and the file's name is its id.
 cd examples/autoreply && cargo build --release --target wasm32-unknown-unknown
 cp target/wasm32-unknown-unknown/release/autoreply.wasm ~/.local/share/oxidezap/plugins/
-# And the one test that exercises the real SDK against the real host:
-cargo test -p oxidezap-plugin-host -- --ignored
+# And the one test that exercises the real SDK against the real host. Back at
+# the root first: the example is its own workspace and the root excludes it, so
+# from in there cargo cannot resolve the host crate at all.
+cd ../.. && cargo test -p oxidezap-plugin-host --all-features -- --ignored
 ```
 
 Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is
@@ -195,6 +197,15 @@ profile here repeats it deliberately.
   The two share a directory, so a plugin's own store is written under a
   `kv-` prefix no plugin id can produce — one called `approvals` would
   otherwise write its settings over everybody's permissions.
+  What an answer is recorded *against* is the id and the mask, deliberately,
+  and not a hash of the module: replacing `autoreply.wasm` with different
+  code keeps the answer. That is defensible because the mask is the whole
+  authority — there is no WASI, so what the new code can do is exactly the
+  sentence the user agreed to, enforced whatever the bytes are — and because
+  the alternative asks again on every update, which is the surest way to
+  teach somebody to dismiss the question. It is a real trade rather than an
+  oversight: binding to the bytes would say "you approved this build", which
+  is stronger and costs a prompt per release.
 - **An event is a handle, not a payload.** Nothing is serialized for a plugin:
   it reads fields through four host functions against a table of constants, so
   a handler that looks at the text and the chat pays for two strings out of an

@@ -78,8 +78,14 @@ fn widget(
         PluginWidget::Button => {
             let (plugin, action) = (surface.id.clone(), node.id.clone());
             let entity = ctx.entity.clone();
+            // `/` and not `-`: both halves may hold a `-`, so a plugin `a`
+            // with a widget `b-c` and a plugin `a-b` with a widget `c` would
+            // otherwise be one element id in a list that holds every
+            // plugin's roots. The same separator `key` uses, for the same
+            // reason and with the same guarantee: no plugin id may contain
+            // it.
             Button::new(SharedString::from(format!(
-                "plugin-{}-{}",
+                "plugin/{}/{}",
                 surface.id, node.id
             )))
             .label(node.label.clone())
@@ -102,7 +108,7 @@ fn widget(
             row_with_label(
                 &node.label,
                 Switch::new(SharedString::from(format!(
-                    "plugin-{}-{}",
+                    "plugin/{}/{}",
                     surface.id, node.id
                 )))
                 .checked(checked)

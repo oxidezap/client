@@ -219,10 +219,14 @@ fn render_actions(
     let overflow_entity = entity.clone();
     let search_entity = entity;
 
+    // Every native control, and none of them shrinks: the row around them
+    // does, so that what gives way on a narrow header is the plugins' region
+    // rather than Call or the overflow menu.
     let action = |id: &'static str, icon: Icon, tip: &'static str| {
         Button::new(id)
             .icon(icon)
             .ghost()
+            .flex_shrink_0()
             .tooltip(tip)
             .w(layout.icon_button_size())
             .h(layout.icon_button_size())
@@ -230,16 +234,17 @@ fn render_actions(
 
     div()
         .flex()
-        .flex_shrink_0()
+        .min_w_0()
         .items_center()
         .gap(metrics.space_xxs())
         // Plugin controls come first so they read as belonging to the
         // conversation rather than to the window's chrome — but in a region
-        // that may *shrink*, while this row and the native buttons after it
-        // may not. Ordering alone would not have protected them: a
-        // non-shrinking row simply grows, and Call and the overflow menu
-        // would go off the edge of a narrow header. What keeps them reachable
-        // is that the plugins' region is the only thing here that gives way.
+        // that may *shrink*, while the native buttons after it may not.
+        // Ordering alone would not protect them: a row that cannot shrink
+        // simply grows, taking its `min_w_0` child's bound with it, and Call
+        // and the overflow menu go off the edge of a narrow header. So the
+        // row yields, every native control refuses to, and the plugins'
+        // region is the only thing here that gives way.
         .child(
             div()
                 .flex()

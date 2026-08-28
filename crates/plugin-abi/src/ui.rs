@@ -345,6 +345,13 @@ mod parse {
         Anonymous,
         /// Past [`MAX_DEPTH`], [`MAX_NODES`] or [`MAX_TEXT`].
         TooBig,
+        /// The padding byte was not zero.
+        ///
+        /// Refused rather than ignored, so the byte stays free to mean
+        /// something later: a reader that skipped it would let payloads
+        /// carrying a value circulate, and the day it acquires a meaning
+        /// those become trees whose author never agreed to it.
+        Reserved(u8),
     }
 
     impl std::fmt::Display for ParseError {
@@ -353,6 +360,7 @@ mod parse {
                 Self::Format(v) => write!(f, "ui format {v}, expected {FORMAT}"),
                 Self::Truncated => f.write_str("the ui tree ends mid-node"),
                 Self::Trailing => f.write_str("bytes after the last root node"),
+                Self::Reserved(v) => write!(f, "reserved byte {v}, expected 0"),
                 Self::Unknown { kind, slot } => {
                     write!(f, "unknown widget {kind} or slot {slot}")
                 }
@@ -418,7 +426,10 @@ mod parse {
             let kind = self.u8()?;
             let slot = self.u8()?;
             let flags = self.u8()?;
-            let _reserved = self.u8()?;
+            let reserved = self.u8()?;
+            if reserved != 0 {
+                return Err(ParseError::Reserved(reserved));
+            }
             let children = self.u16()?;
             let id = self.string()?;
             let label = self.string()?;
@@ -634,6 +645,27 @@ mod tests {
             bytes.extend_from_slice(&0u32.to_le_bytes());
         }
         assert_eq!(parse(&bytes), Err(ParseError::Misplaced));
+    }
+
+    /// The padding byte is refused rather than skipped, so it stays free to
+    /// mean something later: a reader that ignored it would let payloads
+    /// carrying a value circulate, and the day it acquires a meaning those
+    /// become trees whose author never agreed to it.
+    #[test]
+    fn a_non_zero_reserved_byte_is_refused() {
+        let mut bytes = vec![FORMAT];
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&[kind::LABEL, slot::SETTINGS, flags::ENABLED, 0x7f]);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        for _ in 0..3 {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+        }
+        assert_eq!(parse(&bytes), Err(ParseError::Reserved(0x7f)));
+
+        // And the same payload with a zero there is a tree, so the test is
+        // about the byte rather than about anything else being wrong.
+        bytes[8] = 0;
+        assert!(parse(&bytes).is_ok());
     }
 
     /// A slot number this build does not draw is refused, not dropped. A

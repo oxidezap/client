@@ -31,6 +31,13 @@ pub fn render_settings_view(
     window: &mut Window,
     cx: &mut Context<WhatsAppApp>,
 ) -> impl IntoElement {
+    // Before anything reads a plugin's tree, exactly as the conversation
+    // does it. Settings is where a plugin's own panel lives, so leaving this
+    // to the connected view alone meant a text field a plugin published there
+    // had nowhere to hold what was typed and drew no box at all — the one
+    // screen where it matters most.
+    app.sync_plugin_fields(window, cx);
+
     let layout = app.responsive_layout(window, cx);
     let metrics = *layout.metrics();
     let entity = cx.entity().clone();

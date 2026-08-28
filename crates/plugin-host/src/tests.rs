@@ -956,16 +956,21 @@ fn shutting_down_finishes_even_with_a_saturated_queue() {
     // On another thread with a deadline, because the failure this guards
     // against is a hang: an assertion that never runs proves nothing, and a
     // test that hangs takes CI's whole timeout with it.
+    //
+    // Detached, and that is the whole point: `thread::scope` joins its
+    // threads before it returns *or* propagates a panic, so a `shutdown`
+    // that hung would have the timeout fire and then wait forever anyway —
+    // the deadline could never report the one failure it exists to catch.
     let (done, waited) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            plugins.shutdown();
-            let _ = done.send(());
-        });
-        waited
-            .recv_timeout(Duration::from_secs(20))
-            .expect("shutdown returned");
+    let plugins = Arc::new(plugins);
+    let shutting_down = Arc::clone(&plugins);
+    std::thread::spawn(move || {
+        shutting_down.shutdown();
+        let _ = done.send(());
     });
+    waited
+        .recv_timeout(Duration::from_secs(20))
+        .expect("shutdown returned");
 }
 
 /// `MAX_TIMERS` bounds what a plugin *holds*, not what it asks for in one

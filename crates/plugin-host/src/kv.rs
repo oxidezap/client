@@ -145,7 +145,15 @@ impl Kv {
         let Ok(json) = serde_json::to_vec(&self.entries) else {
             return;
         };
-        let temp = self.path.with_extension("json.tmp");
+        // Unique per process and thread, like the approvals file's. A fixed
+        // name is one two daemons sharing a state directory both write, so
+        // one can rename a file the other is still filling — and a plugin's
+        // settings then read back as corrupt and start empty.
+        let temp = self.path.with_extension(format!(
+            "json.{}.{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let outcome =
             std::fs::write(&temp, &json).and_then(|()| std::fs::rename(&temp, &self.path));
         if let Err(e) = outcome {
@@ -221,7 +229,10 @@ mod tests {
     #[test]
     fn a_corrupt_file_starts_empty_rather_than_failing() {
         let dir = TempDir::new("corrupt");
-        std::fs::write(dir.0.join("p.json"), b"{not json").expect("writable");
+        // The name `Kv::open` actually reads. Writing `p.json` exercised the
+        // missing-file branch instead, so a regression making a corrupt
+        // settings file fatal would have passed.
+        std::fs::write(dir.0.join("kv-p.json"), b"{not json").expect("writable");
         let mut kv = Kv::open(&dir.0, "p");
         assert_eq!(kv.get("anything"), None);
         assert!(kv.set("k", "v"), "and it is usable again");
