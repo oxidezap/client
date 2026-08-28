@@ -110,9 +110,10 @@ jobs:
 
   deploy:
     name: Deploy
-    # Only from main. A pull request builds — which is the part that catches a
-    # break — and publishes nothing.
-    if: github.event_name != 'pull_request'
+    # Only from main, and the branch is checked as well as the event: a
+    # `workflow_dispatch` can be started on any ref, and excluding pull
+    # requests alone would let one publish unmerged code to the live site.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     permissions:

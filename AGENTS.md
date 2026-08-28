@@ -124,9 +124,13 @@ profile here repeats it deliberately.
   excepting localhost, which is the developer's own `trunk serve`. A request
   with no `Origin` is not a browser — a page cannot suppress the header — so
   it is served only on a loopback bind, where anything that could connect
-  could equally have opened the Unix socket. Both endpoints draw on one
-  admission count, because a client costs the same descriptors and tasks
-  however it arrived.
+  could equally have opened the Unix socket — which is what makes that rule
+  safe, and why a non-loopback bind is an error rather than a warning: there
+  the header is a string the client picks and the traffic is cleartext, so
+  remote access is a tunnel's job. Both endpoints draw on one admission
+  count, because a client costs the same descriptors and tasks however it
+  arrived; the web one claims its slot at the upgrade rather than at accept,
+  since the same port serves media and a photo is not a front end.
 - **Nothing stops the daemon but `main`.** The tray's Quit and an IPC
   `Shutdown` ask through `shutdown::request`; ending the process from a D-Bus
   callback or a connection task would skip disconnecting the session and

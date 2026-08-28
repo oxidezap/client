@@ -46,7 +46,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 
 use crate::server::{self, ClientSlots};
 use crate::session_bridge::Commands;
@@ -88,6 +88,27 @@ pub async fn run(
     commands: Commands,
     slots: ClientSlots,
 ) -> Result<()> {
+    // Loopback only, and refused rather than warned about.
+    //
+    // Off this machine the `Origin` header is not a check at all — it is a
+    // string the client chooses, and a program that is not a browser writes
+    // whatever it likes there — so the one thing standing between the network
+    // and a WhatsApp session would be a request to please identify honestly.
+    // The traffic is also plain TCP: no TLS a browser would accept is
+    // something a daemon can produce for itself.
+    //
+    // Reaching this from another machine is a tunnel's job (`ssh -L`, or a
+    // reverse proxy that terminates TLS and authenticates), which is a
+    // deliberate act by someone who can see what they are exposing.
+    if !config.addr.ip().is_loopback() {
+        anyhow::bail!(
+            "the web bridge refuses to bind {}: off the loopback its only check is an \
+             `Origin` header the client chooses, and the session would cross the network \
+             in the clear. Bind it to 127.0.0.1 and reach it through a tunnel.",
+            config.addr
+        );
+    }
+
     let listener = TcpListener::bind(config.addr)
         .await
         .with_context(|| format!("binding the web bridge to {}", config.addr))?;
@@ -100,18 +121,6 @@ pub async fn run(
             config.allowed_origins.join(", ")
         }
     );
-    if !config.addr.ip().is_loopback() {
-        // Said once, loudly. Off the loopback there is nothing between this
-        // endpoint and the network but the `Origin` header, which only a
-        // browser is obliged to send truthfully — see the module
-        // documentation. Anything without one is refused there.
-        log::warn!(
-            "the web bridge is bound to {}, which is not loopback: anything that can \
-             reach that address can reach this session, and only a browser's own \
-             origin check stands in the way",
-            config.addr
-        );
-    }
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -243,7 +252,17 @@ async fn attach(
     // `from_raw_socket` rather than `accept_async`: the handshake was read
     // and answered above, because this port also serves media and the request
     // had to be routed before it could be upgraded.
-    let socket = WebSocketStream::from_raw_socket(stream.into_inner(), Role::Server, None).await;
+    //
+    // Sized to the same budget the server enforces on a frame. The library's
+    // defaults are 64 MiB per message and 16 MiB per frame, which would have
+    // this end assemble a message sixty times larger than anything the server
+    // will accept before the server got to refuse it — the allocation is the
+    // cost, and it happens here.
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(server::MAX_REQUEST_BYTES))
+        .max_frame_size(Some(server::MAX_REQUEST_BYTES));
+    let socket =
+        WebSocketStream::from_raw_socket(stream.into_inner(), Role::Server, Some(config)).await;
     let (mut outbound, mut inbound) = socket.split();
 
     // The server's end of a byte stream, so `serve_client` is untouched: it
@@ -472,12 +491,9 @@ impl Request {
     fn origin_allowed(&self, config: &Config) -> bool {
         let Some(origin) = &self.origin else {
             // Not a browser: a page cannot suppress `Origin`. So this is
-            // something else on the machine, and it is served only where the
-            // machine is the whole of the reach — a loopback bind, where
-            // anything that can connect could equally have opened the Unix
-            // socket. Off the loopback it is refused outright, because there
-            // the header is the only check there is and a client that does
-            // not send one cannot be subject to it.
+            // something else on this machine — `run` refuses to bind anywhere
+            // else — and anything that can reach a loopback port could
+            // equally have opened the Unix socket beside it.
             return config.addr.ip().is_loopback();
         };
         if is_loopback_origin(origin) {
@@ -613,17 +629,24 @@ mod tests {
         assert!(request(None).origin_allowed(&config(&["https://oxidezap.github.io"])));
     }
 
-    /// Off the loopback the header is the only check there is, and a client
-    /// that sends none cannot be subject to it. Refused rather than trusted.
-    #[test]
-    fn a_client_with_no_origin_is_refused_off_the_loopback() {
+    /// A bind that is not loopback is refused before anything is served, so
+    /// the `Origin` header never has to carry weight it cannot bear.
+    #[tokio::test]
+    async fn a_bind_off_the_loopback_is_refused() {
         let exposed = Config {
-            addr: "0.0.0.0:9527".parse().expect("a literal address"),
+            addr: "0.0.0.0:0".parse().expect("a literal address"),
             allowed_origins: vec!["https://oxidezap.github.io".to_string()],
         };
-        assert!(!request(None).origin_allowed(&exposed));
-        // A named origin still is, which is the whole point of naming one.
-        assert!(request(Some("https://oxidezap.github.io")).origin_allowed(&exposed));
+        let hub = StateHub::new();
+        let (commands, _rx) = tokio::sync::mpsc::channel(1);
+        let refused = run(exposed, hub, commands, server::client_slots()).await;
+        let message = refused
+            .expect_err("a non-loopback bind is refused")
+            .to_string();
+        assert!(
+            message.contains("refuses to bind"),
+            "refused for the wrong reason: {message}"
+        );
     }
 
     #[test]

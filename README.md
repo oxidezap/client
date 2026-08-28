@@ -99,8 +99,8 @@ Then open <http://127.0.0.1:8080>.
 **That endpoint is off by default, and should stay off unless you want it.**
 A WebSocket is not subject to the same-origin policy, so any page open in
 your browser can try to reach `ws://127.0.0.1` — and this one carries your
-message history and can send. It therefore binds to loopback, and it refuses
-every browser origin you have not named:
+message history and can send. It therefore refuses to bind anywhere but
+loopback, and it refuses every browser origin you have not named:
 
 ```bash
 # Serve a page published somewhere else — a Pages deployment, say.
@@ -111,6 +111,12 @@ oxidezapd --web --web-allow https://oxidezap.github.io
 `trunk serve` on your own machine. Pass `?daemon=ws://host:port/ws` to point
 a page at a daemon other than the default one; it is honoured only for this
 machine or the origin the page itself came from.
+
+Reaching the bridge from another machine is a tunnel's job — `ssh -L
+9527:127.0.0.1:9527`, or a reverse proxy that terminates TLS and
+authenticates. It will not bind a public address itself: off the loopback its
+only check would be an `Origin` header the client chooses, and the session
+would cross the network in the clear.
 
 What the web build cannot do, and reports rather than pretends:
 

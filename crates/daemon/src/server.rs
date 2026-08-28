@@ -311,7 +311,7 @@ fn prepare_state_dir(dir: &Path) -> Result<()> {
 /// give a long-lived front end an artificial EOF once its small, valid
 /// requests happened to add up. Requests are tiny; a megabyte is far past any
 /// legitimate one and still cheap to refuse.
-const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Read one newline-delimited frame, bounded independently of every other.
 ///

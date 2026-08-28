@@ -392,10 +392,6 @@ async fn download_with_timeout(
     .ok_or_else(|| "Download timed out".to_string())?
 }
 
-/// Write a downloaded document into the user's Downloads directory
-/// ($XDG_DOWNLOAD_DIR, then $HOME or %USERPROFILE% + /Downloads, then the CWD
-/// like the database fallback when no home is known) and return the path
-/// written.
 /// Open the connection, on whichever thread can open one.
 ///
 /// Off the UI thread on a desktop: connecting there can mean starting a

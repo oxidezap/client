@@ -104,10 +104,16 @@ impl WhatsAppApp {
         if !matches!(paging, Paging::Unasked) {
             return;
         }
+        // Only once there is somebody to answer. Nothing sends `PageLost`
+        // for a request that was never made, so a `Loading` set here with no
+        // session is one the list never leaves — and a reconnect keeps it,
+        // because the paging state survives. Common on the web, where a page
+        // cannot start a daemon and simply waits for one.
+        let Some(client) = &self.client else {
+            return;
+        };
         *paging = Paging::Loading { from: None };
-        if let Some(client) = &self.client {
-            client.load_messages(jid.to_string(), None);
-        }
+        client.load_messages(jid.to_string(), None);
     }
 
     /// Ask for the page before the one this conversation is showing.
@@ -121,12 +127,15 @@ impl WhatsAppApp {
             // and that one lands at the bottom, which is where the reader is.
             return;
         };
+        // See `ensure_timeline_page`: no session, no request, so no
+        // `Loading` to be stuck in.
+        let Some(client) = &self.client else {
+            return;
+        };
         *paging = Paging::Loading {
             from: Some(cursor.clone()),
         };
-        if let Some(client) = &self.client {
-            client.load_messages(jid.to_string(), Some(cursor));
-        }
+        client.load_messages(jid.to_string(), Some(cursor));
     }
 
     /// Ask for more of the chat list.
@@ -140,10 +149,11 @@ impl WhatsAppApp {
         let Some(ask) = self.chat_pages.to_ask() else {
             return;
         };
+        let Some(client) = &self.client else {
+            return;
+        };
         self.chat_pages = Paging::Loading { from: ask.clone() };
-        if let Some(client) = &self.client {
-            client.load_chats(ask);
-        }
+        client.load_chats(ask);
     }
 
     /// Fold one page of a conversation into it.

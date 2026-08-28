@@ -266,10 +266,17 @@ pub fn endpoint_url() -> String {
 /// Whether a page may attach to this URL without being asked again.
 ///
 /// Two rules. It has to be a WebSocket URL, because anything else is a
-/// mistake or an attempt at something. And it has to be either this machine
+/// mistake or an attempt at something. And it has to name either this machine
 /// or the origin the page was itself served from — a daemon somewhere else
 /// entirely is a decision, not a default, and a link is not how it should be
 /// made.
+///
+/// Parsed with the browser's own URL parser rather than by splitting on
+/// characters, because *the browser* is what will resolve it and only its
+/// answer is the one that matters. Splitting is how
+/// `wss://127.0.0.1:9527@evil.example/ws` gets through a host check: the part
+/// before the `@` is userinfo, so a reader looking for a colon finds
+/// `127.0.0.1` while the socket opens to `evil.example`.
 ///
 /// # Errors
 ///
@@ -277,22 +284,22 @@ pub fn endpoint_url() -> String {
 /// rather than a failure to start, because a page that refuses to load is
 /// worse than one that attaches where it was going to anyway.
 fn usable_endpoint(url: &str) -> Result<(), String> {
-    let Some(rest) = url
-        .strip_prefix("ws://")
-        .or_else(|| url.strip_prefix("wss://"))
-    else {
-        return Err("not a WebSocket URL".to_string());
-    };
-    let host = host_of(rest);
+    let parsed = web_sys::Url::new(url).map_err(|_| "not a URL".to_string())?;
+    if !matches!(parsed.protocol().as_str(), "ws:" | "wss:") {
+        return Err(format!("{} is not a WebSocket scheme", parsed.protocol()));
+    }
+    // `hostname`, not `host`: no port, no userinfo, and already lowercased
+    // and unwrapped from the brackets an IPv6 literal carries.
+    let host = parsed.hostname();
     if is_loopback_host(&host) {
         return Ok(());
     }
     // The page's own origin: a deployment that serves the bridge beside
     // itself is naming where it already came from.
     let served_from = web_sys::window()
-        .and_then(|window| window.location().host().ok())
+        .and_then(|window| window.location().hostname().ok())
         .unwrap_or_default();
-    if !served_from.is_empty() && host == host_of(&served_from) {
+    if !served_from.is_empty() && host.eq_ignore_ascii_case(&served_from) {
         return Ok(());
     }
     Err(format!(
@@ -300,22 +307,12 @@ fn usable_endpoint(url: &str) -> Result<(), String> {
     ))
 }
 
-/// The host and port of a URL remainder, without the path.
-fn host_of(rest: &str) -> String {
-    rest.split('/').next().unwrap_or(rest).to_string()
-}
-
 /// Whether a host names this machine.
 ///
-/// Matched whole rather than by prefix, so `localhost.example.com` is not
-/// mistaken for one.
+/// A parsed hostname, so there is no port and no userinfo left to be confused
+/// by — and `localhost.example.com` is simply a different string.
 fn is_loopback_host(host: &str) -> bool {
-    let name = host
-        .rsplit_once(':')
-        .map_or(host, |(name, _)| name)
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    matches!(name, "localhost" | "127.0.0.1" | "::1")
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
 
 /// Where the media this daemon has cached can be fetched from.
@@ -328,19 +325,32 @@ fn is_loopback_host(host: &str) -> bool {
 #[must_use]
 pub fn media_base_url() -> String {
     let socket = endpoint_url();
-    let http = if let Some(rest) = socket.strip_prefix("wss://") {
-        format!("https://{rest}")
-    } else if let Some(rest) = socket.strip_prefix("ws://") {
-        format!("http://{rest}")
-    } else {
-        socket
+    // Through the parser rather than by trimming a suffix off the string. A
+    // socket URL is allowed a query — the bridge routes on the path alone, so
+    // `ws://host/ws?token=x` connects — and a suffix test then finds no `/ws`
+    // to remove and produces `http://host/ws?token=x/media`, which asks the
+    // socket endpoint for every photo.
+    let Ok(parsed) = web_sys::Url::new(&socket) else {
+        // `endpoint_url` returns only what already parsed, or the built-in
+        // default; this is unreachable rather than a fallback.
+        return format!(
+            "http://127.0.0.1:{}{}",
+            crate::DEFAULT_WEB_PORT,
+            crate::WEB_MEDIA_PATH
+        );
     };
-    let base = http
-        .strip_suffix(crate::WEB_SOCKET_PATH)
-        .unwrap_or(&http)
-        .trim_end_matches('/')
-        .to_string();
-    format!("{base}{}", crate::WEB_MEDIA_PATH)
+    parsed.set_protocol(if parsed.protocol() == "wss:" {
+        "https:"
+    } else {
+        "http:"
+    });
+    parsed.set_pathname(crate::WEB_MEDIA_PATH);
+    // Neither belongs on a media request: the query was for the socket, and a
+    // fragment never leaves the browser anyway.
+    parsed.set_search("");
+    parsed.set_hash("");
+    // No trailing slash: `fetch_media` joins the key with one.
+    parsed.href().trim_end_matches('/').to_string()
 }
 
 /// One query parameter off the page's own URL.
