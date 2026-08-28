@@ -329,7 +329,35 @@ jobs:
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
+      # Re-asked before every attempt at the branch, exactly as publication
+      # re-asks the opposite. A pull request reopened while this job is still
+      # running has a `reopened` run publishing its preview behind us, and an
+      # unconditional removal would then delete a preview that is wanted —
+      # with no further event left to put it back.
+      - name: Write the still-closed check
+        run: |
+          set -eu
+          cat > "$RUNNER_TEMP/still-closed.sh" <<'CHECK'
+          set -eu
+          pr=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                    -H 'Accept: application/vnd.github+json' \
+                    "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER")
+          # 2, matching the publisher's vocabulary: "the desired state is not
+          # what this job was started to do". Anything else this script can
+          # exit with is curl failing, which the caller refuses to read as an
+          # answer.
+          [ "$(printf '%s' "$pr" | jq -r .state)" = 'open' ] || exit 0
+          echo "pull request was reopened; its preview is wanted again" >&2
+          exit 2
+          CHECK
+
       - name: Remove the preview
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash .github/scripts/publish-pages.sh --remove "pr/${{ github.event.number }}"
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          set -eu
+          bash .github/scripts/publish-pages.sh \
+            --only-if "sh $RUNNER_TEMP/still-closed.sh" \
+            --remove "pr/$PR_NUMBER"

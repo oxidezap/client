@@ -479,18 +479,50 @@ async fn serve_media(stream: &mut TcpStream, key: &str, origin: Option<&str>) ->
         )
         .await;
     };
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            // The daemon does not record what a payload was, and the front
-            // end already knows: every one of these is named by a message
-            // that carried its MIME type.
-            respond(stream, 200, "application/octet-stream", origin, &bytes).await
-        }
+    // Opened rather than read. A video is tens of megabytes and this process
+    // is also the one holding the WhatsApp session — reading each request's
+    // payload whole would let a handful of tabs fetching attachments at once
+    // put several films on the daemon's heap and take the account down with
+    // them. The length comes from the metadata, so the head is still exact.
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
         Err(e) => {
             log::debug!("media {key} is not cached: {e}");
-            respond(stream, 404, "text/plain", origin, b"not cached").await
+            return respond(stream, 404, "text/plain", origin, b"not cached").await;
         }
+    };
+    let length = match file.metadata().await {
+        Ok(metadata) => metadata.len(),
+        Err(e) => {
+            log::debug!("media {key} could not be measured: {e}");
+            return respond(stream, 404, "text/plain", origin, b"not cached").await;
+        }
+    };
+
+    // The daemon does not record what a payload was, and the front end
+    // already knows: every one of these is named by a message that carried
+    // its MIME type.
+    let mut head = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Length: {length}\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n"
+    );
+    if let Some(origin) = origin {
+        head.push_str(&format!(
+            "Access-Control-Allow-Origin: {origin}\r\n\
+             Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+             Vary: Origin\r\n"
+        ));
     }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await?;
+
+    let mut file = tokio::io::BufReader::new(file);
+    tokio::io::copy(&mut file, stream).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 /// One HTTP response, headers and all.

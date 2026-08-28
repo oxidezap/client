@@ -36,27 +36,35 @@
 # last writer wins by re-reading rather than by overwriting.
 set -euo pipefail
 
+# Flags in any order, because two of the three call sites pass both and the
+# positional version silently ignored whichever came second.
 remove=false
-if [ "${1:-}" = "--remove" ]; then
-    remove=true
-    shift
-fi
-
-# Something to re-ask before each attempt, when "should this happen at all" is
-# a question the branch cannot answer.
-#
-# The lease below keeps two writers from losing each other's work; it says
-# nothing about whether the work is still wanted. A pull request that closes
-# while a publish is in flight is exactly that: the close job removes the
-# preview, this one re-reads the branch it just changed, and — with no second
-# question — puts the preview straight back. Asking once before the loop would
-# not close it either; the window is between the question and the push, so the
-# question belongs inside.
 precondition=''
-if [ "${1:-}" = "--only-if" ]; then
-    precondition="${2:?--only-if needs a command}"
-    shift 2
-fi
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --remove)
+            remove=true
+            shift
+            ;;
+        # Something to re-ask before each attempt, when "should this happen at
+        # all" is a question the branch cannot answer.
+        #
+        # The lease below keeps two writers from losing each other's work; it
+        # says nothing about whether the work is still wanted. A pull request
+        # that closes while a publish is in flight is exactly that, and so is
+        # one reopened while its teardown is in flight. Asking once before the
+        # loop would not close either window — the gap is between the question
+        # and the push — so the question belongs inside.
+        --only-if)
+            precondition="${2:?--only-if needs a command}"
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 target="${1:?a target directory is required}"
 
 : "${GH_TOKEN:?a token is required to push}"
@@ -76,9 +84,28 @@ attempts=6
 attempt=1
 while [ "$attempt" -le "$attempts" ]; do
 
-if [ -n "$precondition" ] && ! sh -c "$precondition"; then
-    echo "no longer wanted; not publishing $target"
-    exit 0
+if [ -n "$precondition" ]; then
+    set +e
+    sh -c "$precondition"
+    wanted=$?
+    set -e
+    case "$wanted" in
+        0) ;;
+        # 1 superseded, 2 no longer the desired state. Both are answers, and
+        # standing down is the right thing to do about them.
+        1 | 2)
+            echo "no longer wanted (check said $wanted); not touching $branch"
+            exit 0
+            ;;
+        # Anything else is the check *breaking* — a network blip, a rate
+        # limit, an API 500 — and reading that as "stand down" is how a
+        # deployment silently does not happen while the job reports success
+        # and leaves nothing to retry. An unanswered question is not a no.
+        *)
+            echo "the current-state check failed with $wanted; refusing to guess" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 work=$(mktemp -d)
