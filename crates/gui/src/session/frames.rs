@@ -331,18 +331,24 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
         let Some(key) = media.cache_key.clone() else {
             return;
         };
-        // A key this build could not use if it had the bytes. The daemon
-        // caches a downloaded clip by its content and hands a hydrated row
-        // *that* key in place of the thumbnail's, so a web window attaching
-        // beside a desktop one that had played a video would pull the whole
-        // MP4 down — ahead of the frame it belongs to, to decode it with a
-        // decoder that does not exist here. The thumbnail key (`f-`) is a
-        // different thing and is still worth having: it is what the row draws
-        // next to "video is not supported here".
-        if media.media_type == MediaType::Video
-            && !crate::video::CAN_DECODE
-            && key.starts_with("d-")
-        {
+        // A key this build could not use if it had the bytes, whichever of
+        // the two names it under.
+        //
+        // Neither prefix means "thumbnail": `f-` addresses full media by
+        // message and `d-` addresses the same bytes by content — the `f` is
+        // there *because* it promises full, which is what stopped a blur from
+        // taking a photo's place in the cache. An inbound clip whose eager
+        // download succeeded is written under `f-`, so skipping only `d-`
+        // still pulled whole MP4s down to hand them to a decoder that does
+        // not exist here, ahead of the frame they belong to and inside its
+        // budget.
+        //
+        // Nothing is lost by skipping both. A fallback thumbnail is never
+        // externalized — `cache_media` refuses to cache a preview, and the
+        // bytes themselves are `#[serde(skip)]` — so for a page a video row's
+        // key names the film or nothing at all, and the row draws "video is
+        // not supported here" either way.
+        if media.media_type == MediaType::Video && !crate::video::CAN_DECODE {
             return;
         }
         into.push(key);

@@ -108,8 +108,12 @@ pub enum FromSocket {
 /// content block. Everything that fails later is reported on the channel.
 pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), String> {
     let socket = WebSocket::new(url).map_err(|e| {
+        // Redacted, like the two log paths. This one is worse than a log: it
+        // is the string the window *draws*, so the token would be in any
+        // screenshot of the failure as well as in anything copied out of it.
         format!(
-            "could not open a socket to {url}: {}",
+            "could not open a socket to {}: {}",
+            without_secrets(url),
             e.as_string()
                 .unwrap_or_else(|| "refused by the browser".into())
         )
