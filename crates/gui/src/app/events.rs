@@ -358,6 +358,10 @@ impl WhatsAppApp {
                 call_id,
                 recipient_jid,
                 placeholder_id: _,
+                // The kind the offer went out as is state, and the daemon
+                // folds it into the stage it renames; this side draws it from
+                // there like everything else about the call.
+                is_video: _,
             } => {
                 info!(
                     "Outgoing call started: {} to {}",

@@ -2332,6 +2332,15 @@ impl WhatsAppClient {
             };
             let Some(handle) = handle else {
                 debug!("set_call_video: no live handle for {}", call_id);
+                // Answered rather than dropped. A window draws the camera as
+                // coming on the moment it is asked, and it clears that on the
+                // settle — so a request that arrives in the seconds between
+                // the state saying a call is live and this side registering
+                // its handle would otherwise leave the control lit for the
+                // rest of the call, and its next click asking to turn off a
+                // camera that was never opened. What the registry holds is
+                // nothing, which is exactly what is said.
+                Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
                 return;
             };
 
@@ -2720,6 +2729,10 @@ impl WhatsAppClient {
                 Some((local, endpoints)) => (Some(local), Some(endpoints)),
                 None => (None, None),
             };
+            // What the offer will say, decided by what is attached to it
+            // rather than by what was asked for. Read here because the
+            // endpoints are about to be handed away.
+            let endpoints_attached = endpoints.is_some();
 
             let voip = client.voip();
             let outgoing = voip.call(&jid).audio(mic, speaker);
@@ -2811,6 +2824,13 @@ impl WhatsAppClient {
                             call_id: call_id.clone(),
                             recipient_jid,
                             placeholder_id,
+                            // What went out, not what was asked for: a video
+                            // call whose camera would not open was placed as
+                            // a voice call, and the state drawn from the
+                            // request would otherwise hold video panes open
+                            // on a call with no camera and write the
+                            // conversation's record as a video call.
+                            is_video: endpoints_attached,
                         });
                     }
                     // Not announced here: the call is ringing, and a ringing

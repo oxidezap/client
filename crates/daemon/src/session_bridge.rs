@@ -453,6 +453,7 @@ impl Bridge {
                 call_id,
                 recipient_jid: _,
                 placeholder_id,
+                is_video,
             } => {
                 // Renamed *and* advanced: the placeholder id was ours, and the
                 // server answering with the real one is also what says the
@@ -464,7 +465,7 @@ impl Bridge {
                 // `CallState::update_outgoing_call_id`.
                 let mut adopted = false;
                 self.hub.calls(|s| {
-                    adopted = s.update_outgoing_call_id(placeholder_id, call_id.clone());
+                    adopted = s.update_outgoing_call_id(placeholder_id, call_id.clone(), *is_video);
                     if adopted {
                         s.set_outgoing_ringing(call_id);
                     }
@@ -2188,6 +2189,7 @@ mod tests {
             call_id: "call-1".into(),
             recipient_jid: "1@s.whatsapp.net".into(),
             placeholder_id: "ui-call-1".into(),
+            is_video: false,
         });
         bridge.observe(UiEvent::CallAccepted("call-1".into()));
 
@@ -2221,6 +2223,7 @@ mod tests {
             call_id: "call-1".into(),
             recipient_jid: "1@s.whatsapp.net".into(),
             placeholder_id: "ui-call-1".into(),
+            is_video: false,
         });
 
         let calls = bridge.hub.call_state();

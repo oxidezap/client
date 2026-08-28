@@ -749,10 +749,23 @@ impl CallState {
     /// first one's id made the state hold an id nobody was ringing under, so
     /// the front end's orphan-cancellation path let the abandoned call go on
     /// ringing at the far end.
-    pub fn update_outgoing_call_id(&mut self, placeholder_id: &str, new_call_id: CallId) -> bool {
+    ///
+    /// `is_video` is what the offer *was*, which is not always what was asked
+    /// for: a video call whose camera would not open is placed as a voice
+    /// call rather than not placed at all, and the state drawn from the
+    /// request would otherwise keep video panes open on a call that has none
+    /// and write the conversation's record as a video call. The answer is
+    /// known here and nowhere earlier, so the rename carries it.
+    pub fn update_outgoing_call_id(
+        &mut self,
+        placeholder_id: &str,
+        new_call_id: CallId,
+        is_video: bool,
+    ) -> bool {
         match &mut self.stage {
             Some(Stage::Outgoing(call)) if call.call_id == placeholder_id => {
                 call.call_id = new_call_id;
+                call.is_video = is_video;
                 true
             }
             _ => false,
@@ -1068,8 +1081,23 @@ mod tests {
         let mut state = CallState::default();
         state.set_outgoing(outgoing("ui-call-1"));
 
-        assert!(state.update_outgoing_call_id("ui-call-1", "REAL".to_string()));
+        assert!(state.update_outgoing_call_id("ui-call-1", "REAL".to_string(), false));
         assert_eq!(state.outgoing().map(|c| c.call_id.as_str()), Some("REAL"));
+    }
+
+    /// A video call whose camera would not open is *placed* as a voice call,
+    /// and the state drawn from the request has to be corrected — or the
+    /// window holds video panes open on a call with no camera in it and the
+    /// conversation records a video call that never was one.
+    #[test]
+    fn the_offer_that_went_out_decides_the_kind() {
+        let mut state = CallState::default();
+        let mut asked = outgoing("ui-call-1");
+        asked.is_video = true;
+        state.set_outgoing(asked);
+
+        assert!(state.update_outgoing_call_id("ui-call-1", "REAL".to_string(), false));
+        assert_eq!(state.outgoing().map(|c| c.is_video), Some(false));
     }
 
     /// Cancel a call before the server has answered, redial the same person,
@@ -1086,7 +1114,7 @@ mod tests {
         state.set_outgoing(outgoing("ui-call-2"));
 
         assert!(
-            !state.update_outgoing_call_id("ui-call-1", "REAL-1".to_string()),
+            !state.update_outgoing_call_id("ui-call-1", "REAL-1".to_string(), false),
             "the first attempt's answer belongs to a call that is gone"
         );
         assert_eq!(

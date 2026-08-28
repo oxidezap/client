@@ -105,6 +105,12 @@ pub enum UiEvent {
         /// nobody was ringing under, while the abandoned one rang on with
         /// nothing on this side holding it.
         placeholder_id: CallId,
+        /// What the offer that went out actually was.
+        ///
+        /// Not what was asked for: a video call whose camera would not open
+        /// is placed as a voice call rather than not placed at all, and this
+        /// is the first moment anything knows which of the two happened.
+        is_video: bool,
     },
     OutgoingCallFailed {
         recipient_jid: String,
