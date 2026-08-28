@@ -41,6 +41,15 @@ pub fn new_timeline_state(item_count: usize) -> ListState {
     ListState::new(item_count, ListAlignment::Bottom, px(TIMELINE_OVERDRAW))
 }
 
+/// The conversation, as one frame draws it.
+///
+/// Three things share the pane and each takes its position from a different
+/// place. The rows come from the cache, already woven with their dividers.
+/// The gutter is theirs rather than the list's, because `gpui::list` ignores
+/// the horizontal half of its own padding and a container that carries it
+/// instead moves the list — and the scrollbar with it. And the bar goes over
+/// the bounds `state` reports, so the overlay it sits in only has to cover
+/// the pane.
 pub fn render_message_list(
     cache: MessageListCache,
     state: &ListState,
