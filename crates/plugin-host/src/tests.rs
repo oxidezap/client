@@ -1571,3 +1571,33 @@ fn an_approval_is_refused_once_the_host_is_shutting_down() {
         "nothing is granted on the way out"
     );
 }
+
+/// A bit above `kinds::COUNT` means a plugin built against a newer ABI.
+/// Adding a kind deliberately does not bump `VERSION`, so this is the only
+/// thing that catches it — and masking the bit left the plugin loaded and
+/// looking healthy while it never heard about what it asked for.
+const SUBSCRIBES_TO_THE_FUTURE: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
+  (memory (export "memory") 1)
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    ;; 1 << 40, far above any kind this host defines.
+    (call $subscribe (i64.const 1099511627776))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param i32) (param i32) (result i32) (i32.const 0))
+)"#;
+
+#[test]
+fn a_subscription_to_a_kind_this_host_lacks_is_refused() {
+    let dir = TempDir::new("future-kind");
+    dir.plugin("ahead", &versioned(SUBSCRIBES_TO_THE_FUTURE));
+    dir.plugin("autoreply", &pong());
+
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(
+        plugins.ids(),
+        vec!["autoreply"],
+        "refused, and its neighbour still loads"
+    );
+}

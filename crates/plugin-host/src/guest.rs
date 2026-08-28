@@ -144,6 +144,9 @@ pub struct Guest {
     /// What this call has already spent on host work the sandbox does not
     /// measure. Reset by the runtime before every call, because these bound
     /// one delivery rather than one plugin.
+    /// Set when a subscription named a kind this host does not define, which
+    /// the loader turns into a refusal once `oxi_init` returns.
+    pub unknown_kinds: bool,
     pub logged_bytes: usize,
     pub trees_published: usize,
     pub kv: Kv,
@@ -212,12 +215,22 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if c.data().phase != Phase::Init {
                 return;
             }
-            // Bits above the kinds this ABI defines are dropped rather than
-            // refused: a plugin built against a newer table asking for a kind
-            // this host has never heard of should still get the kinds it named
-            // that do exist.
+            // Refused, not masked. `kinds::COUNT`'s own documentation is the
+            // contract: a bit above it means a plugin built against a newer
+            // ABI, and adding a kind deliberately does not bump `VERSION`, so
+            // nothing else would ever catch it. Dropping the bit left such a
+            // plugin loaded and healthy-looking while permanently never
+            // hearing about the one thing it asked for — which is exactly the
+            // failure the constant exists to prevent. Recorded rather than
+            // returned, because this import has no answer: the loader refuses
+            // the plugin once `oxi_init` is done.
             let known = (1i64 << abi::kinds::COUNT) - 1;
-            c.data_mut().subscription = mask & known;
+            let guest = c.data_mut();
+            if mask & !known != 0 {
+                guest.unknown_kinds = true;
+                return;
+            }
+            guest.subscription = mask & known;
         },
     )?;
 
@@ -277,18 +290,23 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         m,
         abi::imports::FIELD_STR,
         |mut c: Caller<'_, Guest>, ev: i32, field: i32, ptr: i32, cap: i32| -> i32 {
-            let value = match c.data().read_field(ev, field) {
-                Some(Value::Str(s)) => s.clone(),
+            // Answered without copying the value anywhere first. Cloning it
+            // to escape the borrow was the obvious way to write this and the
+            // wrong one: the clone lands in *host* memory, which the limiter
+            // does not see and fuel does not price by size, so a handler
+            // reading one large field in a loop — even with `cap == 0`, which
+            // copies nothing into the plugin — could turn its budget into
+            // gigabytes of allocation traffic. `write_field` reaches the
+            // event and the plugin's memory at once and copies once, into the
+            // plugin.
+            match c.data().read_field(ev, field) {
                 // An integer read as a string is not a coercion this ABI
                 // performs: a plugin asking the wrong way has a bug, and
                 // answering it would hide which.
+                Some(Value::Str(_)) | None => {}
                 Some(_) => return abi::ABSENT,
-                None => match c.data().element(ev) {
-                    Some(s) if field == abi::fields::SELF => s.to_owned(),
-                    _ => return abi::ABSENT,
-                },
-            };
-            write_str(&mut c, ptr, cap, &value)
+            }
+            write_field(&mut c, ev, field, ptr, cap)
         },
     )?;
 
@@ -722,6 +740,45 @@ fn read_str(caller: &mut Caller<'_, Guest>, ptr: i32, len: i32) -> Result<String
 /// sizes one and asks again. Truncating silently would hand a plugin half a
 /// JID, and returning only an error would make the first call useless for
 /// learning how much room to make.
+/// Write one of the event's own strings into the plugin, copying it only
+/// into the plugin's memory.
+///
+/// `Memory::data_and_store_mut` is what makes this possible: it hands back
+/// the guest's bytes and the store's data at the same time, so the value can
+/// be read out of the event and written into the plugin without a `String`
+/// in between. Everything else here is [`write_str`]'s contract, which see.
+fn write_field(caller: &mut Caller<'_, Guest>, ev: i32, field: i32, ptr: i32, cap: i32) -> i32 {
+    let Ok(cap) = usize::try_from(cap) else {
+        return abi::outcome::INVALID;
+    };
+    let Some(memory) = memory(caller) else {
+        return abi::outcome::INVALID;
+    };
+    let Ok(offset) = usize::try_from(ptr) else {
+        return abi::outcome::INVALID;
+    };
+
+    let (bytes, guest) = memory.data_and_store_mut(&mut *caller);
+    let value = match guest.read_field(ev, field) {
+        Some(Value::Str(s)) => s.as_str(),
+        Some(_) => return abi::ABSENT,
+        None => match guest.element(ev) {
+            Some(s) if field == abi::fields::SELF => s,
+            _ => return abi::ABSENT,
+        },
+    };
+    let full = i32::try_from(value.len()).unwrap_or(i32::MAX);
+    if cap == 0 {
+        return full;
+    }
+    let end = cap.min(value.len());
+    let Some(target) = bytes.get_mut(offset..offset + end) else {
+        return abi::outcome::INVALID;
+    };
+    target.copy_from_slice(&value.as_bytes()[..end]);
+    full
+}
+
 fn write_str(caller: &mut Caller<'_, Guest>, ptr: i32, cap: i32, value: &str) -> i32 {
     let full = i32::try_from(value.len()).unwrap_or(i32::MAX);
     let Ok(cap) = usize::try_from(cap) else {

@@ -138,6 +138,7 @@ impl Runtime {
                 ui: None,
                 timers: Vec::new(),
                 pending_timers: 0,
+                unknown_kinds: false,
                 logged_bytes: 0,
                 trees_published: 0,
                 kv,
@@ -200,6 +201,18 @@ impl Runtime {
             return Err(anyhow!(
                 "its `{}` refused with {answer}",
                 abi::exports::INIT
+            ));
+        }
+
+        // A subscription naming a kind this host does not define means a
+        // plugin built against a newer ABI. Refused rather than run: adding a
+        // kind deliberately does not bump `VERSION`, so nothing later would
+        // catch it, and the plugin would sit there looking healthy while
+        // permanently never hearing about the one thing it asked for.
+        if store.data().unknown_kinds {
+            return Err(anyhow!(
+                "it subscribed to an event kind this host does not define; it was built \
+                 against a newer ABI"
             ));
         }
 
