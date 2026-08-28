@@ -165,7 +165,16 @@ pub mod imports {
 /// "messages", not for each of the four events a message can produce. The
 /// finer distinctions are fields on the event.
 pub mod kinds {
-    /// A message arrived, in either direction. `FROM_ME` says which.
+    /// A message *arrived*, in either direction. `FROM_ME` says which.
+    ///
+    /// Arriving is the operative word, and both directions are real: one this
+    /// account wrote on another device syncs in here with `FROM_ME` set,
+    /// which is why an autoreply has to check it. What this does **not**
+    /// carry is a send made through this daemon — by a window, or by a plugin
+    /// itself. Those are not re-delivered: the session announces them as an
+    /// id assignment rather than as a message, and synthesizing one would
+    /// hand a plugin its own send twice once the same message came back
+    /// through sync.
     pub const MESSAGE: i32 = 1;
     /// The connection to WhatsApp changed. `CONNECTION_STATE` says how.
     pub const CONNECTION: i32 = 2;

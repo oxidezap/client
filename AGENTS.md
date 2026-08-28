@@ -812,6 +812,12 @@ screen, with the title above the glass and the pair code below it.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
+- **A plugin never sees what this process sends.** `kinds::MESSAGE` is what
+  *arrives*, including a message this account wrote on another device — but a
+  send made through this daemon is announced as an id assignment, not as a
+  message, so a plugin keeping a record of a conversation has a hole in it
+  exactly where its own replies go. Synthesizing one is not free: the same
+  message returns through sync, and a plugin would see it twice.
 - **A plugin's reply quotes an empty message.** `oxi_send_reply` names an id
   and nothing else, which is all the ABI gives a plugin — but the session
   does not re-read the original: `quote_context` puts the preview, the sender

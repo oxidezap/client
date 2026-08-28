@@ -46,6 +46,12 @@ const MAX_HANDLES: usize = 4096;
 /// one is a plugin filling the daemon's log at the speed of its own loop.
 const MAX_LOG_BYTES: i32 = 2048;
 
+/// How long the string naming a plugin may be.
+///
+/// Generous against the 64 characters actually kept, and far under what a
+/// string may be: this is read once, and a name is drawn in a list.
+const MAX_NAME_BYTES: i32 = 1024;
+
 /// How much a plugin may log across one wasm call.
 ///
 /// The per-line cap alone bounded nothing: a loop calling it is millions of
@@ -242,6 +248,13 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         |mut c: Caller<'_, Guest>, ptr: i32, len: i32| -> i32 {
             if c.data().phase != Phase::Init {
                 return abi::outcome::STATE;
+            }
+            // Bounded before the copy, like every other import that takes a
+            // string. Only 64 characters are kept, so allocating 64 KiB to
+            // throw away all but a line of it is host work charged as one
+            // fixed-price call — and a loop is that work without a bound.
+            if !(0..=MAX_NAME_BYTES).contains(&len) {
+                return abi::outcome::INVALID;
             }
             match read_str(&mut c, ptr, len) {
                 Ok(name) => {

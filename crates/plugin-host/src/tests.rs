@@ -1494,3 +1494,45 @@ fn publishes_repeatedly() -> String {
         len = n,
     ))
 }
+
+/// A module without a memory export loads and then answers `INVALID` to
+/// everything, which reaches the user as a plugin listed as running whose
+/// controls quietly do nothing. Refused at load, where the reason can be said.
+const NO_MEMORY: &str = r#"(module
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32) (i32.const 0))
+  (func (export "oxi_on_event") (param i32) (param i32) (result i32) (i32.const 0))
+)"#;
+
+#[test]
+fn a_module_with_nothing_to_read_from_is_refused() {
+    let dir = TempDir::new("no-memory");
+    dir.plugin("mute", &versioned(NO_MEMORY));
+    dir.plugin("autoreply", &pong());
+
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(
+        plugins.ids(),
+        vec!["autoreply"],
+        "refused, and its neighbour still loads"
+    );
+}
+
+/// The account is leaving, so an answer arriving now would be written after
+/// the reset retired the file — and inherited by whoever pairs next.
+#[test]
+fn an_approval_is_refused_once_the_host_is_shutting_down() {
+    let dir = TempDir::new("approve-late");
+    dir.plugin("autoreply", &pong());
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    published.settles("the plugin to be listed", |s| !s.is_empty());
+
+    plugins.shutdown();
+    plugins.approve("autoreply", true);
+    assert!(
+        !plugins.surfaces()[0].approved,
+        "nothing is granted on the way out"
+    );
+}

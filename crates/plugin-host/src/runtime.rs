@@ -165,6 +165,22 @@ impl Runtime {
         let on_event = instance
             .get_typed_func::<(i32, i32), i32>(&store, abi::exports::ON_EVENT)
             .map_err(|e| anyhow!("it exports no usable `{}`: {e}", abi::exports::ON_EVENT))?;
+        // And the memory, which is not a detail: every string, every widget
+        // tree and every stored setting crosses through it. A module without
+        // one loads and then answers `INVALID` to everything it is asked,
+        // which reaches the user as a plugin listed as running whose controls
+        // quietly do nothing — the failure that is hardest to attribute.
+        // Refused here, where the reason can be said.
+        if instance
+            .get_export(&store, abi::exports::MEMORY)
+            .and_then(wasmi::Extern::into_memory)
+            .is_none()
+        {
+            return Err(anyhow!(
+                "it exports no `{}`, so nothing could be read from it",
+                abi::exports::MEMORY
+            ));
+        }
 
         // Only now: the module is instantiated, its version answered, and the
         // exports the host needs are all there. Everything that ran before

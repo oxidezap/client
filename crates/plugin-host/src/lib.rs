@@ -363,6 +363,10 @@ impl Plugins {
         // alone is enough: the flag is only read between events, and a closed
         // channel still hands over what is already queued.
         self.stopping.store(true, Ordering::Relaxed);
+        // Behind the same lock an answer is recorded under, so one already
+        // part-way through finishes before the flag is anybody's answer —
+        // and none can start after it.
+        drop(lock(&self.approving));
         for worker in &self.workers {
             drop(lock(&worker.queue).take());
         }
@@ -385,6 +389,16 @@ impl Plugins {
         let Some(worker) = self.workers.iter().find(|w| w.id == id) else {
             return;
         };
+        // Not once the host is going. The IPC server keeps answering requests
+        // while the session tears down, so a `PluginApproval` arriving then
+        // could write a fresh `approvals.json` *after* the account reset had
+        // retired it — and the next pairing would inherit a grant nobody gave
+        // it. Refusing here is the whole fix: shutdown raises this before it
+        // does anything else.
+        if self.stopping.load(Ordering::Relaxed) {
+            log::warn!("plugin {id}: refusing an approval; the host is shutting down");
+            return;
+        }
         // One ordered step, because these are two answers to the same
         // question and they must not be able to disagree. Two clients acting
         // at once would otherwise let a grant compute its mask, pause while a
