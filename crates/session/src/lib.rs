@@ -5,6 +5,7 @@
 
 mod group_notice;
 mod names;
+mod net;
 mod quoting;
 mod whatsapp;
 

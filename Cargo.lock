@@ -5786,12 +5786,22 @@ dependencies = [
 name = "oxidezap-session"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-channel",
+ "async-trait",
+ "bytes",
+ "futures-channel",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
+ "js-sys",
  "log",
  "oxidezap-audio",
  "oxidezap-chat-store",
  "oxidezap-core",
  "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "whatsapp-rust",
 ]
 
