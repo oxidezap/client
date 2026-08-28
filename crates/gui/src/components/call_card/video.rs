@@ -116,10 +116,19 @@ pub(super) fn panes(
 
 /// What a pane says when it has no frame.
 ///
-/// Three different sentences, because the three are different situations: a
+/// Four different sentences, because they are four different situations: a
 /// camera that is off is a decision somebody made, a camera that is on with
-/// no frame yet is a moment, and our own camera being off during a video call
-/// is the one the user can do something about.
+/// no frame yet is a moment, our own camera being off during a video call is
+/// the one the user can do something about — and a camera that is on where
+/// nothing can decode it is none of those.
+///
+/// That last one is the reason `CAN_DECODE` is asked here, the way the
+/// message row asks it and the composer asks `CAN_RECORD`: it is a property
+/// of the build rather than of this call. A page attaches to a daemon that
+/// may well be holding a video call — the call is the daemon's, and its state
+/// reaches every front end — so both panes can be drawn with their cameras
+/// on, and every access unit is dropped where it arrives. "connecting…" is a
+/// moment passing, and left there it would be the label for the whole call.
 fn waiting_for(
     call: &ActiveCall,
     stream: VideoStream,
@@ -127,7 +136,8 @@ fn waiting_for(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let label = match (stream, call.video.is_on(stream)) {
-        (_, true) => "connecting…",
+        (_, true) if crate::video::CAN_DECODE => "connecting…",
+        (_, true) => "video needs the desktop app",
         (VideoStream::Local, false) => "camera off",
         (VideoStream::Remote, false) => "no camera",
     };
