@@ -19,6 +19,7 @@
 //! against a reference it never received, which is why the camera is asked
 //! for a keyframe whenever one is lost.
 
+use portable_atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use log::{debug, warn};
@@ -115,6 +116,14 @@ pub(crate) struct LocalVideo {
     /// for its thread, and a second owner would leave nothing able to wait.
     /// What the pump needs is the *control*, which is shareable.
     camera: CameraStream,
+    /// Whether the self-view is worth sending yet.
+    ///
+    /// The camera opens before the offer goes out — it has to, or the offer
+    /// is not a video offer — and a call can then ring for half a minute. A
+    /// window has no live call to draw those frames into, so publishing them
+    /// would base64 a 720p stream across the socket, spin up a decoder and
+    /// convert every frame to pixels, all of it to be thrown away on arrival.
+    drawable: Arc<AtomicBool>,
     /// The fan-out task, stopped by dropping the camera's channel.
     pump: tokio::task::JoinHandle<()>,
     id: CallIdSlot,
@@ -139,6 +148,11 @@ fn read(id: &CallIdSlot) -> String {
 }
 
 impl LocalVideo {
+    /// There is a live call now, so the self-view has somewhere to land.
+    pub(crate) fn drawable(&self) {
+        self.drawable.store(true, Ordering::Relaxed);
+    }
+
     /// Which opened camera this is, so a teardown scheduled for an earlier
     /// one does not take it down.
     pub(crate) fn camera_id(&self) -> CameraId {
@@ -216,21 +230,23 @@ pub(crate) async fn open(
         .map_err(|e| format!("{e:#}"))?;
     let stride = camera.quality().timestamp_stride();
     let camera_id = next_camera_id();
+    let drawable = Arc::new(AtomicBool::new(false));
 
     // The encoder's own queue is upstream of this one; this pair is what the
     // media plane and the front end read.
     let (source_tx, source_rx) = async_channel::bounded(PLANE_DEPTH);
     let (sink_tx, sink_rx) = async_channel::bounded(PLANE_DEPTH);
 
-    let pump = tokio::spawn(pump_local(
-        Arc::clone(&call_id),
-        camera.frames(),
-        camera.control(),
-        source_tx,
-        Arc::clone(&publisher),
+    let pump = tokio::spawn(pump_local(LocalPump {
+        call_id: Arc::clone(&call_id),
+        frames: camera.frames(),
+        camera: camera.control(),
+        plane: source_tx,
+        publisher: Arc::clone(&publisher),
         lost,
         camera_id,
-    ));
+        drawable: Arc::clone(&drawable),
+    }));
     tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publisher));
 
     Ok((
@@ -239,6 +255,7 @@ pub(crate) async fn open(
             pump,
             id: call_id,
             camera_id,
+            drawable,
         },
         Endpoints {
             source: CameraSource {
@@ -256,7 +273,10 @@ pub(crate) async fn open(
 /// that is not reading, and a front end must not hold the plane up. Both are
 /// `try_send`, and only the plane's drop is worth a keyframe — a self-view
 /// that misses a frame recovers on the next one it does get.
-async fn pump_local(
+/// The ends the local pump is tied to, named rather than listed: eight
+/// positional arguments is a call nobody can read and one nobody can get
+/// wrong twice.
+pub(crate) struct LocalPump {
     call_id: CallIdSlot,
     frames: async_channel::Receiver<EncodedFrame>,
     camera: CameraControl,
@@ -264,24 +284,48 @@ async fn pump_local(
     publisher: VideoPublisher,
     lost: CameraLost,
     camera_id: CameraId,
-) {
+    drawable: Arc<AtomicBool>,
+}
+
+async fn pump_local(pump: LocalPump) {
+    let LocalPump {
+        call_id,
+        frames,
+        camera,
+        plane,
+        publisher,
+        lost,
+        camera_id,
+        drawable,
+    } = pump;
+    // Set by a drop, spent on the next frame that gets through — the one
+    // whose references are the ones missing. See `CallVideoFrame::gap`.
+    let mut gap = false;
     while let Ok(EncodedFrame { data, keyframe }) = frames.recv().await {
-        let drawn = publish(
-            &publisher,
-            CallVideoFrame::new(
-                read(&call_id),
-                VideoStream::Local,
-                data.clone(),
-                keyframe,
-                0,
-            ),
-        );
-        // The self-view lost a unit, and cannot say so itself: the window
-        // never sees what did not arrive. One extra IDR — on a stream that
-        // emits one every few seconds anyway — against a self-view frozen
-        // until the next.
-        if drawn == Delivery::Dropped {
-            camera.request_keyframe();
+        // Nothing is drawing a call that is still ringing. The camera runs
+        // regardless — the offer said it would — but the picture goes
+        // nowhere until there is somewhere to put it.
+        if drawable.load(Ordering::Relaxed) {
+            let drawn = publish(
+                &publisher,
+                CallVideoFrame::new(
+                    read(&call_id),
+                    VideoStream::Local,
+                    data.clone(),
+                    keyframe,
+                    0,
+                )
+                .after_a_gap(gap),
+            );
+            // The self-view lost a unit, and cannot say so itself: the window
+            // never sees what did not arrive. One extra IDR — on a stream
+            // that emits one every few seconds anyway — against a self-view
+            // frozen until the next, and the mark travels with the frame that
+            // does arrive.
+            gap = drawn == Delivery::Dropped;
+            if gap {
+                camera.request_keyframe();
+            }
         }
         if plane.try_send(data).is_err() {
             if plane.is_closed() {
@@ -319,8 +363,9 @@ async fn pump_remote(
     // is nothing on this side that can ask it to: the library parses the
     // peer's PLI and FIR but exposes no way to *send* one, so the peer's own
     // periodic keyframe is what ends the gap.
+    let mut gap = false;
     while let Ok(frame) = frames.recv().await {
-        publish(
+        let drawn = publish(
             &publisher,
             CallVideoFrame::new(
                 read(&call_id),
@@ -328,8 +373,12 @@ async fn pump_remote(
                 frame.data,
                 frame.keyframe,
                 frame.orientation,
-            ),
+            )
+            .after_a_gap(gap),
         );
+        // Nothing here can ask the peer for a keyframe, so the most this can
+        // do is tell the decoder not to draw on what it no longer has.
+        gap = drawn == Delivery::Dropped;
     }
     debug!("remote video for {} ended", read(&call_id));
 }

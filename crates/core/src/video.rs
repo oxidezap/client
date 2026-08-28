@@ -109,6 +109,15 @@ pub struct CallVideoFrame {
     pub data: Vec<u8>,
     /// The unit carries an IDR — a decoder may (re)start here.
     pub keyframe: bool,
+    /// Units were lost before this one.
+    ///
+    /// Carried *on the frame after the gap* rather than sent beside it,
+    /// because a gap is a position in a stream and a message about one
+    /// arrives somewhere else. A decoder told this stops and waits for a
+    /// keyframe: what it holds no longer matches what the sender encoded
+    /// against, and the units that follow reference what it never received.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub gap: bool,
     /// The sender's device rotation in quarter turns, clockwise.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub orientation: u8,
@@ -133,7 +142,15 @@ impl CallVideoFrame {
             data,
             keyframe,
             orientation,
+            gap: false,
         }
+    }
+
+    /// Say that units were lost before this one.
+    #[must_use]
+    pub fn after_a_gap(mut self, gap: bool) -> Self {
+        self.gap = gap;
+        self
     }
 }
 

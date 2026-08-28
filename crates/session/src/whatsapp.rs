@@ -278,6 +278,31 @@ fn participant_keyed_chat(jid: &Jid) -> bool {
     jid.is_group() || jid.is_broadcast_list() || jid.is_status_broadcast()
 }
 
+/// Clears an accept from `accepting` however its task ends.
+///
+/// A guard rather than a line at each exit: the accept path returns from a
+/// dozen places — a device that would not open, a refusal, a hangup — and the
+/// set is the only thing that tells an ending call there is somebody to leave
+/// a note for. One missed exit leaves a note nobody will ever read, for a
+/// call that will never come back.
+struct AcceptGuard {
+    calls: CallRegistry,
+    call_id: String,
+}
+
+impl Drop for AcceptGuard {
+    fn drop(&mut self) {
+        let calls = self.calls.clone();
+        let call_id = std::mem::take(&mut self.call_id);
+        tokio::spawn(async move {
+            calls.accepting.lock().await.remove(&call_id);
+            // Along with any note left for it: the accept is over, and a
+            // marker outliving it would cancel nothing but grow the set.
+            calls.cancelled.lock().await.remove(&call_id);
+        });
+    }
+}
+
 /// Live call state shared between the event pump and the UI action methods.
 #[derive(Clone, Default)]
 pub struct CallRegistry {
@@ -285,9 +310,20 @@ pub struct CallRegistry {
     pending: Arc<Mutex<HashMap<String, Arc<WaIncomingCall>>>>,
     /// Media-live calls by call id.
     active: Arc<Mutex<HashMap<String, Arc<CallHandle>>>>,
-    /// Ids cancelled before any handle existed (the UI's placeholder id while
-    /// start_call is still connecting); start_call hangs these up on arrival.
+    /// Ids cancelled before any handle existed, by whichever side ended it:
+    /// the UI's placeholder while `start_call` is still connecting, and a
+    /// call ended remotely while an accept is still opening a device. The
+    /// paths that produce a handle consume this as they register one.
     cancelled: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Accepts that have taken an offer and have no handle yet.
+    ///
+    /// Answering opens a camera, and the first time it opens a permission
+    /// prompt: seconds in which the caller can hang up, another device can
+    /// take the call, or the server can end it. Those arrive as events that
+    /// look for something to remove and find nothing — the offer has left
+    /// `pending` and no handle is in `active` — so this is what tells them
+    /// there is somebody to leave a note for.
+    accepting: Arc<Mutex<std::collections::HashSet<String>>>,
     /// One mute lane per live call. Pruned against `active` where it grows,
     /// so a call that ends takes its lane with it without every teardown
     /// path having to remember.
@@ -327,6 +363,20 @@ struct MuteLane {
     /// transitions, but it serializes them in arrival order, which is the
     /// order this exists to stop trusting.
     lane: Mutex<()>,
+}
+
+impl CallRegistry {
+    /// Note that a call ended for an accept that has not registered a handle
+    /// yet, so it stops instead of answering a call nobody is on.
+    ///
+    /// Only for an accept actually in flight: the marker is consumed by the
+    /// registration, and one left for a call nobody is answering is an entry
+    /// nothing ever removes.
+    async fn abandon(&self, call_id: &str) {
+        if self.accepting.lock().await.contains(call_id) {
+            self.cancelled.lock().await.insert(call_id.to_string());
+        }
+    }
 }
 
 /// What keeps a call's camera requests in the order the daemon took them.
@@ -810,12 +860,13 @@ impl WhatsAppClient {
                     // recorded against. This is the first moment it does —
                     // after the acceptance above, which is what creates it.
                     if let Some(local) = calls.cameras.lock().await.get(call_id) {
-                        // And a point for the far end — and for our own
-                        // self-view — to start decoding from. Until this
-                        // moment the call was ringing: no window was drawing
-                        // either direction, so whatever went out went to
-                        // nobody, and the next unit alone references frames
-                        // no decoder starting now has ever seen.
+                        // The call has somewhere to be drawn, and needs a
+                        // point to start decoding from. Until this moment it
+                        // was ringing: no window had a live call to put
+                        // either direction in, so nothing was published and
+                        // the next unit alone references frames no decoder
+                        // starting now has ever seen.
+                        local.drawable();
                         local.request_keyframe();
                         let _ = ui_tx.send(UiEvent::CallVideoChanged {
                             call_id: call_id.clone(),
@@ -827,11 +878,13 @@ impl WhatsAppClient {
                 CallAction::Reject { call_id, .. } => {
                     info!("Call {} rejected by peer", call_id);
                     calls.pending.lock().await.remove(call_id);
+                    calls.abandon(call_id).await;
                     let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                 }
                 CallAction::Terminate { call_id, .. } => {
                     info!("Call {} terminated by peer", call_id);
                     calls.pending.lock().await.remove(call_id);
+                    calls.abandon(call_id).await;
                     if let Some(handle) = calls.active.lock().await.remove(call_id) {
                         // `hangup_local`, not `terminate`: the peer is the
                         // side that ended this, and answering their
@@ -851,11 +904,13 @@ impl WhatsAppClient {
                     missed.from.observe()
                 );
                 calls.pending.lock().await.remove(&missed.call_id);
+                calls.abandon(&missed.call_id).await;
                 let _ = ui_tx.send(UiEvent::CallEnded(missed.call_id.clone()));
             }
             Event::CallEndedElsewhere(ended) => {
                 info!("Call {} handled on another device", ended.call_id);
                 calls.pending.lock().await.remove(&ended.call_id);
+                calls.abandon(&ended.call_id).await;
                 let _ = ui_tx.send(UiEvent::CallEndedElsewhere(ended.call_id.clone()));
             }
             Event::Messages(batch) => {
@@ -2037,6 +2092,14 @@ impl WhatsAppClient {
                 warn!("No pending offer for call {}", call_id);
                 return;
             };
+            // From here to the registration below there is neither an offer
+            // nor a handle for anything ending this call to act on. This is
+            // what it acts on instead.
+            calls.accepting.lock().await.insert(call_id.clone());
+            let _accepting = AcceptGuard {
+                calls: calls.clone(),
+                call_id: call_id.clone(),
+            };
             let (mic, speaker) = match open_call_audio().await {
                 Ok(audio) => audio,
                 Err(err) => {
@@ -2074,6 +2137,20 @@ impl WhatsAppClient {
                 Some((local, endpoints)) => (Some(local), Some(endpoints)),
                 None => (None, None),
             };
+
+            // Ended while the camera was opening — hung up here, hung up by
+            // the caller, or taken on another device. Seconds, the first time
+            // a permission prompt, and the `<accept>` below would answer a
+            // call nobody is on any more. The registration consumes the same
+            // marker under a lock; this is only about not sending the stanza.
+            if calls.cancelled.lock().await.contains(&call_id) {
+                info!("Call {} ended before its media came up", call_id);
+                if let Some(local) = local {
+                    local.stop().await;
+                }
+                Self::notify_call_ended(&ui_sender, &call_id).await;
+                return;
+            }
 
             let endpoints_attached = endpoints.is_some();
             let voip = client.voip();
@@ -2116,6 +2193,8 @@ impl WhatsAppClient {
                     }
                     info!("Call {} media live", handle.call_id());
                     if let Some(local) = local {
+                        // There is a call to draw into now.
+                        local.drawable();
                         calls.cameras.lock().await.insert(call_id.clone(), local);
                         Self::announce_video(&ui_sender, &call_id, VideoStream::Local, true).await;
                     }
@@ -2253,6 +2332,9 @@ impl WhatsAppClient {
             };
             match started {
                 Ok(()) => {
+                    // The call is already live, so the self-view has had
+                    // somewhere to land since before the camera opened.
+                    local.drawable();
                     // Under the same lock the teardown takes, and checked
                     // against it: a call that ended while the camera was
                     // opening has already run its one cleanup, and an entry
@@ -2492,6 +2574,23 @@ impl WhatsAppClient {
                 Some(endpoints) => outgoing.video(endpoints.source, endpoints.sink),
                 None => outgoing,
             };
+
+            // Cancelled while the camera was opening — a device, and the
+            // first time a permission prompt, is seconds in which the user
+            // can change their mind. Checked *before* the offer goes out: the
+            // peer would otherwise ring for a call that was called off, and
+            // be told to stop moments later.
+            if calls.cancelled.lock().await.remove(&placeholder_id) {
+                info!(
+                    "Outgoing call to {} cancelled while its camera opened",
+                    observe_str(&recipient_jid)
+                );
+                if let Some(local) = local {
+                    local.stop().await;
+                }
+                return;
+            }
+
             match outgoing.start().await {
                 Ok(handle) => {
                     let call_id = handle.call_id().to_string();

@@ -14,9 +14,13 @@
 //! blocked on: a decoder that has fallen behind should skip to the newest
 //! unit, not walk a backlog it will never draw. What a drop costs is the
 //! reference chain — every unit after it points at one this decoder never
-//! saw — so a drop is recorded, and the decoder then waits for a keyframe
-//! rather than rendering a second of torn macroblocks over the last good
-//! picture.
+//! saw — so the decoder is told, and waits for a keyframe rather than
+//! rendering a second of torn macroblocks over the last good picture.
+//!
+//! Told *on the first unit after the gap*, not by a flag beside the queue: a
+//! gap is a position in a stream, and a decoder that read a flag while
+//! dequeuing something from before the gap would clear it and walk straight
+//! into the unit the flag was about.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,17 +110,15 @@ const QUEUE_DEPTH: usize = 4;
 /// One direction: a thread, its decoder, and the short queue in front.
 struct Stream {
     units: std::sync::mpsc::SyncSender<CallVideoFrame>,
-    /// Set when a unit was dropped, read by the decoder. The two are on
-    /// different threads and the drop is what the *decoder* has to know
-    /// about: it is the one whose next unit references something it will
-    /// never have.
-    dropped: Arc<AtomicBool>,
+    /// Set when something was lost, and spent on the next unit that gets
+    /// through — which is the one the loss is *about*. Touched only from the
+    /// sending side, so the queue's order is the gap's order.
+    gap: AtomicBool,
 }
 
 impl Stream {
     fn spawn(call_id: String, stream: VideoStream, frames: FrameSink) -> Self {
         let (units, queue) = std::sync::mpsc::sync_channel::<CallVideoFrame>(QUEUE_DEPTH);
-        let dropped = Arc::new(AtomicBool::new(false));
         let name = match stream {
             VideoStream::Local => "oxidezap-selfview",
             VideoStream::Remote => "oxidezap-callvideo",
@@ -124,27 +126,35 @@ impl Stream {
         // A thread that cannot be spawned leaves the queue's receiver dropped,
         // which makes every `accept` a no-op: the call runs without a picture
         // rather than not running.
-        if let Err(e) = std::thread::Builder::new().name(name.to_string()).spawn({
-            let dropped = Arc::clone(&dropped);
-            move || decode_loop(&call_id, stream, &queue, &frames, &dropped)
-        }) {
+        if let Err(e) = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || decode_loop(&call_id, stream, &queue, &frames))
+        {
             log::error!("no thread for the {stream:?} video of a call: {e}");
         }
-        Self { units, dropped }
+        Self {
+            units,
+            gap: AtomicBool::new(false),
+        }
     }
 
+    /// Something upstream lost units. The next one through says so.
     fn interrupted(&self) {
-        self.dropped.store(true, Ordering::Relaxed);
+        self.gap.store(true, Ordering::Relaxed);
     }
 
     fn accept(&self, frame: CallVideoFrame) {
-        if self.units.try_send(frame).is_err() {
-            // Not silent: what follows this unit references it, and a
-            // decoder fed the remainder produces a second of torn picture
-            // over the last good one. Waiting for a keyframe instead is a
-            // freeze, which is at least honest — and a short one, because
-            // the sender emits one every few seconds.
-            self.dropped.store(true, Ordering::Relaxed);
+        // Taken before the send and restored if it fails, so the mark lands
+        // on the first unit that actually reaches the decoder — the one whose
+        // references are the ones missing.
+        let gap = self.gap.swap(false, Ordering::Relaxed) || frame.gap;
+        if self.units.try_send(frame.after_a_gap(gap)).is_err() {
+            // What follows this unit references it, and a decoder fed the
+            // remainder produces a second of torn picture over the last good
+            // one. Waiting for a keyframe instead is a freeze, which is at
+            // least honest — and a short one, because the sender emits one
+            // every few seconds.
+            self.gap.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -154,7 +164,6 @@ fn decode_loop(
     stream: VideoStream,
     queue: &std::sync::mpsc::Receiver<CallVideoFrame>,
     frames: &FrameSink,
-    dropped: &AtomicBool,
 ) {
     let mut decoder = match Decoder::new() {
         Ok(decoder) => decoder,
@@ -170,9 +179,9 @@ fn decode_loop(
     let mut scratch = Scratch::default();
 
     while let Ok(unit) = queue.recv() {
-        // Something never reached this decoder, so what it holds no longer
-        // matches what the sender encoded against.
-        if dropped.swap(false, Ordering::Relaxed) {
+        // Units before this one were lost, so what this decoder holds no
+        // longer matches what the sender encoded against.
+        if unit.gap {
             started = false;
         }
         if !started {
