@@ -189,6 +189,8 @@ mod tests {
         let action = GroupNotificationAction::Subject {
             subject: "Trip".to_string(),
             subject_owner: None,
+            subject_owner_pn: None,
+            subject_owner_username: None,
             subject_time: None,
         };
         assert_eq!(
