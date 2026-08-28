@@ -7,6 +7,7 @@
 //! small screens do.
 
 pub mod clock;
+pub mod download;
 pub mod prefs;
 
 pub use clock::{sleep, with_timeout};

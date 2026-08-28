@@ -1,0 +1,126 @@
+# The web front end, built to a static bundle and published to GitHub Pages.
+#
+# The bundle is the window and nothing else: it holds no session, opens no
+# socket of its own, and needs no server to be *hosted*. It attaches to an
+# `oxidezapd` the visitor runs themselves, which is what the deployed page
+# says on its loading screen.
+name: Pages
+
+on:
+  push:
+    branches: ["main"]
+  # Buildable from a pull request too, without publishing: the build is the
+  # part that breaks, and finding out at merge time is finding out late.
+  pull_request:
+  workflow_dispatch:
+
+# `pages: write` and `id-token: write` are what the deploy step needs and are
+# scoped to the job that deploys; the build job below stays read-only, so a
+# compromised dependency in the much larger build cannot reach a token that
+# publishes.
+permissions:
+  contents: read
+
+concurrency:
+  # Not `cancel-in-progress`: a half-finished deployment is a broken site, and
+  # this build is long enough that a second push during one is likely.
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Nightly, and not by preference. `-Z build-std` is nightly-only, and
+      # the standard library has to be rebuilt with the atomics target feature
+      # on: `gpui_web` runs its background executor on real workers, which
+      # share memory through a `SharedArrayBuffer`, and the prebuilt std is
+      # not compiled for that. `rust-src` is what build-std compiles from.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly
+          targets: wasm32-unknown-unknown
+          components: rust-src
+
+      # The build script that embeds gpui-component's icons runs on the host,
+      # and `waproto` generates code with protoc — both are host builds even
+      # though the artifact is wasm.
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
+        with:
+          tool: protoc,trunk
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # A separate cache from CI's: a different target, a different
+          # toolchain and a rebuilt std share nothing worth restoring.
+          key: pages-wasm
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # A project page is served from `/<repo>/`, so the generated glue has to
+      # be told where it is loading from or it fetches the wasm from the
+      # account root and gets a 404. A user or organisation page is served
+      # from `/`, which is what the fallback below produces.
+      - name: Build the bundle
+        env:
+          PUBLIC_URL: /${{ github.event.repository.name }}/
+        run: ./web/build.sh
+
+      # Proof the artifact is the one the page will ask for: trunk rewrites
+      # `index.html` to point at hashed file names, and a mismatch is a blank
+      # page rather than a failed build.
+      - name: Check the bundle is complete
+        run: |
+          test -f web/dist/index.html || { echo "no index.html"; exit 1; }
+          test -f web/dist/coi-serviceworker.js || {
+            echo "the service worker is missing: the page will load without"
+            echo "cross-origin isolation and the window will have no executor"
+            exit 1
+          }
+          for asset in $(grep -oE '(href|src)="[^"]*"' web/dist/index.html |
+                         sed -E 's/.*="([^"]*)"/\1/' |
+                         grep -vE '^(https?:)?//'); do
+            file="web/dist/$(basename "$asset")"
+            test -f "$file" || { echo "index.html references $asset, which is not in dist"; exit 1; }
+          done
+          echo "bundle contents:"
+          ls -lh web/dist
+
+      # Pages will not serve a path segment beginning with an underscore, and
+      # it will not serve anything at all from a `.nojekyll`-less tree that
+      # Jekyll decides to reinterpret. Neither applies to what trunk emits
+      # today, and both would be silent 404s if it ever did.
+      - name: Disable Jekyll
+        run: touch web/dist/.nojekyll
+
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+        with:
+          path: web/dist
+
+  deploy:
+    name: Deploy
+    # Only from main. A pull request builds — which is the part that catches a
+    # break — and publishes nothing.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

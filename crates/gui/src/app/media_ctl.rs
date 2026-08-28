@@ -451,15 +451,10 @@ impl WhatsAppApp {
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
-                Ok(data) => {
-                    let saved = cx
-                        .background_spawn(async move { save_to_downloads(&file_name, &data) })
-                        .await;
-                    match saved {
-                        Ok(_) => info!("Document {} saved", message_id),
-                        Err(e) => warn!("Failed to save document {}: {}", message_id, e),
-                    }
-                }
+                Ok(data) => match hand_to_user(cx, file_name, data).await {
+                    Ok(where_it_went) => info!("Document {message_id} saved to {where_it_went}"),
+                    Err(e) => warn!("Failed to save document {message_id}: {e}"),
+                },
                 Err(e) => error!("Failed to download document {}: {}", message_id, e),
             }
             let _ = entity.update(cx, |app, cx| {
@@ -498,12 +493,9 @@ impl WhatsAppApp {
         let id = message_id.to_string();
 
         cx.spawn(async move |_entity: WeakEntity<Self>, cx| {
-            let saved = cx
-                .background_spawn(async move { save_to_downloads(&file_name, &data) })
-                .await;
-            match saved {
-                Ok(path) => info!("Saved {} to {}", id, path.display()),
-                Err(e) => warn!("Failed to save {}: {}", id, e),
+            match hand_to_user(cx, file_name, data.to_vec()).await {
+                Ok(where_it_went) => info!("Saved {id} to {where_it_went}"),
+                Err(e) => warn!("Failed to save {id}: {e}"),
             }
         })
         .detach();
@@ -821,5 +813,24 @@ impl WhatsAppApp {
         .detach();
 
         cx.notify();
+    }
+}
+
+/// Put a file where the user keeps things, on whichever thread can.
+///
+/// The desktop write is blocking I/O and belongs off the UI thread. The web
+/// one reaches for `document`, which exists on one thread only — and gpui's
+/// background executor is a real worker there — so it has to stay. One place
+/// asks; the call sites above do not care.
+async fn hand_to_user(
+    cx: &mut gpui::AsyncApp,
+    file_name: String,
+    data: Vec<u8>,
+) -> Result<String, String> {
+    if crate::platform::download::SAVES_OFF_THREAD {
+        cx.background_spawn(async move { crate::platform::download::save(&file_name, &data) })
+            .await
+    } else {
+        crate::platform::download::save(&file_name, &data)
     }
 }

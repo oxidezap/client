@@ -32,6 +32,53 @@ use web_sys::{CloseEvent, MessageEvent, WebSocket};
 
 use crate::Link;
 
+/// How long one media payload may take before it is treated as unavailable.
+///
+/// Generous: the bridge is normally on the same machine, and this exists to
+/// bound a hang rather than to police a slow link.
+const MEDIA_TIMEOUT_MS: i32 = 30_000;
+
+/// A `setTimeout` that aborts a fetch, cleared when the fetch finishes first.
+struct FetchDeadline {
+    handle: i32,
+    _fire: Closure<dyn FnMut()>,
+}
+
+impl FetchDeadline {
+    fn arm(
+        window: &web_sys::Window,
+        abort: &web_sys::AbortController,
+        millis: i32,
+    ) -> Result<Self, String> {
+        let abort = abort.clone();
+        let fire = Closure::<dyn FnMut()>::new(move || abort.abort());
+        let handle = window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                fire.as_ref().unchecked_ref(),
+                millis,
+            )
+            .map_err(|e| format!("could not arm a fetch timeout: {e:?}"))?;
+        Ok(Self {
+            handle,
+            _fire: fire,
+        })
+    }
+}
+
+impl Drop for FetchDeadline {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            window.clear_timeout_with_handle(self.handle);
+        }
+    }
+}
+
+/// How many frames may wait for a socket that has not opened yet.
+///
+/// There is normally one — the hello, written before the connection is up.
+/// The rest is slack for a front end that asks for something immediately.
+const MAX_HELD_FRAMES: usize = 64;
+
 /// What the socket says, in the order it says it.
 ///
 /// One channel rather than one per event, because the order is the point: a
@@ -76,6 +123,15 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
     let is_open = Rc::new(Cell::new(false));
     let held = Rc::new(RefCell::new(Vec::<String>::new()));
 
+    // Held, not forgotten. `Closure::forget` hands a callback to the JS heap
+    // for the life of the page, and the front end reconnects — so every
+    // dropped connection would leave four more behind. These live exactly as
+    // long as the task below, which is exactly as long as the socket.
+    let mut callbacks: Vec<Closure<dyn FnMut()>> = Vec::new();
+    let mut message_callback: Option<Closure<dyn FnMut(MessageEvent)>> = None;
+    let mut close_callback: Option<Closure<dyn FnMut(CloseEvent)>> = None;
+    let mut error_callback: Option<Closure<dyn FnMut(web_sys::Event)>> = None;
+
     {
         let held_socket = socket.clone();
         let is_open = Rc::clone(&is_open);
@@ -91,10 +147,7 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
             let _ = inbound.send(FromSocket::Open);
         });
         socket.set_onopen(Some(opened.as_ref().unchecked_ref()));
-        // The callbacks live as long as the socket does, and the socket lives
-        // as long as the page. Dropping the `Closure` would leave the browser
-        // calling into freed memory, which is what `forget` is for here.
-        opened.forget();
+        callbacks.push(opened);
     }
 
     {
@@ -111,7 +164,7 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
             }
         });
         socket.set_onmessage(Some(message.as_ref().unchecked_ref()));
-        message.forget();
+        message_callback = Some(message);
     }
 
     {
@@ -126,7 +179,7 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
             let _ = inbound.send(FromSocket::Closed(detail));
         });
         socket.set_onclose(Some(closed.as_ref().unchecked_ref()));
-        closed.forget();
+        close_callback = Some(closed);
     }
 
     {
@@ -137,7 +190,7 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
             log::warn!("the daemon socket reported an error; waiting for the close");
         });
         socket.set_onerror(Some(failed.as_ref().unchecked_ref()));
-        failed.forget();
+        error_callback = Some(failed);
     }
 
     // The one place the socket is written from. Everything else queues.
@@ -148,14 +201,32 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
                     log::error!("could not reach the daemon: {e:?}");
                     break;
                 }
-            } else {
+            } else if held.borrow().len() < MAX_HELD_FRAMES {
                 held.borrow_mut().push(frame);
+            } else {
+                // A daemon that accepts the connection and never completes
+                // the handshake would otherwise have this grow for as long as
+                // the front end kept asking. The connection is already broken
+                // by this point; dropping is what lets it be noticed.
+                log::warn!("dropping a frame: the daemon socket has not opened");
             }
         }
         // The sender was dropped, or a write failed: either way this
         // connection is over, and a socket left open would keep the daemon
         // holding a client slot for it.
+        //
+        // The handlers come off before the closures are dropped: a browser
+        // holding a reference to a freed callback is a crash rather than a
+        // missed event.
+        socket.set_onopen(None);
+        socket.set_onmessage(None);
+        socket.set_onclose(None);
+        socket.set_onerror(None);
         let _ = socket.close();
+        drop(callbacks);
+        drop(message_callback);
+        drop(close_callback);
+        drop(error_callback);
     });
 
     Ok((Link::over_socket(outbound), frames))
@@ -169,13 +240,82 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
 /// hand on the same machine listens.
 #[must_use]
 pub fn endpoint_url() -> String {
-    query_parameter("daemon").unwrap_or_else(|| {
+    let default = || {
         format!(
             "ws://127.0.0.1:{}{}",
             crate::DEFAULT_WEB_PORT,
             crate::WEB_SOCKET_PATH
         )
-    })
+    };
+    let Some(asked) = query_parameter("daemon") else {
+        return default();
+    };
+    // A query parameter is whatever put the user on this page, which may be a
+    // link somebody sent them. The daemon it names is handed the message
+    // history and can be told to send, so an unchecked one turns a link into
+    // a way to point the window at somebody else's server.
+    match usable_endpoint(&asked) {
+        Ok(()) => asked,
+        Err(why) => {
+            log::error!("ignoring ?daemon={asked}: {why}");
+            default()
+        }
+    }
+}
+
+/// Whether a page may attach to this URL without being asked again.
+///
+/// Two rules. It has to be a WebSocket URL, because anything else is a
+/// mistake or an attempt at something. And it has to be either this machine
+/// or the origin the page was itself served from — a daemon somewhere else
+/// entirely is a decision, not a default, and a link is not how it should be
+/// made.
+///
+/// # Errors
+///
+/// The reason, for the log: this is a silent fallback to the loopback default
+/// rather than a failure to start, because a page that refuses to load is
+/// worse than one that attaches where it was going to anyway.
+fn usable_endpoint(url: &str) -> Result<(), String> {
+    let Some(rest) = url
+        .strip_prefix("ws://")
+        .or_else(|| url.strip_prefix("wss://"))
+    else {
+        return Err("not a WebSocket URL".to_string());
+    };
+    let host = host_of(rest);
+    if is_loopback_host(&host) {
+        return Ok(());
+    }
+    // The page's own origin: a deployment that serves the bridge beside
+    // itself is naming where it already came from.
+    let served_from = web_sys::window()
+        .and_then(|window| window.location().host().ok())
+        .unwrap_or_default();
+    if !served_from.is_empty() && host == host_of(&served_from) {
+        return Ok(());
+    }
+    Err(format!(
+        "{host} is neither this machine nor where this page came from"
+    ))
+}
+
+/// The host and port of a URL remainder, without the path.
+fn host_of(rest: &str) -> String {
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+/// Whether a host names this machine.
+///
+/// Matched whole rather than by prefix, so `localhost.example.com` is not
+/// mistaken for one.
+fn is_loopback_host(host: &str) -> bool {
+    let name = host
+        .rsplit_once(':')
+        .map_or(host, |(name, _)| name)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    matches!(name, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// Where the media this daemon has cached can be fetched from.
@@ -246,7 +386,19 @@ pub async fn fetch_media(base: &str, key: &str) -> Result<Vec<u8>, String> {
 
     let window = web_sys::window().ok_or("no window to fetch from")?;
     let url = format!("{base}/{}", js_sys::encode_uri_component(key));
-    let response = JsFuture::from(window.fetch_with_str(&url))
+
+    // Bounded, because the caller resolves a frame's media before it hands
+    // the frame on: a bridge that accepts the connection and never answers
+    // would otherwise stall that frame for good, with no error to fall back
+    // on. An abort turns it into an ordinary failure, which the renderer
+    // already draws as an offer to download.
+    let abort = web_sys::AbortController::new()
+        .map_err(|e| format!("could not arm a fetch timeout: {e:?}"))?;
+    let options = web_sys::RequestInit::new();
+    options.set_signal(Some(&abort.signal()));
+    let _timeout = FetchDeadline::arm(&window, &abort, MEDIA_TIMEOUT_MS)?;
+
+    let response = JsFuture::from(window.fetch_with_str_and_init(&url, &options))
         .await
         .map_err(|e| format!("could not reach the daemon's media bridge: {e:?}"))?
         .dyn_into::<web_sys::Response>()

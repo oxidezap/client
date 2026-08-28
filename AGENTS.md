@@ -6,6 +6,10 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 
 - **oxidezap-core**: domain types (chats, messages, calls, UI events). No UI, no I/O.
 - **oxidezap-audio**: capture, playback, Opus encoding, waveforms. cpal; no UI.
+  On the web the sound card and the codec are the browser's: playback is real
+  (`decodeAudioData` takes exactly the bytes the daemon sends) and recording is
+  refused up front, because libopus is C and capturing samples nothing could
+  encode is a recording UI that always fails at the end.
 - **oxidezap-chat-store**: materializes the library's event stream into chats,
   messages, receipts and an FTS5 search index. Owns its schema and migrations;
   consumes only the library's public event surface. Extracted from
@@ -25,6 +29,11 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 - **oxidezap-gui**: GPUI front end, binary `oxidezap`. Talks to the daemon and
   starts one if none is listening. Owns video decode, which writes straight
   into `gpui::RenderImage` and is not reusable off GPUI.
+  The same crate builds for `wasm32-unknown-unknown`, where `main` becomes the
+  module's start function and the differences live in `platform/` — one
+  function the interface calls, two implementations behind it, no `cfg`
+  anywhere above. A component never learns that browsers exist, for the same
+  reason it never learns that small screens do.
 
 A front end depends on ipc/core/audio and never on session: there is exactly
 one WhatsApp session per user, and it lives in the daemon.
@@ -38,6 +47,32 @@ cargo test --workspace
 
 # Running it: two binaries, and the window looks for the daemon beside itself.
 cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxidezap
+```
+
+The same window as a page:
+
+```bash
+# Needs nightly: `-Z build-std` is nightly-only, and the standard library has
+# to be rebuilt with the atomics target feature on — gpui_web runs its
+# background executor on real workers, and the prebuilt std is not compiled
+# for that. The link flags are in /.cargo/config.toml.
+rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown
+cargo install trunk
+
+# Serves on http://127.0.0.1:8080 with the two isolation headers set. On
+# GitHub Pages a service worker adds them instead, because a static host has
+# no way to.
+cd web && trunk serve -- -Z build-std=std,panic_abort
+
+# And the daemon it attaches to. `--web` alone is loopback on the port the
+# page looks for; localhost is served without being named.
+cargo run --bin oxidezapd -- --web
+```
+
+Type-checking the web build without the whole bundle:
+
+```bash
+cargo +nightly check -p oxidezap-gui --target wasm32-unknown-unknown -Z build-std=std,panic_abort
 ```
 
 Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is
@@ -56,7 +91,7 @@ profile here repeats it deliberately.
 
 ## Gotchas
 
-- **The platform split lives in exactly two places.** `ipc/endpoint.rs` is the
+- **The platform split lives in exactly two places.** `ipc/endpoint/` is the
   client end and `daemon/listener/` is the server end; everything above them
   — framing, requests, the whole protocol — is written once. A Unix socket is
   a filesystem entry that survives a crash and a named pipe is a name that
@@ -66,6 +101,32 @@ profile here repeats it deliberately.
   socket inherits a `0700` directory. A client checks who answered, too: the
   socket sits at a predictable path, and under the `/tmp` fallback another
   user can get there first.
+  A third transport joined them rather than becoming a third place:
+  `endpoint/web.rs` and `listener/web.rs` are a WebSocket, because a page can
+  open neither of the others. What every transport shares on the way out is
+  `ipc::Link`, one `Send + Sync` handle with the platform's own object behind
+  it — load-bearing on the web, where a `web_sys::WebSocket` is neither and so
+  cannot be held beside a front end's state at all; it holds a queue into the
+  task that owns one instead. What they do not share is the way *in*: a
+  process parks a thread in a read and a page is handed a callback, so the
+  read halves stay apart and what they meet at is `session/frames.rs`, which
+  is the whole protocol state machine and is written once.
+  The server side repeats none of it either — `serve_client` was already
+  generic over `AsyncRead + AsyncWrite`, so the bridge hands it one end of a
+  `tokio::io::duplex` and moves the lines across as text frames.
+- **A loopback port is not a Unix socket, and the difference is the whole of
+  the web bridge's design.** A socket has file permissions and a peer uid to
+  check; a TCP port has neither, and a WebSocket is not subject to the
+  same-origin policy — so any page in the user's browser can open one to
+  `ws://127.0.0.1` and would otherwise be handed the message history and the
+  ability to send. Hence: off unless asked for (`--web`), loopback unless told
+  otherwise, and every browser origin refused unless named (`--web-allow`),
+  excepting localhost, which is the developer's own `trunk serve`. A request
+  with no `Origin` is not a browser — a page cannot suppress the header — so
+  it is served only on a loopback bind, where anything that could connect
+  could equally have opened the Unix socket. Both endpoints draw on one
+  admission count, because a client costs the same descriptors and tasks
+  however it arrived.
 - **Nothing stops the daemon but `main`.** The tray's Quit and an IPC
   `Shutdown` ask through `shutdown::request`; ending the process from a D-Bus
   callback or a connection task would skip disconnecting the session and
@@ -485,6 +546,41 @@ column that is only centred is clipped at *both* ends the moment it outgrows
 the window — which is how a 640px-tall screen showed the middle of the pairing
 screen, with the title above the glass and the pair code below it.
 
+## The web front end
+
+The page is the window and nothing else. It holds no session, opens no socket
+to WhatsApp, and keeps no store — it attaches to an `oxidezapd` the visitor
+runs, over the same protocol the desktop window speaks. So the export is
+static and needs no server to be *hosted*; the daemon it talks to is the
+user's own process. `.github/workflows/pages.yml` builds and publishes it.
+
+What a page cannot do, and says so rather than pretending. Measured on
+nightly for `wasm32-unknown-unknown` rather than assumed:
+
+| | wasm |
+|---|---|
+| `tokio` `sync`/`rt`/`time`/`macros`/`io-util` | yes |
+| `tokio` `net` (mio) | no |
+| `smol` | no — `async-io` is an epoll loop, via `rustix`/`errno` |
+| `cpal` | yes |
+| `opus`, `openh264` (both C) | no |
+| `symphonia` (aac/mp4), `mp4`, `ogg`, `ringbuf` | yes |
+
+So voice notes play and video does not; recording is refused where it starts
+rather than where it would fail; calls stay in the daemon, which is where the
+microphone already was. WebCodecs (`web_sys::VideoDecoder`) and
+`MediaRecorder` are the ways back in for the last two, and both are Rust
+bindings rather than JavaScript — they are API changes rather than backends,
+which is why neither is done here.
+
+Every browser API in the tree is bound through `web-sys`/`js-sys` from Rust:
+the WebSocket, `fetch`, `setTimeout`, WebAudio, `localStorage`, the download
+anchor. The one piece of hand-written JavaScript is
+`web/coi-serviceworker.js`, and it exists because cross-origin isolation
+needs two response headers and GitHub Pages will not set them — a service
+worker is the only thing that can, and a service worker is a JavaScript file
+by definition.
+
 ## Still to do
 
 - **Spacing is still absolute.** ~28 `px(...)` literals where the guides want
@@ -494,6 +590,21 @@ screen, with the title above the glass and the pair code below it.
   guides want per-feature entities; that is a bigger change than moving code.
 - **Two large files outside the GUI**: `session/whatsapp.rs` (~2.3k) and
   `chat-store/store.rs` (~3.1k).
+- **The session does not run in the browser.** The page is the window; the
+  daemon still holds the account, which means the deployed bundle needs one
+  running on the visitor's machine to be useful. Moving the session in is
+  more plausible than it looks — `sqlite-wasm-rs` targets
+  `wasm32-unknown-unknown` and diesel links against it, so the chat store
+  could be reused rather than rewritten, and `oxidezap/whatsapp-rust-bridge`
+  already runs the library in wasm. What it needs is a transport and an HTTP
+  client built on `web-sys` instead of Tokio's, which the library takes as
+  plugins.
+- **Video is not decoded on the web, and voice notes are not recorded there.**
+  Both are the same cause — the decoder and the encoder are C — and both have
+  a browser-native answer that is a Rust binding: `web_sys::VideoDecoder` and
+  `MediaRecorder`. Each is an API change rather than a backend swap, because
+  one is asynchronous where `StreamingVideoDecoder` is pulled by index, and
+  the other hands back encoded bytes where `RecordedAudio` is samples.
 - **A front end cannot say what went wrong with a command.** `Accepted` means
   the session took it; per-request outcomes would need request ids on more
   than downloads. A failed send arrives as `SendFailed` against the chat, not

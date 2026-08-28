@@ -396,6 +396,51 @@ async fn download_with_timeout(
 /// ($XDG_DOWNLOAD_DIR, then $HOME or %USERPROFILE% + /Downloads, then the CWD
 /// like the database fallback when no home is known) and return the path
 /// written.
+/// What distinguishes this front end from another one on the same daemon.
+///
+/// A process id on the desktop, where two windows are two processes. Two tabs
+/// are *one* process — and on the web, one that reports the same id in every
+/// tab — so a random number stands in there: without it two tabs starting
+/// their counters at zero would mint the same optimistic id within a
+/// millisecond of each other, and the daemon broadcasts every assignment to
+/// both, so one tab's send would rename or dedup the other's bubble.
+///
+/// Drawn once and kept, because it names the tab rather than the message.
+fn front_end_id() -> u64 {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        u64::from(std::process::id())
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        static TAB: AtomicU64 = AtomicU64::new(0);
+        let known = TAB.load(Ordering::Relaxed);
+        if known != 0 {
+            return known;
+        }
+        // The browser's own generator: seeded properly, and already reached
+        // for by everything under `wacore` that needs randomness.
+        let mut bytes = [0u8; 8];
+        // A tab that cannot be told apart from another is worse than one
+        // whose number is a clock reading, so a refused draw still produces
+        // something rather than zero.
+        let drawn = match getrandom::fill(&mut bytes) {
+            Ok(()) => u64::from_le_bytes(bytes),
+            Err(e) => {
+                log::warn!("no randomness for this tab's id ({e}); using the clock");
+                wacore::time::now_millis().cast_unsigned()
+            }
+        };
+        // Never zero, which is the "not drawn yet" marker.
+        let drawn = drawn | 1;
+        TAB.store(drawn, Ordering::Relaxed);
+        drawn
+    }
+}
+
 /// A name for media the sender never named.
 ///
 /// The message id keeps two photos from the same conversation out of each
@@ -421,88 +466,6 @@ fn default_media_name(message_id: &str, mime_type: &str) -> String {
         .rev()
         .collect();
     format!("oxidezap-{suffix}.{extension}")
-}
-
-fn save_to_downloads(file_name: &str, data: &[u8]) -> std::io::Result<std::path::PathBuf> {
-    use std::io::Write;
-    use std::path::PathBuf;
-
-    let not_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(PathBuf::from(v));
-    let dir = std::env::var_os("XDG_DOWNLOAD_DIR")
-        .and_then(not_empty)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .and_then(not_empty)
-                .or_else(|| std::env::var_os("USERPROFILE").and_then(not_empty))
-                .map(|home| home.join("Downloads"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    std::fs::create_dir_all(&dir)?;
-
-    // The name comes off the wire: strip path separators (and `:`, which on
-    // Windows makes a drive-relative path) so a hostile sender can't traverse
-    // out of the directory.
-    let sanitized: String = file_name
-        .chars()
-        .map(|c| {
-            if std::path::is_separator(c) || c == '\\' || c == ':' || c.is_control() {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let name = match sanitized.trim() {
-        "" | "." | ".." => "document",
-        trimmed => trimmed,
-    };
-
-    // Windows treats device basenames (CON, NUL, COM1…) as reserved for any
-    // extension; prefix them so the save can't resolve to a device.
-    let stem = name
-        .split_once('.')
-        .map_or(name, |(stem, _)| stem)
-        .trim_end_matches([' ', '.'])
-        .to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.as_bytes()[3].is_ascii_digit());
-    let name = if reserved {
-        format!("_{name}")
-    } else {
-        name.to_string()
-    };
-
-    // create_new + " (n)" suffixing so a download never clobbers an existing
-    // file of the same name.
-    for attempt in 0..1000u32 {
-        let candidate = if attempt == 0 {
-            name.to_string()
-        } else {
-            match name.rsplit_once('.') {
-                Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({attempt}).{ext}"),
-                _ => format!("{name} ({attempt})"),
-            }
-        };
-        let path = dir.join(candidate);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(data)?;
-                return Ok(path);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "too many downloads with the same name",
-    ))
 }
 
 /// Currently active media playback (mutual exclusion: only one media at a time)
@@ -2219,7 +2182,7 @@ impl WhatsAppApp {
     /// could rename the wrong one), and a timestamp plus a counter collides
     /// across processes: two windows on the same daemon each start their
     /// counter at zero, and the daemon broadcasts every assignment to both.
-    /// The process id is what keeps them apart, and it also namespaces the
+    /// [`front_end_id`] is what keeps them apart, and it also namespaces the
     /// media-cache file a voice note is staged in.
     fn next_local_id(prefix: &str) -> String {
         use portable_atomic::AtomicU64;
@@ -2227,7 +2190,7 @@ impl WhatsAppApp {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         format!(
             "{prefix}_{}_{}_{}",
-            std::process::id(),
+            front_end_id(),
             wacore::time::now_millis(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         )

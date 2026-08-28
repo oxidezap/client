@@ -78,10 +78,13 @@ fn start_logging() {
 /// readable trace rather than "unreachable executed".
 #[cfg(target_family = "wasm")]
 fn start_logging() {
+    // One initializer, not two. `web_init` installs the panic hook that turns
+    // a Rust panic into a readable trace *and* a `log` implementation that
+    // writes to the browser console — and `log` accepts only one, so a second
+    // one after it silently fails and leaves the first one's level in force.
+    // Setting the level afterwards is what actually needs saying.
     gpui_platform::web_init();
-    // After `web_init`, which installs one of its own: whichever runs last
-    // owns the `log` global, and this is the one that carries our filter.
-    let _ = console_log::init_with_level(log::Level::Info);
+    log::set_max_level(log::LevelFilter::Info);
 }
 
 fn open_the_window() {

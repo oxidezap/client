@@ -88,9 +88,15 @@ mod web {
         });
 
         // Nothing to wait on: no window, or the browser refused the timer.
-        // Returning immediately is the safe failure — a caller that polls
-        // will poll hot rather than never poll again.
+        //
+        // Every caller here is a polling loop, so returning immediately would
+        // turn one into a spin that never yields to the browser and freezes
+        // the tab. Parking forever stops that loop instead, which is the
+        // honest outcome: a page with no clock cannot animate anything, and
+        // the loop had nothing left to wait for.
         if handle.is_none() {
+            log::error!("this page has no timer; the loop that was waiting on one stops here");
+            std::future::pending::<()>().await;
             return;
         }
 

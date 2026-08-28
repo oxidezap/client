@@ -88,11 +88,24 @@ openh264 = "0.9" # H.264 software decoder
 # so the dependency differs only in the features a browser has no use for —
 # there is no font-kit, no X11 and no Wayland behind a canvas.
 [target.'cfg(target_family = "wasm")'.dependencies]
-console_log = { version = "1", features = ["color"] }
+# One tab has to be able to tell itself apart from another; see `front_end_id`.
+getrandom = { workspace = true }
+js-sys = "0.3"
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Location", "Storage", "Window"] }
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "BlobPropertyBag",
+    "Document",
+    "Element",
+    "HtmlAnchorElement",
+    "HtmlElement",
+    "Location",
+    "Storage",
+    "Url",
+    "Window",
+] }
 
 [lints]
 workspace = true
