@@ -18,13 +18,21 @@
          `href` because trunk looks for a manifest beside this file and there
          is none: the page is not a crate, it is how the front end is
          packaged. Pointing at the crate keeps the bundle's own files in one
-         directory instead of scattering them through the workspace root. -->
+         directory instead of scattering them through the workspace root.
+
+         The `wasm-opt` parameters are the features this module is *built*
+         with. wasm-opt validates before it optimizes and refuses anything it
+         was not told to expect, so without them a release build fails on the
+         first `memory.init` — "Bulk memory operations require bulk memory" —
+         and again on the first atomic. They are not optimizations; they are
+         the shape of the module. -->
     <link
       data-trunk
       rel="rust"
       href="../crates/gui/Cargo.toml"
       data-bin="oxidezap"
       data-bindgen-target="web"
+      data-wasm-opt-params="--enable-bulk-memory --enable-threads --enable-mutable-globals --enable-nontrapping-float-to-int --enable-sign-ext"
     />
 
     <!-- Cross-origin isolation, which GitHub Pages cannot give us.

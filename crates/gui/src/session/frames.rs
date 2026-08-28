@@ -176,11 +176,12 @@ impl<'a> Frames<'a> {
             // Every command is answered under the id it was asked with, which
             // is why this side no longer has to guess what a failure was
             // about.
-            DaemonMessage::Accepted { id } => {
-                if let Some(id) = id {
-                    take_pending(self.pending, id);
-                }
+            DaemonMessage::Accepted { id: Some(id) } => {
+                take_pending(self.pending, id);
             }
+            // Accepted with no id: a request sent without one, which nobody
+            // is waiting on an answer for.
+            DaemonMessage::Accepted { id: None } => {}
             DaemonMessage::Error { id, error } => {
                 match id.and_then(|id| take_pending(self.pending, id)) {
                     Some(waiting) => self.fail(waiting, &error.to_string()),
