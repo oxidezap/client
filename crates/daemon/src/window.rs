@@ -165,10 +165,12 @@ mod tests {
         /// daemon and a hazard in a test binary that runs its tests in
         /// parallel. Held for the body of each test below, and the slot is
         /// emptied under it so no test inherits another's child.
-        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
+        ///
+        /// The crate's own mutex rather than one of this module's, because
+        /// these are the tests that fork and something else in the binary
+        /// takes a file lock — see [`crate::one_at_a_time`].
         fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-            let guard = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = crate::one_at_a_time();
             if let Some(mut stale) = take_launched() {
                 let _ = stale.kill();
                 let _ = stale.wait();

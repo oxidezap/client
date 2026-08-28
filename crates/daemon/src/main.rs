@@ -14,6 +14,30 @@ mod state;
 mod tray;
 mod window;
 
+/// Keeps the tests that fork away from the tests that hold a file lock.
+///
+/// `Command::spawn` forks, and between the fork and the exec the child holds a
+/// copy of every descriptor this process has open: `O_CLOEXEC` closes them at
+/// the exec, not before. A `flock` taken on one of those descriptors is
+/// therefore still held after its owner has closed it, for as long as that
+/// window lasts — which reads exactly like a lock outliving its holder.
+/// Measured here at ~5% of attempts against a single spawning thread, and it
+/// is what failed `the_startup_lock_is_exclusive` on macOS while Linux got
+/// away with it.
+///
+/// Nothing to repair in the daemon: the window is microseconds wide and the
+/// only lock in it is one the daemon holds for its whole run anyway. It is the
+/// test binary that runs both halves at once, so the exclusion lives here —
+/// one mutex rather than one per module, because the two sides have to agree
+/// on it.
+#[cfg(test)]
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static EXCLUSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    EXCLUSION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};

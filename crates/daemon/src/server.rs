@@ -1718,8 +1718,13 @@ mod tests {
 
     /// Two daemons starting together can both see a stale socket; the lock is
     /// what stops the second from unlinking the first's freshly bound one.
+    ///
+    /// Not while another test is forking: a child caught between the fork and
+    /// its exec holds a copy of this lock's descriptor, and closing ours then
+    /// releases nothing. See [`crate::one_at_a_time`].
     #[test]
     fn the_startup_lock_is_exclusive() {
+        let _exclusive = crate::one_at_a_time();
         let dir = std::env::temp_dir().join(format!("oxidezap-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
