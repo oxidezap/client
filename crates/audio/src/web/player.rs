@@ -61,7 +61,30 @@ struct Playing {
     duration: f64,
     is_playing: bool,
     finished: bool,
+    /// Where a seek asked to be while the clip was still decoding, as a
+    /// fraction — the duration is not known until the buffer is.
+    ///
+    /// `decodeAudioData` is a promise, so a caller that starts a clip and
+    /// immediately positions it (which is what changing the playback speed
+    /// does: it restarts the note and puts it back where it was) is acting on
+    /// a player that has nothing loaded yet. Without somewhere to record the
+    /// intent, both calls did nothing and the note began again from zero.
+    pending_seek: Option<f32>,
+    /// Whether that caller also asked for it to be paused. Same reason: a
+    /// note paused when the speed changed would otherwise start playing by
+    /// itself once the decode landed.
+    pending_pause: bool,
     completion: Option<oneshot::Sender<()>>,
+}
+
+impl Playing {
+    /// Whether a decode is in flight — nothing loaded, but a run underway.
+    ///
+    /// What tells "still decoding" from "stopped": both have no buffer, and
+    /// only one of them is going to get one.
+    fn is_loading(&self) -> bool {
+        self.buffer.is_none() && !self.finished && self.generation > 0
+    }
 }
 
 /// Audio player for PTT voice messages.
@@ -195,6 +218,13 @@ impl AudioPlayer {
             (state.buffer.clone(), state.is_playing, state.duration)
         };
         let Some(buffer) = buffer else {
+            // Still decoding: remember where this asked to be, and let the
+            // decode apply it.
+            let mut state = self.state.borrow_mut();
+            if state.is_loading() {
+                state.pending_seek = Some(fraction.clamp(0.0, 1.0));
+                return true;
+            }
             return false;
         };
         let offset = (f64::from(fraction.clamp(0.0, 1.0))) * duration;
@@ -248,19 +278,39 @@ impl AudioPlayer {
                     }
                     let Ok(buffer) = decoded.dyn_into::<AudioBuffer>() else {
                         warn!("the browser decoded something that is not an audio buffer");
+                        give_up(&state);
                         return;
                     };
                     info!("decoded {:.1}s of audio", buffer.duration());
-                    {
+                    // What was asked for while this was still a promise. The
+                    // speed control restarts the clip and then puts it back
+                    // where it was, and both of those arrive before there is
+                    // anything to put back.
+                    let (offset, stay_paused) = {
                         let mut state = state.borrow_mut();
                         state.duration = buffer.duration();
-                        state.offset = 0.0;
                         state.finished = false;
                         state.buffer = Some(buffer.clone());
+                        let offset = state
+                            .pending_seek
+                            .take()
+                            .map_or(0.0, |fraction| f64::from(fraction) * state.duration);
+                        state.offset = offset;
+                        (offset, std::mem::take(&mut state.pending_pause))
+                    };
+                    start(&context, &buffer, &state, speed, offset);
+                    if stay_paused {
+                        // Started and stopped rather than never started: the
+                        // node is what carries the position, and a pause is
+                        // "here, not playing" rather than "nowhere".
+                        stop_node(&state);
+                        state.borrow_mut().offset = offset;
                     }
-                    start(&context, &buffer, &state, speed, 0.0);
                 }
-                Err(e) => warn!("the browser could not decode this clip: {e:?}"),
+                Err(e) => {
+                    warn!("the browser could not decode this clip: {e:?}");
+                    give_up(&state);
+                }
             }
         });
         Ok(())
@@ -317,11 +367,20 @@ impl AudioPlayer {
         state.offset = 0.0;
         state.duration = 0.0;
         state.finished = false;
+        state.pending_seek = None;
+        state.pending_pause = false;
     }
 
     /// Stop making sound, keeping the position.
     pub fn pause(&mut self) {
         if !self.state.borrow().is_playing {
+            // Same as `seek`: a pause asked for while the clip is decoding
+            // has to be remembered, or the note starts playing on its own the
+            // moment the buffer lands.
+            let mut state = self.state.borrow_mut();
+            if state.is_loading() {
+                state.pending_pause = true;
+            }
             return;
         }
         let now = self
@@ -371,6 +430,29 @@ impl AudioPlayer {
             AudioContext::new().map_err(|e| PlayerError::DeviceError(format!("{e:?}")))?;
         self.context = Some(context.clone());
         Ok(context)
+    }
+}
+
+/// A decode that produced nothing usable, reported to whoever is waiting.
+///
+/// The caller was told the play was accepted — `play` returns before the
+/// decode resolves — so it has already marked the note as the active one and
+/// is holding the completion receiver. Logging alone left that receiver
+/// unresolved and the player with no buffer, so every later tap called
+/// `resume`, which does nothing, and the note stayed stuck until something
+/// else was selected. Firing completion is what releases it.
+fn give_up(state: &Rc<RefCell<Playing>>) {
+    let completion = {
+        let mut state = state.borrow_mut();
+        state.is_playing = false;
+        state.finished = true;
+        state.buffer = None;
+        state.pending_seek = None;
+        state.pending_pause = false;
+        state.completion.take()
+    };
+    if let Some(tx) = completion {
+        let _ = tx.send(());
     }
 }
 

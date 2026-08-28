@@ -122,23 +122,14 @@ pub async fn run(
                 continue;
             }
         };
-        // The same cap the local endpoint honours, from the same count: a
-        // page that reconnects in a loop would otherwise open connections
-        // without limit, each with its own tasks, subscription and duplex
-        // buffer.
-        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
-            tokio::spawn(server::reject(stream));
-            continue;
-        };
-
         let config = config.clone();
         let hub = Arc::clone(&hub);
         let commands = commands.clone();
+        let slots = Arc::clone(&slots);
         tokio::spawn(async move {
-            if let Err(e) = serve(stream, &config, hub, commands).await {
+            if let Err(e) = serve(stream, &config, hub, commands, slots).await {
                 log::debug!("web client {peer} disconnected: {e}");
             }
-            drop(slot);
         });
     }
 }
@@ -149,6 +140,7 @@ async fn serve(
     config: &Config,
     hub: Arc<StateHub>,
     commands: Commands,
+    slots: ClientSlots,
 ) -> Result<()> {
     let mut stream = BufReader::new(stream);
     let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream)).await {
@@ -192,7 +184,19 @@ async fn serve(
             )
             .await;
         };
-        return attach(stream, &key, hub, commands).await;
+        // The cap is claimed here and not at accept: it counts *front ends*,
+        // and this port also answers media requests. Taken at accept, a page
+        // fetching its photos would spend the same slots as the connections
+        // it is fetching them for — thirty-two attached windows would refuse
+        // every one of their own media requests, and one in flight could take
+        // the last slot from a real client.
+        let Ok(slot) = slots.try_acquire_owned() else {
+            server::reject(stream.into_inner()).await;
+            return Ok(());
+        };
+        let served = attach(stream, &key, hub, commands).await;
+        drop(slot);
+        return served;
     }
 
     if let Some(key) = request.path.strip_prefix(&format!("{WEB_MEDIA_PATH}/")) {

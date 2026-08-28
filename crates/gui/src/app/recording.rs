@@ -70,6 +70,14 @@ impl WhatsAppApp {
             return;
         }
 
+        // Refused where nothing can come of it. The composer already draws
+        // the microphone disabled there, so this is the keyboard route and
+        // anything else that reaches the action directly.
+        if !oxidezap_audio::CAN_RECORD {
+            warn!("this build cannot record a voice note");
+            return;
+        }
+
         // Initialize and start recording
         if let Err(e) = self.audio_recorder.init() {
             error!("Failed to initialize audio recorder: {}", e);

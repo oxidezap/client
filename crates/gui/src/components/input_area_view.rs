@@ -445,14 +445,27 @@ impl InputAreaView {
                     })
                     .into_any_element()
             } else {
+                // Drawn disabled where nothing can come of pressing it, with
+                // the reason in the tooltip. A control that looks live and
+                // does nothing is the worse answer: the browser has no Opus
+                // encoder, and that is knowable before the microphone is ever
+                // asked for.
+                let can_record = oxidezap_audio::CAN_RECORD;
                 Button::new("ptt")
                     .icon(ProductIcon::Mic)
                     .ghost()
-                    .tooltip("Hold to record a voice message")
+                    .disabled(!can_record)
+                    .tooltip(if can_record {
+                        "Hold to record a voice message"
+                    } else {
+                        "Voice messages cannot be recorded in the browser"
+                    })
                     .w(control)
                     .h(control)
-                    .on_click(move |_, _window, cx| {
-                        record_entity.update(cx, |view, cx| view.toggle_recording(cx));
+                    .when(can_record, |button| {
+                        button.on_click(move |_, _window, cx| {
+                            record_entity.update(cx, |view, cx| view.toggle_recording(cx));
+                        })
                     })
                     .into_any_element()
             })

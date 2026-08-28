@@ -81,9 +81,14 @@
         user-select: none;
       }
 
-      /* Underneath the canvas, so it is what a visitor reads while the module
-         downloads — and what they are left with if it cannot run at all. The
-         canvas covers it completely once gpui has drawn a frame. */
+      /* What a visitor reads while the module downloads, and what they are
+         left with if it never runs. The canvas covers it completely once gpui
+         has drawn a frame, because the canvas comes later in the document and
+         fills the viewport.
+
+         Not a negative z-index: that would put it behind the body's own
+         background, which is opaque — so the one diagnostic a stalled load
+         has would be invisible under a blank dark surface. */
       #loading {
         position: fixed;
         inset: 0;
@@ -94,7 +99,6 @@
         justify-content: center;
         padding: 2rem;
         text-align: center;
-        z-index: -1;
       }
 
       #loading h1 {

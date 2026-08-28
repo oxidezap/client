@@ -77,14 +77,22 @@ if (typeof window === "undefined") {
                     "the window cannot start its background executor.",
             );
         } else {
+            // Reload when the worker is actually *controlling* the page, not
+            // when it starts installing. `updatefound` fires at the start of
+            // an install, and a reload then lands on another uncontrolled
+            // navigation which sees the same installing registration, gets no
+            // new event, and sits there without a SharedArrayBuffer until
+            // somebody reloads by hand. `controllerchange` is the event that
+            // means "from now on, responses come through the worker".
+            navigator.serviceWorker.addEventListener("controllerchange", () =>
+                window.location.reload(),
+            );
             navigator.serviceWorker
                 .register(window.document.currentScript.src)
                 .then((registration) => {
-                    // One reload, and only once the worker is in charge:
-                    // reloading before it has claimed the page would loop.
-                    registration.addEventListener("updatefound", () =>
-                        window.location.reload(),
-                    );
+                    // Already active but not yet controlling this page — the
+                    // navigation that registered it is never controlled by
+                    // it, and no `controllerchange` is coming for us.
                     if (registration.active && !navigator.serviceWorker.controller) {
                         window.location.reload();
                     }

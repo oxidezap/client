@@ -22,5 +22,13 @@ use unsupported as streaming;
 // Memory-efficient streaming decoder (on-demand decoding, ~3MB vs ~48MB)
 pub use streaming::StreamingVideoDecoder;
 
+/// Whether this build can decode a video at all.
+///
+/// Asked before the bytes are fetched, not after. The decoder refuses at
+/// construction where there is none — but by then the daemon has downloaded
+/// the whole file from WhatsApp and pushed it across the loopback, which for
+/// a large clip is a long wait for an answer that was known at compile time.
+pub const CAN_DECODE: bool = cfg!(not(target_family = "wasm"));
+
 // Video player state machine
 pub use player::{VideoPlayer, VideoPlayerState};
