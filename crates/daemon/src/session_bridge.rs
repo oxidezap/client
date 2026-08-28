@@ -1165,7 +1165,7 @@ impl Bridge {
 /// where it was taken; a task that outlives this one holds it until every
 /// handle has resolved. `JoinHandle` errors are the session's runtime going
 /// away, which is a shutdown, not something to report.
-fn hold<const N: usize>(permit: OwnedSemaphorePermit, work: [tokio::task::JoinHandle<()>; N]) {
+fn hold<const N: usize>(permit: OwnedSemaphorePermit, work: [oxidezap_session::Task<()>; N]) {
     tokio::spawn(async move {
         for handle in work {
             let _ = handle.await;

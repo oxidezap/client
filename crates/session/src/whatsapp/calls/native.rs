@@ -10,7 +10,30 @@
 //! the same split the GUI already uses for `app/`.
 
 use super::super::*;
+use oxidezap_audio::{spawn_mic, spawn_speaker};
 use whatsapp_rust::voip::{CallHandle, CallTermination};
+
+/// The two ends of a call's audio: what the microphone produces, and what the
+/// speaker consumes.
+type CallAudio = (
+    async_channel::Receiver<Vec<i16>>,
+    async_channel::Sender<Vec<i16>>,
+);
+
+/// Open the devices, off the async thread.
+///
+/// cpal's setup is blocking and can take a noticeable moment on a cold audio
+/// stack, which is a moment the session would otherwise spend not answering
+/// anything else.
+async fn open_call_audio() -> Result<CallAudio, String> {
+    tokio::task::spawn_blocking(|| {
+        let mic = spawn_mic().map_err(|e| e.to_string())?;
+        let speaker = spawn_speaker().map_err(|e| e.to_string())?;
+        Ok((mic, speaker))
+    })
+    .await
+    .map_err(|e| format!("audio setup task failed: {e}"))?
+}
 
 /// Live call state shared between the event pump and the UI action methods.
 ///
@@ -289,9 +312,8 @@ impl WhatsAppClient {
         let calls = self.calls.clone();
         let ui_sender = self.ui_sender.clone();
         let call_id = call_id.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let Some(client) = client_handle.lock().await.clone() else {
                 error!("Client not available for accepting call");
                 return;
@@ -367,9 +389,8 @@ impl WhatsAppClient {
         let client_handle = self.client_handle.clone();
         let calls = self.calls.clone();
         let call_id = call_id.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let Some(client) = client_handle.lock().await.clone() else {
                 error!("Client not available for declining call");
                 return;
@@ -394,13 +415,12 @@ impl WhatsAppClient {
         let calls = self.calls.clone();
         let ui_sender = self.ui_sender.clone();
         let recipient_jid = recipient_jid_str.to_string();
-        let runtime = self.runtime.clone();
 
         if is_video {
             warn!("Video calls are not supported yet; placing a voice call");
         }
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             // Before the first await: a cancel arriving after this has
             // somewhere to be written down, and one arriving before it finds
             // nothing — which is right, because nothing has been placed.
@@ -489,9 +509,8 @@ impl WhatsAppClient {
     pub fn cancel_call(&self, call_id: &str) {
         let calls = self.calls.clone();
         let call_id = call_id.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             match calls.cancel(&call_id).await {
                 Cancelled::Live(handle) => {
                     log_termination(&call_id, handle.terminate().await);
@@ -537,7 +556,6 @@ impl WhatsAppClient {
         let calls = self.calls.clone();
         let ui_sender = self.ui_sender.clone();
         let call_id = call_id.to_string();
-        let runtime = self.runtime.clone();
 
         // Before the spawn, because after it the order is gone.
         let (lane, seq) = {
@@ -551,7 +569,7 @@ impl WhatsAppClient {
             (lane, seq)
         };
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             // Cloned out from under the lock: `set_muted` waits on the call's
             // answer-transition lane, and holding the registry across that
             // would stall every other call's bookkeeping behind one peer.

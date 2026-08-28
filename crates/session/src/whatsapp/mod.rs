@@ -20,7 +20,7 @@ use whatsapp_rust::client::Client;
 use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
-use whatsapp_rust::wacore::types::events::Event;
+use whatsapp_rust::wacore::types::events::{ChannelEventHandler, Event};
 use whatsapp_rust::wacore::types::presence::{
     ChatPresence as WaChatPresence, ChatPresenceMedia, ReceiptType,
 };
@@ -29,7 +29,7 @@ use whatsapp_rust::waproto::whatsapp as wa;
 #[cfg(target_family = "wasm")]
 use whatsapp_rust_sqlite_storage::SqliteStore;
 
-use oxidezap_audio::{spawn_mic, spawn_speaker};
+use crate::exec::{Executor, Task};
 use oxidezap_core::{
     Availability, Chat, ChatMessage, ComposingKind, DownloadableMedia, IncomingCall, MediaContent,
     MediaType, MessageStatus, SystemNotice, UiEvent, fallback_chat_name,
@@ -283,21 +283,6 @@ fn parse_chat_cursor(token: &str) -> Option<oxidezap_chat_store::ChatCursor> {
 
 pub type ReadBoundary = (i64, Vec<(String, bool, Option<String>)>);
 
-type CallAudio = (
-    async_channel::Receiver<Vec<i16>>,
-    async_channel::Sender<Vec<i16>>,
-);
-
-async fn open_call_audio() -> Result<CallAudio, String> {
-    tokio::task::spawn_blocking(|| {
-        let mic = spawn_mic().map_err(|e| e.to_string())?;
-        let speaker = spawn_speaker().map_err(|e| e.to_string())?;
-        Ok((mic, speaker))
-    })
-    .await
-    .map_err(|e| format!("audio setup task failed: {e}"))?
-}
-
 fn participant_keyed_chat(jid: &Jid) -> bool {
     jid.is_group() || jid.is_broadcast_list() || jid.is_status_broadcast()
 }
@@ -305,8 +290,9 @@ fn participant_keyed_chat(jid: &Jid) -> bool {
 /// WhatsApp client wrapper that manages the connection and provides
 /// a clean interface for UI operations.
 pub struct WhatsAppClient {
-    /// Tokio runtime for async operations
-    runtime: Arc<tokio::runtime::Runtime>,
+    /// Where the session's work runs: a runtime on a thread of its own on a
+    /// desktop, the page's event loop in a browser. See [`crate::exec`].
+    exec: Executor,
     /// Shared client reference
     client_handle: ClientHandle,
     /// Shared UI event sender for sending events from operations like start_call
@@ -319,8 +305,8 @@ pub struct WhatsAppClient {
     /// the way the load that produced the chat list did.
     names: NameBookHandle,
     /// Tears down `run_client` on retry: without it the replaced client's
-    /// thread would keep its runtime and SQLite pool alive forever (bot.run()
-    /// reconnects internally and never returns on its own).
+    /// loop would keep the executor and the SQLite pool alive forever
+    /// (bot.run() reconnects internally and never returns on its own).
     shutdown: Arc<tokio::sync::Notify>,
     /// Asks the history reloader for a full pass.
     ///
@@ -329,30 +315,18 @@ pub struct WhatsAppClient {
     /// no chats and nothing has changed, so nothing would arrive until the
     /// next message did.
     reload: Arc<tokio::sync::Notify>,
-    /// The session thread, kept joinable.
-    ///
-    /// `shutdown()` only asks it to stop; the thread still has to disconnect
-    /// and close SQLite. Without a handle to wait on, a process that exits
-    /// right after asking can die mid-teardown, because Rust does not wait for
-    /// threads when `main` returns.
-    worker: Option<std::thread::JoinHandle<()>>,
     /// Whether the client has been started
     started: bool,
 }
 
 impl WhatsAppClient {
-    /// Create a new WhatsApp client wrapper. Errors when the tokio runtime
-    /// can't be built (resource exhaustion) so a retry can route to the
-    /// error screen instead of panicking the UI thread.
+    /// Create a new WhatsApp client wrapper. Errors when the executor cannot
+    /// be built — a desktop builds a runtime, which resource exhaustion can
+    /// refuse — so a retry can route to the error screen instead of panicking
+    /// the thread that asked.
     pub fn new() -> std::io::Result<Self> {
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?,
-        );
-
         Ok(Self {
-            runtime,
+            exec: Executor::new()?,
             client_handle: Arc::new(Mutex::new(None)),
             ui_sender: Arc::new(Mutex::new(None)),
             calls: CallRegistry::default(),
@@ -360,14 +334,13 @@ impl WhatsAppClient {
             names: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             reload: Arc::new(tokio::sync::Notify::new()),
-            worker: None,
             started: false,
         })
     }
 
-    /// Stop the background run loop so its thread exits and the runtime and
-    /// SQLite handles drop. Idempotent; a signal fired before the loop is up
-    /// still lands (notify_one stores a permit).
+    /// Stop the background run loop, so the executor and the SQLite handles
+    /// drop with it. Idempotent; a signal fired before the loop is up still
+    /// lands (notify_one stores a permit).
     pub fn shutdown(&self) {
         self.shutdown.notify_one();
     }
@@ -375,32 +348,17 @@ impl WhatsAppClient {
     /// Ask the session to stop and wait for it to finish closing.
     ///
     /// The wait is what separates this from [`shutdown`](Self::shutdown): the
-    /// thread still has to disconnect the socket and close SQLite, and a
+    /// session still has to disconnect the socket and close SQLite, and a
     /// caller that exits without waiting can cut that short. Bounded, so a
     /// wedged session delays exit rather than preventing it.
     ///
-    /// Returns whether the thread finished within `timeout`.
+    /// Returns whether the session's loop finished within `timeout` — see
+    /// [`crate::exec::Executor::join`], which is where a browser's answer
+    /// differs, because a page has no thread to wait on and may not block the
+    /// one it has.
     pub fn shutdown_and_join(&mut self, timeout: std::time::Duration) -> bool {
         self.shutdown();
-        let Some(handle) = self.worker.take() else {
-            return true;
-        };
-
-        // `JoinHandle` has no timed join, so wait on a channel the joining
-        // thread signals instead: the session still gets to finish, and a
-        // stuck one cannot hold the process open forever.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = handle.join();
-            let _ = tx.send(());
-        });
-        rx.recv_timeout(timeout).is_ok()
-    }
-
-    /// Get the runtime handle for UI async operations
-    #[allow(dead_code)]
-    pub fn runtime(&self) -> Arc<tokio::runtime::Runtime> {
-        self.runtime.clone()
+        self.exec.join(timeout)
     }
 
     /// Get the client handle for sending messages
@@ -430,39 +388,31 @@ impl WhatsAppClient {
         let calls = self.calls.clone();
         let chat_store = self.chat_store.clone();
         let names = self.names.clone();
-        let runtime = self.runtime.clone();
         let shutdown = self.shutdown.clone();
         let reload = self.reload.clone();
 
-        let spawned = std::thread::Builder::new()
-            .name("oxidezap-session".to_string())
-            .spawn(move || {
-                runtime.block_on(async move {
-                    {
-                        let mut guard = ui_sender.lock().await;
-                        *guard = Some(ui_tx.clone());
-                    }
-                    Self::run_client(
-                        ui_tx,
-                        Shared {
-                            client_handle,
-                            calls,
-                            chat_store_handle: chat_store,
-                            names_handle: names,
-                            ui_sender: ui_sender.clone(),
-                            shutdown,
-                            reload,
-                        },
-                    )
-                    .await;
-                });
-            });
-        match spawned {
-            Ok(handle) => self.worker = Some(handle),
-            Err(_) => {
-                self.started = false;
-                return Err("failed to spawn WhatsApp client thread");
+        let started = self.exec.start("oxidezap-session", async move {
+            {
+                let mut guard = ui_sender.lock().await;
+                *guard = Some(ui_tx.clone());
             }
+            Self::run_client(
+                ui_tx,
+                Shared {
+                    client_handle,
+                    calls,
+                    chat_store_handle: chat_store,
+                    names_handle: names,
+                    ui_sender: ui_sender.clone(),
+                    shutdown,
+                    reload,
+                },
+            )
+            .await;
+        });
+        if started.is_err() {
+            self.started = false;
+            return Err("failed to start the WhatsApp session");
         }
 
         Ok(ui_rx)
@@ -523,25 +473,11 @@ impl WhatsAppClient {
             *guard = Some(names.clone());
         }
 
-        let ui_tx_clone = ui_tx.clone();
-        let calls_clone = calls.clone();
-        let ui_sender_clone = ui_sender.clone();
-        let names_clone = names.clone();
-
         // Transport, HTTP client and runtime come from whichever platform
         // this is: the library's default features on a desktop, `web-sys`
         // bindings in a page. See `crate::net`.
         let bot = match crate::net::with_platform_plugins(Bot::builder())
             .with_backend(backend)
-            .on_event(move |event, client| {
-                let ui_tx = ui_tx_clone.clone();
-                let calls = calls_clone.clone();
-                let ui_sender = ui_sender_clone.clone();
-                let names = names_clone.clone();
-                async move {
-                    Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
-                }
-            })
             .build()
             .await
         {
@@ -573,6 +509,42 @@ impl WhatsAppClient {
         bot.client()
             .subscribe_handler(chat_store.handler())
             .detach();
+
+        // And so does the UI, through the same door rather than the builder's
+        // `on_event`. The closure registrars want a `Send` future, which is a
+        // bound a page cannot meet: the `Arc<Client>` a handler is handed is
+        // not `Send` there, because the transport it holds is a
+        // `web_sys::WebSocket`. `EventHandler` is the surface the library
+        // already relaxed for this, and the chat store above was using it
+        // before we were.
+        //
+        // Nothing is missed by subscribing after the build: `bot.run()` is
+        // what connects, and this is the same window the store's own
+        // subscription sits in. The channel is unbounded and delivery is a
+        // `try_send`, so a slow reader cannot back up the dispatch path — and
+        // one task per event keeps the concurrent delivery the builder was
+        // giving us, rather than quietly turning the event stream serial.
+        let (events, incoming) = ChannelEventHandler::new();
+        bot.client().subscribe_handler(events).detach();
+        {
+            let client = bot.client();
+            let ui_tx = ui_tx.clone();
+            let calls = calls.clone();
+            let ui_sender = ui_sender.clone();
+            let names = names.clone();
+            crate::exec::spawn(async move {
+                while let Ok(event) = incoming.recv().await {
+                    let client = client.clone();
+                    let ui_tx = ui_tx.clone();
+                    let calls = calls.clone();
+                    let ui_sender = ui_sender.clone();
+                    let names = names.clone();
+                    crate::exec::spawn(async move {
+                        Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
+                    });
+                }
+            });
+        }
 
         // Re-hydrate the UI off the store's invalidation stream instead of raw
         // client events: changes are emitted only after commit, so a reload can
@@ -1304,15 +1276,14 @@ impl WhatsAppClient {
         content: &str,
         local_id: String,
         quoted: Option<oxidezap_core::QuotedMessage>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Task<()> {
         let client_handle = self.client_handle.clone();
         let chat_store = self.chat_store.clone();
         let ui_sender = self.ui_sender.clone();
         let jid_str = jid_str.to_string();
         let content = content.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let jid: Jid = match jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -1394,9 +1365,8 @@ impl WhatsAppClient {
     ) -> tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let client_handle = self.client_handle.clone();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             // Clone the Arc and release the mutex: a slow network call
             // here must not queue every other client action behind it.
             let client = client_handle.lock().await.clone();
@@ -1434,14 +1404,13 @@ impl WhatsAppClient {
         waveform: Vec<u8>,
         local_id: String,
         quoted: Option<oxidezap_core::QuotedMessage>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Task<()> {
         let chat_store = self.chat_store.clone();
         let ui_sender = self.ui_sender.clone();
         let client_handle = self.client_handle.clone();
         let jid_str = jid_str.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let jid: Jid = match jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -1544,9 +1513,8 @@ impl WhatsAppClient {
     pub fn send_composing(&self, jid_str: &str) {
         let client_handle = self.client_handle.clone();
         let jid_str = jid_str.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let jid: Jid = match jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -1568,9 +1536,8 @@ impl WhatsAppClient {
     pub fn send_paused(&self, jid_str: &str) {
         let client_handle = self.client_handle.clone();
         let jid_str = jid_str.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let jid: Jid = match jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -1600,12 +1567,11 @@ impl WhatsAppClient {
         &self,
         chat_jid_str: &str,
         messages: Vec<(String, String)>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Task<()> {
         let client_handle = self.client_handle.clone();
         let chat_jid_str = chat_jid_str.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             // Inside the task, not before it: the caller gets a handle it can
             // await either way, rather than having to special-case nothing to
             // do.
@@ -1679,11 +1645,11 @@ impl WhatsAppClient {
         jid: String,
         before: Option<String>,
         limit: i64,
-    ) -> tokio::task::JoinHandle<Result<Page<ChatMessage>, String>> {
+    ) -> Task<Result<Page<ChatMessage>, String>> {
         let chat_store = self.chat_store.clone();
         let client_handle = self.client_handle.clone();
         let names = self.names.clone();
-        self.runtime.spawn(async move {
+        self.exec.spawn(async move {
             let Some(store) = chat_store.lock().await.clone() else {
                 return Err("no chat store yet".to_string());
             };
@@ -1738,11 +1704,11 @@ impl WhatsAppClient {
         &self,
         after: Option<String>,
         limit: i64,
-    ) -> tokio::task::JoinHandle<Result<Page<oxidezap_core::Chat>, String>> {
+    ) -> Task<Result<Page<oxidezap_core::Chat>, String>> {
         let chat_store = self.chat_store.clone();
         let client_handle = self.client_handle.clone();
         let names = self.names.clone();
-        self.runtime.spawn(async move {
+        self.exec.spawn(async move {
             let Some(store) = chat_store.lock().await.clone() else {
                 return Err("no chat store yet".to_string());
             };
@@ -1812,9 +1778,9 @@ impl WhatsAppClient {
     /// broadcast and every attached front end learns about the view through
     /// the history it already knows how to recover. Nothing has to be told
     /// separately, and nothing is lost if a client is behind.
-    pub fn mark_status_watched(&self, message_ids: Vec<String>) -> tokio::task::JoinHandle<bool> {
+    pub fn mark_status_watched(&self, message_ids: Vec<String>) -> Task<bool> {
         let chat_store = self.chat_store.clone();
-        self.runtime.spawn(async move {
+        self.exec.spawn(async move {
             let Some(store) = chat_store.lock().await.clone() else {
                 warn!("no chat store yet; a watched status update was not recorded");
                 return false;
@@ -1849,12 +1815,11 @@ impl WhatsAppClient {
         &self,
         chat_jid_str: &str,
         last_displayed: Option<ReadBoundary>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Task<()> {
         let client_handle = self.client_handle.clone();
         let chat_jid_str = chat_jid_str.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let chat_jid: Jid = match chat_jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -2031,7 +1996,7 @@ impl WhatsAppClient {
 
         let client = bot.client();
         let ui_tx = ui_tx.clone();
-        tokio::spawn(async move {
+        crate::exec::spawn(async move {
             let mut open = true;
             while open {
                 let mut scope = ReloadScope::empty();
@@ -3044,7 +3009,7 @@ async fn normalize_chat_jid(client: &Client, jid_str: &str) -> String {
 impl Drop for WhatsAppClient {
     fn drop(&mut self) {
         // A dropped wrapper can never be shut down explicitly anymore; free
-        // its background thread instead of leaking the runtime + DB pool.
+        // its loop instead of leaking the executor + DB pool.
         self.shutdown.notify_one();
     }
 }

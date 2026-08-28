@@ -82,7 +82,7 @@ impl WhatsAppClient {
         warn!("a call cannot be {verb} in a browser: there is no audio codec here");
         let ui_sender = self.ui_sender.clone();
         let call_id = call_id.to_string();
-        self.runtime.spawn(async move {
+        self.exec.spawn(async move {
             if let Some(tx) = ui_sender.lock().await.as_ref() {
                 let _ = tx.send(UiEvent::Error(
                     "Calls need the desktop app: a browser has no audio codec for them."

@@ -266,13 +266,6 @@ impl BrowserTransportFactory {
             url: whatsapp_rust::wacore::net::WHATSAPP_WEB_WS_URL.to_string(),
         }
     }
-
-    /// Dial somewhere else — a relay, or a mock.
-    #[must_use]
-    pub fn with_url(mut self, url: impl Into<String>) -> Self {
-        self.url = url.into();
-        self
-    }
 }
 
 #[async_trait(?Send)]
