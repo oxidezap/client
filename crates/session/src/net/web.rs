@@ -235,7 +235,7 @@ impl Transport for BrowserTransport {
         self.outbound
             .send(Outbound::Send(data))
             .await
-            .map_err(|_| anyhow!("the daemon socket is closed"))
+            .map_err(|_| anyhow!("the socket to WhatsApp is closed"))
     }
 
     async fn disconnect(&self) {
@@ -353,7 +353,11 @@ impl TransportFactory for BrowserTransportFactory {
                 match order {
                     Outbound::Send(data) => {
                         if let Err(e) = socket.send_with_u8_array(&data) {
-                            log::error!("could not write to the daemon socket: {e:?}");
+                            // WhatsApp's socket, not the daemon's. This file is
+                            // the library's transport; the daemon link is
+                            // `oxidezap-ipc`, and a reader who trusts this
+                            // sentence goes and reads the wrong one.
+                            log::error!("could not write to the socket to WhatsApp: {e:?}");
                             break;
                         }
                     }
