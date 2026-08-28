@@ -126,7 +126,13 @@ profile here repeats it deliberately.
   bounds tables and instance counts and not only the linear memory's bytes,
   because a declared table is allocated at instantiation — before a
   fuel-metered instruction has run — so a byte cap alone is a bound on one
-  allocation rather than on the plugin. A `Store` is not
+  allocation rather than on the plugin. Two allocations sit outside the
+  limiter entirely and are bounded before they happen: the module's own bytes
+  and whatever parsing them costs, which are spent before the store exists
+  (`MAX_MODULE_BYTES`, asked of the file rather than of its contents), and the
+  strings an event handle clones into the *host* (`MAX_HANDLES`) — a plugin
+  asking for one list element until its fuel runs out would otherwise grow
+  the daemon by far more than the sandbox advertises. A `Store` is not
   shareable and a wasm call is synchronous and blocking, so each plugin gets
   an OS thread of its own rather than a runtime task, which would stall the
   accept loop for as long as it ran. wasmi and not wasmtime: no JIT, so
@@ -162,7 +168,13 @@ profile here repeats it deliberately.
   has not accepted yet, so every import refuses until the module is
   instantiated, its version answered and its exports found. Otherwise a
   module the loader was about to turn away could send a message on its way
-  out. What a plugin does only to itself — draw, keep its own settings,
+  out. Nor may it act on the account during `oxi_init` at all: plugins load
+  before the task that consumes the command channel exists, so a send there
+  would park the loading thread inside the async runtime — where blocking is
+  a panic — waiting for an answer nothing can produce, and there is no
+  session connected to give one. It is refused as `STATE` rather than
+  `DENIED`, which says which: too early, not disallowed. What a plugin does
+  only to itself — draw, keep its own settings,
   run its own timer — takes effect on declaration, and has to: a plugin that
   could not publish its settings panel before being allowed would leave the
   user agreeing to a name and a list of phrases with nothing to look at. The
@@ -177,6 +189,9 @@ profile here repeats it deliberately.
   directory, never in the plugin's own key-value store and never in the
   daemon's `state_dir`: a plugin that can write its own approval has none,
   and an answer under `XDG_RUNTIME_DIR` is one the next login throws away.
+  The two share a directory, so a plugin's own store is written under a
+  `kv-` prefix no plugin id can produce — one called `approvals` would
+  otherwise write its settings over everybody's permissions.
 - **An event is a handle, not a payload.** Nothing is serialized for a plugin:
   it reads fields through four host functions against a table of constants, so
   a handler that looks at the text and the chat pays for two strings out of an

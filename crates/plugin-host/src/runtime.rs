@@ -17,7 +17,7 @@ use wasmi::{Config, Engine, Instance, Linker, Module, Store, StoreLimitsBuilder,
 use crate::event::Event;
 use crate::guest::{Guest, Phase};
 use crate::kv::Kv;
-use crate::{Commands, MAX_TABLE_ELEMENTS, MAX_TABLES, MEMORY_LIMIT};
+use crate::{Commands, MAX_MODULE_BYTES, MAX_TABLE_ELEMENTS, MAX_TABLES, MEMORY_LIMIT};
 
 /// How much work one `oxi_on_event` may do.
 ///
@@ -75,6 +75,20 @@ impl Runtime {
         // answer.
         approved: Arc<AtomicI64>,
     ) -> Result<Self> {
+        // Asked of the *file*, before a byte is read. Everything from here to
+        // `store.limiter` — the bytes themselves, and whatever wasmi
+        // allocates parsing and validating them — happens before the limiter
+        // exists, so the sandbox's memory bound does not cover any of it. One
+        // downloaded file with an enormous section would otherwise exhaust
+        // the daemon during startup and take the account down with it.
+        let size = std::fs::metadata(path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .len();
+        if size > MAX_MODULE_BYTES as u64 {
+            return Err(anyhow!(
+                "it is {size} bytes, past the {MAX_MODULE_BYTES} a plugin may be"
+            ));
+        }
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
 
         let mut config = Config::default();

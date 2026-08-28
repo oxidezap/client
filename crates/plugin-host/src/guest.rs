@@ -30,6 +30,15 @@ use crate::{Commands, Outcome};
 /// worker's list forever.
 const MAX_TIMERS: usize = 16;
 
+/// How many element handles one call may take out.
+///
+/// A handle clones its string into the *host's* memory, which wasmi's limiter
+/// does not bound, so without this a plugin could spend its fuel budget
+/// asking for the same list element over and over and grow the daemon far
+/// past the 4 MiB its sandbox advertises. Generous against any real list an
+/// event carries — the longest is a receipt's message ids.
+const MAX_HANDLES: usize = 4096;
+
 /// The shortest timer a plugin may set.
 ///
 /// A floor rather than a fuel charge: fuel is spent inside a call, and a
@@ -107,6 +116,20 @@ pub struct Guest {
 }
 
 impl Guest {
+    /// Whether an account command may be attempted at all right now.
+    ///
+    /// Only once the plugin is running. During `oxi_init` there is nobody to
+    /// answer one: the daemon loads its plugins before the task that consumes
+    /// the command channel exists, so a send from init would park the thread
+    /// doing the loading — inside the async runtime, where blocking is a
+    /// panic — waiting for a reply nothing can produce. Refusing with
+    /// `STATE` rather than `DENIED` says which: the plugin may well be
+    /// allowed, it is simply too early. There is no session connected yet
+    /// either, so there was never an honest answer to give.
+    fn acting(&self) -> bool {
+        self.phase == Phase::Running
+    }
+
     /// What this plugin actually holds: what it asked for, minus anything
     /// gated the user has not agreed to.
     ///
@@ -265,6 +288,15 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 return abi::ABSENT;
             };
             let guest = c.data_mut();
+            // Bounded, because this is a *host* allocation and wasmi's
+            // limiter does not see it. Nothing stops a plugin asking for the
+            // same element of the same list until its fuel runs out, and each
+            // ask clones a string into the daemon's own memory — fifty
+            // million instructions' worth of that is far past the 4 MiB the
+            // sandbox advertises. A list nobody has is not worth a handle.
+            if guest.arena.len() >= MAX_HANDLES {
+                return abi::ABSENT;
+            }
             // The arena only grows within one call and is emptied when it
             // returns, so a handle can never outlive the event it names —
             // which is what makes handles free of any lifetime bookkeeping
@@ -280,6 +312,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         m,
         abi::imports::SEND_TEXT,
         |mut c: Caller<'_, Guest>, jid: i32, jid_len: i32, text: i32, text_len: i32| -> i32 {
+            if !c.data().acting() {
+                return abi::outcome::STATE;
+            }
             if !c.data().allows(abi::caps::SEND) {
                 return abi::outcome::DENIED;
             }
@@ -309,6 +344,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
          quoted: i32,
          quoted_len: i32|
          -> i32 {
+            if !c.data().acting() {
+                return abi::outcome::STATE;
+            }
             if !c.data().allows(abi::caps::SEND) {
                 return abi::outcome::DENIED;
             }
@@ -331,6 +369,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         m,
         abi::imports::MARK_READ,
         |mut c: Caller<'_, Guest>, jid: i32, jid_len: i32, id: i32, id_len: i32| -> i32 {
+            if !c.data().acting() {
+                return abi::outcome::STATE;
+            }
             if !c.data().allows(abi::caps::MARK_READ) {
                 return abi::outcome::DENIED;
             }
@@ -352,6 +393,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         m,
         abi::imports::TYPING,
         |mut c: Caller<'_, Guest>, jid: i32, jid_len: i32, composing: i32| -> i32 {
+            if !c.data().acting() {
+                return abi::outcome::STATE;
+            }
             if !c.data().allows(abi::caps::TYPING) {
                 return abi::outcome::DENIED;
             }

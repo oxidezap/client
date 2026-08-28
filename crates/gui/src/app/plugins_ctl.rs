@@ -27,11 +27,18 @@ pub struct PluginField {
     _commit: gpui::Subscription,
 }
 
-/// A field's address. Two plugins may both call a widget `keyword`.
-fn key(plugin: &str, id: &str) -> String {
+/// A field's address. Two plugins may both call a widget `keyword`, and one
+/// plugin may draw the same id in two slots.
+///
+/// The slot is part of the address because the two are different fields: they
+/// hold different text, and the action each commits carries the open chat or
+/// does not, depending on where it was drawn. Keyed on the pair alone, the
+/// first one collected won — the header's Enter would arrive as a Settings
+/// action, and the two published values would overwrite each other.
+fn key(plugin: &str, slot: PluginSlot, id: &str) -> String {
     // A separator no plugin id may hold: ids are alphanumeric plus `-` and
     // `_`, checked by the host when it reads the file's name.
-    format!("{plugin}/{id}")
+    format!("{plugin}/{slot:?}/{id}")
 }
 
 impl WhatsAppApp {
@@ -52,8 +59,10 @@ impl WhatsAppApp {
         // Gone means gone: a plugin that stopped drawing a field has taken it
         // back, and holding the entity would keep a subscription alive that
         // fires into a widget nobody can see.
-        let live: std::collections::HashSet<String> =
-            wanted.iter().map(|f| key(&f.plugin, &f.id)).collect();
+        let live: std::collections::HashSet<String> = wanted
+            .iter()
+            .map(|f| key(&f.plugin, f.slot, &f.id))
+            .collect();
         self.plugin_fields.retain(|k, _| live.contains(k));
 
         for Field {
@@ -63,7 +72,7 @@ impl WhatsAppApp {
             value,
         } in wanted
         {
-            let k = key(&plugin, &id);
+            let k = key(&plugin, slot, &id);
             match self.plugin_fields.get_mut(&k) {
                 Some(field) => {
                     // Only when the *plugin* moved it. A tree republished with
@@ -114,8 +123,15 @@ impl WhatsAppApp {
 
     /// The box holding what is typed into one plugin's field.
     #[must_use]
-    pub fn plugin_field(&self, plugin: &str, id: &str) -> Option<&Entity<InputState>> {
-        self.plugin_fields.get(&key(plugin, id)).map(|f| &f.state)
+    pub fn plugin_field(
+        &self,
+        plugin: &str,
+        slot: PluginSlot,
+        id: &str,
+    ) -> Option<&Entity<InputState>> {
+        self.plugin_fields
+            .get(&key(plugin, slot, id))
+            .map(|f| &f.state)
     }
 
     /// Every plugin the daemon has loaded.

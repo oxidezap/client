@@ -146,11 +146,27 @@ impl Approvals {
         if let Err(e) =
             std::fs::write(&temp, &json).and_then(|()| std::fs::rename(&temp, &self.path))
         {
+            // Fail closed. Leaving the previous file is the tempting answer
+            // and it is the wrong one: the write that most matters is a
+            // *withdrawal*, and a stale file that outlives one hands the
+            // capability back on the next start — revoked in this daemon,
+            // granted in the one after it. Removing it costs the answers the
+            // user has given, which they are asked for again; keeping it
+            // costs a permission nobody agreed to.
             log::warn!(
-                "cannot write {}: {e}. Plugin permissions will be asked for again.",
+                "cannot write {}: {e}. Every plugin permission will be asked for again.",
                 self.path.display()
             );
             let _ = std::fs::remove_file(&temp);
+            if let Err(e) = std::fs::remove_file(&self.path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log::error!(
+                    "and {} could not be removed either ({e}); it may still grant what was \
+                     just withdrawn",
+                    self.path.display()
+                );
+            }
         }
     }
 
@@ -285,6 +301,30 @@ mod tests {
         let a = Approvals::open(Some(&dir.0));
         a.set("one", abi::caps::SEND, true);
         assert_eq!(a.granted("two", abi::caps::SEND), 0);
+    }
+
+    /// The write that matters most is a withdrawal, so a flush that cannot
+    /// land must not leave a file that outlives it: revoked here and granted
+    /// again on the next start is the one outcome worse than asking twice.
+    #[test]
+    fn a_failed_write_does_not_leave_a_grant_behind() {
+        let dir = TempDir::new("fail-closed");
+        let a = Approvals::open(Some(&dir.0));
+        a.set("autoreply", abi::caps::SEND, true);
+        assert!(dir.0.join("approvals.json").exists());
+
+        // A directory where the file has to go: the rename cannot replace it,
+        // which is the shape of any write that fails at the last step.
+        std::fs::remove_file(dir.0.join("approvals.json")).expect("writable");
+        std::fs::create_dir(dir.0.join("approvals.json")).expect("writable");
+        a.set("autoreply", abi::caps::SEND, false);
+
+        let reread = Approvals::open(Some(&dir.0));
+        assert_eq!(
+            reread.approved("autoreply"),
+            0,
+            "nothing survives a flush that could not land"
+        );
     }
 
     #[test]

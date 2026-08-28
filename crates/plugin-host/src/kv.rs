@@ -46,7 +46,12 @@ impl Kv {
     /// with its defaults, not fail to load. The first write replaces it.
     #[must_use]
     pub fn open(dir: &Path, id: &str) -> Self {
-        let path = dir.join(format!("{id}.json"));
+        // Prefixed, so no plugin id can name a file the host keeps in the
+        // same directory. A plugin called `approvals` would otherwise write
+        // its own settings over `approvals.json` every time somebody changed
+        // one — every permission answer on the machine unreadable, and read
+        // back on the next start as "nothing was allowed".
+        let path = dir.join(format!("kv-{id}.json"));
         let entries = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 log::warn!("plugin {id}: its stored settings are unreadable ({e}); starting empty");

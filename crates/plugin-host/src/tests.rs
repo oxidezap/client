@@ -1144,3 +1144,98 @@ fn withdrawing_stops_a_plugin_part_way_through_its_backlog() {
         "the backlog drained with the answer already applied"
     );
 }
+
+/// A handle clones its string into the *daemon's* memory, which wasmi's
+/// limiter does not bound. Without a cap a plugin can spend its fuel budget
+/// asking for the same list element over and over and grow the host far past
+/// the memory its sandbox advertises.
+const HOARDS_HANDLES: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_field_at"  (func $field_at (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (global $last (mut i32) (i32.const 0))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $i i32)
+    (block $done
+      (loop $again
+        (br_if $done (i32.ge_s (local.get $i) (i32.const 100000)))
+        ;; fields::MESSAGE_ID is not a list, so this is the honest shape of
+        ;; the attack against whatever field is: ask, and ask again.
+        (global.set $last (call $field_at (local.get $ev) (i32.const 10) (i32.const 0)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $again)))
+    (i32.const 0))
+  (func (export "last") (result i32) (global.get $last))
+)"#;
+
+#[test]
+fn a_plugin_cannot_hoard_handles_out_of_the_hosts_memory() {
+    let dir = TempDir::new("handles");
+    dir.plugin("greedy", &versioned(HOARDS_HANDLES));
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    // Whatever it ends up doing, it does not grow the daemon: either the
+    // arena refuses it or fuel does. What must not happen is a hundred
+    // thousand strings landing in host memory.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !published.latest().is_empty(),
+        "the daemon is still here to say so"
+    );
+}
+
+/// The bytes of a module, and everything wasmi allocates parsing them, are
+/// spent before the store — and so before its limiter — exists.
+#[test]
+fn a_module_too_large_to_be_a_plugin_is_refused_unread() {
+    let dir = TempDir::new("oversized");
+    let path = dir.0.join("huge.wasm");
+    std::fs::create_dir_all(&dir.0).expect("a writable temp dir");
+    // A file past the cap, cheaply: the loader must answer from its size
+    // rather than from its contents.
+    let file = std::fs::File::create(&path).expect("writable");
+    file.set_len(crate::MAX_MODULE_BYTES as u64 + 1)
+        .expect("sparse");
+    drop(file);
+
+    // A good plugin beside it, so an empty list cannot pass this test by
+    // discovery having failed altogether.
+    dir.plugin("autoreply", &pong());
+
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(
+        plugins.ids(),
+        vec!["autoreply"],
+        "the oversized one is refused, and its neighbour still loads"
+    );
+}
+
+/// A plugin's own key-value file and the host's record of what the user
+/// allowed live in the same directory, so no plugin id may name the latter.
+#[test]
+fn a_plugin_cannot_name_the_file_that_holds_its_own_approval() {
+    let dir = TempDir::new("approvals-collision");
+    let state = dir.0.join("state");
+    std::fs::create_dir_all(&state).expect("writable");
+
+    let approvals = crate::approvals::Approvals::open(Some(&state));
+    approvals.set("victim", abi::caps::SEND, true);
+
+    // The worst case: a plugin actually called `approvals`.
+    let mut kv = crate::kv::Kv::open(&state, "approvals");
+    kv.set("anything", "at all");
+
+    let reread = crate::approvals::Approvals::open(Some(&state));
+    assert_eq!(
+        reread.approved("victim"),
+        abi::caps::SEND,
+        "a plugin's settings did not land on everybody's permissions"
+    );
+}

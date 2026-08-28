@@ -69,6 +69,15 @@ const MAX_TABLE_ELEMENTS: usize = 10_000;
 /// How many tables one plugin may declare. Rust and TinyGo emit one.
 const MAX_TABLES: usize = 4;
 
+/// How large a `.wasm` may be to be worth loading at all.
+///
+/// The one bound that has to be checked before the file is opened: the bytes,
+/// and everything wasmi allocates parsing them, are spent before the store —
+/// and so before its limiter — exists. `examples/autoreply` is under six
+/// kilobytes; a plugin written in a language that ships a runtime is a couple
+/// of megabytes, and this leaves room for several of those.
+const MAX_MODULE_BYTES: usize = 32 * 1024 * 1024;
+
 /// How many events may wait for one plugin.
 ///
 /// Deep enough to absorb a burst of arrivals while a handler is working, and
@@ -118,6 +127,9 @@ pub struct Plugins {
     /// full queue abandons its backlog instead of grinding through five
     /// hundred wasm calls while the daemon waits to exit.
     stopping: Arc<AtomicBool>,
+    /// Held across a whole answer: the registry mutation, its persistence and
+    /// the shared mask a plugin's own thread reads.
+    approving: Mutex<()>,
 }
 
 struct Worker {
@@ -231,6 +243,7 @@ impl Plugins {
             registry,
             workers,
             stopping,
+            approving: Mutex::new(()),
         }
     }
 
@@ -242,6 +255,7 @@ impl Plugins {
             registry: Arc::new(Registry::new(sink, Approvals::open(None))),
             workers: Vec::new(),
             stopping: Arc::new(AtomicBool::new(false)),
+            approving: Mutex::new(()),
         }
     }
 
@@ -341,11 +355,17 @@ impl Plugins {
         let Some(worker) = self.workers.iter().find(|w| w.id == id) else {
             return;
         };
+        // One ordered step, because these are two answers to the same
+        // question and they must not be able to disagree. Two clients acting
+        // at once would otherwise let a grant compute its mask, pause while a
+        // revocation persists and publishes a zero, and then store the stale
+        // mask over it: Settings and `approvals.json` would read "not
+        // allowed" while the plugin went on sending.
+        let _order = lock(&self.approving);
+        let granted = self.registry.approve(id, approved);
         // Stored before anything else observes the answer, so the very next
         // command a draining backlog attempts is checked against it.
-        worker
-            .granted
-            .store(self.registry.approve(id, approved), Ordering::Relaxed);
+        worker.granted.store(granted, Ordering::Relaxed);
     }
 
     /// Put a job on a plugin's queue, or take it out of service.
