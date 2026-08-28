@@ -71,53 +71,55 @@ pub fn render_message_list(
     let messages = Arc::clone(&cache.messages);
     let items = Arc::clone(&cache.items);
 
+    let gutter = layout.conversation_padding();
+
     div()
         .flex_1()
         .min_h_0()
         .relative()
-        // The gutter is the container's, not the list's: `gpui::list` honours
-        // the vertical half of its own padding and lays every row out at the
-        // left edge of its bounds regardless of the horizontal half, which is
-        // why asking the list for `px` left the bubbles flush against the
-        // window.
+        .overflow_hidden()
         .child(
-            div()
-                .size_full()
-                .overflow_hidden()
-                .px(layout.conversation_padding())
-                .child(
-                    list(state.clone(), move |ix, _window, cx| {
-                        render_row(
-                            &items,
-                            &messages,
-                            ix,
-                            &entity,
-                            is_group,
-                            is_own_number,
-                            layout,
-                            metrics,
-                            cx,
-                        )
-                    })
-                    .size_full()
-                    .py(layout.conversation_gap()),
-                ),
+            // The gutter is each row's, not the list's. `gpui::list` honours
+            // the vertical half of its own padding and lays every row out at
+            // the left edge of its bounds regardless of the horizontal half,
+            // so asking the list for `px` left the bubbles flush against the
+            // window — and putting it on a container around the list moved
+            // the *list* inwards instead, which is a different thing again:
+            // the list's bounds are what its scrollbar paints itself over, so
+            // a gutter there hung the scrollbar a gutter's width inside the
+            // pane, floating over the conversation rather than at its edge.
+            list(state.clone(), move |ix, _window, cx| {
+                div()
+                    .w_full()
+                    .px(gutter)
+                    .child(render_row(
+                        &items,
+                        &messages,
+                        ix,
+                        &entity,
+                        is_group,
+                        is_own_number,
+                        layout,
+                        metrics,
+                        cx,
+                    ))
+                    .into_any_element()
+            })
+            .size_full()
+            .py(layout.conversation_gap()),
         )
         // A conversation scrolls as much as the sidebar does and said so with
         // nothing: how far back a reader is in a history that keeps growing
         // upwards as they page through it is exactly what a scrollbar is for.
-        // The same placement as the chat list's — over the region that
-        // scrolls, at its trailing edge, outside the rows' own gutter — and
-        // the list's own state is the handle, because a self-measuring list
-        // is the only thing that knows how tall its rows turned out.
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .child(Scrollbar::vertical(state)),
-        )
+        // The list's own state is the handle, because a self-measuring list is
+        // the only thing that knows how tall its rows turned out — and it is
+        // also what decides *where* the bar is drawn: a `Scrollbar` paints
+        // itself over the bounds its handle reports, not over the element it
+        // was hung from. So the overlay covers the pane rather than pinning an
+        // edge of it, exactly as gpui-component hangs its own; the trailing
+        // edge comes from the list reaching that edge, which is why the gutter
+        // is on the rows.
+        .child(div().absolute().inset_0().child(Scrollbar::vertical(state)))
         .into_any_element()
 }
 
