@@ -5,10 +5,17 @@
 //! this: on `wasm32` its traits are `async_trait(?Send)` and its
 //! `MaybeSendSync` bound is empty, because a page is one thread.
 //!
-//! That single thread is also why the `unsafe impl Send + Sync` below are
-//! sound. There is no second thread to race with — `Runtime` itself is
-//! declared `Send + Sync` upstream for the native case, and a wasm
-//! implementation has to satisfy the same signature.
+//! There is no `unsafe` here, and that is deliberate. This build runs real
+//! workers — rebuilding the standard library with atomics is what the whole
+//! `build-std` dance is for — so "a page is one thread" would be a false
+//! premise to hang an `unsafe impl Send` on, however true it looks. A JS
+//! object belongs to the agent that made it, and a type the compiler lets
+//! anyone move is a type that will eventually be moved.
+//!
+//! So nothing here holds a JS object across a boundary the type system is
+//! not already checking: the socket stays in the task that opened it and
+//! callers hold a queue into it, which is the same arrangement `ipc::Link`
+//! describes and for the same reason.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,11 +35,6 @@ use whatsapp_rust::wacore::runtime::{AbortHandle, Runtime};
 
 /// The page's event loop, as a [`Runtime`].
 pub struct BrowserRuntime;
-
-// One thread, so nothing here can be raced. The trait is declared
-// `Send + Sync` for the native case and a wasm implementation has to match it.
-unsafe impl Send for BrowserRuntime {}
-unsafe impl Sync for BrowserRuntime {}
 
 impl Runtime for BrowserRuntime {
     /// Spawned on the page's microtask queue, and cancellable.
@@ -55,22 +57,9 @@ impl Runtime for BrowserRuntime {
             .await;
         });
 
-        // The sender crosses into the handle, which upstream requires to be
-        // `Send`. It never leaves this thread — there is only one — and it is
-        // moved rather than shared.
-        struct OneThread(futures_channel::oneshot::Sender<()>);
-        unsafe impl Send for OneThread {}
-        impl OneThread {
-            /// A method rather than a field read at the call site: a closure
-            /// in edition 2021 captures the *field* it touches, so reaching
-            /// for `.0` directly would capture the sender and leave this
-            /// wrapper — and its `Send` — behind.
-            fn abort(self) {
-                drop(self.0);
-            }
-        }
-        let carried = OneThread(cancel);
-        AbortHandle::new(move || carried.abort())
+        // No wrapper and no `unsafe`: `AbortHandle::new` wants a `Send`
+        // closure, and a `oneshot::Sender<()>` is already one.
+        AbortHandle::new(move || drop(cancel))
     }
 
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()>>> {
@@ -165,9 +154,6 @@ async fn sleep(duration: Duration) {
 /// property of running in a browser at all rather than of this code.
 pub struct BrowserHttpClient;
 
-unsafe impl Send for BrowserHttpClient {}
-unsafe impl Sync for BrowserHttpClient {}
-
 #[async_trait(?Send)]
 impl HttpClient for BrowserHttpClient {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
@@ -217,48 +203,45 @@ impl HttpClient for BrowserHttpClient {
     }
 }
 
-/// The browser's `WebSocket`, as the library's [`Transport`].
+/// The browser's `WebSocket`, as the library's [`Transport`] — at one remove.
 ///
 /// A dumb pipe for bytes, which is all the trait asks for: the framing above
 /// it is WhatsApp's own and knows nothing about this.
+///
+/// What this holds is a queue, not a socket. A `web_sys::WebSocket` and its
+/// closures belong to the agent that created them, and this build has real
+/// worker threads, so a handle the compiler lets anyone move is a handle that
+/// will eventually be moved onto one. The socket therefore stays in the task
+/// that opened it and every writer posts to it — which is exactly what
+/// `ipc::Link` does, and why: a type that owns JS objects cannot honestly be
+/// `Send`, and a channel sender can.
 ///
 /// Binary throughout. The socket is set to hand back `ArrayBuffer` rather than
 /// `Blob`, because a `Blob` is read asynchronously and the read half here is a
 /// callback that has to produce bytes on the spot.
 pub struct BrowserTransport {
-    socket: web_sys::WebSocket,
-    /// Held so they die with the socket. `Closure::forget` would leave four
-    /// behind on the JS heap per reconnect, and the library reconnects.
-    _handlers: Handlers,
+    outbound: async_channel::Sender<Outbound>,
 }
 
-struct Handlers {
-    _open: Closure<dyn FnMut()>,
-    _message: Closure<dyn FnMut(web_sys::MessageEvent)>,
-    _close: Closure<dyn FnMut(web_sys::CloseEvent)>,
-    _error: Closure<dyn FnMut(web_sys::Event)>,
+/// What the owning task accepts.
+enum Outbound {
+    Send(Bytes),
+    Close,
 }
-
-unsafe impl Send for BrowserTransport {}
-unsafe impl Sync for BrowserTransport {}
 
 #[async_trait(?Send)]
 impl Transport for BrowserTransport {
     async fn send(&self, data: Bytes) -> Result<(), anyhow::Error> {
-        self.socket
-            .send_with_u8_array(&data)
-            .map_err(|e| anyhow!("could not write to the daemon socket: {e:?}"))
+        self.outbound
+            .send(Outbound::Send(data))
+            .await
+            .map_err(|_| anyhow!("the daemon socket is closed"))
     }
 
     async fn disconnect(&self) {
-        // The handlers come off first: a browser holding a reference to a
-        // freed callback is a crash rather than a missed event, and the close
-        // we are asking for would otherwise fire one on the way out.
-        self.socket.set_onopen(None);
-        self.socket.set_onmessage(None);
-        self.socket.set_onclose(None);
-        self.socket.set_onerror(None);
-        let _ = self.socket.close();
+        // Asked for rather than done here: closing needs the socket, and the
+        // socket is the one thing this side does not have.
+        let _ = self.outbound.send(Outbound::Close).await;
     }
 }
 
@@ -267,9 +250,6 @@ impl Transport for BrowserTransport {
 pub struct BrowserTransportFactory {
     url: String,
 }
-
-unsafe impl Send for BrowserTransportFactory {}
-unsafe impl Sync for BrowserTransportFactory {}
 
 impl Default for BrowserTransportFactory {
     fn default() -> Self {
@@ -369,15 +349,34 @@ impl TransportFactory for BrowserTransportFactory {
         };
         socket.set_onerror(Some(failed.as_ref().unchecked_ref()));
 
-        let transport = BrowserTransport {
-            socket,
-            _handlers: Handlers {
-                _open: opened,
-                _message: message,
-                _close: closed,
-                _error: failed,
-            },
-        };
-        Ok((std::sync::Arc::new(transport), rx))
+        // The socket never leaves this task, and the closures never leave
+        // the socket. Everything a caller can hold is the sender below.
+        let (outbound, orders) = async_channel::unbounded();
+        spawn_local(async move {
+            // Moved in, not borrowed: this is where they die, which is what
+            // keeps a reconnect from leaving four closures on the JS heap.
+            let _handlers = (opened, message, closed, failed);
+            while let Ok(order) = orders.recv().await {
+                match order {
+                    Outbound::Send(data) => {
+                        if let Err(e) = socket.send_with_u8_array(&data) {
+                            log::error!("could not write to the daemon socket: {e:?}");
+                            break;
+                        }
+                    }
+                    Outbound::Close => break,
+                }
+            }
+            // The handlers come off first: a browser holding a reference to a
+            // freed callback is a crash rather than a missed event, and the
+            // close below would otherwise fire one on the way out.
+            socket.set_onopen(None);
+            socket.set_onmessage(None);
+            socket.set_onclose(None);
+            socket.set_onerror(None);
+            let _ = socket.close();
+        });
+
+        Ok((std::sync::Arc::new(BrowserTransport { outbound }), rx))
     }
 }

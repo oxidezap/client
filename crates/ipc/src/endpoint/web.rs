@@ -337,14 +337,44 @@ fn usable_endpoint(url: &str) -> Result<(), String> {
     }
     // The page's own origin: a deployment that serves the bridge beside
     // itself is naming where it already came from.
-    let served_from = web_sys::window()
-        .and_then(|window| window.location().hostname().ok())
-        .unwrap_or_default();
-    if !served_from.is_empty() && host.eq_ignore_ascii_case(&served_from) {
+    //
+    // The *whole* origin, not the hostname. A host is not an origin — a
+    // different port is a different origin, and on a shared or nonstandard
+    // host it is very likely a different owner. Comparing hostnames alone let
+    // `#daemon=wss://this-host:8443/ws` pass as "where this page came from",
+    // which handed the window, and everything typed into it, to whatever
+    // answers on that port.
+    //
+    // `host()` rather than `hostname()` because it carries the port, and it
+    // omits the default one on both sides — so `wss://example.com/ws` still
+    // matches a page served from `https://example.com`.
+    let Some(location) = web_sys::window().map(|window| window.location()) else {
+        return Err(format!(
+            "{host} is not this machine, and there is no page to compare it to"
+        ));
+    };
+    let (page_scheme, page_host) = (
+        location.protocol().unwrap_or_default(),
+        location.host().unwrap_or_default(),
+    );
+    // A page's scheme decides which socket scheme is the same origin: an
+    // `https:` page reaching `ws:` is a downgrade, and an `http:` page
+    // reaching `wss:` is naming somewhere it did not come from.
+    let expected = match page_scheme.as_str() {
+        "https:" => "wss:",
+        "http:" => "ws:",
+        _ => "",
+    };
+    if !page_host.is_empty()
+        && parsed.protocol() == expected
+        && parsed.host().eq_ignore_ascii_case(&page_host)
+    {
         return Ok(());
     }
     Err(format!(
-        "{host} is neither this machine nor where this page came from"
+        "{}//{} is neither this machine nor where this page came from",
+        parsed.protocol(),
+        parsed.host()
     ))
 }
 

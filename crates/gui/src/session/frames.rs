@@ -323,7 +323,7 @@ pub(super) fn parse(line: &str) -> Option<DaemonMessage> {
 /// await anything. A front end that shares the daemon's filesystem reads them
 /// inside the frame and never calls this.
 #[cfg(target_family = "wasm")]
-pub(super) fn media_keys(message: &DaemonMessage) -> Vec<String> {
+pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<String> {
     use oxidezap_core::MediaType;
 
     fn key_of(media: &Option<MediaContent>, into: &mut Vec<String>) {
@@ -376,7 +376,18 @@ pub(super) fn media_keys(message: &DaemonMessage) -> Vec<String> {
                 }
             }
         }
-        DaemonMessage::Downloaded { key, .. } => keys.push(key.clone()),
+        // Only if somebody is still waiting on it. `apply` drops an answer
+        // whose request has already timed out — but the fetch happens before
+        // `apply`, so without this the page pulls a whole attachment down to
+        // throw it away, and holds every frame behind it for up to the media
+        // budget while it does.
+        DaemonMessage::Downloaded { id, key } => {
+            if is_pending(pending, *id) {
+                keys.push(key.clone());
+            } else {
+                log::debug!("not fetching {key}: nobody is waiting on {id} any more");
+            }
+        }
         _ => {}
     }
     // A download key is the media's *content*, so one photo forwarded into
@@ -387,6 +398,17 @@ pub(super) fn media_keys(message: &DaemonMessage) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     keys.retain(|key| seen.insert(key.clone()));
     keys
+}
+
+/// Whether a request is still being waited on, without consuming it.
+///
+/// [`take_pending`] is the other half: this asks, that answers and removes.
+#[cfg(target_family = "wasm")]
+fn is_pending(pending: &Pending, id: RequestId) -> bool {
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&id)
 }
 
 pub(super) fn take_pending(pending: &Pending, id: RequestId) -> Option<Awaiting> {

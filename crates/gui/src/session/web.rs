@@ -93,7 +93,7 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
                     // already. Everything the frame does not use is dropped
                     // with the next one.
                     fetched.clear();
-                    prefetch(&media_base, &message, fetched.as_ref()).await;
+                    prefetch(&media_base, &message, fetched.as_ref(), &pending).await;
                     if frames.apply(message).is_break() {
                         break;
                     }
@@ -126,9 +126,9 @@ const FRAME_MEDIA_BUDGET: std::time::Duration = std::time::Duration::from_secs(3
 ///
 /// Under one deadline for all of them, so the sequence cannot multiply a
 /// stall by the number of keys; see [`FRAME_MEDIA_BUDGET`].
-async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched) {
+async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched, pending: &super::Pending) {
     let all = async {
-        for key in frames::media_keys(message) {
+        for key in frames::media_keys(message, pending) {
             match web::fetch_media(base, &key).await {
                 Ok(bytes) => into.put(key, bytes),
                 Err(e) => log::debug!("media {key} is not available: {e}"),

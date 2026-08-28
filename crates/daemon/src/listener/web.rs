@@ -206,22 +206,22 @@ async fn serve(
     };
     let request = Request::parse(&head).context("unparsable request")?;
 
-    // The one thing checked before anything else is served: an origin that
-    // was not named gets nothing, not even a 404 that would confirm the port.
+    // The one thing checked before anything else is served — and answered
+    // the same way a bad token is, which the comment here used to describe
+    // and the code did not do.
+    //
+    // A `403` saying "this daemon was not told to accept that origin" is a
+    // confirmation that a daemon is here, handed to a caller who has not
+    // authenticated and cannot. Every account on the machine can reach this
+    // port, so that turns the origin check into a discovery oracle for the
+    // one thing the token exists to keep private. Wrong origin, wrong token
+    // and nothing listening now look alike.
     if !request.origin_allowed(config) {
         log::warn!(
             "refusing a web client from origin {:?}",
             request.origin.as_deref().unwrap_or("(none)")
         );
-        respond(
-            stream.get_mut(),
-            403,
-            "text/plain",
-            None,
-            b"this daemon was not told to accept that origin",
-        )
-        .await?;
-        return Ok(());
+        return respond(stream.get_mut(), 404, "text/plain", None, b"nothing here").await;
     }
     let origin = request.origin.clone();
 
