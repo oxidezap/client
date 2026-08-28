@@ -288,21 +288,62 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -eu
-          # Only on `2`, which is "closed". A `1` means a newer run of this
-          # same pull request published while we were working — what is on the
-          # branch is then *newer* than what we had, and removing it would be
-          # this run deleting a preview that is perfectly good.
+          # The same three-way reading the publish loop uses, because the
+          # same three things can happen and only one of them means remove.
           set +e
           sh "$RUNNER_TEMP/still-current.sh"
           state=$?
           set -e
-          if [ "$state" -ne 2 ]; then
-            echo "not closed (check said $state); leaving the branch alone"
-            echo "removed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          case "$state" in
+            # Still open on this head: the preview we just published is the
+            # right one.
+            0)
+              echo "still open; the preview stays"
+              echo "removed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            # Superseded. A newer run of this same pull request published
+            # while we worked, so what is on the branch is newer than what we
+            # had — removing it would delete a preview that is wanted.
+            1)
+              echo "superseded; a newer run owns the preview"
+              echo "removed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            # Closed. Ours to undo.
+            2) ;;
+            # The check broke rather than answered. Reading that as "not
+            # closed" is how a closed pull request's preview stays published
+            # for good: the close event has already been spent, so nothing
+            # comes back to clean it up. Fail loudly and leave a job to retry.
+            *)
+              echo "the closure check failed with $state; refusing to guess" >&2
+              exit 1
+              ;;
+          esac
           echo "closed while publishing; removing $TARGET again" >&2
-          bash .github/scripts/publish-pages.sh --remove "$TARGET"
+
+          # Re-asked per attempt, like every other write to this branch: the
+          # pull request can be reopened while this removal is fetching, and
+          # the `reopened` run's preview would then be what we delete.
+          #
+          # A translation, not a condition. The publisher's vocabulary is
+          # 0 = do it, 1/2 = stand down, anything else = broken; this removal
+          # wants the *opposite* sense, and the mapping has one case that is
+          # easy to lose in a shell one-liner — an operational failure must
+          # stay a failure rather than collapsing into "not closed".
+          cat > "$RUNNER_TEMP/still-closed-now.sh" <<'CLOSED'
+          set -u
+          sh "$RUNNER_TEMP/still-current.sh"
+          case $? in
+            2) exit 0 ;;   # closed: the removal is still wanted
+            0 | 1) exit 1 ;;  # open, or superseded: leave the branch alone
+            *) exit 3 ;;   # the check broke; the publisher refuses to guess
+          esac
+          CLOSED
+          bash .github/scripts/publish-pages.sh \
+            --only-if "sh $RUNNER_TEMP/still-closed-now.sh" \
+            --remove "$TARGET"
           echo "removed=true" >> "$GITHUB_OUTPUT"
 
       - name: Say where it is
