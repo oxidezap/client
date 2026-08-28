@@ -316,10 +316,12 @@ impl TransportFactory for BrowserTransportFactory {
                 // The code and the reason are carried through rather than
                 // flattened: the library reads them to tell a routine stream
                 // recycle from a failure, and logs the two differently.
-                let _ = tx.try_send(TransportEvent::Disconnected(DisconnectReason::ServerClose {
-                    code: Some(event.code()),
-                    reason: event.reason(),
-                }));
+                let _ = tx.try_send(TransportEvent::Disconnected(
+                    DisconnectReason::ServerClose {
+                        code: Some(event.code()),
+                        reason: event.reason(),
+                    },
+                ));
             })
         };
         socket.set_onclose(Some(closed.as_ref().unchecked_ref()));
