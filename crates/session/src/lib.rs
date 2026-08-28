@@ -8,8 +8,11 @@ mod group_notice;
 mod names;
 mod net;
 mod quoting;
+mod store;
 mod video;
 mod whatsapp;
 
 pub use exec::{Cancelled, Task, unblock};
-pub use whatsapp::{ReadBoundary, WhatsAppClient, resolve_database_path, wipe_local_state};
+pub use whatsapp::{
+    ReadBoundary, WhatsAppClient, prepare_store, resolve_database_path, wipe_local_state,
+};

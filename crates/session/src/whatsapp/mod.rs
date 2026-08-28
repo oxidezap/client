@@ -41,80 +41,12 @@ use crate::quoting::quoted_from;
 use crate::video::{self, CameraLost, VideoPublisher, VideoSenderSlot};
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
-/// Resolve a stable per-user path for the SQLite database. A CWD-relative
-/// path would silently split state between launch methods (desktop launcher
-/// vs terminal), so prefer the platform data dir and only fall back to the
-/// working directory when no home is known.
-pub fn resolve_database_path() -> String {
-    resolve_database_dir()
-        .map(|dir| dir.join(DB_FILE).to_string_lossy().into_owned())
-        .unwrap_or_else(|| DB_FILE.to_string())
-}
+/// Where the store lives on this platform. See [`crate::store`].
+pub use crate::store::{database_path as resolve_database_path, prepare as prepare_store};
 
-const DB_FILE: &str = "whatsapp.db";
-
-/// Per-user data directory, under the platform data root.
-///
-/// No fallback to the old `whatsapp-rust-desktop` name: this app has never
-/// shipped a release, so there is no installed base to migrate and carrying
-/// lookup code for one would be permanent dead weight.
-const DATA_DIR: &str = "oxidezap";
-
-/// Delete the local session: device identity, Signal state and chat history all
-/// live in the one SQLite file.
-///
-/// Called after the server ends the session, where reconnecting is pointless —
-/// the credentials are dead and pairing mints a new device. A partial wipe is
-/// not an option: chat rows are keyed by device id, so keeping them would
-/// orphan every one of them behind the new device anyway.
-pub fn wipe_local_state() -> std::io::Result<()> {
-    let Some(dir) = resolve_database_dir() else {
-        return Ok(());
-    };
-    // -wal and -shm hold committed pages SQLite would replay into a fresh file.
-    for suffix in ["", "-wal", "-shm"] {
-        let path = dir.join(format!("{DB_FILE}{suffix}"));
-        match std::fs::remove_file(&path) {
-            Ok(()) => info!("Removed {}", path.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-fn resolve_database_dir() -> Option<std::path::PathBuf> {
-    let not_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(std::path::PathBuf::from(v));
-    let data_root = if cfg!(target_os = "macos") {
-        std::env::var_os("HOME")
-            .and_then(not_empty)
-            .map(|home| home.join("Library/Application Support"))
-    } else if cfg!(target_os = "windows") {
-        std::env::var_os("LOCALAPPDATA")
-            .and_then(not_empty)
-            .or_else(|| {
-                std::env::var_os("USERPROFILE")
-                    .and_then(not_empty)
-                    .map(|profile| profile.join("AppData").join("Local"))
-            })
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .and_then(not_empty)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .and_then(not_empty)
-                    .map(|home| home.join(".local/share"))
-            })
-    };
-
-    let dir = data_root.map(|root| root.join(DATA_DIR))?;
-    // SQLite won't create missing parent directories itself.
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!("Failed to create data dir: {e}; using CWD-relative {DB_FILE}");
-        return None;
-    }
-    Some(dir)
-}
+/// Delete the local session: device identity, Signal state and chat history
+/// all live in the one SQLite file.
+pub use crate::store::wipe as wipe_local_state;
 
 /// User-facing copy for a server-ended session. The server sometimes supplies
 /// its own text (account locks do); prefer it, and otherwise say plainly which
@@ -515,9 +447,19 @@ impl WhatsAppClient {
             shutdown,
             reload,
         } = shared;
+        // Whatever this platform has to do before a database can be opened
+        // at all. Here rather than at the caller, because forgetting it is
+        // not a failure anybody would see: a browser without its VFS opens a
+        // database in memory quite happily and loses the account when the tab
+        // closes.
+        if let Err(e) = crate::store::prepare().await {
+            error!("Failed to prepare the store: {e}");
+            let _ = ui_tx.send(UiEvent::Error(format!("Database error: {e}")));
+            return;
+        }
         // Device store + durable chat history share one SQLite file (one pool,
         // one WAL writer).
-        let db_path = match tokio::task::spawn_blocking(resolve_database_path).await {
+        let db_path = match crate::exec::unblock(resolve_database_path).await {
             Ok(path) => path,
             Err(e) => {
                 error!("Failed to resolve database path: {e}");
