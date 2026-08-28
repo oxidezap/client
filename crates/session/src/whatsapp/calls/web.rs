@@ -19,18 +19,26 @@ use super::super::*;
 /// page has neither, because it never gets as far as a live call.
 #[derive(Clone, Default)]
 pub struct CallRegistry {
-    pending: Arc<Mutex<HashMap<String, Arc<WaIncomingCall>>>>,
+    /// A `std` lock, like the desktop's, so the two answer the same way from
+    /// the same threads — see the note on `CallRegistry::calls` there.
+    pending: Arc<std::sync::Mutex<HashMap<String, Arc<WaIncomingCall>>>>,
 }
 
 impl CallRegistry {
     /// Record a ringing offer, so the conversation can say who called.
-    pub(in crate::whatsapp) async fn offer(&self, call_id: String, call: Arc<WaIncomingCall>) {
-        self.pending.lock().await.insert(call_id, call);
+    pub(in crate::whatsapp) fn offer(&self, call_id: String, call: Arc<WaIncomingCall>) {
+        self.pending
+            .lock()
+            .expect("call registry poisoned")
+            .insert(call_id, call);
     }
 
     /// Forget a ringing offer, however it stopped ringing.
-    pub(in crate::whatsapp) async fn forget_offer(&self, call_id: &str) {
-        self.pending.lock().await.remove(call_id);
+    pub(in crate::whatsapp) fn forget_offer(&self, call_id: &str) {
+        self.pending
+            .lock()
+            .expect("call registry poisoned")
+            .remove(call_id);
     }
 
     /// Nothing to end: a call that was never answered has no local side.
@@ -38,11 +46,11 @@ impl CallRegistry {
     /// Present so the event pump reads the same on both platforms — the peer
     /// hanging up is the same event here, and it is the removal above that
     /// does the work.
-    pub(in crate::whatsapp) async fn ended_by_peer(&self, _call_id: &str) {}
+    pub(in crate::whatsapp) fn ended_by_peer(&self, _call_id: &str) {}
 
     /// Always false: a page opens no camera, so a call becoming live has none
     /// to make drawable and nothing to announce.
-    pub(in crate::whatsapp) async fn camera_became_drawable(&self, _call_id: &str) -> bool {
+    pub(in crate::whatsapp) fn camera_became_drawable(&self, _call_id: &str) -> bool {
         false
     }
 }

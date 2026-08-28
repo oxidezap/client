@@ -66,7 +66,7 @@ impl Drop for AcceptGuard {
         let calls = self.calls.clone();
         let call_id = std::mem::take(&mut self.call_id);
         tokio::spawn(async move {
-            calls.abandon_accept(&call_id).await;
+            calls.abandon_accept(&call_id);
         });
     }
 }
@@ -103,7 +103,22 @@ enum Camera {
 /// only approximate.
 #[derive(Clone, Default)]
 pub struct CallRegistry {
-    calls: Arc<Mutex<Calls>>,
+    /// A `std` lock, and every method that takes it is synchronous.
+    ///
+    /// Not a preference: an outgoing call has to be marked in flight on the
+    /// caller's thread, *before* its task exists, for the same reason a mute
+    /// request is stamped there — spawning is not sequencing, and a cancel
+    /// spawned a moment later can run first. An async lock would force that
+    /// mark into the task, which is exactly where it is too late: the cancel
+    /// would find nothing in flight, decline to leave a note, and the call it
+    /// meant to stop would go on to ring at the far end with every window
+    /// already showing it gone.
+    ///
+    /// Safe because no critical section here spans an await. They are all a
+    /// handful of map operations; the two that then have to *wait* on
+    /// something — closing a device, hanging up — take what they need out
+    /// under the lock and release it before they do.
+    calls: Arc<std::sync::Mutex<Calls>>,
     /// Apart, deliberately. A mute lane is a `std::sync::Mutex` because a
     /// request is stamped on the caller's thread *before* its task exists —
     /// see [`MuteLane`] — and it takes no part in the ringing/live/cancelled
@@ -167,13 +182,21 @@ struct Calls {
 
 impl CallRegistry {
     /// Record a ringing offer, so accept and decline have something to act on.
-    pub(in crate::whatsapp) async fn offer(&self, call_id: String, call: Arc<WaIncomingCall>) {
-        self.calls.lock().await.pending.insert(call_id, call);
+    pub(in crate::whatsapp) fn offer(&self, call_id: String, call: Arc<WaIncomingCall>) {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .pending
+            .insert(call_id, call);
     }
 
     /// Forget a ringing offer, however it stopped ringing.
-    pub(in crate::whatsapp) async fn forget_offer(&self, call_id: &str) {
-        self.calls.lock().await.pending.remove(call_id);
+    pub(in crate::whatsapp) fn forget_offer(&self, call_id: &str) {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .pending
+            .remove(call_id);
     }
 
     /// Take a ringing offer for something that is *not* an acceptance.
@@ -181,11 +204,15 @@ impl CallRegistry {
     /// A decline needs the offer to reject it, and nothing about it is in
     /// flight afterwards — so unlike [`Self::begin_accept`] there is no
     /// window here for an ending to fall into.
-    pub(in crate::whatsapp) async fn forget_and_take_offer(
+    pub(in crate::whatsapp) fn forget_and_take_offer(
         &self,
         call_id: &str,
     ) -> Option<Arc<WaIncomingCall>> {
-        self.calls.lock().await.pending.remove(call_id)
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .pending
+            .remove(call_id)
     }
 
     /// Take a ringing offer and mark its acceptance as in flight, together.
@@ -193,11 +220,8 @@ impl CallRegistry {
     /// One operation because they are one step: between leaving `pending` and
     /// entering `in_flight` the call would be in nothing at all, which is the
     /// state that has no answer for a peer hanging up.
-    pub(in crate::whatsapp) async fn begin_accept(
-        &self,
-        call_id: &str,
-    ) -> Option<Arc<WaIncomingCall>> {
-        let mut calls = self.calls.lock().await;
+    pub(in crate::whatsapp) fn begin_accept(&self, call_id: &str) -> Option<Arc<WaIncomingCall>> {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
         let offer = calls.pending.remove(call_id)?;
         calls.in_flight.insert(call_id.to_string());
         Some(offer)
@@ -208,12 +232,12 @@ impl CallRegistry {
     /// `false` means the window has already been told the call is over, so
     /// the handle is not filed and the caller hangs it up locally. Both
     /// answers leave `in_flight` empty for this id.
-    pub(in crate::whatsapp) async fn finish_accept(
+    pub(in crate::whatsapp) fn finish_accept(
         &self,
         call_id: &str,
         handle: &Arc<CallHandle>,
     ) -> bool {
-        let mut calls = self.calls.lock().await;
+        let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.in_flight.remove(call_id);
         if calls.cancelled.remove(call_id) {
             return false;
@@ -224,8 +248,8 @@ impl CallRegistry {
 
     /// An acceptance that produced no handle. Says whether the peer had
     /// already ended it, so a caller knows whether anyone is still ringing.
-    pub(in crate::whatsapp) async fn abandon_accept(&self, call_id: &str) -> bool {
-        let mut calls = self.calls.lock().await;
+    pub(in crate::whatsapp) fn abandon_accept(&self, call_id: &str) -> bool {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.in_flight.remove(call_id);
         calls.cancelled.remove(call_id)
     }
@@ -237,15 +261,19 @@ impl CallRegistry {
     /// seconds of device setup, or a stanza, on a call nobody is on — and a
     /// call that ends between this answer and that registration is exactly
     /// what the registration is there to catch.
-    pub(in crate::whatsapp) async fn ended_meanwhile(&self, call_id: &str) -> bool {
-        self.calls.lock().await.cancelled.contains(call_id)
+    pub(in crate::whatsapp) fn ended_meanwhile(&self, call_id: &str) -> bool {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .cancelled
+            .contains(call_id)
     }
 
     /// Mark an outgoing call as being placed, under the id the window drew.
-    pub(in crate::whatsapp) async fn begin_start(&self, placeholder: &str) {
+    pub(in crate::whatsapp) fn begin_start(&self, placeholder: &str) {
         self.calls
             .lock()
-            .await
+            .expect("call registry poisoned")
             .in_flight
             .insert(placeholder.to_string());
     }
@@ -256,13 +284,13 @@ impl CallRegistry {
     /// The placeholder is what a cancel names, because it is the only id the
     /// window had; the rename and the cancellation are answered together so a
     /// cancel arriving between them cannot be lost.
-    pub(in crate::whatsapp) async fn finish_start(
+    pub(in crate::whatsapp) fn finish_start(
         &self,
         placeholder: &str,
         call_id: &str,
         handle: &Arc<CallHandle>,
     ) -> bool {
-        let mut calls = self.calls.lock().await;
+        let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.in_flight.remove(placeholder);
         // Either name: the window cancels under the placeholder, and anything
         // that learned the real id first cancels under that.
@@ -275,8 +303,8 @@ impl CallRegistry {
     }
 
     /// An outgoing call that never produced a handle.
-    pub(in crate::whatsapp) async fn abandon_start(&self, placeholder: &str) {
-        let mut calls = self.calls.lock().await;
+    pub(in crate::whatsapp) fn abandon_start(&self, placeholder: &str) {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.in_flight.remove(placeholder);
         calls.cancelled.remove(placeholder);
     }
@@ -296,8 +324,8 @@ impl CallRegistry {
     /// is decided under the same lock the handle would be filed under: an
     /// acceptance in flight will produce one after this returns, so the news
     /// is left where that acceptance is guaranteed to look for it.
-    pub(in crate::whatsapp) async fn ended_by_peer(&self, call_id: &str) {
-        let mut calls = self.calls.lock().await;
+    pub(in crate::whatsapp) fn ended_by_peer(&self, call_id: &str) {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
         if let Some(handle) = calls.active.remove(call_id) {
             tokio::spawn(async move { handle.hangup_local().await });
             return;
@@ -308,8 +336,13 @@ impl CallRegistry {
     }
 
     /// Ask for a live call without taking it.
-    pub(in crate::whatsapp) async fn live(&self, call_id: &str) -> Option<Arc<CallHandle>> {
-        self.calls.lock().await.active.get(call_id).cloned()
+    pub(in crate::whatsapp) fn live(&self, call_id: &str) -> Option<Arc<CallHandle>> {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .active
+            .get(call_id)
+            .cloned()
     }
 
     /// A live call's handle, and a sweep of the lanes while the answer to
@@ -318,8 +351,8 @@ impl CallRegistry {
     /// Where the lane maps grow is where they are swept: a lane is made by a
     /// request naming a call, and a call that is no longer live is one no
     /// further request can reach.
-    async fn live_and_sweep(&self, call_id: &str) -> Option<Arc<CallHandle>> {
-        let calls = self.calls.lock().await;
+    fn live_and_sweep(&self, call_id: &str) -> Option<Arc<CallHandle>> {
+        let calls = self.calls.lock().expect("call registry poisoned");
         self.mute
             .lock()
             .expect("mute lanes poisoned")
@@ -345,8 +378,8 @@ impl CallRegistry {
     /// A note is only left where something is in flight to receive it, or the
     /// set would grow by one entry for every call that merely rang and
     /// stopped.
-    pub(in crate::whatsapp) async fn cancel(&self, call_id: &str) -> Cancelled {
-        let mut calls = self.calls.lock().await;
+    pub(in crate::whatsapp) fn cancel(&self, call_id: &str) -> Cancelled {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.pending.remove(call_id);
         if let Some(handle) = calls.active.remove(call_id) {
             return Cancelled::Live(handle);
@@ -366,10 +399,10 @@ impl CallRegistry {
     /// between in-flight and live-or-cancelled — rather than what its offer
     /// said, and this reaches that state directly.
     #[cfg(test)]
-    pub(in crate::whatsapp) async fn mark_accepting(&self, call_id: &str) {
+    pub(in crate::whatsapp) fn mark_accepting(&self, call_id: &str) {
         self.calls
             .lock()
-            .await
+            .expect("call registry poisoned")
             .in_flight
             .insert(call_id.to_string());
     }
@@ -395,7 +428,7 @@ impl CallRegistry {
     /// "camera filed" cannot disagree between two acquisitions.
     async fn hold_camera(&self, call_id: &str, local: LocalVideo) -> Camera {
         let taken = {
-            let mut calls = self.calls.lock().await;
+            let mut calls = self.calls.lock().expect("call registry poisoned");
             calls.cameras.insert(call_id.to_string(), local);
             let ended = !calls.active.contains_key(call_id);
             let dead = !calls.cameras.get(call_id).is_some_and(LocalVideo::alive);
@@ -428,8 +461,8 @@ impl CallRegistry {
     /// into a stream nobody could draw — the state had no live call to put a
     /// direction in — so the first unit any decoder now starting sees would
     /// reference frames it never got.
-    pub(in crate::whatsapp) async fn camera_became_drawable(&self, call_id: &str) -> bool {
-        let calls = self.calls.lock().await;
+    pub(in crate::whatsapp) fn camera_became_drawable(&self, call_id: &str) -> bool {
+        let calls = self.calls.lock().expect("call registry poisoned");
         let Some(local) = calls.cameras.get(call_id) else {
             return false;
         };
@@ -439,8 +472,12 @@ impl CallRegistry {
     }
 
     /// Whether this side's camera is on for this call.
-    async fn camera_on(&self, call_id: &str) -> bool {
-        self.calls.lock().await.cameras.contains_key(call_id)
+    fn camera_on(&self, call_id: &str) -> bool {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .cameras
+            .contains_key(call_id)
     }
 
     /// Take this call's camera out, for a caller that is going to close it.
@@ -448,8 +485,12 @@ impl CallRegistry {
     /// Taken rather than borrowed under the lock: closing waits on a capture
     /// thread, and holding the registry across that wait stalls every other
     /// call.
-    async fn take_camera(&self, call_id: &str) -> Option<LocalVideo> {
-        self.calls.lock().await.cameras.remove(call_id)
+    fn take_camera(&self, call_id: &str) -> Option<LocalVideo> {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .cameras
+            .remove(call_id)
     }
 
     /// The same, but only if it is still the camera the caller means.
@@ -458,12 +499,12 @@ impl CallRegistry {
     /// spawned, so the camera in the registry may be a later one. `None` is
     /// "whatever is there now", which is right for something learned from the
     /// peer in the moment.
-    async fn take_camera_if(
+    fn take_camera_if(
         &self,
         call_id: &str,
         only: Option<crate::video::CameraId>,
     ) -> Option<LocalVideo> {
-        let mut calls = self.calls.lock().await;
+        let mut calls = self.calls.lock().expect("call registry poisoned");
         match calls.cameras.get(call_id) {
             Some(held) if only.is_none_or(|wanted| held.camera_id() == wanted) => {
                 calls.cameras.remove(call_id)
@@ -473,47 +514,67 @@ impl CallRegistry {
     }
 
     /// Ask this call's camera for a keyframe, if it has one.
-    async fn ask_for_keyframe(&self, call_id: &str) {
-        if let Some(local) = self.calls.lock().await.cameras.get(call_id) {
+    fn ask_for_keyframe(&self, call_id: &str) {
+        if let Some(local) = self
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .cameras
+            .get(call_id)
+        {
             local.request_keyframe();
         }
     }
 
     /// Ask every live camera, for a subscriber who has never seen one.
-    async fn ask_all_for_keyframes(&self) {
-        for local in self.calls.lock().await.cameras.values() {
+    fn ask_all_for_keyframes(&self) {
+        for local in self
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .cameras
+            .values()
+        {
             local.request_keyframe();
         }
     }
 
     /// Park the peer's request to go to video, so turning the camera on can
     /// answer it.
-    async fn park_upgrade(&self, call_id: &str, token: VideoUpgradeToken) {
+    fn park_upgrade(&self, call_id: &str, token: VideoUpgradeToken) {
         self.calls
             .lock()
-            .await
+            .expect("call registry poisoned")
             .upgrades
             .insert(call_id.to_string(), token);
     }
 
     /// Take the peer's parked request, which is what answering it costs.
-    async fn take_upgrade(&self, call_id: &str) -> Option<VideoUpgradeToken> {
-        self.calls.lock().await.upgrades.remove(call_id)
+    fn take_upgrade(&self, call_id: &str) -> Option<VideoUpgradeToken> {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .upgrades
+            .remove(call_id)
     }
 
     /// Record that an upgrade of *ours* is waiting on the peer's answer.
-    async fn begin_upgrade(&self, call_id: &str) {
+    fn begin_upgrade(&self, call_id: &str) {
         self.calls
             .lock()
-            .await
+            .expect("call registry poisoned")
             .upgrading
             .insert(call_id.to_string());
     }
 
     /// Withdraw it, and say whether there was one — which is the whole
     /// question a refusal has to answer.
-    async fn end_upgrade(&self, call_id: &str) -> bool {
-        self.calls.lock().await.upgrading.remove(call_id)
+    fn end_upgrade(&self, call_id: &str) -> bool {
+        self.calls
+            .lock()
+            .expect("call registry poisoned")
+            .upgrading
+            .remove(call_id)
     }
 
     /// A call has ended: clear everything keyed to it and hand back the
@@ -523,8 +584,8 @@ impl CallRegistry {
     /// arriving mid-teardown would otherwise see a call with no handle but a
     /// camera still filed, or an upgrade still outstanding against a call
     /// that has none.
-    async fn ended(&self, call_id: &str) -> Option<LocalVideo> {
-        let mut calls = self.calls.lock().await;
+    fn ended(&self, call_id: &str) -> Option<LocalVideo> {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.active.remove(call_id);
         calls.upgrades.remove(call_id);
         calls.upgrading.remove(call_id);
@@ -646,7 +707,7 @@ impl WhatsAppClient {
             // the same lock that consumes the offer, because two steps leave
             // a moment where a remote termination finds neither, leaves no
             // note, and the accept goes on to answer a call nobody is on.
-            let Some(offer) = calls.begin_accept(&call_id).await else {
+            let Some(offer) = calls.begin_accept(&call_id) else {
                 warn!("No pending offer for call {}", call_id);
                 return;
             };
@@ -697,7 +758,7 @@ impl WhatsAppClient {
             // a permission prompt, and the `<accept>` below would answer a
             // call nobody is on any more. The registration consumes the same
             // note under the lock; this is only about not sending the stanza.
-            if calls.ended_meanwhile(&call_id).await {
+            if calls.ended_meanwhile(&call_id) {
                 info!("Call {} ended before its media came up", call_id);
                 if let Some(local) = local {
                     local.stop().await;
@@ -723,7 +784,7 @@ impl WhatsAppClient {
                     // one nobody could see or end. The check and the
                     // registration are one operation under one lock; as two
                     // steps there is a gap in which a hangup does neither.
-                    if !calls.finish_accept(&call_id, &handle).await {
+                    if !calls.finish_accept(&call_id, &handle) {
                         info!("Call {} was hung up while its media came up", call_id);
                         if let Some(local) = local {
                             local.stop().await;
@@ -808,7 +869,7 @@ impl WhatsAppClient {
     pub fn request_video_keyframe(&self) {
         let calls = self.calls.clone();
         self.exec.spawn(async move {
-            calls.ask_all_for_keyframes().await;
+            calls.ask_all_for_keyframes();
         });
     }
 
@@ -844,7 +905,7 @@ impl WhatsAppClient {
         };
 
         self.exec.spawn(async move {
-            let Some(handle) = calls.live_and_sweep(&call_id).await else {
+            let Some(handle) = calls.live_and_sweep(&call_id) else {
                 debug!("set_call_video: no live handle for {}", call_id);
                 // Answered rather than dropped. A window draws the camera as
                 // coming on the moment it is asked, and it clears that on the
@@ -872,7 +933,7 @@ impl WhatsAppClient {
                 // Taken out of the registry before it is waited on: closing a
                 // device means waiting for its capture thread, and every
                 // other call's bookkeeping would queue behind it.
-                if let Some(local) = calls.take_camera(&call_id).await {
+                if let Some(local) = calls.take_camera(&call_id) {
                     // The device is released first, matching `stop_video`
                     // itself: the user asked for the camera to go off, and a
                     // failed stanza must not leave it running.
@@ -882,12 +943,12 @@ impl WhatsAppClient {
                 // `stop_video` clears the library's pending request, so a
                 // refusal after it is one the library ignores — and so is
                 // this.
-                calls.end_upgrade(&call_id).await;
+                calls.end_upgrade(&call_id);
                 Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
                 return;
             }
 
-            if calls.camera_on(&call_id).await {
+            if calls.camera_on(&call_id) {
                 // Already on. Said again rather than returning silently: this
                 // is the newest request, and what it costs to restate is
                 // nothing — the daemon publishes no frame for a state that
@@ -917,7 +978,7 @@ impl WhatsAppClient {
             }
             // Consuming the token *is* the answer, so the question goes with
             // it — every window drawing it has to stop.
-            let answering = calls.take_upgrade(&call_id).await;
+            let answering = calls.take_upgrade(&call_id);
             if answering.is_some() {
                 Self::announce_video_request(&ui_sender, &call_id, false).await;
             }
@@ -938,7 +999,7 @@ impl WhatsAppClient {
             // early can, because every path out of here that is not a camera
             // held withdraws it again.
             if ours_to_be_answered {
-                calls.begin_upgrade(&call_id).await;
+                calls.begin_upgrade(&call_id);
             }
             let started = match answering {
                 Some(token) => {
@@ -961,7 +1022,7 @@ impl WhatsAppClient {
                     if lane.intent.lock().expect("video intent poisoned").seq != seq {
                         local.stop().await;
                         Self::stop_peer_video(&handle, &call_id).await;
-                        calls.end_upgrade(&call_id).await;
+                        calls.end_upgrade(&call_id);
                         return;
                     }
                     // The call is already live, so the self-view has had
@@ -986,10 +1047,10 @@ impl WhatsAppClient {
                     match calls.hold_camera(&call_id, local).await {
                         Camera::Died => {
                             Self::stop_peer_video(&handle, &call_id).await;
-                            calls.end_upgrade(&call_id).await;
+                            calls.end_upgrade(&call_id);
                         }
                         Camera::CallEnded => {
-                            calls.end_upgrade(&call_id).await;
+                            calls.end_upgrade(&call_id);
                         }
                         Camera::Held => {}
                     }
@@ -997,7 +1058,7 @@ impl WhatsAppClient {
                 Err(e) => {
                     error!("Failed to start video on call {}: {}", call_id, e);
                     local.stop().await;
-                    calls.end_upgrade(&call_id).await;
+                    calls.end_upgrade(&call_id);
                 }
             }
             Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
@@ -1024,7 +1085,7 @@ impl WhatsAppClient {
         if lane.intent.lock().expect("video intent poisoned").seq != seq {
             return;
         }
-        let settled = calls.camera_on(call_id).await;
+        let settled = calls.camera_on(call_id);
         Self::announce_video(ui_sender, call_id, VideoStream::Local, settled).await;
     }
 
@@ -1052,14 +1113,14 @@ impl WhatsAppClient {
         // the lane is per call, and the library's event queue is unbounded.
         let lane = calls.video_lane(call_id);
         let _serialized = lane.lane.lock().await;
-        let Some(local) = calls.take_camera_if(call_id, only).await else {
+        let Some(local) = calls.take_camera_if(call_id, only) else {
             return;
         };
         local.stop().await;
         // Asked for out of the registry rather than held across the wait:
         // telling the peer is a stanza on the wire, and holding the lock
         // across it stalls every other call's bookkeeping behind one peer.
-        if let Some(handle) = calls.live(call_id).await {
+        if let Some(handle) = calls.live(call_id) {
             Self::stop_peer_video(&handle, call_id).await;
         }
         Self::announce_video(ui_sender, call_id, VideoStream::Local, false).await;
@@ -1087,7 +1148,7 @@ impl WhatsAppClient {
         ui_sender: &UiEventSender,
         call_id: &str,
     ) {
-        if calls.take_upgrade(call_id).await.is_some() {
+        if calls.take_upgrade(call_id).is_some() {
             Self::announce_video_request(ui_sender, call_id, false).await;
         }
     }
@@ -1127,7 +1188,7 @@ impl WhatsAppClient {
                 error!("Client not available for declining call");
                 return;
             };
-            let Some(offer) = calls.forget_and_take_offer(&call_id).await else {
+            let Some(offer) = calls.forget_and_take_offer(&call_id) else {
                 warn!("No pending offer for call {}", call_id);
                 return;
             };
@@ -1154,11 +1215,19 @@ impl WhatsAppClient {
         let lost = self.camera_lost();
         let recipient_jid = recipient_jid_str.to_string();
 
+        // Before the spawn, on the caller's thread, for the same reason a
+        // mute request is stamped there: spawning is not sequencing. A user
+        // who dials and immediately changes their mind produces two spawned
+        // tasks, and the cancel's can run first — finding nothing in flight,
+        // declining to leave a note, and returning `Nothing`. The placement
+        // would then go on to offer the call and file it as live, ringing at
+        // the far end with every window already showing it gone. Inside the
+        // task this mark is too late by construction; here there is no gap
+        // for a cancel to fall into, because the daemon takes the two
+        // requests in order on one thread.
+        calls.begin_start(&placeholder_id);
+
         self.exec.spawn(async move {
-            // Before the first await: a cancel arriving after this has
-            // somewhere to be written down, and one arriving before it finds
-            // nothing — which is right, because nothing has been placed.
-            calls.begin_start(&placeholder_id).await;
             let notify_failure = |error: String| {
                 let ui_sender = ui_sender.clone();
                 let recipient_jid = recipient_jid.clone();
@@ -1167,7 +1236,7 @@ impl WhatsAppClient {
                 async move {
                     // A cancel may have landed for a call that will never
                     // start; the placement is over either way.
-                    calls.abandon_start(&placeholder_id).await;
+                    calls.abandon_start(&placeholder_id);
                     error!(
                         "Failed to start call to {}: {}",
                         observe_str(&recipient_jid),
@@ -1239,7 +1308,7 @@ impl WhatsAppClient {
             // can change their mind. Checked *before* the offer goes out: the
             // peer would otherwise ring for a call that was called off, and
             // be told to stop moments later.
-            if calls.ended_meanwhile(&placeholder_id).await {
+            if calls.ended_meanwhile(&placeholder_id) {
                 info!(
                     "Outgoing call to {} cancelled while its camera opened",
                     observe_str(&recipient_jid)
@@ -1247,7 +1316,7 @@ impl WhatsAppClient {
                 if let Some(local) = local {
                     local.stop().await;
                 }
-                calls.abandon_start(&placeholder_id).await;
+                calls.abandon_start(&placeholder_id);
                 return;
             }
 
@@ -1261,7 +1330,7 @@ impl WhatsAppClient {
                     // moment where a cancel finds no handle and this finds no
                     // note, and what is left is a call ringing at the far end
                     // that no window has ever been told the name of.
-                    if !calls.finish_start(&placeholder_id, &call_id, &handle).await {
+                    if !calls.finish_start(&placeholder_id, &call_id, &handle) {
                         info!("Outgoing call {} cancelled before start", call_id);
                         if let Some(local) = local {
                             local.stop().await;
@@ -1340,7 +1409,7 @@ impl WhatsAppClient {
         self.exec.spawn(async move {
             // One operation, because the three answers are decided by the
             // same state — see [`CallRegistry::cancel`].
-            match calls.cancel(&call_id).await {
+            match calls.cancel(&call_id) {
                 Cancelled::Live(handle) => {
                     log_termination(&call_id, handle.terminate().await);
                 }
@@ -1397,7 +1466,7 @@ impl WhatsAppClient {
             // Taken out rather than held: `set_muted` waits on the call's
             // answer-transition lane, and holding the registry across that
             // would stall every other call's bookkeeping behind one peer.
-            let Some(handle) = calls.live_and_sweep(&call_id).await else {
+            let Some(handle) = calls.live_and_sweep(&call_id) else {
                 debug!("set_call_muted: no live handle for {}", call_id);
                 return;
             };
@@ -1486,7 +1555,7 @@ impl WhatsAppClient {
                         feedback,
                         ..
                     } if reports_video && feedback.iter().any(reports_loss) => {
-                        calls.ask_for_keyframe(&call_id).await;
+                        calls.ask_for_keyframe(&call_id);
                     }
                     _ => {}
                 }
@@ -1504,7 +1573,7 @@ impl WhatsAppClient {
         upgrade_token: Option<VideoUpgradeToken>,
     ) {
         if peer_can_receive_video(state) {
-            calls.ask_for_keyframe(call_id).await;
+            calls.ask_for_keyframe(call_id);
         }
         match state {
             // A request rather than a change: the answer is a person turning
@@ -1514,12 +1583,12 @@ impl WhatsAppClient {
             // not offered as a question.
             VideoState::UpgradeRequest | VideoState::UpgradeRequestV2 => {
                 let Some(token) = upgrade_token else { return };
-                calls.park_upgrade(call_id, token).await;
+                calls.park_upgrade(call_id, token);
                 Self::announce_video_request(ui_sender, call_id, true).await;
             }
             VideoState::Enabled => {
                 // Whatever we were waiting on an answer for has had one.
-                calls.end_upgrade(call_id).await;
+                calls.end_upgrade(call_id);
                 Self::announce_video(ui_sender, call_id, VideoStream::Remote, true).await;
             }
             // Paused is drawn the same as off, and deliberately: a peer whose
@@ -1548,7 +1617,7 @@ impl WhatsAppClient {
                 // when none is. One arriving after our upgrade was already
                 // answered belongs to nothing here, and stopping the camera
                 // on it would take down one nobody refused.
-                if calls.end_upgrade(call_id).await {
+                if calls.end_upgrade(call_id) {
                     Self::stop_local_video(calls, ui_sender, call_id, None).await;
                 } else {
                     debug!("Refused video upgrade on {call_id} answers nothing of ours");
@@ -1564,7 +1633,7 @@ impl WhatsAppClient {
             // The peer took the upgrade, so nothing of ours is outstanding
             // and a refusal landing after it answers something else.
             VideoState::UpgradeAccept => {
-                calls.end_upgrade(call_id).await;
+                calls.end_upgrade(call_id);
             }
             // `UpgradeAccept` is answered by the `Enabled` that follows it,
             // which is the state that actually says a camera is on.
@@ -1578,7 +1647,7 @@ impl WhatsAppClient {
         crate::exec::spawn(async move {
             handle.wait_ended().await;
             let call_id = handle.call_id().to_string();
-            if let Some(camera) = calls.ended(&call_id).await {
+            if let Some(camera) = calls.ended(&call_id) {
                 camera.stop().await;
             }
             Self::notify_call_ended(&ui_sender, &call_id).await;
@@ -1703,43 +1772,43 @@ mod tests {
     /// acceptance file a live handle behind the `CallEnded` the window had
     /// already been sent. A microphone open under a call nobody thought was
     /// happening.
-    #[tokio::test]
-    async fn a_peer_ending_a_call_mid_acceptance_is_not_lost() {
+    #[test]
+    fn a_peer_ending_a_call_mid_acceptance_is_not_lost() {
         let calls = CallRegistry::default();
-        calls.mark_accepting("call-1").await;
-        calls.ended_by_peer("call-1").await;
+        calls.mark_accepting("call-1");
+        calls.ended_by_peer("call-1");
 
         assert!(
-            calls.abandon_accept("call-1").await,
+            calls.abandon_accept("call-1"),
             "an ending that arrived mid-acceptance must reach the acceptance"
         );
     }
 
     /// And it is spent once, so a later acceptance of a call with a reused id
     /// is not cancelled by a stale note.
-    #[tokio::test]
-    async fn a_peer_ending_is_reported_once() {
+    #[test]
+    fn a_peer_ending_is_reported_once() {
         let calls = CallRegistry::default();
-        calls.mark_accepting("call-1").await;
-        calls.ended_by_peer("call-1").await;
+        calls.mark_accepting("call-1");
+        calls.ended_by_peer("call-1");
 
-        assert!(calls.abandon_accept("call-1").await);
+        assert!(calls.abandon_accept("call-1"));
         assert!(
-            !calls.abandon_accept("call-1").await,
+            !calls.abandon_accept("call-1"),
             "the note is consumed by the acceptance that acted on it"
         );
     }
 
     /// Nothing is recorded when no acceptance is in flight, or the set would
     /// grow by one entry for every call that simply rang and stopped.
-    #[tokio::test]
-    async fn an_ending_with_nothing_in_flight_records_nothing() {
+    #[test]
+    fn an_ending_with_nothing_in_flight_records_nothing() {
         let calls = CallRegistry::default();
-        calls.ended_by_peer("call-1").await;
+        calls.ended_by_peer("call-1");
 
-        calls.mark_accepting("call-1").await;
+        calls.mark_accepting("call-1");
         assert!(
-            !calls.abandon_accept("call-1").await,
+            !calls.abandon_accept("call-1"),
             "an ending before the acceptance began is not this acceptance's"
         );
     }
@@ -1752,26 +1821,27 @@ mod tests {
     /// left a gap where a start consumed the note before it was written —
     /// and the abandoned attempt then rang at the far end until its transport
     /// gave up.
-    #[tokio::test]
-    async fn a_cancel_while_connecting_reaches_the_start() {
+    #[test]
+    fn a_cancel_while_connecting_reaches_the_start() {
         let calls = CallRegistry::default();
-        calls.begin_start("placeholder-1").await;
+        calls.begin_start("placeholder-1");
 
         assert!(
-            matches!(calls.cancel("placeholder-1").await, Cancelled::Deferred),
+            matches!(calls.cancel("placeholder-1"), Cancelled::Deferred),
             "nothing is live yet, so the cancel is left for the start"
         );
     }
 
     /// And a cancel with nothing in flight is not remembered, for the same
-    /// reason an ending is not.
-    #[tokio::test]
-    async fn a_cancel_with_nothing_in_flight_is_not_remembered() {
+    /// reason an ending is not — which is also why `start_call` marks the
+    /// placeholder on the caller's thread rather than inside its task. This
+    /// answer is right for the registry and fatal as a sequence: reached
+    /// because a cancel's task ran before a placement's, it would let the
+    /// placement go on to offer a call every window had already cleared.
+    #[test]
+    fn a_cancel_with_nothing_in_flight_is_not_remembered() {
         let calls = CallRegistry::default();
-        assert!(matches!(
-            calls.cancel("placeholder-1").await,
-            Cancelled::Nothing
-        ));
+        assert!(matches!(calls.cancel("placeholder-1"), Cancelled::Nothing));
     }
 
     /// A lone request is nobody's stale task    /// A lone request is nobody's stale task: it applies, and it is the one

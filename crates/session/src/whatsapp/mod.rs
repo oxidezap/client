@@ -729,7 +729,7 @@ impl WhatsAppClient {
                     }
                     info!("Incoming call from {}", call.from.observe());
                     let offer = Arc::new(call.clone());
-                    calls.offer(call_id.clone(), offer.clone()).await;
+                    calls.offer(call_id.clone(), offer.clone());
                     let caller_jid = normalize_chat_jid(&client, &call.from.to_string()).await;
                     let caller_name = call
                         .notify
@@ -761,7 +761,7 @@ impl WhatsAppClient {
                     // direction in, so nothing was published and the next
                     // unit alone references frames no decoder starting now
                     // has ever seen.
-                    if calls.camera_became_drawable(call_id).await {
+                    if calls.camera_became_drawable(call_id) {
                         let _ = ui_tx.send(UiEvent::CallVideoChanged {
                             call_id: call_id.clone(),
                             stream: VideoStream::Local,
@@ -771,13 +771,13 @@ impl WhatsAppClient {
                 }
                 CallAction::Reject { call_id, .. } => {
                     info!("Call {} rejected by peer", call_id);
-                    calls.forget_offer(call_id).await;
+                    calls.forget_offer(call_id);
                     let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                 }
                 CallAction::Terminate { call_id, .. } => {
                     info!("Call {} terminated by peer", call_id);
-                    calls.forget_offer(call_id).await;
-                    calls.ended_by_peer(call_id).await;
+                    calls.forget_offer(call_id);
+                    calls.ended_by_peer(call_id);
                     let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                 }
                 _ => {}
@@ -788,12 +788,12 @@ impl WhatsAppClient {
                     missed.call_id,
                     missed.from.observe()
                 );
-                calls.forget_offer(&missed.call_id).await;
+                calls.forget_offer(&missed.call_id);
                 let _ = ui_tx.send(UiEvent::CallEnded(missed.call_id.clone()));
             }
             Event::CallEndedElsewhere(ended) => {
                 info!("Call {} handled on another device", ended.call_id);
-                calls.forget_offer(&ended.call_id).await;
+                calls.forget_offer(&ended.call_id);
                 let _ = ui_tx.send(UiEvent::CallEndedElsewhere(ended.call_id.clone()));
             }
             Event::Messages(batch) => {
