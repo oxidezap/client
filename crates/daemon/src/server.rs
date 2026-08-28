@@ -372,7 +372,17 @@ enum FrameRead {
     TooLong,
 }
 
-async fn serve_client<S>(stream: S, hub: Arc<StateHub>, commands: Commands) -> Result<()>
+/// One front end, from the handshake to the close.
+///
+/// Generic over the stream, and reached from two places: the local endpoint's
+/// accept loop, and the web bridge — which hands it one end of an in-process
+/// duplex and moves the lines across a WebSocket. Everything about the
+/// protocol lives here, so the second transport adds no second copy of it.
+///
+/// # Errors
+///
+/// The connection ended, or the peer said something unrecoverable.
+pub(crate) async fn serve_client<S>(stream: S, hub: Arc<StateHub>, commands: Commands) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {

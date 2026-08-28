@@ -15,8 +15,21 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# The WebSocket handshake's accept key, which is a SHA-1 of the client's key
+# and a fixed string, base64-encoded (RFC 6455 §4.2.2). Not a security
+# construction — it exists so a cache cannot complete a handshake it did not
+# understand — which is why SHA-1 is the right and only answer here.
+base64 = "0.22"
 env_logger = "0.11"
+# `SinkExt`/`StreamExt` over the WebSocket, which is a sink of messages
+# rather than a byte stream.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 log = { workspace = true }
+sha1 = "0.11"
+# No TLS: the bridge is a loopback endpoint, and a certificate a browser would
+# accept is not something a daemon can produce. See `bridge.rs` on what stands
+# in for the peer check a Unix socket gets for free.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 
 oxidezap-core = { workspace = true }
 oxidezap-ipc = { workspace = true }
