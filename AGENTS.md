@@ -734,11 +734,39 @@ screen, with the title above the glass and the pair code below it.
 
 ## The web front end
 
-The page is the window and nothing else. It holds no session, opens no socket
-to WhatsApp, and keeps no store — it attaches to an `oxidezapd` the visitor
-runs, over the same protocol the desktop window speaks. So the export is
-static and needs no server to be *hosted*; the daemon it talks to is the
-user's own process. `.github/workflows/pages.yml` builds and publishes it.
+The page runs the whole client: the session, the store and the window. It can
+attach to an `oxidezapd` the visitor runs instead — over the same protocol the
+desktop window speaks, and worth preferring, since a desktop daemon holds
+calls, survives the tab and keeps the keys out of a browser's storage — but it
+no longer needs one. The export stays static either way: nothing here needs a
+server to be *hosted*. `.github/workflows/pages.yml` builds and publishes it.
+
+The daemon a page runs is the daemon, minus the process:
+`daemon::embedded::start` assembles the state hub and the session bridge and
+hands the front end one end of a `tokio::io::duplex`, which `serve_client`
+already accepted — so the page speaks the same frames down a pipe that the
+desktop speaks down a socket, and not one line of protocol is written twice.
+
+**Which tab holds the account is claimed, not assumed.** `daemon/claim/` is a
+lock file on the desktop and a Web Lock in a browser, taken with `ifAvailable`
+so a second tab is told *now* rather than queued — a queued tab looks like one
+that is starting, and would silently take the account the moment the first
+closed. What it costs is that the refusal has to survive the trip up: it
+reaches the window as `ErrorKind::AlreadyExists`, `Session::is_settled` names
+it, and it lands in `AppState::Refused` rather than `Error`. That distinction
+is the whole point — the error screen is for an outage, and it promises to
+keep trying, offers *Work offline*, and arms a countdown. All three are false
+for a refusal: nothing was unreachable, nothing is still trying, and *Work
+offline* reads a database this window is precisely the one that could not
+open. A retrying tab also reintroduces, one layer above the lock, the exact
+behaviour `ifAvailable` was chosen to prevent.
+
+**The store round-trips, and that was measured rather than assumed.** A page
+that had never been visited opens the VFS holding 0 files; one that comes back
+after the tab closed opens it holding 1. Worth stating because the failure
+mode is invisible without it: a browser with no VFS installed opens the
+database in memory quite happily, behaves identically all session, and loses
+the account with the tab.
 
 What a page cannot do, and says so rather than pretending. Measured on
 nightly for `wasm32-unknown-unknown` rather than assumed:
@@ -790,28 +818,22 @@ by definition.
   `chat-store/store.rs` (~3.2k). The calls came out of the first one and the
   video plane never went in, so what is left is the event pump, hydration and
   the paged reads — three things rather than one file.
-- **The session compiles for the browser; nothing runs one there yet.** The
-  page is the window and the daemon still holds the account, so the deployed
-  bundle needs one running on the visitor's machine to be useful. Every piece
-  under that, though, is now built for a page. The chat store needs no
-  rewrite — `sqlite-wasm-rs` targets `wasm32-unknown-unknown`, diesel links
-  against it, FTS5 and all — `oxidezap/whatsapp-rust-bridge` already runs the
-  library there, all three plugins the library takes are written
-  (`session/net/web.rs`), and `oxidezap-session` itself builds for that
-  target: `session/exec/` is where its threading went, one interface with a
-  Tokio runtime behind it on a desktop and the page's event loop behind it in
-  a browser.
-  WhatsApp does not refuse a page's origin either. `wss://web.whatsapp.com/ws/chat`
-  opens from a page served off `https://oxidezap.github.io`, which is a public
-  origin and not WhatsApp's own — a WebSocket upgrade is not subject to the
-  same-origin policy, and the server declines to make it one.
-  What is left is no longer a port. It is the upgrade and nothing above it
-  that has been measured, so the Noise handshake and pairing are still
-  unmeasured; `resolve_database_path` names a filesystem a page does not have,
-  and the store would have to open on OPFS instead; and the front end
-  deliberately does not depend on the session at all, because one session per
-  user is what the daemon split protects — a page holding its own is a
-  different answer to that question, not a missing call.
+- **The session runs in the browser; pairing is what nobody has measured.**
+  A page with no daemon named starts its own: the VFS opens, the store and its
+  migrations run, `ChatStore` comes up and the library's client is created and
+  dials `wss://web.whatsapp.com/ws/chat`, with its own backoff behind it. That
+  upgrade succeeds from a page served off `https://oxidezap.github.io`, which
+  is a public origin and not WhatsApp's own — a WebSocket upgrade is not
+  subject to the same-origin policy, and the server declines to make it one.
+  What is past the upgrade has not been seen: the Noise handshake, the QR, and
+  a phone answering it.
+  Durability is the other half. The window's VFS is relaxed-IndexedDB, which
+  writes changed blocks after the commit rather than during it, so a tab killed
+  in that window loses the commit — a message that comes back on the next
+  hydration, or a ratchet that has to re-establish. The durable answer is OPFS
+  through a synchronous access handle, which exists in a dedicated worker and
+  nowhere else, so it arrives with the worker. It changes nothing above
+  `session/store/`, which is why that interface is three functions.
 - **Video is not decoded on the web**, in a message or in a call, **and voice
   notes are not recorded there.** All three are the same cause — the decoder
   and the encoder are C — and each has a browser-native answer that is a Rust
