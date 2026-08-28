@@ -288,6 +288,39 @@ fn start(wanted: VideoQuality) -> Result<Opened> {
     }
 }
 
+/// What the device settled on, refused if a call could not carry it.
+///
+/// Separate from the open so every rejection takes the same way out: the mode
+/// a backend picks is *near* what was asked for, not what was asked for, and
+/// discovering that is a reason to close the device rather than to leave it
+/// streaming into nothing.
+fn prepare(camera: &Camera, wanted: VideoQuality) -> Result<(Frames, VideoQuality)> {
+    let format = camera.camera_format();
+    let (width, height) = (
+        format.resolution().width() as usize,
+        format.resolution().height() as usize,
+    );
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        bail!("produces {width}x{height}, which 4:2:0 cannot carry");
+    }
+    let converter = match format.format() {
+        FrameFormat::YUYV | FrameFormat::NV12 | FrameFormat::GRAY => Frames::planar(width, height)?,
+        _ => Frames::rgb(width, height)?,
+    };
+    // Held to the same bounds the requested numbers were: this is what the
+    // encoder is configured with and what the RTP stride is derived from, and
+    // neither is a place to discover that a camera answered with 1080p.
+    let quality = VideoQuality {
+        width: format.resolution().width(),
+        height: format.resolution().height(),
+        fps: format.frame_rate(),
+        bitrate_kbps: wanted.bitrate_kbps,
+    }
+    .checked()
+    .context("opened at a mode a call cannot carry")?;
+    Ok((converter, quality))
+}
+
 fn start_at(wanted: VideoQuality) -> Result<Opened> {
     let index = configured_device();
     let requested =
@@ -305,30 +338,17 @@ fn start_at(wanted: VideoQuality) -> Result<Opened> {
         .open_stream()
         .with_context(|| format!("starting the stream on camera {index}"))?;
 
+    // Every way out of the checks below closes the stream on the way, because
+    // the one caller that sees a failure reopens the same device immediately
+    // and a backend still holding it fails that open rather than queueing
+    // behind it.
+    let prepared = prepare(&camera, wanted).inspect_err(|_| {
+        if let Err(e) = camera.stop_stream() {
+            log::warn!("the camera did not close cleanly after a refused mode: {e}");
+        }
+    });
+    let (converter, quality) = prepared.with_context(|| format!("camera {index}"))?;
     let format = camera.camera_format();
-    let (width, height) = (
-        format.resolution().width() as usize,
-        format.resolution().height() as usize,
-    );
-    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        bail!("camera {index} produces {width}x{height}, which 4:2:0 cannot carry");
-    }
-    let converter = match format.format() {
-        FrameFormat::YUYV | FrameFormat::NV12 | FrameFormat::GRAY => Frames::planar(width, height)?,
-        _ => Frames::rgb(width, height)?,
-    };
-    // What the device actually settled on, held to the same bounds the
-    // requested numbers were: this is what the encoder is configured with and
-    // what the RTP stride is derived from, and neither is a place to discover
-    // that a camera answered with 1080p.
-    let quality = VideoQuality {
-        width: format.resolution().width(),
-        height: format.resolution().height(),
-        fps: format.frame_rate(),
-        bitrate_kbps: wanted.bitrate_kbps,
-    }
-    .checked()
-    .with_context(|| format!("camera {index} opened at a mode a call cannot carry"))?;
     let encoder = H264Encoder::new(quality)?;
     log::info!(
         "camera {index} open: {}x{} @ {} fps, {} in, H.264 out at {} kbps",

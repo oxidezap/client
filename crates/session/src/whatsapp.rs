@@ -2215,6 +2215,11 @@ impl WhatsAppClient {
             }
 
             if calls.cameras.lock().await.contains_key(&call_id) {
+                // Already on. Said again rather than returning silently: this
+                // is the newest request, and what it costs to restate is
+                // nothing — the daemon publishes no frame for a state that
+                // did not change.
+                Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
                 return;
             }
             let (local, endpoints) = match video::open(video::slot(&call_id), publish, lost).await {
