@@ -515,40 +515,11 @@ impl WhatsAppClient {
             let ui_sender = ui_sender.clone();
             runtime.spawn(async move {
                 // The device is already gone; what is left is to stop
-                // claiming otherwise. The peer is told, because a camera that
-                // has died sends exactly what a camera that was switched off
-                // sends, and only this side knows which it was.
-                //
-                // Only if the registry still holds *that* camera: this runs
-                // on a spawned task, and a user who turned video off and on
-                // again meanwhile would otherwise have the replacement torn
-                // down by its predecessor's failure.
-                let mut cameras = calls.cameras.lock().await;
-                if cameras
-                    .get(&call_id)
-                    .is_none_or(|held| held.camera_id() != camera_id)
-                {
-                    return;
-                }
-                let Some(local) = cameras.remove(&call_id) else {
-                    return;
-                };
-                drop(cameras);
-                local.stop().await;
-                // Cloned out from under the lock: telling the peer is a
-                // stanza on the wire, and holding the registry across it
-                // stalls every other call's bookkeeping behind one peer —
-                // the same reason `set_call_muted` takes its handle this way.
-                let handle = calls.active.lock().await.get(&call_id).cloned();
-                if let Some(handle) = handle
-                    && let Err(e) = handle.stop_video().await
-                {
-                    warn!(
-                        "Failed to tell the peer the camera on {} is gone: {}",
-                        call_id, e
-                    );
-                }
-                Self::announce_video(&ui_sender, &call_id, VideoStream::Local, false).await;
+                // claiming otherwise — and to name the camera that died,
+                // because this runs on a spawned task and a user who turned
+                // video off and on again meanwhile must not have the
+                // replacement torn down by its predecessor's failure.
+                Self::stop_local_video(&calls, &ui_sender, &call_id, Some(camera_id)).await;
             });
         })
     }
@@ -2330,6 +2301,47 @@ impl WhatsAppClient {
         Self::announce_video(ui_sender, call_id, VideoStream::Local, settled).await;
     }
 
+    /// Close this side's camera and say so, for the reasons that are not a
+    /// request: the device died, or the peer refused the upgrade it was
+    /// opened for.
+    ///
+    /// `only` names the camera the teardown was scheduled for, where it was
+    /// scheduled at all — the work is spawned, and the camera in the registry
+    /// may be a later one. `None` means "whatever is there now", which is
+    /// right for something learned from the peer in the moment.
+    async fn stop_local_video(
+        calls: &CallRegistry,
+        ui_sender: &UiEventSender,
+        call_id: &str,
+        only: Option<crate::video::CameraId>,
+    ) {
+        let local = {
+            let mut cameras = calls.cameras.lock().await;
+            match cameras.get(call_id) {
+                Some(held) if only.is_none_or(|wanted| held.camera_id() == wanted) => {
+                    cameras.remove(call_id)
+                }
+                _ => return,
+            }
+        };
+        let Some(local) = local else { return };
+        local.stop().await;
+        // Cloned out from under the lock: telling the peer is a stanza on the
+        // wire, and holding the registry across it stalls every other call's
+        // bookkeeping behind one peer — the same reason `set_call_muted`
+        // takes its handle this way.
+        let handle = calls.active.lock().await.get(call_id).cloned();
+        if let Some(handle) = handle
+            && let Err(e) = handle.stop_video().await
+        {
+            warn!(
+                "Failed to tell the peer video stopped on {}: {}",
+                call_id, e
+            );
+        }
+        Self::announce_video(ui_sender, call_id, VideoStream::Local, false).await;
+    }
+
     /// Drop a parked upgrade request and tell every window it is gone.
     ///
     /// Both halves or neither: the token is what an answer is bound to, and a
@@ -2762,15 +2774,21 @@ impl WhatsAppClient {
                 Self::withdraw_video_request(calls, ui_sender, call_id).await;
                 Self::announce_video(ui_sender, call_id, VideoStream::Remote, false).await;
             }
-            // A request — theirs or ours — that was refused, cancelled or ran
-            // out of time. Nothing about either camera changed; what has
-            // changed is that there is no longer a question on the table, and
-            // a front end still drawing one would be pointing at a peer who
-            // has stopped waiting.
-            VideoState::UpgradeReject
-            | VideoState::UpgradeRejectByTimeout
-            | VideoState::UpgradeCancel
-            | VideoState::UpgradeCancelByTimeout => {
+            // Our own upgrade was refused, or ran out of time waiting to be
+            // answered. The camera was opened and announced when the request
+            // went out — the library holds it off the wire until the peer
+            // accepts — so a refusal that only closed the question would
+            // leave the device open and encoding for the rest of the call,
+            // with every window saying our video was on.
+            VideoState::UpgradeReject | VideoState::UpgradeRejectByTimeout => {
+                Self::withdraw_video_request(calls, ui_sender, call_id).await;
+                Self::stop_local_video(calls, ui_sender, call_id, None).await;
+            }
+            // Their request, withdrawn or timed out. Nothing about either
+            // camera changed; what has changed is that there is no longer a
+            // question on the table, and a front end still drawing one would
+            // be pointing at a peer who has stopped waiting.
+            VideoState::UpgradeCancel | VideoState::UpgradeCancelByTimeout => {
                 Self::withdraw_video_request(calls, ui_sender, call_id).await;
             }
             // `UpgradeAccept` is answered by the `Enabled` that follows it,
