@@ -241,6 +241,7 @@ fn run(
     }
 
     let started = Instant::now();
+    let mut failures = Failures::default();
     while !control.stop.load(Ordering::Relaxed) && !frames.is_closed() {
         let buffer = match camera.frame() {
             Ok(buffer) => buffer,
@@ -257,11 +258,27 @@ fn run(
         }
         let at = openh264::Timestamp::from_millis(started.elapsed().as_millis() as u64);
         let encoded = match convert_and_encode(&buffer, &mut converter, &mut encoder, at) {
-            Ok(Some(frame)) => frame,
+            Ok(Some(frame)) => {
+                failures.worked();
+                frame
+            }
             // The rate control skipped it, which is the encoder doing its job.
-            Ok(None) => continue,
+            Ok(None) => {
+                failures.worked();
+                continue;
+            }
             Err(e) => {
                 log::warn!("dropping a camera frame: {e}");
+                // Some of these are one frame — a truncated buffer, a decode
+                // that fell over — and some are permanent: a camera that
+                // changes format mid-stream fails every frame from then on.
+                // Retrying the permanent ones forever holds the channel open,
+                // so nothing reports the loss and every window goes on saying
+                // video is live in front of a pane no picture will reach.
+                if failures.gave_up() {
+                    log::error!("the camera stopped producing frames this side can encode");
+                    break;
+                }
                 continue;
             }
         };
@@ -277,6 +294,36 @@ fn run(
         log::warn!("the camera did not close cleanly: {e}");
     }
     log::debug!("camera stopped");
+}
+
+/// How many frames in a row may fail to convert before the camera is treated
+/// as gone.
+///
+/// A second of them at any sane rate. Long enough that a run of bad buffers
+/// is ridden out, short enough that a person watching a dead pane is not.
+const FAILURES_BEFORE_LOST: u32 = 30;
+
+/// A run of consecutive frame failures, and whether it has gone on too long.
+///
+/// A run rather than a total, because the two failures are different things:
+/// a camera that drops one frame an hour is working, and one that has failed
+/// every frame since it changed format is not going to start again.
+#[derive(Default)]
+struct Failures {
+    run: u32,
+}
+
+impl Failures {
+    /// A frame made it through, so whatever went wrong before was transient.
+    fn worked(&mut self) {
+        self.run = 0;
+    }
+
+    /// Count a failure, and say whether this camera should be given up on.
+    fn gave_up(&mut self) -> bool {
+        self.run += 1;
+        self.run >= FAILURES_BEFORE_LOST
+    }
 }
 
 struct Opened {
@@ -465,5 +512,35 @@ pub fn is_available() -> bool {
             log::debug!("no camera backend: {e}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FAILURES_BEFORE_LOST, Failures};
+
+    /// One bad frame is not a broken camera, and neither are many with good
+    /// ones between them: what says the device is gone is a run.
+    #[test]
+    fn a_frame_that_works_ends_the_run() {
+        let mut failures = Failures::default();
+        for _ in 0..FAILURES_BEFORE_LOST - 1 {
+            assert!(!failures.gave_up());
+        }
+        failures.worked();
+        for _ in 0..FAILURES_BEFORE_LOST - 1 {
+            assert!(!failures.gave_up());
+        }
+    }
+
+    /// A camera that changed format mid-stream fails every frame from then
+    /// on, and retrying it forever is what keeps a dead direction drawn.
+    #[test]
+    fn an_unbroken_run_gives_up() {
+        let mut failures = Failures::default();
+        for _ in 0..FAILURES_BEFORE_LOST - 1 {
+            assert!(!failures.gave_up());
+        }
+        assert!(failures.gave_up());
     }
 }

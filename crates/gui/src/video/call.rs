@@ -42,6 +42,44 @@ use super::streaming::{Rotation, write_bgra_rotated};
 /// decode thread, so it may not block.
 pub type FrameSink = Arc<dyn Fn(CallFrame) + Send + Sync>;
 
+/// The newest decoded picture of each direction, waiting for the window.
+///
+/// A slot per direction rather than a place in a queue, because a decoded
+/// frame is 3.5 MiB of pixels and the only one worth drawing is the last one.
+/// The window's event channel is hundreds of messages deep — it has to be, for
+/// the messages that may not be lost — and a call that outran a stalled window
+/// would fill it with obsolete pictures: gigabytes of them, and every state
+/// frame behind ten seconds of video nobody will see. Here the newest picture
+/// replaces the one before it and the channel carries only a nudge.
+#[derive(Clone, Default)]
+pub struct LatestFrames {
+    /// Indexed by direction: two slots, and no key to get wrong.
+    slots: Arc<std::sync::Mutex<[Option<CallFrame>; 2]>>,
+}
+
+fn slot_of(stream: VideoStream) -> usize {
+    match stream {
+        VideoStream::Local => 0,
+        VideoStream::Remote => 1,
+    }
+}
+
+impl LatestFrames {
+    /// Hold this picture for the window, dropping whatever that direction was
+    /// holding: it is a frame the window never drew and never will.
+    pub fn put(&self, frame: CallFrame) {
+        let mut slots = self.slots.lock().expect("call frame slots poisoned");
+        let slot = slot_of(frame.stream);
+        slots[slot] = Some(frame);
+    }
+
+    /// Everything waiting, in one pass, leaving the slots empty.
+    pub fn take(&self) -> SmallVec<[CallFrame; 2]> {
+        let mut slots = self.slots.lock().expect("call frame slots poisoned");
+        slots.iter_mut().filter_map(Option::take).collect()
+    }
+}
+
 /// One decoded picture, and which side of the call it is.
 pub struct CallFrame {
     pub call_id: String,

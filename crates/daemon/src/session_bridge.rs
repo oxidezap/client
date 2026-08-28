@@ -71,6 +71,10 @@ pub enum Action {
     /// Reload the whole history, for a front end that has just attached and
     /// holds nothing.
     ReloadHistory,
+    /// A front end that draws video has attached; ask the cameras for a point
+    /// its decoders can start from. See
+    /// [`WhatsAppClient::request_video_keyframe`].
+    RefreshVideo,
     /// One page of a chat's messages, answered on `answer_to`.
     ///
     /// Addressed like a download rather than published: a page is a position
@@ -115,6 +119,7 @@ impl Action {
         !matches!(
             self,
             Self::ReloadHistory
+                | Self::RefreshVideo
                 | Self::ForgetSession
                 | Self::MarkStatusWatched { .. }
                 | Self::LoadMessages { .. }
@@ -811,6 +816,10 @@ impl Bridge {
             } => self.download(client, id, *media, answer_to),
             Action::ReloadHistory => {
                 client.reload_history();
+                CommandOutcome::Accepted
+            }
+            Action::RefreshVideo => {
+                client.request_video_keyframe();
                 CommandOutcome::Accepted
             }
             // Awaited here rather than spawned, unlike a download: this is a

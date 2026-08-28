@@ -928,8 +928,8 @@ impl WhatsAppApp {
                     }),
                     // A stream, not an event: the newest picture replaces
                     // the one before it and nothing is queued.
-                    FromDaemon::CallFrame(frame) => entity.update(cx, |app, cx| {
-                        app.draw_call_frame(*frame, cx);
+                    FromDaemon::CallFrames => entity.update(cx, |app, cx| {
+                        app.draw_waiting_call_frames(cx);
                     }),
                     FromDaemon::PageLost { jid } => entity.update(cx, |app, _cx| {
                         app.page_lost(jid);

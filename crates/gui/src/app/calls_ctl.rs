@@ -200,6 +200,21 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    /// Draw whatever pictures were waiting when the window got to them.
+    ///
+    /// Taken from the slot rather than delivered: what arrived while the
+    /// window was busy is not a backlog to work through but one picture per
+    /// direction, the newest, and the ones it replaced were never worth
+    /// drawing.
+    pub(super) fn draw_waiting_call_frames(&mut self, cx: &mut Context<Self>) {
+        let Some(waiting) = self.client.as_ref().map(|c| c.call_frames().take()) else {
+            return;
+        };
+        for frame in waiting {
+            self.draw_call_frame(frame, cx);
+        }
+    }
+
     /// One decoded frame, straight onto the pane that draws it.
     pub(super) fn draw_call_frame(&mut self, frame: CallFrame, cx: &mut Context<Self>) {
         // Frames and state travel on different channels, so one can arrive

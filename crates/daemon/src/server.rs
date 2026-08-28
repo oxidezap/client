@@ -435,6 +435,18 @@ where
     // these receivers is also what tells the session whether to publish at
     // all, so a client that draws nothing must not hold one.
     let mut video = attached.has_window.then(|| hub.subscribe_video());
+    if video.is_some() {
+        // A subscriber that arrives mid-call starts wherever the stream is,
+        // which is a P-frame referencing units published before it was
+        // listening — so its decoders draw nothing until the encoder's own
+        // periodic IDR, seconds after somebody opened a window to look. Asked
+        // for here, where the subscription is, rather than left to the
+        // session: this is the moment a decoder is born, and the session has
+        // no way to see it happen. Nothing waits on the answer — there is no
+        // call to ask about most of the time, and a keyframe that cannot be
+        // requested changes nothing about serving this client.
+        let _ = dispatch(&hub, &commands, Action::RefreshVideo).await;
+    }
 
     // Held for the connection's whole life, so the count falls again however
     // this task ends. What it answers is "is there a window to raise": see

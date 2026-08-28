@@ -16,7 +16,7 @@ mod streaming;
 pub use streaming::StreamingVideoDecoder;
 
 // A live call's two directions, decoded off the IPC thread.
-pub use call::{CallFrame, CallVideo, FrameSink};
+pub use call::{CallFrame, CallVideo, FrameSink, LatestFrames};
 
 // Video player state machine
 pub use player::{VideoPlayer, VideoPlayerState};

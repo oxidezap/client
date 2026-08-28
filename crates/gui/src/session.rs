@@ -99,7 +99,13 @@ pub enum FromDaemon {
     /// this is a stream. It is also the one message here that may be dropped
     /// — a frame the window is too busy to take is worth nothing by the time
     /// it would be free.
-    CallFrame(Box<crate::video::CallFrame>),
+    /// A picture is waiting in [`Session::call_frames`].
+    ///
+    /// A nudge rather than the frame itself: pictures are held in a slot per
+    /// direction, where the newest replaces the last, and this channel is
+    /// deep enough that carrying them would let a stalled window accumulate
+    /// gigabytes of obsolete video ahead of the state frames behind it.
+    CallFrames,
     /// A status view the daemon did not record after all.
     ///
     /// The ring was taken down the moment the update was opened, before the
@@ -235,6 +241,9 @@ pub struct Session {
     /// drawn the message. Without a way to say so from here those failures had
     /// nowhere to go, and the bubble sat pending for good with no retry.
     events: mpsc::Sender<FromDaemon>,
+    /// The newest decoded picture of each direction, written by the reader
+    /// thread and taken by the window. See [`FromDaemon::CallFrames`].
+    frames: crate::video::LatestFrames,
 }
 
 impl Session {
@@ -246,12 +255,14 @@ impl Session {
     pub fn connect() -> std::io::Result<(Self, mpsc::Receiver<FromDaemon>)> {
         let (reader, writer) = connect_or_start()?.split()?;
         let (events, rx) = mpsc::channel(EVENT_QUEUE);
+        let frames = crate::video::LatestFrames::default();
 
         let session = Self {
             writer: Mutex::new(writer),
             pending: Pending::default(),
             next_id: AtomicU64::new(1),
             events: events.clone(),
+            frames: frames.clone(),
         };
         // Before the reader starts, because the daemon serves nothing until it
         // has one and answers it with the history this connection asked for.
@@ -267,9 +278,18 @@ impl Session {
         let pending = Arc::clone(&session.pending);
         std::thread::Builder::new()
             .name("oxidezap-ipc".to_string())
-            .spawn(move || read_frames(reader, &events, &pending))?;
+            .spawn(move || read_frames(reader, &events, &pending, &frames))?;
 
         Ok((session, rx))
+    }
+
+    /// The newest decoded picture of each direction of the live call.
+    ///
+    /// Taken by the window when [`FromDaemon::CallFrames`] says one is
+    /// waiting; the reader thread has been overwriting the slot in the
+    /// meantime, which is exactly what should happen to a picture nobody drew.
+    pub fn call_frames(&self) -> &crate::video::LatestFrames {
+        &self.frames
     }
 
     /// Report a send that failed before it ever left this process.
@@ -670,7 +690,12 @@ fn sanitize(id: &str) -> String {
 }
 
 /// Read frames until the daemon goes away.
-fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pending) {
+fn read_frames(
+    stream: Reader,
+    events: &mpsc::Sender<FromDaemon>,
+    pending: &Pending,
+    frames: &crate::video::LatestFrames,
+) {
     let mut reader = BufReader::new(stream);
     // The decoders for whatever call is up, made when its first frame arrives
     // and dropped when the call state says there is no call: a decoder held
@@ -679,11 +704,15 @@ fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pend
     let mut video: Option<crate::video::CallVideo> = None;
     let decoded: crate::video::FrameSink = {
         let events = events.clone();
+        let frames = frames.clone();
         Arc::new(move |frame| {
-            // Dropped rather than queued: this is the same bargain the daemon
-            // makes one hop earlier, and the window is where the backlog
-            // would actually be seen.
-            let _ = events.try_send(FromDaemon::CallFrame(Box::new(frame)));
+            // Into the slot, replacing whatever that direction was holding:
+            // this is the same bargain the daemon makes one hop earlier, and
+            // the window is where the backlog would actually be seen. The
+            // nudge may be dropped as well — a full channel already has one
+            // in it, and the slot holds the newest picture either way.
+            frames.put(frame);
+            let _ = events.try_send(FromDaemon::CallFrames);
         })
     };
     let mut line = String::new();

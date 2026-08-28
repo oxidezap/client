@@ -127,6 +127,14 @@ profile here repeats it deliberately.
   offer or the announcement did and its opening IDR was published nowhere.
   Without that ask the first frame a new decoder sees is a P-frame and the
   pane says "connecting" until the periodic IDR, seconds later.
+- **A decoded picture is a slot, not a place in a queue.** The window's event
+  channel is hundreds of messages deep because the messages that may not be
+  lost need it to be, and a decoded 720p frame is 3.5 MiB — so frames put
+  there would let a stalled window bank gigabytes of obsolete video *and* park
+  every state frame behind ten seconds of it. `LatestFrames` holds one picture
+  per direction, the newest overwriting the last, and the channel carries only
+  a nudge; a dropped nudge costs nothing, because the slot still holds the
+  newest picture and the next frame nudges again.
 - **A peer's orientation describes their device, not their picture.** The
   camera encodes in the sensor's orientation whatever the phone is doing, so a
   frame arrives already turned by however it is held and `device_orientation`
