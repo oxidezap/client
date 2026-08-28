@@ -15,9 +15,23 @@ log = { workspace = true }
 oxidezap-audio = { workspace = true }
 oxidezap-chat-store = { workspace = true, features = ["search"] }
 oxidezap-core = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
 
+# The library, twice, because the two targets need different halves of it.
+#
+# Same git source and same branch as every other library crate — that rule is
+# about revisions moving together, and these do. What differs is the feature
+# set, which `workspace = true` can only add to: the defaults pull the Tokio
+# transport, the ureq client and `tokio/net`, and `tokio/net` is `mio`, which
+# says outright that it does not build for this target. So the browser build
+# takes none of them and supplies its own through the library's own plugin
+# traits.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 whatsapp-rust = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
 
 [lints]
 workspace = true

@@ -31,7 +31,25 @@ tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 waproto = { workspace = true }
+
+# The storage crate, twice, for the one feature that differs.
+#
+# Its `bundled-sqlite` default exists to compile SQLite in-tree through
+# `libsqlite3-sys`, whose build script looks for a C toolchain and a system
+# library — neither of which a `wasm32-unknown-unknown` build has. Dropped
+# there, diesel supplies SQLite itself: it depends on `sqlite-wasm-rs` for
+# wasm targets and `libsqlite3-sys` for the rest, so the store is the same
+# code over a different C library rather than a second implementation.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 whatsapp-rust-sqlite-storage = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+# Both majors are in this graph and each refuses to build for wasm without
+# being told where the entropy comes from. The browser's own generator, as
+# everywhere else in the workspace.
+getrandom = { workspace = true }
+getrandom_02 = { workspace = true }
 
 [dev-dependencies]
 flate2 = { workspace = true }
