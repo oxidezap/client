@@ -93,6 +93,19 @@ pub enum FromDaemon {
         /// The conversation, or `None` for a page of the chat list.
         jid: Option<String>,
     },
+    /// One decoded picture of the live call.
+    ///
+    /// Not a `UiEvent`: the session says what happened to the account, and
+    /// this is a stream. It is also the one message here that may be dropped
+    /// — a frame the window is too busy to take is worth nothing by the time
+    /// it would be free.
+    /// A picture is waiting in [`Session::call_frames`].
+    ///
+    /// A nudge rather than the frame itself: pictures are held in a slot per
+    /// direction, where the newest replaces the last, and this channel is
+    /// deep enough that carrying them would let a stalled window accumulate
+    /// gigabytes of obsolete video ahead of the state frames behind it.
+    CallFrames,
     /// A status view the daemon did not record after all.
     ///
     /// The ring was taken down the moment the update was opened, before the
@@ -228,6 +241,9 @@ pub struct Session {
     /// drawn the message. Without a way to say so from here those failures had
     /// nowhere to go, and the bubble sat pending for good with no retry.
     events: mpsc::Sender<FromDaemon>,
+    /// The newest decoded picture of each direction, written by the reader
+    /// thread and taken by the window. See [`FromDaemon::CallFrames`].
+    frames: crate::video::LatestFrames,
 }
 
 impl Session {
@@ -239,12 +255,14 @@ impl Session {
     pub fn connect() -> std::io::Result<(Self, mpsc::Receiver<FromDaemon>)> {
         let (reader, writer) = connect_or_start()?.split()?;
         let (events, rx) = mpsc::channel(EVENT_QUEUE);
+        let frames = crate::video::LatestFrames::default();
 
         let session = Self {
             writer: Mutex::new(writer),
             pending: Pending::default(),
             next_id: AtomicU64::new(1),
             events: events.clone(),
+            frames: frames.clone(),
         };
         // Before the reader starts, because the daemon serves nothing until it
         // has one and answers it with the history this connection asked for.
@@ -260,9 +278,18 @@ impl Session {
         let pending = Arc::clone(&session.pending);
         std::thread::Builder::new()
             .name("oxidezap-ipc".to_string())
-            .spawn(move || read_frames(reader, &events, &pending))?;
+            .spawn(move || read_frames(reader, &events, &pending, &frames))?;
 
         Ok((session, rx))
+    }
+
+    /// The newest decoded picture of each direction of the live call.
+    ///
+    /// Taken by the window when [`FromDaemon::CallFrames`] says one is
+    /// waiting; the reader thread has been overwriting the slot in the
+    /// meantime, which is exactly what should happen to a picture nobody drew.
+    pub fn call_frames(&self) -> &crate::video::LatestFrames {
+        &self.frames
     }
 
     /// Report a send that failed before it ever left this process.
@@ -588,6 +615,19 @@ impl Session {
         });
     }
 
+    /// Turn this window's camera on or off during a live call.
+    ///
+    /// Only ever our own direction: the peer's camera is theirs. Turning it
+    /// on is also how the peer's request to go to video is answered — an
+    /// acceptance *is* a camera coming on — so there is no second request for
+    /// that.
+    pub fn set_call_video(&self, call_id: &str, enabled: bool) {
+        self.call(CallAction::SetVideo {
+            call_id: call_id.to_string(),
+            enabled,
+        });
+    }
+
     fn call(&self, action: CallAction) {
         self.tell(ClientRequest::Call(action));
     }
@@ -650,8 +690,31 @@ fn sanitize(id: &str) -> String {
 }
 
 /// Read frames until the daemon goes away.
-fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pending) {
+fn read_frames(
+    stream: Reader,
+    events: &mpsc::Sender<FromDaemon>,
+    pending: &Pending,
+    frames: &crate::video::LatestFrames,
+) {
     let mut reader = BufReader::new(stream);
+    // The decoders for whatever call is up, made when its first frame arrives
+    // and dropped when the call state says there is no call: a decoder held
+    // past its call keeps its reference frames for a picture nobody is
+    // looking at, and its threads with them.
+    let mut video: Option<crate::video::CallVideo> = None;
+    let decoded: crate::video::FrameSink = {
+        let events = events.clone();
+        let frames = frames.clone();
+        Arc::new(move |frame| {
+            // Into the slot, replacing whatever that direction was holding:
+            // this is the same bargain the daemon makes one hop earlier, and
+            // the window is where the backlog would actually be seen. The
+            // nudge may be dropped as well — a full channel already has one
+            // in it, and the slot holds the newest picture either way.
+            frames.put(frame);
+            let _ = events.try_send(FromDaemon::CallFrames);
+        })
+    };
     let mut line = String::new();
     // How far the state this side holds has been carried.
     //
@@ -826,6 +889,31 @@ fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pend
                 );
                 break;
             }
+            // A stream rather than an event: fed to the decoder that owns
+            // its direction, which drops it if it is still busy with the one
+            // before. Nothing here waits, and nothing recovers a frame.
+            Ok(DaemonMessage::CallVideo(frame)) => {
+                let decoders = match &video {
+                    Some(decoders) if decoders.call_id() == frame.call_id => decoders,
+                    // A different call: the old decoders are mid-bitstream on
+                    // a stream that has ended, and feeding them this one
+                    // would produce nothing either could use.
+                    _ => video.insert(crate::video::CallVideo::new(
+                        frame.call_id.clone(),
+                        Arc::clone(&decoded),
+                    )),
+                };
+                decoders.accept(*frame);
+            }
+            // The daemon skipped frames on the way here. Whatever the
+            // decoders hold no longer matches what the senders encoded
+            // against, so they wait for a keyframe rather than drawing on
+            // references that never arrived.
+            Ok(DaemonMessage::CallVideoGap) => {
+                if let Some(decoders) = &video {
+                    decoders.interrupted();
+                }
+            }
             Ok(DaemonMessage::ShowWindow) => {
                 if events.blocking_send(FromDaemon::ShowWindow).is_err() {
                     break;
@@ -874,6 +962,11 @@ fn read_frames(stream: Reader, events: &mpsc::Sender<FromDaemon>, pending: &Pend
                 event: DaemonEvent::CallsChanged(calls),
             }) => {
                 applied = version;
+                // The call the decoders belong to is over, or a different one
+                // is up. Either way theirs has ended.
+                if !calls.holds(video.as_ref().map_or("", |v| v.call_id())) {
+                    video = None;
+                }
                 if events
                     .blocking_send(FromDaemon::Calls(Box::new(calls)))
                     .is_err()

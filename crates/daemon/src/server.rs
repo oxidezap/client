@@ -427,6 +427,26 @@ where
     // already gone, because that looks exactly like a closed channel and the
     // branch below ends the connection on one.
     let mut sessions = attached.session_events.then(|| hub.subscribe_sessions());
+    // Gated on having a window, not on wanting events. This is the one
+    // channel whose cost is measured in megabits: a notifier or a tray asks
+    // for session events and has nowhere to put a picture, and subscribing it
+    // would spend a call's whole bitrate serializing frames it parses and
+    // throws away — while delaying the events it did ask for. The count of
+    // these receivers is also what tells the session whether to publish at
+    // all, so a client that draws nothing must not hold one.
+    let mut video = attached.has_window.then(|| hub.subscribe_video());
+    if video.is_some() {
+        // A subscriber that arrives mid-call starts wherever the stream is,
+        // which is a P-frame referencing units published before it was
+        // listening — so its decoders draw nothing until the encoder's own
+        // periodic IDR, seconds after somebody opened a window to look. Asked
+        // for here, where the subscription is, rather than left to the
+        // session: this is the moment a decoder is born, and the session has
+        // no way to see it happen. Nothing waits on the answer — there is no
+        // call to ask about most of the time, and a keyframe that cannot be
+        // requested changes nothing about serving this client.
+        let _ = dispatch(&hub, &commands, Action::RefreshVideo).await;
+    }
 
     // Held for the connection's whole life, so the count falls again however
     // this task ends. What it answers is "is there a window to raise": see
@@ -508,6 +528,35 @@ where
                 // is not mistaken for a state gap.
                 Err(RecvError::Lagged(missed)) => {
                     log::debug!("client missed {missed} pass-through frames");
+                }
+                Err(RecvError::Closed) => return Ok(()),
+            },
+
+            // Lossy on purpose, and the only branch that is. A video frame
+            // carries no version and nothing recovers it, but unlike a window
+            // request it is *worthless* a moment later: a client that fell
+            // behind wants the newest frame, not the backlog, and telling it
+            // to resync would throw its whole history away to catch up on a
+            // picture that has already moved on.
+            picture = async { video.as_mut().expect("guarded").recv().await },
+                if video.is_some() => match picture {
+                Ok(frame) => write_line(&mut writer, &frame).await?,
+                Err(RecvError::Lagged(missed)) => {
+                    log::trace!("client missed {missed} video frames");
+                    // Said out loud, unlike a state gap: the client's decoder
+                    // is holding references to units it will never get, and
+                    // the frames that follow are built on them. It has no
+                    // other way to know — what did not arrive leaves nothing
+                    // behind to notice.
+                    let frame = serde_json::to_string(&DaemonMessage::CallVideoGap)?;
+                    write_line(&mut writer, &frame).await?;
+                    // And asked for a point it can start from. Telling the
+                    // decoders to stop is half an answer: what they hold is
+                    // useless either way, and without this the picture stays
+                    // blank until the encoder's own periodic IDR. Only our
+                    // own camera can be asked — the peer's direction has
+                    // nobody on this side to ask.
+                    let _ = dispatch(&hub, &commands, Action::RefreshVideo).await;
                 }
                 Err(RecvError::Closed) => return Ok(()),
             },

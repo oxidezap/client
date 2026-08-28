@@ -10,6 +10,7 @@ members = [
     "crates/gui",
     "crates/ipc",
     "crates/session",
+    "crates/video",
 ]
 resolver = "3"
 
@@ -45,6 +46,7 @@ oxidezap-chat-store = { path = "crates/chat-store" }
 oxidezap-core = { path = "crates/core" }
 oxidezap-ipc = { path = "crates/ipc" }
 oxidezap-session = { path = "crates/session" }
+oxidezap-video = { path = "crates/video" }
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 # The Unix syscalls the daemon and the IPC crate need (flock, getuid, kill),
 # as safe wrappers. Already in the tree transitively; declared because both

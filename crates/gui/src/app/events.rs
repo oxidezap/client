@@ -313,6 +313,14 @@ impl WhatsAppApp {
             UiEvent::CallAccepted(call_id) => {
                 info!("Call {call_id} accepted by peer");
             }
+            // What the call is drawn as comes from the state the daemon
+            // publishes beside this; the event is what says so out loud.
+            UiEvent::CallAnswered { call_id, is_video } => {
+                info!(
+                    "Call {call_id} answered as {}",
+                    if is_video { "video" } else { "voice" }
+                );
+            }
             UiEvent::CallEnded(call_id) => {
                 info!("Call {call_id} ended");
             }
@@ -329,10 +337,49 @@ impl WhatsAppApp {
                     if muted { "muted" } else { "open" }
                 );
             }
+            // What the camera really is, once the daemon has opened or closed
+            // it — and, unlike the mute correction, the *answer* to what this
+            // window asked for. The state published beside it is what a pane
+            // is drawn from, but a settle that agrees with the state changes
+            // nothing and so travels alone: a camera that would not open is
+            // announced off against a state that was already off, no frame
+            // goes out, and a button left waiting on one stays lit for the
+            // rest of the call. So the answer is taken from here.
+            UiEvent::CallVideoChanged {
+                call_id,
+                stream,
+                on,
+            } => {
+                info!(
+                    "Call {call_id}: the {stream:?} camera is {}",
+                    if on { "on" } else { "off" }
+                );
+                self.settle_call_video(&call_id, stream, on, cx);
+            }
+            // A question, and the answer is this side's camera coming on —
+            // or the question being withdrawn, which is just as much news:
+            // a request the peer cancelled is one no camera can still answer.
+            UiEvent::CallVideoRequested { call_id, pending } => {
+                info!(
+                    "Call {call_id}: the peer {} video",
+                    if pending {
+                        "asked to add"
+                    } else {
+                        "is no longer asking for"
+                    }
+                );
+                // Nothing to apply: what the window draws comes from the call
+                // state the daemon publishes beside this, the same way mute
+                // does. The event is what says it out loud.
+            }
             UiEvent::OutgoingCallStarted {
                 call_id,
                 recipient_jid,
                 placeholder_id: _,
+                // The kind the offer went out as is state, and the daemon
+                // folds it into the stage it renames; this side draws it from
+                // there like everything else about the call.
+                is_video: _,
             } => {
                 info!(
                     "Outgoing call started: {} to {}",
