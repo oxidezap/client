@@ -173,12 +173,19 @@ What the web build cannot do, and reports rather than pretends:
   `wasm32-unknown-unknown`. Clips keep their thumbnail and say so.
 * **No recording voice notes.** A voice note is Opus, and libopus is C too.
   Playback works, because the browser decodes Opus itself.
-* **No picture on a call.** Calls themselves work: they ring in the daemon,
-  which is where the microphone and the codec already were, so a page can
-  place one and answer one like any other front end — and a call still runs
-  with every window closed. What a page cannot do is *decode* the picture, for
-  the same reason it cannot decode a clip, so a video call's panes say the
-  picture needs the desktop app instead of waiting on one that is not coming.
+* **Calls need a daemon, and then have no picture.** Where the page is
+  attached to an `oxidezapd` — `#daemon=ws://…` — calls work: they ring in the
+  daemon, which is where the microphone and the codec already were, so the
+  page places and answers them like any other front end, and a call still runs
+  with every window closed. What it cannot do even then is *decode* the
+  picture, for the same reason it cannot decode a clip, so a video call's
+  panes say the picture needs the desktop app rather than waiting on one that
+  is not coming.
+
+  A page running its **own** session has no daemon to ring in and refuses
+  every call action, incoming and outgoing alike: the microphone and the codec
+  are the same C libraries a browser has none of. `MediaRecorder` and
+  WebCodecs are the ways in, and both are API changes rather than backends.
 
 ## Data
 

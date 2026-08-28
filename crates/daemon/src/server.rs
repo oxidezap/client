@@ -1100,6 +1100,19 @@ fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<St
 
 /// The store's footprint: the database plus the journal files SQLite would
 /// replay into it. All three are the same data, so all three are counted.
+///
+/// # Zero on a page, deliberately
+///
+/// A browser's database is in a VFS rather than on a filesystem, so every
+/// `metadata` here fails and the sum is 0 — which Settings shows as `0 B`.
+/// Wrong, and it is the least bad of the three answers available. The size is
+/// `page_count * page_size`, which needs a query, and this handler is
+/// synchronous by the shape of the protocol; the VFS's own `export_db` would
+/// answer by copying the whole database into memory, which is precisely what
+/// everything else on this side goes out of its way not to do. Fixing it
+/// properly means an async usage query through `session/store/`, and that is
+/// a wider change than a number in a settings pane is worth today. Recorded
+/// in `AGENTS.md` under what is left.
 fn database_bytes() -> u64 {
     let base = oxidezap_session::resolve_database_path();
     ["", "-wal", "-shm"]
