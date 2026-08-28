@@ -59,12 +59,17 @@ enum Delivery {
 }
 
 /// Hand one frame to whoever is subscribed, if anyone is.
-fn publish(publisher: &VideoPublisher, frame: CallVideoFrame) -> Delivery {
+///
+/// The frame is *built* by the caller's closure and only when there is
+/// somewhere to send it: an access unit has to be copied out of the encoder's
+/// buffer to travel, and nobody watching is the ordinary state of a daemon
+/// holding a call with its window closed.
+fn publish(publisher: &VideoPublisher, frame: impl FnOnce() -> CallVideoFrame) -> Delivery {
     let sender = publisher.lock().expect("video publisher poisoned").clone();
     let Some(sender) = sender else {
         return Delivery::NoSubscriber;
     };
-    match sender.try_send(frame) {
+    match sender.try_send(frame()) {
         Ok(()) => Delivery::Sent,
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Delivery::Dropped,
         // Between the clone and the send, the subscriber went away.
@@ -325,8 +330,7 @@ async fn pump_local(pump: LocalPump) {
         // regardless — the offer said it would — but the picture goes
         // nowhere until there is somewhere to put it.
         if drawable.load(Ordering::Relaxed) {
-            let drawn = publish(
-                &publisher,
+            let drawn = publish(&publisher, || {
                 CallVideoFrame::new(
                     read(&call_id),
                     VideoStream::Local,
@@ -334,8 +338,8 @@ async fn pump_local(pump: LocalPump) {
                     keyframe,
                     0,
                 )
-                .after_a_gap(gap),
-            );
+                .after_a_gap(gap)
+            });
             // The self-view lost a unit, and cannot say so itself: the window
             // never sees what did not arrive. One extra IDR — on a stream
             // that emits one every few seconds anyway — against a self-view
@@ -388,8 +392,7 @@ async fn pump_remote(
     // periodic keyframe is what ends the gap.
     let mut gap = false;
     while let Ok(frame) = frames.recv().await {
-        let drawn = publish(
-            &publisher,
+        let drawn = publish(&publisher, || {
             CallVideoFrame::new(
                 read(&call_id),
                 VideoStream::Remote,
@@ -397,8 +400,8 @@ async fn pump_remote(
                 frame.keyframe,
                 frame.orientation,
             )
-            .after_a_gap(gap),
-        );
+            .after_a_gap(gap)
+        });
         // Nothing here can ask the peer for a keyframe, so the most this can
         // do is tell the decoder not to draw on what it no longer has.
         gap = drawn == Delivery::Dropped;

@@ -2381,7 +2381,12 @@ impl WhatsAppClient {
             }
 
             if !on {
-                if let Some(local) = calls.cameras.lock().await.remove(&call_id) {
+                // Taken out of the registry before it is waited on, rather
+                // than under an `if let` that holds the lock for the wait:
+                // closing a device means waiting for its capture thread, and
+                // every other call's bookkeeping would queue behind it.
+                let held = calls.cameras.lock().await.remove(&call_id);
+                if let Some(local) = held {
                     // The device is released first, matching `stop_video`
                     // itself: the user asked for the camera to go off, and a
                     // failed stanza must not leave it running.
@@ -4405,7 +4410,7 @@ mod tests {
         ChatEntry, ChatStore, Client, LoadedHistory, MuteLane, NameBook, ReadBoundary, ReloadScope,
         SqliteStore, StoreChange, VideoState, WhatsAppClient, apply_status_views, chat_cursor,
         media_metadata, merge_alias_history_messages, message_cursor, parse_chat_cursor,
-        parse_message_cursor, peer_can_receive_video, read_message_range,
+        parse_message_cursor, peer_can_receive_video, read_message_range, reports_loss,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
     use std::sync::Arc;
@@ -4413,6 +4418,37 @@ mod tests {
     use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
     use whatsapp_rust::wacore_binary::Jid;
     use whatsapp_rust::waproto::whatsapp as wa;
+
+    /// A keyframe is asked for when the peer says it lost the picture, and
+    /// not when it says anything else on the same channel.
+    ///
+    /// Payload-specific feedback (206) is a *class*: REMB bandwidth estimates
+    /// ride it too, continuously, on a call that is going perfectly well.
+    /// Treating the class as loss emits an IDR at the reporting rate — large
+    /// frames, over and over, against the very bitrate those reports exist to
+    /// manage.
+    #[test]
+    fn only_a_lost_picture_asks_for_a_keyframe() {
+        use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
+
+        let feedback = |packet_type, fmt| RtcpFeedback {
+            packet_type,
+            fmt,
+            sender_ssrc: 1,
+            media_ssrc: 2,
+            fci: Vec::new(),
+        };
+        // Picture Loss Indication and Full Intra Request.
+        assert!(reports_loss(&feedback(206, 1)));
+        assert!(reports_loss(&feedback(206, 4)));
+        // REMB is 206/15, and a healthy call sends it forever.
+        assert!(!reports_loss(&feedback(206, 15)));
+        assert!(!reports_loss(&feedback(206, 3)));
+        // Transport feedback (205) carries its own format 1, which is a NACK
+        // and not a request to start over.
+        assert!(!reports_loss(&feedback(205, 1)));
+        assert!(!reports_loss(&feedback(200, 4)));
+    }
 
     /// The states that mean the peer now has somewhere to put our video, and
     /// so has a decoder that has never seen a keyframe.

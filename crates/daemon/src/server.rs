@@ -550,6 +550,13 @@ where
                     // behind to notice.
                     let frame = serde_json::to_string(&DaemonMessage::CallVideoGap)?;
                     write_line(&mut writer, &frame).await?;
+                    // And asked for a point it can start from. Telling the
+                    // decoders to stop is half an answer: what they hold is
+                    // useless either way, and without this the picture stays
+                    // blank until the encoder's own periodic IDR. Only our
+                    // own camera can be asked — the peer's direction has
+                    // nobody on this side to ask.
+                    let _ = dispatch(&hub, &commands, Action::RefreshVideo).await;
                 }
                 Err(RecvError::Closed) => return Ok(()),
             },
