@@ -515,6 +515,31 @@ impl CallState {
         true
     }
 
+    /// Correct what a call turned out to be, once the answer has gone out.
+    ///
+    /// The kind is drawn from the offer, because that is all anyone knows
+    /// when the answer is given — and a video offer whose camera would not
+    /// open is answered as a voice call rather than refused. Only the side
+    /// that opened the device knows which happened, so it says so, and this
+    /// is where that lands. Returns whether anything changed, so a daemon
+    /// that agrees publishes no frame.
+    pub fn answered_as(&mut self, call_id: &CallId, is_video: bool) -> bool {
+        let Some(stage) = self.stage.as_mut() else {
+            return false;
+        };
+        if stage.call_id() != call_id {
+            return false;
+        }
+        let kind = match stage {
+            Stage::Incoming(call) => &mut call.is_video,
+            Stage::Outgoing(call) => &mut call.is_video,
+            Stage::Active(call) => &mut call.is_video,
+        };
+        let changed = *kind != is_video;
+        *kind = is_video;
+        changed
+    }
+
     /// Accepting locally: the media is up before any peer answer arrives.
     pub fn connect_accepted(&mut self, call: &IncomingCall) {
         self.stage = Some(Stage::Active(ActiveCall {
@@ -1083,6 +1108,28 @@ mod tests {
 
         assert!(state.update_outgoing_call_id("ui-call-1", "REAL".to_string(), false));
         assert_eq!(state.outgoing().map(|c| c.call_id.as_str()), Some("REAL"));
+    }
+
+    /// The same on the answering side: an incoming video offer whose camera
+    /// would not open is *answered* as a voice call, and the state built from
+    /// the offer has to be corrected or every window keeps a video layout
+    /// open on a call with no picture in it.
+    #[test]
+    fn a_call_answered_without_a_camera_stops_being_a_video_call() {
+        let mut state = CallState::default();
+        let mut offer = incoming("CALL");
+        offer.is_video = true;
+        state.set_incoming(offer);
+        state.connect(&"CALL".to_string());
+        assert_eq!(state.active().map(|c| c.is_video), Some(true));
+
+        assert!(state.answered_as(&"CALL".to_string(), false));
+        assert_eq!(state.active().map(|c| c.is_video), Some(false));
+        // Agreement is not news: a daemon that already says so sends nothing.
+        assert!(!state.answered_as(&"CALL".to_string(), false));
+        // And a call this does not name is left alone.
+        assert!(!state.answered_as(&"OTHER".to_string(), true));
+        assert_eq!(state.active().map(|c| c.is_video), Some(false));
     }
 
     /// A video call whose camera would not open is *placed* as a voice call,

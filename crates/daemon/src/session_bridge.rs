@@ -477,6 +477,14 @@ impl Bridge {
             UiEvent::CallAccepted(id) => self.hub.calls(|s| {
                 s.connect(id);
             }),
+            // The kind an incoming call was answered as, which the accept
+            // decides and the offer only proposed: a camera that would not
+            // open answers a video offer as a voice call. Nothing is
+            // published when it agrees with the offer, which is the ordinary
+            // case.
+            UiEvent::CallAnswered { call_id, is_video } => self.hub.calls(|s| {
+                s.answered_as(call_id, *is_video);
+            }),
             UiEvent::CallEnded(id) => self.hub.calls(|s| {
                 s.end(id);
             }),

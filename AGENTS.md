@@ -171,6 +171,14 @@ profile here repeats it deliberately.
   reads as more careful and is worse: a refusal landing after an off-and-on
   again tears down the replacement's plane in the library while leaving it
   registered here, drawn as live, encoding into nothing.
+- **What a call turned out to be is said by the side that opened the
+  device.** The kind is drawn from the offer, because that is all anyone
+  knows when the call is placed or answered — and a camera that will not open
+  downgrades it to voice rather than failing it, on both paths. So
+  `OutgoingCallStarted::is_video` carries what the offer actually went out
+  as, and `UiEvent::CallAnswered` what the accept actually attached; without
+  them a window holds a video layout open on a call with no picture in it and
+  the conversation records a video call that never was one.
 - **A video call is offered as one, and answered as one.** The endpoints have
   to be attached before the offer or the accept goes out, which is why the
   camera opens first and why a camera that fails downgrades the call to voice

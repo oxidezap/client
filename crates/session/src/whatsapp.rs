@@ -2253,6 +2253,17 @@ impl WhatsAppClient {
                         return;
                     }
                     info!("Call {} media live", handle.call_id());
+                    // What this call turned out to be. The state was built
+                    // from the offer the moment the answer was given, and a
+                    // camera that would not open answers a video offer as a
+                    // voice call rather than refusing it — which only this
+                    // side knows.
+                    if let Some(tx) = ui_sender.lock().await.as_ref() {
+                        let _ = tx.send(UiEvent::CallAnswered {
+                            call_id: call_id.clone(),
+                            is_video: answered_with_video,
+                        });
+                    }
                     if let Some(local) = local {
                         // There is a call to draw into now — and the encoder
                         // has been running since before the accept went out,

@@ -313,6 +313,14 @@ impl WhatsAppApp {
             UiEvent::CallAccepted(call_id) => {
                 info!("Call {call_id} accepted by peer");
             }
+            // What the call is drawn as comes from the state the daemon
+            // publishes beside this; the event is what says so out loud.
+            UiEvent::CallAnswered { call_id, is_video } => {
+                info!(
+                    "Call {call_id} answered as {}",
+                    if is_video { "video" } else { "voice" }
+                );
+            }
             UiEvent::CallEnded(call_id) => {
                 info!("Call {call_id} ended");
             }

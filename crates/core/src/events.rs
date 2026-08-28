@@ -131,6 +131,18 @@ pub enum UiEvent {
     },
     #[allow(dead_code)]
     CallAccepted(CallId),
+    /// What an incoming call was actually answered *as*.
+    ///
+    /// The offer says what kind of call it is and the state is built from
+    /// that the moment the answer is given — but a camera that will not open
+    /// answers it as a voice call rather than refusing it, and only this side
+    /// knows which of the two happened. Without it every window keeps the
+    /// video layout open on a call with no picture in it and writes the
+    /// conversation's record as a video call.
+    CallAnswered {
+        call_id: CallId,
+        is_video: bool,
+    },
     CallEnded(CallId),
     /// What the microphone really is, once the newest request has reached it.
     ///
