@@ -35,6 +35,17 @@ const CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// quadratic in the size of the account.
 const SWEEP_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Cache `bytes` under `key`, droppable from the moment they land.
+///
+/// The same call as [`put`] here. The distinction exists for the page, whose
+/// cache is its own heap and whose sweep therefore has to know which entries
+/// are somebody's pending answer; this side writes a file, and the budget
+/// sweep runs on its own schedule against a disk that is two orders of
+/// magnitude larger.
+pub fn put_evictable(key: &str, bytes: &[u8]) -> Result<String> {
+    put(key, bytes)
+}
+
 /// Write `bytes` under `key`, unless they are already there.
 ///
 /// Returns the key, so a caller can hand it straight to the peer.

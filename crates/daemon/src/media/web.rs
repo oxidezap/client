@@ -33,6 +33,18 @@ struct Entry {
     /// longest without being wanted. A clock rather than a timestamp: there
     /// is no time here that a test would not have to fake.
     touched: u64,
+    /// Somebody asked for these bytes and has not been handed them yet.
+    ///
+    /// The same standing a staged upload has, for the same reason: this is
+    /// not a copy of something that can be fetched again *in time to matter*.
+    /// It is the delivery of a request already answered `Ok`, and the reader
+    /// is on its way. Dropping it makes a download that WhatsApp completed
+    /// report a failure — so it is exempt from the sweep until it is read,
+    /// and reading it is what takes it out of the map altogether.
+    ///
+    /// Exempting it from *eviction* only. It still counts toward the budget,
+    /// so it presses older entries out rather than raising the ceiling.
+    pinned: bool,
 }
 
 #[derive(Default)]
@@ -58,6 +70,19 @@ fn with<T>(f: impl FnOnce(&mut Cache) -> T) -> T {
 /// Never, here. A map does not fail to be written to, and the signature is
 /// the desktop's, where a disk does.
 pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
+    store(key, bytes, true)
+}
+
+/// Cache `bytes` under `key`, droppable from the moment they land.
+///
+/// For the eager copy of an inbound message's media, which nobody is waiting
+/// on and which can be fetched again on demand. See [`super::put_since`],
+/// whose whole subject is that this write is the one allowed to lose.
+pub fn put_evictable(key: &str, bytes: &[u8]) -> Result<String> {
+    store(key, bytes, false)
+}
+
+fn store(key: &str, bytes: &[u8], pinned: bool) -> Result<String> {
     with(|cache| {
         // Content-addressed: the same key is the same bytes, so an entry that
         // is already there is already right — and re-storing it would be a
@@ -65,6 +90,10 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
         if let Some(entry) = cache.entries.get_mut(key) {
             cache.clock += 1;
             entry.touched = cache.clock;
+            // A key first cached eagerly and then asked for is now somebody's
+            // answer, so it takes the stronger standing. Never the reverse:
+            // an eager write must not unpin bytes a reader is coming for.
+            entry.pinned |= pinned;
             return Ok(key.to_string());
         }
         cache.clock += 1;
@@ -75,19 +104,10 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
             Entry {
                 bytes: bytes.to_vec(),
                 touched,
+                pinned,
             },
         );
-        // Everything but what was just written. A download somebody asked
-        // for can be a document larger than the whole budget, and it is the
-        // newest entry — so a sweep that may take it necessarily takes *it*,
-        // while `put` still returns the key. The bridge then sends a
-        // `Downloaded` naming bytes that are already gone, and the front end
-        // reports a failed download for a file WhatsApp delivered.
-        //
-        // Keeping it does not leak: it still counts toward `reclaimable`, so
-        // it presses older entries out, and the next write sweeps again with
-        // it no longer exempt.
-        sweep(cache, Some(key));
+        sweep(cache);
         Ok(key.to_string())
     })
 }
@@ -152,7 +172,7 @@ pub fn wipe(scope: Wipe) -> Result<()> {
 /// send. They are excluded from what is *counted* too — a cache cannot
 /// reclaim what it may not touch, and counting it would make the sweep spin
 /// against a budget it can never reach.
-fn sweep(cache: &mut Cache, keep: Option<&str>) {
+fn sweep(cache: &mut Cache) {
     let reclaimable: u64 = cache
         .entries
         .iter()
@@ -166,7 +186,7 @@ fn sweep(cache: &mut Cache, keep: Option<&str>) {
     let mut oldest: Vec<(String, u64, u64)> = cache
         .entries
         .iter()
-        .filter(|(name, _)| !is_staged_upload(name) && Some(name.as_str()) != keep)
+        .filter(|(name, entry)| !is_staged_upload(name) && !entry.pinned)
         .map(|(name, entry)| (name.clone(), entry.touched, entry.bytes.len() as u64))
         .collect();
     oldest.sort_by_key(|(_, touched, _)| *touched);

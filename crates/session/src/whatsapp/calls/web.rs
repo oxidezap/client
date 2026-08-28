@@ -1,10 +1,31 @@
 //! Calls in a browser: heard, recorded, and not answered.
 //!
-//! Every one of the five actions goes through `client.voip()`, and that is
-//! the module a page does not have — libopus and the RTC stack are C. So the
-//! actions are refused, and refused *here*, at the method the front end
-//! calls, rather than deeper in where the failure would arrive as a call that
-//! silently never connects.
+//! Every one of the actions goes through `client.voip()`, and that is the
+//! module a page does not have. So they are refused, and refused *here*, at
+//! the method the front end calls, rather than deeper in where the failure
+//! would arrive as a call that silently never connects.
+//!
+//! # Declining does not reach the caller, and cannot from here
+//!
+//! It should. A `<reject>` needs no audio codec — it is a stanza on the
+//! socket that is already open — and `AGENTS.md` is explicit that ending a
+//! call is *something you say*, since a local teardown alone leaves the far
+//! end ringing until its transport gives up. That is exactly what a decline
+//! does here, and it is a wart rather than a design.
+//!
+//! What stands in the way is not the codec. `voip()` lives behind the
+//! library's `voip` feature, and enabling it for `wasm32-unknown-unknown`
+//! pulls `tokio`'s `net` and therefore mio, which answers with a
+//! `compile_error!`: "This wasm target is unsupported by mio." Measured, by
+//! turning the feature on and reading what came back — the whole VoIP stack
+//! arrives together, and the reject stanza cannot be taken out of it from
+//! this side.
+//!
+//! The fix belongs upstream: a way to decline a ringing offer that does not
+//! depend on the transport layer for a call nobody is going to place. Until
+//! then a decline clears the card here, which is what the person asked for,
+//! and the caller rings on — and nothing tells them, because this app has no
+//! transient surface to say it in.
 //!
 //! What is kept is the ringing. A page learns about an incoming call like it
 //! learns about anything else, so the offer is recorded and forgotten on the

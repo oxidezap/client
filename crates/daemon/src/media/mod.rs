@@ -154,5 +154,5 @@ pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
     if CACHE_EPOCH.load(Ordering::SeqCst) != epoch {
         anyhow::bail!("the media cache was cleared while this was being prepared");
     }
-    platform::put(key, bytes)
+    platform::put_evictable(key, bytes)
 }
