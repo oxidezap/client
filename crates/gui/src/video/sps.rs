@@ -119,14 +119,17 @@ impl<'a> Bits<'a> {
 
     /// Unsigned Exp-Golomb, `ue(v)`.
     ///
-    /// Bounded at 32 leading zeros: beyond that the value cannot be
-    /// represented, and a run of zeros is exactly what a truncated or hostile
-    /// parameter set looks like.
+    /// Bounded at 31 leading zeros, which is the last width whose value fits
+    /// a `u32` — and the bound is arithmetic rather than merely prudent: the
+    /// bits come from a peer, `1 << 32` is a shift a `u32` cannot take, and a
+    /// long run of zeros is exactly what a truncated or hostile parameter set
+    /// looks like. Answering `None` refuses the reading; the alternative was
+    /// a panic on somebody else's bytes.
     fn ue(&mut self) -> Option<u32> {
-        let mut leading = 0;
+        let mut leading = 0u32;
         while self.bit()? == 0 {
             leading += 1;
-            if leading > 32 {
+            if leading > 31 {
                 return None;
             }
         }
@@ -134,7 +137,9 @@ impl<'a> Bits<'a> {
             return Some(0);
         }
         let rest = self.bits(leading)?;
-        Some((1u32 << leading) - 1 + rest)
+        // Checked for the same reason: the widest legal run is 31 bits, whose
+        // value can still reach past `u32::MAX` once `rest` is added.
+        (1u32 << leading).checked_sub(1)?.checked_add(rest)
     }
 
     /// Signed Exp-Golomb, `se(v)`: the same code with the sign folded into
@@ -219,11 +224,14 @@ const HIGH_PROFILES: [u32; 13] = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138,
 /// parser that read all of them anyway would take the fields after it from
 /// the wrong bits.
 fn skip_scaling_list(bits: &mut Bits<'_>, size: u32) -> Option<()> {
-    let mut last = 8i32;
-    let mut next = 8i32;
+    let mut last = 8i64;
+    let mut next = 8i64;
     for _ in 0..size {
         if next != 0 {
-            let delta = bits.se()?;
+            // In `i64` because `delta` spans the whole of `i32`: the sum is
+            // reduced mod 256 and a peer's bytes must not be able to overflow
+            // it on the way there.
+            let delta = i64::from(bits.se()?);
             next = (last + delta + 256).rem_euclid(256);
         }
         if next != 0 {
@@ -285,5 +293,42 @@ mod tests {
     fn a_truncated_parameter_set_is_refused() {
         let unit = [0, 0, 0, 1, 0x67, 0x42];
         assert_eq!(coded_size(&unit), None);
+    }
+
+    /// The bytes come from whoever is on the call, so the only acceptable
+    /// answer to any of them is a size or `None`.
+    ///
+    /// A long run of zero bits is the shape that matters: Exp-Golomb reads
+    /// them as the width of the value that follows, and a width of 32 is a
+    /// shift a `u32` cannot take. Debug assertions are on under `cargo test`,
+    /// so an arithmetic overflow anywhere in here fails this test rather than
+    /// waiting to meet a real peer.
+    #[test]
+    fn no_bitstream_from_a_peer_can_panic_the_parser() {
+        // The exact shape that reaches the bound: 32 zero bits and then a
+        // one, so the width Exp-Golomb reads is 32 and the value it wants is
+        // `1 << 32`. Everything before it is the fixed profile/level prefix.
+        // The trailing bytes matter: the width is only *used* once that many
+        // bits are actually there to read.
+        let at_the_bound = [
+            0, 0, 0, 1, 0x67, 66, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff,
+        ];
+        assert_eq!(coded_size(&at_the_bound), None);
+        // A parameter set that is nothing but zeros, at every length up to a
+        // few words: the run that ends in nothing at all.
+        for length in 0..48usize {
+            let mut unit = vec![0, 0, 0, 1, 0x67];
+            unit.extend(std::iter::repeat_n(0u8, length));
+            let _ = coded_size(&unit);
+        }
+        // And a spread of patterns, including the high profile branch (100)
+        // that walks the scaling lists.
+        for profile in [66u8, 77, 100, 244, 255] {
+            for fill in [0x00u8, 0x01, 0x55, 0xaa, 0xff] {
+                let mut unit = vec![0, 0, 0, 1, 0x67, profile, 0xff, 0x1f];
+                unit.extend(std::iter::repeat_n(fill, 64));
+                let _ = coded_size(&unit);
+            }
+        }
     }
 }
