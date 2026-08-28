@@ -194,12 +194,66 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github/scripts
 
+      # Still the newest? Asked here, not assumed from having got this far.
+      #
+      # Builds run in parallel, so the order two runs reach this job is the
+      # order their *builds* finished, which is not the order their commits
+      # were pushed: a slower older build publishes last and replaces the live
+      # site with the older bundle. The lock below serializes the pushes; it
+      # cannot order them by recency, because by then both are already here.
+      #
+      # Cancelling the superseded run would be the other answer and is worse:
+      # a publish killed part-way is exactly the broken site the lock exists
+      # to prevent. Asking costs one API call and is checked against the same
+      # state the push is about to change.
+      #
+      # It is also what stops a preview coming back from the dead: a pull
+      # request closed while its build was still running has already had its
+      # directory removed by `take-down`, and this run would otherwise put it
+      # back.
+      - name: Check this is still the revision to publish
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          api="https://api.github.com/repos/${{ github.repository }}"
+          if [ '${{ github.event_name }}' = 'pull_request' ]; then
+            pr=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                      -H 'Accept: application/vnd.github+json' \
+                      "$api/pulls/${{ github.event.number }}")
+            state=$(printf '%s' "$pr" | jq -r .state)
+            head=$(printf '%s' "$pr" | jq -r .head.sha)
+            if [ "$state" != 'open' ]; then
+              echo "pull request is $state; its preview is gone or going" >&2
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$head" != '${{ github.event.pull_request.head.sha }}' ]; then
+              echo "head has moved to $head; a newer run publishes it" >&2
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            tip=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                       -H 'Accept: application/vnd.github+json' \
+                       "$api/commits/${{ github.ref_name }}" | jq -r .sha)
+            if [ "$tip" != '${{ github.sha }}' ]; then
+              echo "${{ github.ref_name }} has moved to $tip; a newer run publishes it" >&2
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: steps.current.outputs.publish == 'true'
         with:
           name: bundle
           path: bundle
 
       - name: Publish to gh-pages
+        if: steps.current.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET: ${{ steps.where.outputs.target }}
@@ -208,7 +262,7 @@ jobs:
           bash .github/scripts/publish-pages.sh "$TARGET"
 
       - name: Say where it is
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.current.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

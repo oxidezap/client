@@ -74,7 +74,39 @@ mod web {
         anchor.click();
         let _ = web_sys::Url::revoke_object_url(&url);
 
+        // Asked *after* the click, because a click is all we get to make and
+        // a blocked one does not say so — `click()` returns the same nothing
+        // either way.
+        //
+        // A script-driven download needs the transient activation from the
+        // user's own tap, and that activation expires in seconds. A document
+        // that was not cached is fetched from the daemon first, so by the time
+        // this runs the tap it belongs to may be long gone and the browser
+        // silently refuses. Reporting a save that did not happen is the worse
+        // half of that: the bytes are cached now, so a second tap works
+        // immediately — but only if the first one admits it failed.
+        if !activation_is_live(&window) {
+            return Err(
+                "the browser would not start the download: too long after the tap. \
+                 The file is ready now, so tapping again saves it immediately."
+                    .to_string(),
+            );
+        }
+
         Ok(format!("{file_name} (your browser's downloads)"))
+    }
+
+    /// Whether the page still holds the user's permission to act on its own.
+    ///
+    /// Absent on browsers that do not implement `UserActivation` — where the
+    /// answer is yes, because a browser without the concept is one that does
+    /// not gate downloads on it either.
+    fn activation_is_live(window: &web_sys::Window) -> bool {
+        let activation = window.navigator().user_activation();
+        if activation.is_undefined() {
+            return true;
+        }
+        activation.is_active()
     }
 }
 

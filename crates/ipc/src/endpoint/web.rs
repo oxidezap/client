@@ -414,8 +414,35 @@ fn parameter_of(search: &str, name: &str) -> Option<String> {
 
 /// One query parameter off the page's own URL.
 fn query_parameter(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    for pair in search.trim_start_matches('?').split('&') {
+    let location = web_sys::window()?.location();
+
+    // The fragment first, and it is where the answer is meant to be.
+    //
+    // A page's query string is sent to whoever served the page — it is in the
+    // request line — so a token carried there reaches the static host's logs
+    // before a single line of this runs. The fragment is never sent: browsers
+    // strip it from the request, which is exactly why the implicit OAuth flow
+    // used it for the same purpose.
+    if let Ok(hash) = location.hash()
+        && let Some(found) = find_parameter(hash.trim_start_matches('#'), name)
+    {
+        return Some(found);
+    }
+
+    // The query still answers, because refusing would not un-send it. What it
+    // does is say so: the URL is already in somebody's logs, and the only
+    // repair is a new token and a bookmark that uses `#`.
+    let found = find_parameter(location.search().ok()?.trim_start_matches('?'), name)?;
+    log::warn!(
+        "?{name}= was read from the query string, which the page's host has already been sent. \
+         Put it after a `#` instead — and if it carried a token, draw a new one."
+    );
+    Some(found)
+}
+
+/// One `key=value` out of an `&`-separated list.
+fn find_parameter(pairs: &str, name: &str) -> Option<String> {
+    for pair in pairs.split('&') {
         // `continue`, not `?`. Returning from the whole function on the first
         // parameter without a value made `?debug&daemon=…` resolve to nothing
         // and fall silently back to the loopback default.

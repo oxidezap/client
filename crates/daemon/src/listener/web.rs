@@ -148,7 +148,7 @@ pub async fn run(
     // tells a log reader nothing.
     if let Some(path) = oxidezap_ipc::web_token_path() {
         log::info!(
-            "point a page at ?daemon=ws://{}{WEB_SOCKET_PATH}?token=<token>, \
+            "point a page at #daemon=ws://{}{WEB_SOCKET_PATH}?token=<token>, \
              where <token> is the contents of {}",
             config.addr,
             path.display()

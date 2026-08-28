@@ -62,12 +62,15 @@ cargo install trunk
 # Serves on http://127.0.0.1:8080 with the two isolation headers set. On
 # GitHub Pages a service worker adds them instead, because a static host has
 # no way to.
-cd web && trunk serve -- -Z build-std=std,panic_abort
+# Through the script: trunk cannot forward arguments to cargo, so it is what
+# sets the toolchain and `CARGO_UNSTABLE_BUILD_STD`.
+TRUNK_ACTION=serve ./web/build.sh
 
 # And the daemon it attaches to. `--web` alone is loopback on the port the
-# page looks for; localhost is served without being named. It logs the query
-# to open the page with — the token is the admission check, so the bare
-# http://127.0.0.1:8080 is refused.
+# page looks for; localhost is served without being named. It logs where the
+# token file is, not the token — that is a bearer credential and a log is
+# what people paste into issues. The token goes after a `#`, never a `?`: a
+# query reaches whoever served the page, a fragment never leaves the browser.
 cargo run --bin oxidezapd -- --web
 ```
 

@@ -85,7 +85,11 @@ while the daemon it talks to stays yours.
 rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown
 cargo install trunk
 
-cd web && trunk serve -- -Z build-std=std,panic_abort
+# Through the script, which is the only thing that sets the toolchain and
+# `CARGO_UNSTABLE_BUILD_STD`. Trunk cannot forward arguments to cargo, so
+# `trunk serve -- -Z build-std=…` passes them to the dev server instead and
+# the build fails on whatever toolchain happens to be default.
+TRUNK_ACTION=serve ./web/build.sh
 ```
 
 and, in another terminal, the daemon with its web endpoint turned on:
@@ -99,7 +103,7 @@ is a bearer credential and a log is the one thing people paste into issues:
 
 ```text
 web bridge listening on http://127.0.0.1:9527/ws (origins: loopback only)
-point a page at ?daemon=ws://127.0.0.1:9527/ws?token=<token>, where <token>
+point a page at #daemon=ws://127.0.0.1:9527/ws?token=<token>, where <token>
 is the contents of $XDG_RUNTIME_DIR/oxidezap/web.token
 ```
 
@@ -109,10 +113,20 @@ That file is yours alone (`0600`, in your own runtime directory), so:
 cat "$XDG_RUNTIME_DIR/oxidezap/web.token"
 ```
 
-Open `http://127.0.0.1:8080/?daemon=ws://127.0.0.1:9527/ws?token=<token>`
+Open `http://127.0.0.1:8080/#daemon=ws://127.0.0.1:9527/ws?token=<token>`
 with it pasted in. Without the token the page reaches the endpoint and is
 refused: it is the whole of the admission check, and a bare
 <http://127.0.0.1:8080> has nothing to present.
+
+**After the `#`, not after a `?`, and that is not cosmetic.** A page's query
+string is part of the request line and reaches whoever served the page — for
+the hosted build, that is GitHub's servers and their logs. The fragment is
+never sent: browsers strip it before the request goes out. Since the token
+is a bearer credential, putting it in the query would hand a copy to the
+static host in exchange for nothing. The page still reads a `?daemon=` and
+says so in the console, because refusing it would not un-send it — but if
+you ever used one, the repair is a new token, which is `rm` on the token
+file and a restart.
 
 **That endpoint is off by default, and should stay off unless you want it.**
 A WebSocket is not subject to the same-origin policy, so any page open in
@@ -133,7 +147,7 @@ oxidezapd --web --web-allow https://oxidezap.github.io
 
 `localhost` and `127.0.0.1` are served without being named, because that is
 `trunk serve` on your own machine. Point a page at a daemon with
-`?daemon=ws://host:port/ws?token=…` — the whole line the daemon logs when it
+`#daemon=ws://host:port/ws?token=…` — the whole line the daemon logs when it
 starts. The URL is honoured only for this machine or the origin the page
 itself came from, and the token has to match either way.
 
