@@ -1,4 +1,17 @@
 [env]
+# The C the wasm build links, which is SQLite's amalgamation.
+#
+# `--shared-memory` under the wasm target below is not optional — gpui_web
+# runs its executor on real workers — and the linker refuses it against any
+# object not built for threads: "--shared-memory is disallowed by sqlite3.o
+# because it was not compiled with 'atomics' or 'bulk-memory' features". So
+# the C is built with them too. They say nothing about SQLite's own locking,
+# which stays off (`SQLITE_THREADSAFE=0` in that crate): one agent owns the
+# database, and these are about what the *module* may do rather than what the
+# library may be asked to do.
+#
+# `cc` reads this per target, so it reaches the wasm build and nothing else.
+CFLAGS_wasm32_unknown_unknown = "-matomics -mbulk-memory"
 # Trim bundled-SQLite subsystems nothing here touches. FTS5 stays: the chat
 # store's `search` feature builds its index on it. Shared cache stays:
 # sqlite-storage's in-memory mode shares one DB across the pool via
