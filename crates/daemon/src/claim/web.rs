@@ -54,7 +54,7 @@ impl Drop for Claim {
 /// old one, or a context without a `navigator`.
 pub(crate) async fn take() -> Result<Claim, String> {
     let navigator = web_sys::window()
-        .ok_or_else(|| "no window to claim a session from".to_string())?
+        .ok_or_else(|| "There is no window here to claim a session from.".to_string())?
         .navigator();
     let locks = navigator.locks();
 
@@ -103,9 +103,13 @@ pub(crate) async fn take() -> Result<Claim, String> {
             _held: callback,
         }),
         Ok(false) => Err(
-            "another tab is already running this account; use that one, or close it first"
+            // A sentence, because it is drawn as one: this is the whole body
+            // text of the screen a second tab shows, not a fragment appended
+            // after a colon.
+            "Another tab is already running this account. Use that one, or \
+             close it and try again."
                 .to_string(),
         ),
-        Err(_) => Err("the browser did not answer the claim".to_string()),
+        Err(_) => Err("The browser did not answer the claim for this account.".to_string()),
     }
 }

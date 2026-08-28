@@ -53,10 +53,10 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         if !web::session_allowed_here() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "this is a preview build, which does not hold an account by \
-                 default: point it at a daemon with #daemon=ws://…, or add \
+                "This is a preview build, which does not hold an account by \
+                 default. Point it at a daemon with #daemon=ws://…, or add \
                  #preview-session to let it keep one in this origin's storage \
-                 — which is the same origin the deployment uses",
+                 — the same origin the deployment uses.",
             ));
         }
         return super::embedded::connect().await;

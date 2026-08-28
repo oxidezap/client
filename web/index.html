@@ -138,12 +138,17 @@
       <h1>oxidezap</h1>
       <p>Starting the window…</p>
       <p>
-        This page is the front end only. It talks to
-        <code>oxidezapd</code> on your own machine — start it with
-        <code>oxidezapd --web --web-allow https://&lt;this-origin&gt;</code>, or
-        point this page somewhere else with <code>#daemon=ws://…</code> —
-        after a <code>#</code>, so the token in it stays in your browser
-        instead of reaching whoever served this page.
+        Loading a few megabytes of WebAssembly. This page runs the whole
+        client — the session, the store and the window — in your browser,
+        under your account and nobody else's.
+      </p>
+      <p>
+        It can talk to <code>oxidezapd</code> on your own machine instead,
+        which is worth preferring: a desktop daemon holds calls, survives the
+        tab, and keeps your keys out of a browser's storage. Point this page
+        at one with <code>#daemon=ws://…</code> — after a <code>#</code>, so
+        the token in it stays in your browser instead of reaching whoever
+        served this page.
       </p>
     </div>
   </body>
