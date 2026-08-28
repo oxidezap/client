@@ -47,13 +47,13 @@ const PIPE: usize = 1 << 18;
 /// the tray's Quit and an IPC `Shutdown` make. Nothing here ends a process,
 /// because on the side this exists for there is no process to end that is
 /// not the tab itself.
-pub async fn start() -> Result<DuplexStream, String> {
+pub async fn start() -> Result<DuplexStream, StartFailed> {
     // Before anything opens the store, and held for as long as this service
     // is. Two of these on one origin would preload the same database, write
     // it back independently, and advance the same Signal state from two
     // places — the losing writer's chats gone, its ratchets no longer
     // decrypting. See [`crate::claim`].
-    let claim = crate::claim::take().await?;
+    let claim = crate::claim::take().await.map_err(StartFailed::Claimed)?;
 
     let hub = StateHub::new();
 
@@ -85,3 +85,29 @@ pub async fn start() -> Result<DuplexStream, String> {
 
     Ok(client)
 }
+
+/// Why a session did not start here.
+///
+/// One variant today and the distinction is the whole reason the type exists:
+/// a refused claim is **settled**. Another tab holds this account, and asking
+/// again in ten seconds cannot change that — only the person closing the
+/// other tab can. A front end that retries it anyway does the thing
+/// `ifAvailable` was chosen to prevent: it sits looking like a page that is
+/// starting, and the moment the other tab closes it silently takes an account
+/// nobody was looking at.
+#[derive(Debug)]
+pub enum StartFailed {
+    /// Something else already holds this account. The string says who, as far
+    /// as the platform can tell, and is written for the person reading it.
+    Claimed(String),
+}
+
+impl std::fmt::Display for StartFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Claimed(who) => f.write_str(who),
+        }
+    }
+}
+
+impl std::error::Error for StartFailed {}

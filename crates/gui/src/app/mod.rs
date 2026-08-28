@@ -2130,6 +2130,17 @@ impl WhatsAppApp {
                         app.event_task = Some(Self::spawn_event_task(ui_rx, cx));
                         app.client = Some(client);
                     }
+                    Err(e) if Session::is_settled(&e) => {
+                        // A refusal, not a failure to reach anything: another
+                        // tab holds this account, or this preview has not been
+                        // told it may keep one. Said in its own words — a
+                        // "Failed to reach the daemon" in front of it would be
+                        // the one sentence that is not true — and with no
+                        // timer behind it, because the next attempt would get
+                        // the same answer and the one after that would take an
+                        // account the moment somebody else's tab closed.
+                        app.app_state = AppState::Error(e.to_string());
+                    }
                     Err(e) => {
                         app.app_state = AppState::Error(format!("Failed to reach the daemon: {e}"));
                         // The error screen says "we'll keep trying", and this

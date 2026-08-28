@@ -38,9 +38,11 @@ use super::sink::{self, Events};
 pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     log::info!("no daemon named; starting a session in this page");
 
+    // `AlreadyExists`, deliberately, and read as such one layer up: this is
+    // the refusal that retrying cannot fix. See `Session::is_settled`.
     let pipe = oxidezap_daemon::embedded::start()
         .await
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::AlreadyExists, e.to_string()))?;
     let (reader, mut writer) = tokio::io::split(pipe);
 
     // The write half, as a queue into the task that owns it — the same

@@ -321,6 +321,27 @@ impl Session {
         }
     }
 
+    /// Whether asking again could ever produce a different answer.
+    ///
+    /// Most connection failures are transient — a daemon still starting, a
+    /// socket not yet accepted — and the error screen is right to keep
+    /// trying. Two are not, and both are refusals rather than accidents:
+    /// another tab already holds this account, and a preview that has not
+    /// been told it may keep one. Retrying either is worse than not: the
+    /// window sits looking like it is starting, the reason never reaches the
+    /// person, and in the first case the moment the other tab closes this one
+    /// silently takes an account nobody was looking at — the exact behaviour
+    /// the browser lock's `ifAvailable` was chosen to prevent.
+    ///
+    /// Manual retry stays available, because the answer *does* change when
+    /// somebody closes the other tab. What stops is guessing on their behalf.
+    pub fn is_settled(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+        )
+    }
+
     /// The parts every transport supplies, assembled.
     fn new(link: Link, events: EventSink, media: Arc<dyn MediaCache>) -> Self {
         Self {

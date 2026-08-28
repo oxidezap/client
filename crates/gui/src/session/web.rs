@@ -51,7 +51,8 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         // database is not a risk worth a convenience, so a preview is an
         // attach-only page and says so.
         if !web::session_allowed_here() {
-            return Err(std::io::Error::other(
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
                 "this is a preview build, which does not hold an account by \
                  default: point it at a daemon with #daemon=ws://…, or add \
                  #preview-session to let it keep one in this origin's storage \
