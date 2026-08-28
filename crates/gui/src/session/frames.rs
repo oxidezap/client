@@ -409,12 +409,18 @@ pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<Stri
 /// Whether a request is still being waited on, without consuming it.
 ///
 /// [`take_pending`] is the other half: this asks, that answers and removes.
+///
+/// Membership is not enough. A caller that gave up drops its receiver and the
+/// entry stays until some later request sweeps it, so `contains_key` says yes
+/// for a download nobody is listening to any more — which is the whole case
+/// this is asked for. `is_abandoned` is what the sweep itself uses.
 #[cfg(target_family = "wasm")]
 fn is_pending(pending: &Pending, id: RequestId) -> bool {
     pending
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains_key(&id)
+        .get(&id)
+        .is_some_and(|waiting| !waiting.is_abandoned())
 }
 
 pub(super) fn take_pending(pending: &Pending, id: RequestId) -> Option<Awaiting> {

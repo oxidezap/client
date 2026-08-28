@@ -371,7 +371,12 @@ const MAX_VIDEO_PLAYERS: usize = 10;
 const MAX_DECODED_IMAGES: usize = 50;
 
 /// Download timeout in seconds (for audio/video downloads)
-const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
+/// How long a download somebody asked for is allowed to take.
+///
+/// Public because the web front end has to fetch the bytes over HTTP before
+/// it can answer the request, and doing that under a shorter deadline than
+/// this one would make the allowance a fiction — see `session::web::prefetch`.
+pub(crate) const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 
 /// Download media with timeout - returns Ok(data) or Err(error message)
 async fn download_with_timeout(

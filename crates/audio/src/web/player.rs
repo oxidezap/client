@@ -538,8 +538,15 @@ fn start(
     speed: f32,
     offset: f64,
 ) {
+    // Every failure below goes through `give_up`, for the reason written on
+    // it: `play` returned before any of this ran, so the caller is already
+    // holding a completion receiver and showing the note as the active one.
+    // Logging and returning left that receiver unresolved and the player with
+    // no node, so every later tap called `resume`, which does nothing, and
+    // the note stayed stuck until something else was selected.
     let Ok(node) = context.create_buffer_source() else {
         warn!("the browser refused a source node");
+        give_up(state);
         return;
     };
     node.set_buffer(Some(buffer));
@@ -549,6 +556,7 @@ fn start(
         .is_err()
     {
         warn!("the browser refused to connect the source node");
+        give_up(state);
         return;
     }
 
@@ -584,15 +592,22 @@ fn start(
     };
     // `addEventListener` rather than the `onended` property, which web-sys
     // deprecates.
+    // Fatal, where it used to be a warning that carried on. `ended` is the
+    // only thing that fires completion for a run that plays to its end, so
+    // starting without it makes a clip that sounds correct and leaves the UI
+    // showing it as playing for good — which is worse than not playing it.
     if node
         .add_event_listener_with_callback("ended", ended.as_ref().unchecked_ref())
         .is_err()
     {
         warn!("the browser refused an ended listener");
+        give_up(state);
+        return;
     }
 
     if let Err(e) = node.start_with_when_and_grain_offset(0.0, offset) {
         warn!("the browser refused to start playback: {e:?}");
+        give_up(state);
         return;
     }
 

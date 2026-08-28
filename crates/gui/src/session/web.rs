@@ -127,6 +127,26 @@ const FRAME_MEDIA_BUDGET: std::time::Duration = std::time::Duration::from_secs(3
 /// Under one deadline for all of them, so the sequence cannot multiply a
 /// stall by the number of keys; see [`FRAME_MEDIA_BUDGET`].
 async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched, pending: &super::Pending) {
+    // A download somebody asked for gets the allowance it was promised.
+    //
+    // [`FRAME_MEDIA_BUDGET`] is for the optional kind: a history load's
+    // thumbnails, where the whole point is that a stall must not hold the
+    // stream and a missing key is drawn as an offer to download. A
+    // `Downloaded` frame is the *answer* to a request that
+    // `download_with_timeout` allows a minute — capping it at half that meant
+    // a large document could never arrive, and would be reported as a failure
+    // by the very code waiting for it, after the daemon had already fetched
+    // and cached it.
+    //
+    // The reason the shared budget is short does not apply here either: it is
+    // there so a sequence of keys cannot multiply one stall, and this frame
+    // names exactly one.
+    let budget = if matches!(message, DaemonMessage::Downloaded { .. }) {
+        std::time::Duration::from_secs(crate::app::DOWNLOAD_TIMEOUT_SECS)
+    } else {
+        FRAME_MEDIA_BUDGET
+    };
+
     let all = async {
         for key in frames::media_keys(message, pending) {
             match web::fetch_media(base, &key).await {
@@ -135,10 +155,7 @@ async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched, pending: 
             }
         }
     };
-    if crate::platform::with_timeout(all, FRAME_MEDIA_BUDGET)
-        .await
-        .is_none()
-    {
+    if crate::platform::with_timeout(all, budget).await.is_none() {
         log::debug!("this frame's media did not arrive within its budget");
     }
 }
