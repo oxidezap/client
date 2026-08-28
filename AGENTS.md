@@ -161,14 +161,16 @@ profile here repeats it deliberately.
   never got, and a device unplugged mid-call all end the same way — the
   registry entry is what "our video is on" *means*, and `settle_video` says
   what is in it.
-- **An answer from the peer names the camera it is about.** A refused
-  upgrade arrives seconds after the ask, and in those seconds the user can
-  have turned the camera off and on again — so `CallRegistry::upgrading`
-  remembers which camera the request went out with, the way a camera's own
-  loss carries its `CameraId`. Without it a refusal tears down whichever
-  camera is held, which is the *replacement*, belonging to a request nobody
-  refused. A stale entry is inert by construction: camera ids are never
-  reused, so one naming a camera that has gone matches nothing.
+- **A refusal is answered by whether one is outstanding, not by which camera
+  asked.** The library does not match a refused upgrade to the request it
+  refuses: its handler tears the local plane down whenever *some* request of
+  ours is pending — whichever camera is attached by then — and ignores the
+  stanza when none is. So `CallRegistry::upgrading` holds presence rather
+  than identity, and the camera goes off exactly when the library has
+  released its endpoints. Keying it on the camera the request went out with
+  reads as more careful and is worse: a refusal landing after an off-and-on
+  again tears down the replacement's plane in the library while leaving it
+  registered here, drawn as live, encoding into nothing.
 - **A video call is offered as one, and answered as one.** The endpoints have
   to be attached before the offer or the accept goes out, which is why the
   camera opens first and why a camera that fails downgrades the call to voice

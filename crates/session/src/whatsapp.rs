@@ -381,18 +381,18 @@ pub struct CallRegistry {
     /// it. Turning the camera on while one is parked answers it; turning it
     /// on with none parked asks a question of our own.
     upgrades: Arc<Mutex<HashMap<String, VideoUpgradeToken>>>,
-    /// The camera an upgrade *we* asked for was opened with, until the peer
-    /// answers.
+    /// Calls with an upgrade of *ours* still waiting on an answer.
     ///
-    /// A refusal arrives seconds later, and in those seconds the camera can
-    /// have been turned off and on again — so the answer names which camera
-    /// it was about, exactly as a camera's own loss does. Without it a
-    /// refusal tears down whichever camera happens to be held, which is the
-    /// replacement, belonging to a request nobody refused.
-    ///
-    /// A stale entry is inert rather than dangerous: camera ids are never
-    /// reused, so one naming a camera that has gone matches nothing.
-    upgrading: Arc<Mutex<HashMap<String, crate::video::CameraId>>>,
+    /// Presence, not identity, and that is the whole of it: the library does
+    /// not match a refusal to the request it refuses. Its handler tears the
+    /// local plane down whenever *some* request of ours is outstanding —
+    /// whichever camera is attached by then — and ignores the stanza
+    /// entirely when none is. So the question this has to answer is "did the
+    /// library just release our endpoints", and this flag is exactly that.
+    /// Keying on the camera the request went out with would leave a camera
+    /// registered and drawn after its media plane was already gone, which is
+    /// the same lie in the other direction.
+    upgrading: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// What keeps a call's mute requests in the order the daemon took them.
@@ -2405,6 +2405,10 @@ impl WhatsAppClient {
                     local.stop().await;
                 }
                 Self::stop_peer_video(&handle, &call_id).await;
+                // `stop_video` clears the library's pending request, so a
+                // refusal after it is one the library ignores — and so is
+                // this.
+                calls.upgrading.lock().await.remove(&call_id);
                 Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
                 return;
             }
@@ -2475,10 +2479,10 @@ impl WhatsAppClient {
                     // which is otherwise the periodic one, seconds away.
                     local.drawable();
                     local.request_keyframe();
-                    // Read before the camera is handed over, because a
-                    // refusal for an upgrade of ours may be seconds away and
-                    // the device held by then may be a later one.
-                    let camera_id = local.camera_id();
+                    // Whether the peer owes us an answer: an upgrade we asked
+                    // for is accepted or refused seconds later, and what that
+                    // answer means depends on a request of ours still being
+                    // outstanding when it lands.
                     let ours_to_be_answered = answering.is_none();
                     // The announcement landed and the device may not have
                     // survived it: the peer has this direction enabled and is
@@ -2488,11 +2492,7 @@ impl WhatsAppClient {
                     match Self::hold_camera(&calls, &call_id, local).await {
                         Camera::Died => Self::stop_peer_video(&handle, &call_id).await,
                         Camera::Held if ours_to_be_answered => {
-                            calls
-                                .upgrading
-                                .lock()
-                                .await
-                                .insert(call_id.clone(), camera_id);
+                            calls.upgrading.lock().await.insert(call_id.clone());
                         }
                         Camera::Held | Camera::CallEnded => {}
                     }
@@ -3134,19 +3134,17 @@ impl WhatsAppClient {
             // with every window saying our video was on.
             VideoState::UpgradeReject | VideoState::UpgradeRejectByTimeout => {
                 Self::withdraw_video_request(calls, ui_sender, call_id).await;
-                // Only the camera the refused request was opened with. A
-                // refusal is seconds of wire away from the ask, and a user
-                // who turned video off and on again in the meantime has a
-                // camera nobody has refused — one that would otherwise be
-                // torn down by its predecessor's answer.
-                let refused = calls.upgrading.lock().await.remove(call_id);
-                match refused {
-                    Some(camera_id) => {
-                        Self::stop_local_video(calls, ui_sender, call_id, Some(camera_id)).await;
-                    }
-                    // Nothing of ours was waiting on an answer: the camera in
-                    // the registry, if any, belongs to something else.
-                    None => debug!("Refused video upgrade on {call_id} names no camera of ours"),
+                // Only while a request of ours is outstanding, and then for
+                // whatever camera is held — which is what the library does
+                // with the same stanza: it tears the attached plane down when
+                // some request of ours is pending, and ignores the refusal
+                // when none is. One arriving after our upgrade was already
+                // answered belongs to nothing here, and stopping the camera
+                // on it would take down one nobody refused.
+                if calls.upgrading.lock().await.remove(call_id) {
+                    Self::stop_local_video(calls, ui_sender, call_id, None).await;
+                } else {
+                    debug!("Refused video upgrade on {call_id} answers nothing of ours");
                 }
             }
             // Their request, withdrawn or timed out. Nothing about either
@@ -3156,8 +3154,8 @@ impl WhatsAppClient {
             VideoState::UpgradeCancel | VideoState::UpgradeCancelByTimeout => {
                 Self::withdraw_video_request(calls, ui_sender, call_id).await;
             }
-            // The peer took the upgrade, so there is no refusal coming for
-            // the camera it was asked with.
+            // The peer took the upgrade, so nothing of ours is outstanding
+            // and a refusal landing after it answers something else.
             VideoState::UpgradeAccept => {
                 calls.upgrading.lock().await.remove(call_id);
             }
