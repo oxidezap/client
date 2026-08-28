@@ -142,9 +142,12 @@ profile here repeats it deliberately.
   ringing offer rather than taking a front end's word: the library refuses
   `.video()` on an audio offer. The peer's mid-call request to add video gets
   no dialog of its own — turning our camera on *is* the acceptance, and the
-  token that binds it to that request never leaves the session — but it can
-  be withdrawn, so `CallVideoRequested { pending: false }` exists to stop
-  every window drawing a question nobody is asking.
+  token that binds it to that request never leaves the session — but the
+  *question* is state (`CallVideo::requested`) rather than one window's
+  memory of an event: a window that attached after it was asked never saw the
+  event, and would draw an ordinary camera button while somebody waited on
+  it. It clears when a camera comes on, which is the answer, and when the
+  peer withdraws it.
 - **Ending a call is something you say, and muting is something you may fail
   to say.** A hangup is `CallHandle::terminate`, which sends `<terminate>` to
   every device a still-ringing call rang and then tears the local side down

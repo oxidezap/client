@@ -798,13 +798,6 @@ pub struct WhatsAppApp {
     /// person watching. Cleared with the call, because the last frame of a
     /// call that has ended is not something to keep drawing.
     call_pictures: CallPictures,
-    /// The call the peer has asked to add video to, while the ask stands.
-    ///
-    /// A question rather than a state: nothing has changed until somebody's
-    /// camera comes on, and the answer *is* turning ours on. Kept so the card
-    /// can say who is waiting on it rather than leaving the request to be
-    /// guessed from a peer who has suddenly gone quiet.
-    call_video_request: Option<String>,
     /// Cache of JID -> display name mappings (from notify/pushname attribute)
     name_cache: HashMap<String, String>,
     /// System notices whose conversation has not arrived yet.
@@ -1011,7 +1004,6 @@ impl WhatsAppApp {
             call_state: CallState::new(),
             call_card: CallCard::default(),
             call_pictures: CallPictures::default(),
-            call_video_request: None,
             name_cache: HashMap::new(),
             pending_notices: HashMap::new(),
             video_players: HashMap::new(),
@@ -1474,7 +1466,6 @@ impl WhatsAppApp {
         // Including the pictures: a frame of the old account's peer left in
         // a pane is exactly the kind of thing a reset exists to remove.
         self.call_pictures = CallPictures::default();
-        self.call_video_request = None;
         // What the *old* account occupied, and the query that is still
         // measuring it. Settings survives the reset, so a completion landing
         // after it would show the previous account's database and media under

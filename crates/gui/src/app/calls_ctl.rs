@@ -120,18 +120,13 @@ impl WhatsAppApp {
         self.call_pictures.of(stream)
     }
 
-    /// The peer asked to add video, or stopped asking.
-    pub(super) fn note_video_request(&mut self, call_id: String, pending: bool) {
-        if pending {
-            self.call_video_request = Some(call_id);
-        } else if self.call_video_request.as_deref() == Some(call_id.as_str()) {
-            self.call_video_request = None;
-        }
-    }
-
     /// Whether the peer is waiting on this side to turn its camera on.
+    ///
+    /// Read from the call state rather than remembered here: the request is
+    /// something the daemon holds, so a window that attaches mid-call is
+    /// handed it like everything else about the call.
     pub fn call_video_requested(&self) -> bool {
-        self.call_video_request.is_some()
+        self.call_state.video().requested
     }
 
     /// Turn this window's camera on or off.
@@ -145,10 +140,6 @@ impl WhatsAppApp {
             return;
         };
         let (call_id, wanted) = (call.call_id.clone(), !call.video.local);
-        // The ask is answered by the gesture, whichever way it goes: turning
-        // the camera on accepts it, and turning it off is not something to be
-        // asked about twice.
-        self.call_video_request = None;
         if let Some(client) = &self.client {
             client.set_call_video(&call_id, wanted);
         }
@@ -238,7 +229,6 @@ impl WhatsAppApp {
         info!("Ending call {call_id}");
         self.call_card.call_ended();
         self.call_pictures = CallPictures::default();
-        self.call_video_request = None;
         // A ringing offer ended by this button was refused, not missed — the
         // same thing `decline_call` writes down, and the phone viewport routes
         // its Decline through here. Deriving the outcome from the stage alone
@@ -429,15 +419,6 @@ impl WhatsAppApp {
         // After the state, because what a picture may still be drawn for is
         // exactly what the new state says has a camera behind it.
         self.call_pictures.follow(&self.call_state);
-        // A question outlives neither its call nor its answer.
-        if self
-            .call_video_request
-            .as_ref()
-            .is_none_or(|call_id| !self.call_state.holds(call_id))
-            || self.call_state.video().local
-        {
-            self.call_video_request = None;
-        }
         // The duration on the card is a clock, and a clock nobody winds shows
         // the second it started at. Armed here rather than off `CallAccepted`,
         // because a call this window did not answer — the daemon accepted it,

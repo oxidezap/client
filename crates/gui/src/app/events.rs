@@ -345,8 +345,9 @@ impl WhatsAppApp {
                         "is no longer asking for"
                     }
                 );
-                self.note_video_request(call_id, pending);
-                cx.notify();
+                // Nothing to apply: what the window draws comes from the call
+                // state the daemon publishes beside this, the same way mute
+                // does. The event is what says it out loud.
             }
             UiEvent::OutgoingCallStarted {
                 call_id,

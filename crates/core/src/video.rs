@@ -3,9 +3,9 @@
 //! The library transports pre-encoded H.264 — one complete Annex-B access
 //! unit per frame — so what crosses this boundary is a codec payload rather
 //! than pixels. That is what makes a picture affordable between two
-//! processes: a 720p frame is 60 KiB of RGBA per *row* and about 16 KiB
-//! encoded for the whole thing, and the front end already owns an H.264
-//! decoder for the video it plays in a conversation.
+//! processes: a 720p frame is 3.5 MiB of RGBA and about 16 KiB encoded, and
+//! the front end already owns an H.264 decoder for the video it plays in a
+//! conversation.
 //!
 //! Both directions travel: the peer's because it is the call, and our own
 //! because the camera is opened by the process that owns the session (the
@@ -43,11 +43,25 @@ pub struct CallVideo {
     /// The peer has video enabled and frames are expected from them.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub remote: bool,
+    /// The peer has asked to turn this into a video call and is waiting on an
+    /// answer.
+    ///
+    /// State rather than one window's memory of an event, because a window
+    /// that attached after the request was made never saw it: it would draw
+    /// an ordinary camera button while somebody waited for it, and learn
+    /// nothing until the request timed out. The answer is a camera coming on,
+    /// so it clears with `local` — but the *question* has to survive being
+    /// asked before the asker was listening.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub requested: bool,
 }
 
 impl CallVideo {
     /// Whether anything at all is being drawn, which is what decides whether
     /// the card takes the video layout.
+    ///
+    /// A question is not a picture: a peer asking for video changes what the
+    /// camera button says and not what the card is shaped like.
     #[must_use]
     pub fn any(self) -> bool {
         self.local || self.remote

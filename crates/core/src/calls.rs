@@ -550,7 +550,32 @@ impl CallState {
     /// camera the daemon never opened.
     pub fn set_video(&mut self, call_id: &CallId, stream: VideoStream, on: bool) -> bool {
         match &mut self.stage {
-            Some(Stage::Active(call)) if call.call_id == *call_id => call.video.set(stream, on),
+            Some(Stage::Active(call)) if call.call_id == *call_id => {
+                let mut changed = call.video.set(stream, on);
+                // Our camera coming on answers whatever was being asked, so
+                // the question goes with it.
+                if on && stream == VideoStream::Local && call.video.requested {
+                    call.video.requested = false;
+                    changed = true;
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    /// Record that the peer asked for video, or stopped asking.
+    ///
+    /// Returns whether it changed. Cleared when our own camera comes on,
+    /// because that *is* the answer: leaving the question up beside a live
+    /// camera would ask a second time for something already given.
+    pub fn set_video_requested(&mut self, call_id: &CallId, pending: bool) -> bool {
+        match &mut self.stage {
+            Some(Stage::Active(call)) if call.call_id == *call_id => {
+                let changed = call.video.requested != pending;
+                call.video.requested = pending;
+                changed
+            }
             _ => false,
         }
     }
@@ -1213,5 +1238,37 @@ mod tests {
         let json = serde_json::to_string(&state).expect("serializable");
         let back: CallState = serde_json::from_str(&json).expect("round trip");
         assert_eq!(back, state);
+    }
+
+    /// The peer's question is state, so a window attaching mid-call is handed
+    /// it — and turning the camera on is what answers it.
+    #[test]
+    fn a_camera_coming_on_answers_the_question() {
+        let mut state = CallState::new();
+        let call_id = "CALL".to_string();
+        state.set_outgoing(outgoing("CALL"));
+        state.connect(&call_id);
+
+        assert!(state.set_video_requested(&call_id, true));
+        assert!(state.video().requested);
+        // The card is not reshaped by a question: there is still no picture.
+        assert!(!state.video().any());
+
+        assert!(state.set_video(&call_id, VideoStream::Local, true));
+        assert!(!state.video().requested, "the answer closed it");
+        assert!(state.video().any());
+    }
+
+    /// A window that fell behind can name a call that has ended, and neither
+    /// half of the video state may be applied to whatever is live now.
+    #[test]
+    fn video_state_is_refused_for_a_call_that_is_not_the_one_up() {
+        let mut state = CallState::new();
+        state.set_outgoing(outgoing("CALL"));
+        state.connect(&"CALL".to_string());
+
+        assert!(!state.set_video(&"OTHER".to_string(), VideoStream::Remote, true));
+        assert!(!state.set_video_requested(&"OTHER".to_string(), true));
+        assert_eq!(state.video(), CallVideo::default());
     }
 }

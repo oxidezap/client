@@ -32,6 +32,23 @@ use whatsapp_rust::voip::{VideoFrame, VideoSource};
 /// only frame worth having is the newest one.
 pub type VideoFrameSender = tokio::sync::mpsc::Sender<CallVideoFrame>;
 
+/// The publisher as the pumps see it: a slot, read per frame.
+///
+/// Not a captured `VideoFrameSender`, because subscribing replaces it — and a
+/// pump holding the old one would find its receiver closed and conclude that
+/// nobody is watching, for the rest of the call, while a window sat in front
+/// of it. Absent or closed means exactly "nobody is watching *now*", which is
+/// a frame to drop and never a reason to stop pumping.
+pub type VideoPublisher = Arc<std::sync::Mutex<Option<VideoFrameSender>>>;
+
+/// Hand one frame to whoever is subscribed, if anyone is.
+fn publish(publisher: &VideoPublisher, frame: CallVideoFrame) {
+    let sender = publisher.lock().expect("video publisher poisoned").clone();
+    if let Some(sender) = sender {
+        let _ = sender.try_send(frame);
+    }
+}
+
 /// What is called when the device itself goes away.
 ///
 /// A camera can be unplugged, or its backend can fail for good, and the
@@ -143,7 +160,7 @@ impl VideoSource for CameraSource {
 /// offer or an accept goes out claiming video.
 pub(crate) async fn open(
     call_id: CallIdSlot,
-    publish: Option<VideoFrameSender>,
+    publisher: VideoPublisher,
     lost: CameraLost,
 ) -> Result<(LocalVideo, Endpoints), String> {
     let quality = VideoQuality::from_environment();
@@ -163,10 +180,10 @@ pub(crate) async fn open(
         camera.frames(),
         camera.control(),
         source_tx,
-        publish.clone(),
+        Arc::clone(&publisher),
         lost,
     ));
-    tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publish));
+    tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publisher));
 
     Ok((
         LocalVideo {
@@ -195,20 +212,20 @@ async fn pump_local(
     frames: async_channel::Receiver<EncodedFrame>,
     camera: CameraControl,
     plane: async_channel::Sender<Vec<u8>>,
-    publish: Option<VideoFrameSender>,
+    publisher: VideoPublisher,
     lost: CameraLost,
 ) {
     while let Ok(EncodedFrame { data, keyframe }) = frames.recv().await {
-        if let Some(publish) = &publish {
-            let frame = CallVideoFrame::new(
+        publish(
+            &publisher,
+            CallVideoFrame::new(
                 read(&call_id),
                 VideoStream::Local,
                 data.clone(),
                 keyframe,
                 0,
-            );
-            let _ = publish.try_send(frame);
-        }
+            ),
+        );
         if plane.try_send(data).is_err() {
             if plane.is_closed() {
                 break;
@@ -235,21 +252,27 @@ async fn pump_local(
 async fn pump_remote(
     call_id: CallIdSlot,
     frames: async_channel::Receiver<VideoFrame>,
-    publish: Option<VideoFrameSender>,
+    publisher: VideoPublisher,
 ) {
+    // Runs for as long as the call does, whoever is or is not watching. A
+    // pump that stopped at the first frame nobody took would leave the peer's
+    // picture gone for good the moment a window closed and reopened.
+    //
+    // A dropped unit here is one the far side has to recover from, and there
+    // is nothing on this side that can ask it to: the library parses the
+    // peer's PLI and FIR but exposes no way to *send* one, so the peer's own
+    // periodic keyframe is what ends the gap.
     while let Ok(frame) = frames.recv().await {
-        let Some(publish) = &publish else { continue };
-        let published = CallVideoFrame::new(
-            read(&call_id),
-            VideoStream::Remote,
-            frame.data,
-            frame.keyframe,
-            frame.orientation,
+        publish(
+            &publisher,
+            CallVideoFrame::new(
+                read(&call_id),
+                VideoStream::Remote,
+                frame.data,
+                frame.keyframe,
+                frame.orientation,
+            ),
         );
-        if publish.try_send(published).is_err() && publish.is_closed() {
-            warn!("nobody is drawing the video of {}", read(&call_id));
-            break;
-        }
     }
     debug!("remote video for {} ended", read(&call_id));
 }

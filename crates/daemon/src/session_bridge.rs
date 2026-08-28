@@ -485,6 +485,13 @@ impl Bridge {
             } => self.hub.calls(|s| {
                 s.set_video(call_id, *stream, *on);
             }),
+            // A question the peer asked, kept as state rather than left as an
+            // event: a window that attaches after it was asked never saw it,
+            // and would draw an ordinary camera button while somebody waited
+            // on it.
+            UiEvent::CallVideoRequested { call_id, pending } => self.hub.calls(|s| {
+                s.set_video_requested(call_id, *pending);
+            }),
             UiEvent::CallMuteChanged { call_id, muted } => self.hub.calls(|s| {
                 s.set_muted(call_id, *muted);
             }),
