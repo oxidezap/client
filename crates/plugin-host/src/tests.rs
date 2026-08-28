@@ -237,6 +237,42 @@ const GREEDY: &str = r#"(module
 /// to make visible.
 const NAME: &str = "Saudações";
 
+/// Asks for four far-future timers on every message, and reports back the
+/// first refusal it is given.
+const ARMS_TIMERS: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_timer_set"    (func $timer (param i64 i64) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "a@s.whatsapp.net")
+  (data (i32.const 64) "refused")
+  (func (export "oxi_abi_version") (result i32) (i32.const 1))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))         ;; messages
+    (call $caps (i64.const 33))             ;; caps::SEND | caps::TIMERS
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $i i32)
+    (local $answer i32)
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_s (local.get $i) (i32.const 4)))
+        ;; An hour out, so none of these ever fires and they only accumulate.
+        (local.set $answer (call $timer (i64.const 3600000) (i64.const 1)))
+        (if (i32.lt_s (local.get $answer) (i32.const 0))
+          (then
+            (drop (call $send (i32.const 0) (i32.const 16) (i32.const 64) (i32.const 7)))
+            (br $done)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next)))
+    (i32.const 0))
+)"#;
+
+fn arms_timers() -> String {
+    ARMS_TIMERS.to_string()
+}
+
 fn wat_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("\\{b:02x}")).collect()
 }
@@ -291,6 +327,24 @@ fn draws() -> String {
 // ---- what the host does --------------------------------------------------
 
 fn host(dir: &TempDir, commands: Arc<Recorder>, published: &Published) -> Plugins {
+    let plugins = Plugins::load(&dir.0, None, Arc::new(commands), published.sink());
+    // Nothing acts on the account until somebody says so, so a test about
+    // what a plugin *does* has to say so first. Written out here rather than
+    // hidden in the constructor: the gate is the point, and a helper that
+    // silently opened it would make every test below prove nothing.
+    for id in plugins
+        .ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    {
+        plugins.approve(&id, true);
+    }
+    plugins
+}
+
+/// The same, with nobody having agreed to anything.
+fn unapproved_host(dir: &TempDir, commands: Arc<Recorder>, published: &Published) -> Plugins {
     Plugins::load(&dir.0, None, Arc::new(commands), published.sink())
 }
 
@@ -624,11 +678,14 @@ fn the_example_plugin_loads_and_answers_its_own_widgets() {
         published.sink(),
     );
 
-    // It draws its settings panel from `oxi_init`, before any event.
+    // It draws its settings panel from `oxi_init`, before any event and
+    // before anybody has allowed it anything — which is the point: this is
+    // what the user reads before deciding.
     let surfaces = published.settles("its settings panel", |s| {
         s.first().is_some_and(|p| !p.roots.is_empty())
     });
     let surface = &surfaces[0];
+    assert!(!surface.approved, "it has not been allowed to send yet");
     assert_eq!(surface.id, "autoreply");
     assert_eq!(surface.name, "Resposta automática");
     assert_eq!(
@@ -644,7 +701,10 @@ fn the_example_plugin_loads_and_answers_its_own_widgets() {
     assert_eq!(section.widget, PluginWidget::Section);
     assert!(!section.children[0].checked, "it starts switched off");
 
-    // Off, so it answers nothing.
+    plugins.approve("autoreply", true);
+    published.settles("the answer", |s| s.first().is_some_and(|p| p.approved));
+
+    // Its own toggle is still off, so it answers nothing.
     plugins.observe(&message("5511999@s.whatsapp.net", "ping"));
     std::thread::sleep(Duration::from_millis(200));
     assert!(commands.sent().is_empty());
@@ -776,4 +836,116 @@ fn a_short_buffer_is_told_how_much_room_it_needed() {
     // The second is as long as the host said the whole value was, which is
     // the number a caller sizes its next buffer from.
     assert_eq!(sent[1].1.len(), NEEDS_TWELVE.len());
+}
+
+// ---- what a plugin may do, and when ------------------------------------
+
+/// The gate that makes the permission sentence mean something: copying a
+/// `.wasm` into a folder grants nothing, and until somebody agrees the plugin
+/// runs and is refused.
+#[test]
+fn a_plugin_cannot_act_on_the_account_until_it_is_allowed() {
+    let dir = TempDir::new("ungranted");
+    dir.plugin("autoreply", PONG);
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Arc::clone(&commands), &published);
+
+    let surfaces = published.settles("the plugin to be listed", |s| !s.is_empty());
+    assert!(!surfaces[0].approved, "it is waiting on an answer");
+    assert_eq!(surfaces[0].capabilities, vec!["send messages".to_string()]);
+
+    plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(commands.sent().is_empty(), "asking is not being allowed");
+    assert!(
+        surfaces[0].is_running(),
+        "and it is refused rather than stopped: it may still watch"
+    );
+
+    // Now say yes, and the very next message is answered.
+    plugins.approve("autoreply", true);
+    published.settles("the answer to be recorded", |s| {
+        s.first().is_some_and(|p| p.approved)
+    });
+    plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    until("the reply", || commands.sent().len() == 1);
+
+    // And taking it back stops it again.
+    plugins.approve("autoreply", false);
+    published.settles("the withdrawal", |s| s.first().is_some_and(|p| !p.approved));
+    plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(commands.sent().len(), 1, "nothing more went out");
+}
+
+/// Drawing is not gated, and it must not be: a plugin that could not publish
+/// its settings panel before being allowed would leave the user agreeing to a
+/// name and a list of phrases with nothing to look at.
+#[test]
+fn an_unapproved_plugin_can_still_explain_itself() {
+    let dir = TempDir::new("draws-unapproved");
+    dir.plugin("greeter", &draws());
+    let published = Published::default();
+    let _plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    let surfaces = published.settles("its interface", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+    assert!(!surfaces[0].approved, "it still cannot send");
+    assert_eq!(surfaces[0].name, NAME, "and it still says who it is");
+}
+
+/// Shutdown has to finish from any state, and the hard one is a plugin whose
+/// queue is full: a stop message would have nowhere to go, so the sender is
+/// dropped and a flag tells the worker to abandon its backlog.
+#[test]
+fn shutting_down_finishes_even_with_a_saturated_queue() {
+    let dir = TempDir::new("saturated");
+    dir.plugin("autoreply", PONG);
+    let plugins = host(
+        &dir,
+        Recorder::new(Outcome::Accepted),
+        &Published::default(),
+    );
+
+    for _ in 0..(QUEUE_DEPTH * 4) {
+        plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    }
+
+    // On another thread with a deadline, because the failure this guards
+    // against is a hang: an assertion that never runs proves nothing, and a
+    // test that hangs takes CI's whole timeout with it.
+    let (done, waited) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            plugins.shutdown();
+            let _ = done.send(());
+        });
+        waited
+            .recv_timeout(Duration::from_secs(20))
+            .expect("shutdown returned");
+    });
+}
+
+/// `MAX_TIMERS` bounds what a plugin *holds*, not what it asks for in one
+/// call — otherwise a few far-future timers per message would grow the
+/// worker's list forever.
+#[test]
+fn a_plugin_cannot_grow_its_timer_list_across_calls() {
+    let dir = TempDir::new("timers");
+    dir.plugin("greedy", &arms_timers());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    // Each message asks for four timers, an hour out so none of them fires.
+    // Past the cap the host refuses, and the plugin reports the refusal by
+    // sending a message naming what it was told.
+    for _ in 0..12 {
+        plugins.observe(&message("a@s.whatsapp.net", "tick"));
+    }
+    until("a refusal", || {
+        commands.sent().iter().any(|(_, text, _)| text == "refused")
+    });
 }

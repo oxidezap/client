@@ -233,10 +233,22 @@ fn render_actions(
         .flex_shrink_0()
         .items_center()
         .gap(metrics.space_xxs())
-        // Before this window's own controls, so a plugin cannot push Call and
-        // the overflow menu off the edge of a narrow header: the buttons that
-        // are always there stay where a user learned they are.
-        .children(plugin_actions)
+        // Plugin controls come first so they read as belonging to the
+        // conversation rather than to the window's chrome — but in a region
+        // that may *shrink*, while this row and the native buttons after it
+        // may not. Ordering alone would not have protected them: a
+        // non-shrinking row simply grows, and Call and the overflow menu
+        // would go off the edge of a narrow header. What keeps them reachable
+        // is that the plugins' region is the only thing here that gives way.
+        .child(
+            div()
+                .flex()
+                .min_w_0()
+                .items_center()
+                .gap(metrics.space_xxs())
+                .overflow_hidden()
+                .children(plugin_actions),
+        )
         .when(layout.show_call_buttons(), |el| {
             el.child(
                 action(

@@ -36,7 +36,10 @@ const FUEL_FOR_INIT: u64 = 200_000_000;
 pub struct Runtime {
     pub id: String,
     pub name: String,
-    pub caps: i64,
+    /// What it asked to be allowed to do, which is not what it may do: the
+    /// store starts with whatever the user had already agreed to, and this is
+    /// what the surface shows so they can agree to the rest.
+    pub requested_caps: i64,
     pub subscription: i64,
     store: Store<Guest>,
     on_event: TypedFunc<(i32, i32), i32>,
@@ -65,6 +68,11 @@ impl Runtime {
         id: &str,
         state_dir: Option<&Path>,
         commands: Arc<dyn Commands>,
+        // The raw mask the user has already agreed to for this plugin, read
+        // before it runs a single instruction — so whatever it declares
+        // during `oxi_init`, what it *holds* there is already bounded by the
+        // answer.
+        approved: i64,
     ) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
 
@@ -94,12 +102,15 @@ impl Runtime {
                     .build(),
                 phase: Phase::Init,
                 subscription: 0,
+                requested: 0,
                 caps: 0,
+                approved,
                 name: None,
                 event: None,
                 arena: Vec::new(),
                 ui: None,
                 timers: Vec::new(),
+                pending_timers: 0,
                 kv,
                 commands,
             },
@@ -142,17 +153,42 @@ impl Runtime {
 
         let guest = store.data();
         let name = guest.name.clone().unwrap_or_else(|| id.to_owned());
-        let caps = guest.caps;
+        let requested_caps = guest.requested;
         let subscription = guest.subscription;
 
         Ok(Self {
             id: id.to_owned(),
             name,
-            caps,
+            requested_caps,
             subscription,
             store,
             on_event,
         })
+    }
+
+    /// Apply the user's answer.
+    ///
+    /// Only this thread may touch the store, which is why this is reached
+    /// through the plugin's own queue rather than written from wherever the
+    /// answer arrived.
+    pub fn set_capabilities(&mut self, approved: i64) {
+        let guest = self.store.data_mut();
+        guest.approved = approved;
+        guest.caps = crate::approvals::effective(guest.requested, approved);
+    }
+
+    /// The timers armed during `oxi_init`, if any.
+    ///
+    /// Taken separately for the same reason the initial interface is: a
+    /// plugin whose whole job is periodic arms its first timer there and
+    /// subscribes to no event at all, so dropping these would leave it
+    /// waiting for a wake-up nobody was going to send.
+    pub fn take_initial_timers(&mut self) -> Vec<(i64, i64)> {
+        let now = wacore::time::now_millis();
+        std::mem::take(&mut self.store.data_mut().timers)
+            .into_iter()
+            .map(|(delay, token)| (now.saturating_add(delay), token))
+            .collect()
     }
 
     /// The tree the plugin published during `oxi_init`, if any.
@@ -171,7 +207,7 @@ impl Runtime {
     /// out that does: a plugin returning a non-zero answer has said something
     /// went wrong with one event, which is its business, while a trap means
     /// it ran out of fuel, out of memory, or off the end of its own logic.
-    pub fn deliver(&mut self, event: Arc<Event>) -> Result<Effects> {
+    pub fn deliver(&mut self, event: Arc<Event>, pending_timers: usize) -> Result<Effects> {
         let kind = event.kind;
         {
             let guest = self.store.data_mut();
@@ -179,6 +215,9 @@ impl Runtime {
             guest.arena.clear();
             guest.ui = None;
             guest.timers.clear();
+            // What the worker already holds armed, so the cap is on what this
+            // plugin *has* rather than on what it asks for in one call.
+            guest.pending_timers = pending_timers;
         }
         // Reset per call, not topped up: a budget that carried over would let
         // a plugin bank the fuel of every event it ignored and spend it on

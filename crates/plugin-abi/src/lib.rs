@@ -237,6 +237,21 @@ pub mod caps {
     /// bit outside it.
     pub const ALL: i64 = SEND | MARK_READ | TYPING | UI | STORAGE | TIMERS;
 
+    /// The ones that act on the *account*, and so do not take effect until
+    /// the user has agreed to them.
+    ///
+    /// The line is drawn at what a plugin can do that someone else would
+    /// notice: send as you, clear your unread, tell a contact you are typing.
+    /// The rest — drawing, its own settings file, its own timer — is confined
+    /// to the plugin, and gating those would mean a plugin could not draw the
+    /// panel explaining itself before it was allowed to draw anything, which
+    /// would leave the user agreeing to a name and a bit-list.
+    ///
+    /// A plugin holds these only once approved, and holds them from before
+    /// `oxi_init` runs rather than after: init is code the plugin chose too,
+    /// and granting for the length of one call is granting.
+    pub const NEEDS_APPROVAL: i64 = SEND | MARK_READ | TYPING;
+
     /// A short, user-facing name for one capability bit.
     ///
     /// Here rather than in the host because it is part of what the ABI

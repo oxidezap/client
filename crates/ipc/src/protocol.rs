@@ -667,6 +667,17 @@ pub enum ClientRequest {
     PluginAction {
         action: PluginAction,
     },
+    /// Allow, or stop allowing, what a plugin asked to be able to do.
+    ///
+    /// Its own request rather than a reserved [`PluginAction`] id, and that
+    /// is the point: an action id comes from the plugin's own tree, so a
+    /// plugin could publish a button labelled "OK" carrying whatever id the
+    /// approval used and have a user grant it by pressing the wrong thing.
+    /// Nothing a plugin can write reaches this.
+    PluginApproval {
+        plugin: String,
+        approved: bool,
+    },
     /// Stop the daemon: disconnect the session, close the store, exit.
     Shutdown,
 }

@@ -49,13 +49,14 @@ pub fn slot(
     plugins
         .iter()
         .flat_map(|surface| surface.roots_in(slot).map(move |node| (surface, node)))
-        .map(|(surface, node)| widget(surface, node, app, ctx, cx).into_any_element())
+        .map(|(surface, node)| widget(surface, slot, node, app, ctx, cx).into_any_element())
         .collect()
 }
 
 /// One widget and, below it, whatever it holds.
 fn widget(
     surface: &PluginSurface,
+    slot: PluginSlot,
     node: &PluginNode,
     app: &WhatsAppApp,
     ctx: &PluginContext,
@@ -64,10 +65,12 @@ fn widget(
     let metrics = ctx.metrics;
     // A plugin that has stopped keeps its widgets on screen and loses the
     // ability to act: a control that vanished tells nobody anything, while
-    // one drawn inert beside a reason says what happened. This is also why
-    // the flag is `&&`ed rather than replacing the plugin's own — a widget
-    // the plugin itself disabled stays disabled when it stops.
-    let live = surface.is_running() && node.enabled;
+    // one drawn inert beside a reason says what happened. The same goes for
+    // one still waiting to be allowed — its buttons would be refused at the
+    // host, and drawing them live would be an invitation to press something
+    // that does nothing. This is also why the plugin's own flag is `&&`ed
+    // rather than replaced: a widget it disabled stays disabled.
+    let live = surface.is_running() && surface.approved && node.enabled;
 
     match node.widget {
         PluginWidget::Button => {
@@ -84,7 +87,7 @@ fn widget(
             .on_click(move |_, _window, cx| {
                 let (plugin, action) = (plugin.clone(), action.clone());
                 entity.update(cx, |app, cx| {
-                    app.send_plugin_action(&plugin, &action, None, cx);
+                    app.send_plugin_action(&plugin, &action, None, slot, cx);
                 });
             })
             .into_any_element()
@@ -109,7 +112,7 @@ fn widget(
                     // press a no-op the second time.
                     let value = if checked { "0" } else { "1" }.to_string();
                     entity.update(cx, |app, cx| {
-                        app.send_plugin_action(&plugin, &action, Some(value), cx);
+                        app.send_plugin_action(&plugin, &action, Some(value), slot, cx);
                     });
                 })
                 .into_any_element(),
@@ -150,14 +153,14 @@ fn widget(
             .items_center()
             .flex_wrap()
             .gap(metrics.space_md())
-            .children(children(surface, node, app, ctx, cx))
+            .children(children(surface, slot, node, app, ctx, cx))
             .into_any_element(),
 
         PluginWidget::Column => div()
             .flex()
             .flex_col()
             .gap(metrics.space_md())
-            .children(children(surface, node, app, ctx, cx))
+            .children(children(surface, slot, node, app, ctx, cx))
             .into_any_element(),
 
         PluginWidget::Section => div()
@@ -178,7 +181,7 @@ fn widget(
                     .flex()
                     .flex_col()
                     .gap(metrics.space_lg())
-                    .children(children(surface, node, app, ctx, cx)),
+                    .children(children(surface, slot, node, app, ctx, cx)),
             )
             .into_any_element(),
     }
@@ -186,6 +189,7 @@ fn widget(
 
 fn children(
     surface: &PluginSurface,
+    slot: PluginSlot,
     node: &PluginNode,
     app: &WhatsAppApp,
     ctx: &PluginContext,
@@ -193,7 +197,7 @@ fn children(
 ) -> Vec<gpui::AnyElement> {
     node.children
         .iter()
-        .map(|child| widget(surface, child, app, ctx, cx))
+        .map(|child| widget(surface, slot, child, app, ctx, cx))
         .collect()
 }
 
@@ -241,11 +245,41 @@ pub fn settings_entry(
 ) -> impl IntoElement + use<> {
     let metrics = ctx.metrics;
     let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let wants = surface.capabilities.join(", ");
     let permissions = if surface.capabilities.is_empty() {
         "Watches only. It cannot act on your account.".to_string()
+    } else if surface.approved {
+        format!("Allowed to: {wants}")
     } else {
-        format!("May: {}", surface.capabilities.join(", "))
+        // The sentence, before anything is granted rather than after. A
+        // plugin that has not been allowed is running and refused: it can
+        // watch, and every command it issues comes back denied.
+        format!("Wants to: {wants}")
     };
+    // Drawn by this window and not by the plugin, which is the whole point:
+    // a widget id comes from the plugin's own tree, so a control it could
+    // publish is a control it could disguise.
+    let approval = (!surface.capabilities.is_empty()).then(|| {
+        let id = surface.id.clone();
+        let entity = ctx.entity.clone();
+        let approved = surface.approved;
+        row_with_label(
+            if approved {
+                "Allowed"
+            } else {
+                "Not allowed yet"
+            },
+            Switch::new(SharedString::from(format!("plugin-allow-{}", surface.id)))
+                .checked(approved)
+                .on_click(move |_, _window, cx| {
+                    let id = id.clone();
+                    entity.update(cx, |app, cx| app.approve_plugin(&id, !approved, cx));
+                })
+                .into_any_element(),
+            metrics,
+            cx,
+        )
+    });
 
     div()
         .w_full()
@@ -291,6 +325,7 @@ pub fn settings_entry(
                 // Why it stopped, where the widgets it left behind are. A
                 // plugin that simply disappeared would give nobody anything
                 // to act on.
+                .children(approval)
                 .children(surface.stopped.as_ref().map(|reason| {
                     div()
                         .text_size(metrics.text_small())
@@ -301,6 +336,6 @@ pub fn settings_entry(
         .children(
             surface
                 .roots_in(PluginSlot::Settings)
-                .map(|node| widget(surface, node, app, ctx, cx)),
+                .map(|node| widget(surface, PluginSlot::Settings, node, app, ctx, cx)),
         )
 }

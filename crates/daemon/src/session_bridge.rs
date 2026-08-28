@@ -284,7 +284,16 @@ pub async fn run(
         }
     };
 
-    // Plugins first, and for exactly the reason the publisher is joined
+    // Before the plugins are joined, and this ordering is the whole of it: a
+    // plugin thread that issued a command is parked on its answer, and the
+    // loop that would have answered has just stopped running. Dropping the
+    // receiver ends both halves at once — a command already queued has its
+    // reply channel dropped with it, so the plugin's wait returns, and every
+    // command after this fails to send at all. Joining first would have the
+    // teardown waiting for a thread waiting for the teardown.
+    drop(commands);
+
+    // Plugins next, and for exactly the reason the publisher is joined
     // below: one still in a handler can write its settings file, and that
     // file sits in a directory the wipe is about to remove. Joining is
     // blocking, so it goes on a blocking thread like the rest of the

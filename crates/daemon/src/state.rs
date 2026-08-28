@@ -996,6 +996,7 @@ mod tests {
             id: id.into(),
             name: id.into(),
             capabilities: vec!["send messages".into()],
+            approved: true,
             roots: vec![oxidezap_core::PluginRoot {
                 slot: oxidezap_core::PluginSlot::ChatHeader,
                 node: oxidezap_core::PluginNode {

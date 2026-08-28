@@ -108,6 +108,19 @@ pub struct PluginSurface {
     /// do". A user consents to the sentence, not to the bit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// Whether the user has agreed to [`capabilities`](Self::capabilities).
+    ///
+    /// Until they have, every command this plugin issues is refused — asking
+    /// is not being allowed, and copying a file into a folder is not consent.
+    /// A plugin that asked for nothing is approved by definition: there is no
+    /// sentence to agree to, and a prompt with nothing in it only teaches
+    /// people to dismiss prompts.
+    ///
+    /// Not skipped when false, unlike most of this frame. A front end has to
+    /// tell "this plugin is waiting on you" from "an older daemon does not
+    /// know about approval", and absence reading as `false` would make an old
+    /// daemon's every plugin look blocked.
+    pub approved: bool,
     /// What it wants drawn. Empty for a plugin that draws nothing, which is
     /// the ordinary case for one that only watches.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

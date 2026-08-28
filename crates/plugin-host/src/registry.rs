@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use oxidezap_core::{PluginRoot, PluginSurface};
 use oxidezap_plugin_abi as abi;
 
+use crate::approvals::Approvals;
+
 /// Where a published set of surfaces goes.
 ///
 /// A callback rather than a channel: the daemon's hub is what publishes
@@ -23,7 +25,8 @@ pub type Sink = Arc<dyn Fn(Vec<PluginSurface>) + Send + Sync>;
 #[derive(Debug, Clone)]
 struct Entry {
     name: String,
-    caps: i64,
+    /// What it asked to be allowed to do, which is not what it may do.
+    requested: i64,
     roots: Vec<PluginRoot>,
     stopped: Option<String>,
 }
@@ -35,14 +38,18 @@ struct Entry {
 /// between two frames would move a button under somebody's cursor.
 pub struct Registry {
     entries: Mutex<BTreeMap<String, Entry>>,
+    /// What the user has allowed. Held here because the surface has to say
+    /// so, and because the answer outlives any one plugin thread.
+    approvals: Approvals,
     sink: Sink,
 }
 
 impl Registry {
     #[must_use]
-    pub fn new(sink: Sink) -> Self {
+    pub fn new(sink: Sink, approvals: Approvals) -> Self {
         Self {
             entries: Mutex::new(BTreeMap::new()),
+            approvals,
             sink,
         }
     }
@@ -53,17 +60,34 @@ impl Registry {
     /// Published even with no widgets, because "which plugins are running"
     /// is what the Settings screen lists, and one that draws nothing is
     /// still something a user needs to be able to see is there.
-    pub fn insert(&self, id: &str, name: String, caps: i64) {
+    pub fn insert(&self, id: &str, name: String, requested: i64) {
         self.lock().insert(
             id.to_owned(),
             Entry {
                 name,
-                caps,
+                requested,
                 roots: Vec::new(),
                 stopped: None,
             },
         );
         self.publish();
+    }
+
+    /// The raw mask the user has agreed to for this plugin.
+    ///
+    /// Read before a plugin is instantiated, so what it holds during its own
+    /// `oxi_init` is already bounded by the answer.
+    #[must_use]
+    pub fn approved(&self, id: &str) -> i64 {
+        self.approvals.approved(id)
+    }
+
+    /// Record the user's answer and hand back the mask to give the plugin.
+    pub fn approve(&self, id: &str, approved: bool) -> i64 {
+        let requested = self.lock().get(id).map_or(0, |e| e.requested);
+        let mask = self.approvals.set(id, requested, approved);
+        self.publish();
+        mask
     }
 
     /// Replace what a plugin wants drawn.
@@ -125,7 +149,8 @@ impl Registry {
             .map(|(id, entry)| PluginSurface {
                 id: id.clone(),
                 name: entry.name.clone(),
-                capabilities: describe(entry.caps),
+                capabilities: describe(entry.requested),
+                approved: self.approvals.is_approved(id, entry.requested),
                 roots: entry.roots.clone(),
                 stopped: entry.stopped.clone(),
             })
@@ -167,9 +192,14 @@ mod tests {
     fn recorder() -> (Registry, Arc<Mutex<Vec<Vec<PluginSurface>>>>) {
         let log: Arc<Mutex<Vec<Vec<PluginSurface>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_log = Arc::clone(&log);
-        let registry = Registry::new(Arc::new(move |s| {
-            sink_log.lock().expect("not poisoned").push(s);
-        }));
+        let registry = Registry::new(
+            Arc::new(move |s| {
+                sink_log.lock().expect("not poisoned").push(s);
+            }),
+            // Nowhere to write: these tests are about what the registry
+            // publishes, not about what survives a restart.
+            Approvals::open(None),
+        );
         (registry, log)
     }
 
@@ -199,6 +229,35 @@ mod tests {
         assert_eq!(surface.id, "autoreply");
         assert!(surface.roots.is_empty());
         assert_eq!(surface.capabilities, vec!["send messages".to_string()]);
+        assert!(
+            !surface.approved,
+            "asking is not being allowed: nothing is granted until somebody says so"
+        );
+    }
+
+    /// The sentence and the answer are separate: what a plugin asked for is
+    /// still shown after the answer, because withdrawing has to be possible.
+    #[test]
+    fn approving_leaves_the_request_visible() {
+        let (registry, _) = recorder();
+        registry.insert("p", "p".into(), abi::caps::SEND);
+        assert_eq!(registry.approve("p", true), abi::caps::SEND);
+
+        let surface = registry.surfaces().remove(0);
+        assert!(surface.approved);
+        assert_eq!(surface.capabilities, vec!["send messages".to_string()]);
+
+        assert_eq!(registry.approve("p", false), 0);
+        assert!(!registry.surfaces()[0].approved);
+    }
+
+    /// A plugin that wants nothing has no sentence to agree to, so it must
+    /// not be drawn as waiting on one.
+    #[test]
+    fn a_plugin_that_asks_for_nothing_is_already_approved() {
+        let (registry, _) = recorder();
+        registry.insert("watcher", "watcher".into(), 0);
+        assert!(registry.surfaces()[0].approved);
     }
 
     /// A plugin republishing the same tree on every message is the ordinary

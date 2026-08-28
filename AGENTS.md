@@ -136,9 +136,27 @@ profile here repeats it deliberately.
   configuration, and half the interesting plugins want it, which is exactly
   why it deserves to be decided on its own rather than as a nineteenth import.
   What a plugin *may do* is a mask it declares during `oxi_init` and only
-  then, because that list is what a user is shown before enabling a file they
-  downloaded — one that could widen it afterwards would make the sentence stop
-  being true.
+  then, because that list is what a user is shown before deciding — one that
+  could widen it afterwards would make the sentence stop being true.
+- **Asking is not being allowed.** Declaring a capability grants nothing;
+  dropping a `.wasm` in a folder is not consent. What acts on the *account* —
+  sending, marking read, showing a typing indicator — is withheld until
+  somebody says yes, and the answer is recorded against the exact mask it
+  answered: a plugin that comes back wanting more is not partly approved, it
+  is unapproved again, because the sentence agreed to is no longer the
+  sentence being asked. The mask is read before the plugin runs a single
+  instruction and applied *inside* `oxi_request_caps`, because `oxi_init` is
+  code the plugin chose too and granting for the length of one call is
+  granting. What a plugin does only to itself — draw, keep its own settings,
+  run its own timer — takes effect on declaration, and has to: a plugin that
+  could not publish its settings panel before being allowed would leave the
+  user agreeing to a name and a list of phrases with nothing to look at. The
+  answer travels as `ClientRequest::PluginApproval` rather than a reserved
+  widget id, because an id comes from the plugin's own tree — one could
+  publish a button labelled "OK" carrying that id and be granted by somebody
+  pressing the wrong thing. And the file lives beside the daemon's state,
+  never in the plugin's own key-value store: a plugin that can write its own
+  approval has none.
 - **An event is a handle, not a payload.** Nothing is serialized for a plugin:
   it reads fields through four host functions against a table of constants, so
   a handler that looks at the text and the chat pays for two strings out of an
@@ -158,11 +176,27 @@ profile here repeats it deliberately.
   worth nothing later, but a plugin's whole contract is having *seen* the
   messages. An autoreply that answered some people and not others, with
   nothing anywhere saying which, is worse than one that is off with a reason
-  attached. A trap ends it the same way and for the same reason — fuel gone,
-  memory refused, or the plugin running off the end of its own logic, none of
-  which the next event improves — and it is never restarted in a loop, which
-  would spend a CPU rediscovering that. Its widgets stay on screen, drawn
-  inert beside the reason: a control that vanished tells nobody anything.
+  attached. "Stopped" also has to mean it runs no more of them — the worker
+  checks before every event and `offer` refuses to queue another, or a plugin
+  would go on working through five hundred banked messages while Settings
+  reported it as stopped. A trap ends it the same way and for the same reason
+  — fuel gone, memory refused, or the plugin running off the end of its own
+  logic, none of which the next event improves — and it is never restarted in
+  a loop, which would spend a CPU rediscovering that. Its widgets stay on
+  screen, drawn inert beside the reason: a control that vanished tells nobody
+  anything.
+- **Stopping a plugin is dropping its channel, never queueing a message.** A
+  stop message has to *fit*, and the plugin that most needs stopping is the
+  one whose queue is full — `try_send` there drops the request on the floor
+  and the daemon then waits forever to join a thread nobody told to leave. So
+  shutdown raises a flag and drops the sender: the flag is what makes a worker
+  abandon a backlog it has already been handed, and the closed channel is what
+  wakes one parked in `recv`. Neither alone is enough. The bridge has the
+  mirror of it: the command receiver is dropped *before* the plugins are
+  joined, because a plugin parked on a command's answer is parked on a loop
+  that has already stopped running — dropping the receiver drops the reply
+  channel with it and the wait returns, where joining first would have the
+  teardown waiting for a thread waiting for the teardown.
 - **A plugin's interface is daemon state.** The plugin runs in the daemon and
   the widgets are drawn in the window, which are two processes; the answer is
   not a channel between them. A plugin *declares* a small tree pinned to a

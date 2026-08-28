@@ -649,6 +649,19 @@ impl Session {
     /// The open chat travels along because the daemon does not know it: a
     /// header button is about the conversation the person pressing it was
     /// looking at, and two windows can have different ones.
+    /// Allow, or stop allowing, what a plugin asked to be able to do.
+    ///
+    /// Not a [`plugin_action`](Self::plugin_action) with a reserved id: an
+    /// action id comes from the plugin's own tree, so a plugin could publish
+    /// a button labelled "OK" carrying that id and be granted by somebody
+    /// pressing the wrong thing.
+    pub fn plugin_approval(&self, plugin: &str, approved: bool) {
+        self.tell(ClientRequest::PluginApproval {
+            plugin: plugin.to_string(),
+            approved,
+        });
+    }
+
     pub fn plugin_action(
         &self,
         plugin: &str,
@@ -1100,9 +1113,13 @@ fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
     // Before the connection state, like the chat list above it and for the
     // same reason: a window that draws its first frame without them flashes
     // a plugin's button into the header a moment after everything else.
-    if !snapshot.plugins.is_empty() {
-        events.push(FromDaemon::Plugins(snapshot.plugins.clone()));
-    }
+    //
+    // Always, including when it is empty. A snapshot is whole state, so an
+    // empty set is the daemon saying there are none — after a plugin was
+    // removed, failed to load, or the account was reset — and skipping it
+    // would leave the previous daemon's buttons on screen with nothing behind
+    // them.
+    events.push(FromDaemon::Plugins(snapshot.plugins.clone()));
     match &snapshot.connection {
         ConnectionState::Connecting => events.push(session(UiEvent::InitComplete)),
         ConnectionState::Pairing { qr, pair_code } => {

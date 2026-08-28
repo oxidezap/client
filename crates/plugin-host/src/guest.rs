@@ -22,7 +22,11 @@ use crate::event::{Event, Value};
 use crate::kv::Kv;
 use crate::{Commands, Outcome};
 
-/// How many timers one plugin may have outstanding.
+/// How many timers one plugin may have outstanding at once.
+///
+/// Outstanding, not per call: the runtime reports what is already armed, so a
+/// plugin cannot add a few far-future timers on every message and grow the
+/// worker's list forever.
 const MAX_TIMERS: usize = 16;
 
 /// The shortest timer a plugin may set.
@@ -53,7 +57,16 @@ pub struct Guest {
     pub limits: StoreLimits,
     pub phase: Phase,
     pub subscription: i64,
+    /// What the plugin asked for, whether or not it holds it.
+    pub requested: i64,
+    /// What it actually holds — the request, minus anything gated that the
+    /// user has not agreed to. Computed when the request arrives rather than
+    /// after `oxi_init` returns: init is code the plugin chose too, and
+    /// granting for the length of one call is granting.
     pub caps: i64,
+    /// The raw mask the user agreed to, as read from disk before this plugin
+    /// ran a single instruction.
+    pub approved: i64,
     pub name: Option<String>,
     /// The event being handled, reachable through handle 0. `None` outside a
     /// call, which is what makes a stale handle read as absent rather than as
@@ -67,6 +80,11 @@ pub struct Guest {
     pub ui: Option<Vec<PluginRoot>>,
     /// Timers requested during this call: `(delay_ms, token)`.
     pub timers: Vec<(i64, i64)>,
+    /// How many this plugin already has armed, set by the runtime before each
+    /// call. Without it `MAX_TIMERS` would bound one call rather than one
+    /// plugin, and a handful of far-future timers per message would grow the
+    /// worker's list without limit.
+    pub pending_timers: usize,
     pub kv: Kv,
     pub commands: Arc<dyn Commands>,
 }
@@ -126,9 +144,15 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if c.data().phase != Phase::Init {
                 return;
             }
-            // Masked to what exists, for the same reason, and because a bit the
-            // host cannot name is one it could not have shown the user.
-            c.data_mut().caps = mask & abi::caps::ALL;
+            let guest = c.data_mut();
+            // Masked to what exists, for the same reason, and because a bit
+            // the host cannot name is one it could not have shown the user.
+            guest.requested = mask & abi::caps::ALL;
+            // Asking is not being allowed. What it *holds* is decided here,
+            // inside the call that asked, so there is no window — not even
+            // the length of `oxi_init` — in which a plugin has what it merely
+            // declared.
+            guest.caps = crate::approvals::effective(guest.requested, guest.approved);
         },
     )?;
 
@@ -399,7 +423,7 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 return abi::outcome::DENIED;
             }
             let guest = c.data_mut();
-            if guest.timers.len() >= MAX_TIMERS {
+            if guest.pending_timers + guest.timers.len() >= MAX_TIMERS {
                 return abi::outcome::REFUSED;
             }
             guest.timers.push((delay_ms.max(MIN_TIMER_MS), token));

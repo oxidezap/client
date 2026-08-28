@@ -990,6 +990,14 @@ async fn handle_request(
             plugins.act(&action);
             acted(Ok(()))
         }
+        // The one thing about a plugin that a plugin has no say in. Answered
+        // rather than dispatched, like the action above: what the plugin does
+        // with its new permissions is its own business and arrives as a
+        // republished surface.
+        ClientRequest::PluginApproval { plugin, approved } => {
+            plugins.approve(&plugin, approved);
+            acted(Ok(()))
+        }
         // The acknowledgement goes out first; see the caller.
         ClientRequest::Shutdown => Answer {
             frame: answer(id, Ok(())),

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use gpui::{AppContext as _, Context, Entity, Window};
 use gpui_component::input::{InputEvent, InputState};
-use oxidezap_core::{PluginNode, PluginSurface, PluginWidget};
+use oxidezap_core::{PluginNode, PluginSlot, PluginSurface, PluginWidget};
 
 use super::WhatsAppApp;
 
@@ -42,23 +42,27 @@ impl WhatsAppApp {
     /// which widgets are actually on screen — and because a plugin's tree
     /// changes without any event this window would otherwise act on.
     pub fn sync_plugin_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut wanted: Vec<(String, String, String, String)> = Vec::new();
+        let mut wanted: Vec<Field> = Vec::new();
         for surface in &self.plugins {
             for root in &surface.roots {
-                collect_fields(&surface.id, &root.node, &mut wanted);
+                collect_fields(&surface.id, root.slot, &root.node, &mut wanted);
             }
         }
 
         // Gone means gone: a plugin that stopped drawing a field has taken it
         // back, and holding the entity would keep a subscription alive that
         // fires into a widget nobody can see.
-        let live: std::collections::HashSet<String> = wanted
-            .iter()
-            .map(|(plugin, id, _, _)| key(plugin, id))
-            .collect();
+        let live: std::collections::HashSet<String> =
+            wanted.iter().map(|f| key(&f.plugin, &f.id)).collect();
         self.plugin_fields.retain(|k, _| live.contains(k));
 
-        for (plugin, id, _label, value) in wanted {
+        for Field {
+            plugin,
+            slot,
+            id,
+            value,
+        } in wanted
+        {
             let k = key(&plugin, &id);
             match self.plugin_fields.get_mut(&k) {
                 Some(field) => {
@@ -78,6 +82,7 @@ impl WhatsAppApp {
                         cx.new(|cx| InputState::new(window, cx).default_value(value.clone()));
                     let commit_plugin = plugin.clone();
                     let commit_id = id.clone();
+                    let commit_slot = slot;
                     let commit = cx.subscribe(&state, move |app, state, event, cx| {
                         // Enter, and only Enter. A field that committed on
                         // every keystroke would send one request per letter
@@ -85,7 +90,13 @@ impl WhatsAppApp {
                         // being given.
                         if matches!(event, InputEvent::PressEnter { .. }) {
                             let value = state.read(cx).value().to_string();
-                            app.send_plugin_action(&commit_plugin, &commit_id, Some(value), cx);
+                            app.send_plugin_action(
+                                &commit_plugin,
+                                &commit_id,
+                                Some(value),
+                                commit_slot,
+                                cx,
+                            );
                         }
                     });
                     self.plugin_fields.insert(
@@ -113,19 +124,37 @@ impl WhatsAppApp {
         &self.plugins
     }
 
+    /// Allow, or stop allowing, what a plugin asked to be able to do.
+    pub fn approve_plugin(&mut self, plugin: &str, approved: bool, cx: &mut Context<Self>) {
+        if let Some(client) = self.client.as_ref() {
+            client.plugin_approval(plugin, approved);
+        }
+        // Nothing changes here either: the daemon republishes the surface
+        // with the answer in it, and drawing the toggle optimistically would
+        // be this window claiming a permission was granted before anything
+        // wrote it down.
+        cx.notify();
+    }
+
     /// Tell a plugin one of its widgets was used.
     ///
-    /// The open conversation goes along because the daemon has no idea which
-    /// one this window has: a header button is about the chat the person
-    /// pressing it was looking at.
+    /// The open conversation goes along only for a slot that has one. A
+    /// header button is about the chat the person pressing it was looking at;
+    /// a control in Settings is about no conversation at all, and handing it
+    /// the retained selection would let a generic handler act on a chat
+    /// nobody was looking at.
     pub fn send_plugin_action(
         &mut self,
         plugin: &str,
         action: &str,
         value: Option<String>,
+        slot: PluginSlot,
         cx: &mut Context<Self>,
     ) {
-        let chat = self.selected_chat_jid();
+        let chat = match slot {
+            PluginSlot::ChatHeader => self.selected_chat_jid(),
+            PluginSlot::Settings => None,
+        };
         if let Some(client) = self.client.as_ref() {
             client.plugin_action(plugin, action, value, chat);
         }
@@ -136,22 +165,28 @@ impl WhatsAppApp {
     }
 }
 
+/// One text field found in a plugin's tree.
+struct Field {
+    plugin: String,
+    /// Which slot its root was in, so committing it carries the same context
+    /// pressing a button there would.
+    slot: PluginSlot,
+    id: String,
+    value: String,
+}
+
 /// Every text field in a tree, with the value the plugin gave it.
-fn collect_fields(
-    plugin: &str,
-    node: &PluginNode,
-    out: &mut Vec<(String, String, String, String)>,
-) {
+fn collect_fields(plugin: &str, slot: PluginSlot, node: &PluginNode, out: &mut Vec<Field>) {
     if node.widget == PluginWidget::TextField && !node.id.is_empty() {
-        out.push((
-            plugin.to_owned(),
-            node.id.clone(),
-            node.label.clone(),
-            node.value.clone(),
-        ));
+        out.push(Field {
+            plugin: plugin.to_owned(),
+            slot,
+            id: node.id.clone(),
+            value: node.value.clone(),
+        });
     }
     for child in &node.children {
-        collect_fields(plugin, child, out);
+        collect_fields(plugin, slot, child, out);
     }
 }
 

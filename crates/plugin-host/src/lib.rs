@@ -26,6 +26,7 @@
 //! reason the ABI has no `oxi_http_fetch`: adding one would turn the sentence
 //! above into a promise about configuration.
 
+mod approvals;
 mod event;
 mod guest;
 mod kv;
@@ -33,14 +34,16 @@ mod registry;
 mod runtime;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 
 use oxidezap_core::{PluginAction, PluginSurface, UiEvent};
 use oxidezap_plugin_abi as abi;
 
 pub use registry::Sink;
 
+use crate::approvals::Approvals;
 use crate::event::Event;
 use crate::registry::Registry;
 use crate::runtime::Runtime;
@@ -95,26 +98,39 @@ pub trait Commands: Send + Sync + 'static {
 pub struct Plugins {
     registry: Arc<Registry>,
     workers: Vec<Worker>,
+    /// Raised once, by [`Plugins::shutdown`].
+    ///
+    /// Read by every worker before it takes another event, so a plugin with a
+    /// full queue abandons its backlog instead of grinding through five
+    /// hundred wasm calls while the daemon waits to exit.
+    stopping: Arc<AtomicBool>,
 }
 
 struct Worker {
     id: String,
     subscription: i64,
-    queue: SyncSender<Job>,
-    /// Taken by whoever shuts down first. Behind a lock because the daemon
-    /// holds this whole host through an `Arc` — the server routes actions
-    /// into it while the bridge feeds it events — and there is no moment
-    /// where one of them has it exclusively.
-    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Dropped by [`Plugins::shutdown`], which is what ends the worker.
+    ///
+    /// Dropping the sender rather than queueing a stop message, because a
+    /// stop message has to fit: a plugin whose queue is full is exactly the
+    /// one that needs stopping, and `try_send` on a full queue drops the
+    /// request on the floor. A closed channel cannot be full.
+    queue: Mutex<Option<SyncSender<Job>>>,
+    /// Taken by whoever shuts down first. Behind a lock for the same reason
+    /// the sender is: the daemon holds this whole host through an `Arc` — the
+    /// server routes actions into it while the bridge feeds it events — and
+    /// there is no moment where one of them has it exclusively.
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// What arrives on a plugin's queue.
 enum Job {
     Event(Arc<Event>),
-    /// Stop after finishing whatever is already in the queue. Distinct from
-    /// dropping the sender only in that it can jump nothing: a plugin that is
-    /// mid-handler still finishes it.
-    Stop,
+    /// What the user has allowed this plugin to do, now that they have said.
+    ///
+    /// A job rather than a shared value, because the mask lives inside the
+    /// plugin's wasm store and only its own thread may touch that.
+    Capabilities(i64),
 }
 
 impl Plugins {
@@ -134,7 +150,11 @@ impl Plugins {
         commands: Arc<dyn Commands>,
         sink: Sink,
     ) -> Self {
-        let registry = Arc::new(Registry::new(sink));
+        // The approvals live beside the daemon's own state and never in a
+        // plugin's key-value store: one that could write its own approval has
+        // none.
+        let registry = Arc::new(Registry::new(sink, Approvals::open(state_dir)));
+        let stopping = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::new();
 
         if let Some(state_dir) = state_dir
@@ -154,8 +174,11 @@ impl Plugins {
                 );
                 continue;
             };
-            match Runtime::load(&path, &id, state_dir, Arc::clone(&commands)) {
-                Ok(runtime) => workers.push(start(runtime, Arc::clone(&registry))),
+            let approved = registry.approved(&id);
+            match Runtime::load(&path, &id, state_dir, Arc::clone(&commands), approved) {
+                Ok(runtime) => {
+                    workers.push(start(runtime, Arc::clone(&registry), Arc::clone(&stopping)))
+                }
                 // One plugin that will not load is one plugin, said plainly
                 // and once. A daemon that refused to serve an account because
                 // a file in a folder was stale would be a worse trade than
@@ -176,7 +199,11 @@ impl Plugins {
             );
         }
 
-        Self { registry, workers }
+        Self {
+            registry,
+            workers,
+            stopping,
+        }
     }
 
     /// A host with nothing loaded, for a daemon built without a plugin
@@ -184,8 +211,9 @@ impl Plugins {
     #[must_use]
     pub fn none(sink: Sink) -> Self {
         Self {
-            registry: Arc::new(Registry::new(sink)),
+            registry: Arc::new(Registry::new(sink, Approvals::open(None))),
             workers: Vec::new(),
+            stopping: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -258,21 +286,35 @@ impl Plugins {
     /// beside the store, and one still writing it while the directory is
     /// deleted recreates what the wipe just removed.
     pub fn shutdown(&self) {
+        // The flag first, so a worker part-way through a backlog stops taking
+        // from it; then the sender, so one parked in `recv` wakes up. Neither
+        // alone is enough: the flag is only read between events, and a closed
+        // channel still hands over what is already queued.
+        self.stopping.store(true, Ordering::Relaxed);
         for worker in &self.workers {
-            let _ = worker.queue.try_send(Job::Stop);
+            drop(lock(&worker.queue).take());
         }
         for worker in &self.workers {
-            let thread = worker
-                .thread
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            let thread = lock(&worker.thread).take();
             if let Some(thread) = thread
                 && thread.join().is_err()
             {
                 log::warn!("plugin {}: its thread panicked on the way out", worker.id);
             }
         }
+    }
+
+    /// Grant or withhold what a plugin asked to be allowed to do.
+    ///
+    /// Persisted before it is applied, because the answer has to survive a
+    /// restart: a plugin re-granted on every start would be one whose
+    /// permission prompt means nothing.
+    pub fn approve(&self, id: &str, approved: bool) {
+        let Some(worker) = self.workers.iter().find(|w| w.id == id) else {
+            return;
+        };
+        let granted = self.registry.approve(id, approved);
+        self.offer(worker, Job::Capabilities(granted));
     }
 
     /// Put a job on a plugin's queue, or take it out of service.
@@ -290,7 +332,12 @@ impl Plugins {
         if !self.registry.is_running(&worker.id) {
             return;
         }
-        match worker.queue.try_send(job) {
+        let queue = lock(&worker.queue);
+        let Some(queue) = queue.as_ref() else {
+            // Shutting down. Nothing left to hand it.
+            return;
+        };
+        match queue.try_send(job) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.registry.stop(
@@ -322,10 +369,10 @@ impl Worker {
 }
 
 /// Put a loaded plugin on its own thread.
-fn start(mut runtime: Runtime, registry: Arc<Registry>) -> Worker {
+fn start(mut runtime: Runtime, registry: Arc<Registry>, stopping: Arc<AtomicBool>) -> Worker {
     let id = runtime.id.clone();
     let subscription = runtime.subscription;
-    registry.insert(&id, runtime.name.clone(), runtime.caps);
+    registry.insert(&id, runtime.name.clone(), runtime.requested_caps);
     // Whatever it drew during init, before any event: a plugin whose only
     // interface is a settings panel would otherwise stay invisible until
     // something happened to the account.
@@ -336,36 +383,61 @@ fn start(mut runtime: Runtime, registry: Arc<Registry>) -> Worker {
     let (queue, jobs) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
     let thread = std::thread::Builder::new()
         .name(format!("oxidezap-plugin-{id}"))
-        .spawn(move || run(&mut runtime, &jobs, &registry))
+        .spawn(move || run(&mut runtime, &jobs, &registry, &stopping))
         .map_err(|e| log::error!("plugin {id}: cannot start its thread: {e}"))
         .ok();
 
     Worker {
         id,
         subscription,
-        queue,
-        thread: std::sync::Mutex::new(thread),
+        queue: Mutex::new(Some(queue)),
+        thread: Mutex::new(thread),
     }
+}
+
+/// A poisoned lock means a worker panicked while holding it. Every value
+/// behind one here is a plain `Option`, so nothing can be torn — taking it
+/// and carrying on beats taking the daemon down with one plugin.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One plugin's whole life: take a job or a due timer, run it, apply what it
 /// asked for.
-fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry) {
+fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stopping: &AtomicBool) {
     // Deadlines as milliseconds rather than instants, because the clock here
     // is the library's pluggable one and a test that moves time has to move
     // these with it.
-    let mut timers: Vec<(i64, i64)> = Vec::new();
+    //
+    // Seeded from `oxi_init`, because a plugin whose whole job is periodic
+    // arms its first timer there and subscribes to no event at all: dropping
+    // these would leave it waiting for a wake-up nobody was going to send.
+    let mut timers: Vec<(i64, i64)> = runtime.take_initial_timers();
 
-    while let Some(event) = take(jobs, &mut timers) {
+    while let Some(job) = take(jobs, &mut timers, stopping) {
         // Asked before the call, not only after it: a plugin stopped by its
         // queue overflowing still has a live thread and a backlog, and
         // "stopped" has to mean it runs no more of them. Its own trap breaks
         // below; this is the half somebody else decided.
-        if !registry.is_running(&runtime.id) {
+        if stopping.load(Ordering::Relaxed) || !registry.is_running(&runtime.id) {
             break;
         }
 
-        match runtime.deliver(event) {
+        let event = match job {
+            Job::Event(event) => event,
+            // Not an event: what the user just allowed, applied to the store
+            // only its own thread may touch.
+            Job::Capabilities(granted) => {
+                runtime.set_capabilities(granted);
+                continue;
+            }
+        };
+
+        // What is already armed, so `MAX_TIMERS` bounds what this plugin
+        // *holds* rather than what it asked for in one call. Counting per
+        // call would let it add a handful of far-future timers on every
+        // message and grow this vector without limit.
+        match runtime.deliver(event, timers.len()) {
             Ok(effects) => {
                 if let Some(roots) = effects.ui {
                     registry.set_roots(&runtime.id, roots);
@@ -390,8 +462,11 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry) {
 
 /// The next thing to hand the plugin: a queued job, or a timer that has come
 /// due. `None` when there is nothing left and never will be.
-fn take(jobs: &Receiver<Job>, timers: &mut Vec<(i64, i64)>) -> Option<Arc<Event>> {
+fn take(jobs: &Receiver<Job>, timers: &mut Vec<(i64, i64)>, stopping: &AtomicBool) -> Option<Job> {
     loop {
+        if stopping.load(Ordering::Relaxed) {
+            return None;
+        }
         let now = wacore::time::now_millis();
         // The soonest, which is not necessarily the first: timers are armed
         // in the order a handler asked for them and fire in the order they
@@ -405,9 +480,9 @@ fn take(jobs: &Receiver<Job>, timers: &mut Vec<(i64, i64)>) -> Option<Arc<Event>
         let job = match soonest {
             Some((index, due)) if due <= now => {
                 let (_, token) = timers.swap_remove(index);
-                return Some(Arc::new(
+                return Some(Job::Event(Arc::new(
                     Event::new(abi::kinds::TIMER).int(abi::fields::TIMER_TOKEN, token),
-                ));
+                )));
             }
             Some((_, due)) => {
                 let wait = std::time::Duration::from_millis(due.saturating_sub(now).unsigned_abs());
@@ -420,11 +495,7 @@ fn take(jobs: &Receiver<Job>, timers: &mut Vec<(i64, i64)>) -> Option<Arc<Event>
             }
             None => jobs.recv().ok()?,
         };
-
-        match job {
-            Job::Event(event) => return Some(event),
-            Job::Stop => return None,
-        }
+        return Some(job);
     }
 }
 

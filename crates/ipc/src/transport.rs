@@ -6,13 +6,17 @@ use std::path::PathBuf;
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
 /// 19: plugins. The snapshot carries a `PluginSurface` per loaded plugin —
-/// what it is called, what it asked to be allowed to do, and the widgets it
-/// wants drawn — `DaemonEvent::PluginsChanged` republishes the set, and
-/// `ClientRequest::PluginAction` carries a widget's use back to the plugin
-/// that drew it. A v18 daemon refuses the action as malformed, so an upgraded
-/// window would draw a plugin's button that could never do anything; a v18
-/// client ignores the surfaces and simply draws none, which is why the
-/// snapshot field is skipped when empty rather than versioned separately.
+/// what it is called, what it asked to be allowed to do, whether that has
+/// been allowed, and the widgets it wants drawn — `DaemonEvent::PluginsChanged`
+/// republishes the set, `ClientRequest::PluginAction` carries a widget's use
+/// back to the plugin that drew it, and `ClientRequest::PluginApproval`
+/// carries the answer to what it asked for. A v18 daemon refuses both as
+/// malformed, so an upgraded window would draw a plugin's button that could
+/// never do anything; a v18 client ignores the surfaces and simply draws
+/// none, which is why the snapshot field is skipped when empty rather than
+/// versioned separately. `approved` is the one field in a surface that is
+/// *not* skipped when false: a front end has to tell "waiting on you" from
+/// "this daemon does not know about approval".
 ///
 /// 18: video calls. `DaemonMessage::CallVideo` carries a call's encoded
 /// frames in both directions, `DaemonMessage::CallVideoGap` says some were
