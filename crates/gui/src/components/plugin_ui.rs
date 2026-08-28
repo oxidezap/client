@@ -304,9 +304,17 @@ pub fn settings_entry(
             },
             Switch::new(SharedString::from(format!("plugin-allow-{}", surface.id)))
                 .checked(approved)
-                .on_click(move |_, _window, cx| {
+                .on_click(move |now: &bool, _window, cx| {
                     let id = id.clone();
-                    entity.update(cx, |app, cx| app.approve_plugin(&id, !approved, cx));
+                    // The switch's own state, not the surface this was drawn
+                    // against. Nothing here updates optimistically — the
+                    // daemon republishes and that is the answer — so two
+                    // presses before the round trip both read the same stale
+                    // `approved` and sent `!approved` twice: a grant followed
+                    // immediately by a withdrawal sent two grants and left
+                    // the capability on.
+                    let allowed = *now;
+                    entity.update(cx, |app, cx| app.approve_plugin(&id, allowed, cx));
                 })
                 .into_any_element(),
             metrics,

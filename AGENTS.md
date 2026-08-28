@@ -171,7 +171,13 @@ profile here repeats it deliberately.
   unapproved afterwards is no use to the message. Nor does any of it start at
   instantiation — a start section and `oxi_abi_version` are code the loader
   has not accepted yet, so every import refuses until the module is
-  instantiated, its version answered and its exports found. Otherwise a
+  instantiated, its version answered and its exports found. A withdrawal
+  clears the shared mask *before* it is written down, where a grant is
+  written down first: both fail closed, and doing the write first left a
+  plugin holding its old permissions across a disk write while Settings had
+  already redrawn. And an id may be claimed by only one file — two claiming
+  it are two plugins sharing an identity, so withdrawing would reach one and
+  leave the other acting. Otherwise a
   module the loader was about to turn away could send a message on its way
   out. Nor may it act on the account during `oxi_init` at all: plugins load
   before the task that consumes the command channel exists, so a send there

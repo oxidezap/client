@@ -171,9 +171,13 @@ impl Runtime {
         // away could not have sent a message on the way out.
         store.data_mut().phase = Phase::Init;
 
-        let answer = init
-            .call(&mut store, ())
-            .map_err(|e| anyhow!("its `{}` failed: {e}", abi::exports::INIT))?;
+        let answer = init.call(&mut store, ());
+        // Once, whatever the call did or how it ended. A plugin's settings are
+        // written when its call returns rather than on every `set`, which is
+        // what keeps filesystem I/O — something fuel does not price — bounded
+        // by the number of calls rather than by what one call asks for.
+        store.data_mut().kv.commit();
+        let answer = answer.map_err(|e| anyhow!("its `{}` failed: {e}", abi::exports::INIT))?;
         if answer != 0 {
             return Err(anyhow!(
                 "its `{}` refused with {answer}",
@@ -252,6 +256,10 @@ impl Runtime {
         let guest = self.store.data_mut();
         guest.event = None;
         guest.arena.clear();
+        // Whatever it stored, in one write — including on the path where it
+        // trapped, so a plugin that set a key and then ran out of fuel does
+        // not lose it.
+        guest.kv.commit();
         let effects = Effects {
             ui: guest.ui.take(),
             timers: std::mem::take(&mut guest.timers),

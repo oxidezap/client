@@ -144,7 +144,7 @@ impl Approvals {
             std::thread::current().id()
         ));
         if let Err(e) =
-            std::fs::write(&temp, &json).and_then(|()| std::fs::rename(&temp, &self.path))
+            crate::write_private(&temp, &json).and_then(|()| std::fs::rename(&temp, &self.path))
         {
             // Fail closed. Leaving the previous file is the tempting answer
             // and it is the wrong one: the write that most matters is a

@@ -1286,3 +1286,135 @@ fn a_peer_accepting_our_call_reaches_a_plugin_as_answered() {
         Some(&crate::event::Value::Int(abi::fields::call::ANSWERED))
     );
 }
+
+/// An id is what an approval, a settings file and an action are keyed on, so
+/// two files claiming one are two plugins sharing an identity — and taking a
+/// permission away would reach one of them while the other kept its own copy
+/// of the mask.
+#[test]
+fn two_files_cannot_claim_one_plugin_id() {
+    let dir = TempDir::new("same-id");
+    dir.plugin("autoreply", &pong());
+    // The same stem with the extension in another case: two files on a
+    // case-sensitive filesystem, one id here.
+    std::fs::write(
+        dir.0.join("autoreply.WASM"),
+        wat::parse_str(pong()).expect("valid"),
+    )
+    .expect("writable");
+
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(plugins.ids(), vec!["autoreply"], "one of them, not two");
+}
+
+/// A plugin's settings are written when its call returns, not on every `set`.
+/// Fuel does not price a rename, so a write per key is filesystem I/O a
+/// plugin can ask for without limit.
+const WRITES_A_LOT: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe"   (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_kv_set"      (func $set (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "k01")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))
+    (call $caps (i64.const 16))   ;; caps::STORAGE
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $i i32)
+    (block $done
+      (loop $again
+        (br_if $done (i32.ge_s (local.get $i) (i32.const 500)))
+        ;; The same key, alternating between two one-byte values.
+        (i32.store8 (i32.const 8) (i32.add (i32.const 48) (i32.rem_s (local.get $i) (i32.const 2))))
+        (drop (call $set (i32.const 0) (i32.const 1) (i32.const 8) (i32.const 1)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $again)))
+    (i32.const 0))
+)"#;
+
+/// The same bound through the real path: a module hammering one key inside a
+/// single call survives it, and what it wrote is on disk once the call has
+/// returned.
+#[test]
+fn a_plugin_hammering_its_store_costs_one_write_and_keeps_running() {
+    let dir = TempDir::new("kv-hammer");
+    dir.plugin("busy", &versioned(WRITES_A_LOT));
+    let state = dir.0.join("state");
+    let published = Published::default();
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state),
+        Arc::new(Recorder::new(Outcome::Accepted)),
+        published.sink(),
+    );
+
+    plugins.observe(&message("a@s.whatsapp.net", "go"));
+    let surfaces = published.settles("the plugin to be listed", |s| !s.is_empty());
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        surfaces[0].is_running(),
+        "five hundred sets in one call is not a reason to stop it"
+    );
+    assert!(
+        state.join("kv-busy.json").exists(),
+        "and the call returning wrote what it kept"
+    );
+}
+
+#[test]
+fn a_plugins_settings_are_written_once_a_call_rather_than_once_a_key() {
+    let dir = TempDir::new("kv-writes");
+    let state = dir.0.join("state");
+    std::fs::create_dir_all(&state).expect("writable");
+
+    let mut kv = crate::kv::Kv::open(&state, "busy");
+    for i in 0..500 {
+        kv.set("k", if i % 2 == 0 { "0" } else { "1" });
+    }
+    assert!(
+        !state.join("kv-busy.json").exists(),
+        "five hundred sets have written nothing yet"
+    );
+    kv.commit();
+    assert!(
+        state.join("kv-busy.json").exists(),
+        "and the call returning writes them once"
+    );
+}
+
+/// A plugin's store holds whatever it kept, and an autoreply's list of who it
+/// has answered is a list of people. Per-user state means this user.
+#[cfg(unix)]
+#[test]
+fn a_plugins_stored_settings_are_not_readable_by_other_users() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new("private");
+    let state = dir.0.join("state");
+    crate::create_private_dir(&state).expect("writable");
+    assert_eq!(
+        std::fs::metadata(&state)
+            .expect("it exists")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "nobody else may even enter it"
+    );
+
+    let mut kv = crate::kv::Kv::open(&state, "p");
+    kv.set("who", "somebody");
+    kv.commit();
+    assert_eq!(
+        std::fs::metadata(state.join("kv-p.json"))
+            .expect("written")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "and the file itself is owner-only"
+    );
+}

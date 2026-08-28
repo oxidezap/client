@@ -36,6 +36,16 @@ pub struct Kv {
     /// Set once a write has failed, so a full disk is reported once rather
     /// than on every key a plugin touches afterwards.
     complained: bool,
+    /// Whether anything has changed since the last write.
+    ///
+    /// A `set` no longer writes; [`commit`](Self::commit) does, once, after
+    /// the wasm call returns. Writing per key made filesystem I/O something a
+    /// plugin could ask for without limit — fuel does not price a rename, and
+    /// `oxi_init` has two hundred million of it — so a small downloaded
+    /// module alternating one key could stall the daemon's whole startup.
+    /// Folding them also makes the ordinary case cheaper: a plugin that
+    /// stores three settings from one press writes one file, not three.
+    dirty: bool,
 }
 
 impl Kv {
@@ -67,6 +77,7 @@ impl Kv {
             path,
             entries,
             complained: false,
+            dirty: false,
         }
     }
 
@@ -81,6 +92,7 @@ impl Kv {
             path: PathBuf::new(),
             entries: BTreeMap::new(),
             complained: false,
+            dirty: false,
         }
     }
 
@@ -104,9 +116,8 @@ impl Kv {
             return false;
         }
         if value.is_empty() {
-            let removed = self.entries.remove(key).is_some();
-            if removed {
-                self.flush();
+            if self.entries.remove(key).is_some() {
+                self.dirty = true;
             }
             return true;
         }
@@ -124,8 +135,19 @@ impl Kv {
             return true;
         }
         self.entries.insert(key.to_owned(), value.to_owned());
-        self.flush();
+        self.dirty = true;
         true
+    }
+
+    /// Write out whatever the call changed, if it changed anything.
+    ///
+    /// Called once when a wasm call returns, which is what bounds the I/O a
+    /// plugin can ask for: it may set a key a million times and still cost
+    /// one file.
+    pub fn commit(&mut self) {
+        if std::mem::take(&mut self.dirty) {
+            self.flush();
+        }
     }
 
     fn size(&self) -> usize {
@@ -155,7 +177,7 @@ impl Kv {
             std::thread::current().id()
         ));
         let outcome =
-            std::fs::write(&temp, &json).and_then(|()| std::fs::rename(&temp, &self.path));
+            crate::write_private(&temp, &json).and_then(|()| std::fs::rename(&temp, &self.path));
         if let Err(e) = outcome {
             if !self.complained {
                 self.complained = true;
@@ -202,6 +224,10 @@ mod tests {
         let dir = TempDir::new("reopen");
         let mut kv = Kv::open(&dir.0, "autoreply");
         assert!(kv.set("greeting", "oi"));
+        // What the runtime does when the wasm call returns. A `set` alone is
+        // not durable, deliberately: writing per key made filesystem I/O
+        // something a plugin could ask for without limit.
+        kv.commit();
         drop(kv);
 
         let kv = Kv::open(&dir.0, "autoreply");
@@ -222,6 +248,7 @@ mod tests {
         let dir = TempDir::new("separate");
         let mut a = Kv::open(&dir.0, "a");
         a.set("k", "from a");
+        a.commit();
         let b = Kv::open(&dir.0, "b");
         assert_eq!(b.get("k"), None);
     }

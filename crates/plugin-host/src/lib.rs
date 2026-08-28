@@ -189,7 +189,7 @@ impl Plugins {
         let mut workers = Vec::new();
 
         if let Some(state_dir) = state_dir
-            && let Err(e) = std::fs::create_dir_all(state_dir)
+            && let Err(e) = create_private_dir(state_dir)
         {
             log::warn!(
                 "cannot create {}: {e}. Plugin settings will not survive a restart.",
@@ -197,6 +197,7 @@ impl Plugins {
             );
         }
 
+        let mut taken: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for path in discover(dir) {
             let Some(id) = plugin_id(&path) else {
                 log::warn!(
@@ -205,6 +206,22 @@ impl Plugins {
                 );
                 continue;
             };
+            // An id is what an approval, a settings file and an action are
+            // all keyed on, so two files claiming one is not a duplicate — it
+            // is two plugins sharing an identity. `foo.wasm` and `foo.WASM`
+            // are different files on a case-sensitive filesystem and the same
+            // id here: both would run, the registry would hold whichever
+            // registered last, and withdrawing a permission would reach one
+            // of them while the other kept its own copy of the mask and went
+            // on acting. Refused rather than disambiguated, because a name
+            // this host invented is not one anybody could approve.
+            if !taken.insert(id.clone()) {
+                log::warn!(
+                    "skipping {}: another file already claims the plugin id `{id}`",
+                    path.display()
+                );
+                continue;
+            }
             let granted = Arc::new(AtomicI64::new(registry.approved(&id)));
             match Runtime::load(
                 &path,
@@ -375,10 +392,23 @@ impl Plugins {
         // mask over it: Settings and `approvals.json` would read "not
         // allowed" while the plugin went on sending.
         let _order = lock(&self.approving);
-        let granted = self.registry.approve(id, approved);
-        // Stored before anything else observes the answer, so the very next
-        // command a draining backlog attempts is checked against it.
-        worker.granted.store(granted, Ordering::Relaxed);
+        if approved {
+            // A grant is written down before it is handed over, so a
+            // capability the plugin holds is one the file already records.
+            worker
+                .granted
+                .store(self.registry.approve(id, true), Ordering::Relaxed);
+        } else {
+            // A withdrawal is the other way round, and for the same reason:
+            // fail closed. `Registry::approve` writes a file and publishes a
+            // surface before it returns, and doing that first left the plugin
+            // holding its old mask across a disk write — still sending while
+            // Settings had already redrawn as "not allowed". Taking it away
+            // first costs nothing if the write then fails, because the write
+            // failing removes the file rather than leaving the grant.
+            worker.granted.store(0, Ordering::Relaxed);
+            self.registry.approve(id, false);
+        }
     }
 
     /// Put a job on a plugin's queue, or take it out of service.
@@ -595,6 +625,45 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
         .collect();
     found.sort();
     found
+}
+
+/// Make a directory only this user can enter.
+///
+/// A plugin's store holds whatever it kept — an autoreply's list of who it
+/// has already answered is a list of people — and the approvals beside it say
+/// what the machine's owner agreed to. Under the ordinary `022` umask
+/// `create_dir_all` would leave both at `0755`, readable by every local
+/// account, which is not what "per-user state" means anywhere else in this
+/// daemon. Repaired as well as created, because a directory from an earlier
+/// version is one somebody already has.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Write a file only this user can read.
+///
+/// The mode is set on *creation* rather than afterwards, so there is no
+/// instant in which the contents exist at `0644`. Both stores write through a
+/// temporary file and a rename, and a rename carries the mode with it.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// The id a file carries: `autoreply.wasm` is `autoreply`.
