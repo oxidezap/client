@@ -163,6 +163,18 @@ impl AudioPlayer {
         self.state.borrow().is_playing
     }
 
+    /// Whether this clip is playing, or is going to as soon as it can.
+    ///
+    /// What a play/pause control has to ask. `is_playing` alone is false for
+    /// the whole of a decode, so a second tap on a note that had not started
+    /// yet was read as "resume" — which did nothing, and the decode then
+    /// started the note the user had just asked to stop.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        let state = self.state.borrow();
+        state.is_playing || (state.is_loading() && !state.pending_pause)
+    }
+
     /// Whether a clip has been accepted but is not making sound yet.
     ///
     /// `play` returns while `decodeAudioData` is still a promise, so there is
@@ -447,6 +459,17 @@ impl AudioPlayer {
 
     /// Carry on from where [`pause`](Self::pause) left off.
     pub fn resume(&mut self) {
+        {
+            // Still a promise: there is nothing to start, but the intent has
+            // to be recorded or a pause banked a moment ago would still be
+            // honoured when the buffer lands. `pause` writes this flag from
+            // the same place; this is the other half of it.
+            let mut state = self.state.borrow_mut();
+            if state.is_loading() {
+                state.pending_pause = false;
+                return;
+            }
+        }
         let (buffer, offset, playing, finished) = {
             let state = self.state.borrow();
             (

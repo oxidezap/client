@@ -94,7 +94,17 @@ and, in another terminal, the daemon with its web endpoint turned on:
 cargo run --bin oxidezapd -- --web
 ```
 
-Then open <http://127.0.0.1:8080>.
+It logs the line to open, token and all:
+
+```
+web bridge listening on http://127.0.0.1:9527/ws (origins: loopback only)
+point a page at it with ?daemon=ws://127.0.0.1:9527/ws?token=<token>
+```
+
+Open `http://127.0.0.1:8080/?daemon=ws://127.0.0.1:9527/ws?token=<token>`,
+pasting that query verbatim. Without it the page reaches the endpoint and is
+refused: the token is the whole of the admission check, and a bare
+<http://127.0.0.1:8080> has nothing to present.
 
 **That endpoint is off by default, and should stay off unless you want it.**
 A WebSocket is not subject to the same-origin policy, so any page open in

@@ -65,7 +65,9 @@ cargo install trunk
 cd web && trunk serve -- -Z build-std=std,panic_abort
 
 # And the daemon it attaches to. `--web` alone is loopback on the port the
-# page looks for; localhost is served without being named.
+# page looks for; localhost is served without being named. It logs the query
+# to open the page with — the token is the admission check, so the bare
+# http://127.0.0.1:8080 is refused.
 cargo run --bin oxidezapd -- --web
 ```
 

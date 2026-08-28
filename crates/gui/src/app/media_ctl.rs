@@ -274,8 +274,12 @@ impl WhatsAppApp {
         cx: &mut Context<Self>,
     ) {
         if self.active_media.is_playing(&message_id) && self.active_media.is_audio() {
-            // Same message - toggle play/pause
-            if self.audio_player.is_playing() {
+            // Same message - toggle play/pause. `is_active` rather than
+            // `is_playing`: a clip the browser is still decoding is not
+            // playing yet but is on its way, and reading that as "resume"
+            // ignored the tap and let the decode start what it had just been
+            // asked to stop.
+            if self.audio_player.is_active() {
                 self.audio_player.pause();
             } else {
                 self.audio_player.resume();
@@ -296,9 +300,11 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
-        // If already playing this audio message, just toggle
+        // If already playing this audio message, just toggle. `is_active`
+        // for the same reason as above: a decode in flight is a note on its
+        // way, and a tap during it means stop.
         if self.active_media.is_playing(&message_id) && self.active_media.is_audio() {
-            if self.audio_player.is_playing() {
+            if self.audio_player.is_active() {
                 self.audio_player.pause();
             } else {
                 self.audio_player.resume();

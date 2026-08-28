@@ -123,6 +123,13 @@ mod cpal_output {
         /// make sound. The web player's own explains why the call exists.
         pub fn unlock(&mut self) {}
 
+        /// The same question as [`is_playing`](Self::is_playing) here: there
+        /// is no gap between accepting a clip and playing it. The web
+        /// player's own explains why the two are asked separately.
+        pub fn is_active(&self) -> bool {
+            self.is_playing()
+        }
+
         /// How far through the clip playback is, in `0.0..=1.0`.
         ///
         /// Zero when nothing is loaded, so a caller can render a progress bar
