@@ -52,7 +52,21 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
     session.send(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
         session_events: true,
-        has_window: true,
+        // Not a window, whatever it looks like to the person reading it.
+        //
+        // `has_window` answers one question — is there something the tray's
+        // Open can bring forward — and a browser tab is not. `ShowWindow`
+        // arrives here on an unsolicited socket callback, and a page cannot
+        // raise itself from one: browsers grant that only under a transient
+        // user activation, which a daemon-initiated frame is the opposite of.
+        // Claiming it would leave Open doing nothing at all, which is exactly
+        // what the rule in AGENTS.md exists to prevent — a client that is not
+        // a window standing in for one that is not there.
+        //
+        // Saying no means Open launches the desktop window instead. That is
+        // the honest outcome: a second front end beside the tab, rather than
+        // a tray menu item that silently fails.
+        has_window: false,
     })?;
 
     let pending = Arc::clone(&session.pending);

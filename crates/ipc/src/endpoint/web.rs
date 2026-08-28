@@ -471,6 +471,30 @@ pub async fn fetch_media(base: &str, key: &str) -> Result<Vec<u8>, String> {
     options.set_signal(Some(&abort.signal()));
     let _timeout = FetchDeadline::arm(&window, &abort, MEDIA_TIMEOUT_MS)?;
 
+    /// Aborts the request if this future is dropped before it finishes.
+    ///
+    /// The caller bounds a whole frame's media as well, and when *that*
+    /// deadline wins it simply drops this future — which cancels nothing on
+    /// its own, because dropping a `JsFuture` does not cancel the request
+    /// behind it, and because [`FetchDeadline`]'s own drop *disarms* the
+    /// abort rather than firing it. That is right for the path where the
+    /// fetch already answered and wrong for this one, so the two are
+    /// separate: one stops the timer, this one stops the request. Without it
+    /// every frame that gave up left a browser connection and a daemon slot
+    /// held by a request nobody was waiting for any more.
+    ///
+    /// Unconditional, because aborting a request that has already settled is
+    /// a no-op — there is no success path worth disarming for.
+    struct AbortOnDrop(web_sys::AbortController);
+
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    let _abort_on_drop = AbortOnDrop(abort.clone());
+
     let response = JsFuture::from(window.fetch_with_str_and_init(&url, &options))
         .await
         .map_err(|e| format!("could not reach the daemon's media bridge: {e:?}"))?

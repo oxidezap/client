@@ -105,6 +105,26 @@ impl Runtime for BrowserRuntime {
 /// mid-task — rather than never, because a future that never completes holds
 /// whatever is awaiting it for the life of the page.
 async fn sleep(duration: Duration) {
+    /// Disarms the timer when the sleep is dropped.
+    ///
+    /// Load-bearing now that an abort really drops the future it raced: a
+    /// `setTimeout` left armed fires into a `Closure` that has already been
+    /// freed, which is a wasm-bindgen panic rather than a missed wakeup. And
+    /// `yield_now` is this function at zero milliseconds, so a page that
+    /// cancels anything in a loop would strand one timer per iteration.
+    struct Timer {
+        handle: i32,
+        _fire: Closure<dyn FnMut()>,
+    }
+
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            if let Some(window) = web_sys::window() {
+                window.clear_timeout_with_handle(self.handle);
+            }
+        }
+    }
+
     let (tx, rx) = futures_channel::oneshot::channel::<()>();
     let Some(window) = web_sys::window() else {
         return;
@@ -115,17 +135,19 @@ async fn sleep(duration: Duration) {
             let _ = tx.send(());
         }
     });
-    let armed = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+    let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
         fire.as_ref().unchecked_ref(),
         i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
-    );
-    if armed.is_err() {
+    ) else {
         return;
-    }
-    // Held until it has fired: `Closure::forget` would hand it to the JS heap
-    // for the life of the page, and this is called once per retry, per poll
-    // and per yield.
-    let _fire = fire;
+    };
+    // Held until it has fired *or this future is dropped*. `Closure::forget`
+    // would hand it to the JS heap for the life of the page, and this is
+    // called once per retry, per poll and per yield.
+    let _timer = Timer {
+        handle,
+        _fire: fire,
+    };
     let _ = rx.await;
 }
 

@@ -149,7 +149,14 @@ impl WhatsAppApp {
                 })
         {
             let at = self.audio_player.progress();
-            let was_playing = self.audio_player.is_playing();
+            // `is_active`, not `is_playing`: on the web a clip is neither
+            // playing nor paused for the whole of a decode, and `is_playing`
+            // is false throughout it. Reading that as "was paused" made the
+            // restart bank a `pending_pause`, so changing speed on a note
+            // that had been tapped but had not started yet meant it never
+            // started at all. What a play/pause control has to ask is whether
+            // the clip is playing *or going to*, which is this.
+            let was_playing = self.audio_player.is_active();
             self.play_audio(message_id, (*bytes).clone(), cx);
             self.audio_player.seek(at);
             if !was_playing {
