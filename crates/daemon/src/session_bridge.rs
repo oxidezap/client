@@ -870,15 +870,22 @@ impl Bridge {
                         // out. A window that wants to answer with the camera
                         // off turns it off once the call is up, which is what
                         // a phone does too.
-                        let with_video = self
-                            .hub
-                            .call_state()
-                            .incoming()
-                            .filter(|call| call.call_id == call_id)
-                            .is_some_and(|call| call.is_video);
+                        //
+                        // One question and not two: read separately, a front
+                        // end whose frame is older than this state accepted a
+                        // call the stage no longer holds, so nothing here
+                        // changed, no window was told anything, and the audio
+                        // came up anyway — as voice, since the kind was read
+                        // off a stage that had moved on.
+                        let mut with_video = None;
                         self.hub.calls(|calls| {
-                            calls.connect(&call_id);
+                            with_video = calls.accept(&call_id);
                         });
+                        let Some(with_video) = with_video else {
+                            return CommandOutcome::Refused(format!(
+                                "no call is ringing under {call_id}"
+                            ));
+                        };
                         client.accept_call(&call_id, with_video);
                     }
                     // A decline is the one ending only the declining side

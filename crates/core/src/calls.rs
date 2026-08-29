@@ -480,6 +480,23 @@ impl CallState {
         false
     }
 
+    /// Answer the offer this id names, and say whether it was a video call.
+    ///
+    /// `None` means no offer on the stage goes by that id, which is the only
+    /// honest answer to a front end whose frame is older than this state: an
+    /// accept nobody can place must not reach the session, or the audio comes
+    /// up over a call the daemon is not holding, nothing changes here, and no
+    /// window is told anything.
+    ///
+    /// The kind comes from the offer being answered rather than from a second
+    /// lookup, because the two have to be the same offer: the camera is
+    /// attached before the accept goes out, and a video call answered as
+    /// voice cannot be corrected afterwards.
+    pub fn accept(&mut self, call_id: &CallId) -> Option<bool> {
+        let is_video = self.incoming().filter(|c| c.call_id == *call_id)?.is_video;
+        self.connect(call_id).then_some(is_video)
+    }
+
     /// The call connected: this is the state that used to be missing.
     ///
     /// Accepts from either direction — we answered, or the peer answered us —
@@ -879,6 +896,29 @@ mod tests {
         assert!(parked.dismiss_incoming(&"SECOND".to_string()));
         assert_eq!(parked.active().map(|c| c.call_id.as_str()), Some("FIRST"));
         assert!(parked.waiting().is_none());
+    }
+
+    /// A front end's frame can be older than this state, so it can accept a
+    /// call the stage no longer holds. Answered by the stage alone, that
+    /// brought the audio up over a call the daemon was not holding: nothing
+    /// here changed, so no window was told anything — and the kind was read
+    /// off whatever was on the stage, so a video call could be answered as
+    /// voice.
+    #[test]
+    fn accepting_a_call_the_stage_does_not_hold_answers_nothing() {
+        let mut state = CallState::default();
+        state.set_incoming(incoming("FIRST"));
+
+        assert_eq!(state.accept(&"GONE".to_string()), None);
+        assert!(
+            state.active().is_none(),
+            "an id nobody is ringing under connects nothing"
+        );
+
+        assert_eq!(state.accept(&"FIRST".to_string()), Some(false));
+        assert_eq!(state.active().map(|c| c.call_id.as_str()), Some("FIRST"));
+        // A second accept for the same call is not a second answer.
+        assert_eq!(state.accept(&"FIRST".to_string()), None);
     }
 
     /// The two ways a call leaves without leaving a record. A front end
