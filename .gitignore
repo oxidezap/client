@@ -1,1 +1,5 @@
 /target
+
+# Example plugins are excluded from the workspace, so each has a target
+# directory of its own that `/target` above does not cover.
+target/

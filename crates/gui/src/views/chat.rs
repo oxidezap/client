@@ -10,10 +10,10 @@ use gpui_component::{Icon, IconName};
 
 use crate::app::{Destination, MessageListCache, WhatsAppApp};
 use crate::components::{
-    ChatListProps, EmptyState, InputAreaView, ProductIcon, StatusListProps, StatusViewProps,
-    ViewerProps, render_call_card, render_chat_header, render_chat_list,
-    render_conversation_search, render_media_viewer, render_message_list, render_nav_rail,
-    render_status_list, render_status_view,
+    ChatListProps, EmptyState, InputAreaView, PluginContext, ProductIcon, StatusListProps,
+    StatusViewProps, ViewerProps, plugin_ui, render_call_card, render_chat_header,
+    render_chat_list, render_conversation_search, render_media_viewer, render_message_list,
+    render_nav_rail, render_status_list, render_status_view,
 };
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
@@ -27,9 +27,27 @@ pub fn render_connected_view(
 ) -> impl IntoElement {
     app.ensure_input_area(window, cx);
     app.ensure_chat_search_input(window, cx);
+    // Before anything reads a plugin's tree: a field the plugin added this
+    // frame needs somewhere to hold what is typed into it, and only the
+    // render pass knows which widgets are on screen.
+    app.sync_plugin_fields(window, cx);
 
     let layout = app.responsive_layout(window, cx);
     let entity = cx.entity().clone();
+    // Built here, where the app is still reachable: a header component takes
+    // neither the app nor a `Context`, and drawing a plugin's widget needs
+    // both. Owned elements, so nothing below is borrowing the app.
+    let plugin_ctx = PluginContext {
+        entity: entity.clone(),
+        metrics: *layout.metrics(),
+    };
+    let plugin_actions = plugin_ui::slot(
+        app.plugins(),
+        oxidezap_core::PluginSlot::ChatHeader,
+        app,
+        &plugin_ctx,
+        cx,
+    );
     let selected_jid = app.selected_chat_jid();
     // Cloned rather than borrowed: building the timeline's rows below needs
     // the app mutably, and these are handles — a clone is a refcount.
@@ -288,6 +306,7 @@ pub fn render_connected_view(
                         can_send,
                         is_offline,
                         is_own_number,
+                        plugin_actions,
                     },
                     &message_list,
                     entity.clone(),
@@ -354,6 +373,13 @@ struct ChatAreaProps<'a> {
     is_offline: bool,
     /// Whether the open conversation is with this account's own number.
     is_own_number: bool,
+    /// What plugins want in the conversation's header, already rendered.
+    ///
+    /// Built here rather than inside the header, because drawing a widget
+    /// needs the app and the header component takes neither it nor a
+    /// `Context`. Empty when no plugin drew there, which is the ordinary
+    /// case.
+    plugin_actions: Vec<gpui::AnyElement>,
 }
 
 fn render_chat_area(
@@ -374,6 +400,7 @@ fn render_chat_area(
         can_send,
         is_offline,
         is_own_number,
+        plugin_actions,
     } = props;
     let metrics = *layout.metrics();
     let base = if layout.is_mobile() {
@@ -419,6 +446,7 @@ fn render_chat_area(
                     is_own_number,
                     can_send,
                     entity.clone(),
+                    plugin_actions,
                     layout,
                     cx,
                 ))

@@ -26,12 +26,58 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 - **oxidezap-daemon**: binary `oxidezapd`. The only process that opens the
   store or holds a WhatsApp connection. Serves front ends over a per-user Unix
   socket and carries a tray presence.
+- **oxidezap-plugin-abi**: the wasm ABI — its constants and the widget-tree
+  codec. No dependencies and `no_std`, because it is compiled into the daemon
+  *and* into every plugin, including ones with no allocator.
+- **oxidezap-plugin-host**: runs `.wasm` plugins inside the daemon. Discovery,
+  the sandbox, and the host half of the ABI. One OS thread, one wasmi `Store`
+  and one bounded queue per plugin.
+- **oxidezap-plugin**: the Rust SDK a plugin is written against. Not a
+  dependency of anything here; it exists to be built for wasm32. What it adds
+  over the raw imports is what the compiler can check: two mask types so a
+  capability cannot be passed where a set of event kinds goes, a `Setup` whose
+  methods vanish once used so declaring twice is a missing method rather than
+  a refusal at load, a size carried on each field so a read does not pick one,
+  a UI builder whose sections take closures so there is no `end` to forget,
+  and `Event::which`, which narrows an event to a view naming only the fields
+  its kind carries — the absence rule is right for the wire and wrong for a
+  handler, where reading `TEXT` off a `UI_ACTION` answers an empty string that
+  no compiler and no log will ever question. Every one of those views carries
+  an `Other`/`Unknown` arm, because a `match` that could not compile against a
+  kind the daemon learned later would make every addition a breaking change.
+  All of it monomorphizes away — the example is still a few kilobytes. What is
+  *not* free is `log!`: formatting without a heap still pulls `core::fmt` in,
+  which is about 2.6 KiB, so the choice is per plugin and the doc comment says
+  the number rather than leaving somebody to find it in a size diff. The
+  `plugin!` macro emits the `#[panic_handler]` too — boilerplate every plugin
+  copied, and one of the two ways a first build fails — with `panic = own` for
+  anyone who wants their own. Its `testing` feature answers the imports from a
+  table a test owns, which is the only way to run a handler without the
+  daemon; `raw::Ptr` exists for it, because an address is an `i32` on wasm32
+  and truncates to nothing anywhere else.
 - **oxidezap-gui**: GPUI front end, binary `oxidezap`. Talks to the daemon and
   starts one if none is listening. Owns video decode, which writes straight
   into `gpui::RenderImage` and is not reusable off GPUI.
 
 A front end depends on ipc/core/audio and never on session: there is exactly
 one WhatsApp session per user, and it lives in the daemon.
+
+`examples/` holds plugins, and is excluded from the workspace: they build for
+`wasm32-unknown-unknown` and link imports only the daemon provides, so a
+`cargo build` at the root would try to link them for the host. `template/` is
+the one to copy — it asks for nothing that touches the account, so it runs the
+moment it is dropped in the folder — and `autoreply/` is the same shape with
+something in it.
+
+`docs/plugin-abi.md` is the contract for anyone not using the SDK: the imports
+with their signatures, the field table by kind, the UI encoding, the outcome
+codes and every bound the host holds a plugin to. The SDK is a convenience
+over exactly that and has no privileged access, which is the sentence that
+makes a TinyGo plugin possible — so the document is load-bearing rather than
+descriptive, and the module it prints is loaded by a test
+(`the_minimal_module_in_the_abi_document_loads`) rather than copied into one:
+a copy is what lets the version literal in the snippet drift past
+`abi::VERSION` with nothing to notice.
 
 ## Build & verify
 
@@ -42,6 +88,16 @@ cargo test --workspace
 
 # Running it: two binaries, and the window looks for the daemon beside itself.
 cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxidezap
+
+# A plugin. Its own workspace, its own target, and the file's name is its id.
+# `examples/template` is the same three commands; `cargo test` in either runs
+# its handlers against the SDK's test host, with no daemon and no wasm.
+cd examples/autoreply && cargo build --release --target wasm32-unknown-unknown
+cp target/wasm32-unknown-unknown/release/autoreply.wasm ~/.local/share/oxidezap/plugins/
+# And the one test that exercises the real SDK against the real host. Back at
+# the root first: the example is its own workspace and the root excludes it, so
+# from in there cargo cannot resolve the host crate at all.
+cd ../.. && cargo test -p oxidezap-plugin-host --all-features -- --ignored
 ```
 
 Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is
@@ -96,6 +152,246 @@ profile here repeats it deliberately.
   speaker, so the process that owns the session owns the audio device. That
   follows from the split rather than being chosen, and it is why a call still
   works with the window closed.
+- **A plugin is a front end that does not draw, and it runs in the daemon.**
+  It sees the account's events and acts through the same command channel a
+  window's requests go onto, so it has no privileged path to the session. It
+  lives inside the daemon rather than behind the socket because the daemon is
+  the only process holding the session, and wasm already supplies the
+  isolation a process boundary would have been for — and the count of them is
+  bounded (`MAX_PLUGINS`) because every other bound here is per plugin: a
+  store, a queue and an OS thread are all spent before a module runs an
+  instruction, so a folder somebody unpacked a bundle into costs a thousand
+  threads before the socket opens. Counted at discovery rather than at the
+  workers, because counting the workers counted the *successes*: a folder of
+  modules that each fail — read, parsed, and given their initialization fuel
+  to refuse in — never reached the cap at all. What wasm does *not*
+  supply is a bound on time and on memory, which is why fuel metering and the
+  resource limiter are not optional: a plugin that loops forever runs out and
+  traps, and the daemon loses a plugin rather than a thread. Fuel prices *one
+  call*, though, and a plugin needs nobody's permission to arm a timer — so
+  one could wake itself at the floor, spend almost a whole budget in each
+  callback and never trap, owning a core for something subscribed to no
+  account event at all. The share (`MAX_DUTY`) is the bound on the sum:
+  busy time against elapsed, over a rolling window, with the excess slept off
+  before the next call — the *whole* excess, and asked for before the window
+  may turn over. Both halves of that were bugs: a debt truncated at one
+  window, or forgiven when the window rolled, lets a plugin gain time faster
+  than it pays it and settle near half a core with `MAX_DUTY` reading a
+  tenth. Throttled rather than stopped, because a plugin doing
+  too much is not the same as one doing something wrong — and the sleep is
+  taken in slices, since a plugin being held back is still one the daemon has
+  to be able to join. The limiter
+  bounds tables and instance counts and not only the linear memory's bytes,
+  because a declared table is allocated at instantiation — before a
+  fuel-metered instruction has run — so a byte cap alone is a bound on one
+  allocation rather than on the plugin. Two allocations sit outside the
+  limiter entirely and are bounded before they happen: the module's own bytes
+  and whatever parsing them costs, which are spent before the store exists
+  (`MAX_MODULE_BYTES`, asked of the file rather than of its contents), and the
+  strings an event handle clones into the *host* (`MAX_HANDLES`) — a plugin
+  asking for one list element until its fuel runs out would otherwise grow
+  the daemon by far more than the sandbox advertises. What the *host* writes
+  about a plugin — a refused tree, a dropped root — is charged to that
+  plugin's own logging budget for the same reason `oxi_log` has one: it is
+  the same journal, and an invalid tree is a line a plugin can ask for
+  sixteen times a call without calling `oxi_log` at all. One allowance rather
+  than one plus an unbounded second. Reading a field is
+  bounded too (`MAX_FIELD_BYTES_PER_CALL`), which is the same sentence about
+  the copy rather than about the allocation: `oxi_field_str` writes into the
+  *plugin*, so nothing here grows, and a loop over one ordinary message with
+  a large buffer still turns a callback's fuel into tens of gigabytes of
+  memcpy. Per call and not per window, unlike the log and the commands: that
+  cost is time inside the call, which is exactly what `MAX_DUTY` measures
+  across calls and cannot measure within one. `oxi_log` is bounded
+  for the same reason and refused while loading for the other one: writing a
+  line is host I/O that fuel does not price, and a module the loader is about
+  to turn away should leave nothing behind. What it writes is also escaped —
+  a line break in a plugin's line is a second entry the host's `plugin x:`
+  prefix never reaches, so a module nobody has approved for anything writes
+  what reads as the daemon's own diagnostics. A `Store` is not
+  shareable and a wasm call is synchronous and blocking, so each plugin gets
+  an OS thread of its own rather than a runtime task, which would stall the
+  accept loop for as long as it ran. wasmi and not wasmtime: no JIT, so
+  nothing generates code inside the process that holds the account, and no
+  component model, which is the trade the ABI is built around.
+- **A plugin's whole outside world is the `oxidezap` import module.** There is
+  no WASI — not a restricted one, none — so a `.wasm` a user downloaded cannot
+  open a path or a socket because no function exists that would. It has
+  storage, but not the *filesystem*: `oxi_kv_get`/`oxi_kv_set` are a map the
+  host keeps in a file the plugin cannot name. That
+  is a structural guarantee rather than a policy, and it is the reason the ABI
+  has no `oxi_http_fetch`: adding one turns that sentence into a promise about
+  configuration, and half the interesting plugins want it, which is exactly
+  why it deserves to be decided on its own rather than as a nineteenth import.
+  What a plugin *may do* is a mask it declares during `oxi_init` and only
+  then, because that list is what a user is shown before deciding — one that
+  could widen it afterwards would make the sentence stop being true.
+- **Asking is not being allowed.** Declaring a capability grants nothing;
+  dropping a `.wasm` in a folder is not consent. What acts on the *account* —
+  sending, marking read, showing a typing indicator — is withheld until
+  somebody says yes, and the answer is recorded against the exact mask it
+  answered: a plugin that comes back wanting more is not partly approved, it
+  is unapproved again, because the sentence agreed to is no longer the
+  sentence being asked. The mask is read before the plugin runs a single
+  instruction and every check reads it live, because `oxi_init` is code the
+  plugin chose too and granting for the length of one call is granting — and
+  because withdrawing has to bite *now*: an answer queued behind a backlog
+  would let a plugin send through five hundred banked events while Settings
+  already read "not allowed", and the plugin that most needs stopping is the
+  one whose queue is full. Declaring is a single act, once — and so are
+  naming and subscribing — for the same reason: a plugin that declares the narrow mask it was approved for, sends,
+  and *then* widens has already sent, and the wider surface reading as
+  unapproved afterwards is no use to the message. Nor does any of it start at
+  instantiation — a start section and `oxi_abi_version` are code the loader
+  has not accepted yet, so every import refuses until the module is
+  instantiated, its version answered and its exports found. A withdrawal
+  clears the shared mask *before* it is written down, where a grant is
+  written down first: both fail closed, and doing the write first left a
+  plugin holding its old permissions across a disk write while Settings had
+  already redrawn. And an id may be claimed by only one file — two claiming
+  it are two plugins sharing an identity, so withdrawing would reach one and
+  leave the other acting. Otherwise a
+  module the loader was about to turn away could send a message on its way
+  out. Nor may it act on the account during `oxi_init` at all: plugins load
+  before the task that consumes the command channel exists, so a send there
+  would park the loading thread inside the async runtime — where blocking is
+  a panic — waiting for an answer nothing can produce, and there is no
+  session connected to give one. It is refused as `STATE` rather than
+  `DENIED`, which says which: too early, not disallowed. What a plugin does
+  only to itself — draw, keep its own settings,
+  run its own timer — takes effect on declaration, and has to: a plugin that
+  could not publish its settings panel before being allowed would leave the
+  user agreeing to a name and a list of phrases with nothing to look at. The
+  answer travels as `ClientRequest::PluginApproval` rather than a reserved
+  widget id, because an id comes from the plugin's own tree — one could
+  publish a button labelled "OK" carrying that id and be granted by somebody
+  pressing the wrong thing. And a front end draws that switch only where there
+  is something to withhold: over a plugin that wants nothing but to draw, it
+  could be turned off and would read as on again, which is why
+  `PluginSurface` carries `gated` beside `capabilities` — two sentences, one
+  of them a question. And the file lives beside the plugins in a *persistent*
+  directory, never in the plugin's own key-value store and never in the
+  daemon's `state_dir`: a plugin that can write its own approval has none,
+  and an answer under `XDG_RUNTIME_DIR` is one the next login throws away.
+  The two share a directory, so a plugin's own store is written under a
+  `kv-` prefix no plugin id can produce — one called `approvals` would
+  otherwise write its settings over everybody's permissions. That directory
+  is made private *before* it is read, and the answers already in it are
+  asked about after that door is shut — a directory that was open is one
+  somebody else may have left an `approvals.json` in, and a `chmod` now does
+  not make that file the user's answer, so it is deleted rather than ignored.
+  A directory that cannot be made private is refused outright
+  (`usable_state_dir`): a file saying what a plugin may do to the account,
+  read out of a directory another local user can write, is a mask somebody
+  else chose — and tightening the mode afterwards puts it in memory first.
+  Refusing means no state directory at all, which fails closed: plugins draw
+  and keep settings in memory, and everything touching the account is
+  unapproved until somebody says yes in this session. It is also
+  `%LOCALAPPDATA%` on Windows and never `%APPDATA%`, the same side the store
+  is on: a roaming profile carries a file to another machine, and everything
+  here is scoped to the account this one is paired to. Retiring it is a
+  delete plus a `sync_dir`, for the reason the revocation's rename is
+  flushed — an unlink that has not reached the disk is an `approvals.json`
+  that comes back after the credentials have already been wiped.
+  What an answer is recorded *against* is the id and the mask, deliberately,
+  and not a hash of the module: replacing `autoreply.wasm` with different
+  code keeps the answer. That is defensible because the mask is the whole
+  authority — there is no WASI, so what the new code can do is exactly the
+  sentence the user agreed to, enforced whatever the bytes are — and because
+  the alternative asks again on every update, which is the surest way to
+  teach somebody to dismiss the question. It is a real trade rather than an
+  oversight: binding to the bytes would say "you approved this build", which
+  is stronger and costs a prompt per release. It is also why nothing loads
+  out of a place another local account can write
+  (`only_this_user_can_write`: owner *and* mode, the directory and every
+  module in it) — and a symlink is refused rather than followed, since
+  following one answers about the target and says nothing about who may put a
+  different file there: a target this user owns, `0600`, in a directory
+  somebody else may write is a file they can unlink and replace, and the
+  replacement inherits the id's approval. Allowing the link would mean a
+  verdict on its directory, and on that directory's directory, with a race at
+  every step; `OXIDEZAP_PLUGIN_DIR` is how a module is loaded from somewhere
+  else, and it is checked the same way. An answer recorded against a name
+  rather than against bytes
+  is one somebody else's file under that name inherits — and a writable
+  directory is one where a new name can appear, not only new bytes under an
+  old one.
+- **An event is a handle, not a payload.** Nothing is serialized for a plugin:
+  it reads fields through four host functions against a table of constants, so
+  a handler that looks at the text and the chat pays for two strings out of an
+  event carrying a dozen, and the whole path is cheaper than the JSON one a
+  socket front end already uses. What a plugin is *handed* is decided before
+  any of it is built, though — `event::kind_of` answers from the session
+  event alone, so a plugin watching messages does not pay for an account's
+  receipts and presence, which are most of its traffic. Two matches that
+  disagree would be a plugin silently missing events, which is what
+  `every_converted_event_is_one_the_filter_admits` exists to refuse. Field
+  ids are constants rather than one
+  accessor each, which is what keeps the import surface fixed as the table
+  grows: an absent field reads back as its default — the same rule the wire
+  holds itself to with `skip_serializing_if` — so adding one is a non-event
+  for a plugin built against an older table. Commands go the other way as one
+  import each rather than one `oxi_request` taking a serialized
+  `ClientRequest`, which is what spares a plugin from carrying an encoder at
+  all; the one payload that *does* travel from a plugin is its widget tree,
+  and that has a fixed-width encoding written into a buffer the plugin already
+  owns. A plugin needs no allocator, and `examples/autoreply` is 6 KiB.
+- **A plugin's queue overflowing stops it; it does not skip.** The opposite of
+  the video path, and deliberately: a frame that cannot be delivered now is
+  worth nothing later, but a plugin's whole contract is having *seen* the
+  messages. An autoreply that answered some people and not others, with
+  nothing anywhere saying which, is worse than one that is off with a reason
+  attached. "Stopped" also has to mean it runs no more of them — the worker
+  checks before every event and `offer` refuses to queue another, or a plugin
+  would go on working through five hundred banked messages while Settings
+  reported it as stopped. A trap ends it the same way and for the same reason
+  — fuel gone, memory refused, or the plugin running off the end of its own
+  logic, none of which the next event improves — and it is never restarted in
+  a loop, which would spend a CPU rediscovering that. Its widgets stay on
+  screen, drawn inert beside the reason: a control that vanished tells nobody
+  anything.
+- **Stopping a plugin is dropping its channel, never queueing a message.** A
+  stop message has to *fit*, and the plugin that most needs stopping is the
+  one whose queue is full — `try_send` there drops the request on the floor
+  and the daemon then waits forever to join a thread nobody told to leave. So
+  shutdown raises a flag and drops the sender: the flag is what makes a worker
+  abandon a backlog it has already been handed, and the closed channel is what
+  wakes one parked in `recv`. Neither alone is enough. The bridge has the
+  mirror of it: the command receiver is dropped *before* the plugins are
+  joined, because a plugin parked on a command's answer is parked on a loop
+  that has already stopped running — dropping the receiver drops the reply
+  channel with it and the wait returns, where joining first would have the
+  teardown waiting for a thread waiting for the teardown.
+- **A plugin's interface is daemon state.** The plugin runs in the daemon and
+  the widgets are drawn in the window, which are two processes; the answer is
+  not a channel between them. A plugin *declares* a small tree pinned to a
+  named slot, the tree goes into `StateHub` like everything else, and the
+  press comes back as one more `ClientRequest`. So it survives the window
+  closing and reappears in the next window's snapshot, because it was never
+  the window's in the first place — and a front end that is not a window reads
+  the same tree and renders it its own way or ignores it. A slot is a promise
+  about *where*, never about how: nothing in a tree can express a colour, a
+  size or a position, so a plugin cannot put a literal outside the theme's
+  reach. An action is checked against that tree before it is routed, rather
+  than against the plugin merely being loaded: a front end's frame can be
+  older than the daemon's, so a second window still showing a button since
+  withdrawn or greyed out would land as a real press, and an id the plugin
+  never published would reach a handler as a widget that does not exist —
+  and the check is on the widget's kind as well as its name, since a plugin
+  may republish a button as a text field under the same id and an older
+  window's press would arrive as that field's commit carrying no value. An
+  id names one widget *within a slot*, which is where the encoder refuses a
+  duplicate: across slots it may repeat, because an action says which one it
+  came from, but twice in one slot nothing tells the two apart — a press
+  names both, and a front end keeping a text box per id draws one box for
+  two fields. In the slot the action says it came from, because one plugin may draw the same
+  id in a header and in its settings panel: withdrawing one of them must not
+  leave the other vouching for it, which is why the slot travels on the
+  action rather than being guessed from whether a chat came with it.
+  The open chat travels on the action rather than being looked up,
+  because the daemon does not know it — two windows can have different
+  conversations open, and a header button is about the one the person pressing
+  it was looking at.
 - **The camera is where the microphone is, and the picture crosses encoded.**
   `oxidezap-session` opens both, because the process that owns the session
   owns the devices — so the window has no camera of its own and no way to
@@ -636,10 +932,94 @@ screen, with the title above the glass and the pair code below it.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
+- **A withdrawal is applied before it is written down, and that is a trade.**
+  A revocation clears the shared mask first and persists second, so the very
+  next command a draining backlog attempts is already refused. The cost is a
+  crash in the window between the two: the file still holds the old grant,
+  and the next start reads it. Reversing the order buys durability and sells
+  the live account — the plugin would keep its permissions across a disk
+  write while Settings had already redrawn — and there is no ordering that
+  closes both, because closing the crash window means the write happening
+  first. Protecting the account that is running now is the side worth taking;
+  the failed-write path already removes the file rather than leave a stale
+  grant, so only an actual crash, in that window, reverts anything. Which is
+  also why the *rename* is made durable: syncing the temporary file persists
+  its contents and not the directory entry that names it, so without a sync
+  of the parent a revocation could be undone by losing power at any point
+  after it looked finished — a far wider window than the one above, and the
+  half of this that is fixable rather than a trade.
+- **A withdrawal does not reach a command already in flight.** The mask is
+  read live, so the *next* command a plugin attempts is checked against the
+  answer — but the check and the send are two steps, and the send parks on a
+  bounded channel. A revocation landing in between does not stop the command
+  that is already waiting there, so one send, read receipt or typing update
+  can still act after Settings says "not allowed". The window is bounded by
+  the session's own draining, and closing it means carrying the plugin's
+  authorization into `SessionCommand` so the executing side can check it
+  again — a change to the command shape, decided on its own.
+- **A plugin cannot tell "cleared" from "not carried".** The ABI's absence
+  rule is that a field's absence reads back as its default, and a string's
+  default is empty — which is exactly what makes adding a field a non-event,
+  and exactly why a reaction that was *removed* (an empty emoji) and a text
+  field committed empty arrive indistinguishable from a field the event never
+  had. Smuggling the difference into string presence would break the rule for
+  every reader; carrying it needs a field that says so.
+- **A plugin never sees what this process sends, at the time it is sent.**
+  `kinds::MESSAGE` is what *arrives*, including a message this account wrote
+  on another device — but a send made through this daemon is announced as an
+  id assignment, not as a message, so nothing reaches a plugin at send time
+  and one keeping a record of a conversation has a hole in it exactly where
+  its own replies go. Whether the same message comes back later is the
+  server's business rather than a promise: when it does, through a history
+  sync, it arrives as an ordinary `MESSAGE` with `FROM_ME` set. Which is why
+  synthesizing one at send time is not free — a plugin would see the ones
+  that do come back twice.
+- **A plugin's reply quotes an empty message.** `oxi_send_reply` names an id
+  and nothing else, which is all the ABI gives a plugin — but the session
+  does not re-read the original: `quote_context` puts the preview, the sender
+  and the kind straight on the wire, so the peer sees the reply's linkage
+  over a blank quote bar, and in a group it names no author. Resolving it
+  needs a lookup by id, which the daemon has no store to make and the session
+  has no method for; the alternative is widening the ABI, which is a decision
+  of its own.
 - **A front end cannot say what went wrong with a command.** `Accepted` means
   the session took it; per-request outcomes would need request ids on more
   than downloads. A failed send arrives as `SendFailed` against the chat, not
-  against the request that caused it.
+  against the request that caused it. A *plugin* does learn this, which is the
+  odd part: its call is synchronous, so there is nothing to correlate.
+- **A plugin cannot reach the network or the disk, and half the interesting
+  ones want to.** A translator, a webhook bridge, a conversation export. Each
+  is one import, and each turns the categorical sentence in the gotchas above
+  into a policy — so it wants a declared destination, a prompt at enable time,
+  and a decision of its own.
+- **A plugin's tree is state, and state frames are the ring's to hold.** Every
+  change to any plugin publishes the *whole* set — that is what makes a
+  mid-stream join safe, and it is also what a stalled client's 256-frame
+  backlog then holds a copy of. The arithmetic is `MAX_PLUGINS` trees of
+  `ui::MAX_BYTES`, decoded, times `BROADCAST_CAPACITY`: hundreds of megabytes
+  in the worst case, transiently, before that client is cut to a `Resync`.
+  Bounded and recoverable, but larger than it should be, and the plugin half
+  is the half somebody else writes. Coalescing pending frames or publishing
+  per-plugin deltas would fix it and is a change to the state protocol —
+  every frame there carries a version and a client's whole recovery story is
+  built on their being contiguous — so it is a decision of its own rather
+  than something to bolt onto the plugin path.
+- **"Only this user can write it" is a POSIX sentence.** `only_this_user_can_write`
+  reads an owner and a mode, which Windows does not have — it answers `true`
+  there, and what stands in for it is where the directory *is*: plugins and
+  their state live under `%LOCALAPPDATA%`, whose ACL is the profile's. That
+  covers the default and not an override, so a `OXIDEZAP_PLUGIN_DIR` pointing
+  at a share is trusted on Windows and checked on unix. It is the user's own
+  environment variable naming their own directory, which is the weakest half
+  of the threat this guards against — but it is a gap, and closing it means
+  reading an ACL and deciding what "only this user" means when the answer is
+  a list rather than three bits.
+- **Plugins are not reloadable, and there is no message interception.** A
+  plugin with state, reloaded under itself mid-conversation, is a separate
+  problem; restarting `oxidezapd` is the answer for now and it is cheap. And a
+  plugin that could alter or block an inbound message would sit between the
+  store and every front end, which the whole state model assumes it cannot —
+  plugins observe and act, they do not filter.
 
 Clickable `div`s that remain are deliberate: a chat row and a media thumbnail
 are surfaces, not commands, and have no semantic component to compose from.

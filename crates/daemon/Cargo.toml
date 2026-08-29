@@ -20,6 +20,7 @@ log = { workspace = true }
 
 oxidezap-core = { workspace = true }
 oxidezap-ipc = { workspace = true }
+oxidezap-plugin-host = { workspace = true }
 oxidezap-session = { workspace = true }
 portable-atomic = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }

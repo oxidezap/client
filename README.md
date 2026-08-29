@@ -27,6 +27,9 @@ process that opens the database, however many windows you like.
 | `oxidezap-ipc` | The protocol between the daemon and its front ends, and the client end of the transport. No runtime. |
 | `oxidezap-daemon` | `oxidezapd`: the session, the socket and the tray. |
 | `oxidezap-gui` | `oxidezap`: GPUI front end, plus video decode. |
+| `oxidezap-plugin-abi` | The wasm ABI: constants and the widget-tree codec. `no_std`, no dependencies. |
+| `oxidezap-plugin-host` | Runs `.wasm` plugins inside the daemon: discovery, the sandbox, approvals. |
+| `oxidezap-plugin` | The Rust SDK a plugin is written against. |
 
 ## Install
 
@@ -75,6 +78,24 @@ State lives in one SQLite file under the platform data directory
 (`~/.local/share/oxidezap/whatsapp.db` on Linux): device identity, Signal
 state and chat history together. Deleting it unlinks the device and discards
 local history, which is exactly what the in-app "pair again" action does.
+
+## Plugins
+
+A plugin is a `.wasm` file dropped in `~/.local/share/oxidezap/plugins`. It
+runs inside the daemon, sees the account's events, and can declare a small
+interface — a button in a chat header, a section on the Settings screen — that
+the window draws in its own theme.
+
+There is no WASI: the `oxidezap` import module is a plugin's entire outside
+world, so a downloaded file cannot read the disk or open a socket because no
+function exists that would. What it may do *to the account* — send, mark read,
+show a typing indicator — is withheld until you say yes, and withdrawing that
+answer takes effect on the plugin's next command rather than after its queue
+drains.
+
+Copy `examples/template` to start one, or read `docs/plugin-abi.md` if you are
+writing in something other than Rust — the SDK is a convenience over that
+document and has no privileged access to anything.
 
 ## Known limitations
 

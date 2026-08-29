@@ -24,17 +24,19 @@ pub enum SettingsSection {
     AudioVideo,
     Privacy,
     Storage,
+    Plugins,
     Advanced,
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Account,
         Self::Appearance,
         Self::Notifications,
         Self::AudioVideo,
         Self::Privacy,
         Self::Storage,
+        Self::Plugins,
         Self::Advanced,
     ];
 
@@ -46,6 +48,7 @@ impl SettingsSection {
             Self::AudioVideo => "Audio & video",
             Self::Privacy => "Privacy & keys",
             Self::Storage => "Storage & media",
+            Self::Plugins => "Plugins",
             Self::Advanced => "Advanced",
         }
     }
@@ -58,6 +61,7 @@ impl SettingsSection {
             Self::AudioVideo => "audio-video",
             Self::Privacy => "privacy",
             Self::Storage => "storage",
+            Self::Plugins => "plugins",
             Self::Advanced => "advanced",
         }
     }
