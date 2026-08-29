@@ -311,11 +311,20 @@ pub(crate) fn merge_split_chat(
     // receipt per (msg, user) win across the pair, matching their live-path
     // monotonic rules — drop the losing destination rows, then move.
     //
-    // A tie is settled the way the live path settles it (`ts_ms <= ts_ms`,
-    // so the reaction being applied wins), which here means the removal
-    // tombstone: reaction timestamps are whole seconds, so adding and
-    // removing inside one second ties, and a strict comparison kept the
-    // emoji and threw the tombstone away.
+    // Reaction timestamps are whole seconds, so adding and removing inside
+    // one second ties, and a strict comparison kept the emoji and threw the
+    // tombstone away: the removal came back undone. A tie goes to the
+    // tombstone instead.
+    //
+    // A heuristic, not a proof, and worth saying so. The live path settles a
+    // tie by arrival (`ts_ms <= ts_ms`), and across a split pair there is no
+    // arrival order to consult: a row is updated in place, so its rowid is
+    // when the row was created rather than when its value was applied. The
+    // case this gets wrong is a same-second add, remove and re-add split
+    // across the two identities, where the re-add is dropped. That needs
+    // three actions inside one second landing on both sides; the case it
+    // fixes needs two. Settling it properly means recording when a value was
+    // applied, which is a column this schema does not have.
     diesel::sql_query(
         "DELETE FROM reactions WHERE device_id = ?1 AND chat_jid = ?3 AND EXISTS \
          (SELECT 1 FROM reactions s WHERE s.device_id = ?1 AND s.chat_jid = ?2 \
