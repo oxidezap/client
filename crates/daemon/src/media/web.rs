@@ -36,18 +36,20 @@ struct Entry {
     /// longest without being wanted. A clock rather than a timestamp: there
     /// is no time here that a test would not have to fake.
     touched: u64,
-    /// Somebody asked for these bytes and has not been handed them yet.
+    /// How many answered requests are still waiting to be handed these bytes.
     ///
-    /// The same standing a staged upload has, for the same reason: this is
-    /// not a copy of something that can be fetched again *in time to matter*.
-    /// It is the delivery of a request already answered `Ok`, and the reader
-    /// is on its way. Dropping it makes a download that WhatsApp completed
-    /// report a failure — so it is exempt from the sweep until it is read,
-    /// and reading it is what takes it out of the map altogether.
+    /// A count and not a flag, because the key is content-addressed: the same
+    /// photo asked for from two different messages is one entry answering two
+    /// `Downloaded` frames. A boolean cleared by the first delivery would
+    /// leave the second one's bytes reclaimable while its frame was still in
+    /// the pipe, which is the failure the claim exists to prevent, arrived at
+    /// from the other side.
     ///
-    /// Exempting it from *eviction* only. It still counts toward the budget,
-    /// so it presses older entries out rather than raising the ceiling.
-    pinned: bool,
+    /// A claim is the delivery of a request already answered `Ok`, so it is
+    /// not a copy of something fetchable again *in time to matter* — the
+    /// sweep leaves claimed entries for last. It does not make them
+    /// untouchable: see [`sweep`].
+    claims: usize,
 }
 
 #[derive(Default)]
@@ -73,7 +75,7 @@ fn with<T>(f: impl FnOnce(&mut Cache) -> T) -> T {
 /// Never, here. A map does not fail to be written to, and the signature is
 /// the desktop's, where a disk does.
 pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
-    store(key, bytes.to_vec(), true)
+    store(key, bytes.to_vec(), 1)
 }
 
 /// The same, for a caller that already owns the only copy.
@@ -84,7 +86,7 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
 /// unavoidable; here both are the same linear memory, with a ceiling, and a
 /// large document can be a meaningful fraction of it.
 pub fn put_owned(key: &str, bytes: Vec<u8>) -> Result<String> {
-    store(key, bytes, true)
+    store(key, bytes, 1)
 }
 
 /// Cache `bytes` under `key`, droppable from the moment they land.
@@ -93,10 +95,10 @@ pub fn put_owned(key: &str, bytes: Vec<u8>) -> Result<String> {
 /// on and which can be fetched again on demand. See [`super::put_since`],
 /// whose whole subject is that this write is the one allowed to lose.
 pub fn put_evictable(key: &str, bytes: &[u8]) -> Result<String> {
-    store(key, bytes.to_vec(), false)
+    store(key, bytes.to_vec(), 0)
 }
 
-fn store(key: &str, bytes: Vec<u8>, pinned: bool) -> Result<String> {
+fn store(key: &str, bytes: Vec<u8>, claims: usize) -> Result<String> {
     with(|cache| {
         // Content-addressed: the same key is the same bytes, so an entry that
         // is already there is already right — and re-storing it would be a
@@ -104,10 +106,11 @@ fn store(key: &str, bytes: Vec<u8>, pinned: bool) -> Result<String> {
         if let Some(entry) = cache.entries.get_mut(key) {
             cache.clock += 1;
             entry.touched = cache.clock;
-            // A key first cached eagerly and then asked for is now somebody's
-            // answer, so it takes the stronger standing. Never the reverse:
-            // an eager write must not unpin bytes a reader is coming for.
-            entry.pinned |= pinned;
+            // Added, not replaced: a key first cached eagerly and then asked
+            // for gains a claim, and a second asker gains another. An eager
+            // write adds none, so it can never release bytes a reader is
+            // coming for.
+            entry.claims += claims;
             return Ok(key.to_string());
         }
         cache.clock += 1;
@@ -118,7 +121,7 @@ fn store(key: &str, bytes: Vec<u8>, pinned: bool) -> Result<String> {
             Entry {
                 bytes: Arc::new(bytes),
                 touched,
-                pinned,
+                claims,
             },
         );
         sweep(cache);
@@ -152,11 +155,11 @@ pub fn deliver(key: &str) -> Option<Arc<Vec<u8>>> {
         let entry = cache.entries.get_mut(key)?;
         cache.clock += 1;
         entry.touched = cache.clock;
-        // The delivery this entry was being held for has happened, so it goes
-        // back to being an ordinary cache entry. Kept rather than removed:
-        // another request for the same content is answered with the same key,
-        // and a save that lost the browser's activation is about to ask again.
-        entry.pinned = false;
+        // One delivery has happened. Only one: another request for the same
+        // content is answered with the same key and is still waiting for it.
+        // Kept rather than removed even at zero, because a save that lost the
+        // browser's activation is about to ask again.
+        entry.claims = entry.claims.saturating_sub(1);
         Some(Arc::clone(&entry.bytes))
     })
 }
@@ -186,7 +189,7 @@ pub fn has(key: &str) -> bool {
 /// nothing is holding. The asker is then told a download it was promised is
 /// missing.
 ///
-/// So the promise and the claim are the same act. Touched as well as pinned,
+/// So the promise and the claim are the same act. Touched as well as counted,
 /// because an entry about to be handed over is the last one the sweep should
 /// be eyeing.
 pub fn claim(key: &str) -> bool {
@@ -196,7 +199,7 @@ pub fn claim(key: &str) -> bool {
         };
         cache.clock += 1;
         entry.touched = cache.clock;
-        entry.pinned = true;
+        entry.claims += 1;
         true
     })
 }
@@ -214,7 +217,7 @@ pub fn cache_usage() -> (u64, u64) {
 pub fn wipe(scope: Wipe) -> Result<()> {
     with(|cache| {
         cache.entries.retain(|name, entry| {
-            // A pinned entry survives a *cache* clear, for the same reason it
+            // A claimed entry survives a *cache* clear, for the same reason it
             // survives the sweep: somebody asked for these bytes, the request
             // has already been answered `Ok`, and the reader is on its way.
             // "Clear cached media" means the copies of things that can be
@@ -224,7 +227,7 @@ pub fn wipe(scope: Wipe) -> Result<()> {
             // `Wipe::Everything` takes it regardless: there the account
             // itself is going, and nothing that was going to be shown to it
             // has any business outliving it.
-            let taken = scope.takes(name) && !(entry.pinned && scope == Wipe::Cache);
+            let taken = scope.takes(name) && !(entry.claims > 0 && scope == Wipe::Cache);
             if taken {
                 cache.held = cache.held.saturating_sub(entry.bytes.len() as u64);
             }
@@ -242,14 +245,14 @@ pub fn wipe(scope: Wipe) -> Result<()> {
 /// reclaim what it may not touch, and counting it would make the sweep spin
 /// against a budget it can never reach.
 ///
-/// A pinned entry is different, and the difference is the whole shape of
-/// this: it is preferred, not untouchable. A pin says a delivery is on its
+/// A claimed entry is different, and the difference is the whole shape of
+/// this: it is preferred, not untouchable. A claim says a delivery is on its
 /// way, and a delivery can simply never arrive — the client that asked
 /// disconnected, or timed out, and `answer_now` has nobody to hand the frame
-/// to. Nothing releases the pin then. Treating pins as absolute would let a
-/// run of abandoned downloads grow this map without limit, which is the one
-/// thing a budget exists to prevent, so the budget wins in the end: unpinned
-/// entries go first, and only if that is not enough do pinned ones follow,
+/// to. Nothing releases the claim then. Treating claims as absolute would let
+/// a run of abandoned downloads grow this map without limit, which is the one
+/// thing a budget exists to prevent — so the budget wins in the end: unclaimed
+/// entries go first, and only if that is not enough do claimed ones follow,
 /// oldest first.
 ///
 /// Which means a pending delivery can still be dropped — under exactly the
@@ -266,7 +269,7 @@ fn sweep(cache: &mut Cache) {
         return;
     }
 
-    // Sorted so that everything unpinned comes before anything pinned, and
+    // Sorted so that everything unclaimed comes before anything claimed, and
     // each group runs oldest first. One list rather than two passes, because
     // "take the oldest until the budget is met" is one rule with a
     // tie-breaker rather than two policies.
@@ -277,20 +280,20 @@ fn sweep(cache: &mut Cache) {
         .map(|(name, entry)| {
             (
                 name.clone(),
-                entry.pinned,
+                entry.claims > 0,
                 entry.touched,
                 entry.bytes.len() as u64,
             )
         })
         .collect();
-    oldest.sort_by_key(|(_, pinned, touched, _)| (*pinned, *touched));
+    oldest.sort_by_key(|(_, claimed, touched, _)| (*claimed, *touched));
 
     let mut over = reclaimable - CACHE_BUDGET_BYTES;
-    for (name, pinned, _, size) in oldest {
+    for (name, claimed, _, size) in oldest {
         if over == 0 {
             break;
         }
-        if pinned {
+        if claimed {
             log::warn!(
                 "dropping {name}, which was waiting to be delivered: the media cache is over \
                  its budget with nothing unclaimed left to reclaim"
