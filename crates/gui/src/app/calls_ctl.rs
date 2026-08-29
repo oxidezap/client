@@ -260,6 +260,15 @@ impl WhatsAppApp {
     /// into `decline_call` made the *visible* Decline button refuse a caller
     /// the user could not see, and leave the ringing one ringing.
     pub fn decline_waiting_call(&mut self, cx: &mut Context<Self>) {
+        // Before the call is taken out of the state: with no daemon to reach,
+        // nothing refuses anybody. The caller goes on ringing, and writing the
+        // refusal down anyway put a line in the conversation saying the call
+        // was declined when nothing had been declined at all. The visible
+        // Decline says the same by returning early.
+        if self.client.is_none() {
+            warn!("Cannot decline the waiting call: client is unavailable");
+            return;
+        }
         let Some(waiting) = self.call_state.take_waiting() else {
             return;
         };
