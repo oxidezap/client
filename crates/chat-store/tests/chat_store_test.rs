@@ -6632,6 +6632,39 @@ async fn a_view_never_regresses_a_row() {
     );
 }
 
+/// A read covers both halves of a PN/LID pair, and the message key includes
+/// the chat: until a split is merged the same message exists under both. Drawn
+/// twice it fills two slots of the page's limit and moves the cursor past a
+/// row nobody was shown.
+#[tokio::test]
+async fn a_split_pair_does_not_hand_back_the_same_message_twice() {
+    let (store, chat_store) = test_store().await;
+    // No mapping yet, so the two identities form two threads.
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("via pn"),
+                incoming_info(PEER, PEER, "MSG-DUP-1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("via lid"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-DUP-1", 1_700_000_000),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(chat_store.chats(false, 10).await.unwrap().len(), 2);
+
+    add_lid_mapping(&store).await;
+    let messages = chat_store.messages(&jid(PEER), None, 10).await.unwrap();
+    assert_eq!(
+        messages.iter().filter(|m| m.id == "MSG-DUP-1").count(),
+        1,
+        "one message, whichever key it is filed under"
+    );
+}
+
 /// The write has to look where the reads do. A thread living under the LID
 /// key, named here by the phone number, used to be updated under a key it has
 /// no rows beneath: the view was recorded nowhere and the ring stayed up.

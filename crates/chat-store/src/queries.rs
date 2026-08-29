@@ -134,6 +134,20 @@ pub(crate) struct MessageRow {
     pub(crate) rowid: i64,
 }
 
+/// One row per message id, keeping the first of a duplicate.
+///
+/// A read covers both halves of a PN/LID pair, and the message table's key
+/// includes the chat, so until a split is merged the same message can exist
+/// under both. Returned twice it fills two slots of a page's limit and moves
+/// the cursor past rows nobody was shown; the merge path already treats such
+/// a pair as one message.
+fn dedup_by_id(rows: Vec<MessageRow>) -> Vec<MessageRow> {
+    let mut seen = std::collections::HashSet::with_capacity(rows.len());
+    rows.into_iter()
+        .filter(|row| seen.insert(row.msg_id.clone()))
+        .collect()
+}
+
 impl From<MessageRow> for StoredMessage {
     fn from(row: MessageRow) -> Self {
         let message = row.proto.as_deref().and_then(|bytes| {
@@ -429,7 +443,7 @@ impl ChatStore {
                     .map_err(db_err)
             })
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(dedup_by_id(rows).into_iter().map(Into::into).collect())
     }
 
     /// The newest page of each of several chats, in one read.
@@ -473,7 +487,7 @@ impl ChatStore {
                         .load(conn)
                         .map_err(db_err)?;
                     if !rows.is_empty() {
-                        pages.insert(chat, rows);
+                        pages.insert(chat, dedup_by_id(rows));
                     }
                 }
                 Ok(pages)
@@ -686,18 +700,38 @@ impl ChatStore {
         // Grouped here rather than by the query, because the order that
         // matters is the one within a message — the newest reaction from a
         // sender wins — and a chunked read cannot express it across pages.
-        let mut by_message: HashMap<String, Vec<ReactionEntry>> = HashMap::new();
+        // Keyed by sender as well as by message, because the union covers
+        // both halves of a PN/LID pair: until a split is merged the same
+        // person's reaction can exist under either key, and one reactor would
+        // otherwise be drawn twice. The rule is the writer's own — the newest
+        // per sender wins.
+        let mut by_message: HashMap<String, HashMap<String, (i64, ReactionEntry)>> = HashMap::new();
         for (msg_id, sender, emoji, ts) in rows {
-            by_message.entry(msg_id).or_default().push(ReactionEntry {
+            let entry = ReactionEntry {
                 sender_jid: parse_jid(&sender),
                 emoji,
                 timestamp: ms_to_utc(ts).unwrap_or_default(),
-            });
+            };
+            match by_message.entry(msg_id).or_default().entry(sender) {
+                std::collections::hash_map::Entry::Occupied(mut held) => {
+                    if held.get().0 <= ts {
+                        held.insert((ts, entry));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((ts, entry));
+                }
+            }
         }
-        for entries in by_message.values_mut() {
-            entries.sort_by_key(|entry| entry.timestamp);
-        }
-        Ok(by_message)
+        Ok(by_message
+            .into_iter()
+            .map(|(msg_id, senders)| {
+                let mut entries: Vec<ReactionEntry> =
+                    senders.into_values().map(|(_, entry)| entry).collect();
+                entries.sort_by_key(|entry| entry.timestamp);
+                (msg_id, entries)
+            })
+            .collect())
     }
 
     /// Per-user receipts of one message (group "delivered to"/"read by").
