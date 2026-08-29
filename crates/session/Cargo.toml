@@ -79,5 +79,13 @@ web-sys = { version = "0.3", features = [
 sqlite-wasm-rs = { version = "0.5", default-features = false }
 sqlite-wasm-vfs = "0.2"
 
+# The cancellation semantics `net::abort_requested` decides are the same on
+# both targets — a `oneshot` and nothing else — so the test that pins them
+# runs on the host, where `cargo test` already is. Only the test needs these
+# here; the page's build gets them from the wasm section above.
+[dev-dependencies]
+futures-channel = "0.3"
+futures-lite = "2"
+
 [lints]
 workspace = true

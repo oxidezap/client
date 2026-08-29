@@ -40,26 +40,30 @@ impl Runtime for BrowserRuntime {
     /// Spawned on the page's microtask queue, and cancellable.
     ///
     /// `spawn_local` hands back nothing to cancel with, so the task races the
-    /// future against a channel the handle closes. A flag checked before the
-    /// await would not do: a future that returns `Pending` is not polled
-    /// again until something wakes it, so setting a flag would cancel
-    /// nothing and the future would go on to run its side effects whenever
-    /// it next woke. Dropping the sender wakes the receiver, which is what
-    /// makes this an abort rather than a wish.
+    /// future against a channel. A flag checked before the await would not
+    /// do: a future that returns `Pending` is not polled again until
+    /// something wakes it, so setting a flag would cancel nothing and the
+    /// future would go on to run its side effects whenever it next woke.
+    ///
+    /// The abort is a value *sent*, never a sender dropped, and that is the
+    /// whole of [`super::abort_requested`]: `AbortHandle` says which of its
+    /// two endings happened by whether it calls this closure or drops it, so
+    /// a closure that cancelled by being dropped made `.detach()` — the one
+    /// call whose entire purpose is "run this to completion" — the thing
+    /// that killed the task.
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) -> AbortHandle {
         let (cancel, cancelled) = futures_channel::oneshot::channel::<()>();
         spawn_local(async move {
-            futures_lite::future::or(future, async move {
-                // Resolves when the handle is dropped or aborted, and never
-                // otherwise: the sender is only ever closed, never sent on.
-                let _ = cancelled.await;
-            })
-            .await;
+            futures_lite::future::or(future, super::abort_requested(cancelled)).await;
         });
 
         // No wrapper and no `unsafe`: `AbortHandle::new` wants a `Send`
         // closure, and a `oneshot::Sender<()>` is already one.
-        AbortHandle::new(move || drop(cancel))
+        AbortHandle::new(move || {
+            // Nobody is listening once the task has finished, which is an
+            // abort arriving late rather than a failure.
+            let _ = cancel.send(());
+        })
     }
 
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()>>> {

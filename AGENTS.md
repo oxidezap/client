@@ -234,6 +234,19 @@ profile here repeats it deliberately.
   count, because a client costs the same descriptors and tasks however it
   arrived; the web one claims its slot at the upgrade rather than at accept,
   since the same port serves media and a photo is not a front end.
+- **An abort is something said, not something let go of.** The library's
+  `AbortHandle` tells its two endings apart by whether it *calls* the closure
+  it boxes — `abort()`, and `Drop`, call it; `detach()` drops it uncalled —
+  so a runtime that cancels by dropping the sender makes `.detach()` mean the
+  opposite of what it says. The web runtime did, and the tokio one does not
+  (dropping a `JoinHandle` detaches), so it went unseen on a desktop and was
+  total in a page: `runtime.spawn(…).detach()` is how the library runs nearly
+  everything fire-and-forget — the QR rotation, inbound message handling, the
+  bot's own subscriptions — and every one of them was cancelled before its
+  first poll. What a page did instead was handshake, ack the server's
+  `<pair-device>` from the handler that runs inline, and then sit there with
+  no code on screen. `net::abort_requested` is the rule stated once: a value
+  sent is an abort, a sender dropped is a detachment and waits forever.
 - **Nothing stops the daemon but `main`.** The tray's Quit and an IPC
   `Shutdown` ask through `shutdown::request`; ending the process from a D-Bus
   callback or a connection task would skip disconnecting the session and
