@@ -563,15 +563,18 @@ impl WhatsAppClient {
         // Transport, HTTP client and runtime come from whichever platform
         // this is: the library's default features on a desktop, `web-sys`
         // bindings in a page. See `crate::net`.
-        // Which version to announce is the platform's answer, because only one
-        // of the two can go and look: the desktop lets the library fetch
-        // WhatsApp's own `sw.js`, and a page is refused that by CORS. See
-        // `net::app_version`.
+        //
+        // The version is not among them, and used to be: `sw.js` is
+        // unreachable from a page — no `Access-Control-Allow-Origin`, and its
+        // `Sec-Fetch-Site` gate is a header a browser will not let anyone set
+        // — so this side fetched the number from a CDN feed and announced it
+        // with `with_version`. The library resolves it per target now, off
+        // the Facebook JS SDK bundle where Meta publishes the same `www`
+        // revision cross-origin, so the answer belongs there again. Ours was
+        // worse than redundant: `with_version` is an override, and an
+        // override makes the library skip its own resolution *and* the
+        // day-long cache stamp behind it.
         let builder = crate::net::with_platform_plugins(Bot::builder()).with_backend(backend);
-        let builder = match crate::net::app_version().await {
-            Some(version) => builder.with_version(version),
-            None => builder,
-        };
         let bot = match builder.build().await {
             Ok(bot) => bot,
             Err(e) => {
