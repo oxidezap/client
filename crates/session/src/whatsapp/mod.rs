@@ -575,6 +575,25 @@ impl WhatsAppClient {
         // one task per event keeps the concurrent delivery the builder was
         // giving us, rather than quietly turning the event stream serial.
         let (events, incoming) = ChannelEventHandler::new();
+        // What tells this session's own tasks that it is over.
+        //
+        // A desktop session ends by dropping the runtime it was built on,
+        // which takes every task on it. A page has no such runtime: a
+        // `spawn_local` task is never cancelled by anything, so one that holds
+        // an `Arc<ChatStore>` or a client handle keeps them alive for the life
+        // of the tab — and "clear data and pair again" then deletes the
+        // database out from under a connection somebody still has open.
+        //
+        // Both long-lived children below watch this. A `watch` rather than a
+        // `Notify` because dropping the sender is itself the signal: whichever
+        // way `run_client` returns, including a panic on the way out, the
+        // children wake and stop. There is no notification for a task to have
+        // been too late to register for.
+        // Named, not `_`: a `_` binding drops at once, which would end the
+        // session before it began. This one is never sent on and never read —
+        // holding it until `run_client` returns is the whole of its job.
+        let (_session_over, stopping) = tokio::sync::watch::channel(());
+
         bot.client().subscribe_handler(events).detach();
         {
             let client = bot.client();
@@ -582,8 +601,18 @@ impl WhatsAppClient {
             let calls = calls.clone();
             let ui_sender = ui_sender.clone();
             let names = names.clone();
+            let mut stopping = stopping.clone();
             crate::exec::spawn(async move {
-                while let Ok(event) = incoming.recv().await {
+                loop {
+                    let event = tokio::select! {
+                        event = incoming.recv() => match event {
+                            Ok(event) => event,
+                            Err(_) => break,
+                        },
+                        // The session has gone. Anything still queued belongs
+                        // to an account this task no longer speaks for.
+                        _ = stopping.changed() => break,
+                    };
                     let client = client.clone();
                     let ui_tx = ui_tx.clone();
                     let calls = calls.clone();
@@ -608,6 +637,7 @@ impl WhatsAppClient {
             &ui_tx,
             reload,
             names,
+            stopping,
         );
 
         // Store client reference for UI to use
@@ -2051,7 +2081,13 @@ impl WhatsAppClient {
     const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
     /// One task for the whole session: chat-store invalidations -> debounced
-    /// load_history -> HistoryLoaded. Exits when the store or the UI goes away.
+    /// load_history -> HistoryLoaded.
+    ///
+    /// Exits when the session does, which is `stopping` and not the store: it
+    /// holds an `Arc<ChatStore>` itself, and that store owns the sender its
+    /// receiver is waiting on — so "the store went away" is a thing this task
+    /// makes impossible by existing. On a desktop that never showed, because
+    /// dropping the runtime took the task with it; on a page nothing does.
     fn spawn_history_reloader(
         mut changes: tokio::sync::broadcast::Receiver<oxidezap_chat_store::StoreChange>,
         chat_store: Arc<ChatStore>,
@@ -2059,6 +2095,7 @@ impl WhatsAppClient {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
         reload: Arc<tokio::sync::Notify>,
         names: Arc<NameBook>,
+        mut stopping: tokio::sync::watch::Receiver<()>,
     ) {
         use tokio::sync::broadcast::error::RecvError;
 
@@ -2082,6 +2119,10 @@ impl WhatsAppClient {
                         scope.widen(None);
                         asked = true;
                     }
+                    // Without a final load: the session is going, and a
+                    // reload would read a store that is about to be deleted
+                    // and publish it at a front end that has already left.
+                    _ = stopping.changed() => break,
                 }
                 // Drain the burst; a quiet window flushes the reload.
                 //
@@ -2100,6 +2141,7 @@ impl WhatsAppClient {
                 // the asker waits out the whole sync.
                 while !asked {
                     tokio::select! {
+                        _ = stopping.changed() => return,
                         change = crate::exec::with_timeout(changes.recv(), Self::RELOAD_DEBOUNCE) => {
                             match change {
                                 Some(Ok(change)) => scope.widen(Some(&change)),

@@ -147,6 +147,21 @@ pub fn take(key: &str) -> Option<Vec<u8>> {
 ///
 /// The desktop has no such call: its front end opens the file itself. Here
 /// the front end is this process, so this is how a frame's media reaches it.
+pub fn deliver(key: &str) -> Option<Arc<Vec<u8>>> {
+    with(|cache| {
+        let entry = cache.entries.get_mut(key)?;
+        cache.clock += 1;
+        entry.touched = cache.clock;
+        // The delivery this entry was being held for has happened, so it goes
+        // back to being an ordinary cache entry. Kept rather than removed:
+        // another request for the same content is answered with the same key,
+        // and a save that lost the browser's activation is about to ask again.
+        entry.pinned = false;
+        Some(Arc::clone(&entry.bytes))
+    })
+}
+
+/// Read what is under `key` and leave it there, claim and all.
 pub fn read(key: &str) -> Option<Arc<Vec<u8>>> {
     with(|cache| {
         let entry = cache.entries.get_mut(key)?;

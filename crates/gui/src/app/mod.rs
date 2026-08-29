@@ -381,8 +381,8 @@ pub(crate) const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 
 /// Download media with timeout - returns Ok(data) or Err(error message)
 async fn download_with_timeout(
-    download_rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
-) -> Result<Vec<u8>, String> {
+    download_rx: tokio::sync::oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, String>>,
+) -> Result<std::sync::Arc<Vec<u8>>, String> {
     let download = async {
         download_rx
             .await

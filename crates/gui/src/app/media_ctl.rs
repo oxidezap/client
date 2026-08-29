@@ -7,7 +7,7 @@ use super::*;
 
 impl WhatsAppApp {
     /// Update a message's media data (used to cache downloaded media)
-    fn update_message_media_data(&mut self, message_id: &str, data: Vec<u8>) {
+    fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>) {
         // Find the message in any chat and update its media data
         let mut touched: Option<String> = None;
         for chat in &mut self.chats {
@@ -16,7 +16,7 @@ impl WhatsAppApp {
                     // Bytes and the metadata that describes them, together:
                     // decoding a WebP sticker as the `image/jpeg` its poster
                     // frame claimed fails every time.
-                    media.adopt_full_bytes(Arc::new(data));
+                    media.adopt_full_bytes(data);
                     // Drop any render-cached image built from the old bytes
                     self.decoded_images.borrow_mut().shift_remove(message_id);
                     info!("Cached media data for message {}", message_id);
@@ -367,7 +367,11 @@ impl WhatsAppApp {
                         // Autoplay only if the user hasn't started other media
                         // since this download began.
                         if app.pending_media_request.as_deref() == Some(msg_id.as_str()) {
-                            app.play_audio(msg_id, data, cx);
+                            // Cloned, as at every other call site: the
+                            // player takes the bytes, and a voice note is
+                            // small enough that owning one is not the copy
+                            // worth avoiding.
+                            app.play_audio(msg_id, (*data).clone(), cx);
                         } else {
                             cx.notify();
                         }
@@ -518,7 +522,7 @@ impl WhatsAppApp {
         let id = message_id.to_string();
 
         cx.spawn(async move |_entity: WeakEntity<Self>, cx| {
-            match hand_to_user(cx, file_name, data.to_vec()).await {
+            match hand_to_user(cx, file_name, data).await {
                 Ok(where_it_went) => info!("Saved {id} to {where_it_went}"),
                 Err(e) => warn!("Failed to save {id}: {e}"),
             }
@@ -863,7 +867,7 @@ impl WhatsAppApp {
 async fn hand_to_user(
     cx: &mut gpui::AsyncApp,
     file_name: String,
-    data: Vec<u8>,
+    data: std::sync::Arc<Vec<u8>>,
 ) -> Result<String, String> {
     if crate::platform::download::SAVES_OFF_THREAD {
         cx.background_spawn(async move { crate::platform::download::save(&file_name, &data) })

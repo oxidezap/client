@@ -125,18 +125,15 @@ impl MediaCache for InProcess {
         oxidezap_daemon::media::read(key).ok_or_else(|| format!("media {key} is not cached"))
     }
 
-    /// Taken rather than copied, which is the whole reason this method
-    /// exists.
+    /// Handed over, and the claim released with it.
     ///
-    /// Both ends are this process, so the map's bytes and the front end's are
-    /// the same heap: a `read` here is a second copy of a document that can
-    /// be hundreds of megabytes, in an address space with a ceiling of one
-    /// gigabyte, and the browser download made from it is a third. Moving
-    /// them is also what settles the entry's fate — a requested download is
-    /// pinned against the sweep until somebody takes it, and this is the
-    /// somebody.
-    fn read_once(&self, key: &str) -> Result<Vec<u8>, String> {
-        oxidezap_daemon::media::take(key).ok_or_else(|| format!("media {key} is not cached"))
+    /// A requested download is pinned against the cache's sweep until
+    /// somebody takes delivery, and this is the somebody. The bytes stay —
+    /// shared, so no copy is made of a document that can be hundreds of
+    /// megabytes in an address space with a one-gigabyte ceiling — as an
+    /// ordinary cache entry the budget may now reclaim.
+    fn read_once(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
+        oxidezap_daemon::media::deliver(key).ok_or_else(|| format!("media {key} is not cached"))
     }
 
     fn stage(&self, key: &str, bytes: &[u8]) -> Result<(), String> {

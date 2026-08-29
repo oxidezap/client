@@ -123,7 +123,7 @@ pub enum FromDaemon {
 /// is waiting, and a send that was refused becomes the failure the message it
 /// drew is already able to render.
 enum Awaiting {
-    Download(oneshot::Sender<Result<Vec<u8>, String>>),
+    Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, String>>),
     /// What this account occupies on disk, for the Storage pane.
     Storage(oneshot::Sender<StorageUsage>),
     /// A message drawn before it was sent. On refusal it has to stop being
@@ -718,7 +718,7 @@ impl Session {
     pub fn download_downloadable_media(
         &self,
         media: DownloadableMedia,
-    ) -> oneshot::Receiver<Result<Vec<u8>, String>> {
+    ) -> oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, String>> {
         let (tx, rx) = oneshot::channel();
         self.ask(
             ClientRequest::Download {

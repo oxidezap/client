@@ -36,24 +36,25 @@ pub trait MediaCache: Send + Sync {
 
     /// The bytes answering a request somebody is waiting on.
     ///
-    /// Separate from [`read`](Self::read) because the two have different
-    /// readers. A frame's media is content-addressed and one frame can name
-    /// the same key on several messages, so reading it must leave it there; a
-    /// download is the answer to one request, named once, and handing it over
-    /// is the last thing that happens to it. Where holding both copies costs
-    /// something — a page, whose only copy this is, and whose address space a
-    /// large attachment can fill twice over — that difference is the whole
-    /// point.
+    /// Separate from [`read`](Self::read) because it also *releases the
+    /// claim*: a requested download is held against the cache's own sweep
+    /// until it has been handed over, and this is the handing over. What it
+    /// does not do is destroy it. Two messages carrying the same content are
+    /// one payload under one content-addressed key, so a delivery that
+    /// removed it would answer the first request and tell the second that
+    /// bytes WhatsApp had already delivered were missing — and a save that
+    /// failed on the browser's expired activation would re-download instead
+    /// of finding what it just fetched.
     ///
-    /// Defaults to [`read`](Self::read), which is right wherever the bytes
-    /// live somewhere this side does not own.
-    fn read_once(&self, key: &str) -> Result<Vec<u8>, String> {
-        self.read(key).map(|shared| {
-            // Unwrapped where nobody else holds it, which is the ordinary
-            // case: a download is named once. A clone only where some other
-            // reader is still holding the same payload.
-            Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
-        })
+    /// So what is left behind is an ordinary cache entry: reclaimable by the
+    /// budget like any other, and there for the retry that is about to want
+    /// it.
+    ///
+    /// Defaults to [`read`](Self::read), which is right wherever there is no
+    /// claim to release — a directory the daemon also owns, or a per-frame
+    /// map that is cleared wholesale.
+    fn read_once(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
+        self.read(key)
     }
 
     /// Put bytes where the daemon will look for them.
@@ -157,12 +158,11 @@ impl MediaCache for Fetched {
     /// ceiling, for as long as it takes the next frame to clear the map.
     /// Nothing else is going to ask for this key — a download answers one
     /// request — so there is nothing to leave behind.
-    fn read_once(&self, key: &str) -> Result<Vec<u8>, String> {
+    fn read_once(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
         self.bytes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key)
-            .map(|shared| Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone()))
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
     }
 
