@@ -95,7 +95,7 @@ fn widget(
             .on_click(move |_, _window, cx| {
                 let (plugin, action) = (plugin.clone(), action.clone());
                 entity.update(cx, |app, cx| {
-                    app.send_plugin_action(&plugin, &action, None, slot, cx);
+                    app.send_plugin_action(&plugin, &action, None, slot, PluginWidget::Button, cx);
                 });
             })
             .into_any_element()
@@ -123,7 +123,14 @@ fn widget(
                     // the same value twice, and the second click vanished.
                     let value = if *now { "1" } else { "0" }.to_string();
                     entity.update(cx, |app, cx| {
-                        app.send_plugin_action(&plugin, &action, Some(value), slot, cx);
+                        app.send_plugin_action(
+                            &plugin,
+                            &action,
+                            Some(value),
+                            slot,
+                            PluginWidget::Toggle,
+                            cx,
+                        );
                     });
                 })
                 .into_any_element(),

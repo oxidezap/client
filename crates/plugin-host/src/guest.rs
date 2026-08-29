@@ -69,7 +69,7 @@ const MAX_LOG_BYTES_PER_CALL: usize = 64 * 1024;
 /// generous for anything honest.
 const MAX_UI_PER_CALL: usize = 16;
 
-/// How many bytes one call may push through the key-value store.
+/// How many bytes one call may move through the key-value store.
 ///
 /// Measured in bytes rather than in calls, because what is unpriced here is
 /// the copying: every `oxi_kv_set` reads the key and the value out of guest
@@ -188,6 +188,10 @@ pub struct Guest {
     pub unknown_caps: bool,
     /// Whether it declared its capabilities more than once.
     pub declared_twice: bool,
+    /// Whether `oxi_set_name` has been *attempted*. An `Option` so the one
+    /// call is claimed and answered in a single step, with no window in
+    /// which two would both find it free.
+    pub named: Option<bool>,
     pub logged_bytes: usize,
     /// Key and value bytes this call has pushed into the store. See
     /// [`MAX_KV_BYTES_PER_CALL`].
@@ -343,7 +347,12 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // hundred million fuel over, with the daemon's startup waiting
             // on it. Refused before the copy, so a second call costs nothing
             // at all.
-            if c.data().name.is_some() {
+            // The *attempt* is what latches, not the name. Latching a
+            // successful one left the loop open: a plugin submitting a
+            // kilobyte of whitespace, or bytes that are not UTF-8, is
+            // refused every time and reaches the copy every time, which is
+            // the traffic this exists to stop. One call is one chance.
+            if c.data_mut().named.replace(true) == Some(true) {
                 return abi::outcome::REFUSED;
             }
             // Bounded before the copy, like every other import that takes a
@@ -630,6 +639,16 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if !(0..=(crate::kv::MAX_ENTRY as i32)).contains(&key_len) {
                 return abi::ABSENT;
             }
+            // And against the call's budget, which reading spends as surely
+            // as writing does: the key is copied out of guest memory either
+            // way, and a loop of misses costs exactly as much as a loop of
+            // writes. Charging only the writes left half the door open.
+            let spent = &mut c.data_mut().kv_bytes;
+            let asked = key_len as usize;
+            if asked > MAX_KV_BYTES_PER_CALL.saturating_sub(*spent) {
+                return abi::ABSENT;
+            }
+            *spent += asked;
             let Ok(key) = read_str(&mut c, key, key_len) else {
                 return abi::ABSENT;
             };

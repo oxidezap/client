@@ -575,6 +575,7 @@ fn pressing_a_plugins_button_reaches_the_plugin_with_the_open_chat() {
         value: None,
         chat_jid: Some("5511999@s.whatsapp.net".into()),
         slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
     });
 
     until("the greeting", || commands.sent().len() == 1);
@@ -599,6 +600,7 @@ fn an_action_for_a_plugin_that_is_not_loaded_is_ignored() {
         value: None,
         chat_jid: None,
         slot: PluginSlot::Settings,
+        widget: PluginWidget::Button,
     });
 }
 
@@ -624,6 +626,21 @@ fn an_action_for_a_widget_the_plugin_does_not_draw_is_ignored() {
         value: None,
         chat_jid: Some("5511999@s.whatsapp.net".into()),
         slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(commands.sent().is_empty());
+
+    // Nor as a widget it is not. A plugin may republish a button as a text
+    // field under the same name, and an older window's press would arrive as
+    // that field's commit carrying no value at all.
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: None,
+        chat_jid: Some("5511999@s.whatsapp.net".into()),
+        slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::TextField,
     });
     std::thread::sleep(Duration::from_millis(200));
     assert!(commands.sent().is_empty());
@@ -637,6 +654,7 @@ fn an_action_for_a_widget_the_plugin_does_not_draw_is_ignored() {
         value: None,
         chat_jid: None,
         slot: PluginSlot::Settings,
+        widget: PluginWidget::Button,
     });
     std::thread::sleep(Duration::from_millis(200));
     assert!(commands.sent().is_empty());
@@ -650,6 +668,7 @@ fn an_action_for_a_widget_the_plugin_does_not_draw_is_ignored() {
         value: None,
         chat_jid: Some("5511999@s.whatsapp.net".into()),
         slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
     });
     until("the greeting", || commands.sent().len() == 1);
 }
@@ -810,6 +829,7 @@ fn the_example_plugin_loads_and_answers_its_own_widgets() {
         value: Some("1".into()),
         chat_jid: None,
         slot: PluginSlot::Settings,
+        widget: PluginWidget::Toggle,
     });
     published.settles("the toggle to come back on", |s| {
         s.first()
@@ -1581,6 +1601,55 @@ const RENAMES_ITSELF: &str = r#"(module
     (i32.const 0))
 )"#;
 
+/// Submits an empty name, which is refused, and then a real one — and says
+/// what it was told the second time.
+const NAMES_ITSELF_BADLY: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_set_name"     (func $set_name (param i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "a@s.whatsapp.net   Tarderefused")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (global $answer (mut i32) (i32.const 0))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))
+    (call $caps (i64.const 1))    ;; caps::SEND
+    (drop (call $set_name (i32.const 16) (i32.const 3)))     ;; "   ", refused
+    (global.set $answer (call $set_name (i32.const 19) (i32.const 5)))  ;; "Tarde"
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (if (i32.lt_s (global.get $answer) (i32.const 0))
+      (then (drop (call $send (i32.const 0) (i32.const 16) (i32.const 24) (i32.const 7)))))
+    (i32.const 0))
+)"#;
+
+/// The chance is the *call*, not the name.
+///
+/// Latching a successful name left the loop open: a plugin submitting a
+/// kilobyte of whitespace, or bytes that are not UTF-8, is refused each time
+/// and reaches the copy each time, which is the traffic the rule exists to
+/// stop.
+#[test]
+fn a_refused_name_still_spends_the_one_attempt() {
+    let dir = TempDir::new("bad-name");
+    dir.plugin("shifty", &versioned(NAMES_ITSELF_BADLY));
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    let surfaces = published.settles("the plugin to be listed", |s| !s.is_empty());
+    assert_eq!(
+        surfaces[0].name, "shifty",
+        "neither name stuck: the first was not a name and the second had no turn"
+    );
+
+    plugins.observe(&message("a@s.whatsapp.net", "oi"));
+    until("the report", || {
+        commands.sent().iter().any(|(_, text, _)| text == "refused")
+    });
+}
+
 /// A plugin names itself once.
 ///
 /// The second call is refused *before* the string is read, which is the
@@ -1740,6 +1809,38 @@ fn a_plugin_anyone_could_have_replaced_is_not_loaded() {
     std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
+/// An approvals file another local account could have written is not read.
+///
+/// Tightening the directory's mode on startup closes the door behind
+/// whatever is already inside it: a group- or world-writable `plugin-state`
+/// is one where somebody else may have left an `approvals.json` before this
+/// daemon ran, and the `chmod` does not make that file the user's answer.
+#[cfg(unix)]
+#[test]
+fn an_approvals_file_anyone_could_have_written_is_discarded() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new("planted-approvals");
+    let state = dir.0.join("state");
+    std::fs::create_dir_all(&state).expect("writable");
+    // What an attacker would leave behind: autoreply, already allowed to
+    // send, in a directory this daemon has not locked down yet.
+    let planted = state.join("approvals.json");
+    std::fs::write(&planted, br#"{"autoreply":1}"#).expect("writable");
+    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+
+    assert_eq!(
+        crate::usable_state_dir(Some(&state)),
+        Some(state.as_path()),
+        "the directory is still usable"
+    );
+    assert!(
+        !planted.exists(),
+        "but the file is gone rather than merely ignored: leaving it hands the \
+         next start the same forged answer"
+    );
+}
+
 /// Every bound in the host is per plugin; the count is the bound on the sum.
 /// A directory holding more than the daemon will run costs it nothing past
 /// the limit — not a thread, not a queue, not a wasmi store.
@@ -1754,6 +1855,22 @@ fn a_directory_of_plugins_is_bounded_by_how_many_will_run() {
     let published = Published::default();
     let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
     assert_eq!(plugins.ids().len(), crate::MAX_PLUGINS);
+
+    // And it is the *candidates* that are bounded, not the ones that
+    // survive: a module that fails — after being read, parsed, and given its
+    // initialization fuel to refuse in — never raises a count of successes,
+    // so a folder of those was a folder the daemon worked through whole with
+    // its socket still closed. These have no exports at all, so every one of
+    // them is turned away.
+    let broken = TempDir::new("too-many-broken");
+    for i in 0..crate::MAX_PLUGINS + 4 {
+        broken.plugin(&format!("p{i:03}"), "(module)");
+    }
+    assert_eq!(
+        crate::discover(&broken.0).len(),
+        crate::MAX_PLUGINS,
+        "the list stops at the cap however few of them would load"
+    );
 }
 
 /// Everything the plugin host keeps is account-scoped, and the store it

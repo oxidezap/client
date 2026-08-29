@@ -242,13 +242,6 @@ impl Plugins {
             // of them while the other kept its own copy of the mask and went
             // on acting. Refused rather than disambiguated, because a name
             // this host invented is not one anybody could approve.
-            if workers.len() >= MAX_PLUGINS {
-                log::warn!(
-                    "not loading {} or anything after it: {MAX_PLUGINS} plugins are already                      running, which is the most this daemon will hold",
-                    path.display()
-                );
-                break;
-            }
             if !taken.insert(id.clone()) {
                 log::warn!(
                     "skipping {}: another file already claims the plugin id `{id}`",
@@ -391,7 +384,7 @@ impl Plugins {
         // so it is the only honest answer to whether the thing is there.
         if !self
             .registry
-            .draws(&action.plugin, &action.action, action.slot)
+            .draws(&action.plugin, &action.action, action.slot, action.widget)
         {
             log::debug!(
                 "plugin {}: an action for `{}`, which it does not currently draw",
@@ -875,6 +868,14 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
         })
         .collect();
     found.sort();
+    // Bounded here rather than where a worker starts. Counting the workers
+    // counted the *successes*, so a folder of modules that each fail — after
+    // being read, parsed, instantiated and given two hundred million fuel to
+    // refuse in — never reached the cap at all, and the daemon did all of
+    // that with its socket still closed. Truncated after the sort, so which
+    // ones run is the answer discovery always gives: the first `MAX_PLUGINS`
+    // by name.
+    found.truncate(MAX_PLUGINS);
     found
 }
 
@@ -953,18 +954,42 @@ pub fn forget_approvals(state_dir: &Path) -> std::io::Result<()> {
 /// nobody here granted.
 fn usable_state_dir(dir: Option<&Path>) -> Option<&Path> {
     let dir = dir?;
-    match create_private_dir(dir) {
-        Ok(()) => Some(dir),
-        Err(e) => {
-            log::warn!(
-                "not using {}: {e}. Plugin settings will not survive a restart, and \
-                 permissions must be granted again — a directory this daemon cannot \
-                 make private is one whose recorded approvals are not the user's.",
-                dir.display()
-            );
-            None
-        }
+    if let Err(e) = create_private_dir(dir) {
+        log::warn!(
+            "not using {}: {e}. Plugin settings will not survive a restart, and \
+             permissions must be granted again — a directory this daemon cannot \
+             make private is one whose recorded approvals are not the user's.",
+            dir.display()
+        );
+        return None;
     }
+    // Creating it is not the whole question. A directory that was *already*
+    // there, group- or world-writable, is one another local account may have
+    // put an `approvals.json` into before this daemon started — and a
+    // `chmod` now only closes the door behind whatever is already inside. So
+    // the file is asked about too, and asked after the directory has been
+    // shut: what survives is a file this user owns in a directory only this
+    // user can write, or nothing.
+    let approvals = dir.join(approvals::FILE_NAME);
+    if approvals.exists() && !only_this_user_can_write(&approvals) {
+        log::warn!(
+            "{} could have been written by another user on this machine; every plugin \
+             permission will be asked for again",
+            approvals.display()
+        );
+        // Removed rather than merely ignored: leaving it hands the next start
+        // the same forged answer, and this daemon has no way to tell that
+        // start what it saw.
+        if let Err(e) = std::fs::remove_file(&approvals) {
+            log::warn!(
+                "and {} could not be removed ({e}); running without a state directory",
+                approvals.display()
+            );
+            return None;
+        }
+        let _ = sync_dir(dir);
+    }
+    Some(dir)
 }
 
 /// Make a directory only this user can enter.

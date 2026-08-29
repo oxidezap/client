@@ -125,7 +125,10 @@ profile here repeats it deliberately.
   bounded (`MAX_PLUGINS`) because every other bound here is per plugin: a
   store, a queue and an OS thread are all spent before a module runs an
   instruction, so a folder somebody unpacked a bundle into costs a thousand
-  threads before the socket opens. What wasm does *not*
+  threads before the socket opens. Counted at discovery rather than at the
+  workers, because counting the workers counted the *successes*: a folder of
+  modules that each fail — read, parsed, and given their initialization fuel
+  to refuse in — never reached the cap at all. What wasm does *not*
   supply is a bound on time and on memory, which is why fuel metering and the
   resource limiter are not optional: a plugin that loops forever runs out and
   traps, and the daemon loses a plugin rather than a thread. Fuel prices *one
@@ -225,7 +228,11 @@ profile here repeats it deliberately.
   The two share a directory, so a plugin's own store is written under a
   `kv-` prefix no plugin id can produce — one called `approvals` would
   otherwise write its settings over everybody's permissions. That directory
-  is made private *before* it is read and refused outright when it cannot be
+  is made private *before* it is read, and the answers already in it are
+  asked about after that door is shut — a directory that was open is one
+  somebody else may have left an `approvals.json` in, and a `chmod` now does
+  not make that file the user's answer, so it is deleted rather than ignored.
+  A directory that cannot be made private is refused outright
   (`usable_state_dir`): a file saying what a plugin may do to the account,
   read out of a directory another local user can write, is a mask somebody
   else chose — and tightening the mode afterwards puts it in memory first.
@@ -313,7 +320,10 @@ profile here repeats it deliberately.
   than against the plugin merely being loaded: a front end's frame can be
   older than the daemon's, so a second window still showing a button since
   withdrawn or greyed out would land as a real press, and an id the plugin
-  never published would reach a handler as a widget that does not exist. An
+  never published would reach a handler as a widget that does not exist —
+  and the check is on the widget's kind as well as its name, since a plugin
+  may republish a button as a text field under the same id and an older
+  window's press would arrive as that field's commit carrying no value. An
   id names one widget *within a slot*, which is where the encoder refuses a
   duplicate: across slots it may repeat, because an action says which one it
   came from, but twice in one slot nothing tells the two apart — a press

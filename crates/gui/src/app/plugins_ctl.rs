@@ -148,6 +148,7 @@ impl WhatsAppApp {
                                 &commit_id,
                                 Some(value),
                                 commit_slot,
+                                PluginWidget::TextField,
                                 cx,
                             );
                         }
@@ -210,6 +211,7 @@ impl WhatsAppApp {
         action: &str,
         value: Option<String>,
         slot: PluginSlot,
+        widget: PluginWidget,
         cx: &mut Context<Self>,
     ) {
         let chat = match slot {
@@ -217,7 +219,7 @@ impl WhatsAppApp {
             PluginSlot::Settings => None,
         };
         if let Some(client) = self.client.as_ref() {
-            client.plugin_action(plugin, action, value, chat, slot);
+            client.plugin_action(plugin, action, value, chat, slot, widget);
         }
         // Nothing changes here: what the plugin makes of it comes back as a
         // republished tree, or as nothing at all. Drawing an optimistic

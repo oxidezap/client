@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use oxidezap_core::{PluginNode, PluginRoot, PluginSlot, PluginSurface};
+use oxidezap_core::{PluginNode, PluginRoot, PluginSlot, PluginSurface, PluginWidget};
 use oxidezap_plugin_abi as abi;
 
 use crate::approvals::Approvals;
@@ -161,13 +161,13 @@ impl Registry {
     /// the same id in a header and in its settings panel — two widgets, and
     /// withdrawing one of them must not leave the other vouching for it.
     #[must_use]
-    pub fn draws(&self, id: &str, action: &str, slot: PluginSlot) -> bool {
+    pub fn draws(&self, id: &str, action: &str, slot: PluginSlot, widget: PluginWidget) -> bool {
         self.lock().get(id).is_some_and(|entry| {
             entry
                 .roots
                 .iter()
                 .filter(|root| root.slot == slot)
-                .any(|root| usable(&root.node, action))
+                .any(|root| usable(&root.node, action, widget))
         })
     }
 
@@ -213,11 +213,15 @@ impl Registry {
 }
 
 /// Whether a tree holds an enabled interactive widget by this name.
-fn usable(node: &PluginNode, action: &str) -> bool {
-    if node.id == action && node.widget.is_interactive() && node.enabled {
+fn usable(node: &PluginNode, action: &str, widget: PluginWidget) -> bool {
+    // The kind as well as the name: a plugin may republish a button as a
+    // text field under the same id, and an older window's press would
+    // otherwise arrive as that field's commit carrying no value — an
+    // interaction the tree the daemon holds does not describe.
+    if node.id == action && node.widget == widget && widget.is_interactive() && node.enabled {
         return true;
     }
-    node.children.iter().any(|kid| usable(kid, action))
+    node.children.iter().any(|kid| usable(kid, action, widget))
 }
 
 /// Turn a capability mask into the sentences a user consents to.

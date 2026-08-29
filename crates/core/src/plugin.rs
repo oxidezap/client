@@ -184,6 +184,14 @@ pub struct PluginAction {
     /// The conversation the window had open, for a slot that has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_jid: Option<String>,
+    /// What the widget was.
+    ///
+    /// Checked against the tree the daemon holds, like the slot and the id:
+    /// a plugin may republish a button as a text field under the same name,
+    /// and an older window's press would otherwise arrive as that field's
+    /// commit carrying no value at all — an interaction the current tree
+    /// does not describe.
+    pub widget: PluginWidget,
     /// Where the widget was drawn.
     ///
     /// Carried rather than inferred from `chat_jid`, because a plugin may
