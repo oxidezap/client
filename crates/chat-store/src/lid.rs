@@ -304,6 +304,48 @@ pub(crate) fn merge_split_chat(
     .bind::<Text, _>(src)
     .bind::<Text, _>(dest)
     .execute(conn)?;
+    // The peer's own identity is being unified too, and a reaction names the
+    // person who left it. One person reacting under their phone number and
+    // taking it back under their LID — a removal is a reaction with an empty
+    // emoji — left two rows that no longer look like the same reactor: the
+    // tombstone is filtered out by `reactions_for`, so the reaction it
+    // retracts stayed on screen for good, and two different emojis put the
+    // same person in the list twice. Newest wins, the rule the live path
+    // holds, with the identity as the tiebreak so a tie leaves exactly one
+    // row standing rather than none.
+    //
+    // `?1` device_id, `?2` src, `?3` dest, as below.
+    diesel::sql_query(
+        "DELETE FROM reactions \
+         WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND sender_jid IN (?2, ?3) \
+           AND EXISTS (SELECT 1 FROM reactions s \
+                        WHERE s.device_id = ?1 AND s.chat_jid IN (?2, ?3) \
+                          AND s.sender_jid IN (?2, ?3) AND s.msg_id = reactions.msg_id \
+                          AND (s.ts_ms, s.chat_jid, s.sender_jid) \
+                              > (reactions.ts_ms, reactions.chat_jid, reactions.sender_jid))",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+    diesel::sql_query(
+        "UPDATE OR IGNORE reactions SET sender_jid = ?3 \
+         WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND sender_jid = ?2",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+    // Past that rename, still naming `src` is proof of a collision `OR IGNORE`
+    // skipped, and the fold above already settled which row wins.
+    diesel::sql_query(
+        "DELETE FROM reactions WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND sender_jid = ?2",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+
     diesel::sql_query(
         "UPDATE OR IGNORE reactions SET chat_jid = ? WHERE device_id = ? AND chat_jid = ?",
     )

@@ -4150,6 +4150,67 @@ async fn merge_folds_a_split_peer_identity_into_one_user() {
     );
 }
 
+/// A reaction left under one of the peer's identities and taken back under
+/// the other stayed on screen for ever: a removal is a reaction with an empty
+/// emoji, `reactions_for` filters those out, and the merge moved the rows to
+/// one chat without ever agreeing they came from one person.
+#[tokio::test]
+async fn merge_folds_a_reactor_split_across_their_identities() {
+    let (store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("alvo"),
+                incoming_info(PEER, PEER, "MSG-RX", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("alvo"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-RX-LID", 1_699_999_000),
+            ),
+        ],
+    )
+    .await;
+
+    let react = |chat: &str, emoji: &str, id: &str, ts: i64| {
+        message_event(
+            wa::Message {
+                reaction_message: MessageField::some(wa::message::ReactionMessage {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("MSG-RX".into()),
+                        ..Default::default()
+                    }),
+                    text: Some(emoji.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            incoming_info(chat, chat, id, ts),
+        )
+    };
+    feed(
+        &chat_store,
+        [
+            react(PEER, "👍", "RX1", 1_700_000_010),
+            // Taken back, from the same person addressing themselves the
+            // other way.
+            react(PEER_LID, "", "RX2", 1_700_000_020),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let reactions = chat_store.reactions(&jid(PEER), "MSG-RX").await.unwrap();
+    assert!(
+        reactions.is_empty(),
+        "the reaction was withdrawn: {reactions:?}"
+    );
+}
+
 /// The collision the identity rewrite cannot resolve by itself: both
 /// identities recorded the *same* state, and one of the rows already sits
 /// under the surviving key. Renaming it would duplicate the row that is
