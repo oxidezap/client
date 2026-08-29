@@ -8,10 +8,16 @@
 //! after the allocation it was meant to prevent. The dimensions are in the
 //! SPS, in front of the picture they describe, and this is what reads them.
 //!
-//! Deliberately answers `None` rather than a guess: an access unit with no
-//! SPS carries no new geometry (it is decoded against the one before it), and
-//! a parameter set this cannot follow is one to leave to the decoder rather
-//! than to refuse on a reading nobody has checked.
+//! Three answers rather than two, because the sender picks which one it
+//! sends. An access unit with no parameter set declares no new geometry and
+//! is decoded against the one before it, which was read and bounded when it
+//! arrived. A parameter set this cannot follow is a different thing: the
+//! decoder is about to allocate from numbers nothing here has checked, and
+//! folding that into the same "nothing to say" made the way past the budget a
+//! parameter set shaped so this cannot read it. The shapes that reach it are
+//! the hostile ones — a truncated set, a `ue(v)` of more than 31 zeros, a
+//! frame cycle longer than the bytes carrying it. Baseline and main, which is
+//! all a call has ever carried, parse.
 
 /// Where the emulation prevention byte lives: `00 00 03` in a NAL payload is
 /// `00 00` plus an escape.
@@ -20,25 +26,57 @@ const EMULATION_PREVENTION: u8 = 3;
 /// Macroblocks are 16x16, which is the unit both dimensions are counted in.
 const MACROBLOCK: u32 = 16;
 
-/// The largest coded size an access unit declares, if it declares one.
-///
-/// `None` when there is no sequence parameter set in it, or when the ones
-/// there are all say something this cannot follow.
+/// What an access unit says about the picture that follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Geometry {
+    /// Nothing new is declared: the picture is coded against the parameter
+    /// set before it, which has already been read and bounded.
+    NoParameterSet,
+    /// A parameter set is here and this cannot follow it, so nothing can be
+    /// said about what the decoder is about to allocate.
+    Unreadable,
+    /// The largest size any parameter set in the unit declares.
+    Size(u32, u32),
+}
+
+/// Read the geometry an access unit declares.
 ///
 /// The *largest*, because one access unit may carry several parameter sets
 /// and the slice that follows picks which one it is coded against. Reading
 /// only the first is a budget a sender walks straight past: a thumbnail-sized
 /// SPS in front of the one the picture actually uses, and the allocation this
-/// exists to bound is made from the second. Every set the decoder will see is
-/// a set that may size it, so the answer is the biggest of them.
-pub(super) fn coded_size(access_unit: &[u8]) -> Option<(u32, u32)> {
-    sps_nals(access_unit)
-        .filter_map(|nal| parse(&unescape(nal)))
-        // A set this cannot follow is skipped rather than fatal, for the
-        // reason the module says: refusing on a reading nobody has checked
-        // would break a legitimate call over a parser bug. It is the ones
-        // that *are* readable that have to be bounded.
-        .max_by_key(|&(width, height)| u64::from(width) * u64::from(height))
+/// exists to bound is made from the second.
+///
+/// A set this cannot follow makes the whole answer `Unreadable`, rather than
+/// the largest of the ones it could follow, for the same reason: the slice
+/// may name the one that was skipped. Telling that apart from an access unit
+/// with no parameter set at all is the whole point of three answers instead
+/// of an `Option` — with two, the way past the budget was a set shaped so
+/// this could not read it, which is a shape the sender chooses.
+pub(super) fn coded_size(access_unit: &[u8]) -> Geometry {
+    let mut largest: Option<(u32, u32)> = None;
+    let mut saw_one = false;
+    for nal in sps_nals(access_unit) {
+        saw_one = true;
+        let Some((width, height)) = parse(&unescape(nal)) else {
+            return Geometry::Unreadable;
+        };
+        let bigger = largest.is_none_or(|(w, h)| {
+            u64::from(width) * u64::from(height) > u64::from(w) * u64::from(h)
+        });
+        if bigger {
+            largest = Some((width, height));
+        }
+    }
+    match largest {
+        Some((width, height)) => Geometry::Size(width, height),
+        // Every NAL that looked like a parameter set failed to parse is
+        // already `Unreadable` above; nothing here means nothing declared.
+        None => {
+            debug_assert!(!saw_one);
+            Geometry::NoParameterSet
+        }
+    }
 }
 
 /// The payload of every SPS NAL in an Annex-B access unit, start code and NAL
@@ -275,7 +313,7 @@ mod tests {
         let unit = encoder.encode(&frame).expect("encode").to_vec();
         assert_eq!(
             coded_size(&unit),
-            Some((width as u32, height as u32)),
+            Geometry::Size(width as u32, height as u32),
             "the first access unit carries the parameter set"
         );
     }
@@ -305,7 +343,7 @@ mod tests {
         unit.extend_from_slice(&large);
         assert_eq!(
             coded_size(&unit),
-            Some((320, 240)),
+            Geometry::Size(320, 240),
             "a small set in front of a large one must not hide it"
         );
 
@@ -313,7 +351,7 @@ mod tests {
         reversed.extend_from_slice(&small);
         assert_eq!(
             coded_size(&reversed),
-            Some((320, 240)),
+            Geometry::Size(320, 240),
             "nor must a small one behind it lower the answer"
         );
     }
@@ -323,9 +361,12 @@ mod tests {
     #[test]
     fn an_access_unit_without_a_parameter_set_says_nothing() {
         // A lone non-IDR slice: start code, NAL header of type 1, payload.
-        assert_eq!(coded_size(&[0, 0, 0, 1, 0x41, 0x9a, 0x00]), None);
-        assert_eq!(coded_size(&[]), None);
-        assert_eq!(coded_size(&[0, 0, 0, 1]), None);
+        assert_eq!(
+            coded_size(&[0, 0, 0, 1, 0x41, 0x9a, 0x00]),
+            Geometry::NoParameterSet
+        );
+        assert_eq!(coded_size(&[]), Geometry::NoParameterSet);
+        assert_eq!(coded_size(&[0, 0, 0, 1]), Geometry::NoParameterSet);
     }
 
     /// `00 00 03` inside a parameter set is an escape, and a parser that
@@ -338,16 +379,29 @@ mod tests {
         assert_eq!(unescape(&[3, 0, 3, 1]), vec![3, 0, 3, 1]);
     }
 
-    /// A truncated parameter set is answered with "no idea", never with a
-    /// number read off the end of the buffer.
+    /// A truncated parameter set is never a number read off the end of the
+    /// buffer — and it is not the same answer as no parameter set at all. One
+    /// says nothing is being declared; this says something is, and nothing
+    /// here can check it, which is a picture the decoder is about to allocate
+    /// from numbers nobody has bounded.
     #[test]
     fn a_truncated_parameter_set_is_refused() {
         let unit = [0, 0, 0, 1, 0x67, 0x42];
-        assert_eq!(coded_size(&unit), None);
+        assert_eq!(coded_size(&unit), Geometry::Unreadable);
+    }
+
+    /// The way past the budget was a shape this cannot read: a set it
+    /// abandons used to answer exactly what an access unit with no set at all
+    /// answers, and the caller only ever refused a size.
+    #[test]
+    fn an_unreadable_set_is_not_the_same_answer_as_no_set() {
+        let unreadable = [0, 0, 0, 1, 0x67, 0x42];
+        let none = [0, 0, 0, 1, 0x41, 0x9a, 0x00];
+        assert_ne!(coded_size(&unreadable), coded_size(&none));
     }
 
     /// The bytes come from whoever is on the call, so the only acceptable
-    /// answer to any of them is a size or `None`.
+    /// answer to any of them is a size or a refusal.
     ///
     /// A long run of zero bits is the shape that matters: Exp-Golomb reads
     /// them as the width of the value that follows, and a width of 32 is a
@@ -364,7 +418,7 @@ mod tests {
         let at_the_bound = [
             0, 0, 0, 1, 0x67, 66, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff,
         ];
-        assert_eq!(coded_size(&at_the_bound), None);
+        assert_eq!(coded_size(&at_the_bound), Geometry::Unreadable);
         // A parameter set that is nothing but zeros, at every length up to a
         // few words: the run that ends in nothing at all.
         for length in 0..48usize {
