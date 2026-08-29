@@ -35,15 +35,8 @@ fn user_chat(chat: &str) -> Option<Jid> {
         .then(|| jid.into_non_ad())
 }
 
-#[derive(QueryableByName)]
-struct UserRow {
-    #[diesel(sql_type = Text)]
-    user: String,
-}
-
-/// The peer's other identity, from the device store's mapping table. PN
-/// resolves to its most recently updated LID (the same rule as
-/// `SqliteStore::get_pn_mapping`); LID resolves straight to its PN.
+/// The peer's other identity for a wire key, or `None` when the key is not a
+/// 1:1 user chat.
 pub(crate) fn counterpart_chat_key(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -55,35 +48,33 @@ pub(crate) fn counterpart_chat_key(
     counterpart_of(conn, device_id, &jid)
 }
 
-/// [`counterpart_chat_key`] for an already-normalized key, so callers that
-/// need the normalized form themselves don't parse twice.
+/// The peer's other identity, from the device store's mapping table. PN
+/// resolves to its most recently updated LID (the same rule as
+/// `SqliteStore::get_pn_mapping`); LID resolves straight to its PN.
 fn counterpart_of(
     conn: &mut SqliteConnection,
     device_id: i32,
     jid: &Jid,
 ) -> QueryResult<Option<String>> {
-    let (sql, server) = if jid.is_lid() {
-        (
-            "SELECT phone_number AS user FROM lid_pn_mapping \
-             WHERE lid = ? AND device_id = ? LIMIT 1",
-            Server::Pn,
-        )
-    } else {
-        (
-            // The lid tiebreak keeps routing stable when updated_at ties —
-            // flapping between counterpart keys would re-split the thread.
-            "SELECT lid AS user FROM lid_pn_mapping \
-             WHERE phone_number = ? AND device_id = ? \
-             ORDER BY updated_at DESC, lid DESC LIMIT 1",
-            Server::Lid,
-        )
-    };
-    let row: Option<UserRow> = diesel::sql_query(sql)
-        .bind::<Text, _>(jid.user.as_str())
-        .bind::<Integer, _>(device_id)
-        .get_result(conn)
-        .optional()?;
-    Ok(row.map(|r| Jid::new(r.user, server).to_string()))
+    use schema::lid_pn_mapping::dsl;
+    let user = jid.user.as_str();
+    if jid.is_lid() {
+        return Ok(dsl::lid_pn_mapping
+            .filter(dsl::device_id.eq(device_id).and(dsl::lid.eq(user)))
+            .select(dsl::phone_number)
+            .first::<String>(conn)
+            .optional()?
+            .map(|pn| Jid::new(pn, Server::Pn).to_string()));
+    }
+    Ok(dsl::lid_pn_mapping
+        .filter(dsl::device_id.eq(device_id).and(dsl::phone_number.eq(user)))
+        // The lid tiebreak keeps routing stable when updated_at ties —
+        // flapping between counterpart keys would re-split the thread.
+        .order((dsl::updated_at.desc(), dsl::lid.desc()))
+        .select(dsl::lid)
+        .first::<String>(conn)
+        .optional()?
+        .map(|lid| Jid::new(lid, Server::Lid).to_string()))
 }
 
 /// Every key the peer's rows may live under: the given key plus its mapped
