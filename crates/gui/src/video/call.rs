@@ -68,14 +68,14 @@ impl LatestFrames {
     /// Hold this picture for the window, dropping whatever that direction was
     /// holding: it is a frame the window never drew and never will.
     pub fn put(&self, frame: CallFrame) {
-        let mut slots = self.slots.lock().expect("call frame slots poisoned");
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let slot = slot_of(frame.stream);
         slots[slot] = Some(frame);
     }
 
     /// Everything waiting, in one pass, leaving the slots empty.
     pub fn take(&self) -> SmallVec<[CallFrame; 2]> {
-        let mut slots = self.slots.lock().expect("call frame slots poisoned");
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         slots.iter_mut().filter_map(Option::take).collect()
     }
 }
@@ -315,5 +315,28 @@ impl Scratch {
             Frame::new(image),
             1,
         ))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic while a frame slot is held used to poison the lock, and the
+    /// next `expect` took the IPC thread with it: no events reached the
+    /// window, every request waited on an answer nothing would send, and the
+    /// app still read as connected. Every other lock in this path recovers
+    /// for exactly that reason.
+    #[test]
+    fn a_poisoned_frame_slot_does_not_take_the_connection_down() {
+        let frames = std::sync::Arc::new(LatestFrames::default());
+        let poisoner = std::sync::Arc::clone(&frames);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.slots.lock().expect("first lock");
+            panic!("something in the window went wrong");
+        })
+        .join();
+
+        assert!(frames.take().is_empty());
     }
 }

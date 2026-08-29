@@ -57,6 +57,13 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
 }
 
 /// Read frames until the daemon goes away.
+///
+/// Whatever ends the loop, the reporting has to run: draining `pending` and
+/// failing every request in it, and telling the window the connection is
+/// gone. That block used to sit at the end of the loop and be reached only by
+/// a `break`, so a panic anywhere inside unwound straight past it — leaving a
+/// window that still reads as connected, with no events arriving, every send
+/// spinning on an answer nothing will produce, and no reconnect scheduled.
 fn read_frames(
     stream: oxidezap_ipc::Reader,
     events: &EventSink,
@@ -65,6 +72,17 @@ fn read_frames(
 ) {
     let cache = Directory;
     let mut frames = Frames::new(events, pending, &cache, pictures);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_loop(stream, &mut frames);
+    }))
+    .is_err();
+    if panicked {
+        log::error!("the thread reading the daemon connection panicked");
+    }
+    frames.finish();
+}
+
+fn read_loop(stream: oxidezap_ipc::Reader, frames: &mut Frames<'_>) {
     let mut reader = BufReader::new(stream);
     // Bounded, through the same framing the daemon's own reader is bounded
     // by: reading a frame into a `String` with nothing stopping it means a
@@ -100,7 +118,6 @@ fn read_frames(
             break;
         }
     }
-    frames.finish();
 }
 
 /// How long to keep trying before giving the user an error instead.
