@@ -859,6 +859,15 @@ impl WhatsAppClient {
                 let _ = ui_tx.send(UiEvent::CallEndedElsewhere(ended.call_id.clone()));
             }
             Event::Messages(batch) => {
+                // A drain is a backlog, not an arrival: fetching every
+                // picture in it before the first bubble reaches the window
+                // spends the whole reconnection on work the store has
+                // already materialized and hydration would redo from the
+                // thumbnail anyway.
+                let eager = matches!(
+                    batch.origin,
+                    whatsapp_rust::wacore::types::events::BatchOrigin::Live
+                );
                 for inbound in batch.iter() {
                     Self::handle_inbound_message(
                         &inbound.message,
@@ -866,6 +875,7 @@ impl WhatsAppClient {
                         &client,
                         &ui_tx,
                         &names,
+                        eager,
                     )
                     .await;
                 }
@@ -1022,6 +1032,7 @@ impl WhatsAppClient {
         client: &Arc<Client>,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
         names: &NameBook,
+        eager: bool,
     ) {
         // Use MessageExt to unwrap ephemeral/device_sent/view_once wrappers
         let base_msg = msg.get_base_message();
@@ -1073,7 +1084,7 @@ impl WhatsAppClient {
         }
 
         // Try to extract media content
-        let media_result = Self::try_extract_media(base_msg, client).await;
+        let media_result = Self::try_extract_media(base_msg, client, eager).await;
 
         // Extract text content
         let content = msg
@@ -1157,6 +1168,20 @@ impl WhatsAppClient {
         });
     }
 
+    /// The eager fetch, or nothing when this is not the moment for one.
+    async fn fetch_now<T: whatsapp_rust::wacore::download::Downloadable>(
+        client: &Arc<Client>,
+        media: &T,
+        media_name: &str,
+        eager: bool,
+        file_length: Option<u64>,
+    ) -> Option<Vec<u8>> {
+        if !Self::worth_fetching_now(eager, file_length) {
+            return None;
+        }
+        Self::download_media(client, media, media_name).await
+    }
+
     /// Helper to download media with logging
     async fn download_media<T: whatsapp_rust::wacore::download::Downloadable>(
         client: &Arc<Client>,
@@ -1180,8 +1205,31 @@ impl WhatsAppClient {
         }
     }
 
-    /// Try to extract and download media from a message
-    async fn try_extract_media(msg: &wa::Message, _client: &Arc<Client>) -> Option<MediaContent> {
+    /// Most bytes a picture may be worth fetching before anybody has asked
+    /// for it.
+    ///
+    /// A photo sent through WhatsApp is a fraction of this; past it the
+    /// message keeps its thumbnail and its download metadata, which is what
+    /// the renderer already draws for a video, and the full bytes arrive when
+    /// somebody opens it.
+    const EAGER_MEDIA_BYTES: u64 = 4 * 1024 * 1024;
+
+    /// Whether media of this size is worth fetching before anybody asked.
+    fn worth_fetching_now(eager: bool, file_length: Option<u64>) -> bool {
+        eager && file_length.is_none_or(|len| len <= Self::EAGER_MEDIA_BYTES)
+    }
+
+    /// Try to extract media from a message, fetching the bytes when they are
+    /// worth having before anybody has asked for them.
+    ///
+    /// Not fetching them is the same shape as failing to: the thumbnail is
+    /// what shows and the download metadata is what makes the full bytes
+    /// retryable.
+    async fn try_extract_media(
+        msg: &wa::Message,
+        _client: &Arc<Client>,
+        eager: bool,
+    ) -> Option<MediaContent> {
         // Check for sticker message
         if let Some(sticker) = effective_sticker(msg) {
             let mime = sticker
@@ -1201,21 +1249,28 @@ impl WhatsAppClient {
             // Same rule as the image path below: a failed eager download
             // degrades to the thumbnail (and stays retryable through the
             // download metadata) instead of the message losing its media.
-            let (data, mime_type, is_animated, data_is_preview) =
-                match Self::download_media(_client, sticker, "sticker").await {
-                    Some(data) => (data, mime, sticker.is_animated.unwrap_or(false), false),
-                    None => (
-                        sticker
-                            .png_thumbnail
-                            .as_ref()
-                            .filter(|t| !t.is_empty())
-                            .cloned()
-                            .unwrap_or_default(),
-                        "image/png".to_string(),
-                        false,
-                        true,
-                    ),
-                };
+            let (data, mime_type, is_animated, data_is_preview) = match Self::fetch_now(
+                _client,
+                sticker,
+                "sticker",
+                eager,
+                sticker.file_length,
+            )
+            .await
+            {
+                Some(data) => (data, mime, sticker.is_animated.unwrap_or(false), false),
+                None => (
+                    sticker
+                        .png_thumbnail
+                        .as_ref()
+                        .filter(|t| !t.is_empty())
+                        .cloned()
+                        .unwrap_or_default(),
+                    "image/png".to_string(),
+                    false,
+                    true,
+                ),
+            };
             if data.is_empty() && downloadable.is_none() {
                 return None;
             }
@@ -1259,7 +1314,7 @@ impl WhatsAppClient {
             // now and the full image stays retryable, instead of the message
             // degrading to a plain text row for the whole session.
             let (data, mime_type, data_is_preview) =
-                match Self::download_media(_client, image, "image").await {
+                match Self::fetch_now(_client, image, "image", eager, image.file_length).await {
                     Some(data) => (
                         data,
                         image
@@ -3502,6 +3557,25 @@ mod tests {
             ))
             .as_deref(),
             Some("120363000000000001@g.us")
+        );
+    }
+
+    /// Reconnecting after a while offline hands over a batch of hundreds, and
+    /// fetching a picture per message before the first bubble reaches the
+    /// window spends the whole reconnection on it. The same question decides
+    /// a picture nobody is going to look at soon enough to be worth the
+    /// bytes.
+    #[test]
+    fn a_backlog_is_not_a_reason_to_fetch_every_picture() {
+        // Live and small: the one case worth the round trip.
+        assert!(WhatsAppClient::worth_fetching_now(true, Some(64 * 1024)));
+        assert!(WhatsAppClient::worth_fetching_now(true, None));
+
+        assert!(!WhatsAppClient::worth_fetching_now(false, Some(64 * 1024)));
+        assert!(!WhatsAppClient::worth_fetching_now(false, None));
+        assert!(
+            !WhatsAppClient::worth_fetching_now(true, Some(WhatsAppClient::EAGER_MEDIA_BYTES + 1)),
+            "past the ceiling the thumbnail shows and the bytes stay retryable"
         );
     }
 
