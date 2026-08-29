@@ -91,10 +91,17 @@ pub fn client_slots() -> ClientSlots {
 
 /// How many frames may queue for one connection's own answers.
 ///
-/// Only downloads land here, and a front end asks for as many as it has
-/// visible media. Past this the answer is dropped rather than parking the
-/// download task, and the client retries — which costs nothing, because the
-/// bytes are already in the cache.
+/// Only answers to requests land here, and a front end asks for as many as it
+/// has visible media. Past this the frame is *not* dropped: see
+/// `session_bridge::answer_now`, which hands a full outbox to a task that
+/// waits on the connection's own writer, because a dropped answer leaves the
+/// view that asked waiting forever and it never asks again.
+///
+/// The price is that answers past this point are delivered by request id and
+/// not in order: a frame parked on a full outbox can be overtaken by the next
+/// one, if that one fits. Every answer names the `RequestId` it belongs to, so
+/// nothing is lost, but two pages of one paged `LoadMessages` can arrive the
+/// wrong way round.
 const OUTBOX_CAPACITY: usize = 64;
 
 #[cfg(not(target_family = "wasm"))]
