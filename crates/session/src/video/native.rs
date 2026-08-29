@@ -70,6 +70,22 @@ enum Delivery {
     Dropped,
 }
 
+impl Delivery {
+    /// Whether a gap is still owed to whoever draws next.
+    ///
+    /// Only a frame that arrived spends the mark. A slot nobody was
+    /// listening to carried nothing, so clearing the mark there hands the
+    /// next frame to a decoder still missing the units before it, with
+    /// nothing on it to say so.
+    fn still_owes_a_gap(self, pending: bool) -> bool {
+        match self {
+            Delivery::Sent => false,
+            Delivery::Dropped => true,
+            Delivery::NoSubscriber => pending,
+        }
+    }
+}
+
 /// Hand one frame to whoever is subscribed, if anyone is.
 ///
 /// The frame is *built* by the caller's closure and only when there is
@@ -364,10 +380,10 @@ async fn pump_local(pump: LocalPump) {
             // that emits one every few seconds anyway — against a self-view
             // frozen until the next, and the mark travels with the frame that
             // does arrive.
-            gap = drawn == Delivery::Dropped;
-            if gap {
+            if drawn == Delivery::Dropped {
                 camera.request_keyframe();
             }
+            gap = drawn.still_owes_a_gap(gap);
         }
         if plane.try_send(data).is_err() {
             if plane.is_closed() {
@@ -423,7 +439,34 @@ async fn pump_remote(
         });
         // Nothing here can ask the peer for a keyframe, so the most this can
         // do is tell the decoder not to draw on what it no longer has.
-        gap = drawn == Delivery::Dropped;
+        gap = drawn.still_owes_a_gap(gap);
     }
     debug!("remote video for {} ended", read(&call_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A gap is spent by the frame that carries it, and nothing else. A slot
+    /// nobody was listening to used to clear one: a frame dropped, the next
+    /// found the subscriber replaced, and the one after that arrived unmarked
+    /// at a decoder still missing the units before it.
+    #[test]
+    fn a_gap_survives_a_frame_nobody_was_there_to_take() {
+        let pending = Delivery::Dropped.still_owes_a_gap(false);
+        assert!(pending, "a drop is what owes a gap");
+
+        let across = Delivery::NoSubscriber.still_owes_a_gap(pending);
+        assert!(across, "and nobody watching does not settle it");
+
+        assert!(
+            !Delivery::Sent.still_owes_a_gap(across),
+            "the frame that arrives is what spends it"
+        );
+        assert!(
+            !Delivery::NoSubscriber.still_owes_a_gap(false),
+            "and nothing owed stays nothing owed"
+        );
+    }
 }
