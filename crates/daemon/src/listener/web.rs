@@ -964,6 +964,24 @@ mod tests {
     }
 }
 
+/// How long a drawn token is, in characters.
+///
+/// 24 bytes as lowercase hex. Named rather than spelled twice: the draw and
+/// the check below have to agree, and a check that had drifted would either
+/// refuse every token or accept a truncated one.
+const TOKEN_CHARS: usize = 48;
+
+/// Whether this is a value this daemon could have written.
+///
+/// The whole of the shape, because the whole of it is what makes the token
+/// unguessable: a prefix of one is a shorter secret, not a valid one.
+fn is_a_token(value: &str) -> bool {
+    value.len() == TOKEN_CHARS
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// The bridge's shared secret, created on first use and reused after.
 ///
 /// Reused rather than redrawn per run so a bookmarked URL keeps working
@@ -979,9 +997,24 @@ pub fn token() -> Result<String> {
     let path = oxidezap_ipc::web_token_path().context("no per-user directory for the web token")?;
 
     if let Some(existing) = read_private(&path)? {
-        let existing = existing.trim().to_string();
+        let existing = existing.trim();
+        if is_a_token(existing) {
+            return Ok(existing.to_string());
+        }
         if !existing.is_empty() {
-            return Ok(existing);
+            // Ours by owner and mode, and still not a token. A partial write
+            // is how that happens — a full disk answers `write_all` with an
+            // error after some of the bytes have landed — and what it leaves
+            // is a *short* credential, which is the one kind of malformed
+            // value that is worse than none: the endpoint's whole admission
+            // check is this string, and another local account can reach the
+            // port and try. Redrawn rather than refused, because the file is
+            // this user's own and a daemon that will not start over a
+            // truncated byte is a daemon nobody can recover.
+            log::warn!(
+                "{} did not hold a well-formed token; drawing a new one",
+                path.display()
+            );
         }
     }
 
@@ -1282,6 +1315,41 @@ mod token_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A token this daemon drew is one it accepts, and a remnant is not.
+    ///
+    /// The truncation case is the one with teeth: a full disk answers
+    /// `write_all` with an error after some of the bytes have landed, and
+    /// what is left behind is ours by owner and mode, non-empty, and short —
+    /// which the old check read as a perfectly good credential. The endpoint
+    /// has nothing else to admit on, so a two-character token is a port any
+    /// local account can guess its way into.
+    #[test]
+    fn only_a_whole_token_is_believed() {
+        let mut bytes = [0u8; 24];
+        getrandom::fill(&mut bytes).expect("randomness");
+        let mut drawn = String::new();
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(drawn, "{byte:02x}");
+        }
+        assert!(is_a_token(&drawn), "a drawn token must read back as one");
+
+        for wrong in [
+            "",
+            // A prefix, which is what a partial write leaves.
+            &drawn[..2],
+            &drawn[..TOKEN_CHARS - 1],
+            // Longer than one, which is a file somebody appended to.
+            &format!("{drawn}0"),
+            // The right length, wrong alphabet: uppercase is not what
+            // `{:02x}` writes, and neither is anything else.
+            &drawn.to_uppercase(),
+            &"g".repeat(TOKEN_CHARS),
+        ] {
+            assert!(!is_a_token(wrong), "{wrong:?} was taken for a token");
+        }
     }
 
     /// The check the whole endpoint stands on. Reaching a loopback port is
