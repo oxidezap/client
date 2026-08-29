@@ -134,7 +134,11 @@ profile here repeats it deliberately.
   callback and never trap, owning a core for something subscribed to no
   account event at all. The share (`MAX_DUTY`) is the bound on the sum:
   busy time against elapsed, over a rolling window, with the excess slept off
-  before the next call. Throttled rather than stopped, because a plugin doing
+  before the next call — the *whole* excess, and asked for before the window
+  may turn over. Both halves of that were bugs: a debt truncated at one
+  window, or forgiven when the window rolled, lets a plugin gain time faster
+  than it pays it and settle near half a core with `MAX_DUTY` reading a
+  tenth. Throttled rather than stopped, because a plugin doing
   too much is not the same as one doing something wrong — and the sleep is
   taken in slices, since a plugin being held back is still one the daemon has
   to be able to join. The limiter
@@ -239,7 +243,13 @@ profile here repeats it deliberately.
   the alternative asks again on every update, which is the surest way to
   teach somebody to dismiss the question. It is a real trade rather than an
   oversight: binding to the bytes would say "you approved this build", which
-  is stronger and costs a prompt per release.
+  is stronger and costs a prompt per release. It is also why nothing loads
+  out of a place another local account can write
+  (`only_this_user_can_write`: owner *and* mode, the directory and every
+  module in it). An answer recorded against a name rather than against bytes
+  is one somebody else's file under that name inherits — and a writable
+  directory is one where a new name can appear, not only new bytes under an
+  old one.
 - **An event is a handle, not a payload.** Nothing is serialized for a plugin:
   it reads fields through four host functions against a table of constants, so
   a handler that looks at the text and the chat pays for two strings out of an
