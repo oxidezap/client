@@ -33,15 +33,27 @@ module's exported memory.
 
 ### Declaring — callable only from inside `oxi_init`
 
-Anywhere else these answer `-5` (`STATE`), which says *too early or too late*
-rather than *not allowed*. Each may be called once; a second call is recorded
-and refuses the load, because a plugin that could widen what it asked for
-after the user was shown the first list would make that list a lie.
+Each may be called once, and each answers differently, because two of the
+three have no result to answer with.
+
+`oxi_subscribe` and `oxi_request_caps` are declared without a result. Called
+anywhere but inside `oxi_init` the call is discarded and nothing is said —
+there is no `-5` to return, and a module that declares either with `(result
+i32)` is refused at instantiation for a signature mismatch, before any
+diagnostic could reach its author. A *second* call from inside `oxi_init` is
+recorded and refuses the load, because a plugin that could widen what it asked
+for after the user was shown the first list would make that list a lie.
+
+`oxi_set_name` does answer: `-5` (`STATE`) outside `oxi_init`, which says *too
+early or too late* rather than *not allowed*, and `-4` (`REFUSED`) for a
+second call. A second name does not refuse the load — the plugin runs under
+the first one — because a name is a label rather than a sentence the user
+agreed to.
 
 | Import | Signature |
 |---|---|
-| `oxi_subscribe` | `(mask: i64)` — which event kinds to deliver |
-| `oxi_request_caps` | `(mask: i64)` — which commands this plugin wants |
+| `oxi_subscribe` | `(mask: i64)` — which event kinds to deliver. No result. |
+| `oxi_request_caps` | `(mask: i64)` — which commands this plugin wants. No result. |
 | `oxi_set_name` | `(ptr: i32, len: i32) -> i32` — the name a user sees |
 
 A plugin may not act on the account during `oxi_init` at all: plugins load
