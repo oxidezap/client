@@ -2621,3 +2621,54 @@ fn a_module_behind_a_symlink_is_not_loaded() {
     let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
     assert_eq!(plugins.ids(), vec!["greeter"], "the link is not a plugin");
 }
+
+/// A press carries the slot it came from, and the chat has to agree with it.
+///
+/// The SDK tells a plugin that a Settings widget names no conversation and a
+/// header widget names the one it was drawn in. Neither shape below can come
+/// from a person pressing something, so both are a client of somebody else's.
+#[test]
+fn an_action_whose_chat_contradicts_its_slot_is_ignored() {
+    let dir = TempDir::new("slot-chat");
+    dir.plugin("greeter", &answers_anything());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+    published.settles("the interface", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+
+    // A Settings press carrying a conversation: a handler would act on a chat
+    // nobody was looking at.
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: None,
+        chat_jid: Some("5511999@s.whatsapp.net".into()),
+        slot: PluginSlot::Settings,
+        widget: PluginWidget::Button,
+    });
+    // And a header press naming nothing, which is a button about no
+    // conversation at all.
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: None,
+        chat_jid: None,
+        slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(commands.sent().is_empty(), "neither reached the plugin");
+
+    // The honest shape still does, so this is about the disagreement.
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: None,
+        chat_jid: Some("5511999@s.whatsapp.net".into()),
+        slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
+    });
+    until("the greeting", || commands.sent().len() == 1);
+}

@@ -40,7 +40,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use wacore::time::Instant;
 
-use oxidezap_core::{PluginAction, PluginSurface, UiEvent};
+use oxidezap_core::{PluginAction, PluginSlot, PluginSurface, UiEvent};
 use oxidezap_plugin_abi as abi;
 
 pub use registry::Sink;
@@ -154,8 +154,12 @@ pub enum Outcome {
 pub trait Commands: Send + Sync + 'static {
     /// Send a message, optionally as a reply to `quoted`.
     fn send_text(&self, jid: &str, text: &str, quoted: Option<&str>) -> Outcome;
-    /// Mark a chat read through `message_id`, or as far as the daemon knows
-    /// when that is `None`.
+    /// Mark a chat read through `message_id`.
+    ///
+    /// `None` means "there is nothing behind it", which the daemon accepts
+    /// only for a chat with no messages — one marked unread by hand. A read
+    /// clears whole seconds and cannot be undone, so for any other chat the
+    /// request has to name what the requester saw.
     fn mark_read(&self, jid: &str, message_id: Option<&str>) -> Outcome;
     /// Tell the peer whether we are composing.
     fn typing(&self, jid: &str, composing: bool) -> Outcome;
@@ -429,16 +433,33 @@ impl Plugins {
             );
             return;
         }
+        // The chat has to agree with the slot the press came from, because a
+        // plugin is told it does: a Settings widget names no conversation and
+        // a header widget names the one it was drawn in. A front end sending
+        // a chat with a Settings press would have a handler act on a
+        // conversation nobody was looking at, and a header press with no chat
+        // is a button that named nothing — neither is a shape the tree can
+        // produce, so both are somebody else's client rather than a person
+        // pressing something.
+        let chat = match (action.slot, action.chat_jid.as_deref()) {
+            (PluginSlot::ChatHeader, Some(jid)) if !jid.is_empty() => jid,
+            (PluginSlot::Settings, None) => "",
+            (slot, _) => {
+                log::debug!(
+                    "plugin {}: an action for `{}` whose chat does not match its slot ({slot:?})",
+                    action.plugin,
+                    action.action
+                );
+                return;
+            }
+        };
         let event = Event::new(abi::kinds::UI_ACTION)
             .str(abi::fields::ACTION_ID, action.action.clone())
             .str(
                 abi::fields::ACTION_VALUE,
                 action.value.clone().unwrap_or_default(),
             )
-            .str(
-                abi::fields::CHAT_JID,
-                action.chat_jid.clone().unwrap_or_default(),
-            );
+            .str(abi::fields::CHAT_JID, chat.to_owned());
         self.offer(worker, Job::Event(Arc::new(event)));
     }
 

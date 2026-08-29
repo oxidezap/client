@@ -819,6 +819,18 @@ impl Action<'_> {
         self.0.text(fields::ACTION_VALUE.sized::<N>())
     }
 
+    /// The same id, for a plugin whose ids are longer than the 64 bytes
+    /// [`id`](Self::id) reads into.
+    ///
+    /// The tree accepts up to `abi::ui::MAX_TEXT`, so an id can be longer
+    /// than the default read — and a truncated id is one that matches
+    /// nothing, since an id is only ever compared. `Text::whole` says which
+    /// happened; this is how to make it fit.
+    #[must_use]
+    pub fn id_into<const N: usize>(self) -> Text<N> {
+        self.0.text(fields::ACTION_ID.sized::<N>())
+    }
+
     /// The conversation the window had open when it was pressed.
     ///
     /// Empty for a widget in a slot that has no chat behind it, which is
@@ -1039,9 +1051,25 @@ impl Default for Declaring<false, false, false> {
 
 impl<const S: bool, const A: bool> Declaring<false, S, A> {
     /// The name a user sees beside this plugin's settings.
+    ///
+    /// A refusal is said out loud rather than swallowed. The host answers one
+    /// for a name that is empty, all whitespace, or past its own limit, and
+    /// the plugin then runs under its file name — which is a plugin working
+    /// and looking wrong, the kind of thing an author discovers in a
+    /// screenshot. The typestate cannot carry the failure (this must return
+    /// the named state, or the declaration is unfinished), so it goes where
+    /// the author will look for it.
     #[must_use]
     pub fn name(self, name: &str) -> Declaring<true, S, A> {
-        unsafe { raw::set_name(raw::at(name.as_bytes()), name.len() as i32) };
+        let answer = unsafe { raw::set_name(raw::at(name.as_bytes()), name.len() as i32) };
+        if Outcome::of(answer) != Outcome::Accepted {
+            // A constant line: formatting would pull `core::fmt` into every
+            // plugin that names itself, which is all of them.
+            raw::log(
+                raw::level::WARN,
+                "this plugin's name was refused; it will show under its file name",
+            );
+        }
         Declaring { _private: () }
     }
 }
@@ -1098,8 +1126,14 @@ pub fn send_reply(jid: &str, text: &str, quoted_id: &str) -> Outcome {
     })
 }
 
-/// Mark a chat read through `message_id`, or as far as the daemon knows when
-/// that is `None`. Needs `abi::caps::MARK_READ`.
+/// Mark a chat read through `message_id`. Needs `abi::caps::MARK_READ`.
+///
+/// The id is what makes the request honest, and the daemon refuses one
+/// without it for any chat that has messages: a read clears whole seconds and
+/// is irreversible, so naming what you saw is what stops a request from
+/// consuming arrivals nobody laid eyes on. `None` is for the other case — a
+/// chat with nothing behind it, marked unread by hand, which would otherwise
+/// be impossible to clear.
 pub fn mark_read(jid: &str, message_id: Option<&str>) -> Outcome {
     let id = message_id.unwrap_or("");
     Outcome::of(unsafe {
@@ -1688,6 +1722,25 @@ mod view_tests {
         let seen = run(In::message("5511999@s.whatsapp.net", "hi")
             .int(abi::fields::MEDIA_KIND, abi::fields::media::IMAGE));
         assert_eq!(seen, ["5511999@s.whatsapp.net", "hi", "theirs", "image"]);
+    }
+
+    /// An id may be as long as the tree allows, which is far past what the
+    /// default read makes room for — and a truncated id matches nothing,
+    /// because an id is only ever compared.
+    #[test]
+    fn an_id_longer_than_the_default_read_is_still_reachable() {
+        SEEN.with(|seen| seen.borrow_mut().clear());
+        let long = "i".repeat(200);
+        let mut host = Host::new();
+        let expected = long.clone();
+        host.deliver(In::action(&long, "1"), move |ev| {
+            let Which::Action(a) = ev.which() else {
+                unreachable!()
+            };
+            assert_eq!(a.id().whole(), None, "the default read says it did not fit");
+            note(a.id_into::<256>().whole().expect("this one does"));
+        });
+        assert_eq!(seen(), [expected]);
     }
 
     #[test]
