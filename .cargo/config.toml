@@ -19,6 +19,20 @@ CFLAGS_wasm32_unknown_unknown = "-matomics -mbulk-memory"
 # diesel/sqlite-storage/chat-store; dropping loadable extensions also removes a
 # dlopen surface. STAT4/DBSTAT/RTREE/FTS3/SOUNDEX are upstream-default-off
 # features libsqlite3-sys turns on; none are exercised here.
+#
+# `SQLITE_OMIT_DEPRECATED` is the one that removes symbols the pre-generated
+# bindings still declare, so it is a link error rather than a compile error
+# and only when something reaches one. Checked against diesel 2.3 and
+# sqlite-storage, whose whole FFI surface is `bind_*`, `column_*`, `value_*`,
+# `result_*`, `prepare_v3`, `step`, `reset`, `finalize`, `open_v2`, `close`,
+# `exec`, `errmsg`, `extended_errcode`, `changes`, `free`,
+# `create_function_v2`, `create_collation_v2`, `aggregate_context`,
+# `context_db_handle`, `db_handle`, `user_data`, `serialize` and
+# `deserialize`: none deprecated. What this removes and nothing references is
+# `sqlite3_trace`, `sqlite3_profile`, `sqlite3_aggregate_count`,
+# `sqlite3_expired`, `sqlite3_transfer_bindings`, `sqlite3_global_recover`,
+# `sqlite3_thread_cleanup`, `sqlite3_memory_alarm` and
+# `sqlite3_soft_heap_limit`. Re-check the list when diesel's minor moves.
 LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_SOUNDEX -DSQLITE_OMIT_JSON -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_PROGRESS_CALLBACK"
 
 [target.x86_64-unknown-linux-gnu]
