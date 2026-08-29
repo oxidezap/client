@@ -234,6 +234,7 @@ pub fn render_connected_view(
     let status_list = status_feed.map(|feed| StatusListProps {
         feed,
         selected: app.status_pane().author().map(str::to_string),
+        scroll: app.status_list_scroll().clone(),
     });
     let unseen_status = app.status_unseen();
     let unread_chats = app.unread_chat_count();

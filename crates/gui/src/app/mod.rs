@@ -536,6 +536,9 @@ pub struct WhatsAppApp {
     client: Option<Session>,
     /// Scroll handle for chat list
     chat_list_scroll: VirtualListScrollHandle,
+    /// The Status sidebar's scroll position, so that list can have a
+    /// scrollbar like every other region that scrolls.
+    status_list_scroll: gpui::ScrollHandle,
     /// Focus handle for chat list keyboard navigation
     chat_list_focus: FocusHandle,
     /// Focus target for the call card, so its actions are reachable from
@@ -918,6 +921,7 @@ impl WhatsAppApp {
             selected_chat: None,
             client: None,
             chat_list_scroll: VirtualListScrollHandle::new(),
+            status_list_scroll: gpui::ScrollHandle::new(),
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
@@ -1869,6 +1873,12 @@ impl WhatsAppApp {
     }
 
     /// Get the chat list scroll handle
+    /// The Status sidebar's scroll handle, which is also what its scrollbar
+    /// paints itself over.
+    pub fn status_list_scroll(&self) -> &gpui::ScrollHandle {
+        &self.status_list_scroll
+    }
+
     pub fn chat_list_scroll(&self) -> &VirtualListScrollHandle {
         &self.chat_list_scroll
     }

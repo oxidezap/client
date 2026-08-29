@@ -10,6 +10,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::scroll::Scrollbar;
 use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
 
 use crate::app::WhatsAppApp;
@@ -25,6 +26,9 @@ pub struct StatusListProps {
     pub feed: StatusFeed,
     /// Whose updates are open, so the row reads as selected.
     pub selected: Option<String>,
+    /// Where this list is scrolled to, which is also what its scrollbar
+    /// paints itself over.
+    pub scroll: gpui::ScrollHandle,
 }
 
 pub fn render_status_list(
@@ -55,14 +59,39 @@ pub fn render_status_list(
         .child(render_title_bar(metrics, cx))
         .child(
             div()
-                .id("status-list")
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .px(metrics.space_md())
-                .pb(metrics.space_lg())
-                .child(render_mine(&props, entity.clone(), layout, cx))
-                .children(render_recent(&props, entity, layout, cx)),
+                .relative()
+                .child(
+                    div()
+                        .id("status-list")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&props.scroll)
+                        // The gutter is the rows', not the region's: on the
+                        // scrolling element it moves the region, and the bar
+                        // with it, a gutter's width inside the pane.
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .px(metrics.space_md())
+                                .pb(metrics.space_lg())
+                                .child(render_mine(&props, entity.clone(), layout, cx))
+                                .children(render_recent(&props, entity, layout, cx)),
+                        ),
+                )
+                // Like both other lists: the bar belongs to whatever scrolls,
+                // and it paints over the bounds its handle reports rather than
+                // over the element it was hung from — so the overlay only has
+                // to be here. With twenty contacts posting, nothing else said
+                // the list continued.
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(Scrollbar::vertical(&props.scroll)),
+                ),
         )
 }
 
