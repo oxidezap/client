@@ -571,16 +571,18 @@ mod cpal_output {
             return samples.to_vec();
         }
 
-        let ratio = dst_rate as f32 / src_rate as f32;
-        let output_len = (samples.len() as f32 * ratio) as usize;
-        let mut output = Vec::with_capacity(output_len * channels);
-
-        for i in 0..output_len {
-            let src_idx = (i as f32 / ratio) as usize;
-            let sample = samples.get(src_idx).copied().unwrap_or(0.0);
+        // Through the crate's one resampler: band-limited when the rate is
+        // coming down, read with a fractional cursor. Nearest-neighbour with
+        // no filter is what made a 44.1kHz device's playback hiss, and an
+        // `f32` cursor is what made a clip past six minutes drift.
+        let resampled = crate::resample::resample(samples, src_rate, dst_rate);
+        if channels == 1 {
+            return resampled;
+        }
+        let mut output = Vec::with_capacity(resampled.len() * channels);
+        for sample in resampled {
             output.extend(std::iter::repeat_n(sample, channels));
         }
-
         output
     }
 

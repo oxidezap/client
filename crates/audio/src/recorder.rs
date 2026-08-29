@@ -22,11 +22,20 @@ impl RecordedAudio {
             return self.samples.clone();
         }
 
-        let ratio = self.sample_rate as f32 / TARGET_SAMPLE_RATE as f32;
-        let output_len = (self.samples.len() as f32 / ratio) as usize;
-        let mut output = Vec::with_capacity(output_len);
+        if !self.sample_rate.is_multiple_of(TARGET_SAMPLE_RATE) {
+            // Not a whole-number step — a 44.1kHz device is the ordinary case
+            // — and this branch had no filter at all: everything above the
+            // 8kHz target Nyquist folded back into the voice band, which is
+            // the hiss on the note the peer receives. The crate's resampler
+            // band-limits first and carries its cursor in `f64`, so a long
+            // note does not drift either.
+            return crate::resample::resample(&self.samples, self.sample_rate, TARGET_SAMPLE_RATE);
+        }
 
-        if self.sample_rate.is_multiple_of(TARGET_SAMPLE_RATE) {
+        let mut output = Vec::with_capacity(
+            self.samples.len() / (self.sample_rate / TARGET_SAMPLE_RATE) as usize,
+        );
+        {
             // Integer decimation (the common 48kHz case): low-pass BEFORE
             // dropping samples, or everything above the 8kHz target Nyquist
             // folds back into the voice band (a box average only manages
@@ -71,19 +80,6 @@ impl RecordedAudio {
                     acc += tap * self.samples[src as usize];
                 }
                 output.push(acc);
-            }
-        } else {
-            for i in 0..output_len {
-                // Linear interpolation: nearest-neighbor sample dropping
-                // aliases audibly on voice.
-                let src_pos = i as f32 * ratio;
-                let idx = src_pos as usize;
-                let frac = src_pos - idx as f32;
-                let Some(&a) = self.samples.get(idx) else {
-                    break;
-                };
-                let b = self.samples.get(idx + 1).copied().unwrap_or(a);
-                output.push(a + (b - a) * frac);
             }
         }
 
@@ -382,16 +378,28 @@ mod capture {
 
         use super::*;
 
+        /// A rate that is not a whole-number step down now goes through the
+        /// crate's resampler, which band-limits before it reads — so the
+        /// assertion is about the ramp's interior, where a linear-phase
+        /// filter leaves a ramp alone, rather than about six samples whose
+        /// every value is an edge.
         #[test]
         fn resample_interpolates_between_source_samples() {
-            // A linear ramp resamples to exact fractional positions; the old
-            // nearest-neighbor drop would return [0.0, 1.0, 3.0, 4.0].
             let audio = RecordedAudio {
-                samples: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+                samples: (0..600).map(|n| n as f32).collect(),
                 sample_rate: 24_000,
                 duration_secs: 0,
             };
-            assert_eq!(audio.resample_to_16khz(), vec![0.0, 1.5, 3.0, 4.5]);
+            let out = audio.resample_to_16khz();
+            assert_eq!(out.len(), 400);
+            for at in [100usize, 200, 300] {
+                let want = at as f32 * 1.5;
+                assert!(
+                    (out[at] - want).abs() < 0.01,
+                    "out[{at}] = {} rather than {want}",
+                    out[at]
+                );
+            }
         }
 
         #[test]

@@ -21,6 +21,7 @@
 mod encoder;
 mod player;
 mod recorder;
+mod resample;
 mod waveform;
 
 /// Pitch-preserving re-timing, for the player that does its own mixing. A
