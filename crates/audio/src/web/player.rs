@@ -453,9 +453,12 @@ impl AudioPlayer {
     ///
     /// No audio context, no samples, or a buffer the browser refused to
     /// allocate.
+    /// Borrowed, not owned: the samples are copied into a `WebAudio` buffer
+    /// and nothing here keeps them, so taking the caller's `Vec` was a copy
+    /// of the whole track that the page then dropped.
     pub fn play_samples(
         &mut self,
-        samples: Vec<f32>,
+        samples: &[f32],
         src_sample_rate: u32,
     ) -> Result<(), PlayerError> {
         if samples.is_empty() {
@@ -470,7 +473,7 @@ impl AudioPlayer {
             .create_buffer(1, frames, src_sample_rate as f32)
             .map_err(|e| PlayerError::DeviceError(format!("{e:?}")))?;
         buffer
-            .copy_to_channel(&samples, 0)
+            .copy_to_channel(samples, 0)
             .map_err(|e| PlayerError::DeviceError(format!("{e:?}")))?;
 
         {
