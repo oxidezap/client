@@ -1213,6 +1213,68 @@ async fn an_impossible_timestamp_does_not_stop_the_chat_list() {
     );
 }
 
+/// A vote in a poll used to raise the conversation to the top of the list
+/// with a blank preview and add one to a badge nobody could clear: the row
+/// went in as "unknown" and no bubble corresponds to it, so opening the chat
+/// reads nothing.
+#[tokio::test]
+async fn a_vote_does_not_raise_an_unclearable_badge() {
+    let (_store, chat_store) = test_store().await;
+
+    let vote = wa::Message {
+        poll_update_message: MessageField::some(wa::message::PollUpdateMessage {
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            vote,
+            incoming_info(PEER, PEER, "MSG-VOTE", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+    assert!(
+        chat_store.chats(false, 10).await.unwrap().is_empty(),
+        "a vote amends a poll; it is not a conversation"
+    );
+}
+
+/// A message inside a wrapper `get_base_message` does not peel classified as
+/// "unknown", so it landed as a blank bubble carrying an unread badge instead
+/// of as the text it is.
+#[tokio::test]
+async fn a_wrapped_message_is_still_the_message_inside_it() {
+    let (_store, chat_store) = test_store().await;
+
+    let wrapped = wa::Message {
+        group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
+            message: MessageField::some(wa::Message::text("bom dia")),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            wrapped,
+            incoming_info(GROUP, PEER, "MSG-WRAP", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let msg = chat_store
+        .message(&jid(GROUP), "MSG-WRAP")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.kind, MessageKind::Text);
+    assert_eq!(msg.text.as_deref(), Some("bom dia"));
+}
+
 #[tokio::test]
 async fn history_sync_materializes_without_clobbering_live_rows() {
     let (_store, chat_store) = test_store().await;

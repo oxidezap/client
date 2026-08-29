@@ -119,9 +119,48 @@ pub(crate) fn unavailable_kind(unavailable_type: UnavailableType) -> Option<&'st
     }
 }
 
+/// Wrappers `get_base_message` does not peel.
+///
+/// It knows the envelopes that change how a message is *shown* — ephemeral,
+/// view-once, edited. These change who or what it is attached to, and the
+/// payload inside is an ordinary message: left wrapped, every one of them
+/// classifies as "unknown" and lands as a blank bubble with an unread badge
+/// on it.
+fn peel_extra_wrappers(base: &wa::Message) -> &wa::Message {
+    for wrapper in [
+        &base.group_mentioned_message,
+        &base.associated_child_message,
+        &base.poll_creation_message_v4,
+    ] {
+        if let Some(inner) = wrapper.as_option().and_then(|w| w.message.as_option()) {
+            return inner.get_base_message();
+        }
+    }
+    base
+}
+
+/// Payloads that are bookkeeping for something else, not a message.
+///
+/// A vote, an encrypted reaction or comment, a pin, a keep-in-chat — each
+/// amends a row somewhere rather than adding one. They reach `message_kind`
+/// as "unknown" and `has_any_content` as content, so each used to insert a
+/// row, raise the chat to the top of the list with a blank preview, and add
+/// one to a badge nobody could clear, because no bubble corresponds to it.
+fn is_control_carrier(base: &wa::Message) -> bool {
+    base.poll_update_message.is_set()
+        || base.enc_reaction_message.is_set()
+        || base.enc_comment_message.is_set()
+        || base.enc_event_response_message.is_set()
+        || base.keep_in_chat_message.is_set()
+        || base.pin_in_chat_message.is_set()
+        || base.sticker_sync_rmr_message.is_set()
+        || base.placeholder_message.is_set()
+        || base.status_notification_message.is_set()
+}
+
 /// Classify one decrypted message into its materialization op.
 pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
-    let base = msg.get_base_message();
+    let base = peel_extra_wrappers(msg.get_base_message());
 
     if let Some(reaction) = base.reaction_message.as_option() {
         let Some(target_id) = reaction.key.as_option().and_then(|k| k.id.clone()) else {
@@ -160,6 +199,10 @@ pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
             // Key shares, history-sync notifications, peer data requests, ...
             _ => return MessageOp::Ignore,
         }
+    }
+
+    if is_control_carrier(base) {
+        return MessageOp::Ignore;
     }
 
     let kind = message_kind(base);
