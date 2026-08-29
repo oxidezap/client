@@ -1700,7 +1700,7 @@ impl WhatsAppApp {
     fn add_message_to_chat(&mut self, jid: &str, message: ChatMessage) -> bool {
         if let Some(index) = self.chats.iter().position(|c| c.jid == jid) {
             if self.chats[index].add_message(message) {
-                self.move_chat_to_top(index);
+                self.reposition_chat_by_time(index);
             }
             // Always invalidate chat cache since the chat's content changed
             // (even if it didn't move, the last message preview needs updating)
@@ -1824,25 +1824,17 @@ impl WhatsAppApp {
         }
     }
 
-    /// Move a chat at the given index to the top of the list (index 0).
-    /// Does nothing if already at top.
-    fn move_chat_to_top(&mut self, index: usize) {
-        if index > 0 && index < self.chats.len() {
-            let chat = self.chats.remove(index);
-            self.chats.insert(0, chat);
-            // Note: chat cache invalidation is handled by the caller
-        }
-    }
-
     /// Move a chat to where its `last_message_time` belongs, newest first.
     ///
-    /// [`Self::move_chat_to_top`] is right for live traffic, where whatever
-    /// bumped the chat arrived just now and so is the newest thing the window
-    /// holds. A system notice is not always that: the held ones are replayed
-    /// immediately after a history load, carrying whatever clock they arrived
-    /// with, so one can advance its own conversation and still be older than
-    /// another chat's head. Dropping it at index 0 would stand it above a
-    /// strictly newer row in a list the sidebar draws newest-first.
+    /// The one answer for every arrival, live traffic included. "Advanced" is
+    /// a fact about that chat and not about the list: a catch-up drain after
+    /// a reconnect delivers conversations in whatever order the socket had
+    /// them, and dropping each at index 0 as it arrived left the sidebar in
+    /// arrival order — until the next history load sorted it, with the rows
+    /// jumping under the reader's finger. A held system notice is the same
+    /// case from the other direction: replayed after a load, it carries the
+    /// clock it arrived with, so it can advance its own conversation and
+    /// still be older than another chat's head.
     ///
     /// `None` sorts last, which is where `Reverse(last_message_time)` puts a
     /// chat with nothing in it.
@@ -2503,10 +2495,10 @@ impl WhatsAppApp {
             // Status broadcasts: don't update any names
             let advanced = chat.add_message(message);
 
-            // Move chat to top of list (most recent first); duplicates and
-            // older backfills don't reorder
+            // To where its own head belongs, newest first; duplicates and
+            // older backfills do not reorder at all.
             if advanced {
-                self.move_chat_to_top(index);
+                self.reposition_chat_by_time(index);
             }
 
             // Always invalidate caches since chat content changed
@@ -3302,6 +3294,18 @@ mod tests {
         // older than the chat above it.
         let rest = [chat("b", Some(30)), chat("c", Some(10))];
         assert_eq!(slot_newest_first(&rest, at(20)), 1);
+    }
+
+    /// The catch-up case: an offline drain delivers conversations in whatever
+    /// order the socket had them, and a bump to index 0 per arrival left the
+    /// sidebar in arrival order — sorted only by the next history load, with
+    /// the rows jumping under the reader's finger.
+    #[test]
+    fn a_catch_up_arriving_out_of_order_still_lands_newest_first() {
+        let rest = [chat("b", Some(30)), chat("c", Some(20))];
+        // An older conversation catching up does not stand above a newer one.
+        assert_eq!(slot_newest_first(&rest, at(25)), 1);
+        assert_eq!(slot_newest_first(&rest, at(35)), 0);
     }
 
     #[test]
