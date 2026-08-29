@@ -6632,6 +6632,38 @@ async fn a_view_never_regresses_a_row() {
     );
 }
 
+/// The write has to look where the reads do. A thread living under the LID
+/// key, named here by the phone number, used to be updated under a key it has
+/// no rows beneath: the view was recorded nowhere and the ring stayed up.
+#[tokio::test]
+async fn a_watch_named_by_the_other_identity_still_moves_the_row() {
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("an update"),
+            incoming_info(PEER_LID, PEER_LID, "WATCH-LID-1", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    chat_store
+        .mark_status_watched(&jid(PEER), vec!["WATCH-LID-1".to_string()])
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let messages = chat_store.messages(&jid(PEER_LID), None, 10).await.unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .find(|m| m.id == "WATCH-LID-1")
+            .expect("the update")
+            .status,
+        MessageStatus::Read
+    );
+}
+
 /// The server redistributes app-state mutations on every resync. A pin the
 /// row already carries changes nothing, and the reload it used to buy is the
 /// only load allowed to prune the chat list.

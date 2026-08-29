@@ -933,7 +933,12 @@ fn apply_writer_msg(
             Ok(())
         }
         WriterMsg::StatusWatched { chat, msg_ids } => {
-            let chat_str = chat.to_string();
+            // Routed like every other write that targets a row. The broadcast
+            // this is called with today routes to itself, but the method is
+            // public and its doc names no restriction: a user chat given here
+            // unrouted would write under the key half the reads do not look
+            // at.
+            let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
             // Ours carry the peer's read tick in this column, so a local view
             // must not set it; and `< READ` is what keeps a second viewing —
             // or a played voice status — from moving anything backwards.
