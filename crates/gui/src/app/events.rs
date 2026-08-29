@@ -320,6 +320,10 @@ impl WhatsAppApp {
                     "Call {call_id} microphone is {}",
                     if muted { "muted" } else { "open" }
                 );
+                // The answer to what this window asked for, and the last word
+                // on it: what the state frames carried in the meantime was
+                // the mute the daemon still held.
+                self.settle_call_muted(&call_id, muted, cx);
             }
             // What the camera really is, once the daemon has opened or closed
             // it — and, unlike the mute correction, the *answer* to what this

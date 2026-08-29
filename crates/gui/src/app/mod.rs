@@ -735,6 +735,15 @@ pub struct WhatsAppApp {
     /// every click, so somebody who changed their mind could not say so until
     /// the camera they no longer wanted had finished coming on.
     call_video_asked: Option<(String, bool)>,
+    /// The same, for the microphone.
+    ///
+    /// The announcement is a round trip through the daemon and the peer, and
+    /// every other call frame in between — the peer turning a camera on, a
+    /// waiting call promoted — carries the mute the daemon still holds. That
+    /// took the button back to "open", and the next press computed its toggle
+    /// from that stale value and asked to unmute a microphone the user
+    /// believed was muted.
+    call_muted_asked: Option<(String, bool)>,
     /// Cache of JID -> display name mappings (from notify/pushname attribute)
     name_cache: HashMap<String, String>,
     /// System notices whose conversation has not arrived yet.
@@ -958,6 +967,7 @@ impl WhatsAppApp {
             call_card: CallCard::default(),
             call_pictures: CallPictures::default(),
             call_video_asked: None,
+            call_muted_asked: None,
             name_cache: HashMap::new(),
             pending_notices: HashMap::new(),
             video_players: HashMap::new(),
@@ -1482,6 +1492,7 @@ impl WhatsAppApp {
         // a pane is exactly the kind of thing a reset exists to remove.
         self.call_pictures = CallPictures::default();
         self.call_video_asked = None;
+        self.call_muted_asked = None;
         // What the *old* account occupied, and the query that is still
         // measuring it. Settings survives the reset, so a completion landing
         // after it would show the previous account's database and media under

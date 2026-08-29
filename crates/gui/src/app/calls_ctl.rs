@@ -168,6 +168,29 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    /// What the daemon's microphone really did, as the answer to what was
+    /// asked for here.
+    ///
+    /// The announcement is what ends the ask, not the state frames arriving
+    /// in the meantime — those carry the mute the daemon still held. It is
+    /// sent whether or not it agrees with what was asked, which is what makes
+    /// it the last word: an unmute the peer was never told about leaves the
+    /// device muted, and this is what draws that rather than what was wanted.
+    pub(super) fn settle_call_muted(&mut self, call_id: &str, muted: bool, cx: &mut Context<Self>) {
+        if !self.call_state.holds(call_id) {
+            return;
+        }
+        self.call_state.set_muted(&call_id.to_string(), muted);
+        if self
+            .call_muted_asked
+            .as_ref()
+            .is_some_and(|(asked_for, _)| asked_for == call_id)
+        {
+            self.call_muted_asked = None;
+        }
+        cx.notify();
+    }
+
     /// What the daemon's camera really did, as the answer to what was asked
     /// for here.
     ///
@@ -325,6 +348,10 @@ impl WhatsAppApp {
         let Some(muted) = self.call_state.toggle_muted() else {
             return;
         };
+        // Held until the daemon answers, the way the camera's ask is: what
+        // comes back from the device is the last word, and until it does, no
+        // unrelated call frame may take this back.
+        self.call_muted_asked = Some((call_id.clone(), muted));
         if let Some(client) = &self.client {
             client.set_call_muted(&call_id, muted);
         }
@@ -492,7 +519,20 @@ impl WhatsAppApp {
         }
         self.name_callers(&mut calls);
         let live = calls.active().is_some();
+        // A mute this window asked for and the daemon has not answered yet
+        // survives the frame. Every other call frame carries the mute the
+        // daemon still holds, and letting one of those land put the button
+        // back to "open" over a microphone on its way to muted — with the
+        // next press computing its toggle from that.
+        let pending_mute = self
+            .call_muted_asked
+            .take()
+            .filter(|(call_id, _)| calls.holds(call_id));
         self.call_state = calls;
+        if let Some((call_id, wanted)) = &pending_mute {
+            self.call_state.set_muted(call_id, *wanted);
+        }
+        self.call_muted_asked = pending_mute;
         // After the state, because what a picture may still be drawn for is
         // exactly what the new state says has a camera behind it.
         self.call_pictures.follow(&self.call_state);
