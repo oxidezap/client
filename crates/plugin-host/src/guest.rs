@@ -380,13 +380,16 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // Refused, not masked. `kinds::COUNT`'s own documentation is the
             // contract: a bit above it means a plugin built against a newer
             // ABI, and adding a kind deliberately does not bump `VERSION`, so
-            // nothing else would ever catch it. Dropping the bit left such a
+            // nothing else would ever catch it. `KNOWN` rather than every bit
+            // below `COUNT`, because bit zero is not a kind: the mask that
+            // spells it is `1`, which is what somebody writing against the
+            // raw ABI reaches for first. Dropping the bit left such a
             // plugin loaded and healthy-looking while permanently never
             // hearing about the one thing it asked for — which is exactly the
             // failure the constant exists to prevent. Recorded rather than
             // returned, because this import has no answer: the loader refuses
             // the plugin once `oxi_init` is done.
-            let known = (1i64 << abi::kinds::COUNT) - 1;
+            let known = abi::kinds::KNOWN;
             let guest = c.data_mut();
             // Once, like the capability declaration. Replacing the first mask
             // with the second is what this used to do, silently and with no

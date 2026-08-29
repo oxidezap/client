@@ -211,6 +211,16 @@ pub mod kinds {
         1i64 << kind
     }
 
+    /// Every bit a subscription mask may carry.
+    ///
+    /// Not `(1 << COUNT) - 1`, which is the obvious spelling and is wrong:
+    /// kinds start at `1`, so that includes bit zero, which names nothing.
+    /// Mask `1` is also the first guess of anyone writing against the raw ABI
+    /// rather than the SDK — `1` looks like "the first kind" — and it loaded
+    /// a plugin that then never heard about anything, which is the exact
+    /// failure refusing an unknown bit exists to prevent.
+    pub const KNOWN: i64 = ((1i64 << COUNT) - 1) & !bit(0);
+
     /// Whether `mask` asks for `kind`.
     #[must_use]
     pub const fn subscribed(mask: i64, kind: i32) -> bool {
@@ -409,6 +419,46 @@ pub mod fields {
         pub const OUTGOING: i64 = 1;
         pub const ANSWERED: i64 = 2;
         pub const ENDED: i64 = 3;
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::kinds;
+
+    /// Bit zero is not a kind, and `1` is what somebody writing against the
+    /// raw ABI reaches for first. Accepting it loaded a plugin that then
+    /// heard about nothing at all.
+    #[test]
+    fn the_known_mask_has_no_bit_for_a_kind_that_does_not_exist() {
+        assert_eq!(kinds::KNOWN & 1, 0, "bit zero names nothing");
+        assert_eq!(
+            kinds::KNOWN.count_ones() as i32,
+            kinds::COUNT - 1,
+            "one bit per kind, and kinds start at one"
+        );
+    }
+
+    /// And every kind this ABI names is in it, or a plugin asking for that
+    /// kind is refused for asking about something real.
+    #[test]
+    fn every_kind_this_abi_names_is_in_the_known_mask() {
+        for kind in [
+            kinds::MESSAGE,
+            kinds::CONNECTION,
+            kinds::RECEIPT,
+            kinds::REACTION,
+            kinds::PRESENCE,
+            kinds::CALL,
+            kinds::UI_ACTION,
+            kinds::TIMER,
+        ] {
+            assert!(
+                kinds::KNOWN & kinds::bit(kind) != 0,
+                "kind {kind} is not subscribable"
+            );
+            assert!(kind > 0 && kind < kinds::COUNT, "kind {kind} is in range");
+        }
     }
 }
 

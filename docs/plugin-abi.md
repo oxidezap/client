@@ -132,7 +132,10 @@ nothing to look at.
 ## Events
 
 `oxi_on_event` is called with a `kind` and a handle. The subscription mask is
-`1 << kind`.
+`1 << kind` — so messages are `2`, not `1`. **Bit zero names no kind**, and a
+mask carrying it is refused at load along with any bit above the table: a
+subscription that can never be delivered would otherwise leave a plugin
+loaded, drawn, and permanently deaf.
 
 | Kind | | Delivered without subscribing |
 |---|---|---|

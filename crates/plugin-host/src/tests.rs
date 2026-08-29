@@ -314,6 +314,53 @@ fn wat_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("\\{b:02x}")).collect()
 }
 
+/// A plugin that answers any action by sending a *constant* message.
+///
+/// The difference from [`draws`] matters in exactly one test: that one reads
+/// the chat off the event, so an action carrying an oversized chat is refused
+/// by the send rather than by the guard being tested, and the test passes for
+/// the wrong reason. Sending somewhere fixed makes "did this reach the
+/// plugin" observable whatever the action carried.
+fn answers_anything() -> String {
+    let mut buf = vec![0u8; 512];
+    let mut w = abi::ui::Writer::new(&mut buf);
+    w.leaf(
+        abi::ui::kind::BUTTON,
+        abi::ui::slot::CHAT_HEADER,
+        abi::ui::flags::ENABLED,
+        "greet",
+        "Greet",
+        "",
+    );
+    let n = w.finish().expect("fits");
+    versioned(&format!(
+        r#"(module
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_set_name"     (func $set_name (param i32 i32) (result i32)))
+  (import "oxidezap" "oxi_ui_set"       (func $ui_set (param i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{tree}")
+  (data (i32.const 1024) "{name}")
+  (data (i32.const 1100) "a@s.whatsapp.net")
+  (data (i32.const 1150) "hi")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $caps (i64.const 9))    ;; caps::SEND | caps::UI
+    (drop (call $set_name (i32.const 1024) (i32.const {name_len})))
+    (drop (call $ui_set (i32.const 0) (i32.const {len})))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (drop (call $send (i32.const 1100) (i32.const 16) (i32.const 1150) (i32.const 2)))
+    (i32.const 0))
+)"#,
+        tree = wat_bytes(&buf[..n]),
+        len = n,
+        name = NAME,
+        name_len = NAME.len()
+    ))
+}
+
 /// A plugin whose whole interface is published from `oxi_init`.
 fn draws() -> String {
     let mut buf = vec![0u8; 512];
@@ -1899,7 +1946,7 @@ fn settings_another_user_could_have_written_are_not_read() {
 #[test]
 fn an_action_carrying_more_than_a_setting_is_refused() {
     let dir = TempDir::new("huge-action");
-    dir.plugin("greeter", &draws());
+    dir.plugin("greeter", &answers_anything());
     let commands = Recorder::new(Outcome::Accepted);
     let published = Published::default();
     let plugins = host(&dir, Arc::clone(&commands), &published);
@@ -1907,23 +1954,40 @@ fn an_action_carrying_more_than_a_setting_is_refused() {
         s.first().is_some_and(|p| !p.roots.is_empty())
     });
 
+    const CHAT: &str = "5511999@s.whatsapp.net";
+
     plugins.act(&PluginAction {
         plugin: "greeter".into(),
         action: "greet".into(),
         value: Some("x".repeat(crate::MAX_ACTION_BYTES + 1)),
-        chat_jid: Some("5511999@s.whatsapp.net".into()),
+        chat_jid: Some(CHAT.into()),
         slot: PluginSlot::ChatHeader,
         widget: PluginWidget::Button,
     });
     std::thread::sleep(Duration::from_millis(200));
     assert!(commands.sent().is_empty(), "never reached the plugin");
 
-    // And one of an honest size still does, so this is about the length.
+    // The same megabyte under the other name. A JID is twenty bytes from any
+    // honest front end and a string like any other from a written one, so a
+    // bound on the value alone is a bound on which field somebody chose.
     plugins.act(&PluginAction {
         plugin: "greeter".into(),
         action: "greet".into(),
-        value: Some("x".repeat(crate::MAX_ACTION_BYTES)),
-        chat_jid: Some("5511999@s.whatsapp.net".into()),
+        value: None,
+        chat_jid: Some("x".repeat(crate::MAX_ACTION_BYTES + 1)),
+        slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(commands.sent().is_empty(), "nor under another name");
+
+    // And one of an honest size still does, so this is about the length —
+    // measured across everything the queued event will hold.
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: Some("x".repeat(crate::MAX_ACTION_BYTES - CHAT.len())),
+        chat_jid: Some(CHAT.into()),
         slot: PluginSlot::ChatHeader,
         widget: PluginWidget::Button,
     });
@@ -2211,6 +2275,35 @@ const SUBSCRIBES_TO_THE_FUTURE: &str = r#"(module
     (i32.const 0))
   (func (export "oxi_on_event") (param i32) (param i32) (result i32) (i32.const 0))
 )"#;
+
+/// Bit zero is not a kind — they start at one — and `1` is the mask somebody
+/// writing against the raw ABI reaches for first. Accepting it left the
+/// plugin loaded, drawn, and permanently deaf.
+const SUBSCRIBES_TO_NOTHING: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
+  (memory (export "memory") 1)
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    ;; Bit zero, which names no kind.
+    (call $subscribe (i64.const 1))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param i32) (param i32) (result i32) (i32.const 0))
+)"#;
+
+#[test]
+fn a_subscription_to_bit_zero_is_refused_like_any_other_unknown_kind() {
+    let dir = TempDir::new("kind-zero");
+    dir.plugin("deaf", &versioned(SUBSCRIBES_TO_NOTHING));
+    dir.plugin("autoreply", &pong());
+
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(
+        plugins.ids(),
+        vec!["autoreply"],
+        "refused, rather than loaded and deaf"
+    );
+}
 
 #[test]
 fn a_subscription_to_a_kind_this_host_lacks_is_refused() {

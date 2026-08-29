@@ -112,7 +112,8 @@ const DUTY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 /// is finite, not that it is small.
 const MAX_PLUGINS: usize = 32;
 
-/// The longest value a widget's use may carry.
+/// The most a widget's use may carry into a plugin's queue, across every
+/// string the event clones.
 ///
 /// The window refuses a longer one before it sends; this is the same number
 /// asked on the side that has to *hold* it. `QUEUE_DEPTH` counts items, so
@@ -402,23 +403,28 @@ impl Plugins {
             );
             return;
         }
-        // And the value is bounded before it is cloned into a queued event.
-        // The queue is five hundred deep and counts *items*, so a front end
-        // submitting a valid action carrying most of a megabyte — the
-        // daemon's whole frame limit — could park half a gigabyte in one
-        // plugin's queue while that plugin is throttled or slow. A setting is
-        // a keyword or a sentence; the window refuses anything longer before
-        // it sends, and this is the same number asked on the side that has to
-        // hold it.
-        if action
-            .value
-            .as_ref()
-            .is_some_and(|v| v.len() > MAX_ACTION_BYTES)
-        {
+        // And what the event will carry is bounded before any of it is cloned
+        // into the queue. The queue is five hundred deep and counts *items*,
+        // so a front end submitting a valid action carrying most of a
+        // megabyte — the daemon's whole frame limit — could park half a
+        // gigabyte in one plugin's queue while that plugin is throttled or
+        // slow. A setting is a keyword or a sentence; the window refuses
+        // anything longer before it sends, and this is the same number asked
+        // on the side that has to hold it.
+        //
+        // The *sum*, and not the value alone, because the bound is about what
+        // one queued event costs and the chat travels beside it: a JID is
+        // twenty bytes from any honest front end and a string like any other
+        // from a written one, so capping only the field that happened to be
+        // noticed first leaves the same megabyte arriving under another name.
+        // The widget's id is already bounded by having to be one this plugin
+        // published, which `draws` has just asked.
+        let queued = action.value.as_deref().map_or(0, str::len)
+            + action.chat_jid.as_deref().map_or(0, str::len);
+        if queued > MAX_ACTION_BYTES {
             log::debug!(
-                "plugin {}: refusing a {} byte value for `{}`",
+                "plugin {}: refusing {queued} bytes of payload for `{}`",
                 action.plugin,
-                action.value.as_ref().map_or(0, String::len),
                 action.action
             );
             return;
