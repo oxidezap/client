@@ -126,6 +126,7 @@ pub enum FromSocket {
 pub struct Inbound {
     queued: Receiver<FromSocket>,
     over: Rc<RefCell<Overflow>>,
+    ended: Rc<Cell<bool>>,
 }
 
 /// Whether the queue filled, and whether the reader has been told.
@@ -139,6 +140,21 @@ enum Overflow {
 }
 
 impl Inbound {
+    /// Whether the socket has already gone, ahead of the queue saying so.
+    ///
+    /// The frames still queued are worth applying — a `SendFailed` or a
+    /// window request rides a channel nothing recovers, so dropping the
+    /// backlog would lose it — but the *media* they name is not worth
+    /// waiting for: it is fetched from a bridge that has just closed, and a
+    /// budget spent per frame is what would put two hours between the socket
+    /// going and the front end's pending requests being failed. A reader that
+    /// asks this can drain in order and skip the sideband, which the renderer
+    /// already draws as an offer to download.
+    #[must_use]
+    pub fn connection_ended(&self) -> bool {
+        self.ended.get()
+    }
+
     /// The next thing that happened, oldest first.
     ///
     /// `None` once the connection is over.
@@ -188,6 +204,9 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
     // Out of band, so the ending does not queue behind the backlog it is
     // about. See [`Inbound`].
     let over = Rc::new(RefCell::new(Overflow::None));
+    // Also out of band, and a different question: this one is true while
+    // frames the reader still has to apply are queued behind it.
+    let ended = Rc::new(Cell::new(false));
 
     // Shared with the `onopen` callback so a frame written before the socket
     // was up is sent rather than dropped.
@@ -231,6 +250,7 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
     let message_callback = {
         let inbound = inbound.clone();
         let over = Rc::clone(&over);
+        let ended = Rc::clone(&ended);
         let socket_here = socket.clone();
         let message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             if !matches!(*over.borrow(), Overflow::None) {
@@ -254,6 +274,7 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
                 *over.borrow_mut() = Overflow::Announced(
                     "the daemon sent frames faster than this page could apply them".to_string(),
                 );
+                ended.set(true);
                 let _ = socket_here.close();
             }
         });
@@ -263,8 +284,13 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
 
     let close_callback = {
         let inbound = inbound.clone();
+        let ended = Rc::clone(&ended);
         let mut gone = Some(gone);
         let closed = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
+            // Before the frame is queued, because the point of it is to be
+            // true while the reader is still working through the backlog this
+            // close is behind. See [`Inbound::connection_ended`].
+            ended.set(true);
             let reason = event.reason();
             let detail = if reason.is_empty() {
                 format!("the daemon connection closed (code {})", event.code())
@@ -349,7 +375,14 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
         drop(error_callback);
     });
 
-    Ok((Link::over_socket(outbound), Inbound { queued, over }))
+    Ok((
+        Link::over_socket(outbound),
+        Inbound {
+            queued,
+            over,
+            ended,
+        },
+    ))
 }
 
 /// Put one event on the queue, waiting for room only where waiting is right.

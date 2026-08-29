@@ -128,7 +128,17 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
                     // already. Everything the frame does not use is dropped
                     // with the next one.
                     fetched.clear();
-                    prefetch(&media_base, &message, fetched.as_ref(), &pending).await;
+                    // Unless the socket has already gone, in which case the
+                    // frames still queued are worth applying and their media
+                    // is not worth waiting for: it comes from the bridge that
+                    // just closed, and a budget spent per frame is what would
+                    // put an hour between the close and this loop reaching it
+                    // — with every pending request unanswered until it did.
+                    // The renderer draws media it does not have as an offer to
+                    // download, which is what this becomes.
+                    if !socket.connection_ended() {
+                        prefetch(&media_base, &message, fetched.as_ref(), &pending).await;
+                    }
                     if frames.apply(message).is_break() {
                         break;
                     }
