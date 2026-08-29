@@ -124,7 +124,7 @@ fn store(key: &str, bytes: Vec<u8>, claims: usize) -> Result<String> {
                 claims,
             },
         );
-        sweep(cache);
+        sweep(cache, key);
         Ok(key.to_string())
     })
 }
@@ -258,7 +258,22 @@ pub fn wipe(scope: Wipe) -> Result<()> {
 /// Which means a pending delivery can still be dropped — under exactly the
 /// pressure where dropping it beats exhausting the heap the page is drawn
 /// with.
-fn sweep(cache: &mut Cache) {
+///
+/// With one exception, and it is the entry `arriving` names: whatever has
+/// just been written may not be reclaimed by its own insertion. A payload
+/// larger than the whole budget is over it the moment it lands, and every
+/// other entry taken together cannot bring it back under — so the sweep
+/// reached the new entry, dropped it, and `store` returned its key anyway.
+/// What the person saw was a download WhatsApp completed, reported
+/// successful, and then missing: deterministic for any attachment over the
+/// budget, which is the size at which having the bytes matters most.
+///
+/// Sparing it bounds nothing worse than one payload: it is counted, so
+/// everything else reclaimable is still taken to make room for it, and the
+/// *next* write's sweep sees it as an ordinary claimed entry and may drop it
+/// then. The map therefore holds at most the budget plus whatever single
+/// thing arrived last.
+fn sweep(cache: &mut Cache, arriving: &str) {
     let reclaimable: u64 = cache
         .entries
         .iter()
@@ -276,7 +291,7 @@ fn sweep(cache: &mut Cache) {
     let mut oldest: Vec<(String, bool, u64, u64)> = cache
         .entries
         .iter()
-        .filter(|(name, _)| !is_staged_upload(name))
+        .filter(|(name, _)| !is_staged_upload(name) && name.as_str() != arriving)
         .map(|(name, entry)| {
             (
                 name.clone(),
