@@ -63,6 +63,7 @@ pub enum UiEvent {
     ReceiptReceived {
         chat_jid: String,
         message_ids: Vec<String>,
+        #[serde(with = "receipt_wire")]
         receipt_type: ReceiptType,
     },
     /// The client assigned the real WhatsApp id to a just-sent message; the UI
@@ -246,4 +247,32 @@ pub enum UiEvent {
         notice: SystemNotice,
     },
     Error(String),
+}
+
+/// A receipt type as WhatsApp spells it, which is the only spelling that
+/// survives a round trip.
+///
+/// The library's own `Serialize` writes the variant's Rust name and its
+/// `Deserialize` reads a wire string, and the two tables never meet: `"Read"`
+/// comes back as `Other("Read")`, and an `Other` goes out as a map that the
+/// string-only reader then refuses, taking the whole frame with it. So the
+/// wire carries `as_wire_str`/`parse`, which are inverses by construction.
+mod receipt_wire {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::ReceiptType;
+
+    pub(super) fn serialize<S: Serializer>(
+        receipt: &ReceiptType,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(receipt.as_wire_str())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ReceiptType, D::Error> {
+        let wire = String::deserialize(deserializer)?;
+        Ok(ReceiptType::parse(&wire))
+    }
 }

@@ -256,6 +256,39 @@ impl Awaiting {
 
 type Pending = Arc<Mutex<HashMap<RequestId, Awaiting>>>;
 
+/// What ends this connection's reader when the connection is dropped.
+///
+/// The read half is not the writer's to drop: it belongs to whatever the
+/// transport parks in, and nothing wakes it while the daemon has nothing to
+/// say. So dropping a [`Session`] used to leave the connection open — every
+/// reconnect after a network blip left another one behind, and at the
+/// daemon's `MAX_CLIENTS` the window never connected again, with the ghosts
+/// all still claiming to hold a window.
+///
+/// What "end it" means is the transport's, so it arrives as a closure from
+/// whichever module opened the connection.
+pub(super) struct Teardown(Option<Box<dyn FnOnce() + Send>>);
+
+impl Teardown {
+    /// Nothing to end. A page's socket goes with the page.
+    pub(super) fn none() -> Self {
+        Self(None)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(super) fn new(end: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(end)))
+    }
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        if let Some(end) = self.0.take() {
+            end();
+        }
+    }
+}
+
 /// A connection to `oxidezapd`.
 pub struct Session {
     /// The write half, whichever transport is under it. The reader holds the
@@ -278,6 +311,13 @@ pub struct Session {
     /// The newest decoded picture of each direction, written where the frames
     /// are read and taken by the window. See [`FromDaemon::CallFrames`].
     frames: crate::video::LatestFrames,
+    /// How this connection's reader is ended when this goes.
+    ///
+    /// Last, and that is load-bearing on a named pipe: fields drop in
+    /// declaration order, so the write half is released with `link` before
+    /// the hangup runs. Cancelling a pipe read disconnects nothing — the
+    /// pipe breaks when the last handle to it closes.
+    teardown: Teardown,
 }
 
 impl Session {
@@ -369,7 +409,18 @@ impl Session {
             media,
             events,
             frames: crate::video::LatestFrames::default(),
+            teardown: Teardown::none(),
         }
+    }
+
+    /// Say how this connection's reader is ended, once there is one to end.
+    ///
+    /// Set after construction because the reader needs what construction
+    /// builds — the request table and the frame slots — so there is no reader
+    /// to name until the session exists.
+    #[cfg(not(target_family = "wasm"))]
+    fn ends_with(&mut self, teardown: Teardown) {
+        self.teardown = teardown;
     }
 
     /// The newest decoded picture of each direction of the live call.
