@@ -61,7 +61,12 @@ pub fn render_message_list(
 ) -> impl IntoElement {
     let metrics = *layout.metrics();
 
-    if cache.messages.is_empty() {
+    // What the list holds, not what the chat holds. In a conversation with no
+    // history the other side may still be typing, and that row is the only
+    // thing on screen with anything to say — drawn as an empty state instead,
+    // the window said "No messages yet" over a live indicator, and the list
+    // had already been synchronized to one row.
+    if cache.items.is_empty() {
         return div()
             .flex_1()
             .min_h_0()
