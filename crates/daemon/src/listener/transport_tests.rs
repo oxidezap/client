@@ -227,6 +227,11 @@ fn reconnecting_does_not_leak_a_client() {
 
     let live = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&live);
+    // Said by the server rather than waited out: a sleep long enough for a
+    // loaded runner is a sleep this test spends eight times, and one that is
+    // not is a failure that says nothing about connections.
+    let (accepted, was_accepted) = mpsc::channel::<()>();
+    let (closed, was_closed) = mpsc::channel::<()>();
     // A tokio channel rather than a `std` one: this runtime is
     // single-threaded, and a blocking wait inside it would starve the reads
     // spawned below — the count would then never come down and the test
@@ -237,13 +242,16 @@ fn reconnecting_does_not_leak_a_client() {
             for _ in 0..RECONNECTS {
                 let mut stream = listener.accept().await.expect("accept");
                 counted.fetch_add(1, Ordering::SeqCst);
+                let _ = accepted.send(());
                 let held = Arc::clone(&counted);
+                let closed = closed.clone();
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt as _;
                     // Says nothing, so only the client hanging up ends this.
                     let mut sink = Vec::new();
                     let _ = stream.read_to_end(&mut sink).await;
                     held.fetch_sub(1, Ordering::SeqCst);
+                    let _ = closed.send(());
                 });
             }
             let _ = until_done.recv().await;
@@ -266,7 +274,9 @@ fn reconnecting_does_not_leak_a_client() {
             // nothing to say, so nothing completes this but the hangup.
             let _ = reader.read_line(&mut line);
         });
-        std::thread::sleep(Duration::from_millis(50));
+        was_accepted
+            .recv_timeout(PATIENCE)
+            .expect("the server accepted the connection");
         highest = highest.max(live.load(Ordering::SeqCst));
 
         // The order a `Session` goes in: the write half first, then the
@@ -284,9 +294,12 @@ fn reconnecting_does_not_leak_a_client() {
             ),
             "the reader did not leave after the connection was hung up on"
         );
-        // The server side is told by the same close, which it learns of on
-        // its own runtime rather than on this thread.
-        std::thread::sleep(Duration::from_millis(50));
+        // The server learns of the same close on its own runtime, and the
+        // next connection may not be opened until it has: two at once is
+        // exactly what this test reports.
+        was_closed
+            .recv_timeout(PATIENCE)
+            .expect("the server saw the connection close");
     }
 
     drop(all_done);
