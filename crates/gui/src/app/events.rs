@@ -109,30 +109,7 @@ impl WhatsAppApp {
                     .filter(|message| message.is_read)
                     .map(|message| message.id.clone())
                     .collect();
-                self.merge_chats(chats);
-                self.chats
-                    .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
-                // A selection that no longer names a chat is a selection of
-                // nothing: the conversation pane resolves it every frame and
-                // would draw the empty state with no way back on a phone.
-                self.forget_missing_selection();
-                // The merge above took the store's word for every row, and
-                // a merge assembled before a view was written does not carry
-                // it.
-                self.restore_watched_status(&agreed);
-                // Count-based cache guards can't see reordering/merges.
-                self.invalidate_chat_cache();
-                // Whatever arrived before its conversation did. A group
-                // change is announced to a window that has never seen the
-                // group, and this load is what makes it placeable.
-                self.flush_pending_notices(cx);
-                // A status update expires on the clock with nothing arriving
-                // to say so, and this is where the feed that holds one is
-                // installed. Without arming it here nothing ever did: the
-                // timer only re-armed itself, so the first one was never set
-                // and a lapsed update kept its row, its ring and its badge
-                // until some unrelated change happened to rebuild the list.
-                self.ensure_status_tick(cx);
+                self.install_chats(chats, &agreed, cx);
                 cx.notify();
             }
             UiEvent::QrCode { code, timeout_secs } => {
