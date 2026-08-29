@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use log::warn;
 use oxidezap_chat_store::ChatStore;
 use oxidezap_core::fallback_chat_name;
 use whatsapp_rust::client::Client;
@@ -90,8 +91,17 @@ impl NameBook {
         if let Some(known) = read(&self.identities, &key) {
             return known;
         }
-        let identity = Arc::new(build_identity(client, jid).await);
-        write(&self.identities, key, identity.clone());
+        let (identity, settled) = build_identity(client, jid).await;
+        let identity = Arc::new(identity);
+        // A lookup that failed answers the source JID, which is the same
+        // answer as "no mapping" and is wrong in a way nothing later
+        // corrects: memoized, a transient store error files one person under
+        // two identities for the life of the session — their `composing`
+        // under a phone number, their `paused` under a LID, and a typing line
+        // nothing clears until its TTL runs out.
+        if settled {
+            write(&self.identities, key, identity.clone());
+        }
         identity
     }
 
@@ -176,28 +186,43 @@ impl NameBook {
     }
 }
 
-async fn build_identity(client: &Client, jid: &Jid) -> ChatIdentity {
+/// The pair behind a JID, and whether the answer is worth keeping.
+///
+/// Unsettled means the mapping lookup failed rather than found nothing: the
+/// library keeps those apart deliberately, and so must this.
+async fn build_identity(client: &Client, jid: &Jid) -> (ChatIdentity, bool) {
     let source = jid.to_non_ad();
     let mut canonical = source.clone();
     let mut contact_jids = vec![source.clone()];
     let mut fallback_jid = source.clone();
     let mut has_phone = source.is_pn();
 
-    if let Ok(Some(mapping)) = client.get_lid_pn_entry(&source).await {
-        let pn = Jid::pn(mapping.phone_number.as_ref());
-        let lid = Jid::lid(mapping.lid.as_ref());
-        canonical = lid.clone();
-        fallback_jid = pn.clone();
-        has_phone = true;
-        contact_jids = vec![pn, lid];
+    let mut settled = true;
+    match client.get_lid_pn_entry(&source).await {
+        Ok(Some(mapping)) => {
+            let pn = Jid::pn(mapping.phone_number.as_ref());
+            let lid = Jid::lid(mapping.lid.as_ref());
+            canonical = lid.clone();
+            fallback_jid = pn.clone();
+            has_phone = true;
+            contact_jids = vec![pn, lid];
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!("identity lookup for {} failed: {e}", source.observe());
+            settled = false;
+        }
     }
 
-    ChatIdentity {
-        canonical_jid: canonical.to_string(),
-        contact_jids,
-        fallback_name: fallback_chat_name(&fallback_jid),
-        has_phone,
-    }
+    (
+        ChatIdentity {
+            canonical_jid: canonical.to_string(),
+            contact_jids,
+            fallback_name: fallback_chat_name(&fallback_jid),
+            has_phone,
+        },
+        settled,
+    )
 }
 
 /// The server's own stand-in for a number it will not spell out, e.g.
