@@ -247,7 +247,9 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
             // `try_send`, because this is a browser callback and there is
             // nothing here to await on. A full queue is the one case that
             // matters: see [`MAX_QUEUED_FRAMES`].
-            if let Err(TrySendError::Full(_)) = inbound.try_send(FromSocket::Line(line)) {
+            if let Err(TrySendError::Full(FromSocket::Line(line))) =
+                inbound.try_send(FromSocket::Line(line))
+            {
                 log::error!(
                     "the daemon is sending frames faster than this page can apply them; \
                      ending the connection"
@@ -257,12 +259,24 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
                 // the ending *behind* them affordable rather than a wait
                 // measured in hours.
                 ended.set(true);
-                deliver(
-                    &inbound,
-                    FromSocket::Closed(
-                        "the daemon sent frames faster than this page could apply them".to_string(),
-                    ),
-                );
+                // The frame that would not fit is kept, not dropped. It is
+                // one frame — the bound is already closed above it, since
+                // nothing more is queued once `ended` is set — and it may be
+                // news, which no snapshot brings back. It goes ahead of the
+                // ending, in the order it arrived, which is why both are sent
+                // from *one* task rather than two: two would race, and the
+                // ending winning that race is this frame lost after all.
+                let inbound = inbound.clone();
+                spawn_local(async move {
+                    if inbound.send(FromSocket::Line(line)).await.is_ok() {
+                        let _ = inbound
+                            .send(FromSocket::Closed(
+                                "the daemon sent frames faster than this page could apply them"
+                                    .to_string(),
+                            ))
+                            .await;
+                    }
+                });
                 let _ = socket_here.close();
             }
         });
@@ -372,7 +386,10 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
 /// connection, so losing one to a full queue would leave the reader waiting
 /// on a socket that has already gone. A `Line` is not sent through here: a
 /// task per overflowing frame would be the unbounded queue again, wearing the
-/// scheduler's clothes.
+/// scheduler's clothes. The single frame that *triggers* an overflow is the
+/// exception, and is not an exception to the bound: it is spent on the one
+/// frame that closes the connection, after which nothing else is queued at
+/// all.
 fn deliver(inbound: &Sender<FromSocket>, event: FromSocket) {
     match inbound.try_send(event) {
         Ok(()) | Err(TrySendError::Closed(_)) => {}
