@@ -122,6 +122,20 @@ const MAX_PLUGINS: usize = 32;
 /// queue — and a plugin being throttled is exactly one whose queue fills.
 const MAX_ACTION_BYTES: usize = 64 * 1024;
 
+/// How many widget presses one plugin may be handed per rolling window.
+///
+/// Everything else on this queue comes from the account. A press comes from
+/// a front end, which is the one producer somebody outside this process can
+/// run at will, and a full queue does not drop a press: it *stops the plugin
+/// for good*, with nothing short of restarting the daemon to bring it back.
+/// So `QUEUE_DEPTH` valid actions faster than the plugin drains them turn
+/// load into the permanent, silent disabling of a plugin the user approved.
+/// Refusing the excess is the bound; the plugin keeps running.
+///
+/// Far past a person: pressing something ten times a second for the whole
+/// window is a fifth of this, and the window is shared with nothing else.
+const MAX_ACTIONS_PER_WINDOW: usize = 512;
+
 /// How many events may wait for one plugin.
 ///
 /// Deep enough to absorb a burst of arrivals while a handler is working, and
@@ -205,6 +219,9 @@ struct Worker {
     /// the plugin that most needs its permissions taken away is exactly the
     /// one whose queue is full.
     granted: Arc<AtomicI64>,
+    /// What this plugin's widget presses have spent this window. See
+    /// [`MAX_ACTIONS_PER_WINDOW`].
+    actions: Mutex<crate::guest::Rolling>,
 }
 
 /// What arrives on a plugin's queue.
@@ -453,6 +470,22 @@ impl Plugins {
                 return;
             }
         };
+        // And how many of them, per window. Overflowing this queue stops the
+        // plugin permanently, so an unbounded press is a front end able to
+        // disable any approved plugin by pressing hard enough. Refused here
+        // instead, where the plugin goes on running.
+        {
+            let mut actions = worker.actions.lock().expect("action budget poisoned");
+            let elapsed = actions.window_began.elapsed();
+            if !actions.spend(elapsed, 1) {
+                log::debug!(
+                    "plugin {}: refusing `{}`, more than {MAX_ACTIONS_PER_WINDOW} actions this window",
+                    action.plugin,
+                    action.action
+                );
+                return;
+            }
+        }
         let event = Event::new(abi::kinds::UI_ACTION)
             .str(abi::fields::ACTION_ID, action.action.clone())
             .str(
@@ -460,7 +493,7 @@ impl Plugins {
                 action.value.clone().unwrap_or_default(),
             )
             .str(abi::fields::CHAT_JID, chat.to_owned());
-        self.offer(worker, Job::Event(Arc::new(event)));
+        self.offer_refusable(worker, Job::Event(Arc::new(event)));
     }
 
     /// Stop every plugin, waiting for the handler each is in the middle of.
@@ -560,32 +593,58 @@ impl Plugins {
     /// people and not others, with nothing anywhere saying which. A plugin
     /// this far behind is broken, and stopping it says so.
     fn offer(&self, worker: &Worker, job: Job) {
+        if let Some(job) = self.try_offer(worker, job) {
+            let Job::Event(_) = job;
+            self.registry.stop(
+                &worker.id,
+                format!("it fell more than {QUEUE_DEPTH} events behind"),
+            );
+            log::warn!(
+                "plugin {}: stopped, {QUEUE_DEPTH} events behind and not catching up",
+                worker.id
+            );
+        }
+    }
+
+    /// The same, for a job that may be refused instead.
+    ///
+    /// Everything the account produces is unskippable, which is what `offer`
+    /// enforces. A widget press is not: it comes from a front end, and the
+    /// answer to more of them than a plugin can take is to drop them, not to
+    /// disable a plugin the user approved. Without this the per-window budget
+    /// is not enough on its own, because the budget and the queue are the
+    /// same size and the queue is shared: one account event already waiting
+    /// plus a window's worth of presses fills it, and the next press stops
+    /// the plugin for good.
+    fn offer_refusable(&self, worker: &Worker, job: Job) {
+        if self.try_offer(worker, job).is_some() {
+            log::debug!(
+                "plugin {}: refusing an action, its queue is full",
+                worker.id
+            );
+        }
+    }
+
+    /// Hand `job` to `worker`, giving it back when the queue would not take
+    /// it. `None` means it was taken, or that there was nobody to take it.
+    fn try_offer(&self, worker: &Worker, job: Job) -> Option<Job> {
         // A stopped plugin is not offered anything, whatever stopped it. Its
         // thread may still be alive — one stopped by *this* rule is — and
         // filling its queue further would be the host arguing with itself.
         if !self.registry.is_running(&worker.id) {
-            return;
+            return None;
         }
         let queue = lock(&worker.queue);
         let Some(queue) = queue.as_ref() else {
             // Shutting down. Nothing left to hand it.
-            return;
+            return None;
         };
         match queue.try_send(job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.registry.stop(
-                    &worker.id,
-                    format!("it fell more than {QUEUE_DEPTH} events behind"),
-                );
-                log::warn!(
-                    "plugin {}: stopped, {QUEUE_DEPTH} events behind and not catching up",
-                    worker.id
-                );
-            }
+            Ok(()) => None,
+            Err(TrySendError::Full(job)) => Some(job),
             // Its thread is gone, which means it already trapped and the
             // registry already carries the reason.
-            Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Disconnected(_)) => None,
         }
     }
 }
@@ -645,6 +704,7 @@ fn start(
         queue: Mutex::new(Some(queue)),
         thread: Mutex::new(thread),
         granted,
+        actions: Mutex::new(crate::guest::Rolling::new(MAX_ACTIONS_PER_WINDOW)),
     }
 }
 
@@ -827,7 +887,12 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
         // message and grow this vector without limit.
         let started = Instant::now();
         let outcome = runtime.deliver(event, timers.len());
-        duty.spent(started.elapsed());
+        // Minus what it spent blocked on the daemon. `Commands` is
+        // synchronous, so a slow session is time this thread sat still: bill
+        // it and a plugin sending 32 messages is slept for ten times the
+        // network's latency, which is the opposite of what this budget
+        // measures.
+        duty.spent(started.elapsed().saturating_sub(runtime.daemon_wait()));
         match outcome {
             Ok(effects) => {
                 if let Some(roots) = effects.ui {

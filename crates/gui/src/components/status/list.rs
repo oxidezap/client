@@ -24,7 +24,41 @@ use oxidezap_core::{StatusAuthor, StatusFeed};
 pub struct StatusListProps {
     pub feed: StatusFeed,
     /// Whose updates are open, so the row reads as selected.
-    pub selected: Option<String>,
+    pub selected: StatusSelection,
+}
+
+/// Whose run the reader has open.
+///
+/// Named rather than an `Option<String>` in which the account's own updates
+/// are the empty string. That is how the feed keys them and it is fine there;
+/// as a *selection* it meant any path producing an empty JID (an author
+/// without one, a half-cleared reset) drew "My status" as the row being
+/// read, with nothing in the code saying that `""` meant anything at all.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StatusSelection {
+    /// Nobody's: the list is being browsed.
+    #[default]
+    None,
+    /// The account's own.
+    Mine,
+    /// A contact's, by JID.
+    Author(String),
+}
+
+impl StatusSelection {
+    /// What the reader has open, as the pane spells it.
+    #[must_use]
+    pub fn of(author: Option<&str>) -> Self {
+        match author {
+            None => Self::None,
+            Some("") => Self::Mine,
+            Some(jid) => Self::Author(jid.to_string()),
+        }
+    }
+
+    fn is(&self, jid: &str) -> bool {
+        matches!(self, Self::Author(open) if open == jid)
+    }
 }
 
 pub fn render_status_list(
@@ -113,7 +147,7 @@ fn render_mine(
         .child(match mine {
             Some(author) => render_author_row(
                 author,
-                props.selected.as_deref() == Some(""),
+                props.selected == StatusSelection::Mine,
                 Some(subtitle.clone()),
                 entity,
                 layout,
@@ -151,7 +185,7 @@ fn render_recent(
     let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(authors.len() + 1);
     rows.push(section_label("Recent", metrics, cx).into_any_element());
     rows.extend(authors.iter().map(|author| {
-        let is_selected = props.selected.as_deref() == Some(author.jid.as_str());
+        let is_selected = props.selected.is(&author.jid);
         render_author_row(author, is_selected, None, entity.clone(), layout, cx).into_any_element()
     }));
     rows
@@ -307,5 +341,30 @@ fn update_count(count: usize) -> String {
         "1 update".to_string()
     } else {
         format!("{count} updates")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StatusSelection;
+
+    /// The account's own updates are keyed by the empty string in the feed,
+    /// and as a bare `Option<String>` selection any path producing an empty
+    /// JID drew "My status" as the row being read.
+    #[test]
+    fn an_empty_jid_is_not_a_contact_being_read() {
+        assert_eq!(StatusSelection::of(None), StatusSelection::None);
+        assert_eq!(StatusSelection::of(Some("")), StatusSelection::Mine);
+        assert_eq!(
+            StatusSelection::of(Some("a@s.whatsapp.net")),
+            StatusSelection::Author("a@s.whatsapp.net".to_string())
+        );
+
+        assert!(!StatusSelection::None.is(""), "nothing is open");
+        assert!(
+            !StatusSelection::Mine.is(""),
+            "and our own is not a contact"
+        );
+        assert!(StatusSelection::Author("a@s.whatsapp.net".to_string()).is("a@s.whatsapp.net"));
     }
 }

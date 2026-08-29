@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-async-trait = "0.1"
+async-trait = { workspace = true }
 # Only for the call-state transitions, which refuse a second offer and say so.
 log = { workspace = true }
 # `serde` on chrono: message and chat timestamps cross the daemon socket.

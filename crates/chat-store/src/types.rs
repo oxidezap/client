@@ -215,6 +215,15 @@ pub struct StoredMessage {
 
 /// Keyset-pagination cursor: pass the values of the oldest message you have to
 /// fetch the page before it. Never an OFFSET — stable under concurrent inserts.
+///
+/// Stable under *inserts*, which is not the same as stable. A positive
+/// message ack rewrites `messages.timestamp_ms` to the server's own send
+/// clock, so the row a cursor names can move out from under it between two
+/// pages and the next page then skips or repeats a few rows. Narrow in
+/// practice: a cursor names the oldest row of a page and the rewrite reaches
+/// only recent sends. Documented rather than designed around, because
+/// ordering a timeline by anything but the timestamp both ends display costs
+/// more than one refetch is worth.
 #[derive(Debug, Clone)]
 pub struct MessageCursor {
     pub timestamp_ms: i64,

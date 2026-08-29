@@ -139,7 +139,7 @@ impl Rolling {
     /// Asked against what is *needed* rather than against what is already
     /// spent: the latter is a threshold rather than a limit, and lets the one
     /// that crosses it through in full.
-    fn spend(&mut self, elapsed: std::time::Duration, amount: usize) -> bool {
+    pub(crate) fn spend(&mut self, elapsed: std::time::Duration, amount: usize) -> bool {
         if elapsed >= ROLLING_WINDOW {
             self.window_began = wacore::time::Instant::now();
             self.spent = 0;
@@ -335,6 +335,14 @@ pub struct Guest {
     pub kv_bytes: usize,
     /// How many account commands this call has issued.
     pub commands_issued: usize,
+    /// How long this call has spent blocked inside a [`Commands`] call.
+    ///
+    /// Subtracted from what the duty cycle charges. `Commands` is synchronous
+    /// and waits on the session's answer, so a slow session was billed to the
+    /// plugin: 32 commands in one call could total seconds, and `MAX_DUTY`
+    /// then slept an honest autoreply for ten times that because the network
+    /// was busy. The budget measures what a plugin has spent *running*.
+    pub daemon_wait: std::time::Duration,
     pub trees_published: usize,
     pub kv: Kv,
     pub commands: Arc<dyn Commands>,
@@ -657,8 +665,7 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if jid.is_empty() || text.is_empty() {
                 return abi::outcome::INVALID;
             }
-            let commands = Arc::clone(&c.data().commands);
-            code(commands.send_text(&jid, &text, None))
+            commanded(&mut c, |commands| commands.send_text(&jid, &text, None))
         },
     )?;
 
@@ -692,8 +699,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if jid.is_empty() || text.is_empty() || quoted.is_empty() {
                 return abi::outcome::INVALID;
             }
-            let commands = Arc::clone(&c.data().commands);
-            code(commands.send_text(&jid, &text, Some(&quoted)))
+            commanded(&mut c, |commands| {
+                commands.send_text(&jid, &text, Some(&quoted))
+            })
         },
     )?;
 
@@ -717,10 +725,11 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if jid.is_empty() {
                 return abi::outcome::INVALID;
             }
-            let commands = Arc::clone(&c.data().commands);
             // An empty id is "as far as you know", which is what the daemon
             // does with a client that holds no preview. It is not invalid.
-            code(commands.mark_read(&jid, (!id.is_empty()).then_some(id.as_str())))
+            commanded(&mut c, |commands| {
+                commands.mark_read(&jid, (!id.is_empty()).then_some(id.as_str()))
+            })
         },
     )?;
 
@@ -743,8 +752,7 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if jid.is_empty() {
                 return abi::outcome::INVALID;
             }
-            let commands = Arc::clone(&c.data().commands);
-            code(commands.typing(&jid, composing != 0))
+            commanded(&mut c, |commands| commands.typing(&jid, composing != 0))
         },
     )?;
 
@@ -1024,6 +1032,18 @@ fn widget(node: &abi::ui::Node) -> PluginNode {
     }
 }
 
+/// Run one account command, charging the wait for it to the daemon.
+///
+/// See [`Guest::daemon_wait`]. Every command goes through here, so there is
+/// one place the subtraction can be got wrong.
+fn commanded(c: &mut Caller<'_, Guest>, run: impl FnOnce(&dyn Commands) -> Outcome) -> i32 {
+    let commands = Arc::clone(&c.data().commands);
+    let started = wacore::time::Instant::now();
+    let outcome = run(commands.as_ref());
+    c.data_mut().daemon_wait += started.elapsed();
+    code(outcome)
+}
+
 fn code(outcome: Outcome) -> i32 {
     match outcome {
         Outcome::Accepted => abi::outcome::ACCEPTED,
@@ -1168,7 +1188,15 @@ fn write_field(caller: &mut Caller<'_, Guest>, ev: i32, field: i32, ptr: i32, ca
     let Some(target) = bytes.get_mut(offset..offset + end) else {
         return abi::outcome::INVALID;
     };
-    target.copy_from_slice(&value.as_bytes()[..end]);
+    // Asked rather than indexed. `end` was measured against the *first*
+    // lookup, and nothing today can shorten the value between the two, but
+    // an indexed slice makes that a panic one refactor away, and a panic
+    // inside a host function unwinds through the plugin's thread and poisons
+    // the locks the registry already has to handle.
+    let Some(source) = value.as_bytes().get(..end) else {
+        return abi::outcome::INVALID;
+    };
+    target.copy_from_slice(source);
     full
 }
 
@@ -1210,7 +1238,15 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
     let Some(target) = bytes.get_mut(offset..offset + end) else {
         return abi::outcome::INVALID;
     };
-    target.copy_from_slice(&value.as_bytes()[..end]);
+    // Asked rather than indexed. `end` was measured against the *first*
+    // lookup, and nothing today can shorten the value between the two, but
+    // an indexed slice makes that a panic one refactor away, and a panic
+    // inside a host function unwinds through the plugin's thread and poisons
+    // the locks the registry already has to handle.
+    let Some(source) = value.as_bytes().get(..end) else {
+        return abi::outcome::INVALID;
+    };
+    target.copy_from_slice(source);
     full
 }
 

@@ -30,6 +30,18 @@ use crate::theme::ActiveProductTheme as _;
 /// thing — which is honest, because "several" is all a ring can carry.
 const FULL_AT: usize = 8;
 
+/// How wide the avatar inside a ring of this footprint is.
+///
+/// Its own function so the tests can exercise it rather than restate it. They
+/// used to recopy the arithmetic, which meant nothing tied them to the
+/// component: moving `thickness` or `gap` to a metrics token would have left
+/// both of them green over a layout 10px out per row, which is the regression
+/// the note above records.
+fn inner_avatar(size: Pixels, thickness: Pixels, gap: Pixels) -> Pixels {
+    // The avatar gives way to the ring rather than the other way round.
+    (size - (thickness + gap) * 2.0).max(px(1.0))
+}
+
 /// An avatar ringed to show whether `unseen` of `count` updates are unwatched.
 ///
 /// `size` is the whole thing, avatar and ring together, so it drops into a row
@@ -47,8 +59,7 @@ pub fn status_ring(
     let spent = cx.product().hsla(cx.product().palette.faint_foreground);
     let thickness = px(2.0);
     let gap = px(3.0);
-    // The avatar gives way to the ring rather than the other way round.
-    let inner = (size - (thickness + gap) * 2.0).max(px(1.0));
+    let inner = inner_avatar(size, thickness, gap);
 
     // Loudest for a single update, easing off as they pile up: one is a thing
     // to go and see, and a run of eight is the same invitation.
@@ -84,9 +95,7 @@ mod tests {
     #[test]
     fn the_ring_fits_inside_the_size_it_was_given() {
         let size = px(44.0);
-        let thickness = px(2.0);
-        let gap = px(3.0);
-        let inner = (size - (thickness + gap) * 2.0).max(px(1.0));
+        let inner = inner_avatar(size, px(2.0), px(3.0));
 
         assert_eq!(inner, px(34.0));
         assert!(inner < size, "the avatar has to give way to the ring");
@@ -95,8 +104,6 @@ mod tests {
     /// A size smaller than the ring itself must not produce a negative avatar.
     #[test]
     fn an_impossibly_small_ring_still_holds_something() {
-        let size = px(4.0);
-        let inner = (size - (px(2.0) + px(3.0)) * 2.0).max(px(1.0));
-        assert_eq!(inner, px(1.0));
+        assert_eq!(inner_avatar(px(4.0), px(2.0), px(3.0)), px(1.0));
     }
 }

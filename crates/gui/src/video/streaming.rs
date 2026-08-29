@@ -1,11 +1,22 @@
-//! Streaming video decoder with on-demand frame decoding.
+//! A video attachment, decoded a frame at a time.
 //!
-//! Same pipeline Zed's livekit_client uses on Linux: decode H.264 with
-//! openh264, let `YUVSource::write_rgba8` do the YUV→RGBA conversion
-//! (SIMD-accelerated when available), then wrap the RGBA buffer in a
-//! [`gpui::RenderImage`]. Upstream GPUI has no YUV surface on Linux — the
-//! macOS `CVPixelBuffer` path is the only hardware-accelerated route, so
-//! doing the convert in CPU here matches what Zed itself does.
+//! Pulled by index rather than pushed: the timeline asks for the frame it is
+//! about to draw, so what is held is the *compressed* samples plus one
+//! decoded picture, and an unplayed video in a scrolled-past bubble costs
+//! what its file costs. A whole decode up front is the same video as tens of
+//! megabytes of YUV, per attachment, in a window that has no idea which of
+//! them anybody will watch.
+//!
+//! Decode is openh264 and the YUV→RGBA conversion is `YUVSource::write_rgba8`
+//! (SIMD where available), which is the pipeline Zed's livekit_client uses on
+//! Linux and for the same reason: upstream GPUI has no YUV surface there, so
+//! the macOS `CVPixelBuffer` route has no counterpart and the convert happens
+//! on the CPU.
+//!
+//! Nothing here writes an INFO line. Opening an attachment parses a container
+//! and reads a parameter set, and every one of those numbers is derived from
+//! a file somebody sent: worth having when a video will not play, and not
+//! worth a dozen lines in the journal every time one is opened.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -217,7 +228,7 @@ pub struct StreamingVideoDecoder {
 impl StreamingVideoDecoder {
     /// Create a new streaming video decoder from MP4 data
     pub fn new(mp4_data: &[u8]) -> Result<Self> {
-        log::info!(
+        log::debug!(
             "StreamingVideoDecoder: parsing MP4 data ({} bytes)",
             mp4_data.len()
         );
@@ -227,13 +238,13 @@ impl StreamingVideoDecoder {
             .context("Failed to read MP4 header")?;
 
         // Log all tracks found
-        log::info!("MP4 contains {} tracks:", mp4.tracks().len());
+        log::trace!("MP4 contains {} tracks:", mp4.tracks().len());
         for (id, track) in mp4.tracks() {
             let track_type = track
                 .track_type()
                 .map(|t| format!("{:?}", t))
                 .unwrap_or_else(|_| "Unknown".to_string());
-            log::info!(
+            log::trace!(
                 "  Track {}: type={}, media_type={:?}, codec={:?}",
                 id,
                 track_type,
@@ -312,7 +323,7 @@ impl StreamingVideoDecoder {
         }
 
         // Log detailed video track info
-        log::info!(
+        log::debug!(
             "Video track {}: {}x{}, {} samples, {:.2} fps, duration: {:.2}s",
             track_id,
             width,
@@ -321,7 +332,7 @@ impl StreamingVideoDecoder {
             fps,
             duration.as_secs_f64(),
         );
-        log::info!(
+        log::debug!(
             "Video track details: timescale={}, bitrate={} kbps, rotation={:?}",
             video_track.timescale(),
             video_track.bitrate() / 1000,
@@ -336,7 +347,7 @@ impl StreamingVideoDecoder {
         let pps = video_track.picture_parameter_set().ok().map(|s| s.to_vec());
 
         // Log SPS/PPS info
-        log::info!(
+        log::debug!(
             "SPS: {} bytes, PPS: {} bytes",
             sps.as_ref().map(|s| s.len()).unwrap_or(0),
             pps.as_ref().map(|s| s.len()).unwrap_or(0),
@@ -370,7 +381,7 @@ impl StreamingVideoDecoder {
                     _ => "Unknown",
                 };
 
-                log::info!(
+                log::trace!(
                     "H.264 Profile: {} (profile_idc={}), Level: {}.{}, Constraints: 0x{:02x}",
                     profile_name,
                     profile_idc,
@@ -391,7 +402,7 @@ impl StreamingVideoDecoder {
 
         // Build SPS/PPS in Annex B format
         let sps_pps = Self::build_sps_pps_annexb(sps.as_deref(), pps.as_deref());
-        log::info!("Built SPS/PPS Annex B data: {} bytes", sps_pps.len());
+        log::debug!("Built SPS/PPS Annex B data: {} bytes", sps_pps.len());
 
         // Extract H.264 samples (keep compressed)
         let samples = Self::extract_samples(mp4_data, track_id, sample_count, nal_length_size)?;
@@ -400,7 +411,7 @@ impl StreamingVideoDecoder {
         let compressed_size: usize = samples.iter().map(|s| s.data.len()).sum();
         let yuv_frame_size = (width as usize * height as usize * 3) / 2; // YUV420 = 1.5 bytes/pixel
         let bgra_frame_size = width as usize * height as usize * 4;
-        log::info!(
+        log::debug!(
             "StreamingVideoDecoder: H.264={} KB, YUV frame={} KB (vs {} KB BGRA, {:.0}% savings)",
             compressed_size / 1024,
             yuv_frame_size / 1024,
@@ -477,7 +488,7 @@ impl StreamingVideoDecoder {
                     // Log NAL unit types in first sample
                     if sample_idx == 1 {
                         let nal_types = Self::get_nal_types(&annexb_data);
-                        log::info!("First sample NAL types: {:?}", nal_types);
+                        log::trace!("First sample NAL types: {:?}", nal_types);
                     }
 
                     // Check if this is a keyframe by looking at NAL unit type
@@ -503,7 +514,7 @@ impl StreamingVideoDecoder {
             }
         }
 
-        log::info!(
+        log::debug!(
             "Extracted {} samples: {} keyframes, {} failed reads, total size: {} KB",
             samples.len(),
             keyframe_count,
@@ -523,7 +534,12 @@ impl StreamingVideoDecoder {
         Ok(samples)
     }
 
-    /// Get all NAL unit types in the data (for debugging)
+    /// Every NAL unit type in `annexb_data`, in order.
+    ///
+    /// For the two places a decode has already gone wrong, or is about to:
+    /// what openh264 was handed when it refused a sample, and what the first
+    /// sample of a file turned out to be. Nothing on the playing path calls
+    /// it: it walks the buffer a byte at a time and allocates.
     fn get_nal_types(annexb_data: &[u8]) -> Vec<u8> {
         let mut types = Vec::new();
         let mut i = 0;
@@ -625,7 +641,7 @@ impl StreamingVideoDecoder {
 
         // Log first frame decode attempt
         if index == 0 {
-            log::info!(
+            log::debug!(
                 "Decoding first frame: keyframe={}, size={} bytes, keep_output={}",
                 is_keyframe,
                 sample_size,
@@ -658,7 +674,7 @@ impl StreamingVideoDecoder {
 
                 if index == 0 {
                     let (y_stride, u_stride, v_stride) = yuv.strides();
-                    log::info!(
+                    log::trace!(
                         "First frame decoded: strides=({}, {}, {}), plane sizes=({}, {}, {})",
                         y_stride,
                         u_stride,
@@ -720,7 +736,7 @@ impl StreamingVideoDecoder {
                     });
 
                     if index == 0 {
-                        log::info!(
+                        log::debug!(
                             "First frame BGRA created: {} bytes ({}x{}, rotation={:?})",
                             byte_len,
                             display_width,

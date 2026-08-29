@@ -577,8 +577,15 @@ impl Metrics {
 
     // ---- other --------------------------------------------------------
 
+    /// The pairing code, which is content rather than chrome.
+    ///
+    /// `scaled`, not `dense`. Density is defined here as vertical rhythm and
+    /// control frames, and a QR code is neither: it has to be readable by a
+    /// camera across a desk, and Compact took it to ~138px on a handheld
+    /// against 160px in Comfortable, near the limit, for a preference that
+    /// was never about content.
     pub fn qr_size(&self) -> Pixels {
-        self.dense(256.0)
+        self.scaled(256.0)
     }
     /// A hairline stays one device pixel at any zoom: multiplying it makes the
     /// whole interface read as heavier rather than larger.
@@ -655,6 +662,14 @@ mod tests {
             compact.text_body(),
             comfortable.text_body(),
             "density is not zoom"
+        );
+        // Nor is the QR code rhythm or a control frame. It has to be read by
+        // a camera across a desk, and Compact took it to ~138px on a handheld
+        // against 160px in Comfortable, near the limit of that.
+        assert_eq!(
+            compact.qr_size(),
+            comfortable.qr_size(),
+            "density does not touch content"
         );
     }
 

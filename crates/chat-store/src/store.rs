@@ -2022,6 +2022,12 @@ fn apply_receipt(
 /// Peer receipts only ever advance the delivery state of our own messages, and
 /// never backwards — so a replay, or one arriving behind the state already
 /// recorded, moves nothing and says so.
+///
+/// `ERROR` is not below the line but off it. It is 0, so every `lt` here
+/// admits it, and a delivery receipt arriving after a nack or a local failure
+/// would show a send the user was already told had failed as delivered. A
+/// failure is terminal in this store: retrying is a fresh send under a new
+/// id, and the original keeps its bubble.
 fn advance_status(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -2033,7 +2039,8 @@ fn advance_status(
         message_row(device_id, chat, msg_id).filter(
             schema::messages::from_me
                 .eq(true)
-                .and(schema::messages::status.lt(status)),
+                .and(schema::messages::status.lt(status))
+                .and(schema::messages::status.ne(wa::web_message_info::Status::ERROR as i32)),
         ),
     )
     .set(schema::messages::status.eq(status))
@@ -2371,8 +2378,16 @@ fn apply_server_ack(
             .execute(conn)?
             > 0
     } else {
+        // `lt(SERVER_ACK)` covers PENDING and, because `ERROR` is 0, also a
+        // row already recorded as failed. It is excluded: a failure is
+        // terminal here, and the front end agrees (a retry is a fresh send
+        // under a new id, and the original keeps its failed bubble). Without
+        // this a late positive ack turned a send the user was already told
+        // had failed into one shown as delivered.
         diesel::update(
-            target.filter(dsl::status.lt(wa::web_message_info::Status::SERVER_ACK as i32)),
+            target
+                .filter(dsl::status.lt(wa::web_message_info::Status::SERVER_ACK as i32))
+                .filter(dsl::status.ne(wa::web_message_info::Status::ERROR as i32)),
         )
         .set(dsl::status.eq(wa::web_message_info::Status::SERVER_ACK as i32))
         .execute(conn)?
@@ -2765,8 +2780,10 @@ fn bump_chat(
     diesel::update(chat_row(device_id, chat).filter(dsl::last_message_ts.le(bump.ts_ms)))
         .set(dsl::last_message_ts.eq(bump.ts_ms))
         .execute(conn)?;
-    // ...but the preview belongs to the newest row by the FULL (timestamp_ms,
-    // msg_id) order — a same-millisecond sibling applied later must not win.
+    // ...but the preview belongs to the newest row by the store's own order,
+    // (timestamp_ms, rowid): a same-millisecond sibling applied later must
+    // not win. Not msg_id, which is what the `message_arrival_order`
+    // migration removed for biasing the tie towards a `3EB0` prefix.
     refresh_preview_if_latest(conn, device_id, chat, bump.msg_id, bump.preview, bump.kind)?;
     if bump.unread_delta != 0 {
         // An old row materialized late (offline drain) that a read already

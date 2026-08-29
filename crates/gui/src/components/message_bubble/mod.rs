@@ -134,6 +134,9 @@ pub fn render_message_bubble(
     // Right-click anywhere on the row, which is what a desktop reader reaches
     // for and the only route to these commands that does not require finding a
     // control that is invisible until the pointer is already over it.
+    // Formatted once. It was built three times per bubble per frame (the
+    // group and both hover groups), and a `SharedString` clone is a refcount.
+    let group: SharedString = format!("bubble-{message_id}").into();
     let menu_id = message_id.clone();
     let menu_text = message.content.clone();
     let menu_failed = can_retry;
@@ -146,7 +149,7 @@ pub fn render_message_bubble(
         // without this the overflow went out through the window's edge.
         .min_w_0()
         .flex()
-        .group(SharedString::from(format!("bubble-{message_id}")))
+        .group(group.clone())
         .map(|el| {
             if is_from_me {
                 el.justify_end()
@@ -168,9 +171,7 @@ pub fn render_message_bubble(
                 div()
                     .flex_shrink_0()
                     .invisible()
-                    .group_hover(SharedString::from(format!("bubble-{message_id}")), |s| {
-                        s.visible()
-                    })
+                    .group_hover(group.clone(), |s| s.visible())
                     .child(render_hover_actions(
                         message_id.clone(),
                         message.content.clone(),
@@ -308,9 +309,7 @@ pub fn render_message_bubble(
                 div()
                     .flex_shrink_0()
                     .invisible()
-                    .group_hover(SharedString::from(format!("bubble-{message_id}")), |s| {
-                        s.visible()
-                    })
+                    .group_hover(group.clone(), |s| s.visible())
                     .child(render_hover_actions(
                         message_id.clone(),
                         message.content.clone(),

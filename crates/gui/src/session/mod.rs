@@ -153,6 +153,10 @@ enum Awaiting {
     StatusView {
         message_ids: Vec<String>,
     },
+    /// A request whose whole answer is that it was done. The daemon acts on
+    /// `ClearMediaCache` before it acknowledges, so the ack is the moment the
+    /// files are gone and the moment it is worth measuring again.
+    Acted(oneshot::Sender<()>),
     /// A page of history. The timeline holds a request in flight so it does
     /// not ask twice for the same one, and a refusal is what releases it.
     Page {
@@ -167,6 +171,7 @@ impl Awaiting {
         match self {
             Self::Download(tx) => tx.is_closed(),
             Self::Storage(tx) => tx.is_closed(),
+            Self::Acted(tx) => tx.is_closed(),
             // Nor is a ring that has already been taken down: the window is
             // showing the update as watched and only an answer can correct it.
             Self::StatusView { .. } => false,
@@ -194,6 +199,12 @@ impl Awaiting {
             // what it knows and says the rest is unavailable.
             Self::Storage(tx) => {
                 log::debug!("storage query failed: {detail}");
+                drop(tx);
+            }
+            // Same shape: the caller waits on the channel, and a dropped
+            // sender is what tells it the thing did not happen.
+            Self::Acted(tx) => {
+                log::warn!("a request was refused: {detail}");
                 drop(tx);
             }
             Self::Send {
@@ -807,8 +818,15 @@ impl Session {
     }
 
     /// Delete the cached media, keeping the history.
-    pub fn clear_media_cache(&self) {
-        self.tell(ClientRequest::ClearMediaCache);
+    ///
+    /// Answered rather than told, because the daemon wipes before it
+    /// acknowledges: measuring the moment the request goes out reads the size
+    /// the files still had, which looks exactly like a clear that did not
+    /// work.
+    pub fn clear_media_cache(&self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(ClientRequest::ClearMediaCache, Awaiting::Acted(tx));
+        rx
     }
 
     /// Fetch media, answered when the bytes are available.

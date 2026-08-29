@@ -6,6 +6,8 @@
 //! shorter than the paragraph justifying it. It is `serde(with = ...)`
 //! shaped, so the field that uses it reads like every other field.
 
+use std::borrow::Cow;
+
 use serde::de::{Error as _, Unexpected};
 use serde::{Deserialize, Deserializer, Serializer};
 
@@ -94,8 +96,13 @@ pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S:
 }
 
 pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-    let text = <&str>::deserialize(deserializer)?;
-    decode(text).ok_or_else(|| D::Error::invalid_value(Unexpected::Str(text), &"base64"))
+    // `Cow`, not `&str`. Borrowing costs nothing on the common path and is
+    // what every reader in this workspace takes, but a deserializer that
+    // cannot borrow (`from_reader`) or an input carrying an escape refuses a
+    // borrowed string outright, with "invalid type: string, expected a
+    // borrowed string", which names neither the field nor the real problem.
+    let text = <Cow<'_, str>>::deserialize(deserializer)?;
+    decode(&text).ok_or_else(|| D::Error::invalid_value(Unexpected::Str(&text), &"base64"))
 }
 
 #[cfg(test)]
@@ -129,6 +136,23 @@ mod tests {
             let slice = &all[..length];
             assert_eq!(decode(&encode(slice)).as_deref(), Some(slice));
         }
+    }
+
+    /// A deserializer that cannot hand out a borrow (`from_reader`) refused
+    /// the field outright, with "invalid type: string, expected a borrowed
+    /// string", a message about serde rather than about the frame.
+    #[test]
+    fn a_deserializer_that_cannot_borrow_still_reads_the_field() {
+        #[derive(serde::Deserialize)]
+        struct Frame {
+            #[serde(with = "super")]
+            bytes: Vec<u8>,
+        }
+
+        let json = format!(r#"{{"bytes":"{}"}}"#, encode(b"foobar"));
+        let frame: Frame =
+            serde_json::from_reader(std::io::Cursor::new(json)).expect("reads without borrowing");
+        assert_eq!(frame.bytes, b"foobar");
     }
 
     #[test]
