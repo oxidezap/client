@@ -294,11 +294,18 @@ pub(crate) fn merge_split_chat(
     // Satellites: the newest reaction per (msg, sender) and the highest
     // receipt per (msg, user) win across the pair, matching their live-path
     // monotonic rules — drop the losing destination rows, then move.
+    //
+    // A tie is settled the way the live path settles it (`ts_ms <= ts_ms`,
+    // so the reaction being applied wins), which here means the removal
+    // tombstone: reaction timestamps are whole seconds, so adding and
+    // removing inside one second ties, and a strict comparison kept the
+    // emoji and threw the tombstone away.
     diesel::sql_query(
         "DELETE FROM reactions WHERE device_id = ?1 AND chat_jid = ?3 AND EXISTS \
          (SELECT 1 FROM reactions s WHERE s.device_id = ?1 AND s.chat_jid = ?2 \
           AND s.msg_id = reactions.msg_id AND s.sender_jid = reactions.sender_jid \
-          AND s.ts_ms > reactions.ts_ms)",
+          AND (s.ts_ms > reactions.ts_ms \
+               OR (s.ts_ms = reactions.ts_ms AND s.emoji = '' AND reactions.emoji <> '')))",
     )
     .bind::<Integer, _>(device_id)
     .bind::<Text, _>(src)

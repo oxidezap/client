@@ -3776,6 +3776,67 @@ async fn reconcile_merges_split_pair() {
     assert_eq!(chats[0].unread_count, 2);
 }
 
+/// Reaction timestamps are whole seconds, so adding and removing inside one
+/// second ties. The merge dropped a destination row only for a *strictly*
+/// newer source row, so a tie kept the emoji and threw away the tombstone
+/// that cancelled it, and a removed reaction came back. The live path
+/// settles the same tie the other way (`ts_ms <= ts_ms`).
+#[tokio::test]
+async fn a_removal_that_ties_with_its_reaction_survives_the_merge() {
+    let (store, chat_store) = test_store().await;
+    let alice = "559900000002@s.whatsapp.net";
+
+    // The same message reached both sides of the split, and so did alice:
+    // the removal landed on the PN side and the emoji on the LID side, which
+    // newer activity makes the merge's destination, both stamped to the same
+    // second.
+    let react = |chat: &str, emoji: &str, id: &str| {
+        message_event(
+            wa::Message {
+                reaction_message: MessageField::some(wa::message::ReactionMessage {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("MSG-TIE".into()),
+                        ..Default::default()
+                    }),
+                    text: Some(emoji.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            incoming_info(chat, alice, id, 1_700_000_010),
+        )
+    };
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("target"),
+                incoming_info(PEER, PEER, "MSG-TIE", 1_700_000_000),
+            ),
+            react(PEER, "", "R-DEL"),
+            message_event(
+                wa::Message::text("target"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-TIE", 1_700_000_100),
+            ),
+            react(PEER_LID, "\u{1f44d}", "R-ADD"),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    assert!(
+        chat_store
+            .reactions(&jid(PEER), "MSG-TIE")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a removal is always later than the reaction it cancels"
+    );
+}
+
 /// The same message stored under both keys keeps the most advanced status
 /// after the merge.
 #[tokio::test]
