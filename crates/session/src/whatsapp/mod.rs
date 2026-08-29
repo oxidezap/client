@@ -973,9 +973,14 @@ impl WhatsAppClient {
                     if named.contains_key(&key) {
                         continue;
                     }
-                    if let Some(name) = names.known(&client, &jid, None).await {
-                        named.insert(key, name);
-                    }
+                    // Resolved, or the same last resort every other surface
+                    // falls back to: a notice naming somebody by the digits of
+                    // a LID reads as a phone number that is not one.
+                    let name = match names.known(&client, &jid, None).await {
+                        Some(name) => name,
+                        None => names.identity(&client, &jid).await.fallback_name.clone(),
+                    };
+                    named.insert(key, name);
                 }
                 let actor = crate::group_notice::actor_name(
                     update.participant.as_ref(),

@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use oxidezap_core::fallback_chat_name;
 use whatsapp_rust::wacore::stanza::groups::{GroupNotificationAction, GroupParticipantInfo};
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _};
 
@@ -112,22 +113,28 @@ fn names(participants: &[GroupParticipantInfo], named: &ResolvedNames) -> String
 
 /// A participant's name: the one every other surface uses, then the label the
 /// server attached, then their number.
-fn name_of<'a>(participant: &'a GroupParticipantInfo, named: &'a ResolvedNames) -> &'a str {
+fn name_of(participant: &GroupParticipantInfo, named: &ResolvedNames) -> String {
     named
         .get(&participant.jid.to_string())
-        .map(String::as_str)
+        .cloned()
         .or_else(|| {
             participant
                 .display_name
                 .as_deref()
                 .filter(|name| !name.is_empty())
+                .map(str::to_owned)
         })
-        .unwrap_or(participant.jid.user.as_str())
+        // The same last resort every other surface uses. The raw JID user was
+        // a second rule living here: on a LID conversation it printed an
+        // internal number that reads as a phone number, beside a bubble from
+        // the same person saying "Unknown contact".
+        .unwrap_or_else(|| fallback_chat_name(&participant.jid))
 }
 
 /// Whoever triggered the change, as a name rather than a JID.
 ///
-/// The server's own label first, then the number. Not "You" for the reader's
+/// The server's own label first, then the same last resort every other
+/// surface uses. Not "You" for the reader's
 /// own changes: nothing in this process knows which account is linked — the
 /// device identity lives behind the daemon — and guessing at it would be
 /// worse than naming everyone the same way.
@@ -145,7 +152,7 @@ pub fn actor_name(
                 .filter(|name| !name.is_empty())
                 .map(str::to_string)
         })
-        .or_else(|| Some(participant.user.to_string()))
+        .or_else(|| Some(fallback_chat_name(participant)))
 }
 
 /// A disappearing-message window, in the units WhatsApp offers it in.
@@ -170,6 +177,19 @@ fn plural(count: u32, unit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn participant_jid(jid: &str) -> GroupParticipantInfo {
+        GroupParticipantInfo {
+            jid: jid.parse().expect("valid jid"),
+            phone_number: None,
+            display_name: None,
+            r#type: None,
+            lid: None,
+            username: None,
+            join_time: None,
+            group_history_sent_state: None,
+        }
+    }
 
     fn participant(user: &str, display: Option<&str>) -> GroupParticipantInfo {
         GroupParticipantInfo {
@@ -258,14 +278,28 @@ mod tests {
     }
 
     #[test]
-    fn an_unnamed_participant_falls_back_to_their_number() {
+    fn an_unnamed_participant_falls_back_the_way_every_surface_does() {
         let action = GroupNotificationAction::Add {
             participants: vec![participant("5511999", None)],
             reason: None,
         };
         assert_eq!(
             describe(&action, None, None, &ResolvedNames::new()).as_deref(),
-            Some("Someone added 5511999")
+            Some("Someone added +5511999")
+        );
+    }
+
+    /// The digits of a LID are not a phone number, and printing them beside a
+    /// bubble that says "Unknown contact" is the same person under two names.
+    #[test]
+    fn an_unnamed_lid_participant_is_not_named_by_its_digits() {
+        let action = GroupNotificationAction::Add {
+            participants: vec![participant_jid("123456789012345@lid")],
+            reason: None,
+        };
+        assert_eq!(
+            describe(&action, None, None, &ResolvedNames::new()).as_deref(),
+            Some("Someone added Unknown contact")
         );
     }
 
@@ -284,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn an_actor_is_named_by_the_server_label_or_their_number() {
+    fn an_actor_is_named_by_the_server_label_or_the_usual_last_resort() {
         let actor: Jid = "5511999@s.whatsapp.net".parse().unwrap();
         assert_eq!(
             actor_name(Some(&actor), Some("ana"), &ResolvedNames::new()).as_deref(),
@@ -292,7 +326,7 @@ mod tests {
         );
         assert_eq!(
             actor_name(Some(&actor), None, &ResolvedNames::new()).as_deref(),
-            Some("5511999"),
+            Some("+5511999"),
             "no label is still someone"
         );
         assert!(actor_name(None, Some("ana"), &ResolvedNames::new()).is_none());
