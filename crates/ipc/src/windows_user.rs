@@ -62,9 +62,20 @@ pub fn token() -> io::Result<Vec<u8>> {
 /// `token` must be a buffer this module produced, and must outlive the
 /// returned pointer.
 pub unsafe fn sid_of(token: &[u8]) -> *mut core::ffi::c_void {
-    // SAFETY: the caller guarantees the buffer's provenance, and
+    // SAFETY: the caller guarantees the buffer's provenance and lifetime, and
     // `GetTokenInformation` writes a `TOKEN_USER` at its start.
-    unsafe { (*token.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    //
+    // Read *unaligned*, which is the half this used to leave out: the buffer
+    // is a `Vec<u8>` and so has an alignment of one, while `TOKEN_USER`
+    // holds a pointer and wants eight. Dereferencing a `*const TOKEN_USER`
+    // from there is an unaligned read — undefined behaviour by Rust's rules
+    // whatever the allocator happens to hand back — and one of the two
+    // callers builds the named pipe's security descriptor out of the answer.
+    unsafe {
+        std::ptr::read_unaligned(token.as_ptr().cast::<TOKEN_USER>())
+            .User
+            .Sid
+    }
 }
 
 /// This user's SID in its textual form, `S-1-5-21-...`.
