@@ -109,13 +109,16 @@ is a bearer credential and a log is the one thing people paste into issues:
 ```text
 web bridge listening on http://127.0.0.1:9527/ws (origins: loopback only)
 point a page at #daemon=ws://127.0.0.1:9527/ws?token=<token>, where <token>
-is the contents of $XDG_RUNTIME_DIR/oxidezap/web.token
+is the contents of /run/user/1000/oxidezap/web.token
 ```
 
-That file is yours alone (`0600`, in your own runtime directory), so:
+That file is yours alone (`0600`, in your own runtime directory), so — using
+the path the line above printed, which is `$XDG_RUNTIME_DIR/oxidezap` where
+that is set and `${TMPDIR:-/tmp}/oxidezap-$UID` where it is not, as on a
+headless session:
 
 ```bash
-cat "$XDG_RUNTIME_DIR/oxidezap/web.token"
+cat /run/user/1000/oxidezap/web.token
 ```
 
 Open `http://127.0.0.1:8080/#daemon=ws://127.0.0.1:9527/ws?token=<token>`

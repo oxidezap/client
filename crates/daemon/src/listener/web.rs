@@ -751,6 +751,13 @@ fn parameter(query: &str, name: &str) -> Option<String> {
 /// The developer's own `trunk serve`, which is the case that would otherwise
 /// need configuring on every checkout. Matched on the host rather than by
 /// prefix, so `https://localhost.example.com` is not mistaken for one.
+///
+/// The address half goes through `IpAddr::is_loopback` rather than a literal,
+/// which is what the client end and the bind check already do: the whole of
+/// `127.0.0.0/8` is this machine, a page served from `http://127.0.0.2:8080`
+/// is as much the developer's own as one from `127.0.0.1`, and three places
+/// answering "is this loopback" differently is how a page gets refused by the
+/// daemon it is allowed to bind.
 fn is_loopback_origin(origin: &str) -> bool {
     let without_scheme = origin
         .strip_prefix("http://")
@@ -774,7 +781,14 @@ fn is_loopback_origin(origin: &str) -> bool {
             .rsplit_once(':')
             .map_or(authority, |(host, _)| host)
     };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    if host == "localhost" {
+        return true;
+    }
+    // A bracketed literal arrives here unbracketed, which is what
+    // `Ipv6Addr` parses; anything that is not an address at all — a real
+    // hostname — is not loopback, whatever it resolves to today.
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 /// The little decoding a media key can need.
@@ -981,6 +995,33 @@ pub fn token() -> Result<String> {
     Ok(drawn)
 }
 
+/// What is wrong with this file, if anything, in the one sense that matters.
+///
+/// The three things "we wrote this" means: a regular file, owned by this
+/// user, readable by nobody else. One place decides it, because the read side
+/// and the write side have to agree — a check that admitted on one and not
+/// the other would be a token written into a file the next run refuses, or
+/// worse, the reverse.
+///
+/// Asked of a `Metadata` rather than a path so it can be asked of an open
+/// descriptor: what is checked has to be what is used, or the answer is about
+/// a file that was there a moment ago.
+#[cfg(unix)]
+fn not_ours(about: &std::fs::Metadata) -> Option<&'static str> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let us = rustix::process::getuid().as_raw();
+    if !about.is_file() {
+        Some("not a regular file")
+    } else if about.uid() != us {
+        Some("owned by another user")
+    } else if about.mode() & 0o077 != 0 {
+        Some("readable by other users")
+    } else {
+        None
+    }
+}
+
 /// Read the token back, refusing anything that is not the file we wrote.
 ///
 /// A bearer credential is only worth the guarantee that nobody else can name
@@ -1005,7 +1046,6 @@ pub fn token() -> Result<String> {
 #[cfg(unix)]
 fn read_private(path: &std::path::Path) -> Result<Option<String>> {
     use std::io::Read as _;
-    use std::os::unix::fs::MetadataExt as _;
 
     let opened = rustix::fs::open(
         path,
@@ -1030,17 +1070,7 @@ fn read_private(path: &std::path::Path) -> Result<Option<String>> {
     let about = file
         .metadata()
         .with_context(|| format!("reading the type and owner of {}", path.display()))?;
-    let us = rustix::process::getuid().as_raw();
-    let wrong = if !about.is_file() {
-        Some("not a regular file")
-    } else if about.uid() != us {
-        Some("owned by another user")
-    } else if about.mode() & 0o077 != 0 {
-        Some("readable by other users")
-    } else {
-        None
-    };
-    if let Some(wrong) = wrong {
+    if let Some(wrong) = not_ours(&about) {
         anyhow::bail!(
             "{} is {wrong}. The web token is a bearer credential for this account's WhatsApp \
              session; remove it and start again.",
@@ -1071,22 +1101,62 @@ fn read_private(path: &std::path::Path) -> Result<Option<String>> {
 ///
 /// The mode is set as the file is created rather than after: a token that is
 /// briefly world-readable is a token another account had a moment to read.
+/// Which is also why the create is exclusive. `create(true)` opens whatever
+/// is already at the path, and `mode` is only consulted when a file is made —
+/// so a regular file another account planted between [`read_private`]
+/// answering "nothing there" and this call is a file we would open, leave at
+/// its owner's mode, and write this session's bearer token into. `O_NOFOLLOW`
+/// does not cover it: nothing about that is a symlink.
+///
+/// The path can legitimately exist, though — the empty file a previous run
+/// left, which is the case the caller redraws over — so `EEXIST` is not the
+/// end. It reopens without creating and asks the *descriptor* the three
+/// questions [`not_ours`] asks, which is the only form of the question that
+/// cannot be answered about a different file than the one written to.
 #[cfg(unix)]
 fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    // `O_NOFOLLOW`, for the reason [`read_private`] does not follow one
-    // either: writing through a planted link would put this account's bearer
-    // token into a file somebody else can read, which is worse than reading
-    // theirs.
-    let mut file = std::fs::OpenOptions::new()
+    // `O_NOFOLLOW` throughout, for the reason [`read_private`] does not
+    // follow one either: writing through a planted link would put this
+    // account's bearer token into a file somebody else can read, which is
+    // worse than reading theirs.
+    let nofollow = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
+    let made = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(path)?;
+        .custom_flags(nofollow)
+        .open(path);
+    let mut file = match made {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Not truncating on the way in: what is there is unexamined until
+            // the descriptor answers for itself, and destroying it first
+            // would be doing an attacker's file a favour as readily as our
+            // own.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .custom_flags(nofollow)
+                .open(path)?;
+            let about = file.metadata()?;
+            if let Some(wrong) = not_ours(&about) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} is {wrong}. The web token is a bearer credential for this account's \
+                         WhatsApp session; remove it and start again.",
+                        path.display()
+                    ),
+                ));
+            }
+            file.set_len(0)?;
+            file
+        }
+        Err(e) => return Err(e),
+    };
     file.write_all(contents.as_bytes())
 }
 
@@ -1177,6 +1247,35 @@ mod token_tests {
         // A directory is not a token either.
         assert!(read_private(&dir).is_err());
 
+        // The one the exclusive create is for: a regular file another
+        // account got to the path first, which is neither a symlink nor
+        // anything `read_private` was given a chance to see. Writing into it
+        // would hand them this session's bearer token, and `mode` would not
+        // have applied — it is only consulted for a file being made.
+        let raced = dir.join("raced.token");
+        std::fs::write(&raced, "").expect("plant the file");
+        std::fs::set_permissions(&raced, std::fs::Permissions::from_mode(0o666))
+            .expect("as they would leave it");
+        assert!(
+            write_private(&raced, "0123456789abcdef").is_err(),
+            "the token was written into a file anyone can read"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&raced).expect("read it back"),
+            "",
+            "the token reached it anyway"
+        );
+
+        // And the ordinary reason the path is already there: the empty file a
+        // previous run left, which is ours and is redrawn over.
+        let empty = dir.join("empty.token");
+        write_private(&empty, "").expect("leave an empty one");
+        write_private(&empty, "0123456789abcdef").expect("redraw over it");
+        assert_eq!(
+            read_private(&empty).expect("ours reads back").as_deref(),
+            Some("0123456789abcdef")
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1233,6 +1332,11 @@ mod token_tests {
             "http://127.0.0.1:8080",
             "http://[::1]",
             "http://[::1]:8080",
+            // The rest of `127.0.0.0/8`, which the bind check and the client
+            // end already call loopback. A literal here refused a page the
+            // daemon would have served.
+            "http://127.0.0.2:8080",
+            "http://127.1.2.3",
         ] {
             assert!(is_loopback_origin(origin), "{origin} was not recognised");
         }
