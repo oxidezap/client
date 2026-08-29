@@ -1108,7 +1108,12 @@ separating from the one above it: `wasmi` compiles here quite happily — a
 wasm interpreter inside a wasm module is nothing unusual — so the reason a
 page runs no plugins is not the interpreter. It is that the host gives each
 plugin an OS thread and a bounded queue it blocks on, and a page has neither
-to give; the same fact r2d2 ran into. `Builder::spawn` answering an error is
+to give; the same fact r2d2 ran into — twice, since the pool's *management*
+threads are a second spawn behind the connection ones, and
+`scheduled-thread-pool` unwraps that one. Both are the library's to answer and
+it does, in `storages/sqlite-storage/src/pool.rs`: on the web a "pool" is one
+connection behind a lock, keeping r2d2's own spelling so the store above it is
+written once. `Builder::spawn` answering an error is
 already handled — the entry is published and then stopped, with the reason
 beside it — so a page that tried would draw a list of plugins that all failed
 identically. It does not try: `daemon::plugins::start` returns
