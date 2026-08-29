@@ -311,7 +311,12 @@ pub(crate) fn field_len(field: i32) -> i32 {
             .event
             .as_ref()
             .and_then(|e| e.lists.get(&field))
-            .map_or(abi::ABSENT, |l| i32::try_from(l.len()).unwrap_or(0))
+            // `0`, per the absence rule, which is what the real host
+            // answers: `ABSENT` here made a plugin reading `raw::field_len`
+            // directly — or testing `if n < 0` — pass its tests and behave
+            // differently in the daemon, which is the one thing this host
+            // exists to prevent.
+            .map_or(0, |l| i32::try_from(l.len()).unwrap_or(i32::MAX))
     })
 }
 
