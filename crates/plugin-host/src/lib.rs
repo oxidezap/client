@@ -207,6 +207,16 @@ struct Worker {
     granted: Arc<AtomicI64>,
 }
 
+/// Longest the whole of loading may take before the rest of the folder is
+/// left alone.
+///
+/// Generous against an ordinary start, where every module is a few kilobytes
+/// and loads in milliseconds, and short against the thing it bounds: a folder
+/// of modules each shaped to spend as long as they can inside a load nothing
+/// else prices. The daemon has not bound its socket yet, so what this really
+/// bounds is how long a front end waits for one.
+const MAX_LOAD_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What arrives on a plugin's queue.
 enum Job {
     Event(Arc<Event>),
@@ -239,7 +249,29 @@ impl Plugins {
         let mut workers = Vec::new();
 
         let mut taken: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let loading_began = Instant::now();
         for path in discover(dir) {
+            // Wall clock, which nothing else here bounds. Fuel prices guest
+            // instructions and `oxi_init` gets two hundred million of them;
+            // it prices neither reading up to `MAX_MODULE_BYTES` off the
+            // disk, nor wasmi's validation of them, nor the host work an init
+            // buys — a megabyte of key/value traffic, a `write_private` with
+            // its two syncs, sixteen parsed trees. `MAX_DUTY` starts at the
+            // worker, which is after all of this. So `MAX_PLUGINS` files of
+            // valid but pathological wasm are a gigabyte read, validated and
+            // instantiated before the daemon binds its socket.
+            //
+            // Between modules rather than inside one, because a module being
+            // loaded cannot be interrupted: what this bounds is how many of
+            // them a folder can spend, which is the part somebody can arrange
+            // by dropping files in it.
+            if loading_began.elapsed() >= MAX_LOAD_TIME {
+                log::warn!(
+                    "plugins took longer than {MAX_LOAD_TIME:?} to load; the rest of {} is skipped",
+                    dir.display()
+                );
+                break;
+            }
             let Some(id) = plugin_id(&path) else {
                 log::warn!(
                     "skipping {}: its name is not a usable plugin id",
