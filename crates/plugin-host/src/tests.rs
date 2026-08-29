@@ -1568,6 +1568,27 @@ const WRITES_A_LOT: &str = r#"(module
     (i32.const 0))
 )"#;
 
+/// `create_dir_all` and `set_permissions` both follow a symlink, so a link
+/// left where the state directory goes had the daemon tighten and then write
+/// into somebody else's directory — every plugin's settings with it. The
+/// forged approvals file is barred by the owner check either way; what this
+/// closes is where the writing goes.
+#[cfg(unix)]
+#[test]
+fn a_state_directory_behind_a_symlink_is_not_used() {
+    let dir = TempDir::new("state-link");
+    let elsewhere = dir.0.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("writable");
+    let linked = dir.0.join("state");
+    std::os::unix::fs::symlink(&elsewhere, &linked).expect("link");
+
+    assert_eq!(
+        crate::usable_state_dir(Some(&linked)),
+        None,
+        "a link is not this user's directory, whatever it points at"
+    );
+}
+
 /// A module the loader refuses — this one declares its capabilities twice,
 /// which is refused by design and refused again at every launch — used to
 /// write its settings file first: a serialize, a private write and two syncs

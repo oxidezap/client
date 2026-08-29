@@ -1103,6 +1103,22 @@ fn usable_state_dir(dir: Option<&Path>) -> Option<&Path> {
         );
         return None;
     }
+    // The directory itself, asked the same question the plugin directory is
+    // asked. `create_dir_all` and `set_permissions` both follow a symlink, so
+    // a link left where the state directory goes had this daemon tighten and
+    // then write into somebody else's directory — approvals and every
+    // plugin's settings with it. The forged `approvals.json` is still barred
+    // by the owner check below, so what this closes is the redirection of the
+    // writes rather than a way to grant a capability.
+    if !only_this_user_can_write(dir) {
+        log::warn!(
+            "not using {}: it is a symlink, or a directory another user on this machine \
+             can write. Plugin settings will not survive a restart, and permissions must \
+             be granted again.",
+            dir.display()
+        );
+        return None;
+    }
     // Creating it is not the whole question. A directory that was *already*
     // there, group- or world-writable, is one another local account may have
     // put an `approvals.json` into before this daemon started — and a
