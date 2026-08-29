@@ -1235,28 +1235,39 @@ impl WhatsAppApp {
     /// appearing at the same moment the rows do. Appending splices — which
     /// keeps the reader where they were — and anything else resets, which
     /// lands them at the newest message.
+    /// The chat is named rather than handed over, and that is the whole
+    /// point: this needs the app mutably, so a caller holding a `&Chat`
+    /// cannot call it — and the way round that was to clone the chat, every
+    /// frame, with every `ChatMessage` in it. Scrolling a conversation of
+    /// five thousand messages copied five thousand strings, reaction maps and
+    /// quotes per frame for a reader that only ever looks at the timeline
+    /// cache.
     pub fn get_message_list_cache(
         &mut self,
         chat_jid: &str,
-        messages: &[ChatMessage],
-        is_group: bool,
         typing: Option<TypingSummary>,
         layout: ResponsiveLayout,
     ) -> MessageListCache {
-        let cached = {
-            let cache = self.message_list_cache.borrow();
-            cache
-                .get(chat_jid)
-                .filter(|cached| cached.is_valid_for(messages.len(), is_group, typing.as_ref()))
-                .cloned()
+        let rows = {
+            let Some(chat) = self.find_chat(chat_jid) else {
+                return MessageListCache::new(&[], false, typing);
+            };
+            let (messages, is_group) = (chat.messages.as_slice(), chat.is_group);
+            let cached = {
+                let cache = self.message_list_cache.borrow();
+                cache
+                    .get(chat_jid)
+                    .filter(|cached| cached.is_valid_for(messages.len(), is_group, typing.as_ref()))
+                    .cloned()
+            };
+            cached.unwrap_or_else(|| {
+                let built = MessageListCache::new(messages, is_group, typing);
+                self.message_list_cache
+                    .borrow_mut()
+                    .insert(chat_jid.to_string(), built.clone());
+                built
+            })
         };
-        let rows = cached.unwrap_or_else(|| {
-            let built = MessageListCache::new(messages, is_group, typing);
-            self.message_list_cache
-                .borrow_mut()
-                .insert(chat_jid.to_string(), built.clone());
-            built
-        });
 
         // Asked before the rows are handed over, because the question is
         // about the frame that was drawn: a splice replaces measurements with
@@ -1264,19 +1275,6 @@ impl WhatsAppApp {
         // is missing whatever has not been laid out yet. Asked from here at
         // all because this is the frame's one pass over the timeline and it
         // already holds the list.
-        //
-        // And only of a list that is already this conversation's, drawn in
-        // this frame. There is one list for whichever chat is on screen, so
-        // on the frame a reader opens a new one it still holds the geometry
-        // of the one they left — and a chat left near its top would have
-        // every chat opened after it ask for a page of history nobody had
-        // scrolled to. The selection outlives the screen, too: a phone's Back
-        // leaves it standing, as do Status and the fullscreen viewer, and the
-        // measurements freeze where the reader left them — so a conversation
-        // nobody is looking at went on asking for a page every frame, for
-        // ever, since a list with nothing to scroll answers "at the top"
-        // permanently. `visible_chat` is what this frame decided it draws, and
-        // it is written in the same pass, above this.
         if timeline_may_page(
             self.visible_chat.as_deref(),
             self.timeline_anchor
@@ -1684,6 +1682,33 @@ impl WhatsAppApp {
     }
 
     /// Get the currently selected chat data
+    /// One chat by address, for a frame that named it rather than holding it.
+    pub fn chat_named(&self, jid: &str) -> Option<&Chat> {
+        self.find_chat(jid)
+    }
+
+    /// Whether this window holds the chat at `jid`.
+    pub fn has_chat(&self, jid: &str) -> bool {
+        self.find_chat(jid).is_some()
+    }
+
+    /// What the conversation at `chat_jid` calls the author of `message`.
+    ///
+    /// Here rather than at the call site because the caller has the address
+    /// and not the chat: holding the chat means borrowing this across the
+    /// decoding the same frame does, which is what the whole-conversation
+    /// clone existed to avoid.
+    pub fn author_label(&self, chat_jid: Option<&str>, message: &ChatMessage) -> String {
+        chat_jid
+            .and_then(|jid| self.find_chat(jid))
+            .and_then(|chat| {
+                chat.author_name(message)
+                    .map(str::to_owned)
+                    .or_else(|| Some(chat.name.clone()))
+            })
+            .unwrap_or_else(|| "Unknown contact".to_string())
+    }
+
     pub fn selected_chat_data(&self) -> Option<&Chat> {
         self.selected_chat
             .as_ref()
