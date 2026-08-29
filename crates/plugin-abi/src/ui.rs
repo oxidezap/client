@@ -183,6 +183,9 @@ pub struct Writer<'a> {
     /// Where each open node's child-count field sits, so closing one can
     /// patch it. Doubles as the depth.
     open: [usize; MAX_DEPTH],
+    /// What each open node is, so a child can be refused where nothing draws
+    /// one.
+    open_kind: [u8; MAX_DEPTH],
     depth: usize,
     failed: bool,
 }
@@ -197,6 +200,7 @@ impl<'a> Writer<'a> {
             roots: 0,
             nodes: 0,
             open: [0; MAX_DEPTH],
+            open_kind: [0; MAX_DEPTH],
             depth: 0,
             failed: false,
         };
@@ -212,6 +216,47 @@ impl<'a> Writer<'a> {
     /// than quietly ignoring it — a slot that was silently dropped is a
     /// button the author never sees appear.
     pub fn begin(&mut self, kind: u8, slot: u8, flags: u8, id: &str, label: &str, value: &str) {
+        if self.depth >= MAX_DEPTH || self.nodes >= MAX_NODES {
+            self.failed = true;
+            return;
+        }
+        // What the host is going to check anyway, checked here where the
+        // author is: refused there, the whole tree is dropped and the plugin
+        // holds an `ACCEPTED` — its interface simply gone, the correct parts
+        // with it. These are constant comparisons and cost nothing.
+        if !kind::is_known(kind) || flags & !(flags::ENABLED | flags::CHECKED) != 0 {
+            self.failed = true;
+            return;
+        }
+        // A root must land somewhere and a child must not claim to.
+        if self.depth == 0 && !slot::is_known(slot) {
+            self.failed = true;
+            return;
+        }
+        // An action nobody can name is one the plugin could never tell apart
+        // from another.
+        if kind::is_interactive(kind) && id.is_empty() {
+            self.failed = true;
+            return;
+        }
+        // Children hung off anything but a container are children no front
+        // end draws.
+        if self.depth > 0 {
+            let parent = self.open_kind[self.depth - 1];
+            if !kind::holds_children(parent) {
+                self.failed = true;
+                return;
+            }
+        }
+        self.write_node(kind, slot, flags, id, label, value);
+    }
+
+    /// The bytes of one node, with none of the checks above.
+    ///
+    /// Split out for the tests that have to produce a tree the host must
+    /// refuse: a plugin not using this writer can emit anything, so the
+    /// parser's refusals need something that can.
+    fn write_node(&mut self, kind: u8, slot: u8, flags: u8, id: &str, label: &str, value: &str) {
         if self.depth >= MAX_DEPTH || self.nodes >= MAX_NODES {
             self.failed = true;
             return;
@@ -234,6 +279,7 @@ impl<'a> Writer<'a> {
         self.put_str(value);
 
         self.open[self.depth] = children_at;
+        self.open_kind[self.depth] = kind;
         self.depth += 1;
     }
 
@@ -916,10 +962,44 @@ mod tests {
     #[test]
     fn an_interactive_widget_needs_an_id() {
         let bytes = write(|w| {
-            w.leaf(kind::BUTTON, slot::CHAT_HEADER, flags::ENABLED, "", "B", "");
+            w.write_node(kind::BUTTON, slot::CHAT_HEADER, flags::ENABLED, "", "B", "");
+            w.end();
         })
         .expect("fits");
         assert_eq!(parse(&bytes), Err(ParseError::Anonymous));
+    }
+
+    /// The writer refuses what the host would refuse, where the author is:
+    /// a tree the host drops takes the correct parts of the interface with
+    /// it, and the plugin is holding an `ACCEPTED`.
+    #[test]
+    fn the_writer_refuses_what_the_host_would() {
+        // An unknown kind, a reserved flag bit, an interactive node with no
+        // id, a root with no slot, and a child under something that draws
+        // none.
+        assert!(write(|w| w.leaf(200, slot::SETTINGS, 0, "id", "x", "")).is_err());
+        assert!(write(|w| w.leaf(kind::LABEL, slot::SETTINGS, 0b1000_0000, "", "x", "")).is_err());
+        assert!(write(|w| w.leaf(kind::BUTTON, slot::SETTINGS, 0, "", "x", "")).is_err());
+        assert!(write(|w| w.leaf(kind::LABEL, slot::NONE, 0, "", "x", "")).is_err());
+        assert!(
+            write(|w| {
+                w.begin(kind::BUTTON, slot::SETTINGS, 0, "b", "x", "");
+                w.leaf(kind::LABEL, slot::NONE, 0, "", "inside", "");
+                w.end();
+            })
+            .is_err()
+        );
+
+        // And what it does not refuse still parses, which is the half that
+        // matters: a check here that the host does not make would refuse a
+        // tree nothing was wrong with.
+        let bytes = write(|w| {
+            w.begin(kind::SECTION, slot::SETTINGS, 0, "", "Title", "");
+            w.leaf(kind::BUTTON, slot::NONE, flags::ENABLED, "go", "Go", "");
+            w.end();
+        })
+        .expect("fits");
+        assert_eq!(parse(&bytes).expect("parses").len(), 1);
     }
 
     #[test]
