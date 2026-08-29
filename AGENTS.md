@@ -860,6 +860,18 @@ by definition.
   far worse than silence for something this small. What is missing is a
   transient surface — a toast, a line on the row — and it should be designed
   once rather than invented for this.
+- **Nothing evicts the media a conversation is holding.** A message keeps its
+  full bytes in `MediaContent::data` for as long as the row is loaded, and
+  `Chat::add_message` has no ceiling — so the two media budgets that do exist
+  (the daemon's 512 MiB of disk, the page's 48 MiB map) bound what is
+  *cached*, not what the interface is retaining. The sweep can drop an entry
+  whose bytes are still alive through a message that names them. On a desktop
+  that is a long-running window growing; in a tab it is a linear memory with a
+  one-gigabyte ceiling, so the web is where it will be felt first. What is
+  missing is a policy — dematerialize media on rows that are far off screen,
+  and re-fetch on demand as the renderer already does for media it never had.
+  Predates the web build and is not made worse by it: sharing one `Arc` per
+  payload rather than a copy per row moved in the other direction.
 - **A front end cannot say what went wrong with a command.** `Accepted` means
   the session took it; per-request outcomes would need request ids on more
   than downloads. A failed send arrives as `SendFailed` against the chat, not
