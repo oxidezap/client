@@ -129,11 +129,55 @@ impl Executor {
     }
 }
 
+/// Whichever global this agent has a `setTimeout` on.
+///
+/// A window in the page and a `WorkerGlobalScope` in a worker. Both carry the
+/// same two methods and neither inherits from the other, so the choice is
+/// made once, here.
+enum Timers {
+    Window(web_sys::Window),
+    Worker(web_sys::WorkerGlobalScope),
+}
+
+impl Timers {
+    fn here() -> Option<Self> {
+        if let Some(window) = web_sys::window() {
+            return Some(Self::Window(window));
+        }
+        js_sys::global()
+            .dyn_into::<web_sys::WorkerGlobalScope>()
+            .ok()
+            .map(Self::Worker)
+    }
+
+    fn arm(&self, fire: &Closure<dyn FnMut()>, millis: i32) -> Result<i32, wasm_bindgen::JsValue> {
+        match self {
+            Self::Window(window) => window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                fire.as_ref().unchecked_ref(),
+                millis,
+            ),
+            Self::Worker(worker) => worker.set_timeout_with_callback_and_timeout_and_arguments_0(
+                fire.as_ref().unchecked_ref(),
+                millis,
+            ),
+        }
+    }
+
+    fn disarm(&self, handle: i32) {
+        match self {
+            Self::Window(window) => window.clear_timeout_with_handle(handle),
+            Self::Worker(worker) => worker.clear_timeout_with_handle(handle),
+        }
+    }
+}
+
 /// `setTimeout`, as a future.
 ///
-/// Resolves immediately where no timer can be armed — a worker with no
-/// `window` — rather than never, because a future that never completes holds
-/// whatever is awaiting it for the life of the page.
+/// Parks forever where no timer can be armed, which is what the window's own
+/// clock does and for the same reason: every caller here is a loop that waits
+/// — a reconnect backoff, the QR rotation, a keepalive — so returning at once
+/// turns one into a spin that never yields and takes the tab with it.
+/// Stopping the loop is the honest outcome, and the log is what says so.
 pub async fn sleep(duration: Duration) {
     /// Disarms the timer when the sleep is dropped.
     ///
@@ -141,37 +185,41 @@ pub async fn sleep(duration: Duration) {
     /// freed, which is a wasm-bindgen panic rather than a missed wakeup — and
     /// this is raced against something that routinely wins.
     struct Timer {
+        timers: Timers,
         handle: i32,
         _fire: Closure<dyn FnMut()>,
     }
 
     impl Drop for Timer {
         fn drop(&mut self) {
-            if let Some(window) = web_sys::window() {
-                window.clear_timeout_with_handle(self.handle);
-            }
+            self.timers.disarm(self.handle);
         }
     }
 
     let (tx, rx) = futures_channel::oneshot::channel::<()>();
-    let Some(window) = web_sys::window() else {
-        return;
-    };
     let mut tx = Some(tx);
     let fire = Closure::<dyn FnMut()>::new(move || {
         if let Some(tx) = tx.take() {
             let _ = tx.send(());
         }
     });
-    let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-        fire.as_ref().unchecked_ref(),
-        i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
-    ) else {
+    let armed = Timers::here().and_then(|timers| {
+        let handle = timers
+            .arm(
+                &fire,
+                i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
+            )
+            .ok()?;
+        Some(Timer {
+            timers,
+            handle,
+            _fire: fire,
+        })
+    });
+    let Some(_timer) = armed else {
+        log::error!("this agent has no timer; the loop that was waiting on one stops here");
+        std::future::pending::<()>().await;
         return;
-    };
-    let _timer = Timer {
-        handle,
-        _fire: fire,
     };
     let _ = rx.await;
 }
