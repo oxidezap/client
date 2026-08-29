@@ -1129,16 +1129,29 @@ const REDECLARES: &str = r#"(module
 fn a_plugin_declares_what_it_wants_exactly_once() {
     let dir = TempDir::new("redeclares");
     dir.plugin("shifty", &versioned(REDECLARES));
+    dir.plugin("autoreply", &pong());
     let commands = Recorder::new(Outcome::Accepted);
     let published = Published::default();
-    let _plugins = host(&dir, Arc::clone(&commands), &published);
+    let plugins = host(&dir, Arc::clone(&commands), &published);
 
-    let surfaces = published.settles("the plugin to be listed", |s| !s.is_empty());
+    // Refused rather than loaded under the first sentence. Ignoring the
+    // second used to be enough — the widened half never took effect — but the
+    // import answers nothing, so a plugin that declared twice by accident (two
+    // helpers, each declaring its own mask) ran with half of what it wrote,
+    // showed that half in Settings, and had the rest denied for good with
+    // nothing anywhere saying why.
     assert_eq!(
-        surfaces[0].gated,
-        vec!["send messages".to_string()],
-        "the second declaration is not a correction, it is a different sentence"
+        plugins.ids(),
+        vec!["autoreply"],
+        "a second declaration is not a correction, it is a different sentence"
     );
+    assert!(
+        commands.sent().is_empty(),
+        "and what it sent between the two declarations went nowhere"
+    );
+    // The fixture is otherwise loadable, so this test is about the second
+    // declaration rather than about anything else being wrong with it.
+    let _ = published;
 }
 
 /// A plugin whose settings and buttons are its own business has nothing to
@@ -1575,11 +1588,52 @@ fn time_owed_is_not_forgiven_when_the_window_turns_over() {
         window_began: wacore::time::Instant::now(),
         busy: Duration::from_secs(30),
     };
+    // A debt is waited out whole rather than truncated at a window. Capping
+    // it looked like the careful answer and was a way out of the share: a
+    // plugin that slept a window and then ran another long callback gained
+    // debt faster than it paid it. Nothing is lost by waiting — the sleep is
+    // taken in slices, so a plugin held back for minutes is still one the
+    // daemon joins in milliseconds.
     assert_eq!(
         stalled.decide(Duration::from_secs(30)),
-        Turn::Wait(crate::DUTY_WINDOW),
-        "and what the cap does not cover stays owed: nothing here moves it"
+        Turn::Wait(Duration::from_secs(270))
     );
+}
+
+/// A plugin another local account could replace is not loaded.
+///
+/// The approval is recorded against a plugin's id and its mask rather than
+/// its bytes — deliberately, so an update does not ask again — which is
+/// exactly what makes a writable file dangerous: somebody else's
+/// `autoreply.wasm` under that name inherits whatever this account once
+/// agreed to.
+#[cfg(unix)]
+#[test]
+fn a_plugin_anyone_could_have_replaced_is_not_loaded() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new("writable");
+    dir.plugin("autoreply", &pong());
+    dir.plugin("exposed", &pong());
+    let exposed = dir.0.join("exposed.wasm");
+    std::fs::set_permissions(&exposed, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(
+        plugins.ids(),
+        vec!["autoreply"],
+        "the world-writable one is skipped and the one beside it still loads"
+    );
+
+    // And a directory anybody can write takes everything with it: a new name
+    // can appear there too, not only new bytes under an old one.
+    std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert!(plugins.is_empty());
+    // Put it back, or the directory cannot be removed cleanly.
+    std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
 /// Every bound in the host is per plugin; the count is the bound on the sum.

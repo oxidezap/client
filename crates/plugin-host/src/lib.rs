@@ -458,11 +458,16 @@ impl Plugins {
         // mask over it: Settings and `approvals.json` would read "not
         // allowed" while the plugin went on sending.
         if approved {
-            // A grant is written down before it is handed over, so a
-            // capability the plugin holds is one the file already records.
+            // Written down, then handed to the plugin, and only then drawn as
+            // allowed. A capability the plugin holds is one the file already
+            // records, and one Settings shows is one the worker already has:
+            // publishing first left a window in which a front end reacting to
+            // its own frame could press a button the plugin would refuse,
+            // because the mask reaching it is a separate step.
             worker
                 .granted
-                .store(self.registry.approve(id, true), Ordering::Relaxed);
+                .store(self.registry.record(id, true), Ordering::Relaxed);
+            self.registry.publish();
         } else {
             // A withdrawal is the other way round, and for the same reason:
             // fail closed. `Registry::approve` writes a file and publishes a
@@ -472,7 +477,8 @@ impl Plugins {
             // first costs nothing if the write then fails, because the write
             // failing removes the file rather than leaving the grant.
             worker.granted.store(0, Ordering::Relaxed);
-            self.registry.approve(id, false);
+            self.registry.record(id, false);
+            self.registry.publish();
         }
     }
 
@@ -651,12 +657,15 @@ impl Duty {
         // is a multiplication by ten of a duration a thread really ran for.
         let owed = self.busy.div_f64(MAX_DUTY).saturating_sub(elapsed);
         if !owed.is_zero() {
-            // Capped at a window, and what the cap does not cover stays owed:
-            // neither `busy` nor the window's start moves until the debt is
-            // gone, so the next call works out the remainder again. Capped at
-            // all so that a plugin being held back is still one the daemon can
-            // join in reasonable time.
-            return Turn::Wait(owed.min(DUTY_WINDOW));
+            // The whole debt, uncapped. Capping it at a window looked like
+            // the careful answer and was a way out of the share: nine seconds
+            // of work wants eighty-one of window, so a plugin that sleeps ten
+            // and then runs nine more gains debt faster than it pays it and
+            // settles near half a core, whatever `MAX_DUTY` says. Nothing is
+            // lost by waiting it out — the wait is slept in slices, so a
+            // plugin held back for minutes is still one the daemon can join
+            // in milliseconds.
+            return Turn::Wait(owed);
         }
         // Inside its share. Once the window is up, start a fresh one: a burst
         // already paid for is not held against a plugin forever.
@@ -806,6 +815,21 @@ fn take(
 /// buttons are drawn in, and a set that reshuffled between two starts would
 /// move a control under somebody's hand.
 fn discover(dir: &Path) -> Vec<PathBuf> {
+    // A directory anybody else can write is one where the file that runs
+    // tomorrow is not the file that was approved today. Approval is recorded
+    // against a plugin's id and mask rather than its bytes — deliberately, so
+    // an update does not re-ask — which is exactly what makes a replaceable
+    // file dangerous: another local account dropping its own `autoreply.wasm`
+    // there inherits whatever the owner once agreed to. Refused whole rather
+    // than per file, because a writable directory is one where a *new* name
+    // can appear too.
+    if !only_this_user_can_write(dir) {
+        log::warn!(
+            "not loading any plugins from {}: it can be written by other users on this              machine, and a plugin's approval is recorded against its name rather than its              contents",
+            dir.display()
+        );
+        return Vec::new();
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         // Including "it does not exist", which is the ordinary case.
         return Vec::new();
@@ -818,9 +842,60 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
                 .is_some_and(|e| e.eq_ignore_ascii_case("wasm"))
         })
         .filter(|p| p.is_file())
+        // And each module, for the same reason: a directory only this user
+        // may write can still hold a file somebody else may, through a mode
+        // set by hand or a copy that carried one.
+        .filter(|p| {
+            only_this_user_can_write(p) || {
+                log::warn!(
+                    "skipping {}: it can be written by other users on this machine",
+                    p.display()
+                );
+                false
+            }
+        })
         .collect();
     found.sort();
     found
+}
+
+/// Whether only this account can change what is at `path`.
+///
+/// Mode *and* owner: a file another user owns is one they may rewrite
+/// whatever its permission bits say, and a mode that grants group or world
+/// write is one anybody in that group may rewrite whatever owns it. Answering
+/// `false` when the metadata cannot be read at all is the safe direction —
+/// this decides whether to run somebody's code.
+///
+/// Nothing to check off unix: a Windows plugin directory sits under
+/// `%LOCALAPPDATA%`, whose ACL is the profile's, and this process has no
+/// business inventing a second answer to a question the ACL already answers.
+fn only_this_user_can_write(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        // Root owning it is the ordinary case for a system-wide install, and
+        // root can rewrite anything anyway.
+        let ours = meta.uid() == current_uid() || meta.uid() == 0;
+        ours && meta.mode() & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+/// This process's real user id.
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: `getuid` reads a field of the calling process and cannot fail.
+    // The one call site is a permission check, so the alternative is a crate
+    // in the tree for a number the kernel already told us.
+    unsafe { libc::getuid() }
 }
 
 /// Remove only the record of what the user allowed.
@@ -839,8 +914,7 @@ pub fn forget_approvals(state_dir: &Path) -> std::io::Result<()> {
     // the credentials, so what comes back is the old account's grants over
     // whoever pairs next. Flushed here rather than by the caller, because
     // this function's answer is what "retired" means.
-    sync_dir(state_dir);
-    Ok(())
+    sync_dir(state_dir)
 }
 
 /// The state directory, if this daemon can make it its own.
@@ -913,26 +987,31 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-/// Make a rename into `dir` survive losing power.
+/// Make a rename or an unlink in `dir` survive losing power.
 ///
-/// Syncing the temporary file persists its *contents*; the directory entry
-/// that gives it its name is separate metadata, and POSIX says nothing about
-/// when that reaches the disk. So a machine that loses power after a
-/// revocation's rename can come back with the previous `approvals.json` and
-/// the capability it granted — which is not the narrow window it looks like,
-/// because nothing bounds how long the entry sits unflushed.
+/// Syncing a temporary file persists its *contents*; the directory entry that
+/// gives it its name — or the removal of one — is separate metadata, and POSIX
+/// says nothing about when that reaches the disk. So a machine that loses
+/// power after a revocation's rename can come back with the previous
+/// `approvals.json` and the capability it granted, which is not the narrow
+/// window it looks like: nothing bounds how long the entry sits unflushed.
 ///
-/// Best-effort: a filesystem that refuses to open a directory for this is one
-/// where the alternative is refusing to record permissions at all.
-pub(crate) fn sync_dir(dir: &Path) {
+/// Fallible, and its callers fail closed on it. Logging and carrying on was
+/// the wrong answer for the write this exists to protect: a withdrawal that
+/// reported success while the entry was still only in memory is a permission
+/// the next start hands back. On anything but unix there is nothing to do and
+/// nothing that can fail — a rename there is not a directory entry this
+/// process can flush.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
-    if let Ok(handle) = std::fs::File::open(dir)
-        && let Err(e) = handle.sync_all()
     {
-        log::debug!("could not flush {}: {e}", dir.display());
+        std::fs::File::open(dir)?.sync_all()
     }
     #[cfg(not(unix))]
-    let _ = dir;
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 /// The id a file carries: `autoreply.wasm` is `autoreply`.

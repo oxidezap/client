@@ -172,6 +172,8 @@ pub struct Guest {
     /// Set when a declaration named a capability this host does not define,
     /// which the loader turns into a refusal once `oxi_init` returns.
     pub unknown_caps: bool,
+    /// Whether it declared its capabilities more than once.
+    pub declared_twice: bool,
     pub logged_bytes: usize,
     /// How many account commands this call has issued.
     pub commands_issued: usize,
@@ -284,8 +286,13 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             let guest = c.data_mut();
             // One declaration only. A second is not a correction, it is a
             // different sentence — and by then the first has already been
-            // acted on.
+            // acted on. Recorded and refused by the loader rather than
+            // ignored: this import answers nothing, so a plugin whose two
+            // helpers each declared a mask would load with the first one,
+            // show that sentence in Settings, and have every command needing
+            // the second denied for good, with nothing anywhere saying why.
             if guest.declared {
+                guest.declared_twice = true;
                 return;
             }
             guest.declared = true;

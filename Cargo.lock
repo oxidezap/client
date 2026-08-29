@@ -6044,6 +6044,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "libc",
  "log",
  "oxidezap-core",
  "oxidezap-plugin-abi",

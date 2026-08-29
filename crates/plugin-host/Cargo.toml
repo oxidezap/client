@@ -28,6 +28,12 @@ serde_json = { workspace = true, features = ["std"] }
 wacore = { workspace = true }
 wasmi = { version = "1.0", default-features = false, features = ["std"] }
 
+# One call, `getuid`, for the check that refuses a plugin another local
+# account could have replaced. The kernel already knows the number; the
+# alternative is a whole crate to ask it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Fixture modules are hand-written `.wat` assembled at test time. A `.wasm`
 # checked in would be a binary nobody reviews, and building one in CI would

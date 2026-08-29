@@ -141,6 +141,7 @@ impl Runtime {
                 pending_timers: 0,
                 unknown_kinds: false,
                 unknown_caps: false,
+                declared_twice: false,
                 logged_bytes: 0,
                 commands_issued: 0,
                 trees_published: 0,
@@ -226,6 +227,16 @@ impl Runtime {
             return Err(anyhow!(
                 "it asked for a capability this host does not define; it was built against \
                  a newer ABI"
+            ));
+        }
+
+        // Two declarations are two sentences, and only the first was kept.
+        // Refused for the same reason an unknown capability is: what Settings
+        // would ask about is not what the plugin wrote, and the half that was
+        // dropped comes back as commands denied forever.
+        if store.data().declared_twice {
+            return Err(anyhow!(
+                "it declared its capabilities more than once; a plugin says what it wants                  in one call, because that is the sentence somebody is asked about"
             ));
         }
 

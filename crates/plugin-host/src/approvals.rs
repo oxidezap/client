@@ -170,13 +170,13 @@ impl Approvals {
         ));
         let landed = crate::write_private(&temp, &json)
             .and_then(|()| std::fs::rename(&temp, path))
-            .inspect(|()| {
-                // The rename is metadata, and syncing the file did not
-                // persist it. Without this a revocation can be undone by
-                // losing power, whatever this function then returns.
-                if let Some(dir) = path.parent() {
-                    crate::sync_dir(dir);
-                }
+            // The rename is metadata, and syncing the file did not persist
+            // it. Counted as part of the write rather than logged beside it:
+            // an answer that reported success while the entry was still only
+            // in memory is a withdrawal the next start hands back.
+            .and_then(|()| match path.parent() {
+                Some(dir) => crate::sync_dir(dir),
+                None => Ok(()),
             });
         if let Err(e) = landed {
             // Fail closed. Leaving the previous file is the tempting answer
@@ -196,8 +196,14 @@ impl Approvals {
                 // just as unpersisted until the directory is flushed: a file
                 // removed to withhold a grant is one that can come back.
                 Ok(()) => {
-                    if let Some(dir) = path.parent() {
-                        crate::sync_dir(dir);
+                    if let Some(dir) = path.parent()
+                        && let Err(e) = crate::sync_dir(dir)
+                    {
+                        log::error!(
+                            "{} was removed but the removal is not on disk yet ({e}); a \
+                             withdrawn permission could come back",
+                            path.display()
+                        );
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

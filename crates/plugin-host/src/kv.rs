@@ -202,12 +202,15 @@ impl Kv {
         ));
         let outcome = crate::write_private(&temp, &json)
             .and_then(|()| std::fs::rename(&temp, &self.path))
-            .inspect(|()| {
-                // As the approvals file does it, and for the same reason:
-                // syncing the contents does not persist the name.
-                if let Some(dir) = self.path.parent() {
-                    crate::sync_dir(dir);
-                }
+            // As the approvals file does it, and for the same reason:
+            // syncing the contents does not persist the name. Unlike that
+            // file, this one is settings rather than authority — a sync that
+            // fails is a preference that may not survive a power cut, so it
+            // is reported the same way any other failed write here is, and
+            // the value stays dirty to be written again.
+            .and_then(|()| match self.path.parent() {
+                Some(dir) => crate::sync_dir(dir),
+                None => Ok(()),
             });
         if let Err(e) = outcome {
             if !self.complained {
