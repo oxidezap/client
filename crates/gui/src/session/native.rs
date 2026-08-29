@@ -10,7 +10,7 @@
 //! cannot spawn a process, which is why the two front ends differ about what
 //! "no daemon" means. Here it means "start one"; there it means "say so".
 
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::sync::Arc;
 
 use log::info;
@@ -66,17 +66,33 @@ fn read_frames(
     let cache = Directory;
     let mut frames = Frames::new(events, pending, &cache, pictures);
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+    // Bounded, through the same framing the daemon's own reader is bounded
+    // by: reading a frame into a `String` with nothing stopping it means a
+    // peer that never sends a newline grows this thread until the window is
+    // killed.
+    let mut buf = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
+        let frame =
+            oxidezap_ipc::read_frame(&mut reader, &mut buf, oxidezap_ipc::MAX_DAEMON_FRAME_BYTES);
+        let line = match frame {
+            Ok(Some(oxidezap_ipc::FrameRead::Line(line))) => line,
+            Ok(Some(oxidezap_ipc::FrameRead::NotUtf8)) => {
+                log::warn!("the daemon sent a frame that is not text; ignoring it");
+                continue;
+            }
+            Ok(Some(oxidezap_ipc::FrameRead::TooLong)) => {
+                log::error!(
+                    "the daemon sent a frame past {} bytes with no end to it",
+                    oxidezap_ipc::MAX_DAEMON_FRAME_BYTES
+                );
+                break;
+            }
+            Ok(None) => break,
             Err(e) => {
                 log::error!("lost the daemon connection: {e}");
                 break;
             }
-        }
+        };
 
         if let Some(message) = super::frames::parse(&line)
             && frames.apply(message).is_break()

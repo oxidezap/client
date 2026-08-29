@@ -22,6 +22,9 @@
 // /AGENTS.md); everything above it gets [`Link`] and never mentions any of
 // them.
 mod endpoint;
+/// Where a frame ends, and how long one may be — the framing this crate
+/// exists to put around the domain types.
+pub mod framing;
 mod link;
 mod protocol;
 mod transport;
@@ -32,6 +35,7 @@ pub mod windows_user;
 pub use endpoint::web;
 #[cfg(not(target_family = "wasm"))]
 pub use endpoint::{Endpoint, Reader, Writer};
+pub use framing::{FrameRead, MAX_DAEMON_FRAME_BYTES, MAX_REQUEST_BYTES, read_frame};
 pub use link::Link;
 pub use protocol::{
     AccountIdentity, CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent,

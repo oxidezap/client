@@ -288,14 +288,13 @@ fn prepare_state_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Longest single frame a client may send.
+/// The daemon's half of [`oxidezap_ipc::read_frame`].
 ///
-/// Per frame, not per connection: a reader capped for its whole lifetime would
-/// give a long-lived front end an artificial EOF once its small, valid
-/// requests happened to add up. Requests are tiny; a megabyte is far past any
-/// legitimate one and still cheap to refuse.
-pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-
+/// Not that function: this side reads inside a runtime, from an `AsyncRead`
+/// it selects over, where a front end parks a thread in a blocking read. The
+/// bound, the outcome and the resynchronization rules come from the ipc crate
+/// so the two ends cannot disagree; only the loop is a platform each.
+///
 /// Read one newline-delimited frame, bounded independently of every other.
 ///
 /// Returns `None` at end of stream. Reads bytes rather than lines because a
@@ -316,18 +315,18 @@ pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     buf: &mut Vec<u8>,
-) -> Result<Option<FrameRead>> {
+) -> Result<Option<oxidezap_ipc::FrameRead>> {
     // What is already here is a prefix a cancelled call left behind, and it
     // counts against this frame's budget: the cap is per frame, and a frame
     // read across three cancellations is still one frame.
     let carried = buf.len();
-    if carried >= MAX_REQUEST_BYTES {
+    if carried >= oxidezap_ipc::MAX_REQUEST_BYTES {
         buf.clear();
-        return Ok(Some(FrameRead::TooLong));
+        return Ok(Some(oxidezap_ipc::FrameRead::TooLong));
     }
 
     let read = {
-        let mut limited = reader.take((MAX_REQUEST_BYTES - carried) as u64);
+        let mut limited = reader.take((oxidezap_ipc::MAX_REQUEST_BYTES - carried) as u64);
         limited.read_until(b'\n', buf).await?
     };
 
@@ -346,34 +345,20 @@ async fn read_frame<R: AsyncRead + Unpin>(
         // that went away mid-frame. Acting on the partial bytes is not an
         // option either way — the framing says where a frame ends, and this
         // one never said.
-        let hit_the_cap = buf.len() == MAX_REQUEST_BYTES;
+        let hit_the_cap = buf.len() == oxidezap_ipc::MAX_REQUEST_BYTES;
         buf.clear();
-        return Ok(hit_the_cap.then_some(FrameRead::TooLong));
+        return Ok(hit_the_cap.then_some(oxidezap_ipc::FrameRead::TooLong));
     }
 
     buf.pop();
     let frame = match std::str::from_utf8(buf) {
-        Ok(line) => FrameRead::Line(line.to_string()),
-        Err(_) => FrameRead::NotUtf8,
+        Ok(line) => oxidezap_ipc::FrameRead::Line(line.to_string()),
+        Err(_) => oxidezap_ipc::FrameRead::NotUtf8,
     };
     // Cleared here, at the end of a complete frame, rather than at the start
     // of the next call: only a cancelled read may leave anything behind.
     buf.clear();
     Ok(Some(frame))
-}
-
-/// The outcome of reading one frame.
-#[derive(Debug)]
-enum FrameRead {
-    Line(String),
-    /// Well-framed bytes that are not text. Answerable, so the connection
-    /// survives a client with an encoding bug.
-    NotUtf8,
-    /// No newline within the cap. The stream cannot be resynchronized, since
-    /// there is no way to tell where this frame was meant to end, so this
-    /// ends the connection — unlike the other two, which the client recovers
-    /// from.
-    TooLong,
 }
 
 /// One front end, from the handshake to the close.
@@ -583,7 +568,7 @@ where
             // Cancellation-safe: `read_frame` carries a partial frame in
             // `buf` across losing this race. See its documentation.
             frame = read_frame(&mut reader, &mut buf) => match frame? {
-                Some(FrameRead::Line(line)) => {
+                Some(oxidezap_ipc::FrameRead::Line(line)) => {
                     // Parsed once, here: gating update delivery and answering
                     // are two decisions about one frame, and reading it twice
                     // is how they drift apart.
@@ -623,14 +608,17 @@ where
                         return Ok(());
                     }
                 }
-                Some(FrameRead::NotUtf8) => {
+                Some(oxidezap_ipc::FrameRead::NotUtf8) => {
                     write_line(&mut writer, &not_utf8()?).await?;
                 }
-                Some(FrameRead::TooLong) => {
+                Some(oxidezap_ipc::FrameRead::TooLong) => {
                     // Unlike the other two this ends the connection: with no
                     // newline there is no way to know where the frame was meant
                     // to end, so the stream cannot be resynchronized.
-                    let frame = malformed(&format!("frame exceeded {MAX_REQUEST_BYTES} bytes"))?;
+                    let frame = malformed(&format!(
+                    "frame exceeded {} bytes",
+                    oxidezap_ipc::MAX_REQUEST_BYTES
+                ))?;
                     write_line(&mut writer, &frame).await?;
                     return Ok(());
                 }
@@ -656,7 +644,7 @@ async fn handshake<S: AsyncRead + AsyncWrite>(
 ) -> Result<Option<Attached>> {
     loop {
         match read_frame(reader, buf).await? {
-            Some(FrameRead::Line(line)) => match check_hello(&line) {
+            Some(oxidezap_ipc::FrameRead::Line(line)) => match check_hello(&line) {
                 Ok(attached) => return Ok(Some(attached)),
                 Err(rejection) => {
                     if let Some(rejection) = rejection {
@@ -665,9 +653,12 @@ async fn handshake<S: AsyncRead + AsyncWrite>(
                     return Ok(None);
                 }
             },
-            Some(FrameRead::NotUtf8) => write_line(writer, &not_utf8()?).await?,
-            Some(FrameRead::TooLong) => {
-                let frame = malformed(&format!("frame exceeded {MAX_REQUEST_BYTES} bytes"))?;
+            Some(oxidezap_ipc::FrameRead::NotUtf8) => write_line(writer, &not_utf8()?).await?,
+            Some(oxidezap_ipc::FrameRead::TooLong) => {
+                let frame = malformed(&format!(
+                    "frame exceeded {} bytes",
+                    oxidezap_ipc::MAX_REQUEST_BYTES
+                ))?;
                 write_line(writer, &frame).await?;
                 return Ok(None);
             }
@@ -1497,7 +1488,7 @@ mod tests {
 
         // More total bytes than the cap, in frames far below it.
         let frame = "x".repeat(1000);
-        let frames = (MAX_REQUEST_BYTES / 1000) + 10;
+        let frames = (oxidezap_ipc::MAX_REQUEST_BYTES / 1000) + 10;
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt as _;
             for _ in 0..frames {
@@ -1508,7 +1499,7 @@ mod tests {
 
         for i in 0..frames {
             match read_frame(&mut reader, &mut buf).await {
-                Ok(Some(FrameRead::Line(line))) => assert_eq!(line.len(), 1000),
+                Ok(Some(oxidezap_ipc::FrameRead::Line(line))) => assert_eq!(line.len(), 1000),
                 other => panic!("frame {i} of {frames} was cut short: {other:?}"),
             }
         }
@@ -1531,12 +1522,12 @@ mod tests {
 
         assert!(matches!(
             read_frame(&mut reader, &mut buf).await,
-            Ok(Some(FrameRead::NotUtf8))
+            Ok(Some(oxidezap_ipc::FrameRead::NotUtf8))
         ));
         // The stream survives it.
         assert!(matches!(
             read_frame(&mut reader, &mut buf).await,
-            Ok(Some(FrameRead::Line(_)))
+            Ok(Some(oxidezap_ipc::FrameRead::Line(_)))
         ));
     }
 
@@ -1565,7 +1556,7 @@ mod tests {
 
         client.write_all(b"shot\"}\n").await.unwrap();
         match read_frame(&mut reader, &mut buf).await {
-            Ok(Some(FrameRead::Line(line))) => {
+            Ok(Some(oxidezap_ipc::FrameRead::Line(line))) => {
                 assert!(
                     matches!(
                         serde_json::from_str::<ClientRequest>(&line),
@@ -1586,11 +1577,11 @@ mod tests {
         let (client, server) = tokio::io::duplex(1024);
         let mut reader = BufReader::new(server);
         // As if a cancelled read had already consumed a full frame's worth.
-        let mut buf = vec![b'x'; MAX_REQUEST_BYTES];
+        let mut buf = vec![b'x'; oxidezap_ipc::MAX_REQUEST_BYTES];
 
         assert!(matches!(
             read_frame(&mut reader, &mut buf).await,
-            Ok(Some(FrameRead::TooLong))
+            Ok(Some(oxidezap_ipc::FrameRead::TooLong))
         ));
         assert!(buf.is_empty(), "a refused frame leaves nothing behind");
         drop(client);
