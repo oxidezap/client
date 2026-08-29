@@ -601,6 +601,16 @@ impl Bridge {
                 s.mark_unrecorded(id);
                 s.end(id);
             }),
+            // The connection the calls run over is gone, and nothing else
+            // says so: no session event ends a call when the socket dies, so
+            // the stage stood, `is_busy` went on refusing every new call after
+            // the reconnect, and the only way out was a cancel naming an id no
+            // attached window still had.
+            UiEvent::Disconnected(_) | UiEvent::LoggedOut(_) | UiEvent::Error(_) => {
+                self.hub.calls(|s| {
+                    s.end_all();
+                });
+            }
             UiEvent::AccountUpdated { name, jid, lid } => {
                 self.hub.set_account(oxidezap_ipc::AccountIdentity {
                     name: name.clone(),
@@ -2222,6 +2232,30 @@ mod tests {
         // Answered or hung up, it is no longer something to attach to.
         bridge.observe(UiEvent::CallEnded("call-1".into()));
         assert!(bridge.hub.call_state().incoming().is_none());
+    }
+
+    /// Nothing on the session side ends a call when the socket dies, so the
+    /// stage stood: after the reconnect every new call was refused as busy,
+    /// and the only cancel that could clear it named an id no window held.
+    #[test]
+    fn a_lost_connection_does_not_leave_the_call_stage_standing() {
+        let mut bridge = bridge();
+        bridge.observe(UiEvent::IncomingCall(oxidezap_core::IncomingCall {
+            call_id: "call-1".into(),
+            caller_name: "Alice".into(),
+            caller_jid: "1@s.whatsapp.net".into(),
+            is_video: false,
+            is_offline: false,
+            received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        }));
+        assert!(bridge.hub.call_state().is_busy());
+
+        bridge.observe(UiEvent::Disconnected("the socket went away".into()));
+        assert!(
+            !bridge.hub.call_state().is_busy(),
+            "a call cannot outlive the connection it runs over"
+        );
+        assert!(bridge.hub.call_state().stage().is_none());
     }
 
     /// The request is optimistic and the announcement can fail, so the state

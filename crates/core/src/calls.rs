@@ -738,6 +738,22 @@ impl CallState {
                 .is_some_and(|w| w.call_id() == call_id)
     }
 
+    /// Everything on the call front is over, whatever it was.
+    ///
+    /// For the one ending nobody announces: the connection this account's
+    /// calls run over is gone, so the stage and whoever was parked behind it
+    /// are over together. No [`ending`](Self::ending_for) note — each of them
+    /// has an honest local record already, written from the stage a front end
+    /// was holding. Left standing, the state goes on saying a call is up:
+    /// after the reconnect every new call is refused as busy, and the only
+    /// way out is a cancel naming an id no window has any more.
+    pub fn end_all(&mut self) -> bool {
+        let held = self.stage.is_some() || self.waiting.is_some();
+        self.stage = None;
+        self.waiting = None;
+        held
+    }
+
     /// Clear the parked second call, once it has been refused.
     pub fn take_waiting(&mut self) -> Option<WaitingCall> {
         self.waiting.take()
