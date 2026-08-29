@@ -602,7 +602,7 @@ impl WhatsAppClient {
             let ui_sender = ui_sender.clone();
             let names = names.clone();
             let mut stopping = stopping.clone();
-            crate::exec::spawn(async move {
+            crate::exec::spawn_owned(async move {
                 loop {
                     let event = tokio::select! {
                         event = incoming.recv() => match event {
@@ -618,7 +618,7 @@ impl WhatsAppClient {
                     let calls = calls.clone();
                     let ui_sender = ui_sender.clone();
                     let names = names.clone();
-                    crate::exec::spawn(async move {
+                    crate::exec::spawn_owned(async move {
                         Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
                     });
                 }
@@ -2101,7 +2101,7 @@ impl WhatsAppClient {
 
         let client = bot.client();
         let ui_tx = ui_tx.clone();
-        crate::exec::spawn(async move {
+        crate::exec::spawn_owned(async move {
             let mut open = true;
             while open {
                 let mut scope = ReloadScope::empty();

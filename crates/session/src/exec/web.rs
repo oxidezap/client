@@ -68,18 +68,16 @@ impl Executor {
         Spawner
     }
 
-    /// Spawn a task on the page's loop.
+    /// Spawn a task on the page's loop, owned by this session.
+    ///
+    /// Owned because everything reaching this is the session's own work — the
+    /// call backends are its only callers — and [`join`](Self::join) has to
+    /// wait for it. See [`spawn_owned`].
     pub fn spawn<T: MaybeSend + 'static>(
         &self,
         future: impl Future<Output = T> + MaybeSend + 'static,
     ) -> Task<T> {
-        let (tx, rx) = futures_channel::oneshot::channel();
-        wasm_bindgen_futures::spawn_local(async move {
-            // Dropped rather than sent when nobody is waiting, which is what
-            // turns a discarded `Task` into a `Cancelled` for anyone who is.
-            let _ = tx.send(future.await);
-        });
-        Task(rx)
+        spawn_owned(future)
     }
 
     /// Wait for the session's future to end, up to `timeout`.
@@ -95,15 +93,39 @@ impl Executor {
     /// closing: "clear data and pair again" would have refused every time,
     /// left the dead credentials in place, and reopened them on the retry.
     pub async fn join(&mut self, timeout: Duration) -> bool {
-        if self.finished.get() {
-            return true;
-        }
-        // Registered before the wait, so a session that ends between the
-        // check above and here is not missed: `notify_waiters` wakes whoever
-        // is already waiting and nobody else.
-        let ended = self.done.notified();
-        futures_lite::future::or(ended, sleep(timeout)).await;
-        self.finished.get()
+        // One deadline over both waits below, not one each: the caller is
+        // asking how long it is willing to wait in total before deciding the
+        // session is wedged.
+        let deadline = sleep(timeout);
+        futures_lite::future::or(
+            async {
+                if !self.finished.get() {
+                    // Registered before the wait, so a session that ends
+                    // between the check above and here is not missed:
+                    // `notify_waiters` wakes whoever is already waiting and
+                    // nobody else.
+                    let ended = self.done.notified();
+                    ended.await;
+                }
+                // And then its children. `run_client` returning is not the
+                // end of its work here — the tasks it spawned are held by the
+                // page's loop, not by anything that just went out of scope,
+                // and one of them holding the store is what turns a wipe into
+                // a deletion under a live connection. They stop when the
+                // session tells them to; this is where that is waited for.
+                while Outstanding::any() {
+                    let drained = DRAINED.with(|drained| Rc::clone(drained));
+                    let waited = drained.notified();
+                    if !Outstanding::any() {
+                        break;
+                    }
+                    waited.await;
+                }
+            },
+            deadline,
+        )
+        .await;
+        self.finished.get() && !Outstanding::any()
     }
 }
 
@@ -173,7 +195,7 @@ impl Spawner {
         &self,
         future: impl Future<Output = T> + MaybeSend + 'static,
     ) -> Task<T> {
-        spawn(future)
+        spawn_owned(future)
     }
 }
 
@@ -190,6 +212,78 @@ pub fn spawn<T: MaybeSend + 'static>(
         let _ = tx.send(future.await);
     });
     Task(rx)
+}
+
+/// Spawn a task the session owns, and that [`Executor::join`] waits for.
+///
+/// The distinction is not tidiness. [`spawn`] is also what the *daemon* uses
+/// — its bridge and its connections are tasks on this same loop — and the
+/// bridge is the thing that calls `join`, from inside itself, to decide
+/// whether an account's database may be deleted. Counting every task on the
+/// agent would count the caller, so the wait could never end and "clear data
+/// and pair again" would refuse every time. Counted here is what the session
+/// started and what the session can stop.
+pub fn spawn_owned<T: MaybeSend + 'static>(
+    future: impl Future<Output = T> + MaybeSend + 'static,
+) -> Task<T> {
+    let (tx, rx) = futures_channel::oneshot::channel();
+    let counted = Outstanding::enter();
+    wasm_bindgen_futures::spawn_local(async move {
+        let _outstanding = counted;
+        let _ = tx.send(future.await);
+    });
+    Task(rx)
+}
+
+// How many spawned tasks are still running on this agent.
+//
+// A desktop session ends by dropping the runtime it was built on, and every
+// task on it goes at the same moment — so "the session has finished" and "its
+// work has finished" are one fact there. Here they are two: `spawn_local`
+// hands a future to the page's loop and forgets it, so `run_client` can
+// return while tasks it started are still awaiting things.
+//
+// That difference reaches exactly one caller, and the caller is the one that
+// matters most: the answer to "may this account's database be deleted now".
+// A task still holding the store when the file goes is a wipe racing a live
+// connection.
+thread_local! {
+    static OUTSTANDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Woken when the count reaches zero.
+    static DRAINED: Rc<tokio::sync::Notify> = Rc::new(tokio::sync::Notify::new());
+}
+
+/// One spawned task's presence in the count, released when it is dropped.
+///
+/// A guard rather than a decrement at the end of the future, because a future
+/// that panics or is dropped part-way still has to leave the count — and a
+/// count that only ever goes up would make every later teardown wait out its
+/// whole grace period.
+struct Outstanding;
+
+impl Outstanding {
+    fn enter() -> Self {
+        OUTSTANDING.with(|count| count.set(count.get() + 1));
+        Self
+    }
+
+    /// Whether anything spawned here is still running.
+    fn any() -> bool {
+        OUTSTANDING.with(std::cell::Cell::get) > 0
+    }
+}
+
+impl Drop for Outstanding {
+    fn drop(&mut self) {
+        let left = OUTSTANDING.with(|count| {
+            let left = count.get().saturating_sub(1);
+            count.set(left);
+            left
+        });
+        if left == 0 {
+            DRAINED.with(|drained| drained.notify_waiters());
+        }
+    }
 }
 
 /// Run it here, because there is nowhere else.

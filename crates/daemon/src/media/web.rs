@@ -241,6 +241,20 @@ pub fn wipe(scope: Wipe) -> Result<()> {
 /// send. They are excluded from what is *counted* too — a cache cannot
 /// reclaim what it may not touch, and counting it would make the sweep spin
 /// against a budget it can never reach.
+///
+/// A pinned entry is different, and the difference is the whole shape of
+/// this: it is preferred, not untouchable. A pin says a delivery is on its
+/// way, and a delivery can simply never arrive — the client that asked
+/// disconnected, or timed out, and `answer_now` has nobody to hand the frame
+/// to. Nothing releases the pin then. Treating pins as absolute would let a
+/// run of abandoned downloads grow this map without limit, which is the one
+/// thing a budget exists to prevent, so the budget wins in the end: unpinned
+/// entries go first, and only if that is not enough do pinned ones follow,
+/// oldest first.
+///
+/// Which means a pending delivery can still be dropped — under exactly the
+/// pressure where dropping it beats exhausting the heap the page is drawn
+/// with.
 fn sweep(cache: &mut Cache) {
     let reclaimable: u64 = cache
         .entries
@@ -252,18 +266,35 @@ fn sweep(cache: &mut Cache) {
         return;
     }
 
-    let mut oldest: Vec<(String, u64, u64)> = cache
+    // Sorted so that everything unpinned comes before anything pinned, and
+    // each group runs oldest first. One list rather than two passes, because
+    // "take the oldest until the budget is met" is one rule with a
+    // tie-breaker rather than two policies.
+    let mut oldest: Vec<(String, bool, u64, u64)> = cache
         .entries
         .iter()
-        .filter(|(name, entry)| !is_staged_upload(name) && !entry.pinned)
-        .map(|(name, entry)| (name.clone(), entry.touched, entry.bytes.len() as u64))
+        .filter(|(name, _)| !is_staged_upload(name))
+        .map(|(name, entry)| {
+            (
+                name.clone(),
+                entry.pinned,
+                entry.touched,
+                entry.bytes.len() as u64,
+            )
+        })
         .collect();
-    oldest.sort_by_key(|(_, touched, _)| *touched);
+    oldest.sort_by_key(|(_, pinned, touched, _)| (*pinned, *touched));
 
     let mut over = reclaimable - CACHE_BUDGET_BYTES;
-    for (name, _, size) in oldest {
+    for (name, pinned, _, size) in oldest {
         if over == 0 {
             break;
+        }
+        if pinned {
+            log::warn!(
+                "dropping {name}, which was waiting to be delivered: the media cache is over \
+                 its budget with nothing unclaimed left to reclaim"
+            );
         }
         cache.entries.remove(&name);
         cache.held = cache.held.saturating_sub(size);

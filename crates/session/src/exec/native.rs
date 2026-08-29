@@ -190,3 +190,15 @@ pub async fn with_timeout<T>(
 ) -> Option<T> {
     tokio::time::timeout(limit, work).await.ok()
 }
+
+/// Spawn a task the session owns.
+///
+/// The same as [`spawn`] here, and the distinction belongs to the page: this
+/// executor owns the runtime, so dropping it takes every task on it at the
+/// same moment — "the session has finished" and "its work has finished" are
+/// one fact. See the web half, where they are two.
+pub fn spawn_owned<T: MaybeSend + 'static>(
+    future: impl Future<Output = T> + MaybeSend + 'static,
+) -> Task<T> {
+    spawn(future)
+}
