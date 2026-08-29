@@ -1191,7 +1191,15 @@ fn write_field(caller: &mut Caller<'_, Guest>, ev: i32, field: i32, ptr: i32, ca
     let Some(target) = bytes.get_mut(offset..offset + end) else {
         return abi::outcome::INVALID;
     };
-    target.copy_from_slice(&value.as_bytes()[..end]);
+    // Asked rather than indexed. `end` was measured against the *first*
+    // lookup, and nothing today can shorten the value between the two — but
+    // an indexed slice makes that a panic one refactor away, and a panic
+    // inside a host function unwinds through the plugin's thread and poisons
+    // the locks the registry already has to handle.
+    let Some(source) = value.as_bytes().get(..end) else {
+        return abi::outcome::INVALID;
+    };
+    target.copy_from_slice(source);
     full
 }
 
@@ -1233,7 +1241,15 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
     let Some(target) = bytes.get_mut(offset..offset + end) else {
         return abi::outcome::INVALID;
     };
-    target.copy_from_slice(&value.as_bytes()[..end]);
+    // Asked rather than indexed. `end` was measured against the *first*
+    // lookup, and nothing today can shorten the value between the two — but
+    // an indexed slice makes that a panic one refactor away, and a panic
+    // inside a host function unwinds through the plugin's thread and poisons
+    // the locks the registry already has to handle.
+    let Some(source) = value.as_bytes().get(..end) else {
+        return abi::outcome::INVALID;
+    };
+    target.copy_from_slice(source);
     full
 }
 
