@@ -153,24 +153,83 @@ fn create_pipe(name: &str, first: bool) -> std::io::Result<Stream> {
     unsafe { options.create_with_security_attributes_raw(name, security.as_ptr()) }
 }
 
+/// How long the probe waits for an answer before deciding one way.
+///
+/// A local connect is microseconds; anything past this is not a socket
+/// answering slowly, it is one whose backlog is full and which nobody is
+/// accepting from.
+#[cfg(unix)]
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Whether something is accepting connections on `path`.
 ///
-/// A blocking connect, deliberately: it runs once at startup before the
-/// runtime has any work, and `ECONNREFUSED` is the answer that matters.
-/// Anything else (a permission error, a path that is no longer a socket) is
-/// treated as live, because refusing to start is recoverable while stealing a
-/// live daemon's socket is not.
+/// `ECONNREFUSED` is the answer that matters. Anything else — a permission
+/// error, a path that is no longer a socket, no answer at all — is treated as
+/// live, because refusing to start is recoverable while stealing a live
+/// daemon's socket is not.
+///
+/// Off this thread and bounded, because the comment this replaces was no
+/// longer true: it said the probe runs before the runtime has any work, and
+/// by now `server::run` has the tray, the plugins and the session bridge
+/// started. A connect that does not come back — Linux answers a full backlog
+/// with `EAGAIN`, other unices make the caller wait — would stop the daemon
+/// here with not even a "listening" line to say where.
 #[cfg(unix)]
 fn socket_is_live(path: &std::path::Path) -> bool {
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::ConnectionRefused,
-    }
+    let (answer, asked) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+    // Detached: if the connect ever returns, the send fails and the thread
+    // ends. There is one of these per start, and the alternative to leaving
+    // it is waiting on it.
+    std::thread::spawn(move || {
+        let live = match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::ConnectionRefused,
+        };
+        let _ = answer.send(live);
+    });
+    asked.recv_timeout(PROBE_TIMEOUT).unwrap_or(true)
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// The shape this guards against: a process holding the path and never
+    /// accepting from it. The probe has to answer either way, and it must
+    /// answer "live" — refusing to start is recoverable, taking a running
+    /// daemon's socket is not.
+    #[test]
+    fn a_socket_nobody_accepts_from_does_not_stop_the_probe() {
+        let dir = std::env::temp_dir().join(format!("oxidezap-probe-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("daemon.sock");
+        let _ = std::fs::remove_file(&path);
+
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // Past any plausible backlog, and held open so none of them drain.
+        let mut held = Vec::new();
+        for _ in 0..600 {
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(stream) => held.push(stream),
+                Err(_) => break,
+            }
+        }
+
+        let started = std::time::Instant::now();
+        assert!(
+            socket_is_live(&path),
+            "no answer is not a reason to take a live daemon's socket"
+        );
+        assert!(
+            started.elapsed() < PROBE_TIMEOUT * 4,
+            "the probe answers rather than waiting on the kernel"
+        );
+
+        drop(held);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The bug this replaced: unlinking before binding let a second daemon
     /// steal a live one's path, leaving two sessions on one account.
