@@ -25,7 +25,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_NOT_CONNECTED, HANDLE,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent};
 
 /// The flag that makes a handle overlapped, for the caller that opens it.
@@ -109,8 +109,12 @@ impl Overlapped {
     /// # Safety
     ///
     /// `start` must be a `ReadFile`/`WriteFile` over a buffer that stays valid
-    /// and untouched until this returns — which is the whole call, since it
-    /// waits.
+    /// and untouched until this returns.
+    ///
+    /// Which is the whole call, and the reason is the cancellation below
+    /// rather than the wait alone: a wait that *fails* has not ended the
+    /// operation, so every path out cancels and waits again before the frame
+    /// holding the `OVERLAPPED` — and the caller's buffer — goes away.
     unsafe fn perform(
         &mut self,
         start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> windows_sys::core::BOOL,
@@ -147,7 +151,23 @@ impl Overlapped {
         // `OVERLAPPED`, and `TRUE` waits for it rather than polling.
         let ok = unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 1) };
         if ok == 0 {
-            return Err(io::Error::last_os_error());
+            let failed = io::Error::last_os_error();
+            // The wait itself can fail — an abandoned event, a handle closed
+            // under us — and that says nothing about the operation, which is
+            // then still running against an `OVERLAPPED` and a buffer that
+            // both live on this frame. Returning there hands the kernel a
+            // place to write after the frame is gone.
+            //
+            // SAFETY: the same handle the operation was started on. `CancelIo`
+            // asks for everything this thread queued on it and returns at
+            // once, so the second wait is what makes the cancellation
+            // finished rather than merely asked for; it is the only one that
+            // may be trusted to mean the kernel is done with this frame.
+            unsafe {
+                CancelIo(handle);
+                GetOverlappedResult(handle, &overlapped, &mut transferred, 1);
+            }
+            return Err(failed);
         }
         Ok(transferred as usize)
     }
