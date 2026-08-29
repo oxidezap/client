@@ -245,8 +245,13 @@ impl LocalVideo {
         self.remote_pump.abort();
         let camera = self.camera;
         // On a blocking thread: closing waits for the frame the capture
-        // thread is asleep in.
-        let _ = tokio::task::spawn_blocking(move || camera.stop()).await;
+        // thread is asleep in. The answer is read rather than dropped
+        // because a backend that panicked is what leaves the device held,
+        // and the next call's `open` then fails with nothing in the log to
+        // connect the two.
+        if let Err(e) = tokio::task::spawn_blocking(move || camera.stop()).await {
+            warn!("closing the camera failed: {e}");
+        }
     }
 }
 
