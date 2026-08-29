@@ -1700,8 +1700,17 @@ fn refresh_preview_if_latest(
     kind: Option<&str>,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
+    // Both halves of the pair, which is what `messages()` reads. Parity of
+    // order is not parity of rows: with a split still standing, the newest row
+    // of the union can sit under the key this write does not look at, and the
+    // preview then names a message the conversation does not end with.
+    let keys = crate::lid::chat_key_candidates(conn, device_id, chat)?;
     let newest: Option<String> = dsl::messages
-        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq_any(&keys)),
+        )
         .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
         .select(dsl::msg_id)
         .first(conn)
@@ -1730,8 +1739,15 @@ fn newest_chat_head(
     chat: &str,
 ) -> QueryResult<Option<ChatHead>> {
     use schema::messages::dsl;
+    // Both halves of the pair: the same rows `messages()` draws the
+    // conversation from.
+    let keys = crate::lid::chat_key_candidates(conn, device_id, chat)?;
     let newest: Option<(i64, Option<String>, String, bool)> = dsl::messages
-        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq_any(&keys)),
+        )
         .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
         .select((
             dsl::timestamp_ms,
