@@ -139,10 +139,13 @@ fn preview_for(
         // A chat with a stored preview string but no loaded messages — the
         // list hydrates before the timeline does.
         return match chat.last_message.as_deref() {
+            // The markers come out here too: this is the other way a
+            // preview's text is produced, and the row that draws it takes
+            // what it is given.
             Some(text) if !text.is_empty() => Preview::Message {
                 prefix: None,
                 glyph: None,
-                text: single_line(text),
+                text: single_line(&plain_message_text(text)),
                 status: None,
             },
             _ => Preview::Empty,
