@@ -5,8 +5,57 @@
 //! of `UiEvent` is a bare string, which is exactly the shape that fails. A
 //! failure here is invisible until a daemon tries to forward one.
 
-use oxidezap_core::UiEvent;
+use oxidezap_core::{ReceiptType, UiEvent};
 use oxidezap_ipc::DaemonMessage;
+
+/// One of each, so a variant added to the library is a variant this covers.
+fn every_receipt_type() -> Vec<ReceiptType> {
+    vec![
+        ReceiptType::Delivered,
+        ReceiptType::Sent,
+        ReceiptType::Sender,
+        ReceiptType::Retry,
+        ReceiptType::EncRekeyRetry,
+        ReceiptType::Read,
+        ReceiptType::ReadSelf,
+        ReceiptType::Played,
+        ReceiptType::PlayedSelf,
+        ReceiptType::ServerError,
+        ReceiptType::Inactive,
+        ReceiptType::PeerMsg,
+        ReceiptType::HistorySync,
+        // A receipt this build has no name for. It is the shape that used to
+        // serialize as a map and be refused on the way back in, taking the
+        // frame it travelled in with it.
+        ReceiptType::Other("a-receipt-nobody-here-knows".into()),
+    ]
+}
+
+fn a_receipt(receipt_type: ReceiptType) -> UiEvent {
+    UiEvent::ReceiptReceived {
+        chat_jid: "1@s.whatsapp.net".into(),
+        message_ids: vec!["3EB0".into()],
+        receipt_type,
+    }
+}
+
+/// A tick only moves if the receipt that moves it arrives as itself.
+///
+/// The library writes the variant's Rust name and reads a wire string, so
+/// `Read` used to come back as `Other("Read")` — which every front end
+/// ignores, leaving Sent under a message the peer had already read.
+#[test]
+fn a_read_receipt_survives_the_wire() {
+    for receipt_type in every_receipt_type() {
+        let event = a_receipt(receipt_type.clone());
+        let line = serde_json::to_string(&event).expect("a receipt serializes");
+        assert_eq!(
+            serde_json::from_str::<UiEvent>(&line).expect("and parses back"),
+            event,
+            "{line}"
+        );
+    }
+}
 
 #[test]
 fn every_shape_of_session_event_survives_a_frame() {
@@ -21,6 +70,10 @@ fn every_shape_of_session_event_survives_a_frame() {
             code: "2@abc".into(),
             timeout_secs: 60,
         },
+        // A receipt, which is the one variant whose field is not serde's
+        // own. `a_read_receipt_survives_the_wire` walks all of them.
+        a_receipt(ReceiptType::Read),
+        a_receipt(ReceiptType::Other("a-receipt-nobody-here-knows".into())),
         // The big one: a whole history load.
         UiEvent::HistoryLoaded {
             chats: vec![oxidezap_core::Chat::new("1@s.whatsapp.net".into())],
