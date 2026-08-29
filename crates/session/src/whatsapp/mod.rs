@@ -1125,6 +1125,9 @@ impl WhatsAppClient {
             chat_message.media = Some(media);
         }
 
+        Self::canonicalize_quoted_authors(client, names, std::slice::from_mut(&mut chat_message))
+            .await;
+
         // Normalize chat JID to LID if mapping exists, so the same user doesn't
         // appear as two chats when messages come from PN vs LID.
         let normalized_chat_jid = normalize_chat_jid(client, &info.source.chat.to_string()).await;
@@ -1911,6 +1914,7 @@ impl WhatsAppClient {
         page.reverse(); // the store returns newest-first; a timeline is drawn the other way
         let mut messages: Vec<ChatMessage> = page.into_iter().map(stored_to_chat_message).collect();
         Self::hydrate_reactions(store, client, names, &chat, &mut messages).await;
+        Self::canonicalize_quoted_authors(client, names, &mut messages).await;
         if chat.is_group() || chat.is_status_broadcast() {
             Self::hydrate_sender_names(
                 store,
@@ -2478,6 +2482,7 @@ impl WhatsAppClient {
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
                 Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut msgs).await;
+                Self::canonicalize_quoted_authors(client, names, &mut msgs).await;
                 // Groups *and* the status broadcast: both carry rows written
                 // by many people, and a hydrated row has no push name on it.
                 if existing.is_group || existing.is_status {
@@ -2518,6 +2523,7 @@ impl WhatsAppClient {
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut chat.messages)
                 .await;
+            Self::canonicalize_quoted_authors(client, names, &mut chat.messages).await;
             if chat.is_group || chat.is_status {
                 let is_status = chat.is_status;
                 Self::hydrate_sender_names(
@@ -2706,6 +2712,34 @@ impl WhatsAppClient {
     /// A group page names the same handful of people over and over and the
     /// book memoizes per JID, so a page costs one lookup per unique sender
     /// rather than one per row.
+    /// File a quote's author under the identity their own bubbles are filed
+    /// under.
+    ///
+    /// Every other sender field on a message goes through
+    /// `identity.canonical_jid`; the one on a quote came straight off the
+    /// envelope, which is a phone number where the chat is keyed by a LID and
+    /// carries the sending device's suffix besides. `Chat::quoted_author`
+    /// looks a participant up by exact string, so the bar above a reply read
+    /// "Unknown contact" — or a bare number — over bubbles from the same
+    /// person, named from the address book, an inch above it.
+    async fn canonicalize_quoted_authors(
+        client: &Arc<Client>,
+        names: &NameBook,
+        msgs: &mut [ChatMessage],
+    ) {
+        for msg in msgs.iter_mut() {
+            let Some(quoted) = msg.quoted.as_mut() else {
+                continue;
+            };
+            let Ok(jid) = quoted.sender.parse::<Jid>() else {
+                continue;
+            };
+            quoted
+                .sender
+                .clone_from(&names.identity(client, &jid).await.canonical_jid);
+        }
+    }
+
     async fn hydrate_sender_names(
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
@@ -3577,6 +3611,50 @@ mod tests {
             !WhatsAppClient::worth_fetching_now(true, Some(WhatsAppClient::EAGER_MEDIA_BYTES + 1)),
             "past the ceiling the thumbnail shows and the bytes stay retryable"
         );
+    }
+
+    /// The quote bar above a reply named an unknown contact while the bubbles
+    /// from the same person, an inch above it, carried their name: the
+    /// participant went onto the row exactly as the envelope spelled it,
+    /// device suffix and all, and `Chat::quoted_author` looks a participant
+    /// up by exact string.
+    #[tokio::test]
+    async fn a_quoted_author_is_filed_where_their_bubbles_are() {
+        use whatsapp_rust::waproto::buffa;
+        use whatsapp_rust::waproto::whatsapp::message;
+
+        let (chat_store, client) = test_session("quoted-author").await;
+        let reply = wa::Message {
+            extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
+                text: Some("e o áudio?".to_string()),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    stanza_id: Some("ORIGINAL".to_string()),
+                    // As a sending device spells itself.
+                    participant: Some(TEST_PEER.replace('@', ":12@")),
+                    quoted_message: buffa::MessageField::some(wa::Message {
+                        conversation: Some("ping".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        feed(&chat_store, incoming(reply, "MSG-QUOTE", 1_700_000_000)).await;
+
+        let page = WhatsAppClient::message_page(
+            &chat_store,
+            &client,
+            &book(),
+            TEST_PEER.to_string(),
+            None,
+            50,
+        )
+        .await
+        .expect("page loads");
+        let quoted = page.items[0].quoted.as_ref().expect("this is a reply");
+        assert_eq!(quoted.sender, TEST_PEER);
     }
 
     const TEST_PEER: &str = "559900000001@s.whatsapp.net";
