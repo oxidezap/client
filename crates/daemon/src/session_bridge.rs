@@ -503,8 +503,9 @@ impl Bridge {
     fn observe(&mut self, event: UiEvent) -> Answer {
         let mut answer = Answer::Nothing;
         // Before anything is published, so a `MarkRead` that arrives right
-        // behind a message already covers it.
-        self.reads.observe(&event);
+        // behind a message already covers it. What it answers is whether the
+        // message is new to this side, which is what the badge below counts.
+        let first_sighting = self.reads.observe(&event);
 
         if let Some(frame) = passthrough(&event) {
             self.hub.signal(&frame);
@@ -632,7 +633,7 @@ impl Bridge {
         // whole list of ids, and a message-only plugin wants none of it.
         let observed = self.plugins.wants(&event).then(|| event.clone());
 
-        for change in self.translate(event) {
+        for change in self.translate(event, first_sighting) {
             // A chat that left the store owes nothing and will never be read
             // again; keeping its ids would leak one entry per deleted
             // conversation.
@@ -1197,7 +1198,11 @@ impl Bridge {
     /// history load is many chat updates, and a chat with a new message is one
     /// update carrying the whole summary rather than a delta the client would
     /// have to merge.
-    fn translate(&mut self, event: UiEvent) -> Vec<Change> {
+    ///
+    /// `first_sighting` is the read tracker's answer to "is this message new
+    /// to this side", taken before anything was published. The badge counts
+    /// it rather than counting the event, or a redelivery adds two.
+    fn translate(&mut self, event: UiEvent, first_sighting: bool) -> Vec<Change> {
         match event {
             UiEvent::InitComplete => vec![connection(ConnectionState::Connecting)],
             UiEvent::Connected => vec![connection(ConnectionState::Connected)],
@@ -1263,7 +1268,11 @@ impl Bridge {
                     manually_unread: false,
                     last_message: None,
                 });
-                if !message.is_from_me && !message.is_read {
+                // Asked of the tracker rather than recomputed, so the badge
+                // and the receipts this side owes cannot disagree: the same
+                // event delivered twice used to add 2 while the tracker
+                // recognised the duplicate and owed one receipt.
+                if first_sighting {
                     summary.unread = summary.unread.saturating_add(1);
                 }
                 // Only when it really is the newest. Live messages are not
@@ -1693,7 +1702,15 @@ struct ChatReads {
 }
 
 impl ChatReads {
-    fn observe(&mut self, message: &ChatMessage) {
+    /// Fold one message in, answering whether it is an incoming message this
+    /// chat had not seen before.
+    ///
+    /// The answer is what the badge counts. The two bookkeepings used to
+    /// disagree: the same `MessageReceived` delivered twice (offline
+    /// catch-up, a retry) added 2 to the badge while this side recognised
+    /// the duplicate and owed one receipt, and nothing reconciled them until
+    /// a complete store reload.
+    fn observe(&mut self, message: &ChatMessage) -> bool {
         let secs = message.timestamp.timestamp();
         // A backfill older than what we hold says nothing about the boundary.
         if secs > self.newest_secs {
@@ -1712,13 +1729,14 @@ impl ChatReads {
             || message.is_read
             || self.unread.iter().any(|(id, _)| *id == message.id)
         {
-            return;
+            return false;
         }
         self.unread
             .push_back((message.id.clone(), message.sender.clone()));
         if self.unread.len() > MAX_TRACKED_UNREAD {
             self.unread.pop_front();
         }
+        true
     }
 
     fn boundary(&self) -> Option<ReadBoundary> {
@@ -1739,13 +1757,16 @@ struct ReadTracker {
 }
 
 impl ReadTracker {
-    /// Fold one session event in.
-    fn observe(&mut self, event: &UiEvent) {
+    /// Fold one session event in, answering whether it carried an incoming
+    /// message the chat had not seen before. That is what the badge counts:
+    /// see [`ChatReads::observe`].
+    fn observe(&mut self, event: &UiEvent) -> bool {
         match event {
             UiEvent::MessageReceived {
                 chat_jid, message, ..
             } => {
-                self.chats
+                let first_sighting = self
+                    .chats
                     .entry(chat_jid.clone())
                     .or_default()
                     .observe(message);
@@ -1761,6 +1782,7 @@ impl ReadTracker {
                 {
                     self.read_through.remove(chat_jid);
                 }
+                first_sighting
             }
             UiEvent::HistoryLoaded { chats, .. } => {
                 for chat in chats {
@@ -1773,8 +1795,9 @@ impl ReadTracker {
                         reads.observe(message);
                     }
                 }
+                false
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -1791,6 +1814,7 @@ impl ReadTracker {
             .or_default()
             .observe(message);
     }
+
 
     /// Where a read action for `jid` must stop, if the daemon knows.
     fn boundary(&self, jid: &str) -> Option<ReadBoundary> {
@@ -1921,6 +1945,31 @@ mod tests {
             .map(|id| ((*id).to_string(), false, None))
             .collect();
         ReadRecord::through(secs, &boundary)
+    }
+
+    /// The same message delivered twice (offline catch-up, a retry) added 2
+    /// to the badge, while the read tracker recognised the duplicate and
+    /// owed one receipt. Two counts of one thing, disagreeing until a
+    /// complete store reload happened to settle it.
+    #[test]
+    fn a_redelivered_message_is_counted_once() {
+        let mut bridge = bridge();
+        let arrival = || {
+            received(
+                "1@s.whatsapp.net",
+                message("m1", "1@s.whatsapp.net", 10, false, false),
+                None,
+            )
+        };
+        bridge.observe(arrival());
+        bridge.observe(arrival());
+
+        assert_eq!(bridge.hub.chat("1@s.whatsapp.net").unwrap().unread, 1);
+        assert_eq!(
+            bridge.reads.take_receipts("1@s.whatsapp.net").len(),
+            1,
+            "and the badge agrees with the receipts this side owes"
+        );
     }
 
     /// The participant who spoke is not the conversation. Naming a group after
