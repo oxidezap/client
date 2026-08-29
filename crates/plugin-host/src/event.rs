@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn a_group_names_its_sender() {
-        let ev = from_session(&message("120363@g.us", "oi", false)).expect("mapped");
+        let ev = from_session(&message("120363@g.us", "hi", false)).expect("mapped");
         assert_eq!(ev.get(fields::IS_GROUP), Some(&Value::Int(1)));
         assert_eq!(
             ev.get(fields::SENDER_JID),

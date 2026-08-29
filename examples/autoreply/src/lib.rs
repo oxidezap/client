@@ -226,10 +226,10 @@ mod tests {
         let mut host = Host::new();
         host.init(setup);
         host.store("enabled", "1");
-        host.store("keyword", "oi");
+        host.store("keyword", "hello");
 
         host.deliver(
-            In::message("5511999@s.whatsapp.net", "oi, tudo bem?"),
+            In::message("5511999@s.whatsapp.net", "hello, how are you?"),
             handle,
         );
         assert_eq!(

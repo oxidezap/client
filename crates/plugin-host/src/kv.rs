@@ -360,7 +360,7 @@ mod tests {
     fn a_value_survives_reopening() {
         let dir = TempDir::new("reopen");
         let mut kv = Kv::open(&dir.0, "autoreply");
-        assert!(kv.set("greeting", "oi"));
+        assert!(kv.set("greeting", "hi"));
         // What the runtime does when the wasm call returns. A `set` alone is
         // not durable, deliberately: writing per key made filesystem I/O
         // something a plugin could ask for without limit.
@@ -368,7 +368,7 @@ mod tests {
         drop(kv);
 
         let kv = Kv::open(&dir.0, "autoreply");
-        assert_eq!(kv.get("greeting"), Some("oi"));
+        assert_eq!(kv.get("greeting"), Some("hi"));
     }
 
     /// One write per call bounds one handler, and a plugin gives itself

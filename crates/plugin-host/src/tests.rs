@@ -337,7 +337,7 @@ fn draws() -> String {
   (memory (export "memory") 1)
   (data (i32.const 0) "{tree}")
   (data (i32.const 1024) "{name}")
-  (data (i32.const 1100) "oi")
+  (data (i32.const 1100) "hi")
   (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
   (func (export "oxi_init") (result i32)
     (call $caps (i64.const 9))    ;; caps::SEND | caps::UI
@@ -581,7 +581,7 @@ fn pressing_a_plugins_button_reaches_the_plugin_with_the_open_chat() {
     until("the greeting", || commands.sent().len() == 1);
     assert_eq!(
         commands.sent()[0],
-        ("5511999@s.whatsapp.net".into(), "oi".into(), None)
+        ("5511999@s.whatsapp.net".into(), "hi".into(), None)
     );
 }
 
@@ -1644,7 +1644,7 @@ fn a_refused_name_still_spends_the_one_attempt() {
         "neither name stuck: the first was not a name and the second had no turn"
     );
 
-    plugins.observe(&message("a@s.whatsapp.net", "oi"));
+    plugins.observe(&message("a@s.whatsapp.net", "hi"));
     until("the report", || {
         commands.sent().iter().any(|(_, text, _)| text == "refused")
     });
@@ -1705,7 +1705,7 @@ fn a_plugin_names_itself_once() {
     );
 
     // And it was told, rather than left to wonder why its name never changed.
-    plugins.observe(&message("a@s.whatsapp.net", "oi"));
+    plugins.observe(&message("a@s.whatsapp.net", "hi"));
     until("the report", || {
         commands.sent().iter().any(|(_, text, _)| text == "refused")
     });
@@ -2116,7 +2116,7 @@ fn publishes_repeatedly() -> String {
         abi::ui::slot::SETTINGS,
         abi::ui::flags::ENABLED,
         "",
-        "oi",
+        "hi",
         "",
     );
     let n = w.finish().expect("fits");
