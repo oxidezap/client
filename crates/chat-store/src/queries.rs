@@ -22,7 +22,7 @@ use crate::types::{
 ///
 /// SQLite's compiled-in parameter ceiling is 999 on older builds; a page well
 /// under it costs one extra statement per fifty chats at most.
-const BIND_CHUNK: usize = 400;
+pub(crate) const BIND_CHUNK: usize = 400;
 
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(ms)
@@ -477,9 +477,17 @@ impl ChatStore {
             .db()
             .read(move |conn| {
                 let mut pages = HashMap::with_capacity(wanted.len());
+                // Every chat's other identity in one statement. Asked per
+                // chat, this read paid a mapping query for each of them
+                // inside the one snapshot it exists to hold.
+                let chats: Vec<String> = wanted.iter().map(|(chat, _)| chat.clone()).collect();
+                let candidates = crate::lid::chat_key_candidates_batch(conn, device_id, &chats)
+                    .map_err(db_err)?;
                 for (chat, limit) in wanted {
-                    let keys =
-                        crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
+                    let keys = candidates
+                        .get(&chat)
+                        .cloned()
+                        .unwrap_or_else(|| vec![chat.clone()]);
                     let rows: Vec<MessageRow> = dsl::messages
                         .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
                         .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))

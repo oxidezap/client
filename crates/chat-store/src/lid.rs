@@ -15,6 +15,9 @@
 //! derivable — it already is the alias index WA Web keeps as the chat table's
 //! `accountLid` column, and the chat-store needs no schema of its own.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text};
 use wacore_binary::{Jid, Server};
@@ -93,6 +96,80 @@ pub(crate) fn chat_key_candidates(
         keys.push(alt);
     }
     Ok(keys)
+}
+
+/// [`chat_key_candidates`] for many chats in one query.
+///
+/// A batched read exists to stop paying a permit, a blocking task and a
+/// snapshot per chat; asking the mapping table per chat inside it puts a
+/// statement per chat straight back, and an attaching front end names a
+/// hundred of them.
+pub(crate) fn chat_key_candidates_batch(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chats: &[String],
+) -> QueryResult<HashMap<String, Vec<String>>> {
+    use schema::lid_pn_mapping::dsl;
+
+    let parsed: Vec<(String, Option<Jid>)> = chats
+        .iter()
+        .map(|chat| (chat.clone(), user_chat(chat)))
+        .collect();
+    let users: Vec<String> = parsed
+        .iter()
+        .filter_map(|(_, jid)| jid.as_ref().map(|jid| jid.user.to_string()))
+        .collect();
+
+    // One pass over the pairs either side of the mapping touches, folded
+    // here under the same rule `counterpart_of` reads with: newest wins, and
+    // the lid breaks a tie so routing cannot flap.
+    let mut pn_to_lid: HashMap<String, (i64, String)> = HashMap::new();
+    let mut lid_to_pn: HashMap<String, String> = HashMap::new();
+    for page in users.chunks(crate::queries::BIND_CHUNK) {
+        let rows: Vec<(String, String, i64)> = dsl::lid_pn_mapping
+            .filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::lid.eq_any(page).or(dsl::phone_number.eq_any(page))),
+            )
+            .select((dsl::lid, dsl::phone_number, dsl::updated_at))
+            .load(conn)?;
+        for (lid, pn, updated_at) in rows {
+            lid_to_pn.insert(lid.clone(), pn.clone());
+            match pn_to_lid.entry(pn) {
+                Entry::Occupied(mut held) => {
+                    if (updated_at, lid.as_str()) > (held.get().0, held.get().1.as_str()) {
+                        held.insert((updated_at, lid));
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert((updated_at, lid));
+                }
+            }
+        }
+    }
+
+    Ok(parsed
+        .into_iter()
+        .map(|(chat, jid)| {
+            let Some(jid) = jid else {
+                let keys = vec![chat.clone()];
+                return (chat, keys);
+            };
+            let mut keys = vec![jid.to_string()];
+            let alt = if jid.is_lid() {
+                lid_to_pn
+                    .get(jid.user.as_str())
+                    .map(|pn| Jid::new(pn.clone(), Server::Pn).to_string())
+            } else {
+                pn_to_lid
+                    .get(jid.user.as_str())
+                    .map(|(_, lid)| Jid::new(lid.clone(), Server::Lid).to_string())
+            };
+            keys.extend(alt);
+            (chat, keys)
+        })
+        .collect())
 }
 
 /// Storage key for a chat addressed as `wire_chat`, WA Web
