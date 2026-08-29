@@ -581,11 +581,13 @@ impl WhatsAppApp {
         // was thrown out and rebuilt under itself: animated stickers
         // restarting, and the bytes decoded again, which is the whole of what
         // this cache exists to avoid.
-        if let Some(cached) = self.decoded_images.borrow_mut().shift_remove(message_id) {
-            self.decoded_images
-                .borrow_mut()
-                .insert(message_id.to_string(), cached.clone());
-            return Some(cached);
+        {
+            let mut cache = self.decoded_images.borrow_mut();
+            if let Some(at) = cache.get_index_of(message_id) {
+                let last = cache.len() - 1;
+                cache.move_index(at, last);
+                return cache.get_index(last).map(|(_, image)| Arc::clone(image));
+            }
         }
 
         let image = Arc::new(Image::from_bytes(format, data.to_vec()));
