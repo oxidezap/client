@@ -63,11 +63,12 @@ struct AcceptGuard {
 
 impl Drop for AcceptGuard {
     fn drop(&mut self) {
-        let calls = self.calls.clone();
-        let call_id = std::mem::take(&mut self.call_id);
-        tokio::spawn(async move {
-            calls.abandon_accept(&call_id);
-        });
+        // Cleared here rather than from a spawned task. `abandon_accept` is
+        // synchronous, and deferring it left the accept marked in flight
+        // after it had ended, so a decline landing there was answered
+        // `Declined::Accepting` by an acceptance already gone and the caller
+        // went on ringing.
+        self.calls.abandon_accept(&self.call_id);
     }
 }
 
@@ -1968,6 +1969,25 @@ mod tests {
             !calls.abandon_accept("call-1"),
             "an ending before the acceptance began is not this acceptance's"
         );
+    }
+
+    /// The guard clears the mark as it drops, so a decline arriving after
+    /// the acceptance ended has an offer to reject rather than being told an
+    /// acceptance will do it.
+    #[test]
+    fn a_decline_after_the_acceptance_ended_is_not_left_to_the_acceptance() {
+        let calls = CallRegistry::default();
+        calls.mark_accepting("call-1");
+        drop(AcceptGuard {
+            calls: calls.clone(),
+            call_id: "call-1".to_string(),
+        });
+
+        assert!(
+            matches!(calls.decline("call-1"), Declined::Nothing),
+            "the acceptance is over, so nothing is going to send the rejection"
+        );
+        assert_eq!(calls.ending_for("call-1"), None, "and nothing is left over");
     }
 
     /// A cancel for a call that is still connecting has to survive until the
