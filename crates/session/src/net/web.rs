@@ -289,10 +289,17 @@ impl TransportFactory for BrowserTransportFactory {
         // which is the same thread.
         let (tx, rx) = async_channel::unbounded();
 
+        // Whether the socket has stopped being *pending* — opened, or given
+        // up. One slot, because only the first of those matters and the
+        // waiter is gone after it.
+        let (settled, when_settled) = async_channel::bounded::<()>(1);
+
         let opened = {
             let tx = tx.clone();
+            let settled = settled.clone();
             Closure::<dyn FnMut()>::new(move || {
                 let _ = tx.try_send(TransportEvent::Connected);
+                let _ = settled.try_send(());
             })
         };
         socket.set_onopen(Some(opened.as_ref().unchecked_ref()));
@@ -316,6 +323,7 @@ impl TransportFactory for BrowserTransportFactory {
 
         let closed = {
             let tx = tx.clone();
+            let settled_on_close = settled.clone();
             Closure::<dyn FnMut(web_sys::CloseEvent)>::new(move |event: web_sys::CloseEvent| {
                 // The code and the reason are carried through rather than
                 // flattened: the library reads them to tell a routine stream
@@ -326,18 +334,24 @@ impl TransportFactory for BrowserTransportFactory {
                         reason: event.reason(),
                     },
                 ));
+                // A socket that closes without ever opening has to release
+                // the writer below too, or it waits for an event that is
+                // never coming and holds the socket for the life of the page.
+                let _ = settled_on_close.try_send(());
             })
         };
         socket.set_onclose(Some(closed.as_ref().unchecked_ref()));
 
         let failed = {
             let tx = tx.clone();
+            let settled_on_error = settled.clone();
             Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
                 // A browser's socket error is deliberately opaque — a page
                 // must not be able to probe the network with it — so there is
                 // nothing to report but that it happened. `onclose` always
                 // follows, and carries what little there is.
                 let _ = tx.try_send(TransportEvent::Disconnected(DisconnectReason::Unknown));
+                let _ = settled_on_error.try_send(());
             })
         };
         socket.set_onerror(Some(failed.as_ref().unchecked_ref()));
@@ -349,6 +363,32 @@ impl TransportFactory for BrowserTransportFactory {
             // Moved in, not borrowed: this is where they die, which is what
             // keeps a reconnect from leaving four closures on the JS heap.
             let _handlers = (opened, message, closed, failed);
+
+            // Nothing may be written until the socket is open. A browser
+            // throws `InvalidStateError` on `send` while the state is
+            // CONNECTING — it does not queue — and the library writes its
+            // Noise ClientHello the moment the transport exists, which is the
+            // same turn the socket was created in.
+            //
+            // This used to be a race that happened to be won: the library
+            // fetched WhatsApp's `sw.js` for the client version first, and
+            // that round trip was long enough for the socket to open
+            // underneath it. Pinning the version took the fetch away and the
+            // race started losing every time — the first write threw, the
+            // loop below treated it as fatal, and the session reconnected
+            // forever without ever putting a byte on the wire.
+            let _ = when_settled.recv().await;
+            if socket.ready_state() != web_sys::WebSocket::OPEN {
+                // Never opened. The events above have already told the
+                // library, which will retry; there is nothing here to drain.
+                log::debug!("the socket to WhatsApp closed before it opened");
+                socket.set_onopen(None);
+                socket.set_onmessage(None);
+                socket.set_onclose(None);
+                socket.set_onerror(None);
+                return;
+            }
+
             while let Ok(order) = orders.recv().await {
                 match order {
                     Outbound::Send(data) => {
