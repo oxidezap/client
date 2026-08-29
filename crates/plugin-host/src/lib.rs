@@ -617,26 +617,66 @@ impl Duty {
     /// Slept in slices so shutdown is not waiting on the whole debt: a plugin
     /// being throttled is still a plugin the daemon has to be able to join.
     fn wait_its_turn(&mut self, stopping: &AtomicBool) {
-        let elapsed = self.window_began.elapsed();
-        if elapsed >= DUTY_WINDOW {
-            self.window_began = Instant::now();
-            self.busy = std::time::Duration::ZERO;
-            return;
-        }
-        // Never zero: `MAX_DUTY` is a constant tenth, so this is a
-        // multiplication by ten and cannot be an infinity or a NaN for any
-        // duration a thread can actually have run for.
-        let window_wanted = self.busy.div_f64(MAX_DUTY);
-        let Some(over) = window_wanted.checked_sub(elapsed) else {
-            return;
-        };
-        let mut left = over.min(DUTY_WINDOW);
-        while !left.is_zero() && !stopping.load(Ordering::Relaxed) {
-            let slice = left.min(std::time::Duration::from_millis(50));
-            std::thread::sleep(slice);
-            left -= slice;
+        match self.decide(self.window_began.elapsed()) {
+            Turn::Go => {}
+            Turn::Roll => {
+                self.window_began = Instant::now();
+                self.busy = std::time::Duration::ZERO;
+            }
+            Turn::Wait(owed) => {
+                let mut left = owed;
+                while !left.is_zero() && !stopping.load(Ordering::Relaxed) {
+                    let slice = left.min(std::time::Duration::from_millis(50));
+                    std::thread::sleep(slice);
+                    left -= slice;
+                }
+            }
         }
     }
+
+    /// What to do about a window that has been open this long.
+    ///
+    /// Separated from the waiting because it is the whole rule, and because
+    /// the clock it would otherwise read cannot be moved: a test that wants
+    /// an eleven-second window has no way to produce one.
+    ///
+    /// What is owed is asked *before* the window's age, deliberately. Asking
+    /// the other way round was a way out of the share rather than a rule
+    /// about it: a debt not yet paid off when the window turned over was
+    /// forgiven at the reset, and one call that ran longer than the whole
+    /// window — host work fuel does not price, a flush onto a stalled disk —
+    /// was never charged for at all.
+    fn decide(&self, elapsed: std::time::Duration) -> Turn {
+        // Never an infinity or a NaN: `MAX_DUTY` is a constant tenth, so this
+        // is a multiplication by ten of a duration a thread really ran for.
+        let owed = self.busy.div_f64(MAX_DUTY).saturating_sub(elapsed);
+        if !owed.is_zero() {
+            // Capped at a window, and what the cap does not cover stays owed:
+            // neither `busy` nor the window's start moves until the debt is
+            // gone, so the next call works out the remainder again. Capped at
+            // all so that a plugin being held back is still one the daemon can
+            // join in reasonable time.
+            return Turn::Wait(owed.min(DUTY_WINDOW));
+        }
+        // Inside its share. Once the window is up, start a fresh one: a burst
+        // already paid for is not held against a plugin forever.
+        if elapsed >= DUTY_WINDOW {
+            Turn::Roll
+        } else {
+            Turn::Go
+        }
+    }
+}
+
+/// What a plugin's duty cycle says about running its next job.
+#[derive(Debug, PartialEq, Eq)]
+enum Turn {
+    /// Inside its share, with the window still open.
+    Go,
+    /// Inside its share and the window is up: begin a new one.
+    Roll,
+    /// Over its share: hold it back this long first.
+    Wait(std::time::Duration),
 }
 
 /// Turn the delays a call asked for into deadlines.

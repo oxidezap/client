@@ -191,14 +191,21 @@ impl Approvals {
                 path.display()
             );
             let _ = std::fs::remove_file(&temp);
-            if let Err(e) = std::fs::remove_file(path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                log::error!(
+            match std::fs::remove_file(path) {
+                // The unlink is a directory entry like the rename above, and
+                // just as unpersisted until the directory is flushed: a file
+                // removed to withhold a grant is one that can come back.
+                Ok(()) => {
+                    if let Some(dir) = path.parent() {
+                        crate::sync_dir(dir);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::error!(
                     "and {} could not be removed either ({e}); it may still grant what was \
                      just withdrawn",
                     path.display()
-                );
+                ),
             }
             false
         } else {

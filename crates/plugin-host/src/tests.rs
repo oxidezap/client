@@ -1533,6 +1533,55 @@ fn a_state_directory_that_cannot_be_secured_is_not_used() {
     assert!(commands.sent().is_empty(), "no send went out");
 }
 
+/// A debt outlives the window it was run up in.
+///
+/// The rule is asked as a question about a length of time rather than read
+/// off a clock, which is what makes this checkable: an eleven-second window
+/// is not something a test can wait for, and a wasm call is fuel-bounded and
+/// cannot be made to last ten seconds on demand.
+#[test]
+fn time_owed_is_not_forgiven_when_the_window_turns_over() {
+    use crate::Turn;
+
+    // 1.2 seconds of running, which at a tenth wants twelve seconds of
+    // window. Eleven have passed — the window is over, and a second is still
+    // owed. Rolling it over here is the forgiveness this exists to refuse.
+    let over = crate::Duty {
+        window_began: wacore::time::Instant::now(),
+        busy: Duration::from_millis(1_200),
+    };
+    assert_eq!(
+        over.decide(Duration::from_secs(11)),
+        Turn::Wait(Duration::from_secs(1))
+    );
+
+    // The same plugin once it has paid: the window is up and may start again.
+    assert_eq!(over.decide(Duration::from_secs(12)), Turn::Roll);
+
+    // And inside a window it has not filled, it simply runs.
+    assert_eq!(
+        over.decide(Duration::from_secs(5)),
+        Turn::Wait(Duration::from_secs(7))
+    );
+    let idle = crate::Duty {
+        window_began: wacore::time::Instant::now(),
+        busy: Duration::from_millis(100),
+    };
+    assert_eq!(idle.decide(Duration::from_secs(5)), Turn::Go);
+
+    // A debt larger than a window is paid a window at a time rather than in
+    // one sleep the daemon would have to wait out to shut down.
+    let stalled = crate::Duty {
+        window_began: wacore::time::Instant::now(),
+        busy: Duration::from_secs(30),
+    };
+    assert_eq!(
+        stalled.decide(Duration::from_secs(30)),
+        Turn::Wait(crate::DUTY_WINDOW),
+        "and what the cap does not cover stays owed: nothing here moves it"
+    );
+}
+
 /// Every bound in the host is per plugin; the count is the bound on the sum.
 /// A directory holding more than the daemon will run costs it nothing past
 /// the limit — not a thread, not a queue, not a wasmi store.
