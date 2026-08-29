@@ -727,6 +727,29 @@ fn error_frame(id: Option<RequestId>, error: ProtocolError) -> Result<String> {
     Ok(serde_json::to_string(&DaemonMessage::Error { id, error })?)
 }
 
+/// The answer to send when there is no answer left to encode.
+///
+/// Every request gets exactly one answer, the ones that fail included, and
+/// `serde_json` failing is not an exception to that: dropping the frame
+/// leaves the view that asked waiting on it forever, with nothing logged.
+/// This value is a fixed shape with nothing in it that can fail to encode,
+/// and the literal behind it is the same one the bridge falls back to.
+fn unanswerable(id: Option<RequestId>, detail: &str) -> String {
+    log::warn!("a daemon answer could not be encoded: {detail}");
+    error_frame(
+        id,
+        ProtocolError::Malformed {
+            detail: "the answer could not be encoded".to_string(),
+        },
+    )
+    .unwrap_or_else(|_| r#"{"type":"error","error":"malformed","detail":"unanswerable"}"#.into())
+}
+
+/// One answer, whatever happened to the encoder.
+fn always(id: Option<RequestId>, frame: Result<String>) -> Option<String> {
+    Some(frame.unwrap_or_else(|e| unanswerable(id, &e.to_string())))
+}
+
 fn malformed(detail: &str) -> Result<String> {
     error_frame(
         None,
@@ -757,7 +780,7 @@ struct Attached {
 fn check_hello(line: &str) -> Result<Attached, Option<String>> {
     let Request { id, request } = match serde_json::from_str(line) {
         Ok(r) => r,
-        Err(e) => return Err(malformed(&e.to_string()).ok()),
+        Err(e) => return Err(always(None, malformed(&e.to_string()))),
     };
 
     match request {
@@ -769,15 +792,17 @@ fn check_hello(line: &str) -> Result<Attached, Option<String>> {
             session_events,
             has_window,
         }),
-        ClientRequest::Hello { protocol, .. } => Err(error_frame(
+        ClientRequest::Hello { protocol, .. } => Err(always(
             id,
-            ProtocolError::VersionMismatch {
-                client: protocol,
-                daemon: PROTOCOL_VERSION,
-            },
-        )
-        .ok()),
-        _ => Err(malformed("first frame must be a hello").ok()),
+            error_frame(
+                id,
+                ProtocolError::VersionMismatch {
+                    client: protocol,
+                    daemon: PROTOCOL_VERSION,
+                },
+            ),
+        )),
+        _ => Err(always(None, malformed("first frame must be a hello"))),
     }
 }
 
@@ -818,7 +843,9 @@ async fn handle_request(
     let acted = |result| Answer::frame(answer(id, result));
 
     match request {
-        ClientRequest::Snapshot => Answer::frame(hub.hello_frame().ok()),
+        ClientRequest::Snapshot => {
+            Answer::frame(always(id, hub.hello_frame().map_err(anyhow::Error::from)))
+        }
         // A second hello is harmless but says nothing; acknowledging keeps the
         // rule that every request gets exactly one answer.
         ClientRequest::Hello { .. } => acted(Ok(())),
@@ -871,15 +898,15 @@ async fn handle_request(
             // one: its answer arrives seconds later, on a channel shared with
             // every other download this client asked for.
             let Some(id) = id else {
-                return Answer::frame(
+                return Answer::frame(always(
+                    None,
                     error_frame(
                         None,
                         ProtocolError::Malformed {
                             detail: "a download needs an id to answer under".into(),
                         },
-                    )
-                    .ok(),
-                );
+                    ),
+                ));
             };
             // The one request whose answer is *not* an acknowledgement. It
             // comes back as `Downloaded` under this id, seconds later, from
@@ -899,7 +926,7 @@ async fn handle_request(
             .await
             {
                 Ok(()) => Answer::frame(None),
-                Err(error) => Answer::frame(error_frame(Some(id), error).ok()),
+                Err(error) => Answer::frame(always(Some(id), error_frame(Some(id), error))),
             }
         }
         ClientRequest::ReloadHistory => acted(dispatch(hub, commands, Action::ReloadHistory).await),
@@ -908,15 +935,15 @@ async fn handle_request(
         // acknowledgement, so only a refusal is answered here.
         ClientRequest::LoadMessages { jid, before, limit } => {
             let Some(id) = id else {
-                return Answer::frame(
+                return Answer::frame(always(
+                    None,
                     error_frame(
                         None,
                         ProtocolError::Malformed {
                             detail: "a page needs an id to answer under".into(),
                         },
-                    )
-                    .ok(),
-                );
+                    ),
+                ));
             };
             match dispatch(
                 hub,
@@ -932,20 +959,20 @@ async fn handle_request(
             .await
             {
                 Ok(()) => Answer::frame(None),
-                Err(error) => Answer::frame(error_frame(Some(id), error).ok()),
+                Err(error) => Answer::frame(always(Some(id), error_frame(Some(id), error))),
             }
         }
         ClientRequest::LoadChats { after, limit } => {
             let Some(id) = id else {
-                return Answer::frame(
+                return Answer::frame(always(
+                    None,
                     error_frame(
                         None,
                         ProtocolError::Malformed {
                             detail: "a page needs an id to answer under".into(),
                         },
-                    )
-                    .ok(),
-                );
+                    ),
+                ));
             };
             match dispatch(
                 hub,
@@ -960,7 +987,7 @@ async fn handle_request(
             .await
             {
                 Ok(()) => Answer::frame(None),
-                Err(error) => Answer::frame(error_frame(Some(id), error).ok()),
+                Err(error) => Answer::frame(always(Some(id), error_frame(Some(id), error))),
             }
         }
         ClientRequest::ForgetSession => acted(dispatch(hub, commands, Action::ForgetSession).await),
@@ -989,15 +1016,15 @@ async fn handle_request(
             // Answered under an id like a download, because the numbers are
             // the answer rather than an acknowledgement of it.
             let Some(id) = id else {
-                return Answer::frame(
+                return Answer::frame(always(
+                    None,
                     error_frame(
                         None,
                         ProtocolError::Malformed {
                             detail: "a storage query needs an id to answer under".into(),
                         },
-                    )
-                    .ok(),
-                );
+                    ),
+                ));
             };
             // Two directory walks, off the runtime for the same reason the
             // clear is.
@@ -1007,15 +1034,16 @@ async fn handle_request(
             })
             .await;
             let (database_bytes, media_bytes, media_files) = measured.unwrap_or((0, 0, 0));
-            Answer::frame(
+            Answer::frame(always(
+                Some(id),
                 serde_json::to_string(&DaemonMessage::Storage {
                     id,
                     database_bytes,
                     media_bytes,
                     media_files,
                 })
-                .ok(),
-            )
+                .map_err(anyhow::Error::from),
+            ))
         }
         // The store stays; every message keeps its `downloadable`, so what
         // this costs is a re-download of whatever is looked at again.
@@ -1146,8 +1174,11 @@ async fn dispatch(
 /// refused download or a malformed frame.
 fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<String> {
     match result {
-        Ok(()) => serde_json::to_string(&DaemonMessage::Accepted { id }).ok(),
-        Err(error) => error_frame(id, error).ok(),
+        Ok(()) => always(
+            id,
+            serde_json::to_string(&DaemonMessage::Accepted { id }).map_err(anyhow::Error::from),
+        ),
+        Err(error) => always(id, error_frame(id, error)),
     }
 }
 
@@ -1192,6 +1223,22 @@ async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> Result
 
 #[cfg(test)]
 mod tests {
+    /// Every request gets exactly one answer, the ones that fail included.
+    /// A frame that could not be encoded used to be no frame at all, and the
+    /// view that asked waited on it forever with nothing logged.
+    #[test]
+    fn an_answer_that_cannot_be_encoded_is_still_an_answer() {
+        let frame = always(
+            Some(oxidezap_ipc::RequestId::from(7u64)),
+            Err(anyhow::anyhow!("the encoder gave up")),
+        )
+        .expect("there is always a frame");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json");
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["error"], "malformed");
+        assert_eq!(parsed["id"], 7);
+    }
+
     use super::*;
 
     fn hello(protocol: u32, session_events: bool) -> String {
