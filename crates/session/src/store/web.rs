@@ -72,6 +72,14 @@ pub async fn prepare() -> Result<(), String> {
         "opened the browser store, holding {} file(s)",
         store.count()
     );
+    // Kept for [`wipe`], and only the first one needs keeping: `install`
+    // registers the VFS under `vfs_name` once and every later call finds it
+    // registered and hands back another `RelaxedIdbUtil` over the *same*
+    // `&'static VfsAppData` — so a second handle is not a second store, and
+    // the one already here deletes out of the pool the newest preload filled.
+    // Which is why the refused `set` is discarded rather than repaired:
+    // `prepare` runs again after "clear data and pair again", and swapping
+    // handles there would be swapping a thing for itself.
     STORE.with(|cell| {
         let _ = cell.set(store);
     });
