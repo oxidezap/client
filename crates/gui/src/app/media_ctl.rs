@@ -573,19 +573,41 @@ impl WhatsAppApp {
     ) -> Option<Arc<Image>> {
         let format = mime_to_image_format(mime_type)?;
 
-        // Check if already cached
-        if let Some(cached) = self.decoded_images.borrow().get(message_id).cloned() {
+        // A hit moves the entry to the back, which is what makes the order
+        // below least-recently-used rather than insertion order. By
+        // insertion, the entry evicted first was as likely as not the one
+        // being drawn this frame: the viewer and the status reader both
+        // resolve before the list's rows do, so a picture opened full screen
+        // was thrown out and rebuilt under itself — animated stickers
+        // restarting, and the bytes decoded again, which is the whole of what
+        // this cache exists to avoid.
+        if let Some(cached) = self.decoded_images.borrow_mut().shift_remove(message_id) {
+            self.decoded_images
+                .borrow_mut()
+                .insert(message_id.to_string(), cached.clone());
             return Some(cached);
         }
 
         let image = Arc::new(Image::from_bytes(format, data.to_vec()));
 
+        // What is on screen right now, which may not be evicted whatever the
+        // order says: dropping it is a rebuild inside the same frame.
+        let pinned = [
+            self.media_viewer.as_ref().and_then(MediaViewer::current_id),
+            self.status_pane.shown(),
+        ];
         let mut cache = self.decoded_images.borrow_mut();
-
-        // Evict oldest entries if cache is full (FIFO eviction using IndexMap insertion order)
         while cache.len() >= MAX_DECODED_IMAGES {
-            // shift_remove removes from the front (oldest entry)
-            cache.shift_remove_index(0);
+            let Some(at) = cache
+                .keys()
+                .position(|key| !pinned.iter().any(|id| *id == Some(key.as_str())))
+            else {
+                // Everything left is being drawn. Never reached with a cap
+                // this far above the two things that can be pinned; the entry
+                // is kept rather than one of them dropped.
+                break;
+            };
+            cache.shift_remove_index(at);
         }
 
         cache.insert(message_id.to_string(), image.clone());
