@@ -136,6 +136,13 @@ pub struct MediaContent {
     /// end in another process reads it out of the daemon's media cache under
     /// [`cache_key`](Self::cache_key) instead. Skipping it here rather than
     /// remembering not to send it is what makes that mechanical.
+    ///
+    /// It is also the one exception to the rule the rest of these fields keep
+    /// — a field may only be skipped where its absence reads back as the
+    /// value that was skipped — and what makes the exception sound is the
+    /// field below: bytes are dropped from the frame only because a key names
+    /// where they went. Nothing in the type ties the two together, so
+    /// `media_bytes_only_leave_the_frame_once_a_key_names_them` does.
     #[serde(skip)]
     pub data: Arc<Vec<u8>>,
     /// Where the daemon's media cache holds [`data`](Self::data).
