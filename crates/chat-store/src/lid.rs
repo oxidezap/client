@@ -24,6 +24,7 @@ use wacore_binary::{Jid, Server};
 
 use crate::schema;
 use crate::store::ChangeSet;
+use crate::types::MessageStatus;
 
 /// Bare 1:1 user chat key — the only namespace with a PN/LID alias. Hosted
 /// and interop namespaces alias differently and are left alone.
@@ -309,11 +310,20 @@ pub(crate) fn merge_split_chat(
     .load(conn)?;
     for dup in &dups {
         use schema::messages::dsl;
-        diesel::update(
-            crate::store::message_row(device_id, dest, &dup.id).filter(dsl::status.lt(dup.status)),
-        )
-        .set(dsl::status.eq(dup.status))
-        .execute(conn)?;
+        // By precedence, not by the raw number. `Error` sits below `Pending`
+        // on WhatsApp's own scale, so `<` promoted a send that had failed for
+        // good back to "sending", where nothing would ever move it again.
+        let held: Option<i32> = crate::store::message_row(device_id, dest, &dup.id)
+            .select(dsl::status)
+            .first(conn)
+            .optional()?;
+        if held.is_some_and(|held| {
+            MessageStatus::from_raw(dup.status).wins_over(MessageStatus::from_raw(held))
+        }) {
+            diesel::update(crate::store::message_row(device_id, dest, &dup.id))
+                .set(dsl::status.eq(dup.status))
+                .execute(conn)?;
+        }
         if dup.starred {
             diesel::update(crate::store::message_row(device_id, dest, &dup.id))
                 .set(dsl::starred.eq(true))

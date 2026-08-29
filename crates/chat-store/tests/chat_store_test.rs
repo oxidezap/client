@@ -6632,6 +6632,55 @@ async fn a_view_never_regresses_a_row() {
     );
 }
 
+/// `Error` sits below `Pending` on WhatsApp's own scale, so folding a split
+/// by the raw number promoted a send that had failed for good back to
+/// "sending" — where nothing was ever going to move it again.
+#[tokio::test]
+async fn merging_a_split_does_not_put_a_failed_send_back_in_flight() {
+    let (store, chat_store) = test_store().await;
+
+    // The LID side first and older, so the merge keeps the PN side.
+    chat_store
+        .record_outgoing(
+            &jid(PEER_LID),
+            "OUT-SPLIT",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-SPLIT",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .mark_send_failed(&jid(PEER), "OUT-SPLIT")
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store.messages(&jid(PEER), None, 10).await.unwrap()[0].status,
+        MessageStatus::Error
+    );
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let merged = chat_store.messages(&jid(PEER), None, 10).await.unwrap();
+    let row = merged
+        .iter()
+        .find(|m| m.id == "OUT-SPLIT")
+        .expect("the send");
+    assert_eq!(
+        row.status,
+        MessageStatus::Error,
+        "a failure outranks a send still in flight"
+    );
+}
+
 /// A token the tokenizer throws away leaves a phrase with no terms in it.
 /// FTS5 answers that with a syntax error, which reached the caller as a
 /// storage failure rather than the invalid-query answer the API promises.

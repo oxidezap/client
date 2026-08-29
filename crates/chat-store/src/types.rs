@@ -136,6 +136,29 @@ pub enum MessageStatus {
 }
 
 impl MessageStatus {
+    /// Where a status stands when two copies of one message disagree.
+    ///
+    /// Not the stored order, and that is the whole point: the numbers are
+    /// WhatsApp's, and on that scale `Error` sits *below* `Pending`, so a
+    /// plain `<` promotes a send that failed for good back to "sending" and
+    /// leaves it there. What outranks what is: a failure outranks a send in
+    /// flight, and any real answer from the server outranks both.
+    pub fn precedence(self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Error => 1,
+            Self::ServerAck => 2,
+            Self::Delivered => 3,
+            Self::Read => 4,
+            Self::Played => 5,
+        }
+    }
+
+    /// Whether `self` is the answer to keep when both describe one message.
+    pub fn wins_over(self, held: Self) -> bool {
+        self.precedence() > held.precedence()
+    }
+
     pub fn from_raw(raw: i32) -> Self {
         match raw {
             0 => Self::Error,
