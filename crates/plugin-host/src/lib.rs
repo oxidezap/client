@@ -976,6 +976,17 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
 /// `false` when the metadata cannot be read at all is the safe direction —
 /// this decides whether to run somebody's code.
 ///
+/// A symlink is refused outright rather than followed, because following one
+/// answers about the wrong thing: the target can be owned by this user and
+/// `0644` and still sit in a directory somebody else may write, and a file in
+/// such a directory is one they can unlink and replace whatever its own mode
+/// says. The replacement would then inherit the id's recorded approval. What
+/// it would take to allow the link is a verdict on the target's directory,
+/// and on that directory's directory — a walk to the root, with a race at
+/// every step — where the rule that a module is a file is one line and
+/// checkable. Loading from somewhere else is what `OXIDEZAP_PLUGIN_DIR` is
+/// for, and it is checked the same way.
+///
 /// Nothing to check off unix: a Windows plugin directory sits under
 /// `%LOCALAPPDATA%`, whose ACL is the profile's, and this process has no
 /// business inventing a second answer to a question the ACL already answers.
@@ -983,6 +994,15 @@ pub(crate) fn only_this_user_can_write(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
+        // `symlink_metadata` first, and about the link rather than through
+        // it: `metadata` would answer for the target and say nothing about
+        // who can put a different file there.
+        let Ok(link) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        if link.file_type().is_symlink() {
+            return false;
+        }
         let Ok(meta) = std::fs::metadata(path) else {
             return false;
         };

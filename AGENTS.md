@@ -190,7 +190,12 @@ profile here repeats it deliberately.
   (`MAX_MODULE_BYTES`, asked of the file rather than of its contents), and the
   strings an event handle clones into the *host* (`MAX_HANDLES`) — a plugin
   asking for one list element until its fuel runs out would otherwise grow
-  the daemon by far more than the sandbox advertises. Reading a field is
+  the daemon by far more than the sandbox advertises. What the *host* writes
+  about a plugin — a refused tree, a dropped root — is charged to that
+  plugin's own logging budget for the same reason `oxi_log` has one: it is
+  the same journal, and an invalid tree is a line a plugin can ask for
+  sixteen times a call without calling `oxi_log` at all. One allowance rather
+  than one plus an unbounded second. Reading a field is
   bounded too (`MAX_FIELD_BYTES_PER_CALL`), which is the same sentence about
   the copy rather than about the allocation: `oxi_field_str` writes into the
   *plugin*, so nothing here grows, and a loop over one ordinary message with
@@ -299,7 +304,15 @@ profile here repeats it deliberately.
   is stronger and costs a prompt per release. It is also why nothing loads
   out of a place another local account can write
   (`only_this_user_can_write`: owner *and* mode, the directory and every
-  module in it). An answer recorded against a name rather than against bytes
+  module in it) — and a symlink is refused rather than followed, since
+  following one answers about the target and says nothing about who may put a
+  different file there: a target this user owns, `0600`, in a directory
+  somebody else may write is a file they can unlink and replace, and the
+  replacement inherits the id's approval. Allowing the link would mean a
+  verdict on its directory, and on that directory's directory, with a race at
+  every step; `OXIDEZAP_PLUGIN_DIR` is how a module is loaded from somewhere
+  else, and it is checked the same way. An answer recorded against a name
+  rather than against bytes
   is one somebody else's file under that name inherits — and a writable
   directory is one where a new name can appear, not only new bytes under an
   old one.

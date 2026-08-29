@@ -2540,3 +2540,84 @@ fn a_write_does_not_follow_something_already_at_its_path() {
     );
     assert_eq!(std::fs::read(&planted).expect("readable"), b"written");
 }
+
+/// A plugin whose stored value is large and whose key is one byte.
+///
+/// Reads it in a loop and sends once the host refuses, so the budget is
+/// observable as a command rather than as a stopwatch.
+fn reads_one_value_forever() -> String {
+    versioned(
+        r#"(module
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_kv_set"       (func $kv_set (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_kv_get"       (func $kv_get (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 8)
+  (data (i32.const 100) "a@s.whatsapp.net")
+  (data (i32.const 150) "refused")
+  (data (i32.const 200) "k")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $caps (i64.const 17))   ;; caps::SEND | caps::STORAGE
+    (call $subscribe (i64.const 2))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $i i32)
+    (local $n i32)
+    ;; Eight kilobytes of whatever the module image holds, stored under a
+    ;; one byte key: the read below then copies far more than it is charged.
+    (drop (call $kv_set (i32.const 200) (i32.const 1) (i32.const 4096) (i32.const 8192)))
+    (block $done
+      (loop $again
+        (local.set $n
+          (call $kv_get (i32.const 200) (i32.const 1) (i32.const 20000) (i32.const 8192)))
+        (br_if $done (i32.lt_s (local.get $n) (i32.const 0)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br_if $again (i32.lt_s (local.get $i) (i32.const 2000)))))
+    (if (i32.lt_s (local.get $n) (i32.const 0))
+      (then (drop (call $send (i32.const 100) (i32.const 16) (i32.const 150) (i32.const 7)))))
+    (i32.const 0))
+)"#,
+    )
+}
+
+/// The key names the lookup; the value is what gets copied. Charging only the
+/// key bounded how many times a plugin could ask and not how much the host
+/// moved answering — a one byte key over an eight kilobyte value bought a
+/// million reads with the allowance it spent.
+#[test]
+fn reading_one_stored_value_over_and_over_runs_out_of_budget() {
+    let dir = TempDir::new("kv-bytes");
+    dir.plugin("greedy-store", &reads_one_value_forever());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    plugins.observe(&message("a@s.whatsapp.net", "go"));
+    until("the refusal", || commands.sent().len() == 1);
+    assert_eq!(commands.sent()[0].1, "refused");
+}
+
+/// A module reached through a symlink is not a module this account controls.
+///
+/// The target can be owned by this user and `0600` and still sit in a
+/// directory somebody else may write — and a file there is one they can
+/// unlink and replace, with the replacement inheriting whatever the id was
+/// approved for.
+#[cfg(unix)]
+#[test]
+fn a_module_behind_a_symlink_is_not_loaded() {
+    let dir = TempDir::new("symlinked-module");
+    let elsewhere = TempDir::new("elsewhere");
+    let real = elsewhere.0.join("autoreply.wasm");
+    std::fs::write(&real, wat::parse_str(pong()).expect("valid")).expect("writable");
+    std::os::unix::fs::symlink(&real, dir.0.join("autoreply.wasm")).expect("linkable");
+    // And one ordinary file beside it, so this is about the link rather than
+    // about the directory being refused wholesale.
+    dir.plugin("greeter", &draws());
+
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(plugins.ids(), vec!["greeter"], "the link is not a plugin");
+}

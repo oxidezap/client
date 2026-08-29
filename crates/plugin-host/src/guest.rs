@@ -166,6 +166,27 @@ impl Rolling {
 /// keys of a few hundred bytes when somebody presses something.
 const MAX_KV_BYTES_PER_CALL: usize = 1024 * 1024;
 
+/// What a line the *host* writes about a plugin is charged.
+///
+/// An estimate rather than the rendered length, deliberately: the point is to
+/// decide whether to write before formatting anything, and every one of these
+/// lines is an id and a short reason. `oxi_log` is bounded because writing a
+/// line is host I/O that fuel does not price — and a refusal the host writes
+/// costs the journal exactly the same, while being just as easy for a plugin
+/// to ask for. A tree refused sixteen times a callback, by a plugin waking
+/// itself ten times a second, is a disk filled by a module that never called
+/// `oxi_log` at all.
+const HOST_LINE_COST: usize = 128;
+
+/// Whether a host line about a plugin fits that plugin's logging budget.
+///
+/// A function of the budget rather than of a `Guest`, so the rule can be
+/// tested where it is written.
+fn may_report(budget: &mut Rolling) -> bool {
+    let elapsed = budget.window_began.elapsed();
+    budget.spend(elapsed, HOST_LINE_COST)
+}
+
 /// How many bytes of event fields one call may copy into a plugin.
 ///
 /// `oxi_field_str` writes `min(cap, full)` bytes into guest memory, and
@@ -320,6 +341,17 @@ pub struct Guest {
 }
 
 impl Guest {
+    /// Whether the host may write a line *about* this plugin.
+    ///
+    /// The same rolling budget the plugin's own `oxi_log` spends, because it
+    /// is the same journal and the same disk — and because a refusal is one
+    /// of the few lines a plugin can ask for as often as it likes: publishing
+    /// an invalid tree is refused sixteen times a call, and a timer buys as
+    /// many calls as the duty cycle allows.
+    pub fn may_report(&mut self) -> bool {
+        may_report(&mut self.log_budget)
+    }
+
     /// Whether an account command may be attempted at all right now.
     ///
     /// Only once the plugin is running. During `oxi_init` there is nobody to
@@ -744,7 +776,7 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 Ok(nodes) => {
                     let id = c.data().id.clone();
                     let roots: Vec<PluginRoot> = nodes.iter().filter_map(root).collect();
-                    if roots.len() != nodes.len() {
+                    if roots.len() != nodes.len() && c.data_mut().may_report() {
                         log::warn!(
                             "plugin {id}: dropped a root in a slot this front end has no place for"
                         );
@@ -756,7 +788,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                     abi::outcome::ACCEPTED
                 }
                 Err(e) => {
-                    log::warn!("plugin {}: refusing its interface: {e}", c.data().id);
+                    if c.data_mut().may_report() {
+                        log::warn!("plugin {}: refusing its interface: {e}", c.data().id);
+                    }
                     abi::outcome::INVALID
                 }
             }
@@ -1152,14 +1186,27 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
     };
 
     let (bytes, guest) = memory.data_and_store_mut(&mut *caller);
-    let Some(value) = guest.kv.get(key) else {
+    // The length first, so the copy can be charged before it happens — the
+    // same shape as `write_field`, and looked up twice for the same reason.
+    let Some(len) = guest.kv.get(key).map(str::len) else {
         return abi::ABSENT;
     };
-    let full = i32::try_from(value.len()).unwrap_or(i32::MAX);
+    let full = i32::try_from(len).unwrap_or(i32::MAX);
     if cap == 0 {
         return full;
     }
-    let end = cap.min(value.len());
+    let end = cap.min(len);
+    // The *value*, not only the key that named it. Charging the key alone
+    // bounded the lookups and not the copying: a one byte key over an eight
+    // kilobyte value bought a million reads with the budget it spent, and
+    // every one of them a memcpy the host performs and fuel does not price.
+    if end > MAX_KV_BYTES_PER_CALL.saturating_sub(guest.kv_bytes) {
+        return abi::ABSENT;
+    }
+    guest.kv_bytes += end;
+    let Some(value) = guest.kv.get(key) else {
+        return abi::ABSENT;
+    };
     let Some(target) = bytes.get_mut(offset..offset + end) else {
         return abi::outcome::INVALID;
     };
@@ -1169,7 +1216,25 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LOG_BYTES_PER_WINDOW, Rolling, escape_controls};
+    use super::{HOST_LINE_COST, MAX_LOG_BYTES_PER_WINDOW, Rolling, escape_controls, may_report};
+
+    /// A refusal the *host* writes costs the journal what a plugin's own line
+    /// costs, and a plugin can ask for one as often as it likes: an invalid
+    /// tree is refused sixteen times a call, and a timer buys the calls. So
+    /// the two come out of one allowance — before, a plugin that never
+    /// called `oxi_log` had an unbounded second one.
+    #[test]
+    fn what_the_host_writes_about_a_plugin_comes_out_of_the_plugin_s_budget() {
+        let mut budget = Rolling::new(HOST_LINE_COST * 2);
+        let none = std::time::Duration::ZERO;
+
+        assert!(may_report(&mut budget));
+        assert!(may_report(&mut budget));
+        assert!(!may_report(&mut budget), "a third does not fit");
+        // And the plugin's own logging is spending the same allowance, which
+        // is the point: not a smaller budget, one budget.
+        assert!(!budget.spend(none, 1));
+    }
 
     /// The per-call cap bounds one handler. A plugin needs nobody's
     /// permission to arm a timer, so it can spend a fresh one sixteen times a

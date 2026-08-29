@@ -263,10 +263,10 @@ copied or a task spawned. So the host bounds both.
 | 512-deep event queue | Overflowing **stops** the plugin rather than skipping an event: a plugin's whole contract is having seen the messages. |
 | 4096 event handles per call | Strings a handle clones into the host. |
 | 4 MiB of field bytes copied per call | `oxi_field_str` writes into your memory, and fuel prices the call rather than the copy. A length probe (`cap` of `0`) is free. |
-| 2 KiB per log line, 64 KiB per call, 256 KiB per window | Writing a line is host I/O fuel does not price. Newlines are escaped, so a plugin cannot forge a second log entry. |
+| 2 KiB per log line, 64 KiB per call, 256 KiB per window | Writing a line is host I/O fuel does not price. Newlines are escaped, so a plugin cannot forge a second log entry. Lines the host writes *about* a plugin — a refused tree — come out of the same window. |
 | 16 UI publishes per call | |
 | 32 commands per call, 256 per window | |
-| 1 MiB of key/value traffic per call, charged on reads as much as writes | 8 KiB per entry, 256 KiB per plugin. |
+| 1 MiB of key/value traffic per call, keys and values both, on reads as much as writes | 8 KiB per entry, 256 KiB per plugin. |
 | 16 timers, 100 ms floor, 7 day ceiling | The floor is why a plugin cannot spin on its own timer. |
 | 1 KiB name, 64 KiB action value | |
 
@@ -283,7 +283,10 @@ not share.
 
 Nothing loads out of a directory another local account can write, owner and
 mode both, the directory and every module in it: an answer recorded against a
-name is one somebody else's file under that name would inherit.
+name is one somebody else's file under that name would inherit. A symlink is
+refused rather than followed — the target's own mode says nothing about who
+may replace it — so a module has to be a file in that directory. Point
+`OXIDEZAP_PLUGIN_DIR` at your build directory instead while writing one.
 
 An approval is recorded against the **id and the mask, not a hash of the
 bytes**, so replacing the file with a new build does not ask again. That is
