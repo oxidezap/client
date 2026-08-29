@@ -551,6 +551,16 @@ where
             // Normally drain published state before reading more requests, so
             // a client that floods the socket cannot starve its own event
             // stream. After a lag that inverts, because recovery comes first.
+            //
+            // The reverse starvation is bounded rather than prevented: a
+            // request is read only once every branch above it is `Pending`,
+            // so a call with video or a hydration burst delays one. It cannot
+            // accumulate, because every producer above is slower than a local
+            // socket write is: a camera leaves tens of milliseconds between
+            // frames and a burst is finite, so the loop empties them and
+            // reaches the read. The delay is a frame interval, not a
+            // conversation, and a `Hangup` waiting that long is waiting
+            // less than the stanza it turns into.
             biased;
 
             update = updates.recv(), if !awaiting_resync => match update {
