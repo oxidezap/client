@@ -149,6 +149,22 @@ fn frame_byte_len(width: usize, height: usize) -> Option<usize> {
         .checked_mul(4)
 }
 
+/// The picture an access unit declares, when that is more than will be drawn.
+///
+/// Asked of every unit that reaches the decoder rather than only of the
+/// container's parameter set: a sample carries its own as often as not, and
+/// openh264 allocates from whichever one it saw last — so a budget applied
+/// only to the first is one a later set walks straight past. `None` when the
+/// unit declares no geometry, which is a unit decoded against the set before
+/// it. See [`frame_byte_len`] for why the geometry is never the container's.
+///
+/// The bound is an argument so a test can name one it can afford to encode
+/// against; every caller passes [`MAX_VIDEO_PIXELS`].
+fn declares_more_than(access_unit: &[u8], max_pixels: usize) -> Option<(u32, u32)> {
+    let (width, height) = super::sps::coded_size(access_unit)?;
+    ((width as usize).saturating_mul(height as usize) > max_pixels).then_some((width, height))
+}
+
 /// A decoded video frame, BGRA8-encoded and ready to hand to `gpui::img`.
 #[derive(Clone)]
 pub struct StreamingFrame {
@@ -393,11 +409,9 @@ impl StreamingVideoDecoder {
         );
 
         // The container's declaration was bounded above; this is the number
-        // the decoder will actually allocate from, read before it is handed
-        // one. A unit carrying no parameter set declares no geometry.
-        if let Some((coded_width, coded_height)) = super::sps::coded_size(&sps_pps)
-            && frame_byte_len(coded_width as usize, coded_height as usize).is_none()
-        {
+        // the decoder would actually allocate from, read before it is handed
+        // one.
+        if let Some((coded_width, coded_height)) = declares_more_than(&sps_pps, MAX_VIDEO_PIXELS) {
             return Err(anyhow!(
                 "Coded video dimensions out of range: {}x{}",
                 coded_width,
@@ -617,6 +631,18 @@ impl StreamingVideoDecoder {
                 sample_size,
                 keep_output
             );
+        }
+
+        // A sample may declare a picture of its own, and it is read before
+        // the decoder allocates from it. Not a gap to recover from: every
+        // unit after this one references a picture that was never decoded,
+        // so the stream stays refused until one that fits declares itself.
+        if let Some((coded_width, coded_height)) =
+            declares_more_than(&self.samples[index].data, MAX_VIDEO_PIXELS)
+        {
+            log::warn!("refusing a {coded_width}x{coded_height} video stream");
+            self.last_decoded_index = index as i32;
+            return;
         }
 
         // For keyframes, feed SPS/PPS first
@@ -895,6 +921,43 @@ mod tests {
             RgbaImage::from_raw(width as u32, height as u32, turned).is_some(),
             "the image is drawn at the size it decoded at"
         );
+    }
+
+    /// A budget read off the container is one a sample walks past: an `avc1`
+    /// entry can declare a thumbnail and the picture in front of it declare
+    /// 16K, and openh264 allocates from whichever set it saw last.
+    ///
+    /// Encoded rather than hand-built, for the reason above.
+    #[test]
+    fn a_sample_declaring_its_own_picture_is_bounded_before_the_decoder_sees_it() {
+        use openh264::encoder::{Encoder, EncoderConfig};
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+
+        let (width, height) = (128usize, 96usize);
+        let mut encoder =
+            Encoder::with_api_config(openh264::OpenH264API::from_source(), EncoderConfig::new())
+                .expect("encoder");
+        let pixels = vec![0u8; width * height * 3];
+        let unit = encoder
+            .encode(&YUVBuffer::from_rgb8_source(RgbSliceU8::new(
+                &pixels,
+                (width, height),
+            )))
+            .expect("encode")
+            .to_vec();
+
+        assert_eq!(
+            declares_more_than(&unit, MAX_VIDEO_PIXELS),
+            None,
+            "an ordinary picture is decoded"
+        );
+        assert_eq!(
+            declares_more_than(&unit, 64 * 48),
+            Some((width as u32, height as u32)),
+            "one past the budget is refused by what it declares, not by what it decoded to"
+        );
+        // A unit that declares nothing is decoded against the set before it.
+        assert_eq!(declares_more_than(b"nothing here", MAX_VIDEO_PIXELS), None);
     }
 
     /// The budget is on the picture, and a frame that has none is not one.
