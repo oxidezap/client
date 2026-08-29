@@ -109,9 +109,8 @@ impl WhatsAppApp {
                     .filter(|message| message.is_read)
                     .map(|message| message.id.clone())
                     .collect();
+                // Sorted by the merge itself, on the same key.
                 self.merge_chats(chats);
-                self.chats
-                    .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
                 // A selection that no longer names a chat is a selection of
                 // nothing: the conversation pane resolves it every frame and
                 // would draw the empty state with no way back on a phone.
