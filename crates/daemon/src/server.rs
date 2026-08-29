@@ -999,11 +999,18 @@ async fn handle_request(
                     .ok(),
                 );
             };
-            let (media_bytes, media_files) = crate::media::cache_usage();
+            // Two directory walks, off the runtime for the same reason the
+            // clear is.
+            let measured = oxidezap_session::unblock(|| {
+                let (media_bytes, media_files) = crate::media::cache_usage();
+                (database_bytes(), media_bytes, media_files)
+            })
+            .await;
+            let (database_bytes, media_bytes, media_files) = measured.unwrap_or((0, 0, 0));
             Answer::frame(
                 serde_json::to_string(&DaemonMessage::Storage {
                     id,
-                    database_bytes: database_bytes(),
+                    database_bytes,
                     media_bytes,
                     media_files,
                 })
@@ -1013,15 +1020,28 @@ async fn handle_request(
         // The store stays; every message keeps its `downloadable`, so what
         // this costs is a re-download of whatever is looked at again.
         ClientRequest::ClearMediaCache => {
-            acted(
+            // Off the runtime, for the reason the plugin approval is: this
+            // reads a directory of up to half a gigabyte and deletes it file
+            // by file, holding a lock that the session's own publish thread
+            // takes for every photo it caches. Done here it stopped event
+            // delivery for as long as a slow disk took. Awaited rather than
+            // spawned loose, so the acknowledgement still means the cache is
+            // clear.
+            let cleared = oxidezap_session::unblock(|| {
                 // Cached downloads only: a staged upload belongs to a send
                 // that has not run yet. See `media::Wipe`.
-                crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| {
-                    ProtocolError::Malformed {
-                        detail: format!("could not clear the media cache: {e}"),
-                    }
+                crate::media::wipe(crate::media::Wipe::Cache).map_err(|e| e.to_string())
+            })
+            .await;
+            acted(match cleared {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(ProtocolError::Malformed {
+                    detail: format!("could not clear the media cache: {e}"),
                 }),
-            )
+                Err(_) => Err(ProtocolError::Malformed {
+                    detail: "the media cache was not cleared".to_string(),
+                }),
+            })
         }
         // The daemon has no window of its own, so this is relayed rather than
         // acted on: whoever owns a window is the only one that can raise it.
