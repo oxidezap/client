@@ -143,15 +143,17 @@ async fn service() -> Result<(Arc<StateHub>, session_bridge::Commands), StartFai
 /// A bridge that has stopped — a shutdown, an account reset — leaves a sender
 /// nobody is reading. Reusing it would accept every command into a channel
 /// with no receiver, so the page would look connected and answer nothing.
-/// Forgetting it here also drops the claim, which is what lets the next
-/// session take one of its own.
+/// Forgetting it here lets the next session build a fresh one over the claim
+/// this page already holds — which is the page's for as long as the page is,
+/// and not something a session hands back between two of its own.
 fn running() -> Result<Option<(Arc<StateHub>, session_bridge::Commands)>, StartFailed> {
     SERVICE.with(|cell| {
         let mut slot = cell.borrow_mut();
 
         // Gone: the bridge exited, so its receiver is dropped. Forgetting the
-        // entry is what releases the claim, and the next caller takes a fresh
-        // one for a fresh session.
+        // entry is what lets the next caller build a fresh session; the claim
+        // it will run under is this one, because the account did not stop
+        // being this page's when its bridge did.
         if slot.as_ref().is_some_and(|s| s.commands.is_closed()) {
             *slot = None;
         }
@@ -163,8 +165,8 @@ fn running() -> Result<Option<(Arc<StateHub>, session_bridge::Commands)>, StartF
         // service would serve the new pipe the account that is being deleted,
         // out of a hub nothing will update again.
         //
-        // Not forgotten, because the store is still open behind it: dropping
-        // the claim here would let a second session start over a database the
+        // Not forgotten, because the store is still open behind it: handing
+        // this page a second session here would start one over a database the
         // first has not let go of. So the honest answer is neither the old
         // service nor a new one, but "ask again in a moment" — which is what
         // the front end's ordinary reconnect already does.
