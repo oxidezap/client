@@ -304,4 +304,5 @@ pub mod level {
     pub const WARN: i32 = abi::log::WARN;
     pub const INFO: i32 = abi::log::INFO;
     pub const DEBUG: i32 = abi::log::DEBUG;
+    pub const TRACE: i32 = abi::log::TRACE;
 }
