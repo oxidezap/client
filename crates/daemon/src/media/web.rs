@@ -211,10 +211,12 @@ pub fn cache_usage() -> (u64, u64) {
 
 /// Delete the cached entries this wipe is entitled to.
 ///
+/// The lock and the epoch belong to [`super::wipe`], which is the only caller.
+///
 /// # Errors
 ///
 /// Never, for the same reason [`put`] does not.
-pub fn wipe(scope: Wipe) -> Result<()> {
+pub(super) fn delete(scope: Wipe) -> Result<()> {
     with(|cache| {
         cache.entries.retain(|name, entry| {
             // A claimed entry survives a *cache* clear, for the same reason it
