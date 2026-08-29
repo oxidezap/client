@@ -58,7 +58,7 @@ pub fn render_message_list(
     is_own_number: bool,
     layout: ResponsiveLayout,
     _cx: &App,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
 
     if cache.messages.is_empty() {

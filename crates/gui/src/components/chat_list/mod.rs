@@ -52,7 +52,7 @@ pub fn render_chat_list(
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     cx: &App,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
     let entity_for_up = entity.clone();
     let entity_for_down = entity.clone();
