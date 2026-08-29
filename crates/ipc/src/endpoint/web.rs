@@ -24,7 +24,8 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen_futures::spawn_local;
@@ -79,6 +80,23 @@ impl Drop for FetchDeadline {
 /// The rest is slack for a front end that asks for something immediately.
 const MAX_HELD_FRAMES: usize = 64;
 
+/// How many frames off the socket may wait to be applied.
+///
+/// A browser hands a page everything that arrives and offers no way to say
+/// "not yet", so the only back pressure available is this queue refusing to
+/// grow. It has to refuse: applying a frame means fetching the media it names
+/// first, which carries a budget measured in tens of seconds, while a daemon
+/// with a large history writes its hydration frames as fast as the socket
+/// takes them. Unbounded, that is every remaining frame's JSON held at once
+/// against a linear memory with a one-gigabyte ceiling — and an allocation
+/// that fails there is an abort, not an error.
+///
+/// Deep enough that an ordinary burst never reaches it, and a connection that
+/// does reach it ends with a reason rather than losing frames one at a time:
+/// the front end is tracking requests against them, and `Frames::finish`
+/// fails all of those at once so the views that asked can ask again.
+const MAX_QUEUED_FRAMES: usize = 256;
+
 /// What the socket says, in the order it says it.
 ///
 /// One channel rather than one per event, because the order is the point: a
@@ -106,7 +124,7 @@ pub enum FromSocket {
 ///
 /// Only for a URL the browser refuses outright — a bad scheme, or a mixed
 /// content block. Everything that fails later is reported on the channel.
-pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), String> {
+pub fn connect(url: &str) -> Result<(Link, Receiver<FromSocket>), String> {
     let socket = WebSocket::new(url).map_err(|e| {
         // Redacted, like the two log paths. This one is worse than a log: it
         // is the string the window *draws*, so the token would be in any
@@ -119,8 +137,10 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
         )
     })?;
 
-    let (inbound, frames) = unbounded_channel::<FromSocket>();
-    let (outbound, mut to_send) = unbounded_channel::<String>();
+    let (inbound, frames) = channel::<FromSocket>(MAX_QUEUED_FRAMES);
+    let (outbound, mut to_send) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Set once, by whichever of the two overflow paths gets there first.
+    let ended = Rc::new(Cell::new(false));
 
     // Shared with the `onopen` callback so a frame written before the socket
     // was up is sent rather than dropped.
@@ -155,7 +175,7 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
                     log::error!("could not send a held frame: {e:?}");
                 }
             }
-            let _ = inbound.send(FromSocket::Open);
+            deliver(&inbound, FromSocket::Open);
         });
         socket.set_onopen(Some(opened.as_ref().unchecked_ref()));
         callbacks.push(opened);
@@ -163,15 +183,35 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
 
     let message_callback = {
         let inbound = inbound.clone();
+        let ended = Rc::clone(&ended);
+        let socket_here = socket.clone();
         let message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if ended.get() {
+                return;
+            }
             // Text only. The daemon speaks JSON and a binary frame would be
             // something else entirely — saying so beats decoding whatever it
             // is and failing to parse it a layer up.
-            match event.data().as_string() {
-                Some(line) => {
-                    let _ = inbound.send(FromSocket::Line(line));
-                }
-                None => log::warn!("ignoring a non-text frame from the daemon"),
+            let Some(line) = event.data().as_string() else {
+                log::warn!("ignoring a non-text frame from the daemon");
+                return;
+            };
+            // `try_send`, because this is a browser callback and there is
+            // nothing here to await on. A full queue is the one case that
+            // matters: see [`MAX_QUEUED_FRAMES`].
+            if let Err(TrySendError::Full(_)) = inbound.try_send(FromSocket::Line(line)) {
+                ended.set(true);
+                log::error!(
+                    "the daemon is sending frames faster than this page can apply them; \
+                     ending the connection"
+                );
+                deliver(
+                    &inbound,
+                    FromSocket::Closed(
+                        "the daemon sent frames faster than this page could apply them".to_string(),
+                    ),
+                );
+                let _ = socket_here.close();
             }
         });
         socket.set_onmessage(Some(message.as_ref().unchecked_ref()));
@@ -188,7 +228,7 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
             } else {
                 format!("the daemon connection closed: {reason}")
             };
-            let _ = inbound.send(FromSocket::Closed(detail));
+            deliver(&inbound, FromSocket::Closed(detail));
             // Wakes the writer, which is what ends it. Without this it stays
             // parked on its receive: the next `send_line` would queue
             // happily, the caller would record a request against it, and
@@ -239,9 +279,12 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
                 // produce. Ending it is what runs `Frames::finish`, which
                 // fails every one of them at once and lets the views that
                 // asked ask again.
-                let _ = inbound.send(FromSocket::Closed(
-                    "the daemon accepted the connection but never opened it".to_string(),
-                ));
+                deliver(
+                    &inbound,
+                    FromSocket::Closed(
+                        "the daemon accepted the connection but never opened it".to_string(),
+                    ),
+                );
                 break;
             }
         }
@@ -264,6 +307,25 @@ pub fn connect(url: &str) -> Result<(Link, UnboundedReceiver<FromSocket>), Strin
     });
 
     Ok((Link::over_socket(outbound), frames))
+}
+
+/// Put one event on the queue, waiting for room only where waiting is right.
+///
+/// `Open` and `Closed` are one apiece and say what happened to the
+/// connection, so losing one to a full queue would leave the reader waiting
+/// on a socket that has already gone. A `Line` is not sent through here: a
+/// task per overflowing frame would be the unbounded queue again, wearing the
+/// scheduler's clothes.
+fn deliver(inbound: &Sender<FromSocket>, event: FromSocket) {
+    match inbound.try_send(event) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(event)) => {
+            let inbound = inbound.clone();
+            spawn_local(async move {
+                let _ = inbound.send(event).await;
+            });
+        }
+    }
 }
 
 /// Where to look for a daemon, as the page was asked to.
