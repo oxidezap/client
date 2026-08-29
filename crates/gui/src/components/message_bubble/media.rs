@@ -323,12 +323,17 @@ fn render_download_placeholder(
                 )
             }
         })
-        .on_click(move |_, _window, cx| {
-            let msg_id = message_id.clone();
-            let dl = dl.clone();
-            entity.update(cx, |app, cx| {
-                app.download_image(msg_id, dl, cx);
-            });
+        // Only while there is something to ask for. The cursor was already
+        // conditional and the handler was not, so tapping a box that says
+        // "Downloading…" asked for the same download again.
+        .when(!is_downloading, |el| {
+            el.on_click(move |_, _window, cx| {
+                let msg_id = message_id.clone();
+                let dl = dl.clone();
+                entity.update(cx, |app, cx| {
+                    app.download_image(msg_id, dl, cx);
+                });
+            })
         })
 }
 
@@ -697,8 +702,12 @@ fn render_video_player(
                 } else if is_error {
                     // toggle_video's Error arm restarts the download; without
                     // a handler a transient failure left the video stuck.
+                    //
+                    // A `Button`, like the play and pause it stands in for:
+                    // this is a command rather than a surface, and drawn as a
+                    // `div` there was no way to reach a failed video from the
+                    // keyboard at all.
                     div()
-                        .id(button_id)
                         .w(px(48.))
                         .h(px(48.))
                         .rounded_full()
@@ -706,16 +715,23 @@ fn render_video_player(
                         .flex()
                         .justify_center()
                         .items_center()
-                        .child(Icon::new(IconName::Redo).text_color(on_scrim).size(px(20.)))
-                        .when_some(downloadable.clone(), |el, dl| {
-                            el.cursor_pointer().on_click(move |_, _window, cx| {
-                                let msg_id = message_id.clone();
-                                let dl = dl.clone();
-                                entity.update(cx, |app, cx| {
-                                    app.toggle_video(msg_id, dl, cx);
-                                });
-                            })
-                        })
+                        .child(
+                            Button::new(button_id)
+                                .icon(Icon::new(IconName::Redo).text_color(on_scrim).size(px(20.)))
+                                .ghost()
+                                .disabled(downloadable.is_none())
+                                .on_click({
+                                    let downloadable = downloadable.clone();
+                                    move |_, _window, cx| {
+                                        if let Some(dl) = downloadable.clone() {
+                                            let msg_id = message_id.clone();
+                                            entity.update(cx, |app, cx| {
+                                                app.toggle_video(msg_id, dl, cx);
+                                            });
+                                        }
+                                    }
+                                }),
+                        )
                         .into_any_element()
                 } else if !is_playing {
                     Button::new(button_id)
