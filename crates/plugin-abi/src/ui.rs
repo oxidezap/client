@@ -356,6 +356,14 @@ mod parse {
         TooBig,
         /// Children hung off a widget that is drawn without any.
         Childless(u8),
+        /// Two interactive widgets in one slot sharing an action id.
+        ///
+        /// Nothing could tell them apart: a press names an id and a slot, so
+        /// both would answer it, and a front end keeping a text box per id
+        /// would draw one box for two fields. Refused rather than
+        /// disambiguated, because a name this parser invented is not one the
+        /// plugin would recognise coming back.
+        Ambiguous(u8),
         /// An action id that was not valid UTF-8.
         ///
         /// A label is decoded lossily, and an id may not be: an id is
@@ -382,6 +390,12 @@ mod parse {
                 Self::Trailing => f.write_str("bytes after the last root node"),
                 Self::Reserved(v) => write!(f, "reserved byte {v}, expected 0"),
                 Self::MangledId => f.write_str("an action id that is not valid utf-8"),
+                Self::Ambiguous(slot) => {
+                    write!(
+                        f,
+                        "two interactive widgets share an action id in slot {slot}"
+                    )
+                }
                 Self::Childless(kind) => {
                     write!(f, "widget kind {kind} is drawn without children")
                 }
@@ -435,7 +449,40 @@ mod parse {
         if r.at != bytes.len() {
             return Err(ParseError::Trailing);
         }
+        // An id has to name one widget within the slot it is drawn in.
+        // Across slots it may repeat — a plugin's "enabled" toggle can sit
+        // in its header and in its settings panel, and an action says which
+        // one it came from — but twice in the same slot there is nothing to
+        // tell them apart: a press names both, and a front end holding a
+        // text box per id would draw one box for two fields, with the second
+        // node's value overwriting the first's on every republish.
+        let mut seen: Vec<(u8, String)> = Vec::new();
+        for root in &out {
+            let mut ids = Vec::new();
+            collect_ids(root, &mut ids);
+            for id in ids {
+                // Within the slot, not within the root: a slot is drawn as
+                // one surface however many roots a plugin split it into.
+                if seen
+                    .iter()
+                    .any(|(slot, other)| *slot == root.slot && other == &id)
+                {
+                    return Err(ParseError::Ambiguous(root.slot));
+                }
+                seen.push((root.slot, id));
+            }
+        }
         Ok(out)
+    }
+
+    /// Every action id an interactive widget in this tree carries.
+    fn collect_ids(node: &Node, out: &mut Vec<String>) {
+        if kind::is_interactive(node.kind) {
+            out.push(node.id.clone());
+        }
+        for kid in &node.children {
+            collect_ids(kid, out);
+        }
     }
 
     struct Reader<'a> {
@@ -771,6 +818,76 @@ mod tests {
         let drawn = tree(b"translate", b"Trad\xffuzir").expect("a label is decoded lossily");
         assert_eq!(drawn[0].id, "translate");
         assert_eq!(drawn[0].label, "Trad\u{fffd}uzir");
+    }
+
+    /// An id names one widget in the slot it is drawn in. Across slots it
+    /// may repeat, because an action says which slot it came from.
+    #[test]
+    fn one_slot_may_not_hold_two_widgets_by_the_same_name() {
+        let twice_in_one_slot = write(|w| {
+            w.begin(
+                kind::SECTION,
+                slot::SETTINGS,
+                flags::ENABLED,
+                "",
+                "Respostas",
+                "",
+            );
+            w.leaf(
+                kind::TEXT_FIELD,
+                slot::NONE,
+                flags::ENABLED,
+                "keyword",
+                "Ping",
+                "",
+            );
+            w.leaf(
+                kind::TEXT_FIELD,
+                slot::NONE,
+                flags::ENABLED,
+                "keyword",
+                "Pong",
+                "",
+            );
+            w.end();
+        })
+        .expect("fits");
+        assert_eq!(
+            parse(&twice_in_one_slot),
+            Err(ParseError::Ambiguous(slot::SETTINGS))
+        );
+
+        // The same id in two slots is two widgets and stays allowed.
+        let once_in_each = write(|w| {
+            w.leaf(
+                kind::BUTTON,
+                slot::CHAT_HEADER,
+                flags::ENABLED,
+                "enabled",
+                "Ligar",
+                "",
+            );
+            w.leaf(
+                kind::TOGGLE,
+                slot::SETTINGS,
+                flags::ENABLED,
+                "enabled",
+                "Ligada",
+                "1",
+            );
+        })
+        .expect("fits");
+        assert_eq!(parse(&once_in_each).expect("parses").len(), 2);
+
+        // And a label carries no id, so two of them are not a collision.
+        let two_labels = write(|w| {
+            w.begin(kind::SECTION, slot::SETTINGS, flags::ENABLED, "", "S", "");
+            w.leaf(kind::LABEL, slot::NONE, 0, "", "um", "");
+            w.leaf(kind::LABEL, slot::NONE, 0, "", "dois", "");
+            w.end();
+        })
+        .expect("fits");
+        assert!(parse(&two_labels).is_ok());
     }
 
     /// A slot number this build does not draw is refused, not dropped. A

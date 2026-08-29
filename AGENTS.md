@@ -154,7 +154,10 @@ profile here repeats it deliberately.
   the daemon by far more than the sandbox advertises. `oxi_log` is bounded
   for the same reason and refused while loading for the other one: writing a
   line is host I/O that fuel does not price, and a module the loader is about
-  to turn away should leave nothing behind. A `Store` is not
+  to turn away should leave nothing behind. What it writes is also escaped —
+  a line break in a plugin's line is a second entry the host's `plugin x:`
+  prefix never reaches, so a module nobody has approved for anything writes
+  what reads as the daemon's own diagnostics. A `Store` is not
   shareable and a wasm call is synchronous and blocking, so each plugin gets
   an OS thread of its own rather than a runtime task, which would stall the
   accept loop for as long as it ran. wasmi and not wasmtime: no JIT, so
@@ -184,8 +187,8 @@ profile here repeats it deliberately.
   because withdrawing has to bite *now*: an answer queued behind a backlog
   would let a plugin send through five hundred banked events while Settings
   already read "not allowed", and the plugin that most needs stopping is the
-  one whose queue is full. Declaring is a single act, once, for the same
-  reason: a plugin that declares the narrow mask it was approved for, sends,
+  one whose queue is full. Declaring is a single act, once — and so is
+  naming — for the same reason: a plugin that declares the narrow mask it was approved for, sends,
   and *then* widens has already sent, and the wider surface reading as
   unapproved afterwards is no use to the message. Nor does any of it start at
   instantiation — a start section and `oxi_abi_version` are code the loader
@@ -310,8 +313,12 @@ profile here repeats it deliberately.
   than against the plugin merely being loaded: a front end's frame can be
   older than the daemon's, so a second window still showing a button since
   withdrawn or greyed out would land as a real press, and an id the plugin
-  never published would reach a handler as a widget that does not exist. In
-  the slot the action says it came from, because one plugin may draw the same
+  never published would reach a handler as a widget that does not exist. An
+  id names one widget *within a slot*, which is where the encoder refuses a
+  duplicate: across slots it may repeat, because an action says which one it
+  came from, but twice in one slot nothing tells the two apart — a press
+  names both, and a front end keeping a text box per id draws one box for
+  two fields. In the slot the action says it came from, because one plugin may draw the same
   id in a header and in its settings panel: withdrawing one of them must not
   leave the other vouching for it, which is why the slot travels on the
   action rather than being guessed from whether a chat came with it.

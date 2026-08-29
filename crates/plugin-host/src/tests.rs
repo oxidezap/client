@@ -1559,6 +1559,55 @@ fn a_directory_that_cannot_be_made_private_is_refused() {
     assert_eq!(crate::usable_state_dir(Some(&blocker.join("state"))), None);
 }
 
+/// Names itself twice and reports what the host answered the second time.
+const RENAMES_ITSELF: &str = r#"(module
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_set_name"     (func $set_name (param i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "a@s.whatsapp.netPrimeiroSegundorefused")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))
+    (call $caps (i64.const 1))    ;; caps::SEND
+    (drop (call $set_name (i32.const 16) (i32.const 8)))     ;; "Primeiro"
+    (global.set $answer (call $set_name (i32.const 24) (i32.const 7)))  ;; "Segundo"
+    (i32.const 0))
+  (global $answer (mut i32) (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (if (i32.lt_s (global.get $answer) (i32.const 0))
+      (then (drop (call $send (i32.const 0) (i32.const 16) (i32.const 31) (i32.const 7)))))
+    (i32.const 0))
+)"#;
+
+/// A plugin names itself once.
+///
+/// The second call is refused *before* the string is read, which is the
+/// point: answering it meant a kilobyte out of guest memory and an
+/// allocation per call, priced as one fixed-cost import, with `oxi_init`
+/// carrying two hundred million fuel and the daemon's startup waiting.
+#[test]
+fn a_plugin_names_itself_once() {
+    let dir = TempDir::new("renames");
+    dir.plugin("shifty", &versioned(RENAMES_ITSELF));
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    let surfaces = published.settles("the plugin to be listed", |s| !s.is_empty());
+    assert_eq!(
+        surfaces[0].name, "Primeiro",
+        "the first name is the one it has"
+    );
+
+    // And it was told, rather than left to wonder why its name never changed.
+    plugins.observe(&message("a@s.whatsapp.net", "oi"));
+    until("the report", || {
+        commands.sent().iter().any(|(_, text, _)| text == "refused")
+    });
+}
+
 /// A state directory that cannot be made private is not used at all.
 ///
 /// `approvals.json` says what each plugin may do to the account, so a

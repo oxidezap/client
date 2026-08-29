@@ -326,6 +326,11 @@ impl Setup {
     }
 
     /// The name a user sees beside this plugin's settings.
+    ///
+    /// Said once. A second call is refused and the first name stands — the
+    /// same rule the capability declaration holds to, and for the same
+    /// reason on the host's side: answering one is a read and an allocation
+    /// that no fuel pays for.
     pub fn name(&mut self, name: &str) {
         unsafe { raw::set_name(name.as_ptr() as i32, name.len() as i32) };
     }

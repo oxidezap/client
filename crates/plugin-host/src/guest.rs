@@ -334,6 +334,18 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if c.data().phase != Phase::Init {
                 return abi::outcome::STATE;
             }
+            // Once, like the capability declaration and for the second of
+            // its two reasons: bounding the work. A name is one string a
+            // plugin picks, so a second call is a correction nobody asked
+            // for — and answering it meant reading a kilobyte out of guest
+            // memory and allocating what is kept, per call, priced as one
+            // fixed-cost import. A loop during `oxi_init` is that work two
+            // hundred million fuel over, with the daemon's startup waiting
+            // on it. Refused before the copy, so a second call costs nothing
+            // at all.
+            if c.data().name.is_some() {
+                return abi::outcome::REFUSED;
+            }
             // Bounded before the copy, like every other import that takes a
             // string. Only 64 characters are kept, so allocating 64 KiB to
             // throw away all but a line of it is host work charged as one
@@ -733,6 +745,16 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             let Ok(line) = read_str(&mut c, ptr, len) else {
                 return;
             };
+            // One record, one line. A plugin that embeds a newline writes
+            // what looks like a second entry, and the prefix below only
+            // reaches the first — so the rest reads as the daemon's own
+            // diagnostics, written by a module nobody has approved for
+            // anything. Escaped rather than split, so the prefix keeps
+            // meaning "everything after this came from the plugin"; every
+            // control character goes, not only the line breaks, since an
+            // ANSI escape rewrites a terminal's idea of what it is showing
+            // just as well as a newline does.
+            let line = escape_controls(&line);
             let id = &c.data().id;
             // Prefixed, always. A plugin's line in the daemon's log is
             // otherwise indistinguishable from the daemon's own, and the
@@ -832,6 +854,28 @@ fn read_bytes(caller: &mut Caller<'_, Guest>, ptr: i32, len: usize) -> Result<Ve
     Ok(buf)
 }
 
+/// A log line with nothing in it that can pretend to be another one.
+///
+/// Control characters become their escapes, so what a plugin wrote stays
+/// readable and stays on the one line the host prefixed. Borrowed back
+/// unchanged in the ordinary case, which is every honest line.
+fn escape_controls(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains(char::is_control) {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len() + 8);
+    for c in line.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 fn read_str(caller: &mut Caller<'_, Guest>, ptr: i32, len: i32) -> Result<String, i32> {
     let Ok(len) = usize::try_from(len) else {
         return Err(abi::outcome::INVALID);
@@ -923,4 +967,30 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
     };
     target.copy_from_slice(&value.as_bytes()[..end]);
     full
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_controls;
+
+    /// A plugin's line is one line. Embedding a newline would otherwise
+    /// write what reads as a second log entry — one the host's "plugin x:"
+    /// prefix never reaches, and so one that reads as the daemon's own.
+    #[test]
+    fn a_log_line_cannot_forge_another() {
+        let forged = escape_controls("done\nERROR wiping local state");
+        assert_eq!(forged, "done\\nERROR wiping local state");
+        assert!(!forged.contains('\n'));
+
+        // Every control character, not only the line breaks: an ANSI escape
+        // rewrites a terminal's idea of what it is showing just as well.
+        assert_eq!(escape_controls("a\u{1b}[2Jb"), "a\\u{1b}[2Jb");
+        assert_eq!(escape_controls("a\rb\tc"), "a\\rb\\tc");
+
+        // And an ordinary line is handed back untouched, borrowed.
+        assert!(matches!(
+            escape_controls("respondi a 3 mensagens"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 }
