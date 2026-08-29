@@ -1105,19 +1105,45 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 /// The mode is set on *creation* rather than afterwards, so there is no
 /// instant in which the contents exist at `0644`. Both stores write through a
 /// temporary file and a rename, and a rename carries the mode with it.
+///
+/// Created *exclusively*, which is the half that is about somebody else. The
+/// state directory is made private before it is read, and a `chmod` does not
+/// empty it: an entry another local user left there while it was writable
+/// survives, and `create(true)` opens it — following a symlink to wherever it
+/// points, with the mode ignored because the file already exists. So a
+/// planted `approvals.json.<pid>.<thread>.tmp` would have this truncate
+/// whatever the daemon's user can write. `create_new` refuses any existing
+/// entry, symlink included; the one honest way to meet one is a temporary
+/// file from a previous process that shared this pid and thread id and died
+/// mid-write, which is why the entry is unlinked once and the create tried
+/// again. Unlinked rather than opened, because removing a symlink removes the
+/// link and not what it names — and a second refusal is left to fail, since
+/// something is racing this directory and losing a preference beats writing
+/// through it.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
+    let mut file = match create_private(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            create_private(path)?
+        }
+        other => other?,
+    };
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Create `path`, failing if anything is already there.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    options.open(path)
 }
 
 /// Make a rename or an unlink in `dir` survive losing power.

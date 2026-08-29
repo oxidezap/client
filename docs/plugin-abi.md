@@ -262,6 +262,7 @@ copied or a task spawned. So the host bounds both.
 | 32 MiB module, 32 plugins | Asked of the file and of the folder, before a `Store` exists. |
 | 512-deep event queue | Overflowing **stops** the plugin rather than skipping an event: a plugin's whole contract is having seen the messages. |
 | 4096 event handles per call | Strings a handle clones into the host. |
+| 4 MiB of field bytes copied per call | `oxi_field_str` writes into your memory, and fuel prices the call rather than the copy. A length probe (`cap` of `0`) is free. |
 | 2 KiB per log line, 64 KiB per call, 256 KiB per window | Writing a line is host I/O fuel does not price. Newlines are escaped, so a plugin cannot forge a second log entry. |
 | 16 UI publishes per call | |
 | 32 commands per call, 256 per window | |

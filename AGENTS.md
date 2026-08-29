@@ -190,7 +190,14 @@ profile here repeats it deliberately.
   (`MAX_MODULE_BYTES`, asked of the file rather than of its contents), and the
   strings an event handle clones into the *host* (`MAX_HANDLES`) — a plugin
   asking for one list element until its fuel runs out would otherwise grow
-  the daemon by far more than the sandbox advertises. `oxi_log` is bounded
+  the daemon by far more than the sandbox advertises. Reading a field is
+  bounded too (`MAX_FIELD_BYTES_PER_CALL`), which is the same sentence about
+  the copy rather than about the allocation: `oxi_field_str` writes into the
+  *plugin*, so nothing here grows, and a loop over one ordinary message with
+  a large buffer still turns a callback's fuel into tens of gigabytes of
+  memcpy. Per call and not per window, unlike the log and the commands: that
+  cost is time inside the call, which is exactly what `MAX_DUTY` measures
+  across calls and cannot measure within one. `oxi_log` is bounded
   for the same reason and refused while loading for the other one: writing a
   line is host I/O that fuel does not price, and a module the loader is about
   to turn away should leave nothing behind. What it writes is also escaped —

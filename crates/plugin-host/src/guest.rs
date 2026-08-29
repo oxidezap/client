@@ -166,6 +166,27 @@ impl Rolling {
 /// keys of a few hundred bytes when somebody presses something.
 const MAX_KV_BYTES_PER_CALL: usize = 1024 * 1024;
 
+/// How many bytes of event fields one call may copy into a plugin.
+///
+/// `oxi_field_str` writes `min(cap, full)` bytes into guest memory, and
+/// nothing about that is priced: fuel counts the handful of instructions the
+/// import costs the guest, not the memcpy the host performs on its behalf. So
+/// a plugin handed one ordinary message can read the same field in a loop
+/// with a large buffer and turn a fifty-million-fuel callback into tens of
+/// gigabytes of copying — the same shape as the log, key/value and UI
+/// budgets, and it was the one path without one.
+///
+/// Per call and not also per window, unlike commands and logging: those buy
+/// host work that outlives the call — a task, a file — where this is time,
+/// spent inside the call, which is exactly what `MAX_DUTY` measures across
+/// them. The per-call bound is what the duty cycle cannot give, since it is
+/// only consulted once a callback returns.
+///
+/// Four megabytes is far past any honest handler: the largest single value
+/// the ABI carries is a widget's use at 64 KiB, and a receipt's whole list of
+/// message ids is a few hundred.
+const MAX_FIELD_BYTES_PER_CALL: usize = 4 * 1024 * 1024;
+
 /// How many account commands one call may issue.
 ///
 /// Each one crosses into the daemon and the session spawns work for it — a
@@ -285,6 +306,9 @@ pub struct Guest {
     /// which two would both find it free.
     pub named: Option<bool>,
     pub logged_bytes: usize,
+    /// Event bytes this call has copied into the plugin. See
+    /// [`MAX_FIELD_BYTES_PER_CALL`].
+    pub field_bytes: usize,
     /// Key and value bytes this call has pushed into the store. See
     /// [`MAX_KV_BYTES_PER_CALL`].
     pub kv_bytes: usize,
@@ -1048,6 +1072,20 @@ fn read_str(caller: &mut Caller<'_, Guest>, ptr: i32, len: i32) -> Result<String
 /// the guest's bytes and the store's data at the same time, so the value can
 /// be read out of the event and written into the plugin without a `String`
 /// in between. Everything else here is [`write_str`]'s contract, which see.
+/// The string a handle carries under `field`, or the element a child handle
+/// *is*.
+fn field_str(guest: &Guest, ev: i32, field: i32) -> Option<&str> {
+    match guest.read_field(ev, field) {
+        Some(Value::Str(s)) => Some(s.as_str()),
+        // An integer read as a string is not a coercion this ABI performs.
+        Some(_) => None,
+        None => match guest.element(ev) {
+            Some(s) if field == abi::fields::SELF => Some(s),
+            _ => None,
+        },
+    }
+}
+
 fn write_field(caller: &mut Caller<'_, Guest>, ev: i32, field: i32, ptr: i32, cap: i32) -> i32 {
     let Ok(cap) = usize::try_from(cap) else {
         return abi::outcome::INVALID;
@@ -1060,15 +1098,15 @@ fn write_field(caller: &mut Caller<'_, Guest>, ev: i32, field: i32, ptr: i32, ca
     };
 
     let (bytes, guest) = memory.data_and_store_mut(&mut *caller);
-    let value = match guest.read_field(ev, field) {
-        Some(Value::Str(s)) => s.as_str(),
-        Some(_) => return abi::ABSENT,
-        None => match guest.element(ev) {
-            Some(s) if field == abi::fields::SELF => s,
-            _ => return abi::ABSENT,
-        },
+    // Looked up twice — once for the length, once for the copy — because the
+    // charge in between needs the store mutably and a `&str` into it would
+    // still be borrowed. It is a map lookup either way, and the alternative
+    // is holding a copy in host memory, which is the thing this function
+    // exists not to do.
+    let Some(len) = field_str(guest, ev, field).map(str::len) else {
+        return abi::ABSENT;
     };
-    let full = i32::try_from(value.len()).unwrap_or(i32::MAX);
+    let full = i32::try_from(len).unwrap_or(i32::MAX);
     if cap == 0 {
         return full;
     }
@@ -1080,7 +1118,19 @@ fn write_field(caller: &mut Caller<'_, Guest>, ev: i32, field: i32, ptr: i32, ca
     // holds the value and how much is whatever was there before. The
     // snprintf contract is that `min(cap, full)` bytes are written; trimming
     // a character the cut split is the reader's job, and the SDK does it.
-    let end = cap.min(value.len());
+    let end = cap.min(len);
+    // Charged before the copy, and against the bytes actually written rather
+    // than the buffer offered: a `cap` of four gigabytes over an eight byte
+    // value copies eight bytes, and refusing that would bound the caller's
+    // optimism instead of the host's work. A length probe (`cap == 0`)
+    // returned above and costs nothing, which is the point of its being free.
+    if end > MAX_FIELD_BYTES_PER_CALL.saturating_sub(guest.field_bytes) {
+        return abi::outcome::INVALID;
+    }
+    guest.field_bytes += end;
+    let Some(value) = field_str(guest, ev, field) else {
+        return abi::ABSENT;
+    };
     let Some(target) = bytes.get_mut(offset..offset + end) else {
         return abi::outcome::INVALID;
     };

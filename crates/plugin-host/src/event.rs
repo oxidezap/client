@@ -163,6 +163,14 @@ pub fn from_session(event: &UiEvent) -> Option<Event> {
         UiEvent::Connected => {
             Event::new(abi::kinds::CONNECTION).int(fields::CONNECTION_STATE, connection::CONNECTED)
         }
+        // The state a front end is given for this same event
+        // (`session_bridge` translates it to `ConnectionState::Connecting`),
+        // and without it `connection::CONNECTING` is a value the ABI defines
+        // and nothing can ever observe: a plugin watching the connection
+        // would see nothing at all until pairing or a connection finished.
+        UiEvent::InitComplete => {
+            Event::new(abi::kinds::CONNECTION).int(fields::CONNECTION_STATE, connection::CONNECTING)
+        }
         UiEvent::Disconnected(reason) => Event::new(abi::kinds::CONNECTION)
             .int(fields::CONNECTION_STATE, connection::DISCONNECTED)
             .str(fields::REASON, reason.clone()),
@@ -285,7 +293,8 @@ pub fn from_session(event: &UiEvent) -> Option<Event> {
 pub fn kind_of(event: &UiEvent) -> Option<i32> {
     Some(match event {
         UiEvent::MessageReceived { .. } => abi::kinds::MESSAGE,
-        UiEvent::Connected
+        UiEvent::InitComplete
+        | UiEvent::Connected
         | UiEvent::Disconnected(_)
         | UiEvent::LoggedOut(_)
         | UiEvent::QrCode { .. }
@@ -392,7 +401,23 @@ mod tests {
 
     #[test]
     fn an_event_no_kind_covers_is_not_delivered() {
-        assert!(from_session(&UiEvent::InitComplete).is_none());
         assert!(from_session(&UiEvent::Error("boom".into())).is_none());
+    }
+
+    /// Every state the ABI names has to be reachable, or it is a constant
+    /// that documents something a plugin can never see. `CONNECTING` is the
+    /// one that was: it is what a front end is told when the session starts,
+    /// and a plugin heard nothing until pairing or a connection finished.
+    #[test]
+    fn the_session_starting_arrives_as_connecting() {
+        let ev = from_session(&UiEvent::InitComplete).expect("mapped");
+        assert_eq!(ev.kind, abi::kinds::CONNECTION);
+        // Carried by *not* being carried, which is the absence rule doing
+        // exactly what it is for: `CONNECTING` is zero, an integer field of
+        // zero is not stored, and `oxi_field_i64` answers zero for a field
+        // that is not there. The state a plugin reads is the state that was
+        // sent, and the frame is a byte shorter.
+        assert_eq!(fields::connection::CONNECTING, 0);
+        assert_eq!(ev.get(fields::CONNECTION_STATE), None);
     }
 }

@@ -149,6 +149,7 @@ impl Runtime {
                 subscribed: None,
                 subscribed_twice: false,
                 logged_bytes: 0,
+                field_bytes: 0,
                 commands_issued: 0,
                 trees_published: 0,
                 kv,
@@ -338,6 +339,7 @@ impl Runtime {
             guest.trees_published = 0;
             guest.commands_issued = 0;
             guest.kv_bytes = 0;
+            guest.field_bytes = 0;
         }
 
         let outcome = self.on_event.call(&mut self.store, (kind, 0));

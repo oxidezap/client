@@ -2453,3 +2453,90 @@ fn the_minimal_module_in_the_abi_document_loads() {
         "asking for nothing is asking for nothing"
     );
 }
+
+/// A plugin reading one field over and over, with a buffer big enough for it.
+///
+/// Sends only once the host refuses, so "did the budget bite" is a command
+/// rather than a stopwatch.
+fn reads_a_field_forever() -> String {
+    versioned(&format!(
+        r#"(module
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_field_str"    (func $field_str (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 8)
+  (data (i32.const 100) "a@s.whatsapp.net")
+  (data (i32.const 150) "refused")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $caps (i64.const 1))    ;; caps::SEND
+    (call $subscribe (i64.const 2))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $i i32)
+    (local $n i32)
+    (block $done
+      (loop $again
+        (local.set $n
+          (call $field_str (local.get $ev) (i32.const {text}) (i32.const 4096) (i32.const 65536)))
+        ;; A negative answer is the refusal this test is about.
+        (br_if $done (i32.lt_s (local.get $n) (i32.const 0)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br_if $again (i32.lt_s (local.get $i) (i32.const 2000)))))
+    (if (i32.lt_s (local.get $n) (i32.const 0))
+      (then (drop (call $send (i32.const 100) (i32.const 16) (i32.const 150) (i32.const 7)))))
+    (i32.const 0))
+)"#,
+        text = abi::fields::TEXT
+    ))
+}
+
+/// Fuel prices the instructions a plugin runs, and a field read is a handful
+/// of them wrapped around a memcpy the host performs. Without a budget, one
+/// ordinary message becomes as much copying as a callback's fuel can ask for
+/// — and the duty limiter only looks once that callback has returned.
+#[test]
+fn copying_one_field_over_and_over_runs_out_of_budget() {
+    let dir = TempDir::new("field-bytes");
+    dir.plugin("greedy-reader", &reads_a_field_forever());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    // A message whose text fills the buffer the plugin asks for, so the
+    // budget is reached in tens of reads rather than thousands.
+    plugins.observe(&message("a@s.whatsapp.net", &"x".repeat(64 * 1024)));
+    until("the refusal", || commands.sent().len() == 1);
+    assert_eq!(commands.sent()[0].1, "refused");
+}
+
+/// The state directory is made private before it is read, and a `chmod` does
+/// not empty it: an entry another local user left there while it was
+/// writable survives. A temporary file opened with `create` follows it.
+#[cfg(unix)]
+#[test]
+fn a_write_does_not_follow_something_already_at_its_path() {
+    let dir = TempDir::new("symlink");
+    let victim = dir.0.join("victim");
+    std::fs::write(&victim, b"keep").expect("writable");
+
+    let planted = dir.0.join("approvals.json.1.ThreadId(1).tmp");
+    std::os::unix::fs::symlink(&victim, &planted).expect("linkable");
+
+    crate::write_private(&planted, b"written").expect("the write still lands");
+
+    assert_eq!(
+        std::fs::read(&victim).expect("readable"),
+        b"keep",
+        "whatever the link pointed at is untouched"
+    );
+    assert!(
+        std::fs::symlink_metadata(&planted)
+            .expect("readable")
+            .file_type()
+            .is_file(),
+        "and the link was replaced by a file of our own"
+    );
+    assert_eq!(std::fs::read(&planted).expect("readable"), b"written");
+}
