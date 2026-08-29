@@ -262,6 +262,17 @@ impl<'a> Frames<'a> {
                 self.applied = version;
                 self.publish(FromDaemon::Account(Some(account)))?;
             }
+            // Whole every time, because a plugin's interface is published
+            // once when it starts and nothing replays it: a window that
+            // merged deltas would be a second implementation of a set the
+            // daemon already holds whole.
+            DaemonMessage::Update {
+                version,
+                event: DaemonEvent::PluginsChanged(plugins),
+            } => {
+                self.applied = version;
+                self.publish(FromDaemon::Plugins(plugins))?;
+            }
             // The one state update this front end does not derive for
             // itself. Everything else in a snapshot is rebuilt from the
             // session stream; a call the *daemon* answered is not in that
@@ -529,6 +540,16 @@ pub(super) fn catch_up(snapshot: &StateSnapshot) -> Vec<FromDaemon> {
             next: None,
         }));
     }
+    // Before the connection state, like the chat list above it and for the
+    // same reason: a window that draws its first frame without them flashes
+    // a plugin's button into the header a moment after everything else.
+    //
+    // Always, including when it is empty. A snapshot is whole state, so an
+    // empty set is the daemon saying there are none — after a plugin was
+    // removed, failed to load, or the account was reset — and skipping it
+    // would leave the previous daemon's buttons on screen with nothing behind
+    // them.
+    events.push(FromDaemon::Plugins(snapshot.plugins.clone()));
     match &snapshot.connection {
         ConnectionState::Connecting => events.push(session(UiEvent::InitComplete)),
         ConnectionState::Pairing { qr, pair_code } => {
@@ -681,6 +702,7 @@ mod tests {
             chats,
             calls: CallState::default(),
             account: None,
+            plugins: Vec::new(),
         }
     }
 

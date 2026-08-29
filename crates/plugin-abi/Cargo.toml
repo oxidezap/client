@@ -1,0 +1,31 @@
+[package]
+name = "oxidezap-plugin-abi"
+description = "The wasm ABI shared by the plugin host and every plugin SDK"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Deliberately empty, and it has to stay that way. This crate is compiled into
+# every plugin, including ones built for `wasm32-unknown-unknown` with no
+# allocator and no std, so a dependency here is a dependency in a binary whose
+# whole point is being small.
+[dependencies]
+
+[features]
+# The host side: parsing what a plugin wrote. Off by default so a plugin
+# linking this crate gets the writer and the constants and nothing else.
+default = []
+std = []
+
+# A self dev-dependency, which is the standard way to switch a feature on for
+# a crate's own tests: the parser lives behind `std`, and without this
+# `cargo test -p oxidezap-plugin-abi` would silently run none of the tests
+# that exercise it.
+[dev-dependencies]
+oxidezap-plugin-abi = { path = ".", features = ["std"] }
+
+[lints]
+workspace = true

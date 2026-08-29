@@ -8,6 +8,7 @@
 //! - `PresenceRegistry`: who is typing, and who is around
 //! - `CallVideo`, `CallVideoFrame`: which of a call's cameras are on, and the
 //!   encoded frames they produce
+//! - `PluginSurface`: what a plugin asked to have drawn, and what it may do
 //! - `UiEvent`: Events for UI updates
 
 pub mod base64;
@@ -18,6 +19,7 @@ mod calls;
 mod chat;
 mod events;
 mod message_status;
+mod plugin;
 mod presence;
 mod quoted;
 mod rich_text;
@@ -33,6 +35,7 @@ pub use chat::fallback_chat_name;
 pub use chat::{Chat, ChatMessage, DownloadableMedia, MediaContent, MediaType, Resend};
 pub use events::{ReceiptType, UiEvent};
 pub use message_status::MessageStatus;
+pub use plugin::{PluginAction, PluginNode, PluginRoot, PluginSlot, PluginSurface, PluginWidget};
 pub use presence::{
     Availability, ChatTyping, ComposingKind, PresenceRegistry, TypingSummary, Typist,
 };

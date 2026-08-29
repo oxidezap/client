@@ -71,6 +71,13 @@ pub enum FromDaemon {
     Calls(Box<CallState>),
     /// Who this device is linked as, at the moment this client attached.
     Account(Option<oxidezap_ipc::AccountIdentity>),
+    /// Every plugin the daemon has loaded, and what each wants drawn.
+    ///
+    /// State, and whole every time: a plugin published its interface when it
+    /// started and nothing replays that, so a window attaching later has only
+    /// the set the daemon holds. Republished in full whenever any of them
+    /// changes, which is what spares this side from merging deltas.
+    Plugins(Vec<oxidezap_core::PluginSurface>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
     /// One page of a conversation, for the timeline that asked for it.
@@ -684,6 +691,50 @@ impl Session {
 
     fn call(&self, action: CallAction) {
         self.tell(ClientRequest::Call(action));
+    }
+
+    /// Allow, or stop allowing, what a plugin asked to be able to do.
+    ///
+    /// Not a [`plugin_action`](Self::plugin_action) with a reserved id: an
+    /// action id comes from the plugin's own tree, so a plugin could publish
+    /// a button labelled "OK" carrying that id and be granted by somebody
+    /// pressing the wrong thing.
+    pub fn plugin_approval(&self, plugin: &str, approved: bool) {
+        self.tell(ClientRequest::PluginApproval {
+            plugin: plugin.to_string(),
+            approved,
+        });
+    }
+
+    /// Tell a plugin somebody used one of its widgets.
+    ///
+    /// Fire and forget, like typing is: the daemon hands it to the plugin and
+    /// what the plugin makes of it comes back as a new interface, or as
+    /// nothing. There is no answer to wait for, because "the plugin took it"
+    /// is not a fact this window can do anything with.
+    ///
+    /// The open chat travels along because the daemon does not know it: a
+    /// header button is about the conversation the person pressing it was
+    /// looking at, and two windows can have different ones.
+    pub fn plugin_action(
+        &self,
+        plugin: &str,
+        action: &str,
+        value: Option<String>,
+        chat_jid: Option<String>,
+        slot: oxidezap_core::PluginSlot,
+        widget: oxidezap_core::PluginWidget,
+    ) {
+        self.tell(ClientRequest::PluginAction {
+            action: oxidezap_core::PluginAction {
+                plugin: plugin.to_string(),
+                action: action.to_string(),
+                value,
+                chat_jid,
+                slot,
+                widget,
+            },
+        });
     }
 
     /// Wipe the local store and pair again.

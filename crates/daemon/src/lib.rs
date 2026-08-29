@@ -19,6 +19,12 @@
 mod claim;
 pub mod embedded;
 pub mod media;
+/// The plugin host, wired to the hub and the command channel.
+///
+/// In the library rather than the binary because the page's daemon is the
+/// library: which plugins there are — and, on the web, why there are none —
+/// is a fact about the daemon rather than about the process around it.
+pub mod plugins;
 mod publisher;
 pub mod server;
 pub mod session_bridge;

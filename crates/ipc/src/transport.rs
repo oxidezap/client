@@ -5,6 +5,23 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 19: plugins. The snapshot carries a `PluginSurface` per loaded plugin —
+/// what it is called, what it asked to be allowed to do, whether that has
+/// been allowed, and the widgets it wants drawn — `DaemonEvent::PluginsChanged`
+/// republishes the set, `ClientRequest::PluginAction` carries a widget's use
+/// back to the plugin that drew it, and `ClientRequest::PluginApproval`
+/// carries the answer to what it asked for. A v18 daemon refuses both as
+/// malformed, so an upgraded window would draw a plugin's button that could
+/// never do anything; a v18 client ignores the surfaces and simply draws
+/// none, which is why the snapshot field is skipped when empty rather than
+/// versioned separately. `capabilities` is everything it asked for and
+/// `gated` the half that acts on the account, because those are two different
+/// sentences: drawing and keeping its own settings take effect on
+/// declaration, so a consent control over them would be one that cannot be
+/// switched off. `approved` is the one field in a surface that is *not*
+/// skipped when false: a front end has to tell "waiting on you" from "this
+/// daemon does not know about approval".
+///
 /// 18: video calls. `DaemonMessage::CallVideo` carries a call's encoded
 /// frames in both directions, `DaemonMessage::CallVideoGap` says some were
 /// skipped, `ClientRequest::Call(SetVideo)` turns this
@@ -101,7 +118,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

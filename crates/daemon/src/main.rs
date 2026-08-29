@@ -4,7 +4,7 @@
 //! The process around [`oxidezap_daemon`], which is where everything it
 //! actually does lives — see that crate's own note for why the two are apart.
 
-use oxidezap_daemon::{listener, server, session_bridge, shutdown, state, tray};
+use oxidezap_daemon::{listener, plugins, server, session_bridge, shutdown, state, tray};
 
 use std::sync::Arc;
 
@@ -76,11 +76,23 @@ async fn run() -> Result<()> {
     // would let it queue payloads, and spawn session tasks, without limit.
     let (commands, command_rx) = tokio::sync::mpsc::channel(server::MAX_CLIENTS);
 
+    // After the command channel, because a plugin acts through it, and before
+    // the session, because a plugin subscribed to messages must not miss the
+    // ones that arrive while it is still loading.
+    let plugins = plugins::start(&hub, commands.clone());
+
     let mut session = {
         let hub = Arc::clone(&hub);
+        let plugins = Arc::clone(&plugins);
         let stop = Arc::clone(&stop);
         tokio::spawn(async move {
-            session_bridge::run(hub, command_rx, async move { stop.notified().await }).await
+            session_bridge::run(
+                hub,
+                plugins,
+                command_rx,
+                async move { stop.notified().await },
+            )
+            .await
         })
     };
 
@@ -111,13 +123,20 @@ async fn run() -> Result<()> {
     };
     let mut bridge = web.map(|config| {
         let hub = Arc::clone(&hub);
+        let plugins = Arc::clone(&plugins);
         let commands = commands.clone();
         let slots = Arc::clone(&slots);
-        tokio::spawn(async move { listener::web::run(config, hub, commands, slots).await })
+        tokio::spawn(async move { listener::web::run(config, hub, plugins, commands, slots).await })
     });
 
     let server_outcome = tokio::select! {
-        result = server::run(&claim, Arc::clone(&hub), commands, Arc::clone(&slots)) => {
+        result = server::run(
+            &claim,
+            Arc::clone(&hub),
+            Arc::clone(&plugins),
+            commands,
+            Arc::clone(&slots),
+        ) => {
             // Fatal, and it has to reach the exit code: a supervisor that sees
             // status zero treats a daemon nobody can connect to as a clean
             // stop and never restarts it.

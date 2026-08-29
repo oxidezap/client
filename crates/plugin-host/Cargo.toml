@@ -1,0 +1,45 @@
+[package]
+name = "oxidezap-plugin-host"
+description = "Runs .wasm plugins inside the daemon: discovery, sandbox, and the host half of the ABI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+# A 64-bit capability mask, through portable-atomic rather than std
+# (see /clippy.toml).
+portable-atomic = { workspace = true }
+log = { workspace = true }
+oxidezap-core = { workspace = true }
+oxidezap-plugin-abi = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
+# The interpreter, deliberately: wasmi has no JIT, so nothing here generates
+# code inside the process that holds the account. It also has the two things
+# that make running a stranger's module in-process defensible — fuel metering
+# and a resource limiter — and it does not implement the component model,
+# which is the trade this ABI is built around.
+# The clock behind `oxi_now_ms`, through the library's pluggable
+# TimeProvider rather than std (see /clippy.toml): a plugin observing time
+# must move when a deterministic test moves it.
+wacore = { workspace = true }
+wasmi = { version = "1.0", default-features = false, features = ["std"] }
+
+# One call, `getuid`, for the check that refuses a plugin another local
+# account could have replaced. The kernel already knows the number; the
+# alternative is a whole crate to ask it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Fixture modules are hand-written `.wat` assembled at test time. A `.wasm`
+# checked in would be a binary nobody reviews, and building one in CI would
+# mean a wasm toolchain there for the sake of six tests.
+chrono = { workspace = true, features = ["std", "clock"] }
+wat = "1.0"
+
+[lints]
+workspace = true

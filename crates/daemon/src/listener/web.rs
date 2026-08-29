@@ -104,6 +104,7 @@ const MAX_PENDING: usize = 128;
 pub async fn run(
     config: Config,
     hub: Arc<StateHub>,
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
     commands: Commands,
     slots: ClientSlots,
 ) -> Result<()> {
@@ -180,10 +181,11 @@ pub async fn run(
         };
         let config = config.clone();
         let hub = Arc::clone(&hub);
+        let plugins = Arc::clone(&plugins);
         let commands = commands.clone();
         let slots = Arc::clone(&slots);
         tokio::spawn(async move {
-            if let Err(e) = serve(stream, &config, hub, commands, slots).await {
+            if let Err(e) = serve(stream, &config, hub, plugins, commands, slots).await {
                 log::debug!("web client {peer} disconnected: {e}");
             }
             drop(permit);
@@ -196,6 +198,7 @@ async fn serve(
     stream: TcpStream,
     config: &Config,
     hub: Arc<StateHub>,
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
     commands: Commands,
     slots: ClientSlots,
 ) -> Result<()> {
@@ -276,7 +279,7 @@ async fn serve(
         let Ok(slot) = slots.try_acquire_owned() else {
             return refuse_full(stream, &key).await;
         };
-        let served = attach(stream, &key, hub, commands).await;
+        let served = attach(stream, &key, hub, plugins, commands).await;
         drop(slot);
         return served;
     }
@@ -370,6 +373,7 @@ async fn attach(
     stream: BufReader<TcpStream>,
     key: &str,
     hub: Arc<StateHub>,
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
     commands: Commands,
 ) -> Result<()> {
     let socket = upgrade(stream, key).await?;
@@ -380,7 +384,7 @@ async fn attach(
     // Sized for one frame of a history load rather than one message.
     let (server_side, bridge_side) = tokio::io::duplex(256 * 1024);
     let serving = tokio::spawn(async move {
-        if let Err(e) = crate::server::serve_client(server_side, hub, commands).await {
+        if let Err(e) = crate::server::serve_client(server_side, hub, plugins, commands).await {
             log::debug!("web client disconnected: {e}");
         }
     });
@@ -912,7 +916,8 @@ mod tests {
         };
         let hub = StateHub::new();
         let (commands, _rx) = tokio::sync::mpsc::channel(1);
-        let refused = run(exposed, hub, commands, server::client_slots()).await;
+        let plugins = Arc::new(oxidezap_plugin_host::Plugins::none(Arc::new(|_| {})));
+        let refused = run(exposed, hub, plugins, commands, server::client_slots()).await;
         let message = refused
             .expect_err("a non-loopback bind is refused")
             .to_string();

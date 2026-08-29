@@ -67,6 +67,10 @@ pub fn render_chat_header(
     // button that still looked live would place a call into nothing.
     can_send: bool,
     entity: Entity<WhatsAppApp>,
+    // What plugins want in this bar, already rendered. Elements rather than
+    // the trees they came from: this component knows where a plugin's button
+    // goes and nothing about what a plugin is.
+    plugin_actions: Vec<gpui::AnyElement>,
     layout: ResponsiveLayout,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -108,7 +112,15 @@ pub fn render_chat_header(
         .child(render_identity(
             chat, name, subtitle, presence, &entity, layout, metrics, cx,
         ))
-        .child(render_actions(chat, can_send, entity, layout, metrics, cx))
+        .child(render_actions(
+            chat,
+            can_send,
+            plugin_actions,
+            entity,
+            layout,
+            metrics,
+            cx,
+        ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -184,9 +196,11 @@ fn render_identity(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_actions(
     chat: &Chat,
     can_send: bool,
+    plugin_actions: Vec<gpui::AnyElement>,
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     metrics: Metrics,
@@ -205,10 +219,14 @@ fn render_actions(
     let overflow_entity = entity.clone();
     let search_entity = entity;
 
+    // Every native control, and none of them shrinks: the row around them
+    // does, so that what gives way on a narrow header is the plugins' region
+    // rather than Call or the overflow menu.
     let action = |id: &'static str, icon: Icon, tip: &'static str| {
         Button::new(id)
             .icon(icon)
             .ghost()
+            .flex_shrink_0()
             .tooltip(tip)
             .w(layout.icon_button_size())
             .h(layout.icon_button_size())
@@ -216,9 +234,26 @@ fn render_actions(
 
     div()
         .flex()
-        .flex_shrink_0()
+        .min_w_0()
         .items_center()
         .gap(metrics.space_xxs())
+        // Plugin controls come first so they read as belonging to the
+        // conversation rather than to the window's chrome — but in a region
+        // that may *shrink*, while the native buttons after it may not.
+        // Ordering alone would not protect them: a row that cannot shrink
+        // simply grows, taking its `min_w_0` child's bound with it, and Call
+        // and the overflow menu go off the edge of a narrow header. So the
+        // row yields, every native control refuses to, and the plugins'
+        // region is the only thing here that gives way.
+        .child(
+            div()
+                .flex()
+                .min_w_0()
+                .items_center()
+                .gap(metrics.space_xxs())
+                .overflow_hidden()
+                .children(plugin_actions),
+        )
         .when(layout.show_call_buttons(), |el| {
             el.child(
                 action(

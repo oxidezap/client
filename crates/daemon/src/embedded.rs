@@ -49,11 +49,11 @@ const PIPE: usize = 1 << 18;
 /// because on the side this exists for there is no process to end that is
 /// not the tab itself.
 pub async fn start() -> Result<DuplexStream, StartFailed> {
-    let (hub, commands) = service().await?;
+    let (hub, plugins, commands) = service().await?;
 
     let (client, server) = tokio::io::duplex(PIPE);
     oxidezap_session::spawn(async move {
-        if let Err(e) = server::serve_client(server, hub, commands).await {
+        if let Err(e) = server::serve_client(server, hub, plugins, commands).await {
             log::error!("the in-process client ended badly: {e}");
         }
         // Nothing is released here, and that is the fix rather than an
@@ -86,11 +86,25 @@ struct Service {
     /// The account, claimed. Released when the page goes, which the browser
     /// does for us: a Web Lock does not outlive the agent that holds it.
     _claim: crate::claim::Claim,
+    /// The plugin host, which on a page holds nothing.
+    ///
+    /// Built and carried rather than skipped: every front end asks the same
+    /// protocol the same questions, and a page answering "no plugins" out of
+    /// a real host is the same answer a desktop daemon with an empty folder
+    /// gives. See [`crate::plugins::start`] for why it is empty here.
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
 }
 
 /// Start this page's session if it is not already running, and hand back what
 /// a connection needs to talk to it.
-async fn service() -> Result<(Arc<StateHub>, session_bridge::Commands), StartFailed> {
+async fn service() -> Result<
+    (
+        Arc<StateHub>,
+        Arc<oxidezap_plugin_host::Plugins>,
+        session_bridge::Commands,
+    ),
+    StartFailed,
+> {
     if let Some(running) = running()? {
         return Ok(running);
     }
@@ -123,9 +137,18 @@ async fn service() -> Result<(Arc<StateHub>, session_bridge::Commands), StartFai
     // per connection is ever outstanding.
     let (commands, command_rx) = tokio::sync::mpsc::channel(server::MAX_CLIENTS);
 
+    // After the command channel, because a plugin acts through it, and before
+    // the session, because a plugin subscribed to messages must not miss the
+    // ones that arrive while it is still loading. The order is the binary's
+    // order, kept even though a page's host is empty: this is the one place
+    // the two daemons could quietly diverge, and the difference between them
+    // is meant to be what `plugins::start` says it is and nothing else.
+    let plugins = crate::plugins::start(&hub, commands.clone());
+
     oxidezap_session::spawn({
         let hub = Arc::clone(&hub);
-        async move { session_bridge::run(hub, command_rx, stopped).await }
+        let plugins = Arc::clone(&plugins);
+        async move { session_bridge::run(hub, plugins, command_rx, stopped).await }
     });
 
     SERVICE.with(|cell| {
@@ -133,9 +156,10 @@ async fn service() -> Result<(Arc<StateHub>, session_bridge::Commands), StartFai
             hub: Arc::clone(&hub),
             commands: commands.clone(),
             _claim: claim,
+            plugins: Arc::clone(&plugins),
         });
     });
-    Ok((hub, commands))
+    Ok((hub, plugins, commands))
 }
 
 /// This page's session, if it has one that is still listening.
@@ -146,7 +170,13 @@ async fn service() -> Result<(Arc<StateHub>, session_bridge::Commands), StartFai
 /// Forgetting it here lets the next session build a fresh one over the claim
 /// this page already holds — which is the page's for as long as the page is,
 /// and not something a session hands back between two of its own.
-fn running() -> Result<Option<(Arc<StateHub>, session_bridge::Commands)>, StartFailed> {
+type Running = (
+    Arc<StateHub>,
+    Arc<oxidezap_plugin_host::Plugins>,
+    session_bridge::Commands,
+);
+
+fn running() -> Result<Option<Running>, StartFailed> {
     SERVICE.with(|cell| {
         let mut slot = cell.borrow_mut();
 
@@ -174,9 +204,13 @@ fn running() -> Result<Option<(Arc<StateHub>, session_bridge::Commands)>, StartF
             return Err(StartFailed::Stopping);
         }
 
-        Ok(slot
-            .as_ref()
-            .map(|running| (Arc::clone(&running.hub), running.commands.clone())))
+        Ok(slot.as_ref().map(|running| {
+            (
+                Arc::clone(&running.hub),
+                Arc::clone(&running.plugins),
+                running.commands.clone(),
+            )
+        }))
     })
 }
 

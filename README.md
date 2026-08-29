@@ -27,6 +27,9 @@ process that opens the database, however many windows you like.
 | `oxidezap-ipc` | The protocol between the daemon and its front ends, and the client end of the transport. No runtime. |
 | `oxidezap-daemon` | `oxidezapd`: the session, the socket and the tray. |
 | `oxidezap-gui` | `oxidezap`: GPUI front end, plus video decode. Also builds to WebAssembly — see [the web front end](#the-web-front-end). |
+| `oxidezap-plugin-abi` | The wasm ABI: constants and the widget-tree codec. `no_std`, no dependencies. |
+| `oxidezap-plugin-host` | Runs `.wasm` plugins inside the daemon: discovery, the sandbox, approvals. |
+| `oxidezap-plugin` | The Rust SDK a plugin is written against. |
 
 ## Install
 
@@ -78,10 +81,17 @@ nothing about that needs a server.
 
 It can attach to an `oxidezapd` on your own machine instead, over a WebSocket
 and speaking the protocol the desktop window already speaks. That is worth
-preferring where you have one: a desktop daemon holds calls, survives the tab
-closing, and keeps your device keys in a `0700` directory rather than in a
-browser's storage. Naming one with `#daemon=` is how you choose it, and the
-rest of this section is how.
+preferring where you have one: a desktop daemon holds calls, runs your
+plugins, survives the tab closing, and keeps your device keys in a `0700`
+directory rather than in a browser's storage. Naming one with `#daemon=` is
+how you choose it, and the rest of this section is how.
+
+Plugins are the clearest case of that trade, because they are all or nothing.
+Attached to a daemon you get its plugins in full — their panels, their buttons
+in the chat header, and the permission prompt each one asks — over the same
+protocol frames the desktop window uses. A page holding its own session gets
+none, and says so where the list would be: a plugin runs on its own thread in
+the process that holds the session, and a tab has no thread to give it.
 
 ```bash
 # Nightly, because the standard library has to be rebuilt with the atomics
@@ -208,14 +218,34 @@ State lives in one SQLite file under the platform data directory
 state and chat history together. Deleting it unlinks the device and discards
 local history, which is exactly what the in-app "pair again" action does.
 
+## Plugins
+
+A plugin is a `.wasm` file dropped in `~/.local/share/oxidezap/plugins`. It
+runs inside the daemon, sees the account's events, and can declare a small
+interface — a button in a chat header, a section on the Settings screen — that
+the window draws in its own theme.
+
+There is no WASI: the `oxidezap` import module is a plugin's entire outside
+world, so a downloaded file cannot read the disk or open a socket because no
+function exists that would. What it may do *to the account* — send, mark read,
+show a typing indicator — is withheld until you say yes, and withdrawing that
+answer takes effect on the plugin's next command rather than after its queue
+drains.
+
+Copy `examples/template` to start one, or read `docs/plugin-abi.md` if you are
+writing in something other than Rust — the SDK is a convenience over that
+document and has no privileged access to anything.
+
 ## Known limitations
 
 * Voice calls only. The library's call facade is 1:1 audio, so video calls,
   group calls and output-device selection are drawn but disabled.
 * Spacing does not yet follow the rem scale, so the UI ignores base-font zoom.
-* The web build is the window only. It reaches a daemon on your own machine
-  directly, and one elsewhere only through a tunnel you set up; see [the web
-  front end](#the-web-front-end) for what it drops.
+* The web build runs the whole client, but not all of it: no video decode, no
+  voice-note recording, no calls and no plugins, and its storage is a
+  browser's rather than a `0700` directory. Attaching it to a daemon on your
+  own machine gets those back; one elsewhere is reachable only through a
+  tunnel you set up. See [the web front end](#the-web-front-end).
 
 ## License
 

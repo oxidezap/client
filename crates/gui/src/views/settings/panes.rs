@@ -30,6 +30,7 @@ pub fn render(
         SettingsSection::Privacy => privacy(entity.clone(), metrics, cx),
         SettingsSection::Storage => storage(app, entity, metrics, cx),
         SettingsSection::Advanced => advanced(metrics, cx),
+        SettingsSection::Plugins => plugins(app, entity, metrics, cx),
         // Rendered by its own module.
         SettingsSection::Appearance => div().into_any_element(),
     };
@@ -57,6 +58,53 @@ pub fn group(
         .gap(metrics.space_lg())
         .child(heading)
         .child(content)
+}
+
+/// The loaded plugins, each with what it may do and whatever it drew for
+/// itself.
+///
+/// A list of what is running rather than a place to install anything: a
+/// plugin is a file in a folder, and a screen that pretended otherwise would
+/// be describing a mechanism this daemon does not have.
+fn plugins(
+    app: &WhatsAppApp,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> AnyElement {
+    let ctx = crate::components::PluginContext { entity, metrics };
+    if app.plugins().is_empty() {
+        // Two different empty lists, and only one of them is waiting for a
+        // file. Where the daemon cannot run plugins at all, advice about a
+        // folder is advice nobody can take — see
+        // [`crate::platform::plugins_unavailable`].
+        let (heading, detail) = crate::platform::plugins_unavailable().map_or_else(
+            || {
+                (
+                    "None loaded",
+                    "Drop a .wasm file in the plugins folder and restart".to_string(),
+                )
+            },
+            |why| ("Not available here", why.to_string()),
+        );
+        return group(
+            label("PLUGINS", metrics, cx),
+            card(vec![(heading.to_string(), detail)], metrics, cx),
+            metrics,
+        )
+        .into_any_element();
+    }
+
+    group(
+        label("PLUGINS", metrics, cx),
+        div().flex().flex_col().gap(metrics.space_lg()).children(
+            app.plugins().iter().map(|surface| {
+                crate::components::plugin_ui::settings_entry(surface, app, &ctx, cx)
+            }),
+        ),
+        metrics,
+    )
+    .into_any_element()
 }
 
 /// A short all-caps section label.

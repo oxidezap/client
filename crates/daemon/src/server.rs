@@ -107,6 +107,7 @@ const OUTBOX_CAPACITY: usize = 64;
 pub async fn run(
     claim: &Claim,
     hub: Arc<StateHub>,
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
     commands: Commands,
     slots: ClientSlots,
 ) -> Result<()> {
@@ -139,11 +140,12 @@ pub async fn run(
         };
 
         let hub = Arc::clone(&hub);
+        let plugins = Arc::clone(&plugins);
         let commands = commands.clone();
         // Per-connection task: one slow or malformed client cannot hold up
         // the accept loop or any other client.
         tokio::spawn(async move {
-            if let Err(e) = serve_client(stream, hub, commands).await {
+            if let Err(e) = serve_client(stream, hub, plugins, commands).await {
                 log::debug!("client disconnected: {e}");
             }
             drop(slot);
@@ -430,7 +432,12 @@ enum FrameRead {
 /// # Errors
 ///
 /// The connection ended, or the peer said something unrecoverable.
-pub(crate) async fn serve_client<S>(stream: S, hub: Arc<StateHub>, commands: Commands) -> Result<()>
+pub(crate) async fn serve_client<S>(
+    stream: S,
+    hub: Arc<StateHub>,
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
+    commands: Commands,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -649,7 +656,7 @@ where
                         updates = hub.subscribe();
                         awaiting_resync = false;
                     }
-                    let answer = handle_request(request, &hub, &commands, &outbox).await;
+                    let answer = handle_request(request, &hub, &plugins, &commands, &outbox).await;
                     if let Some(frame) = answer.frame {
                         write_line(&mut writer, &frame).await?;
                     }
@@ -801,6 +808,7 @@ impl Answer {
 async fn handle_request(
     Request { id, request }: Request,
     hub: &StateHub,
+    plugins: &Arc<oxidezap_plugin_host::Plugins>,
     commands: &Commands,
     outbox: &Outbox,
 ) -> Answer {
@@ -1024,6 +1032,31 @@ async fn handle_request(
         // thing however it was asked — including when there is none to raise.
         ClientRequest::ShowWindow => {
             crate::window::show(hub);
+            acted(Ok(()))
+        }
+        // Not dispatched to the session: a plugin action touches the account
+        // only if the plugin decides it should, and what it decides is its
+        // own business. Handing it over is the whole of the daemon's part,
+        // which is why this answers `Accepted` rather than waiting — the
+        // plugin's own answer reaches it inside the sandbox, where a socket
+        // front end's never could.
+        ClientRequest::PluginAction { action } => {
+            plugins.act(&action);
+            acted(Ok(()))
+        }
+        // The one thing about a plugin that a plugin has no say in. Answered
+        // rather than dispatched, like the action above: what the plugin does
+        // with its new permissions is its own business and arrives as a
+        // republished surface.
+        ClientRequest::PluginApproval { plugin, approved } => {
+            // On a blocking thread, because answering one is a file written
+            // and renamed: on a single-worker runtime that stalls the session
+            // bridge and every other connection for as long as the disk takes,
+            // and on any runtime it spends a worker on I/O. Awaited rather
+            // than spawned loose, so the acknowledgement still means the
+            // answer is recorded.
+            let plugins = Arc::clone(plugins);
+            let _ = tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved)).await;
             acted(Ok(()))
         }
         // The acknowledgement goes out first; see the caller.
@@ -1263,6 +1296,12 @@ mod tests {
         tokio::sync::mpsc::channel(OUTBOX_CAPACITY).0
     }
 
+    /// A host with nothing loaded, for the requests that are not about
+    /// plugins — which is every request but one.
+    fn no_plugins() -> Arc<oxidezap_plugin_host::Plugins> {
+        Arc::new(oxidezap_plugin_host::Plugins::none(Arc::new(|_| {})))
+    }
+
     fn parse(frame: Option<String>) -> DaemonMessage {
         serde_json::from_str(&frame.expect("every request gets an answer")).unwrap()
     }
@@ -1292,7 +1331,7 @@ mod tests {
             local_id: None,
             quoted: None,
         });
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Accepted { .. }
@@ -1319,7 +1358,7 @@ mod tests {
             jid: "a@s.whatsapp.net".into(),
             through_message_id: None,
         });
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error {
@@ -1343,7 +1382,7 @@ mod tests {
             local_id: None,
             quoted: None,
         });
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error {
@@ -1368,7 +1407,7 @@ mod tests {
             local_id: None,
             quoted: None,
         });
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error {
@@ -1393,8 +1432,14 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
-        let answer =
-            handle_request(bare(ClientRequest::Shutdown), &hub, &commands, &outbox()).await;
+        let answer = handle_request(
+            bare(ClientRequest::Shutdown),
+            &hub,
+            &no_plugins(),
+            &commands,
+            &outbox(),
+        )
+        .await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Accepted { .. }
@@ -1412,7 +1457,12 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
-        let served = tokio::spawn(serve_client(server, Arc::clone(&hub), commands));
+        let served = tokio::spawn(serve_client(
+            server,
+            Arc::clone(&hub),
+            no_plugins(),
+            commands,
+        ));
         client
             .write_all(format!("{}\n", hello(PROTOCOL_VERSION, false)).as_bytes())
             .await
@@ -1466,7 +1516,7 @@ mod tests {
         let mut signals = hub.subscribe_signals();
 
         let request = bare(ClientRequest::ShowWindow);
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Accepted { .. }
@@ -1635,7 +1685,12 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
-        let served = tokio::spawn(serve_client(server, Arc::clone(&hub), commands));
+        let served = tokio::spawn(serve_client(
+            server,
+            Arc::clone(&hub),
+            no_plugins(),
+            commands,
+        ));
         client
             .write_all(format!("{}\n", hello(PROTOCOL_VERSION, false)).as_bytes())
             .await
@@ -1678,7 +1733,12 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Accepted);
 
-        let served = tokio::spawn(serve_client(server, Arc::clone(&hub), commands));
+        let served = tokio::spawn(serve_client(
+            server,
+            Arc::clone(&hub),
+            no_plugins(),
+            commands,
+        ));
         client
             .write_all(format!("{}\n", hello(PROTOCOL_VERSION, true)).as_bytes())
             .await
@@ -1750,7 +1810,7 @@ mod tests {
                 quoted: None,
             },
         };
-        let answer = handle_request(request, &hub, &commands, &outbox()).await;
+        let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
             DaemonMessage::Error {
@@ -1771,7 +1831,9 @@ mod tests {
 
         // Returns rather than parking forever; the paused clock reaches the
         // handshake deadline as soon as nothing else can run.
-        serve_client(server, hub, commands).await.unwrap();
+        serve_client(server, hub, no_plugins(), commands)
+            .await
+            .unwrap();
 
         let mut answer = String::new();
         BufReader::new(client).read_line(&mut answer).await.unwrap();
@@ -1840,22 +1902,46 @@ mod tests {
             "a second daemon must not get in"
         );
 
-        // Released with the handle, so a restart is not blocked by the last run.
+        // Released with the handle, so a restart is not blocked by the last
+        // run.
+        //
+        // Retried, and not because the property is doubtful: on an idle
+        // machine the first attempt succeeds and this loop never sleeps. It
+        // is here because the immediate assertion failed twice on the macOS
+        // runner and nowhere else, which a single attempt reports as "the
+        // lock outlived its holder" — a claim about this code that the
+        // evidence does not support, since re-acquiring works everywhere it
+        // can be reproduced.
+        //
+        // The likeliest mechanism is that a `flock` belongs to the *open file
+        // description*, which `fork` duplicates: a child spawned by another
+        // test in this binary (`window::tests::launching` starts a shell that
+        // sleeps) holds this descriptor from the moment it is forked until it
+        // execs, so dropping the handle here releases nothing until it does.
+        // That is a hypothesis — it did not reproduce under load here — which
+        // is why this waits for the lock rather than asserting anything about
+        // why it was briefly unavailable. What it still refuses is a lock
+        // that is never released.
         drop(first);
+        // The library's clock, which is what this repo uses everywhere: a
+        // test that moved time would move this with it.
+        let deadline = wacore::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut last = None;
-        let mut released = false;
-        for _ in 0..100 {
+        let regained = loop {
             match acquire_startup_lock(&socket) {
-                Ok(_) => {
-                    released = true;
-                    break;
+                Ok(lock) => break Some(lock),
+                Err(e) if wacore::time::Instant::now() < deadline => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                Err(e) => last = Some(e),
+                Err(e) => {
+                    last = Some(e);
+                    break None;
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        };
         assert!(
-            released,
+            regained.is_some(),
             "lock outlived its holder: {}",
             last.map_or_else(|| "no reason given".to_string(), |e| e.to_string())
         );

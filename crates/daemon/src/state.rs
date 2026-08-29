@@ -130,6 +130,13 @@ struct Inner {
     /// State for the same reason the calls are: announced on connect, once,
     /// and a client attaching afterwards never saw it.
     account: Option<oxidezap_ipc::AccountIdentity>,
+    /// Every loaded plugin, and what each wants drawn.
+    ///
+    /// State like the calls are: a plugin publishes its interface when it
+    /// starts, once, and a window attaching an hour later never saw that
+    /// happen. Held whole rather than per plugin, because a set of some
+    /// plugins is not a snapshot of the set.
+    plugins: Vec<oxidezap_core::PluginSurface>,
     /// Chats keyed by JID. A map, not a Vec: every update is a lookup by JID,
     /// and a Vec would make a rename or a receipt O(n) over every chat.
     chats: std::collections::HashMap<String, ChatEntry>,
@@ -137,6 +144,9 @@ struct Inner {
 
 pub struct StateHub {
     inner: Mutex<Inner>,
+    /// Held from inside the state lock until a frame is on the channel, so
+    /// versions leave in the order they were assigned. See [`StateHub::apply`].
+    ordering: Mutex<()>,
     /// Pre-serialized frames. `Arc<str>` so fanning out to N clients costs N
     /// refcount bumps rather than N serializations.
     updates: broadcast::Sender<Arc<str>>,
@@ -200,11 +210,13 @@ impl StateHub {
             unread: 0,
         });
         Arc::new(Self {
+            ordering: Mutex::new(()),
             inner: Mutex::new(Inner {
                 version: StateVersion::INITIAL,
                 connection: ConnectionState::Connecting,
                 calls: oxidezap_core::CallState::default(),
                 account: None,
+                plugins: Vec::new(),
                 chats: std::collections::HashMap::new(),
             }),
             updates,
@@ -317,6 +329,7 @@ impl StateHub {
             chats,
             calls: inner.calls.clone(),
             account: inner.account.clone(),
+            plugins: inner.plugins.clone(),
         }
     }
 
@@ -335,6 +348,32 @@ impl StateHub {
             return;
         }
         self.apply(Change::live(DaemonEvent::AccountChanged(account)));
+    }
+
+    /// Record what the plugins are now, and tell everyone.
+    ///
+    /// Called from a plugin's own thread rather than from the event loop,
+    /// which is the one place in this file that is true. The lock already
+    /// covers the mutation and the version bump together, so it costs
+    /// nothing beyond the note: a plugin republishing its tree is a writer
+    /// like the bridge is.
+    ///
+    /// A set that did not change consumes no version and sends no frame — a
+    /// plugin that redraws the same button on every message is the ordinary
+    /// case, not the exception.
+    pub fn set_plugins(&self, plugins: Vec<oxidezap_core::PluginSurface>) {
+        // The guard is bound and dropped before `apply` takes the lock again.
+        // An `if self.lock()… { }` would rely on where a condition's
+        // temporaries die, which is a rule nobody should have to recall to
+        // see that this does not deadlock.
+        let unchanged = {
+            let inner = self.lock();
+            inner.plugins == plugins
+        };
+        if unchanged {
+            return;
+        }
+        self.apply(Change::live(DaemonEvent::PluginsChanged(plugins)));
     }
 
     /// Change what is happening on the call front, and tell everyone.
@@ -357,12 +396,17 @@ impl StateHub {
                 None
             } else {
                 inner.version = inner.version.next();
-                Some((inner.version, inner.calls.clone()))
+                // Taken before the state lock goes, like `apply` does it.
+                let order = self
+                    .ordering
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Some((inner.version, inner.calls.clone(), order))
             }
         };
 
-        if let Some((version, calls)) = published {
-            self.broadcast(version, DaemonEvent::CallsChanged(calls));
+        if let Some((version, calls, order)) = published {
+            self.broadcast(version, DaemonEvent::CallsChanged(calls), order);
         }
     }
 
@@ -374,12 +418,16 @@ impl StateHub {
     /// is logged and the phantom outgoing call stays on screen with no way
     /// to end it. Saying the state again is what takes it back.
     pub fn republish_calls(&self) {
-        let (version, calls) = {
+        let (version, calls, order) = {
             let mut inner = self.lock();
             inner.version = inner.version.next();
-            (inner.version, inner.calls.clone())
+            let order = self
+                .ordering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (inner.version, inner.calls.clone(), order)
         };
-        self.broadcast(version, DaemonEvent::CallsChanged(calls));
+        self.broadcast(version, DaemonEvent::CallsChanged(calls), order);
     }
 
     /// What is happening on the call front right now.
@@ -471,7 +519,18 @@ impl StateHub {
     /// observer can read a state whose version has not caught up.
     pub fn apply(&self, change: Change) -> StateVersion {
         let Change { event, from_store } = change;
-        let (version, tray) = {
+        // Taken before the state lock is released and held across the send, so
+        // frames leave in the order their versions were assigned. There is
+        // more than one writer now — a plugin publishes from its own thread
+        // while the session bridge publishes from its task — and a client
+        // drops any frame it has already passed, so version N broadcast after
+        // N+1 is not late, it is *lost*: the widget change or the approval in
+        // it would sit stale until something unrelated published again.
+        //
+        // Hand-over-hand rather than broadcasting under the state lock: the
+        // order is fixed here, and the serialization that follows happens with
+        // the state free.
+        let (version, tray, order) = {
             let mut inner = self.lock();
             inner.version = inner.version.next();
 
@@ -506,12 +565,17 @@ impl StateHub {
                 DaemonEvent::AccountChanged(account) => {
                     inner.account = Some(account.clone());
                 }
+                DaemonEvent::PluginsChanged(plugins) => inner.plugins = plugins.clone(),
             }
 
-            (inner.version, inner.tray_state())
+            let order = self
+                .ordering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (inner.version, inner.tray_state(), order)
         };
 
-        self.broadcast(version, event);
+        self.broadcast(version, event, order);
 
         // `send_if_modified` so an update that leaves the tray identical wakes
         // nothing: receipts and typing churn state constantly without changing
@@ -533,7 +597,12 @@ impl StateHub {
     /// Serializes once, and only when someone is listening: with no clients
     /// the daemon still tracks state for the tray, but pays nothing to format
     /// frames nobody reads.
-    fn broadcast(&self, version: StateVersion, event: DaemonEvent) {
+    fn broadcast(
+        &self,
+        version: StateVersion,
+        event: DaemonEvent,
+        _order: std::sync::MutexGuard<'_, ()>,
+    ) {
         if self.updates.receiver_count() == 0 {
             return;
         }
@@ -953,6 +1022,58 @@ mod tests {
         hub.apply(stored(chat("a@s.whatsapp.net", 0, 10)));
         hub.apply(live(chat("a@s.whatsapp.net", 1, 20)));
         assert_eq!(hub.store_backed_chat_jids(), ["a@s.whatsapp.net"]);
+    }
+
+    fn surface(id: &str, label: &str) -> oxidezap_core::PluginSurface {
+        oxidezap_core::PluginSurface {
+            id: id.into(),
+            name: id.into(),
+            capabilities: vec!["send messages".into()],
+            gated: vec!["send messages".into()],
+            approved: true,
+            roots: vec![oxidezap_core::PluginRoot {
+                slot: oxidezap_core::PluginSlot::ChatHeader,
+                node: oxidezap_core::PluginNode {
+                    widget: oxidezap_core::PluginWidget::Button,
+                    id: "go".into(),
+                    label: label.into(),
+                    value: String::new(),
+                    enabled: true,
+                    checked: false,
+                    children: Vec::new(),
+                },
+            }],
+            stopped: None,
+        }
+    }
+
+    /// A plugin's interface is state, so it has to be in the snapshot a
+    /// window attaching an hour later is handed: nothing replays the moment a
+    /// plugin published it.
+    #[test]
+    fn a_plugins_interface_reaches_a_client_that_attached_afterwards() {
+        let hub = StateHub::new();
+        hub.set_plugins(vec![surface("autoreply", "Answer")]);
+        let snapshot = hub.snapshot();
+        assert_eq!(snapshot.plugins.len(), 1);
+        assert_eq!(snapshot.plugins[0].roots[0].node.label, "Answer");
+    }
+
+    /// A plugin republishes its whole tree whenever anything of its own
+    /// changes, which for one that redraws on every message is most of them.
+    /// Consuming a version for a set that did not move would wake every front
+    /// end for a redraw of the same buttons.
+    #[test]
+    fn republishing_the_same_plugins_consumes_no_version() {
+        let hub = StateHub::new();
+        hub.set_plugins(vec![surface("autoreply", "Answer")]);
+        let after_first = hub.snapshot().version;
+
+        hub.set_plugins(vec![surface("autoreply", "Answer")]);
+        assert_eq!(hub.snapshot().version, after_first, "nothing moved");
+
+        hub.set_plugins(vec![surface("autoreply", "Reply")]);
+        assert!(hub.snapshot().version > after_first, "a label did");
     }
 
     /// With nobody connected the daemon still tracks state, but must not pay

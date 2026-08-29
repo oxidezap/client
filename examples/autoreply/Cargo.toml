@@ -1,0 +1,36 @@
+[package]
+name = "autoreply"
+description = "Example oxidezap plugin: answers a keyword, configurable from Settings"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+
+# Its own workspace. This crate builds for `wasm32-unknown-unknown` and links
+# against imports only the daemon provides, so a `cargo build` at the repo
+# root would try to link it for the host and fail at every `oxi_*` symbol.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oxidezap-plugin = { path = "../../crates/plugin-sdk" }
+
+# The SDK's test host, so this plugin's handlers can be run by `cargo test` on
+# an ordinary machine rather than only inside the daemon. A dev-dependency, so
+# the `.wasm` this crate ships carries none of it — and so the `no_std` build
+# stays `no_std`, since the host needs a heap.
+[dev-dependencies]
+oxidezap-plugin = { path = "../../crates/plugin-sdk", features = ["testing"] }
+
+# What makes the output tens of kilobytes rather than hundreds: no unwinding
+# tables, one codegen unit for LTO to work across, and size over speed in a
+# module whose hot path is a string comparison.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
