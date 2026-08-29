@@ -549,12 +549,26 @@ async fn preflight(
     origin: Option<&str>,
     private_network: bool,
 ) -> Result<()> {
+    stream
+        .write_all(preflight_head(origin, private_network).as_bytes())
+        .await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// The preflight's headers, so what a browser is told can be asserted.
+fn preflight_head(origin: Option<&str>, private_network: bool) -> String {
     let mut head = String::from(
         "HTTP/1.1 204 No Content\r\n\
          Content-Length: 0\r\n\
          Connection: close\r\n",
     );
     if let Some(origin) = origin {
+        // Without a lifetime a browser picks its own, and Chrome's is five
+        // seconds — which is one preflight per photo, and a preflight is a
+        // whole connection and round trip before the one that fetches. A
+        // history load naming a hundred photos paid for two hundred.
+        head.push_str("Access-Control-Max-Age: 600\r\n");
         head.push_str(&format!(
             "Access-Control-Allow-Origin: {origin}\r\n\
              Access-Control-Allow-Methods: GET, OPTIONS\r\n\
@@ -565,9 +579,7 @@ async fn preflight(
         head.push_str("Access-Control-Allow-Private-Network: true\r\n");
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).await?;
-    stream.flush().await?;
-    Ok(())
+    head
 }
 
 async fn respond(
@@ -895,6 +907,20 @@ mod tests {
                 "{origin} was served"
             );
         }
+    }
+
+    /// A preflight with no lifetime on it is one the browser repeats, and
+    /// Chrome repeats it after five seconds — so a history load naming a
+    /// hundred photos spends a hundred extra round trips before the fetches
+    /// that carry the pictures, and the ones that miss the frame's budget are
+    /// drawn as media that is not there.
+    #[test]
+    fn a_preflight_says_how_long_it_is_good_for() {
+        let head = preflight_head(Some("https://oxidezap.github.io"), true);
+        assert!(
+            head.contains("Access-Control-Max-Age:"),
+            "the browser was told nothing, so it asks again per photo: {head}"
+        );
     }
 
     /// A client that sends no `Origin` is not a page — a page cannot suppress
