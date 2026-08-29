@@ -1140,6 +1140,16 @@ microphone already was, and so do plugins, for the same kind of reason. WebCodec
 bindings rather than JavaScript — they are API changes rather than backends,
 which is why neither is done here.
 
+Declining is the exception, and the exception is instructive. A page cannot
+answer a call, but it *does* tell the caller to stop ringing: `client.voip()`
+and `reject` carry no `cfg` — their stanza builders live in `wacore` — so
+what the `voip` feature gates is the media stack and never the signalling.
+This module concluded the opposite for a long time, from a real measurement
+of the wrong question: enabling the feature for wasm does pull mio and fail
+exactly as its comment described, which says nothing about a function that
+never needed it. When a comment says something is impossible, reproduce the
+impossibility it describes before believing it.
+
 **A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
 is there because cross-origin isolation needs two response headers GitHub Pages
 will not set, and the price is that it also caches the bundle: an ordinary
