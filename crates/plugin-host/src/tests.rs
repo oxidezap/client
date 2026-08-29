@@ -940,6 +940,24 @@ fn a_plugin_stopped_for_falling_behind_is_offered_nothing_more() {
     }
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(commands.sent().len(), settled, "it is not still working");
+
+    // And it is not merely idle: the channel is closed, which is what wakes
+    // the worker out of `recv` and lets the thread, its `Store`, its linear
+    // memory and everything still queued go. Held open, a plugin that
+    // overflowed — the one holding the most of all of that — kept it until
+    // the daemon shut down.
+    assert!(
+        crate::lock(&plugins.workers[0].queue).is_none(),
+        "a stopped plugin's queue is closed, not left standing"
+    );
+    plugins.workers[0]
+        .thread
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .take()
+        .expect("the worker thread")
+        .join()
+        .expect("it ends on its own");
 }
 
 /// The snprintf contract, both halves: the answer is the value's *full*

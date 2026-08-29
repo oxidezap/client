@@ -566,12 +566,12 @@ impl Plugins {
         if !self.registry.is_running(&worker.id) {
             return;
         }
-        let queue = lock(&worker.queue);
-        let Some(queue) = queue.as_ref() else {
+        let mut queue = lock(&worker.queue);
+        let Some(sender) = queue.as_ref() else {
             // Shutting down. Nothing left to hand it.
             return;
         };
-        match queue.try_send(job) {
+        match sender.try_send(job) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.registry.stop(
@@ -582,6 +582,16 @@ impl Plugins {
                     "plugin {}: stopped, {QUEUE_DEPTH} events behind and not catching up",
                     worker.id
                 );
+                // And the channel goes with it, which is the same rule
+                // shutdown keeps: a stop message has to fit, and this queue is
+                // full by definition. Closed, the worker wakes out of `recv`
+                // and ends — releasing the thread, the `Store`, up to four
+                // megabytes of linear memory and every event still queued,
+                // which are the very things the plugin that overflowed is
+                // holding most of. Left open, all of it stayed until the
+                // daemon shut down, and the backlog could never drain because
+                // this method refuses to queue anything more.
+                *queue = None;
             }
             // Its thread is gone, which means it already trapped and the
             // registry already carries the reason.
