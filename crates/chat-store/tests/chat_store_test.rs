@@ -6632,6 +6632,33 @@ async fn a_view_never_regresses_a_row() {
     );
 }
 
+/// A token the tokenizer throws away leaves a phrase with no terms in it.
+/// FTS5 answers that with a syntax error, which reached the caller as a
+/// storage failure rather than the invalid-query answer the API promises.
+#[cfg(feature = "search")]
+#[tokio::test]
+async fn a_query_of_punctuation_is_an_invalid_query_not_a_storage_error() {
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("reunião amanhã"),
+            incoming_info(PEER, PEER, "MSG-FTS-PUNCT", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    for query in ["-", "...", "- ;"] {
+        assert!(
+            matches!(
+                chat_store.search_messages(query, 10).await,
+                Err(oxidezap_chat_store::ChatStoreError::InvalidSearchQuery)
+            ),
+            "{query:?} names no term to search for"
+        );
+    }
+}
+
 /// A read covers both halves of a PN/LID pair, and the message key includes
 /// the chat: until a split is merged the same message exists under both. Drawn
 /// twice it fills two slots of the page's limit and moves the cursor past a

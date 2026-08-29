@@ -68,12 +68,20 @@ fn ensure_fts_inner(conn: &mut SqliteConnection) -> QueryResult<()> {
     Ok(())
 }
 
-/// Turn free text into an FTS5 query: each whitespace token becomes a quoted
-/// prefix term (`"tok"*`), AND-combined. Sidesteps FTS5 operator syntax so
-/// user input can't produce a syntax error.
+/// Turn free text into an FTS5 query: each whitespace token that carries a
+/// term becomes a quoted prefix term (`"tok"*`), AND-combined. Sidesteps FTS5
+/// operator syntax so user input can't produce a syntax error, and answers
+/// `None` when nothing in the input is a term at all.
 fn build_match_query(input: &str) -> Option<String> {
     let mut query = String::with_capacity(input.len() + 8);
     for token in input.split_whitespace() {
+        // A token the tokenizer throws away leaves a phrase with no terms in
+        // it, which FTS5 answers with a syntax error: the caller then sees a
+        // storage failure where the API promises an invalid query, and the
+        // search box reports a database problem on every such keystroke.
+        if !token.chars().any(char::is_alphanumeric) {
+            continue;
+        }
         if !query.is_empty() {
             query.push(' ');
         }
