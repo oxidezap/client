@@ -1185,7 +1185,13 @@ by definition.
   Durability is the other half. The window's VFS is relaxed-IndexedDB, which
   writes changed blocks after the commit rather than during it, so a tab killed
   in that window loses the commit — a message that comes back on the next
-  hydration, or a ratchet that has to re-establish. The durable answer is OPFS
+  hydration, or a ratchet that has to re-establish. Nor is an ordinary commit
+  *observable*: the VFS answers for an import, a deletion and a clear, and
+  hands back nothing for the writes a session makes — so a quota the browser
+  refuses has nowhere to be reported, and the account behaves perfectly all
+  session and is gone on the next load. What the store does about that is say
+  the headroom out loud when it opens, which is a warning rather than a fix.
+  The durable answer is OPFS
   through a synchronous access handle, which exists in a dedicated worker and
   nowhere else, so it arrives with the worker. It changes nothing above
   `session/store/`, which is why that interface is three functions.
