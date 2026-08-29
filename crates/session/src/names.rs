@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use log::warn;
 use oxidezap_chat_store::ChatStore;
 use oxidezap_core::fallback_chat_name;
 use whatsapp_rust::client::Client;
@@ -162,11 +163,17 @@ impl NameBook {
         if let Some(known) = read(&self.contacts, &key) {
             return known;
         }
-        let name = store
-            .contact(jid)
-            .await
-            .ok()
-            .flatten()
+        // An error is not an answer, so it is not written down: memoizing it
+        // would file somebody as nameless for the rest of the session over a
+        // pool that was busy for a moment.
+        let contact = match store.contact(jid).await {
+            Ok(contact) => contact,
+            Err(e) => {
+                warn!("Address book lookup for {} failed: {}", key, e);
+                return None;
+            }
+        };
+        let name = contact
             .and_then(|contact| contact.display_name().map(str::to_owned))
             .filter(|name| !name.trim().is_empty());
         write(&self.contacts, key, name.clone());
