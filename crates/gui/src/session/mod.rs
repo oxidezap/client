@@ -301,6 +301,11 @@ pub struct Session {
     /// are read and taken by the window. See [`FromDaemon::CallFrames`].
     frames: crate::video::LatestFrames,
     /// How this connection's reader is ended when this goes.
+    ///
+    /// Last, and that is load-bearing on a named pipe: fields drop in
+    /// declaration order, so the write half is released with `link` before
+    /// the hangup runs. Cancelling a pipe read disconnects nothing — the
+    /// pipe breaks when the last handle to it closes.
     teardown: Teardown,
 }
 

@@ -252,7 +252,7 @@ fn reconnecting_does_not_leak_a_client() {
 
     let mut highest = 0;
     for _ in 0..RECONNECTS {
-        let (reader, _writer) = Endpoint::connect_at(&path)
+        let (reader, writer) = Endpoint::connect_at(&path)
             .expect("connect")
             .split()
             .expect("split");
@@ -269,6 +269,13 @@ fn reconnecting_does_not_leak_a_client() {
         std::thread::sleep(Duration::from_millis(50));
         highest = highest.max(live.load(Ordering::SeqCst));
 
+        // The order a `Session` goes in: the write half first, then the
+        // hangup that ends the read. It is load-bearing on a named pipe,
+        // where cancelling the read does not disconnect anything — the pipe
+        // breaks when the last handle to it closes, and the reader's is the
+        // last only once this one has gone. A socket is shut down instead,
+        // so there the order does not show.
+        drop(writer);
         hangup.hang_up();
         assert!(
             matches!(
