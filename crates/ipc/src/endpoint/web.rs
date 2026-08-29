@@ -312,8 +312,21 @@ pub enum NamedDaemon {
 /// The daemon this page was pointed at, if it was pointed at one.
 #[must_use]
 pub fn named_daemon() -> NamedDaemon {
-    let Some(asked) = query_parameter("daemon") else {
-        return NamedDaemon::Nobody;
+    let asked = match read_parameter("daemon") {
+        Parameter::Present(asked) => asked,
+        Parameter::Absent => return NamedDaemon::Nobody,
+        // Named, and not readable — a truncated `%` in a pasted URL is the
+        // usual way. Refused rather than ignored: ignoring it opens a session
+        // against this origin's own store for somebody who asked for a
+        // daemon, which is the substitution `Rejected` exists to prevent.
+        Parameter::Unreadable => {
+            log::error!("ignoring #daemon=: the value is not decodable");
+            return NamedDaemon::Rejected(
+                "The #daemon in this page's address could not be read — a percent escape in it \
+                 is incomplete. Correct it, or remove it to let this page run its own session."
+                    .to_string(),
+            );
+        }
     };
     // A query parameter is whatever put the user on this page, which may be a
     // link somebody sent them. The daemon it names is handed the message
@@ -407,7 +420,7 @@ fn usable_endpoint(url: &str) -> Result<(), String> {
     // `hostname`, not `host`: no port, no userinfo, and already lowercased
     // and unwrapped from the brackets an IPv6 literal carries.
     let host = parsed.hostname();
-    if is_loopback_host(&host) {
+    if super::is_loopback_host(&host) {
         return Ok(());
     }
     // The page's own origin: a deployment that serves the bridge beside
@@ -451,14 +464,6 @@ fn usable_endpoint(url: &str) -> Result<(), String> {
         parsed.protocol(),
         parsed.host()
     ))
-}
-
-/// Whether a host names this machine.
-///
-/// A parsed hostname, so there is no port and no userinfo left to be confused
-/// by — and `localhost.example.com` is simply a different string.
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
 
 /// Where the media this daemon has cached can be fetched from.
@@ -602,9 +607,36 @@ fn flag_present(name: &str) -> bool {
     location.hash().is_ok_and(names) || location.search().is_ok_and(names)
 }
 
+/// One query parameter off the page's own URL, or why there is none.
+///
+/// Three answers rather than two, for the same reason [`NamedDaemon`] has
+/// three: "nobody wrote one" and "somebody wrote one this cannot read" lead
+/// to opposite places. A truncated `%` in a pasted URL is the ordinary way to
+/// arrive at the second, and collapsing it into the first started a session
+/// against the browser's own store for somebody who had asked for a daemon.
+enum Parameter {
+    /// Not in the fragment or the query.
+    Absent,
+    /// There, and not decodable — a malformed percent escape.
+    Unreadable,
+    /// There, and decoded.
+    Present(String),
+}
+
 /// One query parameter off the page's own URL.
 fn query_parameter(name: &str) -> Option<String> {
-    let location = web_sys::window()?.location();
+    match read_parameter(name) {
+        Parameter::Present(value) => Some(value),
+        Parameter::Absent | Parameter::Unreadable => None,
+    }
+}
+
+/// The same, keeping the distinction [`query_parameter`] discards.
+fn read_parameter(name: &str) -> Parameter {
+    let Some(window) = web_sys::window() else {
+        return Parameter::Absent;
+    };
+    let location = window.location();
 
     // The fragment first, and it is where the answer is meant to be.
     //
@@ -613,25 +645,31 @@ fn query_parameter(name: &str) -> Option<String> {
     // before a single line of this runs. The fragment is never sent: browsers
     // strip it from the request, which is exactly why the implicit OAuth flow
     // used it for the same purpose.
-    if let Ok(hash) = location.hash()
-        && let Some(found) = find_parameter(hash.trim_start_matches('#'), name)
-    {
-        return Some(found);
+    if let Ok(hash) = location.hash() {
+        match find_parameter(hash.trim_start_matches('#'), name) {
+            found @ (Parameter::Present(_) | Parameter::Unreadable) => return found,
+            Parameter::Absent => {}
+        }
     }
 
     // The query still answers, because refusing would not un-send it. What it
     // does is say so: the URL is already in somebody's logs, and the only
     // repair is a new token and a bookmark that uses `#`.
-    let found = find_parameter(location.search().ok()?.trim_start_matches('?'), name)?;
-    log::warn!(
-        "?{name}= was read from the query string, which the page's host has already been sent. \
-         Put it after a `#` instead — and if it carried a token, draw a new one."
-    );
-    Some(found)
+    let Ok(search) = location.search() else {
+        return Parameter::Absent;
+    };
+    let found = find_parameter(search.trim_start_matches('?'), name);
+    if matches!(found, Parameter::Present(_)) {
+        log::warn!(
+            "?{name}= was read from the query string, which the page's host has already been \
+             sent. Put it after a `#` instead — and if it carried a token, draw a new one."
+        );
+    }
+    found
 }
 
 /// One `key=value` out of an `&`-separated list.
-fn find_parameter(pairs: &str, name: &str) -> Option<String> {
+fn find_parameter(pairs: &str, name: &str) -> Parameter {
     for pair in pairs.split('&') {
         // `continue`, not `?`. Returning from the whole function on the first
         // parameter without a value made `?debug&daemon=…` resolve to nothing
@@ -640,10 +678,15 @@ fn find_parameter(pairs: &str, name: &str) -> Option<String> {
             continue;
         };
         if key == name {
-            return decode_component(value);
+            // Undecodable is an answer, not the absence of one: the name is
+            // there and this is the value somebody meant.
+            return match decode_component(value) {
+                Some(decoded) => Parameter::Present(decoded),
+                None => Parameter::Unreadable,
+            };
         }
     }
-    None
+    Parameter::Absent
 }
 
 /// Percent-decoding, through the browser's own decoder.

@@ -959,7 +959,7 @@ mod tests {
 pub fn token() -> Result<String> {
     let path = oxidezap_ipc::web_token_path().context("no per-user directory for the web token")?;
 
-    if let Ok(existing) = std::fs::read_to_string(&path) {
+    if let Some(existing) = read_private(&path)? {
         let existing = existing.trim().to_string();
         if !existing.is_empty() {
             return Ok(existing);
@@ -981,6 +981,92 @@ pub fn token() -> Result<String> {
     Ok(drawn)
 }
 
+/// Read the token back, refusing anything that is not the file we wrote.
+///
+/// A bearer credential is only worth the guarantee that nobody else can name
+/// it, and following a symlink hands that guarantee to whoever planted the
+/// link: the directory is `0700` today, but an installation that predates
+/// that — or one whose state directory somebody widened — can already have a
+/// `web.token` pointing at a file another account controls. Read through it
+/// and the daemon comes up with a bearer token that account knows, which is
+/// the whole session.
+///
+/// So the link is not followed, and the file it would have been is checked
+/// for the three things "we wrote this" means: a regular file, owned by this
+/// user, readable by nobody else. Anything else is an error rather than a
+/// token redrawn over it — writing would follow the same link, which is the
+/// worse half of the same problem, and a state directory in that condition is
+/// something a person has to look at.
+///
+/// # Errors
+///
+/// The path is there and is not ours. Absent is not an error: that is the
+/// first run, and the caller draws one.
+#[cfg(unix)]
+fn read_private(path: &std::path::Path) -> Result<Option<String>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let opened = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    );
+    let fd = match opened {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        // `ELOOP` is precisely the case this exists for: something is there
+        // and it is a symlink. Named rather than folded into the rest,
+        // because the rest are ordinary I/O failures and this one is not.
+        Err(rustix::io::Errno::LOOP) => anyhow::bail!(
+            "{} is a symbolic link. The web token is a bearer credential and this one would be \
+             somebody else's file; remove it and start again.",
+            path.display()
+        ),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("opening {}", path.display()))),
+    };
+
+    let mut file = std::fs::File::from(fd);
+    let about = file
+        .metadata()
+        .with_context(|| format!("reading the type and owner of {}", path.display()))?;
+    let us = rustix::process::getuid().as_raw();
+    let wrong = if !about.is_file() {
+        Some("not a regular file")
+    } else if about.uid() != us {
+        Some("owned by another user")
+    } else if about.mode() & 0o077 != 0 {
+        Some("readable by other users")
+    } else {
+        None
+    };
+    if let Some(wrong) = wrong {
+        anyhow::bail!(
+            "{} is {wrong}. The web token is a bearer credential for this account's WhatsApp \
+             session; remove it and start again.",
+            path.display()
+        );
+    }
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(contents))
+}
+
+/// The same, where the directory is already inside the user's own profile.
+///
+/// There is no other account to defend against on the path a Windows profile
+/// takes, which is the same reason [`write_private`] has nothing to set there.
+#[cfg(not(unix))]
+fn read_private(path: &std::path::Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
+    }
+}
+
 /// Create the token file readable by nobody else.
 ///
 /// The mode is set as the file is created rather than after: a token that is
@@ -990,11 +1076,16 @@ fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> 
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
+    // `O_NOFOLLOW`, for the reason [`read_private`] does not follow one
+    // either: writing through a planted link would put this account's bearer
+    // token into a file somebody else can read, which is worse than reading
+    // theirs.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
         .open(path)?;
     file.write_all(contents.as_bytes())
 }
@@ -1027,6 +1118,66 @@ mod token_tests {
             allowed_origins: Vec::new(),
             token: TEST_TOKEN.to_string(),
         }
+    }
+
+    /// What the token file has to be before it is believed.
+    ///
+    /// The link case is the one with teeth: a state directory that predates
+    /// the `0700` rule, or one somebody widened, can already hold a
+    /// `web.token` pointing somewhere another account writes — and following
+    /// it would hand that account a bearer token for this WhatsApp session.
+    #[cfg(unix)]
+    #[test]
+    fn a_token_file_that_is_not_ours_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("oxidezap-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory to test in");
+
+        // Absent is not a failure: it is the first run.
+        assert!(
+            read_private(&dir.join("missing"))
+                .expect("absent is not an error")
+                .is_none()
+        );
+
+        // Ours, and private: read back verbatim.
+        let ours = dir.join("web.token");
+        write_private(&ours, "0123456789abcdef").expect("write the token");
+        assert_eq!(
+            read_private(&ours).expect("ours reads back").as_deref(),
+            Some("0123456789abcdef")
+        );
+
+        // A link, however inviting what it points at.
+        let planted = dir.join("planted");
+        std::fs::write(&planted, "attacker-known").expect("the file it points at");
+        let link = dir.join("linked.token");
+        std::os::unix::fs::symlink(&planted, &link).expect("plant the link");
+        assert!(read_private(&link).is_err(), "a symlink must be refused");
+        // And the write refuses it too, which is the half that would have
+        // leaked our own token rather than adopted theirs.
+        assert!(write_private(&link, "ours").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&planted).expect("read what it points at"),
+            "attacker-known",
+            "the token was written through the link"
+        );
+
+        // Ours, but not private.
+        let open = dir.join("open.token");
+        write_private(&open, "0123456789abcdef").expect("write the token");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o644)).expect("widen it");
+        assert!(
+            read_private(&open).is_err(),
+            "a readable token must be refused"
+        );
+
+        // A directory is not a token either.
+        assert!(read_private(&dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The check the whole endpoint stands on. Reaching a loopback port is
