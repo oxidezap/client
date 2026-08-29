@@ -25,13 +25,30 @@
          was not told to expect, so without them a release build fails on the
          first `memory.init` — "Bulk memory operations require bulk memory" —
          and again on the first atomic. They are not optimizations; they are
-         the shape of the module. -->
+         the shape of the module.
+
+         `data-wasm-opt` is the optimization, and it is declared because the
+         default is trunk's rather than ours and trunk is not pinned — the
+         Pages workflow installs whatever `taiki-e/install-action` resolves to
+         that day, so the level our bundle is built at was a property of the
+         runner. It was also not `z`: measured against the same
+         wasm-bindgen output, trunk's release default produced 29,825,238
+         bytes and `-Oz` produced 29,419,240.
+
+         Nothing here strips anything, because there is nothing left to strip:
+         `strip = true` in the release profile removes the name section before
+         wasm-opt ever sees the module, and `wasm-objdump -h` on the shipped
+         artifact lists exactly one custom section, `producers`, at 72 bytes.
+         Which is also the warning worth leaving: a DevTools flame graph of
+         this page has no Rust symbols in it and never had. Build with
+         `WEB_PROFILE=debug ./web/build.sh` when you need them. -->
     <link
       data-trunk
       rel="rust"
       href="../crates/gui/Cargo.toml"
       data-bin="oxidezap"
       data-bindgen-target="web"
+      data-wasm-opt="z"
       data-wasm-opt-params="--enable-bulk-memory --enable-threads --enable-mutable-globals --enable-nontrapping-float-to-int --enable-sign-ext"
     />
 
