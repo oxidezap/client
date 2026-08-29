@@ -176,6 +176,31 @@ pub fn has(key: &str) -> bool {
     with(|cache| cache.entries.contains_key(key))
 }
 
+/// Claim `key` for a delivery, if it is here.
+///
+/// [`has`] asks; this one *takes responsibility*. The difference matters on
+/// the one path that answers a request out of an entry it did not write: a
+/// download whose bytes were already cached is reported successful
+/// immediately, and between that answer and the front end reading it, another
+/// media write's sweep — or a "clear cached media" — can take an entry
+/// nothing is holding. The asker is then told a download it was promised is
+/// missing.
+///
+/// So the promise and the claim are the same act. Touched as well as pinned,
+/// because an entry about to be handed over is the last one the sweep should
+/// be eyeing.
+pub fn claim(key: &str) -> bool {
+    with(|cache| {
+        let Some(entry) = cache.entries.get_mut(key) else {
+            return false;
+        };
+        cache.clock += 1;
+        entry.touched = cache.clock;
+        entry.pinned = true;
+        true
+    })
+}
+
 /// What the media cache occupies: bytes, and how many entries.
 pub fn cache_usage() -> (u64, u64) {
     with(|cache| (cache.held, cache.entries.len() as u64))

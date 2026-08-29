@@ -327,6 +327,13 @@ impl WhatsAppApp {
             UiEvent::CallEndedElsewhere(call_id) => {
                 info!("Call {call_id} was handled on another device");
             }
+            // Nothing to draw and nothing to write down: the removal that
+            // carries this also carries `Ending::Nothing`, which is what the
+            // conversation reads. Logged so a refused accept is not silent to
+            // whoever is reading the console.
+            UiEvent::CallUnrecorded(call_id) => {
+                info!("Call {call_id} left no record: it was never answered here");
+            }
             // The correction, not the request: the state it names is what the
             // session found on the handle after an announcement that did not
             // go out as asked. What the window draws comes from the daemon's

@@ -507,6 +507,14 @@ impl Bridge {
             UiEvent::CallEndedElsewhere(id) => self.hub.calls(|s| {
                 s.end_elsewhere(id);
             }),
+            // Marked before it is ended, because ending is what publishes the
+            // removal and the explanation has to be in that same frame — a
+            // reason arriving after the record it was meant to change is no
+            // reason at all.
+            UiEvent::CallUnrecorded(id) => self.hub.calls(|s| {
+                s.mark_unrecorded(id);
+                s.end(id);
+            }),
             UiEvent::AccountUpdated { name, jid, lid } => {
                 self.hub.set_account(oxidezap_ipc::AccountIdentity {
                     name: name.clone(),
@@ -946,7 +954,11 @@ impl Bridge {
         let key = crate::media::download_key(&media.file_enc_sha256);
         // Already here: the same media shared into two chats, or a front end
         // that restarted. No network, no permit, no wait.
-        if crate::media::has(&key) {
+        //
+        // Claimed rather than asked about, because the next line promises it:
+        // an entry nothing is holding can be swept between this answer and
+        // the front end reading it. See `media::claim`.
+        if crate::media::claim(&key) {
             answer_now(&answer_to, downloaded(id, Ok(key)));
             return CommandOutcome::Accepted;
         }

@@ -198,6 +198,19 @@ pub enum UiEvent {
     /// answered or refused it. Not a missed call: the device that took it has
     /// the entry, and this one has nothing true to write down.
     CallEndedElsewhere(CallId),
+    /// This call is over and there is nothing honest to write down about it.
+    ///
+    /// For a call the *daemon* had already staged before the session refused
+    /// it: the front end drew a card, the state said the call was connecting,
+    /// and then nothing happened. Ending it on its own would be indexed as an
+    /// ordinary call — a zero-second one, in the conversation, for a call
+    /// nobody ever answered.
+    ///
+    /// A separate event rather than a flag on [`Self::CallEnded`] because it
+    /// is a different fact: `CallEnded` says a call finished, and this says
+    /// there was none. It reaches [`CallState::mark_unrecorded`], which is the
+    /// same door the daemon uses when it refuses a call a window has drawn.
+    CallUnrecorded(CallId),
     /// Who this device is linked as.
     ///
     /// Sent on connect and whenever the push name changes, rather than only

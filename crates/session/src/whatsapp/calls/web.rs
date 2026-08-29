@@ -86,7 +86,20 @@ impl WhatsAppClient {
     /// With or without video, and the second is not a near miss: the picture
     /// would need an encoder as much as the voice needs one, and both are C.
     pub fn accept_call(&self, call_id: &str, _with_video: bool) {
-        self.refuse_call(call_id, "answered");
+        // `CallUnrecorded`, not the shared refusal. The daemon stages an
+        // accept optimistically — `CallState::connect` before the backend is
+        // asked — so by the time this runs the call is drawn as connecting in
+        // every window. Ending it like an ordinary call would write a
+        // zero-second call into the conversation for one that was never
+        // answered, and the peer is still ringing meanwhile.
+        warn!("a call cannot be answered in a browser: there is no audio codec here");
+        let ui_sender = self.ui_sender.clone();
+        let call_id = call_id.to_string();
+        self.exec.spawn(async move {
+            if let Some(tx) = ui_sender.lock().await.as_ref() {
+                let _ = tx.send(UiEvent::CallUnrecorded(call_id));
+            }
+        });
     }
 
     /// Refused for the same reason as accepting.

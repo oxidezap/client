@@ -24,7 +24,7 @@ mod platform;
 ///
 pub use platform::wipe;
 
-pub use platform::{cache_usage, has, put, put_owned, take};
+pub use platform::{cache_usage, claim, has, put, put_owned, take};
 /// Read without removing, where the front end is this process. See `web.rs`.
 #[cfg(target_family = "wasm")]
 pub use platform::{deliver, read};
