@@ -1463,6 +1463,13 @@ fn cache_media(cache_epoch: usize, message_id: &str, media: &mut Option<MediaCon
 /// full outbox is handed to a task that waits on the connection's own writer.
 /// The frame is dropped only when the connection itself is gone, which is the
 /// one case where there is nobody left to tell.
+///
+/// Delivery is therefore by id and not by order: a frame parked here can be
+/// overtaken by the next one if that one fits, so two pages of one paged
+/// `LoadMessages` can arrive the wrong way round. Every answer names its
+/// `RequestId` and a front end matches on it, so nothing is lost. Serializing
+/// would mean a spill queue per connection, which buys an ordering nothing
+/// reads at the cost of a second buffer per client.
 fn answer_now(answer_to: &Outbox, frame: String) {
     use tokio::sync::mpsc::error::TrySendError;
     if let Err(TrySendError::Full(frame)) = answer_to.try_send(frame) {
