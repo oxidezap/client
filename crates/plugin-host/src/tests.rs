@@ -2512,6 +2512,30 @@ fn the_minimal_module_in_the_abi_document_loads() {
         surfaces[0].capabilities.is_empty(),
         "asking for nothing is asking for nothing"
     );
+
+    // And the codes it prints are the ones the ABI defines. The document is
+    // the contract for anyone not using the SDK, so a constant that moved
+    // under it is a plugin reading the wrong answer.
+    for (code, name) in [
+        (abi::outcome::ACCEPTED, "ACCEPTED"),
+        (abi::outcome::NO_SESSION, "NO_SESSION"),
+        (abi::outcome::REFUSED, "REFUSED"),
+        (abi::outcome::DENIED, "DENIED"),
+        (abi::outcome::INVALID, "INVALID"),
+        (abi::outcome::STATE, "STATE"),
+    ] {
+        assert!(
+            doc.contains(&format!("| `{code}` | `{name}` |")),
+            "the outcome table does not print {name} as {code}"
+        );
+    }
+
+    // Including the one an allowance that is spent answers with, which the
+    // table used to leave to be discovered.
+    assert!(
+        doc.contains("allowance that is spent answers with"),
+        "the document has to say which code a spent budget answers with"
+    );
 }
 
 /// A plugin reading one field over and over, with a buffer big enough for it.

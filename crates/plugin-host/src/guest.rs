@@ -645,7 +645,10 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 return abi::outcome::DENIED;
             }
             if !c.data_mut().spend_command() {
-                return abi::outcome::STATE;
+                // Refused rather than `STATE`: the moment is fine, the
+                // allowance is spent. `STATE` is "right call, wrong moment",
+                // which sends a plugin looking for a moment that never comes.
+                return abi::outcome::REFUSED;
             }
             let (jid, text) = match (
                 read_str(&mut c, jid, jid_len),
@@ -680,7 +683,10 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 return abi::outcome::DENIED;
             }
             if !c.data_mut().spend_command() {
-                return abi::outcome::STATE;
+                // Refused rather than `STATE`: the moment is fine, the
+                // allowance is spent. `STATE` is "right call, wrong moment",
+                // which sends a plugin looking for a moment that never comes.
+                return abi::outcome::REFUSED;
             }
             let (Ok(jid), Ok(text), Ok(quoted)) = (
                 read_str(&mut c, jid, jid_len),
@@ -708,7 +714,10 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 return abi::outcome::DENIED;
             }
             if !c.data_mut().spend_command() {
-                return abi::outcome::STATE;
+                // Refused rather than `STATE`: the moment is fine, the
+                // allowance is spent. `STATE` is "right call, wrong moment",
+                // which sends a plugin looking for a moment that never comes.
+                return abi::outcome::REFUSED;
             }
             let (Ok(jid), Ok(id)) = (read_str(&mut c, jid, jid_len), read_str(&mut c, id, id_len))
             else {
@@ -735,7 +744,10 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 return abi::outcome::DENIED;
             }
             if !c.data_mut().spend_command() {
-                return abi::outcome::STATE;
+                // Refused rather than `STATE`: the moment is fine, the
+                // allowance is spent. `STATE` is "right call, wrong moment",
+                // which sends a plugin looking for a moment that never comes.
+                return abi::outcome::REFUSED;
             }
             let Ok(jid) = read_str(&mut c, jid, jid_len) else {
                 return abi::outcome::INVALID;
@@ -760,7 +772,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // it without spending fuel.
             let published = &mut c.data_mut().trees_published;
             if *published >= MAX_UI_PER_CALL {
-                return abi::outcome::STATE;
+                // The same distinction: an allowance that is spent is a
+                // refusal, not a moment to wait for.
+                return abi::outcome::REFUSED;
             }
             *published += 1;
             let Ok(len) = usize::try_from(len) else {
@@ -1206,8 +1220,12 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
     // bounded the lookups and not the copying: a one byte key over an eight
     // kilobyte value bought a million reads with the budget it spent, and
     // every one of them a memcpy the host performs and fuel does not price.
+    // Refused, not absent. The two are different facts and a plugin acts on
+    // them differently: read as absent, a setting comes back as its default,
+    // and the plugin then redraws with those defaults and writes them over
+    // the user's configuration on the next action.
     if end > MAX_KV_BYTES_PER_CALL.saturating_sub(guest.kv_bytes) {
-        return abi::ABSENT;
+        return abi::outcome::REFUSED;
     }
     guest.kv_bytes += end;
     let Some(value) = guest.kv.get(key) else {
