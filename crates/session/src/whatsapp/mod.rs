@@ -521,11 +521,16 @@ impl WhatsAppClient {
         // Transport, HTTP client and runtime come from whichever platform
         // this is: the library's default features on a desktop, `web-sys`
         // bindings in a page. See `crate::net`.
-        let bot = match crate::net::with_platform_plugins(Bot::builder())
-            .with_backend(backend)
-            .build()
-            .await
-        {
+        // Which version to announce is the platform's answer, because only one
+        // of the two can go and look: the desktop lets the library fetch
+        // WhatsApp's own `sw.js`, and a page is refused that by CORS. See
+        // `net::app_version`.
+        let builder = crate::net::with_platform_plugins(Bot::builder()).with_backend(backend);
+        let builder = match crate::net::app_version().await {
+            Some(version) => builder.with_version(version),
+            None => builder,
+        };
+        let bot = match builder.build().await {
             Ok(bot) => bot,
             Err(e) => {
                 error!("Failed to build bot: {}", e);

@@ -60,3 +60,89 @@ pub(crate) fn with_platform_plugins<B>(
         .with_http_client(web::BrowserHttpClient)
         .with_runtime(web::BrowserRuntime)
 }
+
+/// Which client version to announce, where this side has to decide it.
+///
+/// `None` means "let the library find out", which is what a desktop does: it
+/// fetches `https://web.whatsapp.com/sw.js` once a day and reads
+/// `client_revision` out of it.
+///
+/// A page cannot. That request is a cross-origin `fetch` and WhatsApp sends
+/// no `Access-Control-Allow-Origin`, so the browser blocks it before it goes
+/// out and the session never gets past "failed to resolve app version",
+/// retrying forever behind its backoff. Measured on the deployed page rather
+/// than guessed — and the socket to `wss://web.whatsapp.com/ws/chat` opens
+/// from that same origin quite happily, because a WebSocket upgrade is not
+/// subject to the same-origin policy and a `fetch` is.
+///
+/// `no-cors` is not a way round it: it yields an opaque response whose body
+/// cannot be read, and the body is the whole point. A proxy is the other way,
+/// and it would mean this bundle needs a server — the one thing the web build
+/// exists not to need.
+pub(crate) async fn app_version() -> Option<(u32, u32, u32)> {
+    platform_version().await
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn platform_version() -> Option<(u32, u32, u32)> {
+    None
+}
+
+#[cfg(target_family = "wasm")]
+async fn platform_version() -> Option<(u32, u32, u32)> {
+    Some(web::app_version().await)
+}
+
+/// `2.3000.1046291534-alpha` and the like, down to three numbers.
+///
+/// Anything after the third is dropped: the feed marks pre-release builds
+/// with a suffix, and the wire wants the triple. Parsed strictly rather than
+/// leniently, because the value comes from somewhere this code does not
+/// control — a field that is not three integers is a feed to ignore, not a
+/// number to guess at.
+///
+/// Here rather than beside its one caller in [`web`], so that it can be
+/// tested: a test inside a `wasm32`-only module is a test that runs nowhere.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+fn parse_version(named: &str) -> Option<(u32, u32, u32)> {
+    let digits = named.split('-').next()?;
+    let mut parts = digits.split('.');
+    let mut triple = [0u32; 3];
+    for slot in &mut triple {
+        *slot = parts.next()?.parse::<u32>().ok()?;
+    }
+    // A fourth component would mean this is not the shape it was taken for.
+    parts
+        .next()
+        .is_none()
+        .then_some((triple[0], triple[1], triple[2]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_version;
+
+    #[test]
+    fn a_release_version_reads_back_as_three_numbers() {
+        assert_eq!(
+            parse_version("2.3000.1045368834"),
+            Some((2, 3000, 1045368834))
+        );
+    }
+
+    /// What the feed actually serves today, suffix and all.
+    #[test]
+    fn a_prerelease_suffix_is_dropped() {
+        assert_eq!(
+            parse_version("2.3000.1046291534-alpha"),
+            Some((2, 3000, 1046291534))
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_three_numbers_is_refused() {
+        for bad in ["", "2.3000", "2.3000.1.4", "2.3000.x", "latest", "-alpha"] {
+            assert_eq!(parse_version(bad), None, "{bad} should not parse");
+        }
+    }
+}

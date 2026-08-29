@@ -6252,6 +6252,7 @@ dependencies = [
  "oxidezap-core",
  "oxidezap-video",
  "portable-atomic",
+ "serde_json",
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",
  "tokio",
