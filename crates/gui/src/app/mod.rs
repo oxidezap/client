@@ -2840,11 +2840,28 @@ fn read_bound(chat: &Chat) -> ReadBound {
     }
 }
 
+/// The newest message in `chat` that the daemon has also seen.
+///
+/// Which excludes a send this window has drawn optimistically as well as its
+/// own notices: the id is invented here (`next_local_id`) and the daemon has
+/// never heard of it. That matters because messages sort by `(timestamp, id)`
+/// and `"local_…"` sorts after the uppercase hex the server issues, so a
+/// reply arriving in the same second as a send still in flight left the local
+/// id as the newest — the daemon refuses a read naming a message it does not
+/// know, the badge clears here anyway, no receipt goes out, and the next
+/// hydration puts it straight back.
 fn newest_shared_message(chat: &Chat) -> Option<String> {
     chat.messages
         .iter()
         .rev()
-        .find(|message| message.system.is_none())
+        .find(|message| {
+            message.system.is_none()
+                && !(message.is_from_me
+                    && matches!(
+                        message.status,
+                        MessageStatus::Pending | MessageStatus::Failed
+                    ))
+        })
         .map(|message| message.id.clone())
 }
 
@@ -3154,6 +3171,38 @@ mod tests {
             None,
             "a@s.whatsapp.net"
         ));
+    }
+
+    /// A read is bounded by an id the daemon knows, and a send this window
+    /// has only drawn is not one: `local_…` sorts after the server's
+    /// uppercase hex, so a reply landing in the same second as a send still
+    /// in flight left the invented id as the newest. The daemon refuses it,
+    /// the badge clears here anyway, no receipt goes out, and the next
+    /// hydration puts the badge back.
+    #[test]
+    fn a_read_is_not_bounded_by_a_message_only_this_window_has() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        let mut theirs = ChatMessage::new_incoming(
+            "3EB0ABCDEF".to_string(),
+            "a@s.whatsapp.net".to_string(),
+            "oi".to_string(),
+        );
+        theirs.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut mine = ChatMessage::new_incoming(
+            "local_1".to_string(),
+            "me@s.whatsapp.net".to_string(),
+            "já respondo".to_string(),
+        );
+        mine.is_from_me = true;
+        mine.status = MessageStatus::Pending;
+        mine.timestamp = theirs.timestamp;
+        chat.messages = vec![theirs, mine];
+
+        assert_eq!(
+            newest_shared_message(&chat).as_deref(),
+            Some("3EB0ABCDEF"),
+            "the newest message both sides hold"
+        );
     }
 
     /// A page of older history arrives in front of every message the list
