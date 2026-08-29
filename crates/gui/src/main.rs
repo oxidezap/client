@@ -34,6 +34,9 @@ fn main() {
     crate::platform::logging();
     // Before anything reads it: the first read is what settles the default.
     crate::platform::clocks();
+    // Before the session exists, so the ask cannot be missed: `shutdown` keeps
+    // a permit for one that arrives early.
+    crate::platform::watch_for_departure();
     open_the_window();
 }
 
