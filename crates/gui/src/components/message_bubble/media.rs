@@ -594,6 +594,7 @@ fn render_video_player(
     let is_error = state.is_error();
     let scrim = cx.product().hsla(cx.product().palette.scrim);
     let on_scrim = cx.product().hsla(cx.product().palette.on_scrim);
+    let metrics = cx.product().metrics;
 
     div()
         .relative()
@@ -660,8 +661,7 @@ fn render_video_player(
                 .when(is_playing, |el| el.bg(scrim.opacity(0.)))
                 .child(if is_loading {
                     div()
-                        .w(px(48.))
-                        .h(px(48.))
+                        .size(metrics.media_control())
                         .rounded_full()
                         .bg(scrim.opacity(0.55))
                         .flex()
@@ -686,8 +686,7 @@ fn render_video_player(
                     // way the composer asks `CAN_RECORD`: it is a property of
                     // the build, not of this clip.
                     div()
-                        .w(px(48.))
-                        .h(px(48.))
+                        .size(metrics.media_control())
                         .rounded_full()
                         .bg(scrim.opacity(0.55))
                         .flex()
@@ -696,7 +695,7 @@ fn render_video_player(
                         .child(
                             Icon::new(IconName::Eye)
                                 .text_color(on_scrim.opacity(0.6))
-                                .size(px(20.)),
+                                .size(metrics.icon_media()),
                         )
                         .into_any_element()
                 } else if is_error {
@@ -708,8 +707,7 @@ fn render_video_player(
                     // `div` there was no way to reach a failed video from the
                     // keyboard at all.
                     div()
-                        .w(px(48.))
-                        .h(px(48.))
+                        .size(metrics.media_control())
                         .rounded_full()
                         .bg(cx.theme().danger.opacity(0.65))
                         .flex()
@@ -717,7 +715,11 @@ fn render_video_player(
                         .items_center()
                         .child(
                             Button::new(button_id)
-                                .icon(Icon::new(IconName::Redo).text_color(on_scrim).size(px(20.)))
+                                .icon(
+                                    Icon::new(IconName::Redo)
+                                        .text_color(on_scrim)
+                                        .size(metrics.icon_media()),
+                                )
                                 .ghost()
                                 .disabled(downloadable.is_none())
                                 .on_click({
@@ -739,7 +741,7 @@ fn render_video_player(
                             Icon::default()
                                 .path("icons/play.svg")
                                 .text_color(on_scrim)
-                                .size(px(32.)),
+                                .size(metrics.icon_media_large()),
                         )
                         .ghost()
                         .disabled(!can_download)
@@ -766,7 +768,7 @@ fn render_video_player(
                                 // fixed white is a guess about someone else's
                                 // video.
                                 .text_color(on_scrim.opacity(0.6))
-                                .size(px(24.)),
+                                .size(metrics.icon_media_playing()),
                         )
                         .ghost()
                         .on_click({

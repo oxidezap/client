@@ -397,6 +397,60 @@ impl Metrics {
     pub fn icon_small(&self) -> Pixels {
         self.scaled(14.0)
     }
+    /// A glyph over media: bigger than a toolbar's, because the wash behind
+    /// it is a picture rather than a surface.
+    pub fn icon_media(&self) -> Pixels {
+        self.scaled(20.0)
+    }
+    /// The play control at the centre of a video.
+    pub fn icon_media_large(&self) -> Pixels {
+        self.scaled(32.0)
+    }
+    /// The same, once a video is playing and the control gives way to it.
+    pub fn icon_media_playing(&self) -> Pixels {
+        self.scaled(24.0)
+    }
+
+    // ---- fine geometry ------------------------------------------------
+    //
+    // Small enough to look like constants and not be: they are drawn beside
+    // type and rows that move with the base font, so a hairline that stayed
+    // one pixel at double the base is a line that has quietly halved.
+
+    /// The narrowest a drawn bar gets, and the floor under a bar whose height
+    /// is a level: a waveform column at silence is still a column.
+    pub fn bar_thin(&self) -> Pixels {
+        self.scaled(2.0)
+    }
+    /// A level meter's column.
+    pub fn bar(&self) -> Pixels {
+        self.scaled(3.0)
+    }
+    /// A dot in a row of them, as the connecting indicator draws.
+    pub fn dot_small(&self) -> Pixels {
+        self.scaled(3.0)
+    }
+    /// A single status dot beside a label.
+    pub fn dot(&self) -> Pixels {
+        self.scaled(6.0)
+    }
+    /// The floor under a badge that is otherwise a fraction of its avatar.
+    pub fn badge_min(&self) -> Pixels {
+        self.scaled(10.0)
+    }
+    /// The round control drawn over a video: play, retry, or the spinner.
+    pub fn media_control(&self) -> Pixels {
+        self.scaled(48.0)
+    }
+    /// A status ring's stroke, and the breathing room between it and the
+    /// avatar inside. Rem-derived like the row height the ring is sized
+    /// against.
+    pub fn ring_thickness(&self) -> Pixels {
+        self.scaled(2.0)
+    }
+    pub fn ring_gap(&self) -> Pixels {
+        self.scaled(3.0)
+    }
 
     // ---- timeline -----------------------------------------------------
 
@@ -427,6 +481,15 @@ impl Metrics {
     pub fn reaction_height(&self) -> Pixels {
         self.dense(22.0)
     }
+    /// How far beyond the viewport the timeline keeps rows laid out.
+    ///
+    /// About a screen either way, which is a claim about the rows rather than
+    /// about the glass: at double the base font a fixed 800px is no longer a
+    /// screen, and a flick lands on rows nobody has measured.
+    pub fn timeline_overdraw(&self) -> Pixels {
+        self.scaled(800.0)
+    }
+
     /// One line of body text in a bubble.
     pub fn line_height(&self) -> Pixels {
         self.scaled(22.0)

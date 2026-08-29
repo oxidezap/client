@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use gpui::{
     App, Bounds, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, SharedString, Styled, canvas, div, prelude::FluentBuilder as _, px,
+    ParentElement, Pixels, SharedString, Styled, canvas, div, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -187,7 +187,7 @@ fn render_waveform(
                 .w(metrics.waveform_bar_width())
                 // A floor so silence still reads as part of the clip rather
                 // than a gap in it.
-                .h((height * (level as f32 / 100.0)).max(px(2.0)))
+                .h((height * (level as f32 / 100.0)).max(metrics.bar_thin()))
                 .rounded_full()
                 .bg(if position <= progress {
                     played
@@ -204,7 +204,7 @@ fn render_waveform(
                     .top_0()
                     .bottom_0()
                     .left(gpui::relative(progress))
-                    .w(px(2.0))
+                    .w(metrics.bar_thin())
                     .rounded_full()
                     .bg(playhead),
             )
@@ -307,7 +307,7 @@ fn format_speed(speed: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{point, size};
+    use gpui::{point, px, size};
 
     #[test]
     fn an_absent_envelope_draws_flat_rather_than_inventing_a_shape() {

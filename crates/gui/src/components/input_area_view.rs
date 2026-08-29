@@ -569,7 +569,7 @@ fn render_level(level: f32, metrics: Metrics, cx: &App) -> impl IntoElement + us
             let envelope = 0.35 + 0.65 * (position * std::f32::consts::PI).sin();
             div()
                 .w(metrics.waveform_bar_width())
-                .h((full * envelope * level).max(gpui::px(2.0)))
+                .h((full * envelope * level).max(metrics.bar_thin()))
                 .rounded_full()
                 .bg(cx.theme().primary)
         }))

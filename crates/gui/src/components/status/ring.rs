@@ -18,7 +18,7 @@
 //! the border and its gap are added on the outside.
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::{App, Hsla, IntoElement, ParentElement, Pixels, Styled, div, px};
+use gpui::{App, Hsla, IntoElement, ParentElement, Pixels, Styled, div};
 use gpui_component::ActiveTheme as _;
 
 use crate::components::Avatar;
@@ -45,10 +45,11 @@ pub fn status_ring(
 ) -> impl IntoElement + use<> {
     let lit = cx.theme().primary;
     let spent = cx.product().hsla(cx.product().palette.faint_foreground);
-    let thickness = px(2.0);
-    let gap = px(3.0);
+    let metrics = cx.product().metrics;
+    let thickness = metrics.ring_thickness();
+    let gap = metrics.ring_gap();
     // The avatar gives way to the ring rather than the other way round.
-    let inner = (size - (thickness + gap) * 2.0).max(px(1.0));
+    let inner = (size - (thickness + gap) * 2.0).max(metrics.hairline());
 
     // Loudest for a single update, easing off as they pile up: one is a thing
     // to go and see, and a run of eight is the same invitation.
@@ -76,17 +77,19 @@ pub fn status_ring(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::theme::Metrics;
+    use gpui::px;
 
     /// The ring occupies what the caller asked for. Adding the border and its
     /// gap on the outside made the Status list 10px wider per row than the
     /// chat list, so switching destination slid every name sideways.
     #[test]
     fn the_ring_fits_inside_the_size_it_was_given() {
+        let metrics = Metrics::default();
         let size = px(44.0);
-        let thickness = px(2.0);
-        let gap = px(3.0);
-        let inner = (size - (thickness + gap) * 2.0).max(px(1.0));
+        let thickness = metrics.ring_thickness();
+        let gap = metrics.ring_gap();
+        let inner = (size - (thickness + gap) * 2.0).max(metrics.hairline());
 
         assert_eq!(inner, px(34.0));
         assert!(inner < size, "the avatar has to give way to the ring");
@@ -95,8 +98,10 @@ mod tests {
     /// A size smaller than the ring itself must not produce a negative avatar.
     #[test]
     fn an_impossibly_small_ring_still_holds_something() {
+        let metrics = Metrics::default();
         let size = px(4.0);
-        let inner = (size - (px(2.0) + px(3.0)) * 2.0).max(px(1.0));
-        assert_eq!(inner, px(1.0));
+        let inner =
+            (size - (metrics.ring_thickness() + metrics.ring_gap()) * 2.0).max(metrics.hairline());
+        assert_eq!(inner, metrics.hairline());
     }
 }

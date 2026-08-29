@@ -7,7 +7,7 @@
 
 use gpui::{
     App, Entity, InteractiveElement as _, IntoElement, ParentElement, Pixels,
-    StatefulInteractiveElement as _, Styled, div, px,
+    StatefulInteractiveElement as _, Styled, div,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -45,7 +45,12 @@ pub fn live_header(
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_size(metrics.text_meta())
                 .text_color(cx.theme().primary)
-                .child(div().size(px(6.0)).rounded_full().bg(cx.theme().primary))
+                .child(
+                    div()
+                        .size(metrics.dot())
+                        .rounded_full()
+                        .bg(cx.theme().primary),
+                )
                 .child(label),
         )
         .child(
@@ -187,8 +192,8 @@ fn mic_state(muted: bool, metrics: Metrics, cx: &App) -> impl IntoElement + use<
         .gap(metrics.space_xs())
         .children(LEVELS.into_iter().map(move |level| {
             div()
-                .w(px(3.0))
-                .h(if muted { px(3.0) } else { full * level })
+                .w(metrics.bar())
+                .h(if muted { metrics.bar() } else { full * level })
                 .rounded_full()
                 .bg(colour)
         }))

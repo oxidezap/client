@@ -15,7 +15,7 @@ mod video;
 
 use gpui::{
     AnyElement, App, DragMoveEvent, Entity, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -328,7 +328,7 @@ fn drag_handle(
         .on_mouse_up(gpui::MouseButton::Left, move |_, _window, cx| {
             up_entity.update(cx, |app, _| app.end_call_drag());
         })
-        .children((0..4).map(|_| div().size(px(3.0)).rounded_full().bg(dot)))
+        .children((0..4).map(|_| div().size(metrics.dot_small()).rounded_full().bg(dot)))
 }
 
 /// The card collapsed to a pill: who, how long, and the two controls worth

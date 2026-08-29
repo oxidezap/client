@@ -566,7 +566,7 @@ mod tests {
     /// frame, and neither end of that is visible from our own code.
     #[test]
     fn an_unscrolled_timeline_names_the_row_past_its_last() {
-        let state = crate::components::new_timeline_state(12);
+        let state = crate::components::new_timeline_state(12, crate::theme::Metrics::default());
 
         assert_eq!(
             state.logical_scroll_top().item_ix,

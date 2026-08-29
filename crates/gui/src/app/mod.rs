@@ -945,7 +945,9 @@ impl WhatsAppApp {
             conversation_search_input: None,
             chat_search_query: String::new(),
             chat_search_task: None,
-            message_list: new_timeline_state(0),
+            // The window's own base font is not known until it has been laid
+            // out; the reference scale is what it starts from.
+            message_list: new_timeline_state(0, crate::theme::Metrics::default()),
             timeline_anchor: None,
             input_area: None,
             composing_chat: None,
