@@ -8,7 +8,7 @@
 //! interleave with anything else.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use oxidezap_core::{CallOutcome, Chat, ChatMessage, MediaContent, UiEvent};
@@ -454,7 +454,7 @@ struct Bridge {
     /// a session event carries, and forgetting the session deletes exactly
     /// the directory it writes into.
     publisher: Option<crate::publisher::Handle>,
-    reads: ReadTracker,
+    reads: Arc<Mutex<ReadTracker>>,
     in_flight: Arc<Semaphore>,
     /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
     /// and wipes once the session has let go of the store.
@@ -475,7 +475,7 @@ impl Bridge {
             plugins,
             publish: Some(publish),
             publisher: Some(publisher),
-            reads: ReadTracker::default(),
+            reads: Arc::new(Mutex::new(ReadTracker::default())),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             forget: false,
         }
@@ -504,7 +504,7 @@ impl Bridge {
         let mut answer = Answer::Nothing;
         // Before anything is published, so a `MarkRead` that arrives right
         // behind a message already covers it.
-        self.reads.observe(&event);
+        self.reads().observe(&event);
 
         if let Some(frame) = passthrough(&event) {
             self.hub.signal(&frame);
@@ -637,7 +637,7 @@ impl Bridge {
             // again; keeping its ids would leak one entry per deleted
             // conversation.
             if let DaemonEvent::ChatRemoved { jid } = &change.event {
-                self.reads.forget(jid);
+                self.reads().forget(jid);
             }
             self.hub.apply(change);
         }
@@ -675,10 +675,160 @@ impl Bridge {
     /// session and returns.
     async fn execute(&mut self, client: &WhatsAppClient, command: SessionCommand) {
         let SessionCommand { action, reply } = command;
+        // The store reads answer from tasks of their own; what comes back here
+        // is everything else.
+        let Some((action, reply)) = self.begin_slow(client, action, reply) else {
+            return;
+        };
         let outcome = self.act(client, action).await;
         // A refusal nobody is listening for is not worth logging: the client
         // hung up, which is its right.
         let _ = reply.send(outcome);
+    }
+
+    fn reads(&self) -> std::sync::MutexGuard<'_, ReadTracker> {
+        self.reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Start the actions whose work is a store round trip, and answer from a
+    /// task of their own. Gives the command back when it is not one of them.
+    ///
+    /// Awaited in the run loop, one of these stops the loop for as long as
+    /// SQLite takes: a signal is not observed while it runs, and the video
+    /// channel — four frames deep, with this loop its only consumer —
+    /// overflows into dropped frames and keyframe requests for the length of
+    /// a local query. What the fold needs is shared rather than borrowed, so
+    /// what the daemon learns from a page it serves is learned wherever the
+    /// page lands.
+    fn begin_slow(
+        &mut self,
+        client: &WhatsAppClient,
+        action: Action,
+        reply: tokio::sync::oneshot::Sender<CommandOutcome>,
+    ) -> Option<(Action, tokio::sync::oneshot::Sender<CommandOutcome>)> {
+        match action {
+            Action::MarkStatusWatched { message_ids } => {
+                // The other actions are finished when the session has taken
+                // them and what the network makes of them arrives later; this
+                // one *is* the write, there is no retry, and the answer is the
+                // only thing that can tell a window its ring is coming back.
+                let written = client.mark_status_watched(message_ids);
+                oxidezap_session::spawn(async move {
+                    let outcome = match written.await {
+                        Ok(true) => CommandOutcome::Accepted,
+                        Ok(false) => CommandOutcome::Refused(
+                            "the status view could not be recorded".to_string(),
+                        ),
+                        Err(e) => CommandOutcome::Refused(format!(
+                            "the status view could not be recorded: {e}"
+                        )),
+                    };
+                    let _ = reply.send(outcome);
+                });
+                None
+            }
+            Action::LoadMessages {
+                id,
+                jid,
+                before,
+                limit,
+                answer_to,
+            } => {
+                let page = client.load_messages(
+                    jid.clone(),
+                    before.map(|cursor| cursor.as_str().to_string()),
+                    limit.map_or(WhatsAppClient::MESSAGE_PAGE, i64::from),
+                );
+                let reads = Arc::clone(&self.reads);
+                oxidezap_session::spawn(async move {
+                    let answer = match page.await {
+                        Ok(Ok(mut page)) => {
+                            // The bytes travel the way they do everywhere
+                            // else: written to the media directory, named by
+                            // a key.
+                            externalize_messages(crate::media::epoch(), &mut page.items);
+                            // What this side served, it now knows. A read is
+                            // bounded by the messages the daemon has observed,
+                            // and the page a front end asked for is the
+                            // history it is about to read: without this, a
+                            // window naming a message from a page nobody told
+                            // the daemon about is refused, and the badge comes
+                            // back on the next hydration.
+                            {
+                                let mut reads =
+                                    reads.lock().unwrap_or_else(|held| held.into_inner());
+                                for message in &page.items {
+                                    reads.observe_message(&jid, message);
+                                }
+                            }
+                            Ok(DaemonMessage::Messages {
+                                id,
+                                jid,
+                                messages: page.items,
+                                next: page.next.map(PageCursor::new),
+                            })
+                        }
+                        Ok(Err(detail)) => Err(detail),
+                        Err(_) => Err("the session stopped before the page arrived".to_string()),
+                    };
+                    answer_now(&answer_to, answered(id, answer));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                });
+                None
+            }
+            Action::LoadChats {
+                id,
+                after,
+                limit,
+                answer_to,
+            } => {
+                let page = client.load_chats(
+                    after.map(|cursor| cursor.as_str().to_string()),
+                    limit.map_or(WhatsAppClient::CHAT_PAGE, i64::from),
+                );
+                let reads = Arc::clone(&self.reads);
+                let hub = Arc::clone(&self.hub);
+                oxidezap_session::spawn(async move {
+                    let answer = match page.await {
+                        Ok(Ok(mut page)) => {
+                            let epoch = crate::media::epoch();
+                            // The same rule. A chat past the attach window is
+                            // in no snapshot, and a read for one is refused
+                            // with "no such chat" until this side has been
+                            // told it exists. Its rows are learned as well as
+                            // its summary: a window opening such a chat names
+                            // the message it can see, and a read naming a
+                            // message this side has never observed is refused
+                            // for having no boundary — a badge that clears
+                            // locally, sends no receipt and comes straight
+                            // back on the next hydration.
+                            for chat in &mut page.items {
+                                externalize_messages(epoch, &mut chat.messages);
+                                let mut reads =
+                                    reads.lock().unwrap_or_else(|held| held.into_inner());
+                                for message in &chat.messages {
+                                    reads.observe_message(&chat.jid, message);
+                                }
+                                hub.apply(chat_updated(chat, &mut reads));
+                            }
+                            Ok(DaemonMessage::Chats {
+                                id,
+                                chats: page.items,
+                                next: page.next.map(PageCursor::new),
+                            })
+                        }
+                        Ok(Err(detail)) => Err(detail),
+                        Err(_) => Err("the session stopped before the page arrived".to_string()),
+                    };
+                    answer_now(&answer_to, answered(id, answer));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                });
+                None
+            }
+            action => Some((action, reply)),
+        }
     }
 
     async fn act(&mut self, client: &WhatsAppClient, action: Action) -> CommandOutcome {
@@ -765,41 +915,12 @@ impl Bridge {
                 jid,
                 through_message_id,
             } => self.mark_read(client, &jid, through_message_id.as_deref()),
-            // No permit and no boundary check: this writes one local row and
-            // sends nothing, so there is no receipt to get wrong and nothing
-            // for a stale client to consume on somebody's behalf. Watching an
-            // update it has already watched is the same row again.
-            //
-            // Awaited, unlike everything around it. The other actions are
-            // finished when the session has taken them and what the network
-            // makes of them arrives later; this one *is* the write, there is
-            // no retry, and a session torn down a moment later would cancel
-            // it — losing exactly the view the request exists to keep.
-            Action::MarkStatusWatched { message_ids } => {
-                let written = client.mark_status_watched(message_ids).await;
-                match written {
-                    // No frame of its own: the row that moved invalidates the
-                    // broadcast, so the reloader republishes it and every
-                    // attached front end — including this one — learns about
-                    // the view through the history channel it can already
-                    // recover from. A signal would be news on a lossy
-                    // channel, and a client behind by more than its capacity
-                    // would keep a ring nothing puts back.
-                    Ok(true) => CommandOutcome::Accepted,
-                    // Said rather than swallowed: the window has already
-                    // drawn the ring as watched, and a refusal is the only
-                    // thing that can tell it the ring is coming back.
-                    Ok(false) => {
-                        CommandOutcome::Refused("the status view could not be recorded".to_string())
-                    }
-                    Err(e) => CommandOutcome::Refused(format!(
-                        "the status view could not be recorded: {e}"
-                    )),
-                }
+            // Answered from a task of its own. See `begin_slow`.
+            Action::MarkStatusWatched { .. }
+            | Action::LoadMessages { .. }
+            | Action::LoadChats { .. } => {
+                CommandOutcome::Refused("a store read reached the wrong path".to_string())
             }
-            // No permit: these send one small stanza and hold nothing open,
-            // and a typing indicator refused for being busy would be a worse
-            // answer than a late one.
             Action::Typing { jid, composing } => {
                 if composing {
                     client.send_composing(&jid);
@@ -939,96 +1060,6 @@ impl Bridge {
                 client.request_video_keyframe();
                 CommandOutcome::Accepted
             }
-            // Awaited here rather than spawned, unlike a download: this is a
-            // page of local rows, which is milliseconds of SQLite, and what
-            // comes back has to be folded into this side's own state before
-            // it is sent. `MarkStatusWatched` waits on its write for the same
-            // reason.
-            Action::LoadMessages {
-                id,
-                jid,
-                before,
-                limit,
-                answer_to,
-            } => {
-                let page = client
-                    .load_messages(
-                        jid.clone(),
-                        before.map(|cursor| cursor.as_str().to_string()),
-                        limit.map_or(WhatsAppClient::MESSAGE_PAGE, i64::from),
-                    )
-                    .await;
-                let answer = match page {
-                    Ok(Ok(mut page)) => {
-                        // The bytes travel the way they do everywhere else:
-                        // written to the media directory, named by a key.
-                        externalize_messages(crate::media::epoch(), &mut page.items);
-                        // What this side served, it now knows. A read is
-                        // bounded by the messages the daemon has observed, and
-                        // the page a front end asked for is the history it is
-                        // about to read: without this, a window naming a
-                        // message from a page nobody told the daemon about is
-                        // refused, and the badge comes back on the next
-                        // hydration.
-                        for message in &page.items {
-                            self.reads.observe_message(&jid, message);
-                        }
-                        Ok(DaemonMessage::Messages {
-                            id,
-                            jid,
-                            messages: page.items,
-                            next: page.next.map(PageCursor::new),
-                        })
-                    }
-                    Ok(Err(detail)) => Err(detail),
-                    Err(_) => Err("the session stopped before the page arrived".to_string()),
-                };
-                answer_now(&answer_to, answered(id, answer));
-                CommandOutcome::Accepted
-            }
-            Action::LoadChats {
-                id,
-                after,
-                limit,
-                answer_to,
-            } => {
-                let page = client
-                    .load_chats(
-                        after.map(|cursor| cursor.as_str().to_string()),
-                        limit.map_or(WhatsAppClient::CHAT_PAGE, i64::from),
-                    )
-                    .await;
-                let answer = match page {
-                    Ok(Ok(mut page)) => {
-                        let epoch = crate::media::epoch();
-                        // The same rule. A chat past the attach window is in
-                        // no snapshot, and a read for one is refused with "no
-                        // such chat" until this side has been told it exists.
-                        // Its rows are learned as well as its summary: a
-                        // window opening such a chat names the message it can
-                        // see, and a read naming a message this side has never
-                        // observed is refused for having no boundary — which
-                        // is a badge that clears locally, sends no receipt and
-                        // comes straight back on the next hydration.
-                        for chat in &mut page.items {
-                            externalize_messages(epoch, &mut chat.messages);
-                            for message in &chat.messages {
-                                self.reads.observe_message(&chat.jid, message);
-                            }
-                            self.hub.apply(chat_updated(chat, &mut self.reads));
-                        }
-                        Ok(DaemonMessage::Chats {
-                            id,
-                            chats: page.items,
-                            next: page.next.map(PageCursor::new),
-                        })
-                    }
-                    Ok(Err(detail)) => Err(detail),
-                    Err(_) => Err("the session stopped before the page arrived".to_string()),
-                };
-                answer_now(&answer_to, answered(id, answer));
-                CommandOutcome::Accepted
-            }
             // Deferred rather than done here, because the file to delete is
             // the one the session still has open. The event loop already ends
             // by disconnecting and closing SQLite; the wipe belongs after
@@ -1108,7 +1139,7 @@ impl Bridge {
         hold(
             permit,
             [
-                client.send_read_receipts(jid, self.reads.take_receipts(jid)),
+                client.send_read_receipts(jid, self.reads().take_receipts(jid)),
                 client.mark_chat_read(jid, boundary),
             ],
         );
@@ -1118,7 +1149,7 @@ impl Bridge {
         // stays busy — exactly when a user is most likely to be clearing it.
         // And remembered, so the reload that is already in flight for the
         // message that raised the badge cannot put it straight back.
-        self.reads.record_read(jid, read);
+        self.reads().record_read(jid, read);
         if let Some(mut summary) = self.hub.chat(jid).filter(ChatSummary::has_unread) {
             summary.unread = 0;
             summary.manually_unread = false;
@@ -1142,7 +1173,7 @@ impl Bridge {
             return Err(format!("no such chat: {}", observe_str(jid)));
         };
 
-        match self.reads.boundary(jid) {
+        match self.reads().boundary(jid) {
             Some((secs, ids)) => {
                 // What the requester says it is looking at, against the second
                 // this read would clear. A read is irreversible and clears
@@ -1319,7 +1350,8 @@ impl Bridge {
                     );
                 }
 
-                changes.extend(chats.iter().map(|chat| chat_updated(chat, &mut self.reads)));
+                let mut reads = self.reads();
+                changes.extend(chats.iter().map(|chat| chat_updated(chat, &mut reads)));
                 changes
             }
             _ => Vec::new(),
@@ -2432,7 +2464,7 @@ mod tests {
         assert_eq!(at_boundary, ["a", "b", "mine"]);
 
         let mut owed: Vec<String> = bridge
-            .reads
+            .reads()
             .take_receipts("1@s.whatsapp.net")
             .into_iter()
             .map(|(id, _)| id)
@@ -2441,11 +2473,11 @@ mod tests {
         assert_eq!(owed, ["a", "b", "older"]);
 
         assert!(
-            bridge.reads.take_receipts("1@s.whatsapp.net").is_empty(),
+            bridge.reads().take_receipts("1@s.whatsapp.net").is_empty(),
             "a receipt is owed once, not every time"
         );
         assert!(
-            bridge.reads.boundary("1@s.whatsapp.net").is_some(),
+            bridge.reads().boundary("1@s.whatsapp.net").is_some(),
             "the boundary outlives the receipts: the next read still needs it"
         );
     }
@@ -2616,7 +2648,7 @@ mod tests {
 
         // What `mark_read` records once it has issued the action.
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(10, &["m1"]));
 
         // The reload the store already had queued, still carrying the count.
@@ -2640,7 +2672,7 @@ mod tests {
         let first = message("m1", "1@s.whatsapp.net", 10, false, false);
         bridge.observe(received("1@s.whatsapp.net", first.clone(), None));
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(10, &["m1"]));
 
         let second = message("m2", "1@s.whatsapp.net", 20, false, false);
@@ -2667,7 +2699,7 @@ mod tests {
         let read_msg = message("m1", "1@s.whatsapp.net", 20, false, false);
         bridge.observe(received("1@s.whatsapp.net", read_msg.clone(), None));
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(20, &["m1"]));
 
         // Same second, different message: the action named `m1`, not this.
@@ -2697,7 +2729,7 @@ mod tests {
 
         let mut stale = read_through(20, &["m1"]);
         stale.expires_at_ms = wacore::time::now_millis() - 1;
-        bridge.reads.record_read("1@s.whatsapp.net", stale);
+        bridge.reads().record_read("1@s.whatsapp.net", stale);
 
         bridge.observe(loaded(vec![stored_chat("1@s.whatsapp.net", 1, vec![only])]));
         assert_eq!(
@@ -2716,7 +2748,7 @@ mod tests {
         let only = message("m1", "1@s.whatsapp.net", 10, false, true);
         bridge.observe(received("1@s.whatsapp.net", only.clone(), None));
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(10, &["m1"]));
 
         // The read landed: the store now agrees, which spends the override.
@@ -2748,7 +2780,7 @@ mod tests {
                 None,
             ));
         }
-        let unread = bridge.reads.take_receipts("1@s.whatsapp.net");
+        let unread = bridge.reads().take_receipts("1@s.whatsapp.net");
         assert_eq!(unread.len(), MAX_TRACKED_UNREAD);
         assert_eq!(unread.first().unwrap().0, "m5", "the oldest went first");
     }
@@ -2770,7 +2802,7 @@ mod tests {
         )]));
 
         assert!(
-            bridge.reads.take_receipts("1@s.whatsapp.net").is_empty(),
+            bridge.reads().take_receipts("1@s.whatsapp.net").is_empty(),
             "read elsewhere, so nothing is owed"
         );
     }
@@ -2786,13 +2818,13 @@ mod tests {
             vec![message("a", "1@s.whatsapp.net", 10, false, false)],
         )]));
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(10, &["m1"]));
-        assert!(bridge.reads.boundary("1@s.whatsapp.net").is_some());
+        assert!(bridge.reads().boundary("1@s.whatsapp.net").is_some());
 
         bridge.observe(loaded(Vec::new()));
-        assert!(bridge.reads.boundary("1@s.whatsapp.net").is_none());
-        assert!(!bridge.reads.read_through.contains_key("1@s.whatsapp.net"));
+        assert!(bridge.reads().boundary("1@s.whatsapp.net").is_none());
+        assert!(!bridge.reads().read_through.contains_key("1@s.whatsapp.net"));
     }
 
     /// The bound the command channel cannot provide: every session call spawns
