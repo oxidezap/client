@@ -31,8 +31,8 @@ pub struct StatusListProps {
 ///
 /// Named rather than an `Option<String>` in which the account's own updates
 /// are the empty string. That is how the feed keys them and it is fine there;
-/// as a *selection* it meant any path producing an empty JID — an author
-/// without one, a half-cleared reset — drew "My status" as the row being
+/// as a *selection* it meant any path producing an empty JID (an author
+/// without one, a half-cleared reset) drew "My status" as the row being
 /// read, with nothing in the code saying that `""` meant anything at all.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StatusSelection {

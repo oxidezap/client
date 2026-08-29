@@ -94,7 +94,7 @@ impl Runtime {
         // And of the bytes, because the answer above was about the file as it
         // was a moment ago. The race is narrow and the directory is provably
         // not writable by another account, so whoever won it is already the
-        // owner — but the cap is what the sentence above promises, and asking
+        // owner. The cap is what the sentence above promises, and asking
         // twice is what makes it true rather than nearly true.
         if bytes.len() > MAX_MODULE_BYTES {
             return Err(too_big(bytes.len() as u64));

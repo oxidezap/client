@@ -100,7 +100,7 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>
     // what every reader in this workspace takes, but a deserializer that
     // cannot borrow (`from_reader`) or an input carrying an escape refuses a
     // borrowed string outright, with "invalid type: string, expected a
-    // borrowed string" — which names neither the field nor the real problem.
+    // borrowed string", which names neither the field nor the real problem.
     let text = <Cow<'_, str>>::deserialize(deserializer)?;
     decode(&text).ok_or_else(|| D::Error::invalid_value(Unexpected::Str(&text), &"base64"))
 }
@@ -140,7 +140,7 @@ mod tests {
 
     /// A deserializer that cannot hand out a borrow (`from_reader`) refused
     /// the field outright, with "invalid type: string, expected a borrowed
-    /// string" — a message about serde rather than about the frame.
+    /// string", a message about serde rather than about the frame.
     #[test]
     fn a_deserializer_that_cannot_borrow_still_reads_the_field() {
         #[derive(serde::Deserialize)]

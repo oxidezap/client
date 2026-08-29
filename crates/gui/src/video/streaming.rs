@@ -15,7 +15,7 @@
 //!
 //! Nothing here writes an INFO line. Opening an attachment parses a container
 //! and reads a parameter set, and every one of those numbers is derived from
-//! a file somebody sent — worth having when a video will not play, and not
+//! a file somebody sent: worth having when a video will not play, and not
 //! worth a dozen lines in the journal every time one is opened.
 
 use std::io::Cursor;
@@ -539,7 +539,7 @@ impl StreamingVideoDecoder {
     /// For the two places a decode has already gone wrong, or is about to:
     /// what openh264 was handed when it refused a sample, and what the first
     /// sample of a file turned out to be. Nothing on the playing path calls
-    /// it — it walks the buffer a byte at a time and allocates.
+    /// it: it walks the buffer a byte at a time and allocates.
     fn get_nal_types(annexb_data: &[u8]) -> Vec<u8> {
         let mut types = Vec::new();
         let mut i = 0;

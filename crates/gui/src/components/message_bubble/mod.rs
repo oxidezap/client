@@ -134,8 +134,8 @@ pub fn render_message_bubble(
     // Right-click anywhere on the row, which is what a desktop reader reaches
     // for and the only route to these commands that does not require finding a
     // control that is invisible until the pointer is already over it.
-    // Formatted once. It was built three times per bubble per frame — the
-    // group and both hover groups — and a `SharedString` clone is a refcount.
+    // Formatted once. It was built three times per bubble per frame (the
+    // group and both hover groups), and a `SharedString` clone is a refcount.
     let group: SharedString = format!("bubble-{message_id}").into();
     let menu_id = message_id.clone();
     let menu_text = message.content.clone();

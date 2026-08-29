@@ -351,8 +351,8 @@ impl WhatsAppApp {
             return;
         };
         // Asked after the author, and allowed to be absent. `follow` records
-        // `None` when the author being opened had nothing in the feed — a
-        // short race between the row being drawn and the run lapsing — and
+        // `None` when the author being opened had nothing in the feed, which
+        // a short race between the row being drawn and the run lapsing can
         // returning on that left the reader open on an empty pane forever,
         // because the branch that closes it is below.
         let anchor = self.status_pane.shown().map(str::to_string);

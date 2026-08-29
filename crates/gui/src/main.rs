@@ -2,7 +2,7 @@
 //!
 //! It owns no session. `oxidezap` reaches `oxidezapd` and starts one if
 //! nobody answers, because there is exactly one WhatsApp session per user and
-//! it lives in that process — so what this crate has is the protocol, the
+//! it lives in that process. So what this crate has is the protocol, the
 //! drawing, and video decode, which writes straight into `gpui::RenderImage`
 //! and is not reusable off GPUI.
 //!

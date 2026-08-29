@@ -578,7 +578,7 @@ impl WhatsAppApp {
         // insertion, the entry evicted first was as likely as not the one
         // being drawn this frame: the viewer and the status reader both
         // resolve before the list's rows do, so a picture opened full screen
-        // was thrown out and rebuilt under itself — animated stickers
+        // was thrown out and rebuilt under itself: animated stickers
         // restarting, and the bytes decoded again, which is the whole of what
         // this cache exists to avoid.
         if let Some(cached) = self.decoded_images.borrow_mut().shift_remove(message_id) {

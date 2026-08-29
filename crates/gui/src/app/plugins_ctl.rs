@@ -305,8 +305,8 @@ mod tests {
 
     /// The key used to be a formatted string with `/` between its parts. A
     /// plugin id cannot hold one, which is what the comment there said, but a
-    /// *widget* id can — `ui::ident` asks for valid non-empty UTF-8 and
-    /// nothing more — and so can a chat JID. Two different fields formatting
+    /// *widget* id can, since `ui::ident` asks for valid non-empty UTF-8 and
+    /// nothing more, and so can a chat JID. Two different fields formatting
     /// to one key is two boxes sharing an `InputState`: what is typed over
     /// one conversation commits in the other.
     #[test]

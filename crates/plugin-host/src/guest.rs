@@ -1189,7 +1189,7 @@ fn write_field(caller: &mut Caller<'_, Guest>, ev: i32, field: i32, ptr: i32, ca
         return abi::outcome::INVALID;
     };
     // Asked rather than indexed. `end` was measured against the *first*
-    // lookup, and nothing today can shorten the value between the two — but
+    // lookup, and nothing today can shorten the value between the two, but
     // an indexed slice makes that a panic one refactor away, and a panic
     // inside a host function unwinds through the plugin's thread and poisons
     // the locks the registry already has to handle.
@@ -1239,7 +1239,7 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
         return abi::outcome::INVALID;
     };
     // Asked rather than indexed. `end` was measured against the *first*
-    // lookup, and nothing today can shorten the value between the two — but
+    // lookup, and nothing today can shorten the value between the two, but
     // an indexed slice makes that a panic one refactor away, and a panic
     // inside a host function unwinds through the plugin's thread and poisons
     // the locks the registry already has to handle.

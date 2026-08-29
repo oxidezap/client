@@ -87,7 +87,7 @@ mod tests {
         const FRAMES: usize = 100;
 
         let plain = "thanks, that works for me";
-        let marked = "*thanks*, that _works_ for me — see `run.sh`";
+        let marked = "*thanks*, that _works_ for me, see `run.sh`";
 
         for (what, source) in [("plain", plain), ("marked", marked)] {
             let started = wacore::time::Instant::now();

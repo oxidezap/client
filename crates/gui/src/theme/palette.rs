@@ -178,8 +178,8 @@ pub struct Palette {
     ///
     /// Not in `PALETTE_KEYS`, deliberately, so a `theme.json` cannot move
     /// them. Every other role is one colour with a name; this is a ramp whose
-    /// meaning is the *set* — seven hues that have to stay apart from each
-    /// other, and legible on both grounds — and an override table that hands
+    /// meaning is the *set*: seven hues that have to stay apart from each
+    /// other, and legible on both grounds. An override table that hands
     /// out one slot at a time is a way to break that one entry at a time.
     /// Changing the ramp is changing the preset.
     pub speakers: [Rgb; 7],

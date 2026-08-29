@@ -108,7 +108,7 @@ pub struct ChatListCache {
     ///
     /// The whole point of asking this rather than comparing counts: a count
     /// can only be compared after the list has been filtered, which is where
-    /// the work is — a `to_lowercase` of the name and of the JID per chat
+    /// the work is: a `to_lowercase` of the name and of the JID per chat
     /// while a search is running, spent on every frame to conclude that
     /// nothing had changed.
     pub version: u64,
@@ -134,7 +134,7 @@ impl WhatsAppApp {
     pub(super) fn merge_chats(&mut self, chats: Vec<Chat>) {
         // An index, not a scan per incoming chat. A page is a hundred chats
         // and an account is thousands, so the search alone was hundreds of
-        // thousands of string comparisons per load — and a history sync
+        // thousands of string comparisons per load, and a history sync
         // commits these back to back for minutes.
         let mut index: HashMap<String, usize> = self
             .chats
@@ -289,7 +289,7 @@ mod tests {
     /// the list costs, scanned against indexed.
     ///
     /// `merge_chats` searched linearly per incoming chat, so a page of 100
-    /// over an account of 3000 was 300k string comparisons — and a history
+    /// over an account of 3000 was 300k string comparisons, and a history
     /// sync commits pages like this back to back for minutes.
     ///
     /// `cargo test -p oxidezap-gui -- --ignored --nocapture chat_merge_lookup_costs`

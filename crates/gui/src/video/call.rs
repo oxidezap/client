@@ -333,7 +333,7 @@ mod tests {
 
     /// `put` runs on a decode thread and `take` on the window's. Panicking on
     /// a poisoned lock turned a panic in one decoder into a panic in the UI
-    /// on its next read, so the call and the window went down together —
+    /// on its next read, so the call and the window went down together.
     /// over two `Option`s with no invariant to break.
     #[test]
     fn a_panicked_decoder_does_not_take_the_window_with_it() {

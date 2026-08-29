@@ -1070,7 +1070,7 @@ impl WhatsAppApp {
         // filter allocates two lowercased strings per chat while a search is
         // running, and it used to run on every frame just to compare the
         // count it produced. Both halves are O(1). The version is what every
-        // path that changes a preview — a receipt, a draft, a typing notice —
+        // path that changes a preview (a receipt, a draft, a typing notice)
         // already announces; the length is what catches a chat that reached
         // the list without announcing anything.
         let version = self.chat_cache_version.get();
