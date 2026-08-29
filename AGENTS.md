@@ -306,7 +306,12 @@ profile here repeats it deliberately.
   the same tree and renders it its own way or ignores it. A slot is a promise
   about *where*, never about how: nothing in a tree can express a colour, a
   size or a position, so a plugin cannot put a literal outside the theme's
-  reach. The open chat travels on the action rather than being looked up,
+  reach. An action is checked against that tree before it is routed, rather
+  than against the plugin merely being loaded: a front end's frame can be
+  older than the daemon's, so a second window still showing a button since
+  withdrawn or greyed out would land as a real press, and an id the plugin
+  never published would reach a handler as a widget that does not exist.
+  The open chat travels on the action rather than being looked up,
   because the daemon does not know it — two windows can have different
   conversations open, and a header button is about the one the person pressing
   it was looking at.

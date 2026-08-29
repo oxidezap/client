@@ -600,6 +600,42 @@ fn an_action_for_a_plugin_that_is_not_loaded_is_ignored() {
     });
 }
 
+/// A window's frame can be older than the daemon's state, so an action has
+/// to be checked against the tree the plugin last published rather than
+/// against the plugin merely being loaded.
+#[test]
+fn an_action_for_a_widget_the_plugin_does_not_draw_is_ignored() {
+    let dir = TempDir::new("stale-action");
+    dir.plugin("greeter", &draws());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+    published.settles("the interface", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+
+    // An id this plugin never published, which is a handler asked about a
+    // widget that does not exist.
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "farewell".into(),
+        value: None,
+        chat_jid: Some("5511999@s.whatsapp.net".into()),
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(commands.sent().is_empty());
+
+    // And the one it does draw still works, so this is about the id rather
+    // than about actions having stopped arriving.
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: None,
+        chat_jid: Some("5511999@s.whatsapp.net".into()),
+    });
+    until("the greeting", || commands.sent().len() == 1);
+}
+
 #[test]
 fn plugins_load_in_a_stable_order() {
     let dir = TempDir::new("order");

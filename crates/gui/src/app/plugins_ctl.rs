@@ -50,7 +50,18 @@ const MAX_FIELD_BYTES: usize = 64 * 1024;
 /// plugin storing or sending it for the wrong conversation. Switching chats
 /// therefore drops what was half-typed in the old one, which is the honest
 /// trade: the alternative is not a preserved draft, it is a misdirected one.
+///
+/// Which is why the *same* answer `send_plugin_action` gives is taken here
+/// rather than the selection itself: a Settings action carries no chat, so
+/// keying a Settings field on one made every field in that panel a different
+/// field the moment somebody clicked another conversation — swept away and
+/// rebuilt from the plugin's last published value, with what had been typed
+/// gone for a context it never had.
 fn key(plugin: &str, slot: PluginSlot, chat: Option<&str>, id: &str) -> String {
+    let chat = match slot {
+        PluginSlot::ChatHeader => chat,
+        PluginSlot::Settings => None,
+    };
     // A separator no plugin id may hold: ids are alphanumeric plus `-` and
     // `_`, checked by the host when it reads the file's name.
     format!("{plugin}/{slot:?}/{}/{id}", chat.unwrap_or(""))
@@ -242,3 +253,32 @@ fn collect_fields(plugin: &str, slot: PluginSlot, node: &PluginNode, out: &mut V
 
 /// The map the app holds.
 pub type PluginFields = HashMap<String, PluginField>;
+
+#[cfg(test)]
+mod tests {
+    use super::{PluginSlot, key};
+
+    /// A Settings field is one field whatever is selected, because the action
+    /// it commits carries no conversation. A header field is one per chat,
+    /// because the action it commits carries the open one.
+    #[test]
+    fn only_a_header_field_belongs_to_a_conversation() {
+        let settings = |chat| key("autoreply", PluginSlot::Settings, chat, "keyword");
+        assert_eq!(settings(Some("a@s.whatsapp.net")), settings(None));
+        assert_eq!(
+            settings(Some("a@s.whatsapp.net")),
+            settings(Some("b@s.whatsapp.net"))
+        );
+
+        let header = |chat| key("autoreply", PluginSlot::ChatHeader, chat, "keyword");
+        assert_ne!(
+            header(Some("a@s.whatsapp.net")),
+            header(Some("b@s.whatsapp.net"))
+        );
+        assert_ne!(
+            header(Some("a@s.whatsapp.net")),
+            settings(Some("a@s.whatsapp.net")),
+            "and the same id in two slots is still two fields"
+        );
+    }
+}

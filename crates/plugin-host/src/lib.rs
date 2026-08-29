@@ -381,6 +381,22 @@ impl Plugins {
             log::debug!("an action for {}, which is not loaded", action.plugin);
             return;
         };
+        // And it has to be a control the plugin currently draws, enabled. A
+        // front end's frame can be older than the daemon's state — a second
+        // window still showing a button this plugin has since withdrawn or
+        // greyed out — and routing on the plugin's id alone made every one of
+        // those a real press. It also let an id the plugin never published
+        // through, which is a handler asked about a widget that does not
+        // exist. The tree the registry holds is what the plugin last said,
+        // so it is the only honest answer to whether the thing is there.
+        if !self.registry.draws(&action.plugin, &action.action) {
+            log::debug!(
+                "plugin {}: an action for `{}`, which it does not currently draw",
+                action.plugin,
+                action.action
+            );
+            return;
+        }
         let event = Event::new(abi::kinds::UI_ACTION)
             .str(abi::fields::ACTION_ID, action.action.clone())
             .str(

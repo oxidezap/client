@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use oxidezap_core::{PluginRoot, PluginSurface};
+use oxidezap_core::{PluginNode, PluginRoot, PluginSurface};
 use oxidezap_plugin_abi as abi;
 
 use crate::approvals::Approvals;
@@ -148,6 +148,21 @@ impl Registry {
         self.publish();
     }
 
+    /// Whether this plugin currently draws a control by this name that can
+    /// be used.
+    ///
+    /// Asked before an action is routed, because a front end's frame can be
+    /// older than the daemon's: a plugin that withdrew a button, or drew it
+    /// disabled, is answered by the window that still shows the last one.
+    /// The tree the daemon holds is what a plugin published, so it is also
+    /// the only honest answer to "is this thing still there".
+    #[must_use]
+    pub fn draws(&self, id: &str, action: &str) -> bool {
+        self.lock()
+            .get(id)
+            .is_some_and(|entry| entry.roots.iter().any(|root| usable(&root.node, action)))
+    }
+
     /// Whether this plugin is still allowed to run.
     #[must_use]
     pub fn is_running(&self, id: &str) -> bool {
@@ -187,6 +202,14 @@ impl Registry {
         // only answer that does not take the daemon down with one plugin.
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// Whether a tree holds an enabled interactive widget by this name.
+fn usable(node: &PluginNode, action: &str) -> bool {
+    if node.id == action && node.widget.is_interactive() && node.enabled {
+        return true;
+    }
+    node.children.iter().any(|kid| usable(kid, action))
 }
 
 /// Turn a capability mask into the sentences a user consents to.
