@@ -493,7 +493,7 @@ impl Plugins {
                 action.value.clone().unwrap_or_default(),
             )
             .str(abi::fields::CHAT_JID, chat.to_owned());
-        self.offer(worker, Job::Event(Arc::new(event)));
+        self.offer_refusable(worker, Job::Event(Arc::new(event)));
     }
 
     /// Stop every plugin, waiting for the handler each is in the middle of.
@@ -593,32 +593,58 @@ impl Plugins {
     /// people and not others, with nothing anywhere saying which. A plugin
     /// this far behind is broken, and stopping it says so.
     fn offer(&self, worker: &Worker, job: Job) {
+        if let Some(job) = self.try_offer(worker, job) {
+            let Job::Event(_) = job;
+            self.registry.stop(
+                &worker.id,
+                format!("it fell more than {QUEUE_DEPTH} events behind"),
+            );
+            log::warn!(
+                "plugin {}: stopped, {QUEUE_DEPTH} events behind and not catching up",
+                worker.id
+            );
+        }
+    }
+
+    /// The same, for a job that may be refused instead.
+    ///
+    /// Everything the account produces is unskippable, which is what `offer`
+    /// enforces. A widget press is not: it comes from a front end, and the
+    /// answer to more of them than a plugin can take is to drop them, not to
+    /// disable a plugin the user approved. Without this the per-window budget
+    /// is not enough on its own, because the budget and the queue are the
+    /// same size and the queue is shared: one account event already waiting
+    /// plus a window's worth of presses fills it, and the next press stops
+    /// the plugin for good.
+    fn offer_refusable(&self, worker: &Worker, job: Job) {
+        if self.try_offer(worker, job).is_some() {
+            log::debug!(
+                "plugin {}: refusing an action, its queue is full",
+                worker.id
+            );
+        }
+    }
+
+    /// Hand `job` to `worker`, giving it back when the queue would not take
+    /// it. `None` means it was taken, or that there was nobody to take it.
+    fn try_offer(&self, worker: &Worker, job: Job) -> Option<Job> {
         // A stopped plugin is not offered anything, whatever stopped it. Its
         // thread may still be alive — one stopped by *this* rule is — and
         // filling its queue further would be the host arguing with itself.
         if !self.registry.is_running(&worker.id) {
-            return;
+            return None;
         }
         let queue = lock(&worker.queue);
         let Some(queue) = queue.as_ref() else {
             // Shutting down. Nothing left to hand it.
-            return;
+            return None;
         };
         match queue.try_send(job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.registry.stop(
-                    &worker.id,
-                    format!("it fell more than {QUEUE_DEPTH} events behind"),
-                );
-                log::warn!(
-                    "plugin {}: stopped, {QUEUE_DEPTH} events behind and not catching up",
-                    worker.id
-                );
-            }
+            Ok(()) => None,
+            Err(TrySendError::Full(job)) => Some(job),
             // Its thread is gone, which means it already trapped and the
             // registry already carries the reason.
-            Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Disconnected(_)) => None,
         }
     }
 }

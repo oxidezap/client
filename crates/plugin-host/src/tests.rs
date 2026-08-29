@@ -731,6 +731,54 @@ fn a_flood_of_presses_does_not_disable_the_plugin() {
     );
 }
 
+/// The per-window budget alone is not enough, because it and the queue are
+/// the same size and the queue is shared with the account's own traffic: with
+/// events already waiting, a press that would not fit used to reach `stop`
+/// and disable the plugin for good. An account event may not be skipped and a
+/// press may, so a full queue refuses the press instead.
+#[test]
+fn a_press_that_will_not_fit_is_refused_rather_than_fatal() {
+    let dir = TempDir::new("press-full");
+    dir.plugin("greeter", &draws_and_listens());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+    published.settles("the interface", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+
+    // Held inside the first command, so nothing drains behind it.
+    commands.close_gate();
+    // Exactly the queue's capacity, which cannot overflow it on its own: the
+    // plugin is holding one of them, so at most `QUEUE_DEPTH - 1` wait.
+    // Overflowing with *these* is the documented rule and is not what this is
+    // about.
+    for _ in 0..QUEUE_DEPTH {
+        plugins.observe(&message("1@s.whatsapp.net", "hi"));
+    }
+    // And then the presses, which have nowhere left to go.
+    for _ in 0..QUEUE_DEPTH {
+        plugins.act(&PluginAction {
+            plugin: "greeter".into(),
+            action: "greet".into(),
+            value: None,
+            chat_jid: Some("5511999@s.whatsapp.net".into()),
+            slot: PluginSlot::ChatHeader,
+            widget: PluginWidget::Button,
+        });
+    }
+    commands.open_gate();
+
+    let surfaces = published.settles("the plugin to answer", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+    assert!(
+        surfaces[0].is_running(),
+        "a full queue refuses a press; it does not disable the plugin: {:?}",
+        surfaces[0].stopped
+    );
+}
+
 #[test]
 fn an_action_for_a_plugin_that_is_not_loaded_is_ignored() {
     let dir = TempDir::new("stray");
@@ -1262,6 +1310,24 @@ fn a_timer_past_the_far_end_of_time_is_refused() {
 }
 
 /// A plugin that wants nothing but to draw: no account capability at all.
+/// [`draws`], and subscribed to messages as well.
+///
+/// The one shape that puts both kinds of job on a plugin's queue: the
+/// account's, which may not be skipped, and a front end's presses, which may.
+fn draws_and_listens() -> String {
+    draws()
+        .replace(
+            r#"(import "oxidezap" "oxi_request_caps" (func $caps (param i64)))"#,
+            r#"(import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))"#,
+        )
+        .replace(
+            r#"(func (export "oxi_init") (result i32)"#,
+            r#"(func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))"#,
+        )
+}
+
 fn draws_only() -> String {
     let mut buf = vec![0u8; 512];
     let mut w = abi::ui::Writer::new(&mut buf);
