@@ -103,7 +103,9 @@ impl Wipe {
     pub(super) fn takes(self, name: &str) -> bool {
         match self {
             Self::Everything => true,
-            Self::Cache => name.starts_with("f-") || name.starts_with("d-"),
+            Self::Cache => {
+                (name.starts_with("f-") || name.starts_with("d-")) && !is_in_progress(name)
+            }
         }
     }
 }
@@ -117,6 +119,20 @@ impl Wipe {
 /// more than that.
 pub(super) fn is_staged_upload(name: &str) -> bool {
     name.starts_with("u-")
+}
+
+/// The prefix a write in progress carries.
+///
+/// Its own, and not the key's: named `<key>.partN`, a temporary inherited the
+/// prefix of what it was becoming, so a "clear cached media" and the budget
+/// sweep both counted a download somebody was waiting for as theirs to
+/// delete. Nothing claims this one — a wipe of everything does, which is the
+/// account leaving, and the epoch already answers for that.
+pub(super) const IN_PROGRESS_PREFIX: &str = "w-";
+
+/// Whether a file is a write that has not landed yet.
+pub(super) fn is_in_progress(name: &str) -> bool {
+    name.starts_with(IN_PROGRESS_PREFIX)
 }
 /// Which cache the writers still in flight think they are writing into.
 ///

@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 
-use super::{CACHE_EPOCH, WIPE_LOCK, Wipe, is_staged_upload};
+use super::{CACHE_EPOCH, IN_PROGRESS_PREFIX, WIPE_LOCK, Wipe, is_in_progress, is_staged_upload};
 #[cfg(test)]
 use super::{download_key, message_key};
 
@@ -97,9 +97,21 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
     // Through a temporary and a rename: a reader that opens the key must
     // never see half a file, and the reader is another process racing this
     // one by design.
-    let temp = path.with_extension(format!("part{}", write_ticket()));
+    // Under a name nothing else claims: a temporary called `<key>.partN`
+    // carried the key's own prefix, so a wipe and the budget sweep both read
+    // a download in flight as theirs to delete.
+    let temp = dir.join(format!("{IN_PROGRESS_PREFIX}{}", write_ticket()));
     std::fs::write(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
-    if let Err(e) = std::fs::rename(&temp, &path) {
+    // The rename under the wipe lock, so the file is either wholly before a
+    // clear — and taken by it — or wholly after. What it cannot cover is the
+    // caller's answer, which is a round trip later: a clear landing there
+    // costs one refetch, since media the renderer does not have is drawn as
+    // an offer to download. See `claim`.
+    let renamed = {
+        let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::fs::rename(&temp, &path)
+    };
+    if let Err(e) = renamed {
         // Windows will not rename onto an existing file, and two clients
         // asking for the same uncached media both miss the check above. The
         // other write winning is a cache hit, not a failure — the bytes are
@@ -272,7 +284,10 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         // waiting to have sent, and it never counted toward the budget it
         // would be dropped for: `put` is what feeds the sweep, and an upload
         // is written by the front end, not through it.
-        if is_staged_upload(&entry.file_name().to_string_lossy()) {
+        // A write in progress is nobody's to reclaim either: the bytes are
+        // not there yet, and whoever asked for them is waiting.
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_staged_upload(&name) || is_in_progress(&name) {
             continue;
         }
         let age = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -309,6 +324,22 @@ mod tests {
             !Wipe::Cache.takes("u-local_audio-7"),
             "somebody is still waiting for that to be sent"
         );
+    }
+
+    /// A download in flight is written under a name of its own. Called
+    /// `<key>.partN` it carried the key's prefix, so a clear pressed in the
+    /// same moment deleted the file somebody was waiting for.
+    #[test]
+    fn a_write_in_progress_is_nobodys_to_delete() {
+        let temp = format!("{IN_PROGRESS_PREFIX}1234.0");
+        assert!(is_in_progress(&temp));
+        assert!(!Wipe::Cache.takes(&temp));
+        assert!(!is_staged_upload(&temp));
+        // The old spelling, which both of them claimed.
+        assert!(Wipe::Cache.takes("d-9f86d081884c7d65.part1234.0"));
+        // The account leaving takes everything, temporaries included; the
+        // epoch is what stops the writer putting it back.
+        assert!(Wipe::Everything.takes(&temp));
     }
 
     /// The budget sweep reclaims more than a "clear cached media" does: the
