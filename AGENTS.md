@@ -812,6 +812,17 @@ screen, with the title above the glass and the pair code below it.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
+- **A withdrawal is applied before it is written down, and that is a trade.**
+  A revocation clears the shared mask first and persists second, so the very
+  next command a draining backlog attempts is already refused. The cost is a
+  crash in the window between the two: the file still holds the old grant,
+  and the next start reads it. Reversing the order buys durability and sells
+  the live account — the plugin would keep its permissions across a disk
+  write while Settings had already redrawn — and there is no ordering that
+  closes both, because closing the crash window means the write happening
+  first. Protecting the account that is running now is the side worth taking;
+  the failed-write path already removes the file rather than leave a stale
+  grant, so only an actual crash, in that window, reverts anything.
 - **A withdrawal does not reach a command already in flight.** The mask is
   read live, so the *next* command a plugin attempts is checked against the
   answer — but the check and the send are two steps, and the send parks on a
