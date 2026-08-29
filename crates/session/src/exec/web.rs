@@ -191,6 +191,7 @@ pub struct Spawner;
 
 #[allow(dead_code)]
 impl Spawner {
+    /// Spawn onto the page's loop, owned by the session. See [`spawn_owned`].
     pub fn spawn<T: MaybeSend + 'static>(
         &self,
         future: impl Future<Output = T> + MaybeSend + 'static,
@@ -262,6 +263,7 @@ thread_local! {
 struct Outstanding;
 
 impl Outstanding {
+    /// Join the count, for as long as the returned guard lives.
     fn enter() -> Self {
         OUTSTANDING.with(|count| count.set(count.get() + 1));
         Self
@@ -274,6 +276,10 @@ impl Outstanding {
 }
 
 impl Drop for Outstanding {
+    /// Leave the count, and wake [`Executor::join`] if this was the last one.
+    ///
+    /// The whole mechanism is this drop: a task that panics, or is dropped
+    /// part-way, leaves the count exactly as one that ran to completion does.
     fn drop(&mut self) {
         let left = OUTSTANDING.with(|count| {
             let left = count.get().saturating_sub(1);

@@ -39,6 +39,11 @@ pub(crate) struct Claim {
 }
 
 impl Drop for Claim {
+    /// Releases the lock, which is the only way it is ever released.
+    ///
+    /// The lock is held for as long as the promise the callback returned is
+    /// pending, and this is what settles it — so letting go of a `Claim` is
+    /// letting go of the account.
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
             let _ = release.send(());

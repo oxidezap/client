@@ -107,6 +107,11 @@ async fn sleep(duration: Duration) {
     }
 
     impl Drop for Timer {
+        /// Cancels the pending `setTimeout`.
+        ///
+        /// Not tidiness: the closure it would fire into is freed with this
+        /// struct, and a browser calling a freed `Closure` is a wasm-bindgen
+        /// panic rather than a missed wakeup.
         fn drop(&mut self) {
             if let Some(window) = web_sys::window() {
                 window.clear_timeout_with_handle(self.handle);
@@ -392,7 +397,30 @@ impl TransportFactory for BrowserTransportFactory {
             while let Ok(order) = orders.recv().await {
                 match order {
                     Outbound::Send(data) => {
-                        if let Err(e) = socket.send_with_u8_array(&data) {
+                        // Copied out of linear memory, not viewed into it.
+                        //
+                        // `send_with_u8_array` hands the browser a
+                        // `Uint8Array` *view* over the wasm heap, and this
+                        // module is built with `--shared-memory` — so that
+                        // heap is a `SharedArrayBuffer` and the view is a
+                        // shared one. `WebSocket.send` refuses those by
+                        // specification: "The provided ArrayBufferView value
+                        // must not be shared." Every frame threw, the writer
+                        // treated it as fatal, and the session reconnected
+                        // forever without a byte reaching WhatsApp.
+                        //
+                        // `Uint8Array::from` allocates in the JavaScript heap
+                        // and copies, so what goes out is unshared and the
+                        // send is allowed. It costs one copy per frame, which
+                        // for protocol traffic is nothing — and media takes
+                        // the same route into the same rule.
+                        //
+                        // The same trap is waiting anywhere else a view is
+                        // passed to a browser API: `fetch` bodies refuse
+                        // shared views too. Every other crossing in this tree
+                        // already goes through `Uint8Array::from`.
+                        let bytes = js_sys::Uint8Array::from(&data[..]);
+                        if let Err(e) = socket.send_with_array_buffer(&bytes.buffer()) {
                             // WhatsApp's socket, not the daemon's. This file is
                             // the library's transport; the daemon link is
                             // `oxidezap-ipc`, and a reader who trusts this
