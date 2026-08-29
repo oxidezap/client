@@ -213,6 +213,32 @@ pub struct StoredMessage {
     pub seq: i64,
 }
 
+/// Whole seconds as whole milliseconds, inside the range a `DateTime` can
+/// hold.
+///
+/// The multiplication is the easy half. The hard half is that a stored
+/// millisecond outside chrono's range reads back as `None`, and every reader
+/// here turns `None` into `0` — which puts a chat at the top of the list on
+/// the way in and at the bottom of the cursor on the way out. That chat is
+/// then almost certainly the one a page ends on, so the cursor it writes asks
+/// for rows older than the epoch and the chat list stops paginating for good.
+/// A clamp keeps a nonsense timestamp nonsense rather than letting it become
+/// a cursor that answers nothing.
+pub(crate) fn secs_to_ms(secs: i64) -> i64 {
+    clamp_ms(secs.saturating_mul(1000))
+}
+
+/// A millisecond count inside the range a `DateTime` can hold.
+///
+/// Applied on the way out as well as on the way in, because a row written
+/// before the way in had it is still in the database.
+pub(crate) fn clamp_ms(ms: i64) -> i64 {
+    ms.clamp(
+        DateTime::<Utc>::MIN_UTC.timestamp_millis(),
+        DateTime::<Utc>::MAX_UTC.timestamp_millis(),
+    )
+}
+
 /// Keyset-pagination cursor: pass the values of the oldest message you have to
 /// fetch the page before it. Never an OFFSET — stable under concurrent inserts.
 #[derive(Debug, Clone)]

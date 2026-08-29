@@ -25,7 +25,7 @@ use crate::types::{
 const BIND_CHUNK: usize = 400;
 
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
-    DateTime::<Utc>::from_timestamp_millis(ms)
+    DateTime::<Utc>::from_timestamp_millis(crate::types::clamp_ms(ms))
 }
 
 /// A wall-clock instant as the first whole millisecond at or after it.

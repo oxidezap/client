@@ -10,7 +10,9 @@ use std::time::Duration;
 use buffa::MessageField;
 use chrono::{Datelike, TimeZone, Utc};
 use diesel::RunQueryDsl;
-use oxidezap_chat_store::{ChatStore, MessageCursor, MessageKind, MessageStatus, StoreChange};
+use oxidezap_chat_store::{
+    ChatCursor, ChatStore, MessageCursor, MessageKind, MessageStatus, StoreChange,
+};
 use wacore::proto_helpers::MessageBuilderExt;
 use wacore::types::events::{
     BatchOrigin, Event, InboundMessage, LazyHistorySync, MessageBatch, Receipt, ServerAck,
@@ -1163,6 +1165,52 @@ async fn keyset_pagination_covers_all_pages_in_order() {
     }
     // Newest first, no duplicates, no gaps.
     assert_eq!(seen, ["m4", "m3", "m2", "m1", "m0"]);
+}
+
+/// A conversation timestamp far outside anything a clock produces used to
+/// stop the chat list paginating for good: it sorts to the top, so it is very
+/// likely the row a page ends on, and the instant it reads back as is `None`
+/// — which the cursor writes as 0 and the next page reads as "older than the
+/// epoch", coming back empty for ever after.
+#[tokio::test]
+async fn an_impossible_timestamp_does_not_stop_the_chat_list() {
+    let (_store, chat_store) = test_store().await;
+
+    let history = wa::HistorySync {
+        sync_type: wa::history_sync::HistorySyncType::RECENT,
+        conversations: vec![
+            wa::Conversation {
+                id: "559900000004@s.whatsapp.net".to_string(),
+                conversation_timestamp: Some(u64::MAX / 2),
+                ..Default::default()
+            },
+            wa::Conversation {
+                id: PEER.to_string(),
+                conversation_timestamp: Some(1_700_000_900),
+                ..Default::default()
+            },
+            wa::Conversation {
+                id: GROUP.to_string(),
+                conversation_timestamp: Some(1_700_000_800),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    feed(&chat_store, [history_sync_event(history)]).await;
+
+    let first = chat_store.chats_page(false, None, 1).await.unwrap();
+    assert_eq!(first.len(), 1);
+    let cursor = ChatCursor::from(&first[0]);
+    let second = chat_store
+        .chats_page(false, Some(cursor), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.len(),
+        2,
+        "the rest of the list is still reachable behind the corrupt row"
+    );
 }
 
 #[tokio::test]
