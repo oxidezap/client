@@ -3776,6 +3776,43 @@ async fn reconcile_merges_split_pair() {
     assert_eq!(chats[0].unread_count, 2);
 }
 
+/// A receipt names the peer's device (`user:48@lid`), and that is the form
+/// a reconcile can be asked for under. `merge_split_chat` took its keys raw
+/// where every other entry point normalizes, so nothing was filed under the
+/// name it was given, the early return fired, and the repair that was asked
+/// for silently did not happen.
+#[tokio::test]
+async fn a_reconcile_named_by_a_device_still_merges_the_pair() {
+    let (store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("via pn"),
+                incoming_info(PEER, PEER, "MSG-AD-A", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("via lid"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-AD-B", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(chat_store.chats(false, 10).await.unwrap().len(), 2);
+
+    add_lid_mapping(&store).await;
+    let with_device: Jid = format!("{}:48@s.whatsapp.net", jid(PEER).user)
+        .parse()
+        .expect("valid device address");
+    chat_store.reconcile_chat(&with_device).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1, "the pair asked about is the pair merged");
+    assert_eq!(chats[0].jid, jid(PEER_LID));
+}
+
 /// Reaction timestamps are whole seconds, so adding and removing inside one
 /// second ties. The merge dropped a destination row only for a *strictly*
 /// newer source row, so a tie kept the emoji and threw away the tombstone

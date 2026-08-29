@@ -35,6 +35,15 @@ fn user_chat(chat: &str) -> Option<Jid> {
         .then(|| jid.into_non_ad())
 }
 
+/// The key rows are actually filed under, for anything else left alone.
+///
+/// [`user_chat`]'s normalization applied to a string: the one shape every
+/// entry point here has to agree on, since a device-suffixed address reaches
+/// this module from receipts.
+fn chat_key(chat: &str) -> String {
+    user_chat(chat).map_or_else(|| chat.to_string(), |jid| jid.to_string())
+}
+
 #[derive(QueryableByName)]
 struct UserRow {
     #[diesel(sql_type = Text)]
@@ -193,6 +202,13 @@ pub(crate) fn merge_split_chat(
     b: &str,
     cs: &mut ChangeSet,
 ) -> QueryResult<String> {
+    // Normalized here rather than trusted from the caller, the same way
+    // `route_chat_key` does it. A device-suffixed key (`user:48@lid`, the
+    // form receipts carry) names nothing in the store, so the early return
+    // below fired and the reconciliation that was asked for silently did not
+    // happen.
+    let (a, b) = (chat_key(a), chat_key(b));
+    let (a, b) = (a.as_str(), b.as_str());
     if a == b {
         return Ok(a.to_string());
     }
