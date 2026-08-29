@@ -32,7 +32,7 @@ use openh264::formats::YUVSource as _;
 use oxidezap_core::{CallVideoFrame, VideoStream};
 use smallvec::SmallVec;
 
-use super::streaming::{Rotation, write_bgra_rotated};
+use super::streaming::{Rotation, swap_rb_in_place, write_bgra_rotated};
 
 /// Where a decoded picture goes.
 ///
@@ -295,16 +295,26 @@ impl Scratch {
             log::warn!("refusing a {width}x{height} video frame");
             return None;
         }
-        if self.size != (width, height) {
-            self.rgba = vec![0; width * height * 4];
-            self.size = (width, height);
+        // The buffer the image will own. Allocated per frame because that is
+        // what `RgbaImage::from_raw` takes ownership of; what used to be
+        // allocated per frame *beside* it is the scratch, and an unturned
+        // frame does not need one — it is written here and corrected in
+        // place. At 720p that is 3.5 MiB a frame, per direction, thirty times
+        // a second.
+        let mut turned = vec![0; width * height * 4];
+        if rotation == Rotation::None {
+            yuv.write_rgba8(&mut turned);
+            swap_rb_in_place(&mut turned);
+        } else {
+            if self.size != (width, height) {
+                self.rgba = vec![0; width * height * 4];
+                self.size = (width, height);
+            }
+            yuv.write_rgba8(&mut self.rgba);
+            // `RenderImage` reads BGRA, and the peer's device orientation is a
+            // rotation only they know about.
+            write_bgra_rotated(&self.rgba, width, height, rotation, &mut turned);
         }
-        yuv.write_rgba8(&mut self.rgba);
-
-        // `RenderImage` reads BGRA, and the peer's device orientation is a
-        // rotation only they know about.
-        let mut turned = vec![0; self.rgba.len()];
-        write_bgra_rotated(&self.rgba, width, height, rotation, &mut turned);
         let (drawn_width, drawn_height) = if rotation.transposes() {
             (height, width)
         } else {

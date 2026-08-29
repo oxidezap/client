@@ -112,6 +112,20 @@ pub(super) fn write_bgra_rotated(
     debug_assert_eq!(src.len(), width * height * 4);
     debug_assert_eq!(dst.len(), src.len());
 
+    // The common case, and worth its own path: a call at 720p in both
+    // directions is ~55 million pixels a second, and the general loop pays
+    // two bounds checks and a multiply per pixel for a rotation that is not
+    // happening.
+    if rotation == Rotation::None {
+        for (to, from) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            to[0] = from[2];
+            to[1] = from[1];
+            to[2] = from[0];
+            to[3] = from[3];
+        }
+        return;
+    }
+
     let dst_width = if rotation.transposes() { height } else { width };
 
     for y in 0..height {
@@ -129,6 +143,17 @@ pub(super) fn write_bgra_rotated(
             dst[t + 2] = src[s];
             dst[t + 3] = src[s + 3];
         }
+    }
+}
+
+/// RGBA to BGRA where the two are the same buffer.
+///
+/// For a frame that is not being turned: the destination is the buffer the
+/// image will own, so it can be written into directly and corrected in place
+/// rather than copied out of a scratch.
+pub(super) fn swap_rb_in_place(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
     }
 }
 
