@@ -132,6 +132,33 @@ pub fn format_time_local(timestamp: &DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A push name is whatever the peer typed and the wire carries it whole:
+    /// three hundred characters turned the sidebar row into nothing but the
+    /// name, with the preview squeezed to zero and the message gone from the
+    /// list, and pushed the call card's pill off the left of the window.
+    #[test]
+    fn a_name_from_the_peer_cannot_be_any_length() {
+        let flood = "a".repeat(300);
+        let capped = super::capped_name(&flood);
+        assert_eq!(capped.chars().count(), super::MAX_NAME_CHARS + 1);
+        assert!(capped.ends_with('\u{2026}'));
+
+        // An ordinary name is handed back exactly as it was.
+        assert_eq!(super::capped_name("Ana Souza"), "Ana Souza");
+    }
+
+    /// Counted in characters, never in bytes: most of the world's names are
+    /// not ASCII, and cutting a UTF-8 sequence in half panics.
+    #[test]
+    fn a_name_is_cut_between_characters() {
+        let accented = "á".repeat(super::MAX_NAME_CHARS + 10);
+        let capped = super::capped_name(&accented);
+        assert_eq!(capped.chars().count(), super::MAX_NAME_CHARS + 1);
+        // Emoji are several bytes and one character each.
+        let emoji = "🇧🇷".repeat(super::MAX_NAME_CHARS);
+        assert!(super::capped_name(&emoji).chars().count() <= super::MAX_NAME_CHARS + 1);
+    }
+
     use super::{mime_to_image_format, scale_media_dimensions};
     use gpui::ImageFormat;
 
@@ -193,5 +220,33 @@ mod tests {
         // 10:1 stays 10:1; the floor grow stops at max_size instead of
         // stretching only the short side (the old per-axis behavior).
         assert_close(scale_media_dimensions(200, 20, 300.0), (300.0, 30.0));
+    }
+}
+
+/// Longest a person's name may be where one is drawn.
+///
+/// A push name is whatever the peer typed and the wire carries it whole. It
+/// reaches the sidebar's preview line and the call card's pill, and both are
+/// laid out around it: a three-hundred-character name turns the sidebar row
+/// into nothing but the name, with the preview squeezed to zero, and pushes
+/// the call card off the left edge of the window with its drag handle. Sixty
+/// four is far past any name anybody chooses and short enough that the
+/// layout still owns the row.
+const MAX_NAME_CHARS: usize = 64;
+
+/// A name at a length a layout can hold.
+///
+/// Counted in `chars`, never in bytes: a name is somebody's, most of the
+/// world's are not ASCII, and cutting a UTF-8 sequence in half panics.
+/// Truncated here rather than only in the component, because the string is
+/// also measured, compared and put in tooltips.
+#[must_use]
+pub fn capped_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let head: String = chars.by_ref().take(MAX_NAME_CHARS).collect();
+    if chars.next().is_none() {
+        head
+    } else {
+        format!("{head}\u{2026}")
     }
 }
