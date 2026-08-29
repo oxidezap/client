@@ -97,8 +97,13 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
     // Through a temporary and a rename: a reader that opens the key must
     // never see half a file, and the reader is another process racing this
     // one by design.
+    // `create_new`, so nothing already at this name is opened: a plain
+    // `write` follows a symlink to wherever it points and truncates whatever
+    // is there. A leftover from a process that shared this pid and sequence
+    // and died mid-write is the one honest way to meet one, so it is unlinked
+    // once — the link and not its target — and the create tried again.
     let temp = path.with_extension(format!("part{}", write_ticket()));
-    std::fs::write(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
+    write_new(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
     if let Err(e) = std::fs::rename(&temp, &path) {
         // Windows will not rename onto an existing file, and two clients
         // asking for the same uncached media both miss the check above. The
@@ -132,6 +137,26 @@ pub fn take(key: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Write `bytes` to a path nothing is using, refusing any existing entry.
+fn write_new(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    };
+    let mut file = match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            create()?
+        }
+        other => other?,
+    };
+    file.write_all(bytes)
+}
+
 /// A name no other in-progress write is using.
 ///
 /// The process id alone is not enough: two clients of the same daemon asking
@@ -156,22 +181,41 @@ pub fn has(key: &str) -> bool {
 
 /// The cache directory carries a copy of every photo the account has shown,
 /// so it gets the same treatment as the socket beside it: ours alone.
-#[cfg(unix)]
+///
+/// It used to accept any existing entry that `Path::is_dir` answered for,
+/// which follows a symlink and asks nothing about owner or mode — so a
+/// `media` planted by another local account was taken as the cache and every
+/// attachment written into it. And the keys here are derived from content the
+/// account has already published, which makes them predictable: a file left
+/// under one while the directory was open is served as the attachment it
+/// names. The cache is the one thing here that can simply be thrown away —
+/// every entry is re-fetchable, and the renderer already draws media it does
+/// not hold as an offer to download — so a directory found open is emptied
+/// rather than inherited.
 fn prepare_dir(dir: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => Ok(()),
-        // Already there is the common case, and the only failure that is not
-        // one: the directory is created once and written to thousands of
-        // times.
-        Err(_) if dir.is_dir() => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("creating {}", dir.display())),
+    if crate::private_dir::prepare(dir, "cached media")? == crate::private_dir::Found::WasOpen {
+        log::warn!(
+            "{} was reachable by other accounts on this machine; dropping what is in it",
+            dir.display()
+        );
+        clear_dir(dir)?;
     }
+    Ok(())
 }
 
-#[cfg(not(unix))]
-fn prepare_dir(dir: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
+/// Empty a directory without removing it, so a caller that has just made it
+/// private keeps the private directory it made.
+fn clear_dir(dir: &std::path::Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        let removed = if path.is_dir() && !path.is_symlink() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Drop the oldest files once enough has been written to be worth looking.

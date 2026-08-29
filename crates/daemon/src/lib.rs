@@ -33,6 +33,8 @@ pub mod state;
 /// The ways in, which are a platform each.
 #[cfg(not(target_family = "wasm"))]
 pub mod listener;
+#[cfg(not(target_family = "wasm"))]
+mod private_dir;
 /// Being asked to stop, which is a notification rather than a signal — so it
 /// is the same code wherever the asking happens. What acts on it differs: a
 /// process ends, a worker closes.

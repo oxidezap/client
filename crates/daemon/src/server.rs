@@ -269,69 +269,23 @@ fn acquire_startup_lock(_path: &Path) -> Result<StartupLock> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-/// Create the socket directory, or verify an existing one is safe to use.
+/// Make the directory the socket lives in ours alone.
 ///
-/// The socket carries control of a WhatsApp session. Under `XDG_RUNTIME_DIR`
-/// that is already a private per-user directory, but the `TMPDIR` fallback
-/// sits in a world-writable place at a predictable path, where another local
-/// user can pre-create it, or replace it with a symlink pointing somewhere
-/// they can read. Creating it blindly and chmod-ing afterwards checks neither.
-///
-/// So: create it with the right mode from the start, and if it already exists,
-/// refuse unless it is a real directory, owned by us, and inaccessible to
-/// anyone else. Refusing to start is a bad outcome; putting a socket that
-/// controls the account somewhere another user can reach is a worse one.
-#[cfg(unix)]
+/// The socket carries control of a WhatsApp session, and under the `TMPDIR`
+/// fallback its directory sits at a predictable path in a world-writable
+/// place. The check itself is shared with the media cache next door; what is
+/// specific here is what a directory that *was* open means: another local
+/// account could have left something inside under a name this daemon is about
+/// to use — a `daemon.sock` in front of the bind, a `daemon.lock` held open,
+/// a `media` symlink pointing at a directory of their own. Refusing to start
+/// is a bad outcome; opening the account's photo cache through somebody
+/// else's symlink is a worse one, so what could not be ours is removed rather
+/// than inherited.
 fn prepare_state_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => return Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
-    }
-
-    // `symlink_metadata`, not `metadata`: the latter follows the link, which
-    // would report on the target and miss exactly the substitution this
-    // guards against.
-    let meta =
-        std::fs::symlink_metadata(dir).with_context(|| format!("inspecting {}", dir.display()))?;
-
-    if !meta.is_dir() {
-        anyhow::bail!(
-            "{} exists but is not a directory; refusing to place the socket there",
-            dir.display()
-        );
-    }
-    if meta.uid() != current_uid() {
-        anyhow::bail!(
-            "{} is owned by uid {}, not by us; refusing to place the socket there",
-            dir.display(),
-            meta.uid()
-        );
-    }
-
-    // Tighten rather than reject: a directory that is ours but too permissive
-    // is recoverable, and this is the common case when an earlier version
-    // created it.
-    let mode = meta.permissions().mode() & 0o777;
-    if mode != 0o700 {
-        log::warn!("tightening {} from {mode:o} to 700", dir.display());
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting {}", dir.display()))?;
+    if crate::private_dir::prepare(dir, "the socket")? == crate::private_dir::Found::WasOpen {
+        crate::private_dir::drop_foreign_entries(dir)?;
     }
     Ok(())
-}
-
-#[cfg(not(target_family = "wasm"))]
-#[cfg(unix)]
-fn current_uid() -> u32 {
-    rustix::process::getuid().as_raw()
-}
-
-#[cfg(all(not(unix), not(target_family = "wasm")))]
-fn prepare_state_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
 }
 
 /// Longest single frame a client may send.
