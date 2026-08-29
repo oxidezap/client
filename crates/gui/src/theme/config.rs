@@ -201,6 +201,8 @@ pub const PALETTE_KEYS: &[PaletteKey] = palette_keys![
     "warning" => warning,
     "success" => success,
     "info" => info,
+    "scrim" => scrim,
+    "on_scrim" => on_scrim,
 ];
 
 /// Authorship colours, addressed under `brand` rather than `colors`.
@@ -412,6 +414,24 @@ mod tests {
             file.colors.is_empty() && file.brand.is_empty(),
             "an untouched preset should not be spelled out key by key"
         );
+    }
+
+    /// `scrim`'s own doc says a hand-edited `theme.json` can move it. It was
+    /// not in the override table, so "colors.scrim" came back as "is not a
+    /// known colour role" on the Appearance screen, with no literal anywhere
+    /// to blame for the picture's ground.
+    #[test]
+    fn the_viewers_ground_can_be_moved_by_hand() {
+        let settings = resolve(
+            r##"{"extends":"tokyo-night","colors":{"scrim":"#101010","on_scrim":"#f0f0f0"}}"##,
+        );
+        assert_eq!(settings.problems, Vec::<String>::new());
+        assert_eq!(settings.palette.scrim, Rgb(0x101010));
+        assert_eq!(settings.palette.on_scrim, Rgb(0xf0f0f0));
+
+        // And written back, or the next save would drop what was typed in.
+        let written = settings.to_file();
+        assert_eq!(written.colors.get("scrim").map(String::as_str), Some("#101010"));
     }
 
     #[test]
