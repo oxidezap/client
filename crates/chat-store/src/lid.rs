@@ -10,6 +10,17 @@
 //! (`WAWebMessageProcessUtils.selectChatForOneOnOneMessage`): legacy chat ids
 //! stay stable, only brand-new chats are keyed by LID.
 //!
+//! Two questions here look like one and are not. A *chat key* is where rows
+//! live, and it is decided by [`route_chat_key`] with WA Web parity: an
+//! existing thread keeps the key it already has, whichever identity addressed
+//! it, so a legacy conversation stays under its phone number forever. A
+//! *person's* canonical identity is the other question, answered in
+//! `session/names.rs`, which prefers the LID whenever the pair is known. They
+//! disagree on purpose, and neither is the other's answer: `canonical_jid`
+//! must never be used to key a chat, and a chat key says nothing about who
+//! somebody is. What makes the disagreement harmless is that every read here
+//! resolves both halves of the pair.
+//!
 //! The device store's `lid_pn_mapping` table lives in the same database file
 //! and is bidirectional, so both candidate keys of a peer are always
 //! derivable — it already is the alias index WA Web keeps as the chat table's
