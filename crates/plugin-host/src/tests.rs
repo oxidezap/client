@@ -1630,3 +1630,76 @@ fn a_capability_this_host_lacks_is_refused() {
         "refused rather than loaded asking for less than it wrote"
     );
 }
+
+/// Fuel prices one call. A plugin needs no permission to arm a timer, so an
+/// unapproved one can wake itself forever, burn almost a full budget in each
+/// callback and never trap — a core, permanently, for something subscribed to
+/// no account event. The duty cycle is the bound on the sum.
+const BURNS_ON_A_TIMER: &str = r#"(module
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_timer_set"    (func $timer (param i64 i64) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "a@s.whatsapp.nettick")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func $spin
+    (local $i i32)
+    (block $done
+      (loop $again
+        (br_if $done (i32.ge_s (local.get $i) (i32.const 2000000)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $again))))
+  (func (export "oxi_init") (result i32)
+    ;; TIMERS needs nobody's yes; SEND is here only so each callback leaves a
+    ;; mark the test can count.
+    (call $caps (i64.const 33))
+    (drop (call $timer (i64.const 100) (i64.const 1)))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (drop (call $send (i32.const 0) (i32.const 16) (i32.const 16) (i32.const 4)))
+    (call $spin)
+    ;; And arm the next one, so it never runs out of work to do.
+    (drop (call $timer (i64.const 100) (i64.const 1)))
+    (i32.const 0))
+)"#;
+
+#[test]
+fn a_plugin_that_wakes_itself_forever_is_held_to_its_share() {
+    let dir = TempDir::new("duty");
+    dir.plugin("greedy", &versioned(BURNS_ON_A_TIMER));
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+    published.settles("the plugin to be listed", |s| !s.is_empty());
+
+    // Each callback marks itself before spinning, so this counts how many
+    // actually ran. The bound is measured rather than guessed: over this
+    // window an unthrottled plugin gets through about sixteen callbacks and a
+    // throttled one about six, so ten separates them with room on both sides.
+    // Six seconds because the debt is paid off incrementally — a shorter
+    // window catches the throttle mid-convergence and the two are a factor of
+    // two apart, which is not a margin.
+    std::thread::sleep(Duration::from_secs(6));
+    let ran = commands.sent().len();
+    assert!(
+        ran <= 10,
+        "a plugin waking itself forever ran {ran} times in six seconds, which is not a share"
+    );
+    assert!(
+        plugins.surfaces()[0].is_running(),
+        "held back rather than stopped: it is doing nothing wrong, only too much"
+    );
+
+    // And it lets go when asked, which is the property a sleeping worker
+    // most easily breaks.
+    let (done, waited) = std::sync::mpsc::channel();
+    let plugins = Arc::new(plugins);
+    let shutting_down = Arc::clone(&plugins);
+    std::thread::spawn(move || {
+        shutting_down.shutdown();
+        let _ = done.send(());
+    });
+    waited
+        .recv_timeout(Duration::from_secs(20))
+        .expect("a throttled plugin is still one the daemon can join");
+}

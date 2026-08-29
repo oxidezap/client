@@ -124,7 +124,16 @@ profile here repeats it deliberately.
   isolation a process boundary would have been for — what wasm does *not*
   supply is a bound on time and on memory, which is why fuel metering and the
   resource limiter are not optional: a plugin that loops forever runs out and
-  traps, and the daemon loses a plugin rather than a thread. The limiter
+  traps, and the daemon loses a plugin rather than a thread. Fuel prices *one
+  call*, though, and a plugin needs nobody's permission to arm a timer — so
+  one could wake itself at the floor, spend almost a whole budget in each
+  callback and never trap, owning a core for something subscribed to no
+  account event at all. The share (`MAX_DUTY`) is the bound on the sum:
+  busy time against elapsed, over a rolling window, with the excess slept off
+  before the next call. Throttled rather than stopped, because a plugin doing
+  too much is not the same as one doing something wrong — and the sleep is
+  taken in slices, since a plugin being held back is still one the daemon has
+  to be able to join. The limiter
   bounds tables and instance counts and not only the linear memory's bytes,
   because a declared table is allocated at instantiation — before a
   fuel-metered instruction has run — so a byte cap alone is a bound on one

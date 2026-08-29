@@ -43,10 +43,17 @@ const MAX_FIELD_BYTES: usize = 64 * 1024;
 /// does not, depending on where it was drawn. Keyed on the pair alone, the
 /// first one collected won — the header's Enter would arrive as a Settings
 /// action, and the two published values would overwrite each other.
-fn key(plugin: &str, slot: PluginSlot, id: &str) -> String {
+/// And the conversation, for a slot that has one. A header field belongs to
+/// the chat it was drawn over: `send_plugin_action` resolves the *current*
+/// selection when Enter is pressed, so a box shared across chats would take
+/// what somebody typed in one and commit it carrying the other's JID — a
+/// plugin storing or sending it for the wrong conversation. Switching chats
+/// therefore drops what was half-typed in the old one, which is the honest
+/// trade: the alternative is not a preserved draft, it is a misdirected one.
+fn key(plugin: &str, slot: PluginSlot, chat: Option<&str>, id: &str) -> String {
     // A separator no plugin id may hold: ids are alphanumeric plus `-` and
     // `_`, checked by the host when it reads the file's name.
-    format!("{plugin}/{slot:?}/{id}")
+    format!("{plugin}/{slot:?}/{}/{id}", chat.unwrap_or(""))
 }
 
 impl WhatsAppApp {
@@ -57,6 +64,10 @@ impl WhatsAppApp {
     /// which widgets are actually on screen — and because a plugin's tree
     /// changes without any event this window would otherwise act on.
     pub fn sync_plugin_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The same answer `send_plugin_action` will give when one of these
+        // commits, taken here so the two cannot disagree about which
+        // conversation a header field belongs to.
+        let chat = self.selected_chat_jid();
         let mut wanted: Vec<Field> = Vec::new();
         for surface in &self.plugins {
             for root in &surface.roots {
@@ -69,7 +80,7 @@ impl WhatsAppApp {
         // fires into a widget nobody can see.
         let live: std::collections::HashSet<String> = wanted
             .iter()
-            .map(|f| key(&f.plugin, f.slot, &f.id))
+            .map(|f| key(&f.plugin, f.slot, chat.as_deref(), &f.id))
             .collect();
         self.plugin_fields.retain(|k, _| live.contains(k));
 
@@ -80,7 +91,7 @@ impl WhatsAppApp {
             value,
         } in wanted
         {
-            let k = key(&plugin, slot, &id);
+            let k = key(&plugin, slot, chat.as_deref(), &id);
             match self.plugin_fields.get_mut(&k) {
                 Some(field) => {
                     // Only when the *plugin* moved it. A tree republished with
@@ -151,8 +162,9 @@ impl WhatsAppApp {
         slot: PluginSlot,
         id: &str,
     ) -> Option<&Entity<InputState>> {
+        let chat = self.selected_chat_jid();
         self.plugin_fields
-            .get(&key(plugin, slot, id))
+            .get(&key(plugin, slot, chat.as_deref(), id))
             .map(|f| &f.state)
     }
 

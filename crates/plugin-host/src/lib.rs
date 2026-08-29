@@ -79,6 +79,27 @@ const MAX_TABLES: usize = 4;
 /// of megabytes, and this leaves room for several of those.
 const MAX_MODULE_BYTES: usize = 32 * 1024 * 1024;
 
+/// What share of its own thread a plugin may actually spend running.
+///
+/// Fuel bounds one call and nothing bounded the sum of them. A plugin needs
+/// no permission to arm a timer, so an unapproved one could hold sixteen at
+/// the hundred-millisecond floor, burn almost a full budget in each callback
+/// and rearm — never trapping, and never idle. That is a core, permanently,
+/// per plugin, for something that subscribes to no account event at all.
+///
+/// A tenth, measured over a rolling window: far more than any honest handler
+/// wants, and slow enough that spending it deliberately is a plugin somebody
+/// notices rather than one that quietly owns the machine.
+const MAX_DUTY: f64 = 0.10;
+
+/// How long that share is measured over.
+///
+/// Long enough that a plugin doing a genuine burst of work — a settings panel
+/// redrawn a few times, a handler that formats a long reply — is not slowed
+/// for it, and short enough that a plugin which will not stop is slowed
+/// within seconds rather than minutes.
+const DUTY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How many events may wait for one plugin.
 ///
 /// Deep enough to absorb a burst of arrivals while a handler is working, and
@@ -547,6 +568,53 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// How much of its own thread one plugin has been using.
+///
+/// Fuel prices a single call and says nothing about how many a plugin gives
+/// itself: timers are ungated, so one can wake itself forever and never trap.
+/// This is the bound on the sum — busy time against elapsed time, over a
+/// rolling window, with the excess paid back as sleep before the next call.
+struct Duty {
+    window_began: Instant,
+    busy: std::time::Duration,
+}
+
+impl Duty {
+    fn new() -> Self {
+        Self {
+            window_began: Instant::now(),
+            busy: std::time::Duration::ZERO,
+        }
+    }
+
+    fn spent(&mut self, running: std::time::Duration) {
+        self.busy += running;
+    }
+
+    /// Hold the plugin back until it is inside its share again.
+    ///
+    /// Slept in slices so shutdown is not waiting on the whole debt: a plugin
+    /// being throttled is still a plugin the daemon has to be able to join.
+    fn wait_its_turn(&mut self, stopping: &AtomicBool) {
+        let elapsed = self.window_began.elapsed();
+        if elapsed >= DUTY_WINDOW {
+            self.window_began = Instant::now();
+            self.busy = std::time::Duration::ZERO;
+            return;
+        }
+        let allowed = elapsed.mul_f64(MAX_DUTY);
+        let Some(over) = self.busy.checked_sub(allowed) else {
+            return;
+        };
+        let mut left = over.min(DUTY_WINDOW);
+        while !left.is_zero() && !stopping.load(Ordering::Relaxed) {
+            let slice = left.min(std::time::Duration::from_millis(50));
+            std::thread::sleep(slice);
+            left -= slice;
+        }
+    }
+}
+
 /// Turn the delays a call asked for into deadlines.
 ///
 /// Monotonic, because `oxi_timer_set` takes a *delay*: a wall-clock deadline
@@ -582,7 +650,12 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
     // these would leave it waiting for a wake-up nobody was going to send.
     let mut timers: Vec<(Instant, i64)> = runtime.take_initial_timers();
 
+    // What this plugin has actually spent running, against the wall clock it
+    // is spending. See `MAX_DUTY`.
+    let mut duty = Duty::new();
+
     while let Some(job) = take(jobs, &mut timers, stopping) {
+        duty.wait_its_turn(stopping);
         // Asked before the call, not only after it: a plugin stopped by its
         // queue overflowing still has a live thread and a backlog, and
         // "stopped" has to mean it runs no more of them. Its own trap breaks
@@ -597,7 +670,10 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
         // *holds* rather than what it asked for in one call. Counting per
         // call would let it add a handful of far-future timers on every
         // message and grow this vector without limit.
-        match runtime.deliver(event, timers.len()) {
+        let started = Instant::now();
+        let outcome = runtime.deliver(event, timers.len());
+        duty.spent(started.elapsed());
+        match outcome {
             Ok(effects) => {
                 if let Some(roots) = effects.ui {
                     registry.set_roots(&runtime.id, roots);
