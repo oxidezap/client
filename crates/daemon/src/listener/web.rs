@@ -921,7 +921,7 @@ mod tests {
     fn a_preflight_says_how_long_it_is_good_for() {
         let head = preflight_head(Some("https://oxidezap.github.io"), true);
         assert!(
-            head.contains("Access-Control-Max-Age:"),
+            head.contains("Access-Control-Max-Age: 600\r\n"),
             "the browser was told nothing, so it asks again per photo: {head}"
         );
     }
