@@ -15,6 +15,16 @@ use crate::system_notice::SystemNotice;
 /// Maximum number of unique emoji reactions per message to prevent spam
 const MAX_REACTIONS_PER_MESSAGE: usize = 50;
 
+/// Maximum reactors one message will record, across every emoji on it.
+///
+/// The emoji count was bounded and the list under each was not, so one
+/// message grew by a name per reaction — and reactions arrive from the
+/// network with the sender in the envelope, so the same emoji from a
+/// thousand JIDs is a row that is serialized into every history load and
+/// copied into every status rebuild. Generous, because a large group really
+/// does react.
+const MAX_REACTORS_PER_MESSAGE: usize = 500;
+
 pub fn fallback_chat_name(jid: &Jid) -> String {
     if jid.is_status_broadcast() {
         "Status".to_string()
@@ -462,6 +472,21 @@ impl ChatMessage {
             }
         }
 
+        // The other half of the same bound: a distinct sender is a name this
+        // message keeps, and a message with no ceiling on those is one the
+        // network can grow without limit. Somebody who already reacted is
+        // changing their mind rather than adding to it, so they are never
+        // turned away.
+        if !emoji.is_empty()
+            && self.reactors() >= MAX_REACTORS_PER_MESSAGE
+            && !self
+                .reactions
+                .values()
+                .any(|senders| senders.contains(&sender))
+        {
+            return;
+        }
+
         // Remove any existing reaction from this sender (one reaction per person)
         for senders in self.reactions.values_mut() {
             senders.retain(|s| s != &sender);
@@ -474,6 +499,11 @@ impl ChatMessage {
         }
 
         self.reactions.entry(emoji).or_default().push(sender);
+    }
+
+    /// How many people have reacted to this message.
+    fn reactors(&self) -> usize {
+        self.reactions.values().map(Vec::len).sum()
     }
 
     /// Get the preview text for chat list display.
@@ -1611,6 +1641,27 @@ mod tests {
         assert_eq!(chat.messages[0].content, "Message local_1000_0");
 
         assert!(!chat.rename_message("missing", "whatever"));
+    }
+
+    /// The emoji count was bounded and the reactor list under each was not,
+    /// so one message grew by a name for every reaction the network carried —
+    /// and that row is serialized into every history load.
+    #[test]
+    fn one_message_does_not_grow_a_name_per_reaction_forever() {
+        let mut message = make_message("3EB0AAA", 1000);
+        for reactor in 0..MAX_REACTORS_PER_MESSAGE + 200 {
+            message.add_reaction("👍".to_string(), format!("{reactor}@s.whatsapp.net"));
+        }
+        assert_eq!(message.reactors(), MAX_REACTORS_PER_MESSAGE);
+
+        // Somebody already counted is changing their mind, not adding to it.
+        message.add_reaction("🎉".to_string(), "0@s.whatsapp.net".to_string());
+        assert_eq!(message.reactors(), MAX_REACTORS_PER_MESSAGE);
+        assert_eq!(
+            message.reactions.get("🎉").map(Vec::len),
+            Some(1),
+            "and their new emoji is the one recorded"
+        );
     }
 
     #[test]
