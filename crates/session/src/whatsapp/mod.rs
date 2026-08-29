@@ -655,6 +655,16 @@ impl WhatsAppClient {
             let names = names.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
+                let mut lanes = EventLanes::new(move |event| {
+                    let client = client.clone();
+                    let ui_tx = ui_tx.clone();
+                    let calls = calls.clone();
+                    let ui_sender = ui_sender.clone();
+                    let names = names.clone();
+                    async move {
+                        Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
+                    }
+                });
                 loop {
                     let event = tokio::select! {
                         event = incoming.recv() => match event {
@@ -674,14 +684,7 @@ impl WhatsAppClient {
                     // nothing to say — the arms below speak only for the
                     // variants they handle.
                     debug!("client event: {:?}", event.kind());
-                    let client = client.clone();
-                    let ui_tx = ui_tx.clone();
-                    let calls = calls.clone();
-                    let ui_sender = ui_sender.clone();
-                    let names = names.clone();
-                    crate::exec::spawn_owned(async move {
-                        Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
-                    });
+                    lanes.dispatch(event);
                 }
             });
         }
@@ -2916,6 +2919,87 @@ fn effective_sticker(msg: &wa::Message) -> Option<&wa::message::StickerMessage> 
     })
 }
 
+/// How many lanes events about a subject are spread across.
+///
+/// Fixed rather than one per subject: a lane is a task and a queue, and a
+/// lane per chat is one of each for every conversation an account has ever
+/// had. Subjects share a lane by hash, so two busy chats can queue behind
+/// each other — which costs latency, where the alternative costs order.
+const EVENT_LANES: usize = 8;
+
+/// Events about one subject, handled in the order they arrived.
+///
+/// The event stream reaches this side already ordered, and handling each
+/// event on its own task threw that away: a `CallEndedElsewhere` could run
+/// before the `IncomingCall` it ends, leaving a card ringing for a call that
+/// is over, and a receipt could run before the message it answers. Ordering
+/// only matters between events about the same thing, so events are keyed by
+/// their call or their chat and a key always reaches the same lane. Anything
+/// naming neither is session-wide and gets a lane of its own, so a pairing
+/// code never waits behind a conversation.
+struct EventLanes {
+    lanes: Vec<mpsc::UnboundedSender<Arc<Event>>>,
+}
+
+impl EventLanes {
+    fn new<F, Fut>(handle: F) -> Self
+    where
+        F: Fn(Arc<Event>) -> Fut + Clone + crate::exec::MaybeSend + 'static,
+        Fut: Future<Output = ()> + crate::exec::MaybeSend + 'static,
+    {
+        let lanes = (0..=EVENT_LANES)
+            .map(|_| {
+                let (tx, mut rx) = mpsc::unbounded_channel::<Arc<Event>>();
+                let handle = handle.clone();
+                // Dropping the senders is what ends these: the loop above owns
+                // them and returns when the session does.
+                crate::exec::spawn_owned(async move {
+                    while let Some(event) = rx.recv().await {
+                        handle(event).await;
+                    }
+                });
+                tx
+            })
+            .collect();
+        Self { lanes }
+    }
+
+    fn dispatch(&mut self, event: Arc<Event>) {
+        let _ = self.lanes[lane_for(&event)].send(event);
+    }
+}
+
+/// Which lane an event is handled on. Same subject, same lane.
+fn lane_for(event: &Event) -> usize {
+    match event_subject(event) {
+        Some(subject) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&subject, &mut hasher);
+            (std::hash::Hasher::finish(&hasher) as usize) % EVENT_LANES
+        }
+        None => EVENT_LANES,
+    }
+}
+
+/// What an event is about, for the lane that keeps its order.
+///
+/// A call or a chat. `None` is a session-wide event, which is about the
+/// account rather than about anything in it.
+fn event_subject(event: &Event) -> Option<String> {
+    match event {
+        Event::IncomingCall(call) => Some(call.action.call_id().to_string()),
+        Event::MissedCall(missed) => Some(missed.call_id.clone()),
+        Event::CallEndedElsewhere(ended) => Some(ended.call_id.clone()),
+        Event::Messages(batch) => batch
+            .iter()
+            .next()
+            .map(|inbound| inbound.info.source.chat.to_string()),
+        Event::Receipt(receipt) => Some(receipt.source.chat.to_string()),
+        Event::ChatPresence(update) => Some(update.source.chat.to_string()),
+        _ => None,
+    }
+}
+
 /// Un-read the newest `unread` incoming rows of a hydrated page.
 ///
 /// [`stored_to_chat_message`] reads an incoming row back as read, because the
@@ -3355,6 +3439,69 @@ mod tests {
         assert!(
             page.items.iter().all(|m| !m.is_read),
             "nothing in the chat has been read, so nothing in its page may say it was"
+        );
+    }
+
+    /// The stream reaches this side ordered and used to be handled on a task
+    /// per event, so a call's later stanza could run before the offer that
+    /// made it: the removal finds nothing, the offer's task files the call
+    /// after it, and a card rings on for a call that is over.
+    #[test]
+    fn a_calls_later_stanza_is_handled_behind_its_offer() {
+        use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall, MissedCall};
+        use whatsapp_rust::wacore::types::events::Event;
+
+        let call_id = "CALL-ORDER-1";
+        let peer: Jid = TEST_PEER.parse().expect("test JID");
+        let at = whatsapp_rust::wacore::time::from_secs(1_700_000_000).expect("test timestamp");
+        let offer = Event::IncomingCall(IncomingCall::new_for_test(
+            peer.clone(),
+            "STANZA-1".to_string(),
+            at,
+            CallAction::Offer {
+                call_id: call_id.to_string(),
+                call_creator: peer.clone(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            },
+        ));
+        let missed = Event::MissedCall(MissedCall::new(
+            peer,
+            call_id.to_string(),
+            at,
+            whatsapp_rust::wacore::types::call::MissedReason::Offline,
+        ));
+
+        assert_eq!(super::lane_for(&offer), super::lane_for(&missed));
+    }
+
+    /// Two chats are not each other's business, so they do not queue behind
+    /// one another; an event about the account is about neither.
+    #[test]
+    fn events_are_keyed_by_what_they_are_about() {
+        assert_eq!(
+            super::event_subject(&incoming(
+                wa::Message::text("oi"),
+                "MSG-LANE",
+                1_700_000_000
+            ))
+            .as_deref(),
+            Some(TEST_PEER)
+        );
+        assert_eq!(
+            super::event_subject(&incoming_in(
+                "120363000000000001@g.us",
+                wa::Message::text("oi"),
+                "MSG-LANE-2",
+                1_700_000_000,
+            ))
+            .as_deref(),
+            Some("120363000000000001@g.us")
         );
     }
 
