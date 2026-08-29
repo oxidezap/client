@@ -2121,12 +2121,13 @@ impl WhatsAppApp {
     pub fn reset_and_pair_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.app_state = AppState::Loading;
 
-        let asked = self
-            .client
-            .take()
-            .inspect(Session::forget_session)
-            .is_some();
+        let dying = self.client.take().inspect(Session::forget_session);
+        // Before the connection goes, because dropping it waits for its
+        // reader to leave and a reader parked for room in this queue is
+        // waiting on the thread standing here.
         self.event_task.take();
+        let asked = dying.is_some();
+        drop(dying);
 
         self.forget_account_state(window, cx);
 
@@ -2148,9 +2149,14 @@ impl WhatsAppApp {
         self.app_state = AppState::Loading;
 
         // Drop the old connection first: a second one alongside it would be
-        // served the whole history again for nothing.
-        self.client.take();
+        // served the whole history again for nothing — and dropping it is
+        // what ends its reader, which is the half the daemon counts.
+        //
+        // The event task goes first, because dropping the session waits for
+        // the reader to leave and a reader parked for room in that queue is
+        // waiting on this very thread to drain it.
         self.event_task.take();
+        self.client.take();
 
         // A failure routes back to the error screen, where retry stays
         // available.
