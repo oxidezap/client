@@ -3695,6 +3695,36 @@ async fn known_mapping_keys_new_chat_by_lid() {
     assert_eq!(msg.status, MessageStatus::Read);
 }
 
+/// A send that failed left the bubble spinning for good: the row goes in
+/// under the peer's LID, the failure was looked for under the phone number
+/// the send named, nothing matched, and nothing said so — no error state, no
+/// retry, and no invalidation to redraw either.
+#[tokio::test]
+async fn a_failed_send_does_not_stay_pending_forever() {
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-FAIL",
+            &wa::Message::text("não saiu"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    // Addressed exactly as the send was, which is all the caller holds.
+    chat_store.mark_send_failed(&jid(PEER), "OUT-FAIL").unwrap();
+    chat_store.flush().await.unwrap();
+
+    let msg = chat_store
+        .message(&jid(PEER), "OUT-FAIL")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Error);
+}
+
 /// An inbound LID-addressed message joins the peer's existing PN-keyed
 /// thread instead of opening a twin chat.
 #[tokio::test]

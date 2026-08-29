@@ -961,7 +961,14 @@ fn apply_writer_msg(
             Ok(())
         }
         WriterMsg::SendFailed { chat, msg_id } => {
-            let chat_str = chat.to_string();
+            // The routing every other write that targets a row goes through.
+            // The caller names the chat the send named, so a row written
+            // under a peer's LID was looked for under their phone number:
+            // nothing matched, nothing was invalidated, and the message sat
+            // PENDING for the rest of the session — a spinner with no error
+            // state and no retry.
+            let wire = chat.to_string();
+            let chat_str = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
             // Same guard as the nack path: a row past PENDING already got its
             // positive answer, so a late local failure must not regress it.
             let updated =
@@ -975,6 +982,9 @@ fn apply_writer_msg(
             // A no-op update (row already acked, or unknown id) must not
             // broadcast an invalidation and re-hydrate the UI for nothing.
             if updated > 0 {
+                if chat_str != wire {
+                    cs.message_chats.insert(wire);
+                }
                 cs.message_chats.insert(chat_str);
             }
             Ok(())
