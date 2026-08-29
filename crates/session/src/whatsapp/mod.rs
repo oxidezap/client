@@ -665,6 +665,15 @@ impl WhatsAppClient {
                         // to an account this task no longer speaks for.
                         _ = stopping.changed() => break,
                     };
+                    // The kind, and only the kind. It is `Copy`, carries no
+                    // payload and names the variant, which makes this the one
+                    // account of the event stream that can be pasted into an
+                    // issue: a `Debug` of the event itself would be somebody's
+                    // messages. Worth having at all because a session that
+                    // goes quiet is otherwise indistinguishable from one with
+                    // nothing to say — the arms below speak only for the
+                    // variants they handle.
+                    debug!("client event: {:?}", event.kind());
                     let client = client.clone();
                     let ui_tx = ui_tx.clone();
                     let calls = calls.clone();
@@ -706,7 +715,12 @@ impl WhatsAppClient {
         // to exit (letting block_on return drops the runtime + SQLite pool).
         let client = bot.client();
         tokio::select! {
-            _ = bot.run() => {}
+            // Said out loud, because this is a session ending. `run`
+            // reconnects internally, so it returns only when there is nothing
+            // left to try — and returning quietly left a window sitting on
+            // "Connecting to WhatsApp" with a console that had stopped saying
+            // anything at all, which reads as a hang rather than as a stop.
+            () = bot.run() => info!("the WhatsApp session ended"),
             _ = shutdown.notified() => {
                 // Graceful stop: flushes state and closes the transport. The
                 // dropped run future is not awaited out instead, because a
