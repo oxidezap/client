@@ -187,6 +187,14 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
     // the reader still has to apply are queued behind it. See
     // [`Inbound::connection_ended`].
     let ended = Rc::new(Cell::new(false));
+    // Whether somebody has already taken responsibility for putting the
+    // ending on the queue. Exactly one sender may, because a queue that is
+    // full is one where a second `Closed` waits on the same freed slot as the
+    // first — and the reader stops at whichever arrives, so a race there is a
+    // frame silently never applied. Closing the socket ourselves is what
+    // makes this two callbacks rather than one: `close()` brings `onclose`
+    // along behind it.
+    let ending = Rc::new(Cell::new(false));
 
     // Shared with the `onopen` callback so a frame written before the socket
     // was up is sent rather than dropped.
@@ -230,6 +238,7 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
     let message_callback = {
         let inbound = inbound.clone();
         let ended = Rc::clone(&ended);
+        let ending = Rc::clone(&ending);
         let socket_here = socket.clone();
         let message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             // Whatever else arrives on a socket already being torn down is
@@ -266,6 +275,11 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
                 // ending, in the order it arrived, which is why both are sent
                 // from *one* task rather than two: two would race, and the
                 // ending winning that race is this frame lost after all.
+                //
+                // Claimed here, so the `onclose` that `close()` is about to
+                // fire leaves the ending to this task rather than queueing a
+                // second one to race it.
+                ending.set(true);
                 let inbound = inbound.clone();
                 spawn_local(async move {
                     if inbound.send(FromSocket::Line(line)).await.is_ok() {
@@ -287,19 +301,26 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
     let close_callback = {
         let inbound = inbound.clone();
         let ended = Rc::clone(&ended);
+        let ending = Rc::clone(&ending);
         let mut gone = Some(gone);
         let closed = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
             // Before the frame is queued, because the point of it is to be
             // true while the reader is still working through the backlog this
             // close is behind. See [`Inbound::connection_ended`].
             ended.set(true);
-            let reason = event.reason();
-            let detail = if reason.is_empty() {
-                format!("the daemon connection closed (code {})", event.code())
-            } else {
-                format!("the daemon connection closed: {reason}")
-            };
-            deliver(&inbound, FromSocket::Closed(detail));
+            // Unless the overflow above already claimed it, in which case its
+            // task is carrying the retained frame and the ending together and
+            // a second `Closed` here would only race that frame to the queue's
+            // next free slot.
+            if !ending.replace(true) {
+                let reason = event.reason();
+                let detail = if reason.is_empty() {
+                    format!("the daemon connection closed (code {})", event.code())
+                } else {
+                    format!("the daemon connection closed: {reason}")
+                };
+                deliver(&inbound, FromSocket::Closed(detail));
+            }
             // Wakes the writer, which is what ends it. Without this it stays
             // parked on its receive: the next `send_line` would queue
             // happily, the caller would record a request against it, and
