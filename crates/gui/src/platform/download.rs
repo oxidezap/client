@@ -45,10 +45,12 @@ mod web {
     /// Hand the bytes to the browser's own download machinery.
     ///
     /// A blob, an object URL, and an `<a download>` clicked from script. The
-    /// anchor never joins the document — it does not need to, and a page that
-    /// visibly grew a link for a moment would be a page with a flicker in it.
-    /// The URL is revoked straight away: the click has already taken its own
-    /// reference to the blob.
+    /// anchor joins the document for the length of the click and comes out
+    /// again: a detached one is ignored outright by some browsers, and an
+    /// empty one draws nothing while it is there. The URL outlives the
+    /// click by a tick, because the download is queued rather than performed
+    /// — revoking it in the same turn is what made a save answer `Ok` and
+    /// write nothing.
     pub fn save(file_name: &str, data: &[u8]) -> Result<String, String> {
         let window = web_sys::window().ok_or("no window to save from")?;
         let document = window.document().ok_or("no document to save from")?;
@@ -71,8 +73,20 @@ mod web {
             .map_err(|_| "the browser made something that is not a link".to_string())?;
         anchor.set_href(&url);
         anchor.set_download(file_name);
+        let body = document.body().ok_or("no document body to save from")?;
+        let _ = body.append_child(&anchor);
         anchor.click();
-        let _ = web_sys::Url::revoke_object_url(&url);
+        let _ = body.remove_child(&anchor);
+
+        // A tick later, not now. The click queues a fetch of the object URL
+        // and returns before it runs, so a revocation in this turn races it —
+        // and the race is lost quietly, as a saved file of zero bytes or one
+        // the browser reports as missing.
+        let deferred = url.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            crate::platform::sleep(std::time::Duration::from_millis(0)).await;
+            let _ = web_sys::Url::revoke_object_url(&deferred);
+        });
 
         // Asked *after* the click, because a click is all we get to make and
         // a blocked one does not say so — `click()` returns the same nothing

@@ -113,6 +113,7 @@ web-sys = { version = "0.3", features = [
     "HtmlAnchorElement",
     "HtmlElement",
     "Location",
+    "Node",
     "PageTransitionEvent",
     "Storage",
     "Url",
