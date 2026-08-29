@@ -128,17 +128,14 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
                     // already. Everything the frame does not use is dropped
                     // with the next one.
                     fetched.clear();
-                    // Unless the socket has already gone, in which case the
-                    // frames still queued are worth applying and their media
-                    // is not worth waiting for: it comes from the bridge that
-                    // just closed, and a budget spent per frame is what would
-                    // put an hour between the close and this loop reaching it
-                    // — with every pending request unanswered until it did.
-                    // The renderer draws media it does not have as an offer to
-                    // download, which is what this becomes.
-                    if !socket.connection_ended() {
-                        prefetch(&media_base, &message, fetched.as_ref(), &pending).await;
-                    }
+                    prefetch(
+                        &media_base,
+                        &message,
+                        fetched.as_ref(),
+                        &pending,
+                        socket.connection_ended(),
+                    )
+                    .await;
                     if frames.apply(message).is_break() {
                         break;
                     }
@@ -186,7 +183,23 @@ const FRAME_MEDIA_CEILING: u64 = 48 * 1024 * 1024;
 ///
 /// Under one deadline for all of them, so the sequence cannot multiply a
 /// stall by the number of keys; see [`FRAME_MEDIA_BUDGET`].
-async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched, pending: &super::Pending) {
+///
+/// `after_close` skips the optional half. Once the socket has gone, the
+/// frames still queued behind it are worth applying and the media they name
+/// is not worth waiting for — a budget spent per frame is what would put an
+/// hour between the close and the reader reaching it, with every pending
+/// request unanswered until it did. It does not skip a `Downloaded`: that
+/// frame *is* somebody's answer, and the sideband is a different endpoint
+/// that a closed socket says nothing about — an overflow close is one this
+/// page made while the daemon was perfectly well. Skipping it would report a
+/// download that succeeded as one that failed.
+async fn prefetch(
+    base: &str,
+    message: &DaemonMessage,
+    into: &Fetched,
+    pending: &super::Pending,
+    after_close: bool,
+) {
     // A download somebody asked for gets the allowance it was promised.
     //
     // [`FRAME_MEDIA_BUDGET`] is for the optional kind: a history load's
@@ -201,7 +214,11 @@ async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched, pending: 
     // The reason the shared budget is short does not apply here either: it is
     // there so a sequence of keys cannot multiply one stall, and this frame
     // names exactly one.
-    let budget = if matches!(message, DaemonMessage::Downloaded { .. }) {
+    let answering_a_request = matches!(message, DaemonMessage::Downloaded { .. });
+    if after_close && !answering_a_request {
+        return;
+    }
+    let budget = if answering_a_request {
         std::time::Duration::from_secs(crate::app::DOWNLOAD_TIMEOUT_SECS)
     } else {
         FRAME_MEDIA_BUDGET
@@ -213,7 +230,7 @@ async fn prefetch(base: &str, message: &DaemonMessage, into: &Fetched, pending: 
 
     // A request somebody made is not optional and is one key, so it is not
     // rationed; everything else is a frame's own media and is.
-    let ceiling = if matches!(message, DaemonMessage::Downloaded { .. }) {
+    let ceiling = if answering_a_request {
         u64::MAX
     } else {
         FRAME_MEDIA_CEILING
