@@ -202,11 +202,6 @@ impl Runtime {
         store.data_mut().phase = Phase::Init;
 
         let answer = init.call(&mut store, ());
-        // Once, whatever the call did or how it ended. A plugin's settings are
-        // written when its call returns rather than on every `set`, which is
-        // what keeps filesystem I/O — something fuel does not price — bounded
-        // by the number of calls rather than by what one call asks for.
-        store.data_mut().kv.commit();
         let answer = answer.map_err(|e| anyhow!("its `{}` failed: {e}", abi::exports::INIT))?;
         if answer != 0 {
             return Err(anyhow!(
@@ -252,6 +247,20 @@ impl Runtime {
                 "it declared its capabilities more than once; a plugin says what it wants                  in one call, because that is the sentence somebody is asked about"
             ));
         }
+
+        // Only now, and this is the same reasoning that makes `Phase::Loading`
+        // refuse every import: a module the loader is about to turn away
+        // leaves nothing behind. Committed before the checks below, a `.wasm`
+        // that declares twice — refused by design, every time — still wrote up
+        // to a megabyte of key-value traffic through a serialize, a private
+        // write and two syncs, on the startup path, at every launch of the
+        // daemon, for a plugin that will never be accepted.
+        //
+        // Once, whatever the call did. A plugin's settings are written when
+        // its call returns rather than on every `set`, which is what keeps
+        // filesystem I/O — something fuel does not price — bounded by the
+        // number of calls rather than by what one call asks for.
+        store.data_mut().kv.commit();
 
         // From here on, declarations are refused. What the user was shown is
         // what it can do.

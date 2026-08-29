@@ -1568,6 +1568,48 @@ const WRITES_A_LOT: &str = r#"(module
     (i32.const 0))
 )"#;
 
+/// A module the loader refuses — this one declares its capabilities twice,
+/// which is refused by design and refused again at every launch — used to
+/// write its settings file first: a serialize, a private write and two syncs
+/// on the startup path, for a plugin that will never be accepted.
+#[test]
+fn a_module_the_loader_refuses_leaves_no_settings_behind() {
+    let dir = TempDir::new("kv-refused");
+    dir.plugin(
+        "twice",
+        &versioned(
+            r#"(module
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_kv_set"       (func $kv_set (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (data (i32.const 200) "k")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $caps (i64.const 16))   ;; caps::STORAGE
+    (drop (call $kv_set (i32.const 200) (i32.const 1) (i32.const 1024) (i32.const 4096)))
+    ;; The second sentence, which is what the loader turns it away for.
+    (call $caps (i64.const 16))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32) (i32.const 0))
+)"#,
+        ),
+    );
+    let state = dir.0.join("state");
+    let published = Published::default();
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state),
+        Arc::new(Recorder::new(Outcome::Accepted)),
+        published.sink(),
+    );
+
+    assert!(plugins.ids().is_empty(), "the loader turned it away");
+    assert!(
+        !state.join("kv-twice.json").exists(),
+        "a module that was refused leaves nothing behind"
+    );
+}
+
 /// The same bound through the real path: a module hammering one key inside a
 /// single call survives it, and what it wrote is on disk once the call has
 /// returned.
