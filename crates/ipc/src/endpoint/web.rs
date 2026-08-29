@@ -112,6 +112,52 @@ pub enum FromSocket {
     Closed(String),
 }
 
+/// What the socket says, and the one thing it says out of turn.
+///
+/// The queue keeps arrival order, because a frame that came before a close
+/// has to be handled before the close is. An *overflow* is the exception and
+/// has to be: the backlog it is announcing is precisely the backlog this page
+/// could not get through, so putting the ending behind it would leave the
+/// front end's pending requests waiting out the very frames that caused the
+/// problem — a media budget apiece — after the socket had already gone. So it
+/// jumps the queue, and the backlog is abandoned with it. Nothing is lost by
+/// that: the connection is over, `Frames::finish` fails every request at
+/// once, and the views that asked ask again.
+pub struct Inbound {
+    queued: Receiver<FromSocket>,
+    over: Rc<RefCell<Overflow>>,
+}
+
+/// Whether the queue filled, and whether the reader has been told.
+enum Overflow {
+    /// Nothing has gone wrong; the queue is the whole story.
+    None,
+    /// It filled, and the reader has not asked since.
+    Announced(String),
+    /// The reader has been told, so nothing after this is worth handing over.
+    Told,
+}
+
+impl Inbound {
+    /// The next thing that happened, oldest first.
+    ///
+    /// `None` once the connection is over.
+    pub async fn recv(&mut self) -> Option<FromSocket> {
+        {
+            let mut over = self.over.borrow_mut();
+            match std::mem::replace(&mut *over, Overflow::Told) {
+                // Put back: the read is a peek in the ordinary case.
+                Overflow::None => *over = Overflow::None,
+                Overflow::Announced(why) => return Some(FromSocket::Closed(why)),
+                // Already said. Whatever is still queued arrived on a
+                // connection that has ended and belongs to nobody.
+                Overflow::Told => return None,
+            }
+        }
+        self.queued.recv().await
+    }
+}
+
 /// Connect to a daemon over a WebSocket.
 ///
 /// Returns immediately: the socket is still opening, and anything written in
@@ -124,7 +170,7 @@ pub enum FromSocket {
 ///
 /// Only for a URL the browser refuses outright — a bad scheme, or a mixed
 /// content block. Everything that fails later is reported on the channel.
-pub fn connect(url: &str) -> Result<(Link, Receiver<FromSocket>), String> {
+pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
     let socket = WebSocket::new(url).map_err(|e| {
         // Redacted, like the two log paths. This one is worse than a log: it
         // is the string the window *draws*, so the token would be in any
@@ -137,10 +183,11 @@ pub fn connect(url: &str) -> Result<(Link, Receiver<FromSocket>), String> {
         )
     })?;
 
-    let (inbound, frames) = channel::<FromSocket>(MAX_QUEUED_FRAMES);
+    let (inbound, queued) = channel::<FromSocket>(MAX_QUEUED_FRAMES);
     let (outbound, mut to_send) = tokio::sync::mpsc::unbounded_channel::<String>();
-    // Set once, by whichever of the two overflow paths gets there first.
-    let ended = Rc::new(Cell::new(false));
+    // Out of band, so the ending does not queue behind the backlog it is
+    // about. See [`Inbound`].
+    let over = Rc::new(RefCell::new(Overflow::None));
 
     // Shared with the `onopen` callback so a frame written before the socket
     // was up is sent rather than dropped.
@@ -183,10 +230,10 @@ pub fn connect(url: &str) -> Result<(Link, Receiver<FromSocket>), String> {
 
     let message_callback = {
         let inbound = inbound.clone();
-        let ended = Rc::clone(&ended);
+        let over = Rc::clone(&over);
         let socket_here = socket.clone();
         let message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if ended.get() {
+            if !matches!(*over.borrow(), Overflow::None) {
                 return;
             }
             // Text only. The daemon speaks JSON and a binary frame would be
@@ -200,16 +247,12 @@ pub fn connect(url: &str) -> Result<(Link, Receiver<FromSocket>), String> {
             // nothing here to await on. A full queue is the one case that
             // matters: see [`MAX_QUEUED_FRAMES`].
             if let Err(TrySendError::Full(_)) = inbound.try_send(FromSocket::Line(line)) {
-                ended.set(true);
                 log::error!(
                     "the daemon is sending frames faster than this page can apply them; \
                      ending the connection"
                 );
-                deliver(
-                    &inbound,
-                    FromSocket::Closed(
-                        "the daemon sent frames faster than this page could apply them".to_string(),
-                    ),
+                *over.borrow_mut() = Overflow::Announced(
+                    "the daemon sent frames faster than this page could apply them".to_string(),
                 );
                 let _ = socket_here.close();
             }
@@ -306,7 +349,7 @@ pub fn connect(url: &str) -> Result<(Link, Receiver<FromSocket>), String> {
         drop(error_callback);
     });
 
-    Ok((Link::over_socket(outbound), frames))
+    Ok((Link::over_socket(outbound), Inbound { queued, over }))
 }
 
 /// Put one event on the queue, waiting for room only where waiting is right.
