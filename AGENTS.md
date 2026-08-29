@@ -948,6 +948,16 @@ screen, with the title above the glass and the pair code below it.
   every frame there carries a version and a client's whole recovery story is
   built on their being contiguous — so it is a decision of its own rather
   than something to bolt onto the plugin path.
+- **"Only this user can write it" is a POSIX sentence.** `only_this_user_can_write`
+  reads an owner and a mode, which Windows does not have — it answers `true`
+  there, and what stands in for it is where the directory *is*: plugins and
+  their state live under `%LOCALAPPDATA%`, whose ACL is the profile's. That
+  covers the default and not an override, so a `OXIDEZAP_PLUGIN_DIR` pointing
+  at a share is trusted on Windows and checked on unix. It is the user's own
+  environment variable naming their own directory, which is the weakest half
+  of the threat this guards against — but it is a gap, and closing it means
+  reading an ACL and deciding what "only this user" means when the answer is
+  a list rather than three bits.
 - **Plugins are not reloadable, and there is no message interception.** A
   plugin with state, reloaded under itself mid-conversation, is a separate
   problem; restarting `oxidezapd` is the answer for now and it is cheap. And a

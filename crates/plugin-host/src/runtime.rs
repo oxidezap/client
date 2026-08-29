@@ -144,6 +144,7 @@ impl Runtime {
                 unknown_caps: false,
                 declared_twice: false,
                 named: None,
+                log_budget: crate::guest::LogBudget::new(),
                 logged_bytes: 0,
                 commands_issued: 0,
                 trees_published: 0,

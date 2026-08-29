@@ -64,6 +64,45 @@ impl Kv {
         // one — every permission answer on the machine unreadable, and read
         // back on the next start as "nothing was allowed".
         let path = dir.join(format!("kv-{id}.json"));
+        // The same question the approvals file is asked, and for a weaker but
+        // real version of the same reason: this directory may have been open
+        // before the host closed it, so a file in it can be one another local
+        // account wrote. A plugin's settings are not authority — nothing here
+        // grants anything — but they *steer* it, and an autoreply reading
+        // somebody else's list of phrases is a plugin doing what a stranger
+        // configured. Started empty rather than refused, which is what a
+        // corrupt file already does.
+        if path.exists() && !crate::only_this_user_can_write(&path) {
+            log::warn!(
+                "{} could have been written by another user on this machine; starting empty",
+                path.display()
+            );
+            let _ = std::fs::remove_file(&path);
+            return Self {
+                path,
+                entries: BTreeMap::new(),
+                bytes: 0,
+                complained: false,
+                dirty: false,
+            };
+        }
+        // Bounded before it is read, not after it is parsed: the file is this
+        // plugin's own and is written under `MAX_BYTES`, so one larger than
+        // that is not something this host wrote — and reading it to find out
+        // is the allocation the limit exists to refuse.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES as u64 * 2) {
+            log::warn!(
+                "{} is larger than a plugin's whole budget; starting empty",
+                path.display()
+            );
+            return Self {
+                path,
+                entries: BTreeMap::new(),
+                bytes: 0,
+                complained: false,
+                dirty: false,
+            };
+        }
         let entries = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 log::warn!("plugin {id}: its stored settings are unreadable ({e}); starting empty");

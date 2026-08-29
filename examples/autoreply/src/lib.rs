@@ -37,7 +37,7 @@ const DEFAULT_KEYWORD: &str = "ping";
 const DEFAULT_REPLY: &str = "pong";
 
 fn setup(p: &mut Setup) {
-    p.name("Resposta automática");
+    p.name("Auto-reply");
     // Messages, and nothing else. An account's whole traffic is receipts and
     // presence; asking for kinds this never looks at would have the daemon
     // convert and queue every one of them for nothing.
@@ -142,7 +142,7 @@ fn draw() {
         abi::ui::slot::SETTINGS,
         abi::ui::flags::ENABLED,
         "",
-        "Resposta automática",
+        "Auto-reply",
         "",
     );
     w.leaf(
@@ -150,7 +150,7 @@ fn draw() {
         abi::ui::slot::NONE,
         abi::ui::flags::ENABLED | if enabled { abi::ui::flags::CHECKED } else { 0 },
         ID_ON,
-        "Responder sozinho",
+        "Reply automatically",
         if enabled { "1" } else { "0" },
     );
     // Drawn inert while the plugin is off, rather than hidden: a setting that
@@ -161,7 +161,7 @@ fn draw() {
         abi::ui::slot::NONE,
         editable,
         ID_KEYWORD,
-        "Quando a mensagem contiver",
+        "When a message contains",
         keyword.as_str(),
     );
     w.leaf(
@@ -169,7 +169,7 @@ fn draw() {
         abi::ui::slot::NONE,
         editable,
         ID_REPLY,
-        "Responder com",
+        "Reply with",
         reply.as_str(),
     );
     w.leaf(
@@ -177,7 +177,7 @@ fn draw() {
         abi::ui::slot::NONE,
         0,
         "",
-        "Só em conversas de duas pessoas.",
+        "One-to-one conversations only.",
         "",
     );
     w.end();

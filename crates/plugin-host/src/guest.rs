@@ -69,6 +69,60 @@ const MAX_LOG_BYTES_PER_CALL: usize = 64 * 1024;
 /// generous for anything honest.
 const MAX_UI_PER_CALL: usize = 16;
 
+/// How much a plugin may log over a rolling window, across calls.
+///
+/// The per-call cap bounds one handler and nothing else, and a plugin needs
+/// nobody's permission to arm a timer: sixteen callbacks a second, each
+/// spending a fresh per-call allowance, is most of a megabyte a second of
+/// somebody else's journal — per plugin, and the duty cycle does not catch
+/// it because writing a line is fast rather than long. `MAX_DUTY` bounds the
+/// time a plugin spends; this bounds what it leaves behind.
+///
+/// Generous for anything honest: a plugin that logs a line per message is
+/// three orders of magnitude under it.
+const MAX_LOG_BYTES_PER_WINDOW: usize = 256 * 1024;
+
+/// How long that allowance is measured over. The duty cycle's window, because
+/// it is the same question about a different resource.
+const LOG_WINDOW: std::time::Duration = crate::DUTY_WINDOW;
+
+/// What one plugin has logged, and when its window began.
+///
+/// Separated from the import so the rule is a function of a duration rather
+/// than of a clock: a window that has been open for eleven seconds is not
+/// something a test can wait for, and the arithmetic is the whole point.
+pub struct LogBudget {
+    pub window_began: wacore::time::Instant,
+    spent: usize,
+}
+
+impl LogBudget {
+    pub fn new() -> Self {
+        Self {
+            window_began: wacore::time::Instant::now(),
+            spent: 0,
+        }
+    }
+
+    /// Whether a line of `len` bytes may be written, given how long the
+    /// window has been open, and charge it if so.
+    ///
+    /// Asked against what the line *needs* rather than against what is
+    /// already spent: the latter is a threshold rather than a limit, and lets
+    /// the line that crosses it through in full.
+    fn spend(&mut self, elapsed: std::time::Duration, len: usize) -> bool {
+        if elapsed >= LOG_WINDOW {
+            self.window_began = wacore::time::Instant::now();
+            self.spent = 0;
+        }
+        if len > MAX_LOG_BYTES_PER_WINDOW.saturating_sub(self.spent) {
+            return false;
+        }
+        self.spent += len;
+        true
+    }
+}
+
 /// How many bytes one call may move through the key-value store.
 ///
 /// Measured in bytes rather than in calls, because what is unpriced here is
@@ -188,6 +242,8 @@ pub struct Guest {
     pub unknown_caps: bool,
     /// Whether it declared its capabilities more than once.
     pub declared_twice: bool,
+    /// What this plugin has logged across calls. See [`LogBudget`].
+    pub log_budget: LogBudget,
     /// Whether `oxi_set_name` has been *attempted*. An `Option` so the one
     /// call is claimed and answered in a single step, with no window in
     /// which two would both find it free.
@@ -761,6 +817,14 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 return;
             }
             *spent += line;
+            // And across calls, which the per-call cap says nothing about: a
+            // plugin waking itself sixteen times a second spends a fresh
+            // allowance every time, and filling a disk is not something the
+            // duty cycle notices — writing a line is fast, not long.
+            let budget = &mut c.data_mut().log_budget;
+            if !budget.spend(budget.window_began.elapsed(), line) {
+                return;
+            }
             let Ok(line) = read_str(&mut c, ptr, len) else {
                 return;
             };
@@ -990,7 +1054,36 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
 
 #[cfg(test)]
 mod tests {
-    use super::escape_controls;
+    use super::{LogBudget, MAX_LOG_BYTES_PER_WINDOW, escape_controls};
+
+    /// The per-call cap bounds one handler. A plugin needs nobody's
+    /// permission to arm a timer, so it can spend a fresh one sixteen times a
+    /// second — and the duty cycle does not notice, because writing a line is
+    /// fast rather than long.
+    #[test]
+    fn a_plugin_cannot_log_forever_by_waking_itself() {
+        use std::time::Duration;
+
+        let mut budget = LogBudget::new();
+        let line = 2048;
+        let fits = MAX_LOG_BYTES_PER_WINDOW / line;
+
+        // Spread across calls inside one window, which is exactly what the
+        // per-call cap cannot see: each of these would be a fresh allowance.
+        for i in 0..fits {
+            assert!(
+                budget.spend(Duration::from_secs(1), line),
+                "line {i} is inside the window's allowance"
+            );
+        }
+        assert!(
+            !budget.spend(Duration::from_secs(1), line),
+            "and the window's allowance is spent, whatever any one call did"
+        );
+
+        // The window turning over is what gives it back.
+        assert!(budget.spend(super::LOG_WINDOW, line));
+    }
 
     /// A plugin's line is one line. Embedding a newline would otherwise
     /// write what reads as a second log entry — one the host's "plugin x:"
@@ -1008,7 +1101,7 @@ mod tests {
 
         // And an ordinary line is handed back untouched, borrowed.
         assert!(matches!(
-            escape_controls("respondi a 3 mensagens"),
+            escape_controls("answered 3 messages"),
             std::borrow::Cow::Borrowed(_)
         ));
     }

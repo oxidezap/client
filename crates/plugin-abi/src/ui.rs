@@ -635,7 +635,7 @@ mod tests {
                 slot::CHAT_HEADER,
                 flags::ENABLED,
                 "translate",
-                "Traduzir",
+                "Translate",
                 "",
             );
             w.begin(
@@ -643,7 +643,7 @@ mod tests {
                 slot::SETTINGS,
                 flags::ENABLED,
                 "cfg",
-                "Resposta automática",
+                "Auto-reply",
                 "",
             );
             w.leaf(
@@ -651,7 +651,7 @@ mod tests {
                 slot::NONE,
                 flags::ENABLED | flags::CHECKED,
                 "on",
-                "Ligada",
+                "On",
                 "1",
             );
             w.leaf(kind::LABEL, slot::NONE, 0, "", "Responde a 'ping'", "");
@@ -811,13 +811,13 @@ mod tests {
 
         // 0xff is not a byte any UTF-8 sequence contains.
         assert_eq!(
-            tree(b"tr\xffanslate", b"Traduzir"),
+            tree(b"tr\xffanslate", b"Translate"),
             Err(ParseError::MangledId)
         );
 
-        let drawn = tree(b"translate", b"Trad\xffuzir").expect("a label is decoded lossily");
+        let drawn = tree(b"translate", b"Trans\xfflate").expect("a label is decoded lossily");
         assert_eq!(drawn[0].id, "translate");
-        assert_eq!(drawn[0].label, "Trad\u{fffd}uzir");
+        assert_eq!(drawn[0].label, "Trans\u{fffd}late");
     }
 
     /// An id names one widget in the slot it is drawn in. Across slots it
@@ -830,7 +830,7 @@ mod tests {
                 slot::SETTINGS,
                 flags::ENABLED,
                 "",
-                "Respostas",
+                "Replies",
                 "",
             );
             w.leaf(
@@ -872,7 +872,7 @@ mod tests {
                 slot::SETTINGS,
                 flags::ENABLED,
                 "enabled",
-                "Ligada",
+                "On",
                 "1",
             );
         })
@@ -882,8 +882,8 @@ mod tests {
         // And a label carries no id, so two of them are not a collision.
         let two_labels = write(|w| {
             w.begin(kind::SECTION, slot::SETTINGS, flags::ENABLED, "", "S", "");
-            w.leaf(kind::LABEL, slot::NONE, 0, "", "um", "");
-            w.leaf(kind::LABEL, slot::NONE, 0, "", "dois", "");
+            w.leaf(kind::LABEL, slot::NONE, 0, "", "one", "");
+            w.leaf(kind::LABEL, slot::NONE, 0, "", "two", "");
             w.end();
         })
         .expect("fits");

@@ -262,7 +262,7 @@ const GREEDY: &str = r#"(module
 /// Deliberately not ASCII: a length in characters rather than bytes would
 /// truncate this, which is the mistake the ABI's snprintf convention exists
 /// to make visible.
-const NAME: &str = "Saudações";
+const NAME: &str = "Greeter";
 
 /// Asks for four far-future timers on every message, and reports back the
 /// first refusal it is given.
@@ -323,7 +323,7 @@ fn draws() -> String {
         abi::ui::slot::CHAT_HEADER,
         abi::ui::flags::ENABLED,
         "greet",
-        "Cumprimentar",
+        "Greet",
         "",
     );
     let n = w.finish().expect("fits");
@@ -542,10 +542,10 @@ fn a_plugin_publishes_its_interface_before_any_event() {
     });
     let surface = &surfaces[0];
     assert_eq!(surface.id, "greeter");
-    assert_eq!(surface.name, "Saudações");
+    assert_eq!(surface.name, "Greeter");
     assert_eq!(surface.roots[0].slot, PluginSlot::ChatHeader);
     assert_eq!(surface.roots[0].node.widget, PluginWidget::Button);
-    assert_eq!(surface.roots[0].node.label, "Cumprimentar");
+    assert_eq!(surface.roots[0].node.label, "Greet");
     assert!(surface.roots[0].node.enabled);
     assert_eq!(
         surface.capabilities,
@@ -800,7 +800,7 @@ fn the_example_plugin_loads_and_answers_its_own_widgets() {
     let surface = &surfaces[0];
     assert!(!surface.approved, "it has not been allowed to send yet");
     assert_eq!(surface.id, "autoreply");
-    assert_eq!(surface.name, "Resposta automática");
+    assert_eq!(surface.name, "Auto-reply");
     assert_eq!(
         surface.capabilities,
         vec![
@@ -1124,7 +1124,7 @@ fn draws_only() -> String {
         abi::ui::slot::SETTINGS,
         abi::ui::flags::ENABLED,
         "",
-        "Nada a pedir.",
+        "Nothing to ask for.",
         "",
     );
     let n = w.finish().expect("fits");
@@ -1586,13 +1586,13 @@ const RENAMES_ITSELF: &str = r#"(module
   (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
   (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
   (memory (export "memory") 1)
-  (data (i32.const 0) "a@s.whatsapp.netPrimeiroSegundorefused")
+  (data (i32.const 0) "a@s.whatsapp.netTheFirstAnotherrefused")
   (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
   (func (export "oxi_init") (result i32)
     (call $subscribe (i64.const 2))
     (call $caps (i64.const 1))    ;; caps::SEND
-    (drop (call $set_name (i32.const 16) (i32.const 8)))     ;; "Primeiro"
-    (global.set $answer (call $set_name (i32.const 24) (i32.const 7)))  ;; "Segundo"
+    (drop (call $set_name (i32.const 16) (i32.const 8)))     ;; "TheFirst"
+    (global.set $answer (call $set_name (i32.const 24) (i32.const 7)))  ;; "Another"
     (i32.const 0))
   (global $answer (mut i32) (i32.const 0))
   (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
@@ -1666,7 +1666,7 @@ fn a_plugin_names_itself_once() {
 
     let surfaces = published.settles("the plugin to be listed", |s| !s.is_empty());
     assert_eq!(
-        surfaces[0].name, "Primeiro",
+        surfaces[0].name, "TheFirst",
         "the first name is the one it has"
     );
 
@@ -1770,6 +1770,47 @@ fn time_owed_is_not_forgiven_when_the_window_turns_over() {
     assert_eq!(
         stalled.decide(Duration::from_secs(30)),
         Turn::Wait(Duration::from_secs(270))
+    );
+}
+
+/// The ordinary machine has no plugin directory, and that is not a security
+/// finding to report on every start.
+#[test]
+fn a_directory_that_is_not_there_is_simply_empty() {
+    let dir = TempDir::new("absent-plugins");
+    let missing = dir.0.join("nothing-here");
+    assert!(crate::discover(&missing).is_empty());
+}
+
+/// A plugin's own settings file gets the question the approvals file gets.
+/// Weaker stakes — settings grant nothing — but a file another account wrote
+/// still *steers* the plugin, and an autoreply reading somebody else's list
+/// of phrases is a plugin doing what a stranger configured.
+#[cfg(unix)]
+#[test]
+fn settings_another_user_could_have_written_are_not_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new("planted-kv");
+    let planted = dir.0.join("kv-autoreply.json");
+    std::fs::write(&planted, br#"{"keyword":"somebody else's"}"#).expect("writable");
+    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+
+    let kv = crate::kv::Kv::open(&dir.0, "autoreply");
+    assert_eq!(kv.get("keyword"), None, "started empty");
+    assert!(
+        !planted.exists(),
+        "and the file is gone rather than ignored"
+    );
+
+    // One this user owns, privately, is read as before.
+    let mut mine = crate::kv::Kv::open(&dir.0, "autoreply");
+    mine.set("keyword", "ping");
+    mine.commit();
+    drop(mine);
+    assert_eq!(
+        crate::kv::Kv::open(&dir.0, "autoreply").get("keyword"),
+        Some("ping")
     );
 }
 

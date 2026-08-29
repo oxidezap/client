@@ -835,15 +835,25 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
     // there inherits whatever the owner once agreed to. Refused whole rather
     // than per file, because a writable directory is one where a *new* name
     // can appear too.
+    // Absence first, and silently: the ordinary machine has no plugin
+    // directory at all, and answering that with a warning about other users
+    // being able to write it reports a vulnerability that does not exist, on
+    // every start, to everyone who has never installed a plugin. The check
+    // below cannot tell the two apart on its own — it reads metadata, and a
+    // directory that is not there has none.
+    if !dir.exists() {
+        return Vec::new();
+    }
     if !only_this_user_can_write(dir) {
         log::warn!(
-            "not loading any plugins from {}: it can be written by other users on this              machine, and a plugin's approval is recorded against its name rather than its              contents",
+            "not loading any plugins from {}: it can be written by other users on this \
+             machine, and a plugin's approval is recorded against its name rather than \
+             its contents",
             dir.display()
         );
         return Vec::new();
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        // Including "it does not exist", which is the ordinary case.
         return Vec::new();
     };
     let mut found: Vec<PathBuf> = entries
@@ -890,7 +900,7 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
 /// Nothing to check off unix: a Windows plugin directory sits under
 /// `%LOCALAPPDATA%`, whose ACL is the profile's, and this process has no
 /// business inventing a second answer to a question the ACL already answers.
-fn only_this_user_can_write(path: &Path) -> bool {
+pub(crate) fn only_this_user_can_write(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
