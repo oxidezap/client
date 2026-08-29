@@ -99,13 +99,121 @@ mod imp {
     /// `web_init` also installs the panic hook that turns a Rust panic into a
     /// readable trace rather than "unreachable executed".
     pub(super) fn logging() {
-        // One initializer, not two. `web_init` installs the panic hook that turns
-        // a Rust panic into a readable trace *and* a `log` implementation that
-        // writes to the browser console — and `log` accepts only one, so a second
-        // one after it silently fails and leaves the first one's level in force.
-        // Setting the level afterwards is what actually needs saying.
+        // Ours first, and that order is the whole of it. `log` accepts one
+        // logger, and `web_init` installs one — so registering after it fails
+        // silently and leaves a logger with no module floors in force, which
+        // is exactly what makes `?log=debug` useless: gpui, wgpu and the text
+        // shaper narrate every frame, and the twenty lines worth reading
+        // arrive buried in thousands that are not. Registering first makes
+        // `web_init`'s own `set_logger` the one that fails, and it is written
+        // to tolerate that (`.ok()`); the panic hook it installs — the thing
+        // that turns a Rust panic into a trace rather than "unreachable
+        // executed" — is what it is still called for.
+        log::set_logger(&CONSOLE).ok();
         gpui_platform::web_init();
-        log::set_max_level(log::LevelFilter::Info);
+        // After `web_init`, never before: it sets a level of its own, so a
+        // level set ahead of it is the one that gets overwritten.
+        let level = requested_level();
+        log::set_max_level(level);
+        if level > log::LevelFilter::Info {
+            log::info!("logging at {level}, asked for by the URL");
+        }
+    }
+
+    /// The browser console, with the desktop's module floors.
+    static CONSOLE: Console = Console;
+
+    /// What a page has instead of stderr.
+    ///
+    /// The floors are the desktop's, for the desktop's reason: the renderer
+    /// and the text shaper narrate at debug about their own business, and
+    /// turning debug on to read *our* logs should not bury them. `log`'s
+    /// global level is one number with no per-target part, so a filter that
+    /// knows targets has to live in a logger.
+    struct Console;
+
+    /// Crates that narrate, held at `warn` however loud the rest is asked to
+    /// be. Named rather than derived, and the same list the desktop quiets.
+    const QUIET: &[&str] = &[
+        "naga",
+        "gpui",
+        "gpui_web",
+        "gpui_wgpu",
+        "gpui_platform",
+        "cosmic_text",
+        "wgpu_core",
+        "wgpu_hal",
+    ];
+
+    impl log::Log for Console {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            let floor = QUIET
+                .iter()
+                .any(|quiet| {
+                    metadata.target() == *quiet
+                        || metadata.target().starts_with(&format!("{quiet}::"))
+                })
+                .then_some(log::Level::Warn);
+            match floor {
+                Some(floor) => metadata.level() <= floor,
+                None => true,
+            }
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let line = wasm_bindgen::JsValue::from_str(&format!(
+                "[{}] {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            ));
+            match record.level() {
+                log::Level::Error => web_sys::console::error_1(&line),
+                log::Level::Warn => web_sys::console::warn_1(&line),
+                log::Level::Info => web_sys::console::info_1(&line),
+                log::Level::Debug | log::Level::Trace => web_sys::console::log_1(&line),
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// How much to say, which on a page is a question only the URL can answer.
+    ///
+    /// A desktop reads `RUST_LOG` and this is that: `?log=debug` for the
+    /// person who has hit something, `info` for everyone else. It exists
+    /// because the alternative is asking someone to run a debug build of a
+    /// wasm bundle to find out what happened, and because the interesting
+    /// half of a session — every stanza the library reads, every step of a
+    /// pairing — is written at `debug` and was unreachable from a browser at
+    /// any price.
+    ///
+    /// In the query rather than the fragment, beside `backend`: the fragment
+    /// is where the daemon token goes precisely because it never leaves the
+    /// browser, and a log level is not a secret. An unreadable value is the
+    /// default rather than an error — this runs before there is anywhere to
+    /// report one.
+    fn requested_level() -> log::LevelFilter {
+        let Some(asked) = parameter("log") else {
+            return log::LevelFilter::Info;
+        };
+        asked
+            .parse::<log::LevelFilter>()
+            .unwrap_or(log::LevelFilter::Info)
+    }
+
+    /// One `name=value` out of the page's query string.
+    fn parameter(name: &str) -> Option<String> {
+        let search = web_sys::window()
+            .and_then(|window| window.location().search().ok())
+            .unwrap_or_default();
+        search
+            .trim_start_matches('?')
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(&format!("{name}="))?.to_string().into())
     }
 
     /// `Date.now()` for the wall clock, `performance.now()` for the
@@ -169,21 +277,10 @@ mod imp {
     /// are named, because "the window is black" is otherwise unactionable
     /// from either side.
     fn requested_backend() -> gpui_platform::WebBackendPreference {
-        let search = web_sys::window()
-            .and_then(|window| window.location().search().ok())
-            .unwrap_or_default();
-        let asked = |name: &str| {
-            search
-                .trim_start_matches('?')
-                .split('&')
-                .any(|parameter| parameter == format!("backend={name}"))
-        };
-        if asked("webgpu") {
-            gpui_platform::WebBackendPreference::WebGpu
-        } else if asked("auto") {
-            gpui_platform::WebBackendPreference::Auto
-        } else {
-            gpui_platform::WebBackendPreference::WebGl
+        match parameter("backend").as_deref() {
+            Some("webgpu") => gpui_platform::WebBackendPreference::WebGpu,
+            Some("auto") => gpui_platform::WebBackendPreference::Auto,
+            _ => gpui_platform::WebBackendPreference::WebGl,
         }
     }
 }
