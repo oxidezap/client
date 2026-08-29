@@ -12,6 +12,8 @@ pub mod chat_row;
 mod chats;
 mod commands;
 mod events;
+#[cfg(test)]
+mod frame_cost;
 mod media;
 mod media_ctl;
 mod messages;
@@ -30,7 +32,7 @@ pub use calls_ctl::CallPictures;
 pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
 pub use chats::{ChatFilter, ChatListCache, Survival, survives_complete_load};
 pub use media::RecordingState;
-pub use messages::{MessageListCache, TimelineItem};
+pub use messages::{BubbleIds, MessageListCache, TimelineItem};
 pub use paging::nearing_end;
 pub use plugins_ctl::PluginFields;
 
@@ -333,7 +335,7 @@ use wacore_binary::jid::{Jid, JidExt, observe_str};
 use crate::responsive::{MobilePanel, ResponsiveLayout};
 use crate::session::{FromDaemon, Session};
 use crate::theme::ActiveProductTheme as _;
-use crate::utils::mime_to_image_format;
+use crate::utils::{contains_ignore_case, mime_to_image_format};
 use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
 use crate::views::pairing::generate_qr_png;
 use crate::views::{
@@ -370,8 +372,19 @@ const SEARCH_DEBOUNCE_MS: u64 = 150;
 /// Maximum number of video players to keep cached (each holds decoded frames)
 const MAX_VIDEO_PLAYERS: usize = 10;
 
-/// Maximum number of sticker images to keep cached
-const MAX_DECODED_IMAGES: usize = 50;
+/// How many bytes of decoded images to keep cached.
+///
+/// Bytes rather than entries, which is what this was. Fifty is a number about
+/// a list; what the cache actually costs is the photographs in it, and fifty
+/// pictures off a phone are two hundred megabytes of encoded bytes before
+/// `gpui` has decoded any of them — in a linear memory with a one-gigabyte
+/// ceiling that never shrinks. The count bounded the wrong thing in both
+/// directions: fifty stickers are a rounding error, and fifty photos are the
+/// tab.
+///
+/// [`oxidezap_core::DECODED_IMAGE_BUDGET_BYTES`] is where the share comes
+/// from, because the page's budgets are ceilings on one heap.
+const DECODED_IMAGE_BUDGET: usize = oxidezap_core::DECODED_IMAGE_BUDGET_BYTES as usize;
 
 /// Download timeout in seconds (for audio/video downloads)
 /// How long a download somebody asked for is allowed to take.
@@ -520,7 +533,20 @@ pub struct WhatsAppApp {
     /// Current application state
     app_state: AppState,
     /// List of chats
-    chats: Vec<Chat>,
+    /// The conversations this window holds, newest first.
+    ///
+    /// Behind an `Arc` because the conversation pane reads one of them out of
+    /// here on every frame and then needs `self` mutably to build the
+    /// timeline — so what it took had to be a clone, and a `Chat` is its
+    /// messages: five hundred rows of four `String`s each, a reaction map, a
+    /// quote and a media handle, rebuilt sixty times a second to be read
+    /// through and dropped. A refcount says the same thing.
+    ///
+    /// The write side pays nothing for it either. Every mutation here goes
+    /// through `Arc::make_mut`, and the only clone that ever hands out is one
+    /// taken by a frame still being drawn — which is a frame that is about to
+    /// end.
+    chats: Vec<Arc<Chat>>,
     /// Currently selected chat JID
     selected_chat: Option<String>,
     /// WhatsApp client wrapper
@@ -1063,26 +1089,28 @@ impl WhatsAppApp {
         let mut cache = self.chat_list_cache.borrow_mut();
 
         let query = &self.chat_search_query;
-        let filtered: Vec<&Chat> = self
-            .conversations()
-            .filter(|chat| self.chat_filter.matches(chat))
-            .filter(|chat| {
-                query.is_empty()
-                    || chat.name.to_lowercase().contains(query)
-                    || chat.jid.to_lowercase().contains(query)
-            })
-            .collect();
+        let matches = |chat: &Chat| {
+            self.chat_filter.matches(chat)
+                && (contains_ignore_case(&chat.name, query)
+                    || contains_ignore_case(&chat.jid, query))
+        };
 
         // The count alone cannot see a preview change — a receipt, a draft, a
         // typing notice — so every path that changes one invalidates the cache
         // explicitly. This guard only skips the rebuild when nothing was
         // added or removed *and* nothing claimed a change.
+        //
+        // Counted rather than collected, because this is the path a frame
+        // almost always takes: the rows are already right, and building the
+        // `Vec<&Chat>` that proves it is an allocation per frame for a value
+        // about to be dropped.
         if let Some(cached) = cache.as_ref()
-            && cached.chat_count == filtered.len()
+            && cached.chat_count == self.conversations().filter(|c| matches(c)).count()
         {
             return cached.clone();
         }
 
+        let filtered: Vec<&Chat> = self.conversations().filter(|c| matches(c)).collect();
         let rows: Arc<[ChatRow]> = filtered
             .into_iter()
             .map(|chat| {
@@ -1124,7 +1152,10 @@ impl WhatsAppApp {
     /// broadcast is excluded once rather than at each of them: it is not a
     /// conversation, and it has [its own destination](Destination::Status).
     fn conversations(&self) -> impl Iterator<Item = &Chat> {
-        self.chats.iter().filter(|chat| !chat.is_status)
+        self.chats
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|chat| !chat.is_status)
     }
 
     pub fn chat_filter(&self) -> ChatFilter {
@@ -1677,20 +1708,23 @@ impl WhatsAppApp {
     }
 
     /// Get the currently selected chat data
-    pub fn selected_chat_data(&self) -> Option<&Chat> {
+    pub fn selected_chat_data(&self) -> Option<&Arc<Chat>> {
         self.selected_chat
             .as_ref()
             .and_then(|jid| self.find_chat(jid))
     }
 
     /// Find a chat by JID (immutable)
-    fn find_chat(&self, jid: &str) -> Option<&Chat> {
+    fn find_chat(&self, jid: &str) -> Option<&Arc<Chat>> {
         self.chats.iter().find(|c| c.jid == jid)
     }
 
     /// Find a chat by JID (mutable)
     fn find_chat_mut(&mut self, jid: &str) -> Option<&mut Chat> {
-        self.chats.iter_mut().find(|c| c.jid == jid)
+        self.chats
+            .iter_mut()
+            .find(|c| c.jid == jid)
+            .map(Arc::make_mut)
     }
 
     /// Add a message to a chat, bumping it to the top of the list only when
@@ -1699,7 +1733,7 @@ impl WhatsAppApp {
     /// Returns true if the chat was found and updated, false otherwise.
     fn add_message_to_chat(&mut self, jid: &str, message: ChatMessage) -> bool {
         if let Some(index) = self.chats.iter().position(|c| c.jid == jid) {
-            if self.chats[index].add_message(message) {
+            if Arc::make_mut(&mut self.chats[index]).add_message(message) {
                 self.move_chat_to_top(index);
             }
             // Always invalidate chat cache since the chat's content changed
@@ -1734,7 +1768,7 @@ impl WhatsAppApp {
             Some(name) => Chat::with_name(jid.to_string(), name.clone()),
             None => Chat::new(jid.to_string()),
         };
-        self.chats.insert(0, chat);
+        self.chats.insert(0, Arc::new(chat));
         self.invalidate_chat_cache();
     }
 
@@ -2474,7 +2508,7 @@ impl WhatsAppApp {
 
         if let Some(index) = chat_index {
             // Update the existing chat
-            let chat = &mut self.chats[index];
+            let chat = Arc::make_mut(&mut self.chats[index]);
 
             // For groups: update participant name, NOT the chat name
             if is_group {
@@ -2526,12 +2560,15 @@ impl WhatsAppApp {
             }
 
             new_chat.add_message(message);
-            self.chats.insert(0, new_chat);
+            self.chats.insert(0, Arc::new(new_chat));
             self.invalidate_chat_cache();
         }
 
         if read_now {
-            let newest = self.find_chat(&chat_jid).and_then(newest_shared_message);
+            let newest = self
+                .find_chat(&chat_jid)
+                .map(Arc::as_ref)
+                .and_then(newest_shared_message);
             if let Some(client) = &self.client {
                 // Receipt and the persisted read in one: see `select_chat`.
                 client.mark_chat_read(&chat_jid, newest);
@@ -2697,7 +2734,7 @@ impl WhatsAppApp {
                 .push((notice_id, at, notice));
             return;
         };
-        let chat = &mut self.chats[index];
+        let chat = Arc::make_mut(&mut self.chats[index]);
         if chat.messages.iter().any(|message| message.id == notice_id) {
             return;
         }
@@ -3011,7 +3048,7 @@ impl Render for WhatsAppApp {
 ///
 /// `None` is older than any timestamp, so an empty conversation lands at the
 /// end — the same place `Reverse(last_message_time)` puts it.
-fn slot_newest_first(rest: &[Chat], at: Option<chrono::DateTime<chrono::Utc>>) -> usize {
+fn slot_newest_first(rest: &[Arc<Chat>], at: Option<chrono::DateTime<chrono::Utc>>) -> usize {
     rest.iter()
         .position(|other| other.last_message_time < at)
         .unwrap_or(rest.len())
@@ -3280,7 +3317,7 @@ mod tests {
 
     #[test]
     fn the_newest_head_goes_first() {
-        let rest = [chat("b", Some(30)), chat("c", Some(20))];
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(20)))];
         assert_eq!(slot_newest_first(&rest, at(40)), 0);
     }
 
@@ -3289,13 +3326,13 @@ mod tests {
         // The case a plain bump to index 0 got wrong: a held notice replayed
         // after a history load advances its own conversation and is still
         // older than the chat above it.
-        let rest = [chat("b", Some(30)), chat("c", Some(10))];
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(10)))];
         assert_eq!(slot_newest_first(&rest, at(20)), 1);
     }
 
     #[test]
     fn the_oldest_head_goes_last() {
-        let rest = [chat("b", Some(30)), chat("c", Some(20))];
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(20)))];
         assert_eq!(slot_newest_first(&rest, at(10)), 2);
     }
 
@@ -3305,13 +3342,13 @@ mod tests {
     /// applied to two chats that are equally undated.
     #[test]
     fn an_empty_conversation_sorts_last_of_all() {
-        let rest = [chat("b", Some(30)), chat("c", None)];
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", None))];
         assert_eq!(slot_newest_first(&rest, None), 2);
     }
 
     #[test]
     fn an_equal_head_keeps_the_incumbent_above_it() {
-        let rest = [chat("b", Some(30)), chat("c", Some(10))];
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(10)))];
         assert_eq!(slot_newest_first(&rest, at(30)), 1);
     }
 }

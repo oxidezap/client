@@ -10,7 +10,7 @@ impl WhatsAppApp {
     fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>) {
         // Find the message in any chat and update its media data
         let mut touched: Option<String> = None;
-        for chat in &mut self.chats {
+        for chat in self.chats.iter_mut().map(std::sync::Arc::make_mut) {
             if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id) {
                 if let Some(ref mut media) = msg.media {
                     // Bytes and the metadata that describes them, together:
@@ -582,10 +582,17 @@ impl WhatsAppApp {
 
         let mut cache = self.decoded_images.borrow_mut();
 
-        // Evict oldest entries if cache is full (FIFO eviction using IndexMap insertion order)
-        while cache.len() >= MAX_DECODED_IMAGES {
-            // shift_remove removes from the front (oldest entry)
-            cache.shift_remove_index(0);
+        // Oldest first, until this one fits. Measured in bytes rather than
+        // entries: see `DECODED_IMAGE_BUDGET`. An image larger than the whole
+        // budget still goes in and is then alone in the cache — refusing it
+        // would mean a picture the reader opened and the renderer decoded on
+        // every frame.
+        let cost = image.bytes.len();
+        let mut held: usize = cache.values().map(|image| image.bytes.len()).sum();
+        while held + cost > DECODED_IMAGE_BUDGET && !cache.is_empty() {
+            if let Some((_, evicted)) = cache.shift_remove_index(0) {
+                held = held.saturating_sub(evicted.bytes.len());
+            }
         }
 
         cache.insert(message_id.to_string(), image.clone());
@@ -627,9 +634,10 @@ impl WhatsAppApp {
                         let resume_pos = player.current_time();
                         let needs = player.play();
                         let data = if needs {
+                            // A refcount, not the track: `samples` is shared.
                             player
                                 .get_audio()
-                                .map(|a| (a.samples.clone(), a.sample_rate))
+                                .map(|a| (a.samples.clone(), 0, a.sample_rate))
                         } else if !owns_audio {
                             // Another media's start stole the paused sink, so a
                             // plain resume() would leave this video silent;
@@ -639,7 +647,9 @@ impl WhatsAppApp {
                                 let offset = ((resume_pos.as_secs_f64() * a.sample_rate as f64)
                                     as usize)
                                     .min(a.samples.len());
-                                (a.samples[offset..].to_vec(), a.sample_rate)
+                                // Where to start, rather than a copy of
+                                // everything from there on.
+                                (a.samples.clone(), offset, a.sample_rate)
                             })
                         } else {
                             None
@@ -654,13 +664,16 @@ impl WhatsAppApp {
                 };
                 self.start_video_update_task(cx);
 
-                if let Some((samples, sample_rate)) = audio_data {
+                if let Some((samples, from, sample_rate)) = audio_data {
                     info!(
                         "Playing video audio: {} samples at {} Hz",
-                        samples.len(),
+                        samples.len() - from,
                         sample_rate
                     );
-                    if let Err(e) = self.audio_player.play_samples(samples, sample_rate) {
+                    if let Err(e) = self
+                        .audio_player
+                        .play_samples(&samples[from..], sample_rate)
+                    {
                         warn!("Failed to play video audio: {}", e);
                     } else {
                         // Ownership only on success: recording it for a dead
@@ -825,7 +838,7 @@ impl WhatsAppApp {
                                                 );
                                                 if let Err(e) = app
                                                     .audio_player
-                                                    .play_samples(audio.samples, audio.sample_rate)
+                                                    .play_samples(&audio.samples, audio.sample_rate)
                                                 {
                                                     warn!("Failed to play video audio: {}", e);
                                                 } else {

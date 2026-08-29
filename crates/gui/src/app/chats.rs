@@ -119,7 +119,12 @@ impl WhatsAppApp {
     /// only the caller knows whether this was one.
     pub(super) fn merge_chats(&mut self, chats: Vec<Chat>) {
         for chat in chats {
-            match self.chats.iter_mut().find(|c| c.jid == chat.jid) {
+            match self
+                .chats
+                .iter_mut()
+                .find(|c| c.jid == chat.jid)
+                .map(Arc::make_mut)
+            {
                 Some(existing) => {
                     let jid = chat.jid.clone();
                     existing.merge_history(chat);
@@ -151,7 +156,7 @@ impl WhatsAppApp {
                     }
                     self.invalidate_message_cache(&jid);
                 }
-                None => self.chats.push(chat),
+                None => self.chats.push(Arc::new(chat)),
             }
         }
         self.chats

@@ -9,7 +9,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, Sizable as _};
 
-use crate::app::WhatsAppApp;
+use crate::app::{BubbleIds, WhatsAppApp};
 use crate::components::ProductIcon;
 use crate::theme::Metrics;
 
@@ -75,13 +75,14 @@ pub fn render_reactions(
 /// keyboard and assistive-technology users reach. What this replaces is a
 /// clipboard button welded into every bubble's timestamp line.
 pub fn render_hover_actions(
+    ids: &BubbleIds,
     message_id: String,
     content: String,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     _cx: &App,
 ) -> impl IntoElement + use<> {
-    let reply_id = message_id.clone();
+    let reply_id = message_id;
     let reply_entity = entity;
     let has_text = !content.is_empty();
 
@@ -106,28 +107,20 @@ pub fn render_hover_actions(
             // stays because reactions are already *rendered* on bubbles —
             // hiding it would suggest they are not a thing here.
             action(
-                format!("react-{message_id}").into(),
+                ids.react.clone(),
                 ProductIcon::Smile.into(),
                 "Reacting is not available yet",
             )
             .disabled(true),
         )
         .child(
-            action(
-                format!("reply-{message_id}").into(),
-                ProductIcon::Reply.into(),
-                "Reply",
-            )
-            .on_click(move |_, window, cx| {
-                reply_entity.update(cx, |app, cx| app.begin_reply(&reply_id, window, cx));
-            }),
+            action(ids.reply.clone(), ProductIcon::Reply.into(), "Reply").on_click(
+                move |_, window, cx| {
+                    reply_entity.update(cx, |app, cx| app.begin_reply(&reply_id, window, cx));
+                },
+            ),
         )
         .when(has_text, |el| {
-            el.child(
-                gpui_component::clipboard::Clipboard::new(SharedString::from(format!(
-                    "copy-{message_id}"
-                )))
-                .value(content),
-            )
+            el.child(gpui_component::clipboard::Clipboard::new(ids.copy.clone()).value(content))
         })
 }
