@@ -45,7 +45,7 @@ tokio = { workspace = true, features = ["fs", "net", "rt-multi-thread", "signal"
 # and a fixed string, base64-encoded (RFC 6455 §4.2.2). Not a security
 # construction — it exists so a cache cannot complete a handshake it did not
 # understand — which is why SHA-1 is the right and only answer here.
-base64 = "0.22"
+base64 = "0.23"
 env_logger = "0.11"
 # `SinkExt`/`StreamExt` over the WebSocket, which is a sink of messages
 # rather than a byte stream.
@@ -60,7 +60,7 @@ sha1 = "0.11"
 # Here rather than shared, and it is not only about size: it drags `rand`,
 # whose `getrandom` refuses this target outright. A page has no WebSocket
 # *server* to run — it is the thing that connects — so nothing is lost.
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 # The page half. `getrandom_02` is named for the same reason the session and
 # the chat store name it: an older `getrandom` comes in through the graph and
