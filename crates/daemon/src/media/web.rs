@@ -10,8 +10,9 @@
 //! it costs is memory rather than disk, which is why the budget is a
 //! different number and not the same one.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -59,11 +60,19 @@ struct Cache {
     held: u64,
 }
 
-static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+thread_local! {
+    /// Thread-local rather than static, for the reason the store and the
+    /// claim are: one agent owns this page's session, so a second one
+    /// reaching for the cache is not a race to make unlikely but one to make
+    /// impossible. It also keeps a `std::sync::Mutex` off a path the window
+    /// thread takes — this module is built with `+atomics` and a shared
+    /// memory, where a contended lock emits `memory.atomic.wait32`, which the
+    /// main thread of a page may not execute at all.
+    static CACHE: RefCell<Cache> = RefCell::new(Cache::default());
+}
 
 fn with<T>(f: impl FnOnce(&mut Cache) -> T) -> T {
-    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    f(guard.get_or_insert_with(Cache::default))
+    CACHE.with(|cache| f(&mut cache.borrow_mut()))
 }
 
 /// Write `bytes` under `key`, unless they are already there.
