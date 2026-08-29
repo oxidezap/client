@@ -132,11 +132,11 @@ impl WhatsAppApp {
             Ok(audio) => audio,
             Err(e) => {
                 error!("Failed to stop recording: {}", e);
-                self.recording_state = RecordingState::Idle;
-                // Every abort path must reset the input area too, or it keeps
-                // rendering the recording UI forever.
-                self.update_input_recording(cx);
-                cx.notify();
+                // Through the cancel, which is the only thing that releases
+                // the device. Setting the state to idle alone left the capture
+                // running with `is_recording` false and the panel gone: no
+                // control on screen could close the microphone after that.
+                self.cancel_recording(cx);
                 return;
             }
         };
