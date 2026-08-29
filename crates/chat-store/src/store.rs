@@ -2780,8 +2780,10 @@ fn bump_chat(
     diesel::update(chat_row(device_id, chat).filter(dsl::last_message_ts.le(bump.ts_ms)))
         .set(dsl::last_message_ts.eq(bump.ts_ms))
         .execute(conn)?;
-    // ...but the preview belongs to the newest row by the FULL (timestamp_ms,
-    // msg_id) order — a same-millisecond sibling applied later must not win.
+    // ...but the preview belongs to the newest row by the store's own order,
+    // (timestamp_ms, rowid): a same-millisecond sibling applied later must
+    // not win. Not msg_id, which is what the `message_arrival_order`
+    // migration removed for biasing the tie towards a `3EB0` prefix.
     refresh_preview_if_latest(conn, device_id, chat, bump.msg_id, bump.preview, bump.kind)?;
     if bump.unread_delta != 0 {
         // An old row materialized late (offline drain) that a read already
