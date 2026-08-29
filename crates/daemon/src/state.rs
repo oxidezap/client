@@ -350,6 +350,24 @@ impl StateHub {
         self.apply(Change::live(DaemonEvent::AccountChanged(account)));
     }
 
+    /// Everything this account had, gone with it.
+    ///
+    /// An account reset is a departure, and the hub only ever learned by
+    /// event: nothing cleared the chats, the identity or the calls, so a
+    /// front end attaching after the next pairing was handed the previous
+    /// account's list and identity in its first snapshot. Cleared under one
+    /// lock and with one version bump, rather than a removal per chat: the
+    /// frame that follows says the account is gone, and a client that had
+    /// fallen far enough behind to need the rest recovers by snapshot
+    /// anyway. Plugins stay: they are the daemon's, not the account's.
+    pub fn forget_account(&self) {
+        let mut inner = self.lock();
+        inner.chats.clear();
+        inner.account = None;
+        inner.calls = oxidezap_core::CallState::new();
+        inner.version = inner.version.next();
+    }
+
     /// Record what the plugins are now, and tell everyone.
     ///
     /// Called from a plugin's own thread rather than from the event loop,

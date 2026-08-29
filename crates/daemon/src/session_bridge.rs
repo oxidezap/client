@@ -610,6 +610,16 @@ impl Bridge {
                 self.hub.calls(|s| {
                     s.end_all();
                 });
+                // And everything keyed to the account leaves with it. An
+                // account reset is a departure: a snapshot taken after the
+                // next pairing would otherwise open with the old identity, the
+                // old chat list, and a stage the new account's front end reads
+                // as a call that just ended — writing the previous account's
+                // call into this one's history.
+                if matches!(event, UiEvent::LoggedOut(_)) {
+                    self.hub.forget_account();
+                    self.reads().forget_all();
+                }
             }
             UiEvent::AccountUpdated { name, jid, lid } => {
                 self.hub.set_account(oxidezap_ipc::AccountIdentity {
@@ -1868,6 +1878,12 @@ impl ReadTracker {
             .unwrap_or_default()
     }
 
+    /// Everything this account taught us, gone with it.
+    fn forget_all(&mut self) {
+        self.chats.clear();
+        self.read_through.clear();
+    }
+
     /// Remember a read the store has not confirmed yet.
     fn record_read(&mut self, jid: &str, read: ReadRecord) {
         self.read_through.insert(jid.to_string(), read);
@@ -2232,6 +2248,34 @@ mod tests {
         // Answered or hung up, it is no longer something to attach to.
         bridge.observe(UiEvent::CallEnded("call-1".into()));
         assert!(bridge.hub.call_state().incoming().is_none());
+    }
+
+    /// An account reset is a departure. The hub only ever learned by event,
+    /// so a snapshot taken after the next pairing opened with the previous
+    /// account's identity and chat list.
+    #[test]
+    fn a_logout_takes_the_account_out_of_the_next_snapshot() {
+        let mut bridge = bridge();
+        bridge.observe(loaded(vec![stored_chat(
+            "1@s.whatsapp.net",
+            1,
+            vec![message("a", "1@s.whatsapp.net", 10, false, false)],
+        )]));
+        bridge.observe(UiEvent::AccountUpdated {
+            name: Some("Ana".to_string()),
+            jid: Some("1@s.whatsapp.net".to_string()),
+            lid: None,
+        });
+        assert!(bridge.hub.chat("1@s.whatsapp.net").is_some());
+
+        bridge.observe(UiEvent::LoggedOut("the server said no".into()));
+
+        assert!(bridge.hub.chat("1@s.whatsapp.net").is_none());
+        assert!(bridge.hub.store_backed_chat_jids().is_empty());
+        assert!(
+            bridge.reads().boundary("1@s.whatsapp.net").is_none(),
+            "and nothing this account taught the read tracker survives it"
+        );
     }
 
     /// Nothing on the session side ends a call when the socket dies, so the
