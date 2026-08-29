@@ -82,15 +82,24 @@ impl Runtime {
         // exists, so the sandbox's memory bound does not cover any of it. One
         // downloaded file with an enormous section would otherwise exhaust
         // the daemon during startup and take the account down with it.
+        let too_big = |size: u64| {
+            anyhow!("it is {size} bytes, past the {MAX_MODULE_BYTES} a plugin may be")
+        };
         let size = std::fs::metadata(path)
             .with_context(|| format!("reading {}", path.display()))?
             .len();
         if size > MAX_MODULE_BYTES as u64 {
-            return Err(anyhow!(
-                "it is {size} bytes, past the {MAX_MODULE_BYTES} a plugin may be"
-            ));
+            return Err(too_big(size));
         }
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        // And of the bytes, because the answer above was about the file as it
+        // was a moment ago. The race is narrow and the directory is provably
+        // not writable by another account, so whoever won it is already the
+        // owner — but the cap is what the sentence above promises, and asking
+        // twice is what makes it true rather than nearly true.
+        if bytes.len() > MAX_MODULE_BYTES {
+            return Err(too_big(bytes.len() as u64));
+        }
 
         let mut config = Config::default();
         // The whole reason this is defensible in-process.
