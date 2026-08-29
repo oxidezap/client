@@ -335,6 +335,14 @@ pub struct Guest {
     pub kv_bytes: usize,
     /// How many account commands this call has issued.
     pub commands_issued: usize,
+    /// How long this call has spent blocked inside a [`Commands`] call.
+    ///
+    /// Subtracted from what the duty cycle charges. `Commands` is synchronous
+    /// and waits on the session's answer, so a slow session was billed to the
+    /// plugin: 32 commands in one call could total seconds, and `MAX_DUTY`
+    /// then slept an honest autoreply for ten times that because the network
+    /// was busy. The budget measures what a plugin has spent *running*.
+    pub daemon_wait: std::time::Duration,
     pub trees_published: usize,
     pub kv: Kv,
     pub commands: Arc<dyn Commands>,
@@ -657,8 +665,7 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if jid.is_empty() || text.is_empty() {
                 return abi::outcome::INVALID;
             }
-            let commands = Arc::clone(&c.data().commands);
-            code(commands.send_text(&jid, &text, None))
+            commanded(&mut c, |commands| commands.send_text(&jid, &text, None))
         },
     )?;
 
@@ -692,8 +699,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if jid.is_empty() || text.is_empty() || quoted.is_empty() {
                 return abi::outcome::INVALID;
             }
-            let commands = Arc::clone(&c.data().commands);
-            code(commands.send_text(&jid, &text, Some(&quoted)))
+            commanded(&mut c, |commands| {
+                commands.send_text(&jid, &text, Some(&quoted))
+            })
         },
     )?;
 
@@ -717,10 +725,11 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if jid.is_empty() {
                 return abi::outcome::INVALID;
             }
-            let commands = Arc::clone(&c.data().commands);
             // An empty id is "as far as you know", which is what the daemon
             // does with a client that holds no preview. It is not invalid.
-            code(commands.mark_read(&jid, (!id.is_empty()).then_some(id.as_str())))
+            commanded(&mut c, |commands| {
+                commands.mark_read(&jid, (!id.is_empty()).then_some(id.as_str()))
+            })
         },
     )?;
 
@@ -743,8 +752,7 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if jid.is_empty() {
                 return abi::outcome::INVALID;
             }
-            let commands = Arc::clone(&c.data().commands);
-            code(commands.typing(&jid, composing != 0))
+            commanded(&mut c, |commands| commands.typing(&jid, composing != 0))
         },
     )?;
 
@@ -1022,6 +1030,21 @@ fn widget(node: &abi::ui::Node) -> PluginNode {
         checked: node.flags & abi::ui::flags::CHECKED != 0,
         children: node.children.iter().map(widget).collect(),
     }
+}
+
+/// Run one account command, charging the wait for it to the daemon.
+///
+/// See [`Guest::daemon_wait`]. Every command goes through here, so there is
+/// one place the subtraction can be got wrong.
+fn commanded(
+    c: &mut Caller<'_, Guest>,
+    run: impl FnOnce(&dyn Commands) -> Outcome,
+) -> i32 {
+    let commands = Arc::clone(&c.data().commands);
+    let started = std::time::Instant::now();
+    let outcome = run(commands.as_ref());
+    c.data_mut().daemon_wait += started.elapsed();
+    code(outcome)
 }
 
 fn code(outcome: Outcome) -> i32 {

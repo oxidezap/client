@@ -174,6 +174,63 @@ fn message(chat: &str, text: &str) -> UiEvent {
     }
 }
 
+/// A [`Commands`] that takes a fixed, visible amount of time to answer.
+struct SlowCommands(Duration);
+
+impl Commands for SlowCommands {
+    fn send_text(&self, _jid: &str, _text: &str, _quoted: Option<&str>) -> Outcome {
+        std::thread::sleep(self.0);
+        Outcome::Accepted
+    }
+    fn mark_read(&self, _jid: &str, _message_id: Option<&str>) -> Outcome {
+        Outcome::Accepted
+    }
+    fn typing(&self, _jid: &str, _composing: bool) -> Outcome {
+        Outcome::Accepted
+    }
+}
+
+/// `Commands` is synchronous and blocks the plugin's thread on the session's
+/// answer, and that wait used to land in `Duty::busy`. A slow session then
+/// spent a plugin's whole share on time it did not run for, and `MAX_DUTY`
+/// slept an honest autoreply for ten times the network's latency. The budget
+/// measures what a plugin has spent running.
+#[test]
+fn waiting_on_the_daemon_is_not_charged_to_the_plugin() {
+    let dir = TempDir::new("daemon-wait");
+    dir.plugin("slow", &pong());
+
+    let wait = Duration::from_millis(200);
+    let mut runtime = crate::runtime::Runtime::load(
+        &dir.0.join("slow.wasm"),
+        "slow",
+        None,
+        Arc::new(SlowCommands(wait)),
+        Arc::new(AtomicI64::new(abi::caps::SEND)),
+    )
+    .expect("the fixture loads");
+
+    let event = crate::event::from_session(&message("1@s.whatsapp.net", "hi"))
+        .expect("a message is an event");
+    let started = Instant::now();
+    runtime.deliver(Arc::new(event), 0).expect("it answers");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= wait,
+        "the fixture really did wait on the command: {elapsed:?}"
+    );
+    assert!(
+        runtime.daemon_wait() >= wait,
+        "and the wait is attributed to the daemon: {:?}",
+        runtime.daemon_wait()
+    );
+    assert!(
+        elapsed.saturating_sub(runtime.daemon_wait()) < wait,
+        "so what the duty cycle charges is the plugin's own time"
+    );
+}
+
 // ---- fixtures ------------------------------------------------------------
 
 /// Subscribes to messages, asks for `send`, and answers every message with

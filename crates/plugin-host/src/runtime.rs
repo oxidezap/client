@@ -151,6 +151,7 @@ impl Runtime {
                 logged_bytes: 0,
                 field_bytes: 0,
                 commands_issued: 0,
+                daemon_wait: std::time::Duration::ZERO,
                 trees_published: 0,
                 kv,
                 commands,
@@ -314,6 +315,13 @@ impl Runtime {
         self.store.data_mut().kv.flush_pending();
     }
 
+    /// How much of the last call was spent waiting on the daemon rather than
+    /// running the plugin. See [`Guest::daemon_wait`]; read after `deliver`,
+    /// including after one that trapped.
+    pub fn daemon_wait(&self) -> std::time::Duration {
+        self.store.data().daemon_wait
+    }
+
     pub fn deliver(&mut self, event: Arc<Event>, pending_timers: usize) -> Result<Effects> {
         let kind = event.kind;
         {
@@ -340,6 +348,7 @@ impl Runtime {
             guest.commands_issued = 0;
             guest.kv_bytes = 0;
             guest.field_bytes = 0;
+            guest.daemon_wait = std::time::Duration::ZERO;
         }
 
         let outcome = self.on_event.call(&mut self.store, (kind, 0));

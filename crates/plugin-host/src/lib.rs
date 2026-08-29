@@ -827,7 +827,12 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
         // message and grow this vector without limit.
         let started = Instant::now();
         let outcome = runtime.deliver(event, timers.len());
-        duty.spent(started.elapsed());
+        // Minus what it spent blocked on the daemon. `Commands` is
+        // synchronous, so a slow session is time this thread sat still: bill
+        // it and a plugin sending 32 messages is slept for ten times the
+        // network's latency, which is the opposite of what this budget
+        // measures.
+        duty.spent(started.elapsed().saturating_sub(runtime.daemon_wait()));
         match outcome {
             Ok(effects) => {
                 if let Some(roots) = effects.ui {
