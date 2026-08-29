@@ -388,9 +388,20 @@ mod tests {
         assert_eq!(download_key(&sha), download_key(&sha));
         assert_ne!(download_key(&sha), download_key(&[0xcd; 32]));
         assert!(
-            download_key(&sha).len() < 40,
+            download_key(&sha).expect("a hash").len() < 40,
             "a key is a file name a person may have to read"
         );
+    }
+
+    /// The field comes off the network as a plain byte string, so it can
+    /// arrive empty. Truncating whatever is there produced the literal key
+    /// `d-` for every one of them, and the second such download was answered
+    /// with the first one's bytes.
+    #[test]
+    fn media_with_no_content_hash_has_no_key() {
+        assert_eq!(download_key(&[]), None);
+        assert_eq!(download_key(&[0xab; 4]), None);
+        assert!(download_key(&[0xab; 16]).is_some());
     }
 
     /// Message keys and download keys share a directory and must not collide:
@@ -399,7 +410,7 @@ mod tests {
     #[test]
     fn the_two_key_spaces_stay_apart() {
         assert!(message_key("abc").starts_with("f-"));
-        assert!(download_key(&[1; 32]).starts_with("d-"));
+        assert!(download_key(&[1; 32]).expect("a hash").starts_with("d-"));
         assert!(
             !message_key("abc").starts_with("m-"),
             "the old prefix cached thumbnails under it and must stay orphaned"

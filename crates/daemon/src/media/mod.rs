@@ -55,14 +55,27 @@ pub fn message_key(message_id: &str) -> String {
 /// Its SHA-256 is the encrypted file's identity, so the same media shared into
 /// two chats is downloaded once. Truncated: 128 bits is far past collision
 /// range for a cache and keeps the name short enough to read.
-pub fn download_key(file_enc_sha256: &[u8]) -> String {
+/// `None` when there is no identity to address by: the field comes off the
+/// network and is a plain `Vec<u8>`, so it can arrive short or empty, and
+/// truncating whatever is there produced the literal key `d-` for every one
+/// of them. Two unrelated messages then shared a cache entry, and a download
+/// of the second was answered with the first one's bytes.
+pub fn download_key(file_enc_sha256: &[u8]) -> Option<String> {
+    if file_enc_sha256.len() < KEY_HASH_BYTES {
+        return None;
+    }
     let mut key = String::from("d-");
-    for byte in file_enc_sha256.iter().take(16) {
+    for byte in file_enc_sha256.iter().take(KEY_HASH_BYTES) {
         use std::fmt::Write as _;
         let _ = write!(key, "{byte:02x}");
     }
-    key
+    Some(key)
 }
+
+/// How much of the hash the key carries, and the least it may be built from.
+/// 128 bits is far past collision range for a cache and keeps the name short
+/// enough to read.
+const KEY_HASH_BYTES: usize = 16;
 
 /// Keep a key to the characters [`oxidezap_ipc::media_path`] accepts.
 ///

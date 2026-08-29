@@ -1107,7 +1107,19 @@ impl Bridge {
         media: oxidezap_core::DownloadableMedia,
         answer_to: Outbox,
     ) -> CommandOutcome {
-        let key = crate::media::download_key(&media.file_enc_sha256);
+        // No content to address by. Refused rather than filed under a key
+        // every such request would share, which answered one message's
+        // download with another's bytes.
+        let Some(key) = crate::media::download_key(&media.file_enc_sha256) else {
+            answer_now(
+                &answer_to,
+                downloaded(
+                    id,
+                    Err("that media carries no content hash to fetch it by".to_string()),
+                ),
+            );
+            return CommandOutcome::Accepted;
+        };
         // Already here: the same media shared into two chats, or a front end
         // that restarted. No network, no permit, no wait.
         //
@@ -1473,11 +1485,11 @@ fn cache_media(cache_epoch: usize, message_id: &str, media: &mut Option<MediaCon
         // message's own key, so a photo whose eager fetch failed and was
         // fetched on demand later is on this disk under a name a hydrated row
         // never looks for. It was downloaded again on every restart.
-        if let Some(downloadable) = &media.downloadable {
-            let by_content = crate::media::download_key(&downloadable.file_enc_sha256);
-            if crate::media::has(&by_content) {
-                media.cache_key = Some(by_content);
-            }
+        if let Some(downloadable) = &media.downloadable
+            && let Some(by_content) = crate::media::download_key(&downloadable.file_enc_sha256)
+            && crate::media::has(&by_content)
+        {
+            media.cache_key = Some(by_content);
         }
         return;
     }
