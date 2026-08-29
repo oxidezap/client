@@ -245,7 +245,37 @@ appear.
 
 Flags: `1` enabled, `2` checked.
 
-Bounds: 8 deep, 256 nodes, 4096 bytes per id/label/value, 64 KiB encoded.
+Bounds: 8 deep, 256 nodes, 256 roots, 4096 bytes per id/label/value, 64 KiB
+encoded.
+
+### When the tree is refused
+
+All of it, not the node at fault: a tree is one payload, and a plugin drawing
+half of what it published would be worse than one drawing none of it. The host
+logs the reason against the plugin's id. A tree is refused when
+
+- the first byte is not the format byte, or a length or a child count runs off
+  the end of the payload;
+- there are bytes left over after the last root — a tree that decodes and then
+  has more behind it is not one this encoding produced;
+- the root count is above 256, or the tree is past any bound above;
+- a widget kind or a slot byte is one this ABI does not define, or a slot
+  appears on a node that is not a root, or is missing from one that is;
+- a button, toggle or field carries an empty id, which nothing could ever name
+  in an action;
+- children hang off a widget that is drawn without any — anything but a row, a
+  column or a section;
+- two interactive widgets in one slot share an id, since nothing would tell
+  the two presses apart;
+- an action id is not valid UTF-8, where a label with a broken byte is
+  replaced and drawn: an id is compared rather than read, and a replacement
+  character gives the front end an id the plugin will never recognise coming
+  back;
+- the reserved byte is not zero, or a flag bit outside `1|2` is set. Both are
+  refused rather than ignored so the space stays free to mean something later:
+  a reader that skipped them would let payloads carrying a value circulate,
+  and the day one acquires a meaning those become trees whose author never
+  agreed to it.
 
 An id names one widget **within a slot**. Across slots it may repeat, because
 an action says which slot it came from; twice in one slot is refused, since
