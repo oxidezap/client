@@ -105,11 +105,20 @@ impl Kv {
                 dirty: false,
             };
         }
-        // Bounded before it is read, not after it is parsed: the file is this
-        // plugin's own and is written under `MAX_BYTES`, so one larger than
-        // that is not something this host wrote — and reading it to find out
-        // is the allocation the limit exists to refuse.
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES as u64 * 2) {
+        // Bounded before it is read, not after it is parsed: reading a
+        // planted file to discover how big it is would be the allocation the
+        // limit exists to refuse.
+        //
+        // The ceiling is on the *encoded* size, which is not the budget:
+        // `MAX_BYTES` counts the bytes a plugin stored, and JSON writes a
+        // control character as `\u0000` — six bytes for one. A store full of
+        // them is a valid store this host wrote and would serialize past
+        // twice the budget, so a ceiling of `MAX_BYTES * 2` refused the
+        // daemon's own file and started the plugin empty, losing every
+        // setting it had. Eight covers the six with room for the quotes and
+        // commas around it, and what a file at that size decodes to is
+        // checked against the real budget below.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES as u64 * 8) {
             log::warn!(
                 "{} is larger than a plugin's whole budget; starting empty",
                 path.display()
@@ -133,6 +142,20 @@ impl Kv {
                 log::warn!("plugin {id}: cannot read its settings ({e}); starting empty");
                 BTreeMap::new()
             }
+        };
+        // And what it decoded to, against the budget itself. The check above
+        // is about what may be *read*; this is the one that says whether the
+        // contents are something this host would have written, and it is the
+        // reason the encoded ceiling can be generous without the budget
+        // becoming eight times what it says.
+        let bytes = Self::size(&entries);
+        let entries = if bytes > MAX_BYTES {
+            log::warn!(
+                "plugin {id}: its stored settings hold more than its whole budget; starting empty"
+            );
+            BTreeMap::new()
+        } else {
+            entries
         };
         Self {
             path,
@@ -333,6 +356,50 @@ impl Kv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store this host wrote has to be a store it can read back.
+    ///
+    /// JSON writes a control character as six bytes, so a plugin can fill its
+    /// budget with values that serialize to far more than the budget — and a
+    /// ceiling set at twice it then refused the daemon's own file and started
+    /// the plugin empty, losing every setting it had.
+    #[test]
+    fn a_store_full_of_escapes_survives_a_restart() {
+        let dir = TempDir::new("escapes");
+        let mut kv = Kv::open(&dir.0, "escaper");
+
+        // Every byte of this value is written as `\u0000`: six on disk for
+        // one in the budget.
+        let nuls = "\0".repeat(MAX_ENTRY);
+        for i in 0..16 {
+            assert!(kv.set(&format!("k{i}"), &nuls), "within the budget");
+        }
+        kv.flush_pending();
+
+        let reopened = Kv::open(&dir.0, "escaper");
+        assert_eq!(
+            reopened.get("k0"),
+            Some(nuls.as_str()),
+            "what it wrote is what it reads"
+        );
+        assert_eq!(reopened.get("k15"), Some(nuls.as_str()));
+    }
+
+    /// The other half: a file whose *contents* are past the budget is not
+    /// something this host wrote, whatever its encoded size.
+    #[test]
+    fn settings_holding_more_than_the_budget_are_not_read() {
+        let dir = TempDir::new("oversized");
+        let path = dir.0.join("kv-fat.json");
+        let mut entries = std::collections::BTreeMap::new();
+        for i in 0..64 {
+            entries.insert(format!("k{i}"), "v".repeat(MAX_ENTRY));
+        }
+        std::fs::write(&path, serde_json::to_vec(&entries).expect("encodes")).expect("writable");
+
+        let kv = Kv::open(&dir.0, "fat");
+        assert_eq!(kv.get("k0"), None, "started empty");
+    }
 
     /// A directory that removes itself, so these tests leave nothing behind
     /// and do not need a crate for it.

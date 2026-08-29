@@ -266,7 +266,7 @@ copied or a task spawned. So the host bounds both.
 | 2 KiB per log line, 64 KiB per call, 256 KiB per window | Writing a line is host I/O fuel does not price. Newlines are escaped, so a plugin cannot forge a second log entry. Lines the host writes *about* a plugin — a refused tree — come out of the same window. |
 | 16 UI publishes per call | |
 | 32 commands per call, 256 per window | |
-| 1 MiB of key/value traffic per call, keys and values both, on reads as much as writes | 8 KiB per entry, 256 KiB per plugin. |
+| 1 MiB of key/value traffic per call, keys and values both, on reads as much as writes | 8 KiB per entry, 256 KiB per plugin — of stored bytes, not of the file, which JSON escaping can make several times larger. |
 | 16 timers, 100 ms floor, 7 day ceiling | The floor is why a plugin cannot spin on its own timer. |
 | 1 KiB name, 64 KiB action value | |
 
