@@ -15,7 +15,9 @@
 extern crate std;
 
 use oxidezap_plugin::ui::{self, slot};
-use oxidezap_plugin::{Caps, Declared, Event, Kinds, Setup, fields, kv, plugin, send_reply};
+use oxidezap_plugin::{
+    Action, Caps, Declared, Event, Kinds, Message, Setup, Which, kv, log, plugin, send_reply,
+};
 
 plugin!(init = setup, event = handle);
 
@@ -66,15 +68,20 @@ fn setup(p: Setup) -> impl Declared {
     declared
 }
 
+/// One event, narrowed to what it is.
+///
+/// `which` is what makes the two handlers below able to read *only* the
+/// fields their kind carries: asking a message for its action id is not a
+/// field that reads back empty, it is a method that is not there.
 fn handle(ev: &Event) {
-    match ev.kind() {
-        oxidezap_plugin::abi::kinds::MESSAGE => handle_message(ev),
-        oxidezap_plugin::abi::kinds::UI_ACTION => handle_action(ev),
+    match ev.which() {
+        Which::Message(m) => handle_message(m),
+        Which::Action(a) => handle_action(a),
         _ => {}
     }
 }
 
-fn handle_message(ev: &Event) {
+fn handle_message(m: Message<'_>) {
     if !kv::flag(ON) {
         return;
     }
@@ -82,16 +89,16 @@ fn handle_message(ev: &Event) {
     // either is the classic way an autoreply embarrasses somebody: the first
     // makes it talk to itself, and the second answers a message that is no
     // longer there.
-    if ev.flag(fields::FROM_ME) || ev.flag(fields::REVOKED) {
+    if m.from_me() || m.revoked() {
         return;
     }
     // Groups are left alone. A keyword that fires in a conversation of forty
     // people is a keyword that fires forty times.
-    if ev.flag(fields::IS_GROUP) {
+    if m.is_group() {
         return;
     }
 
-    let text = ev.text(fields::TEXT);
+    let text = m.text();
     let keyword = kv::text::<SETTING>(KEYWORD, DEFAULT_KEYWORD);
     if !contains_ignoring_case(text.as_str(), keyword.as_str()) {
         return;
@@ -101,11 +108,11 @@ fn handle_message(ev: &Event) {
     // JID, it is somebody else. This is the one read where truncation would
     // be actively wrong rather than merely incomplete, and the type is what
     // asks the question.
-    let chat = ev.text(fields::CHAT_JID);
+    let chat = m.chat();
     let Some(chat) = chat.whole() else {
         return;
     };
-    let message_id = ev.text(fields::MESSAGE_ID);
+    let message_id = m.id();
     let reply = kv::text::<SETTING>(REPLY, DEFAULT_REPLY);
 
     // As a reply rather than a fresh message: an automatic answer that does
@@ -114,17 +121,21 @@ fn handle_message(ev: &Event) {
     send_reply(chat, reply.as_str(), message_id.as_str());
 }
 
-fn handle_action(ev: &Event) {
-    let id = ev.text(fields::ACTION_ID);
-    let value = ev.text(fields::ACTION_VALUE.sized::<SETTING>());
+fn handle_action(a: Action<'_>) {
+    let id = a.id();
+    let value = a.value_into::<SETTING>();
 
     // A value that did not fit is *not* a shorter value: storing it would
     // silently drop the end of somebody's keyword and then match on a word
     // they never typed.
     let (Some(id), Some(value)) = (id.whole(), value.whole()) else {
-        oxidezap_plugin::log(
+        // Formatted, and still without an allocator: the line is built in a
+        // fixed buffer on the stack. Saying *how much* longer is the
+        // difference between a log line and a shrug.
+        log!(
             oxidezap_plugin::level::WARN,
-            "ignoring a setting longer than this plugin makes room for",
+            "ignoring a {} byte setting; this plugin makes room for {SETTING}",
+            value.full_len()
         );
         return;
     };
@@ -199,17 +210,6 @@ fn contains_ignoring_case(haystack: &str, needle: &str) -> bool {
             .zip(needle)
             .all(|(a, b)| a.eq_ignore_ascii_case(b))
     })
-}
-
-/// Nothing here unwinds — the profile aborts — but `wasm32-unknown-unknown`
-/// with `no_std` still needs the handler to exist.
-#[cfg(target_arch = "wasm32")]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    // A trap, which the host turns into "this plugin stopped, and why". The
-    // alternative — a silent loop — would be a plugin that burns its fuel
-    // budget on every event forever.
-    core::arch::wasm32::unreachable()
 }
 
 #[cfg(test)]

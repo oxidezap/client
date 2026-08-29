@@ -2327,3 +2327,36 @@ fn a_plugin_that_wakes_itself_forever_is_held_to_its_share() {
         .recv_timeout(Duration::from_secs(20))
         .expect("a throttled plugin is still one the daemon can join");
 }
+
+/// The module `docs/plugin-abi.md` prints as the whole contract is a module
+/// this host loads.
+///
+/// Read out of the document rather than copied into this file, because a copy
+/// is what lets the two drift: the version literal in that snippet is the one
+/// a plugin author will type, and nothing else here would notice when
+/// `abi::VERSION` moves past it.
+#[test]
+fn the_minimal_module_in_the_abi_document_loads() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plugin-abi.md"),
+    )
+    .expect("the ABI document is part of this repository");
+    let wat = doc
+        .split("```wat")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("it prints a module");
+
+    let dir = TempDir::new("documented");
+    dir.plugin("minimal", wat);
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    let surfaces = plugins.surfaces();
+    assert_eq!(surfaces.len(), 1, "the documented module loaded");
+    assert_eq!(surfaces[0].name, "Minimal", "and named itself");
+    assert!(
+        surfaces[0].capabilities.is_empty(),
+        "asking for nothing is asking for nothing"
+    );
+}

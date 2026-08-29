@@ -38,12 +38,23 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   capability cannot be passed where a set of event kinds goes, a `Setup` whose
   methods vanish once used so declaring twice is a missing method rather than
   a refusal at load, a size carried on each field so a read does not pick one,
-  and a UI builder whose sections take closures so there is no `end` to
-  forget. All of it monomorphizes away — the example is still a few kilobytes.
-  Its `testing` feature answers the imports from a table a test owns, which is
-  the only way to run a handler without the daemon; `raw::Ptr` exists for it,
-  because an address is an `i32` on wasm32 and truncates to nothing anywhere
-  else.
+  a UI builder whose sections take closures so there is no `end` to forget,
+  and `Event::which`, which narrows an event to a view naming only the fields
+  its kind carries — the absence rule is right for the wire and wrong for a
+  handler, where reading `TEXT` off a `UI_ACTION` answers an empty string that
+  no compiler and no log will ever question. Every one of those views carries
+  an `Other`/`Unknown` arm, because a `match` that could not compile against a
+  kind the daemon learned later would make every addition a breaking change.
+  All of it monomorphizes away — the example is still a few kilobytes. What is
+  *not* free is `log!`: formatting without a heap still pulls `core::fmt` in,
+  which is about 2.6 KiB, so the choice is per plugin and the doc comment says
+  the number rather than leaving somebody to find it in a size diff. The
+  `plugin!` macro emits the `#[panic_handler]` too — boilerplate every plugin
+  copied, and one of the two ways a first build fails — with `panic = own` for
+  anyone who wants their own. Its `testing` feature answers the imports from a
+  table a test owns, which is the only way to run a handler without the
+  daemon; `raw::Ptr` exists for it, because an address is an `i32` on wasm32
+  and truncates to nothing anywhere else.
 - **oxidezap-gui**: GPUI front end, binary `oxidezap`. Talks to the daemon and
   starts one if none is listening. Owns video decode, which writes straight
   into `gpui::RenderImage` and is not reusable off GPUI.
@@ -53,7 +64,20 @@ one WhatsApp session per user, and it lives in the daemon.
 
 `examples/` holds plugins, and is excluded from the workspace: they build for
 `wasm32-unknown-unknown` and link imports only the daemon provides, so a
-`cargo build` at the root would try to link them for the host.
+`cargo build` at the root would try to link them for the host. `template/` is
+the one to copy — it asks for nothing that touches the account, so it runs the
+moment it is dropped in the folder — and `autoreply/` is the same shape with
+something in it.
+
+`docs/plugin-abi.md` is the contract for anyone not using the SDK: the imports
+with their signatures, the field table by kind, the UI encoding, the outcome
+codes and every bound the host holds a plugin to. The SDK is a convenience
+over exactly that and has no privileged access, which is the sentence that
+makes a TinyGo plugin possible — so the document is load-bearing rather than
+descriptive, and the module it prints is loaded by a test
+(`the_minimal_module_in_the_abi_document_loads`) rather than copied into one:
+a copy is what lets the version literal in the snippet drift past
+`abi::VERSION` with nothing to notice.
 
 ## Build & verify
 
@@ -66,6 +90,8 @@ cargo test --workspace
 cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxidezap
 
 # A plugin. Its own workspace, its own target, and the file's name is its id.
+# `examples/template` is the same three commands; `cargo test` in either runs
+# its handlers against the SDK's test host, with no daemon and no wasm.
 cd examples/autoreply && cargo build --release --target wasm32-unknown-unknown
 cp target/wasm32-unknown-unknown/release/autoreply.wasm ~/.local/share/oxidezap/plugins/
 # And the one test that exercises the real SDK against the real host. Back at

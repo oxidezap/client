@@ -474,6 +474,457 @@ impl Event {
     }
 }
 
+// ---- an event, narrowed to what it is ------------------------------------
+
+/// What an event turned out to be.
+///
+/// [`Event`] can read any field of any event, which the ABI's absence rule
+/// makes quiet rather than wrong: reading `fields::TEXT` off a `UI_ACTION`
+/// answers an empty string, indistinguishable from a message that really is
+/// empty. That is the right rule for the wire — it is what lets the table
+/// grow without breaking older plugins — and the wrong shape for a handler,
+/// where reading the wrong field is a bug nothing reports.
+///
+/// So [`Event::which`] hands back a view that names only the fields its kind
+/// carries. Each view is a newtype over the same handle: the reads are the
+/// same host calls, nothing is copied, and the whole thing monomorphizes
+/// away.
+///
+/// ```ignore
+/// match ev.which() {
+///     Which::Message(m) if !m.from_me() => reply_to(m.chat(), m.text()),
+///     Which::Action(a) => setting(a.id(), a.value()),
+///     _ => {}
+/// }
+/// ```
+pub enum Which<'a> {
+    /// A message arrived — including one this account wrote elsewhere.
+    Message(Message<'a>),
+    /// The connection changed state.
+    Connection(Connection<'a>),
+    /// A receipt landed against messages this account sent.
+    Receipt(Receipt<'a>),
+    /// Somebody reacted to a message, or took their reaction back.
+    Reaction(Reaction<'a>),
+    /// Somebody started or stopped typing.
+    Presence(Presence<'a>),
+    /// Something happened to a call.
+    Call(Call<'a>),
+    /// One of this plugin's own widgets was used.
+    Action(Action<'a>),
+    /// A timer this plugin armed came due.
+    Timer(Timer<'a>),
+    /// A kind this build of the SDK does not name.
+    ///
+    /// Not an error: the host may deliver a kind added after a plugin was
+    /// built, and a `match` that has to be exhaustive over a growing table is
+    /// a plugin that stops compiling when the daemon learns something new.
+    Unknown(&'a Event),
+}
+
+impl Event {
+    /// Narrow this event to the fields its kind actually carries.
+    #[must_use]
+    pub fn which(&self) -> Which<'_> {
+        match self.kind {
+            abi::kinds::MESSAGE => Which::Message(Message(self)),
+            abi::kinds::CONNECTION => Which::Connection(Connection(self)),
+            abi::kinds::RECEIPT => Which::Receipt(Receipt(self)),
+            abi::kinds::REACTION => Which::Reaction(Reaction(self)),
+            abi::kinds::PRESENCE => Which::Presence(Presence(self)),
+            abi::kinds::CALL => Which::Call(Call(self)),
+            abi::kinds::UI_ACTION => Which::Action(Action(self)),
+            abi::kinds::TIMER => Which::Timer(Timer(self)),
+            _ => Which::Unknown(self),
+        }
+    }
+}
+
+/// Declare the views, which differ only in what they are called and which
+/// fields they go on to name.
+macro_rules! views {
+    ($($(#[$doc:meta])* $name:ident,)*) => {$(
+        $(#[$doc])*
+        ///
+        /// A view over the same handle rather than a copy of anything: a read
+        /// here is the host call it would have been on [`Event`], and a field
+        /// nobody asks for still costs nothing.
+        #[derive(Clone, Copy)]
+        pub struct $name<'a>(&'a Event);
+
+        impl<'a> $name<'a> {
+            /// The event underneath, for a field this view does not name.
+            #[must_use]
+            pub fn raw(self) -> &'a Event {
+                self.0
+            }
+        }
+    )*};
+}
+
+views! {
+    /// A message, as delivered to a plugin.
+    Message,
+    /// A change in the connection to WhatsApp.
+    Connection,
+    /// A delivery, read or played receipt.
+    Receipt,
+    /// A reaction added to a message, or removed from one.
+    Reaction,
+    /// Somebody typing, or having stopped.
+    Presence,
+    /// Something that happened to a call.
+    Call,
+    /// One of this plugin's widgets, used.
+    Action,
+    /// A timer coming due.
+    Timer,
+}
+
+impl Message<'_> {
+    /// The chat it arrived in.
+    #[must_use]
+    pub fn chat(self) -> Text<128> {
+        self.0.text(fields::CHAT_JID)
+    }
+
+    /// Whether that chat is a group.
+    #[must_use]
+    pub fn is_group(self) -> bool {
+        self.0.flag(fields::IS_GROUP)
+    }
+
+    /// Its id, which [`send_reply`] quotes.
+    #[must_use]
+    pub fn id(self) -> Text<128> {
+        self.0.text(fields::MESSAGE_ID)
+    }
+
+    /// What it says.
+    #[must_use]
+    pub fn text(self) -> Text<1024> {
+        self.0.text(fields::TEXT)
+    }
+
+    /// The same body, in as much room as you care to give it.
+    ///
+    /// A message is the one field with no protocol bound on it, so the page
+    /// [`text`](Self::text) reads into is a guess. This is how a plugin that
+    /// knows better says so.
+    #[must_use]
+    pub fn text_into<const N: usize>(self) -> Text<N> {
+        self.0.text(fields::TEXT.sized::<N>())
+    }
+
+    /// Whether this account wrote it — on this device or another.
+    #[must_use]
+    pub fn from_me(self) -> bool {
+        self.0.flag(fields::FROM_ME)
+    }
+
+    /// When it was written, in milliseconds since the epoch.
+    #[must_use]
+    pub fn timestamp_ms(self) -> i64 {
+        self.0.int(fields::TIMESTAMP_MS)
+    }
+
+    /// Who wrote it. Empty outside a group, where the chat is the sender.
+    #[must_use]
+    pub fn sender(self) -> Text<128> {
+        self.0.text(fields::SENDER_JID)
+    }
+
+    /// What they are called.
+    #[must_use]
+    pub fn sender_name(self) -> Text<128> {
+        self.0.text(fields::SENDER_NAME)
+    }
+
+    /// Whether its author has taken it back.
+    #[must_use]
+    pub fn revoked(self) -> bool {
+        self.0.flag(fields::REVOKED)
+    }
+
+    /// What it carries, if anything.
+    #[must_use]
+    pub fn media(self) -> Media {
+        Media::of(self.0.int(fields::MEDIA_KIND))
+    }
+
+    /// The message this one quotes. Empty when it quotes nothing.
+    #[must_use]
+    pub fn quoted_id(self) -> Text<128> {
+        self.0.text(fields::QUOTED_ID)
+    }
+}
+
+impl Connection<'_> {
+    /// What the connection is doing now.
+    #[must_use]
+    pub fn state(self) -> State {
+        State::of(self.0.int(fields::CONNECTION_STATE))
+    }
+
+    /// Why, where the daemon had a reason to give.
+    #[must_use]
+    pub fn reason(self) -> Text<256> {
+        self.0.text(fields::REASON)
+    }
+}
+
+impl Receipt<'_> {
+    /// The chat the messages it covers are in.
+    #[must_use]
+    pub fn chat(self) -> Text<128> {
+        self.0.text(fields::CHAT_JID)
+    }
+
+    /// Whether that chat is a group.
+    #[must_use]
+    pub fn is_group(self) -> bool {
+        self.0.flag(fields::IS_GROUP)
+    }
+
+    /// Delivered, read, or played.
+    #[must_use]
+    pub fn kind(self) -> ReceiptKind {
+        ReceiptKind::of(self.0.int(fields::RECEIPT_KIND))
+    }
+
+    /// How many messages it covers. One receipt can answer several.
+    #[must_use]
+    pub fn count(self) -> usize {
+        self.0.count(fields::MESSAGE_IDS)
+    }
+
+    /// One of the messages it covers.
+    #[must_use]
+    pub fn message_id(self, index: usize) -> Text<128> {
+        self.0.at(fields::MESSAGE_IDS, index)
+    }
+}
+
+impl Reaction<'_> {
+    /// The chat the reacted-to message is in.
+    #[must_use]
+    pub fn chat(self) -> Text<128> {
+        self.0.text(fields::CHAT_JID)
+    }
+
+    /// Whether that chat is a group.
+    #[must_use]
+    pub fn is_group(self) -> bool {
+        self.0.flag(fields::IS_GROUP)
+    }
+
+    /// The message that was reacted to.
+    #[must_use]
+    pub fn message_id(self) -> Text<128> {
+        self.0.text(fields::MESSAGE_ID)
+    }
+
+    /// Who reacted.
+    #[must_use]
+    pub fn sender(self) -> Text<128> {
+        self.0.text(fields::SENDER_JID)
+    }
+
+    /// What they reacted with.
+    ///
+    /// Empty when the reaction was *removed* — and, under the ABI's absence
+    /// rule, also when the event carried no emoji at all. Those two are
+    /// deliberately indistinguishable here; see the note in `AGENTS.md`.
+    #[must_use]
+    pub fn emoji(self) -> Text<32> {
+        self.0.text(fields::EMOJI)
+    }
+}
+
+impl Presence<'_> {
+    /// The chat somebody is typing in.
+    #[must_use]
+    pub fn chat(self) -> Text<128> {
+        self.0.text(fields::CHAT_JID)
+    }
+
+    /// Whether that chat is a group.
+    #[must_use]
+    pub fn is_group(self) -> bool {
+        self.0.flag(fields::IS_GROUP)
+    }
+
+    /// Who it is.
+    #[must_use]
+    pub fn sender(self) -> Text<128> {
+        self.0.text(fields::SENDER_JID)
+    }
+
+    /// What they are called.
+    #[must_use]
+    pub fn sender_name(self) -> Text<128> {
+        self.0.text(fields::SENDER_NAME)
+    }
+
+    /// Whether they are typing, rather than having stopped.
+    #[must_use]
+    pub fn composing(self) -> bool {
+        self.0.flag(fields::COMPOSING)
+    }
+}
+
+impl Call<'_> {
+    /// The call this is about.
+    #[must_use]
+    pub fn id(self) -> Text<128> {
+        self.0.text(fields::CALL_ID)
+    }
+
+    /// What happened to it.
+    #[must_use]
+    pub fn event(self) -> CallEvent {
+        CallEvent::of(self.0.int(fields::CALL_EVENT))
+    }
+
+    /// Whether it carries video.
+    #[must_use]
+    pub fn is_video(self) -> bool {
+        self.0.flag(fields::CALL_IS_VIDEO)
+    }
+
+    /// Who is on the other end. Empty where the daemon did not say.
+    #[must_use]
+    pub fn peer(self) -> Text<128> {
+        self.0.text(fields::PEER_JID)
+    }
+}
+
+impl Action<'_> {
+    /// Which widget was used: the id this plugin published it under.
+    #[must_use]
+    pub fn id(self) -> Text<64> {
+        self.0.text(fields::ACTION_ID)
+    }
+
+    /// What it now holds — a toggle's new state as `1` or `0`, a field's
+    /// contents, and nothing at all for a button.
+    #[must_use]
+    pub fn value(self) -> Text<256> {
+        self.0.text(fields::ACTION_VALUE)
+    }
+
+    /// The same value, in as much room as this plugin's settings need.
+    #[must_use]
+    pub fn value_into<const N: usize>(self) -> Text<N> {
+        self.0.text(fields::ACTION_VALUE.sized::<N>())
+    }
+
+    /// The conversation the window had open when it was pressed.
+    ///
+    /// Empty for a widget in a slot that has no chat behind it, which is
+    /// every widget on the Settings screen.
+    #[must_use]
+    pub fn chat(self) -> Text<128> {
+        self.0.text(fields::CHAT_JID)
+    }
+}
+
+impl Timer<'_> {
+    /// The token this timer was armed with.
+    #[must_use]
+    pub fn token(self) -> i64 {
+        self.0.int(fields::TIMER_TOKEN)
+    }
+}
+
+/// Values that name a state rather than counting anything.
+///
+/// Each carries `Other` for the same reason [`Which`] carries `Unknown`: the
+/// daemon may learn a value after a plugin was built, and a match that could
+/// not compile against a longer table would make every addition a breaking
+/// change.
+macro_rules! valued {
+    ($(
+        $(#[$doc:meta])* $name:ident from $module:ident {
+            $($(#[$vdoc:meta])* $variant:ident = $konst:ident,)*
+        }
+    )*) => {$(
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum $name {
+            $($(#[$vdoc])* $variant,)*
+            /// A value this build of the SDK does not name.
+            Other(i64),
+        }
+
+        impl $name {
+            #[must_use]
+            fn of(value: i64) -> Self {
+                match value {
+                    $(abi::fields::$module::$konst => Self::$variant,)*
+                    other => Self::Other(other),
+                }
+            }
+        }
+    )*};
+}
+
+valued! {
+    /// What a message carries besides its text.
+    Media from media {
+        /// Text only.
+        None = NONE,
+        /// A photo.
+        Image = IMAGE,
+        /// A video.
+        Video = VIDEO,
+        /// A voice note or an audio file.
+        Audio = AUDIO,
+        /// A file.
+        Document = DOCUMENT,
+        /// A sticker.
+        Sticker = STICKER,
+    }
+
+    /// What the connection to WhatsApp is doing.
+    State from connection {
+        /// Reaching for the server.
+        Connecting = CONNECTING,
+        /// Waiting to be paired with a phone.
+        Pairing = PAIRING,
+        /// Connected, and still pulling history down.
+        Syncing = SYNCING,
+        /// Connected.
+        Connected = CONNECTED,
+        /// Not connected, and expecting to be again.
+        Disconnected = DISCONNECTED,
+        /// The credentials are dead; pairing again is the only way back.
+        LoggedOut = LOGGED_OUT,
+    }
+
+    /// How far a message got.
+    ReceiptKind from receipt {
+        /// It reached the device.
+        Delivered = DELIVERED,
+        /// Somebody read it.
+        Read = READ,
+        /// A voice note was listened to.
+        Played = PLAYED,
+    }
+
+    /// What happened to a call.
+    CallEvent from call {
+        /// Somebody is calling.
+        Incoming = INCOMING,
+        /// This account placed one.
+        Outgoing = OUTGOING,
+        /// It was answered.
+        Answered = ANSWERED,
+        /// It is over.
+        Ended = ENDED,
+    }
+}
+
 /// The shared shape of every "write into my buffer and tell me the real
 /// length" call.
 fn read_into<const N: usize>(mut call: impl FnMut(raw::Ptr, i32) -> i32) -> Text<N> {
@@ -868,6 +1319,106 @@ pub fn after(delay_ms: i64, token: i64) -> Outcome {
     Outcome::of(raw::timer_set(delay_ms, token))
 }
 
+// ---- a log line, without an allocator ------------------------------------
+
+/// A line built on the stack.
+///
+/// [`log`] takes a `&str`, and a plugin with no allocator has no way to make
+/// one that carries a number — so debugging used to mean logging constants
+/// and guessing at the values between them. This is the buffer `format_args!`
+/// writes into: a fixed array, a length, and no heap anywhere.
+///
+/// Usually reached through [`log!`] rather than by name. Build one directly
+/// where a plugin wants a different size, or wants to compose a line before
+/// deciding whether to log it at all.
+pub struct Line<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Line<N> {
+    /// An empty line.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    /// What has been written so far.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Every write lands on a character boundary, so this cannot fail —
+        // and a plugin that has run out of fuel arguing about it is worse
+        // off than one that logs nothing.
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+
+    /// Whether anything has been written.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<const N: usize> Default for Line<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> core::fmt::Write for Line<N> {
+    /// Append what fits, and say when that was not all of it.
+    ///
+    /// The `Err` is what stops `write_fmt` from formatting the rest of a line
+    /// that is already full — the arguments after the overflow cost nothing.
+    /// [`log!`] then ignores it, because a line logged short is worth more
+    /// than a line not logged.
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = N - self.len;
+        if s.len() <= room {
+            self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+            self.len += s.len();
+            return Ok(());
+        }
+        // Cut on a character, never in the middle of one: `as_str` has to
+        // stay valid whatever a plugin formats into this.
+        let cut = whole_characters(s.as_bytes(), room);
+        self.buf[self.len..self.len + cut].copy_from_slice(&s.as_bytes()[..cut]);
+        self.len += cut;
+        Err(core::fmt::Error)
+    }
+}
+
+/// Write a formatted line to the daemon's log.
+///
+/// ```ignore
+/// log!(level::WARN, "keyword did not fit: {} bytes", value.full_len());
+/// ```
+///
+/// The line is built in 256 bytes of stack and truncated there — the host
+/// refuses a longer one anyway, and a log call is host work that fuel does
+/// not price, which is why it is bounded per call *and* across a window.
+/// Where a plugin wants a different size, build a [`Line`] and hand its
+/// [`as_str`](Line::as_str) to [`log`].
+///
+/// It is not free, and the cost is worth knowing before it surprises
+/// somebody: formatting pulls `core::fmt` into the module, which is about
+/// 2.6 KiB — half again the size of a small plugin. A constant line through
+/// [`log`] costs nothing at all, so the choice is per plugin rather than
+/// per line: one that formats anywhere pays once.
+#[macro_export]
+macro_rules! log {
+    ($level:expr, $($arg:tt)*) => {{
+        let mut line = $crate::Line::<256>::new();
+        // Deliberately ignored: an overflow means the line is short, which is
+        // the outcome this already chose.
+        let _ = ::core::fmt::Write::write_fmt(&mut line, ::core::format_args!($($arg)*));
+        $crate::log($level, line.as_str());
+    }};
+}
+
 /// Generate the three exports the host looks for.
 ///
 /// A declarative macro rather than a derive, so this crate needs no
@@ -879,9 +1430,33 @@ pub fn after(delay_ms: i64, token: i64) -> Outcome {
 /// ```
 ///
 /// `init` is `fn(Setup) -> impl Declared` and `event` is `fn(&Event)`.
+///
+/// It also emits the `#[panic_handler]` a `no_std` wasm module cannot link
+/// without — boilerplate every plugin used to copy, and one of the two
+/// reasons a first build fails. A plugin that wants its own says so:
+///
+/// ```ignore
+/// oxidezap_plugin::plugin!(init = setup, event = handle, panic = own);
+/// ```
 #[macro_export]
 macro_rules! plugin {
     (init = $init:path, event = $on_event:path $(,)?) => {
+        $crate::plugin!(init = $init, event = $on_event, panic = own);
+
+        /// Nothing here unwinds — the profile aborts — but a `no_std` module
+        /// for `wasm32-unknown-unknown` still needs the handler to exist.
+        ///
+        /// A trap, which the host turns into "this plugin stopped, and why".
+        /// The alternative — a silent loop — is a plugin spending its whole
+        /// fuel budget on every event forever.
+        #[cfg(target_arch = "wasm32")]
+        #[panic_handler]
+        fn oxi_panicked(_: &::core::panic::PanicInfo) -> ! {
+            ::core::arch::wasm32::unreachable()
+        }
+    };
+
+    (init = $init:path, event = $on_event:path, panic = own $(,)?) => {
         /// The version this plugin was built against.
         ///
         /// A function, not a global: neither Rust nor TinyGo can emit an
@@ -998,11 +1573,185 @@ mod tests {
         }
     }
 
+    /// A line carries values, and a plugin with no allocator can still say
+    /// what they were.
+    #[test]
+    fn a_line_formats_onto_the_stack() {
+        use core::fmt::Write as _;
+
+        let mut line = super::Line::<64>::new();
+        assert!(line.is_empty());
+        write!(line, "{} of {}", 3, 8).expect("fits");
+        assert_eq!(line.as_str(), "3 of 8");
+    }
+
+    /// A line that does not fit is cut on a character, and says so, so
+    /// `write_fmt` stops formatting arguments into a full buffer.
+    #[test]
+    fn a_line_that_overflows_is_cut_on_a_character() {
+        use core::fmt::Write as _;
+
+        // Four bytes of room and a two-byte character straddling the end:
+        // three characters go in, the fourth does not.
+        let mut line = super::Line::<4>::new();
+        assert!(write!(line, "aaç").is_ok());
+        assert!(write!(line, "çç").is_err(), "the rest did not fit");
+        assert_eq!(line.as_str(), "aaç", "and nothing was cut in half");
+    }
+
     /// Bytes that are not UTF-8 at all have nothing to salvage, and this must
     /// answer rather than loop or index past the end.
     #[test]
     fn nothing_but_continuation_bytes_is_left_alone() {
         assert_eq!(whole_characters(&[0x80, 0x80, 0x80], 3), 3);
         assert_eq!(whole_characters(&[], 0), 0);
+    }
+}
+
+/// What the views answer, against the test host rather than the daemon.
+///
+/// Separate from the tests above because reading a field is a host call, and
+/// off target the only host is the one behind this feature.
+#[cfg(all(test, feature = "testing"))]
+mod view_tests {
+    use super::{CallEvent, Event, Media, ReceiptKind, State, Which};
+    use crate::testing::{Event as In, Host};
+    use oxidezap_plugin_abi as abi;
+    use std::cell::RefCell;
+    use std::string::{String, ToString as _};
+    use std::{thread_local, vec::Vec};
+
+    thread_local! {
+        /// What the handler below saw, since a `fn` pointer cannot capture.
+        static SEEN: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn note(what: &str) {
+        SEEN.with(|seen| seen.borrow_mut().push(what.to_string()));
+    }
+
+    fn seen() -> Vec<String> {
+        SEEN.with(|seen| seen.borrow().clone())
+    }
+
+    /// Every view, read through the fields its own kind carries.
+    fn handler(ev: &Event) {
+        match ev.which() {
+            Which::Message(m) => {
+                note(m.chat().as_str());
+                note(m.text().as_str());
+                note(if m.from_me() { "mine" } else { "theirs" });
+                note(match m.media() {
+                    Media::Image => "image",
+                    Media::None => "text",
+                    _ => "other",
+                });
+            }
+            Which::Action(a) => {
+                note(a.id().as_str());
+                note(a.value().as_str());
+                note(a.chat().as_str());
+            }
+            Which::Timer(t) => note(&t.token().to_string()),
+            Which::Connection(c) => note(match c.state() {
+                State::LoggedOut => "logged out",
+                State::Connected => "connected",
+                _ => "other",
+            }),
+            Which::Receipt(r) => {
+                note(match r.kind() {
+                    ReceiptKind::Read => "read",
+                    _ => "other",
+                });
+                for i in 0..r.count() {
+                    note(r.message_id(i).as_str());
+                }
+            }
+            Which::Call(c) => note(match c.event() {
+                CallEvent::Incoming => "ringing",
+                _ => "other",
+            }),
+            Which::Unknown(ev) => note(&ev.kind().to_string()),
+            _ => note("unhandled"),
+        }
+    }
+
+    fn run(event: In) -> Vec<String> {
+        SEEN.with(|seen| seen.borrow_mut().clear());
+        let mut host = Host::new();
+        host.deliver(event, handler);
+        seen()
+    }
+
+    #[test]
+    fn a_message_reads_as_a_message() {
+        let seen = run(In::message("5511999@s.whatsapp.net", "hi")
+            .int(abi::fields::MEDIA_KIND, abi::fields::media::IMAGE));
+        assert_eq!(seen, ["5511999@s.whatsapp.net", "hi", "theirs", "image"]);
+    }
+
+    #[test]
+    fn an_action_reads_as_an_action() {
+        let seen =
+            run(In::action("enabled", "1").str(abi::fields::CHAT_JID, "5511999@s.whatsapp.net"));
+        assert_eq!(seen, ["enabled", "1", "5511999@s.whatsapp.net"]);
+    }
+
+    #[test]
+    fn a_timer_carries_its_token() {
+        assert_eq!(run(In::timer(7)), ["7"]);
+    }
+
+    #[test]
+    fn a_receipt_names_every_message_it_covers() {
+        let seen = run(In::of(abi::kinds::RECEIPT)
+            .int(abi::fields::RECEIPT_KIND, abi::fields::receipt::READ)
+            .list(abi::fields::MESSAGE_IDS, &["a", "b"]));
+        assert_eq!(seen, ["read", "a", "b"]);
+    }
+
+    #[test]
+    fn a_connection_and_a_call_read_their_own_values() {
+        assert_eq!(
+            run(In::of(abi::kinds::CONNECTION).int(
+                abi::fields::CONNECTION_STATE,
+                abi::fields::connection::LOGGED_OUT
+            )),
+            ["logged out"]
+        );
+        assert_eq!(
+            run(In::of(abi::kinds::CALL).int(abi::fields::CALL_EVENT, abi::fields::call::INCOMING)),
+            ["ringing"]
+        );
+    }
+
+    /// A kind this build does not name is not an error and not a panic: it
+    /// arrives as itself. Adding one to the daemon must not stop older
+    /// plugins from compiling or from running.
+    #[test]
+    fn a_kind_from_a_newer_daemon_still_arrives() {
+        assert_eq!(
+            run(In::of(abi::kinds::COUNT + 40)),
+            [(abi::kinds::COUNT + 40).to_string()]
+        );
+    }
+
+    /// The value a view does not name is still reachable, so narrowing costs
+    /// nothing in what can be read.
+    #[test]
+    fn a_view_still_opens_onto_the_event() {
+        SEEN.with(|seen| seen.borrow_mut().clear());
+        let mut host = Host::new();
+        host.deliver(
+            In::message("a@s.whatsapp.net", "x").str(abi::fields::QUOTED_ID, "q1"),
+            |ev| {
+                let Which::Message(m) = ev.which() else {
+                    unreachable!()
+                };
+                note(m.quoted_id().as_str());
+                note(m.raw().text(crate::fields::MESSAGE_ID).as_str());
+            },
+        );
+        assert_eq!(seen()[0], "q1");
     }
 }

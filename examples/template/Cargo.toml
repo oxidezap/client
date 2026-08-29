@@ -1,0 +1,40 @@
+[package]
+# This name is the plugin's id: it names the `.wasm`, the key its settings are
+# stored under, and the answer the user gives about what it may do. Change it
+# before the first build rather than after.
+name = "template"
+description = "Starting point for an oxidezap plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+
+# Its own workspace. This crate builds for `wasm32-unknown-unknown` and links
+# against imports only the daemon provides, so a `cargo build` in an enclosing
+# workspace would try to link it for the host and fail at every `oxi_*`
+# symbol. Keep this line when you copy the directory somewhere else.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# A path while this lives beside the SDK; a version or a git revision once it
+# does not.
+oxidezap-plugin = { path = "../../crates/plugin-sdk" }
+
+# The SDK's test host, so these handlers can be run by `cargo test` on an
+# ordinary machine rather than only inside the daemon. A dev-dependency, so
+# the `.wasm` carries none of it.
+[dev-dependencies]
+oxidezap-plugin = { path = "../../crates/plugin-sdk", features = ["testing"] }
+
+# What makes the output kilobytes rather than hundreds of them: no unwinding
+# tables, one codegen unit for LTO to work across, and size over speed.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
