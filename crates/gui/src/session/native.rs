@@ -147,6 +147,9 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
         .ok_or_else(|| std::io::Error::other("no per-user directory to look for the daemon in"))?;
     let program = daemon_program();
     let deadline = wacore::time::Instant::now() + START_TIMEOUT;
+    // The daemon this call started, kept so it can be asked whether it is
+    // still running rather than left to become a zombie.
+    let mut started: Option<std::process::Child> = None;
 
     loop {
         match Endpoint::connect() {
@@ -160,10 +163,34 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
             Err(_) => {}
         }
 
-        info!("no daemon on {}; starting one", path.display());
-        std::process::Command::new(&program).spawn().map_err(|e| {
-            std::io::Error::other(format!("could not start {}: {e}", program.display()))
-        })?;
+        // Only if the last one is not still coming up. The connect above can
+        // fail for reasons that are not "nobody is listening" — a socket this
+        // user may not open, a peer that is not us — and each turn of the
+        // loop launching another daemon meant five of them per attempt, all
+        // but one losing the per-user lock and exiting. Held rather than
+        // dropped, and reaped: a `Child` nobody waits on is a zombie for as
+        // long as this window lives, and the error screen retries every
+        // fifteen seconds for as long as the user leaves it up.
+        match started.as_mut().map(std::process::Child::try_wait) {
+            Some(Ok(None)) => {}
+            _ => {
+                info!("no daemon on {}; starting one", path.display());
+                started = Some(
+                    std::process::Command::new(&program)
+                        // The daemon's own log belongs in the daemon's, not
+                        // interleaved into this window's.
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .map_err(|e| {
+                            std::io::Error::other(format!(
+                                "could not start {}: {e}",
+                                program.display()
+                            ))
+                        })?,
+                );
+            }
+        }
 
         // Polled rather than waited on: the daemon binds after it has taken
         // its lock and prepared its directory, and there is no signal for that
