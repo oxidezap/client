@@ -1013,11 +1013,19 @@ impl Chat {
     /// or the preview. An id match replaces the live bubble: the store is
     /// authoritative (edits and revokes materialize there), so the hydrated
     /// copy must not be dropped in favor of stale content.
-    pub fn insert_history_message(&mut self, mut message: ChatMessage) {
+    /// Answers whether the timeline actually moved.
+    ///
+    /// A page re-fetched over rows it already holds is the common case — the
+    /// daemon publishes a history load on every ack and receipt, and the open
+    /// conversation asks again from the top — and a caller that invalidated
+    /// its rows for one of those rebuilt and re-measured the whole timeline
+    /// for nothing.
+    pub fn insert_history_message(&mut self, mut message: ChatMessage) -> bool {
         self.name_quoted_author(&mut message);
         // Id-only match: the hydrated copy may carry a slightly different
         // timestamp than the optimistic bubble. Remove-and-reinsert keeps
         // the (timestamp, id) sort invariant when the timestamp shifted.
+        let mut unchanged = false;
         if let Some(pos) = self.messages.iter().position(|m| m.id == message.id) {
             let existing = self.messages.remove(pos);
             // The store never holds downloaded media bytes — hydrated rows
@@ -1025,13 +1033,13 @@ impl Chat {
             // bytes the live bubble already fetched so a reload can't
             // downgrade a full download.
             if let Some(new_media) = message.media.as_mut()
-                && let Some(old_media) = existing.media
+                && let Some(old_media) = existing.media.as_ref()
                 && !old_media.data.is_empty()
                 && (new_media.data.is_empty()
                     || (new_media.data_is_preview && !old_media.data_is_preview))
             {
-                new_media.data = old_media.data;
-                new_media.mime_type = old_media.mime_type;
+                new_media.data = Arc::clone(&old_media.data);
+                new_media.mime_type = old_media.mime_type.clone();
                 new_media.data_is_preview = old_media.data_is_preview;
             }
             // Live-only state the store doesn't carry must also survive the
@@ -1042,8 +1050,9 @@ impl Chat {
             // read bubble back to delivered.
             message.status.advance(existing.status);
             if message.sender_name.is_none() {
-                message.sender_name = existing.sender_name;
+                message.sender_name = existing.sender_name.clone();
             }
+            unchanged = existing == message;
         }
         let pos = self
             .messages
@@ -1054,6 +1063,7 @@ impl Chat {
             })
             .unwrap_or_else(|pos| pos);
         self.messages.insert(pos, message);
+        !unchanged
     }
 
     /// Mark all incoming messages as read and clear the unread badge.
@@ -1641,6 +1651,32 @@ mod tests {
         assert_eq!(chat.messages[0].content, "Message local_1000_0");
 
         assert!(!chat.rename_message("missing", "whatever"));
+    }
+
+    /// A page that repeats rows the conversation already holds is the common
+    /// case: the daemon publishes a history load on every ack and receipt,
+    /// and a conversation whose whole history fit in one page asks for that
+    /// page again each time. A caller that could not tell used to rebuild and
+    /// re-measure the entire timeline for it.
+    #[test]
+    fn a_row_that_arrives_again_unchanged_says_nothing_moved() {
+        let mut chat = Chat::new("test@s.whatsapp.net".to_string());
+        assert!(
+            chat.insert_history_message(make_message("3EB0AAA", 1000)),
+            "the first copy is news"
+        );
+        assert!(
+            !chat.insert_history_message(make_message("3EB0AAA", 1000)),
+            "the same row again is not"
+        );
+        assert_eq!(chat.messages.len(), 1);
+
+        let mut edited = make_message("3EB0AAA", 1000);
+        edited.content = "edited".to_string();
+        assert!(
+            chat.insert_history_message(edited),
+            "a row that changed is news again"
+        );
     }
 
     /// The emoji count was bounded and the reactor list under each was not,

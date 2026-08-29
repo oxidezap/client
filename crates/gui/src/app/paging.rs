@@ -188,8 +188,18 @@ impl WhatsAppApp {
             debug!("a page arrived for {}, which is gone", observe_str(&jid));
             return;
         };
+        let mut moved = false;
         for message in messages {
-            chat.insert_history_message(message);
+            moved |= chat.insert_history_message(message);
+        }
+        // A page that repeated rows this conversation already holds changed
+        // nothing to draw. The daemon publishes a history load on every ack
+        // and receipt, and a conversation whose whole history fit in one page
+        // reopens to `Unasked` and asks for that page again — so invalidating
+        // here rebuilt the rows and re-measured the timeline from scratch
+        // every time a receipt landed.
+        if !moved {
+            return;
         }
         // The rows moved, and the timeline's own measurements are keyed to
         // them: see `sync_timeline`, which is what turns this into a splice at
