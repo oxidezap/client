@@ -166,6 +166,10 @@ pub(crate) struct LocalVideo {
     drawable: Arc<AtomicBool>,
     /// The fan-out task, stopped by dropping the camera's channel.
     pump: tokio::task::JoinHandle<()>,
+    /// The peer's half of the same `Endpoints` pair, held for the same
+    /// reason: nothing else here can end it, and one that outlived the pair
+    /// publishes into whatever call the id slot names next.
+    remote_pump: tokio::task::JoinHandle<()>,
     /// Cleared by the pump *before* it reports the loss, so a caller still
     /// wiring this camera up can ask whether the device is still there.
     ///
@@ -232,6 +236,13 @@ impl LocalVideo {
         // been polled yet — so the device is closed by the owner rather than
         // by whoever happens to drop the last reference.
         self.pump.abort();
+        // The peer's pump too, and for the reason the local one is aborted:
+        // it is the other half of one `Endpoints` pair, and the only thing
+        // that ends it otherwise is the library dropping the sink. One that
+        // outlived its pair would go on publishing `VideoStream::Remote`
+        // under whatever call id the slot holds next, interleaved with the
+        // new call's own pump.
+        self.remote_pump.abort();
         let camera = self.camera;
         // On a blocking thread: closing waits for the frame the capture
         // thread is asleep in.
@@ -303,12 +314,13 @@ pub(crate) async fn open(
         drawable: Arc::clone(&drawable),
         alive: Arc::clone(&alive),
     }));
-    tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publisher));
+    let remote_pump = tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publisher));
 
     Ok((
         LocalVideo {
             camera,
             pump,
+            remote_pump,
             id: call_id,
             camera_id,
             drawable,
