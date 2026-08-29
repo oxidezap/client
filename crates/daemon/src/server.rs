@@ -314,11 +314,31 @@ fn prepare_state_dir(dir: &Path) -> Result<()> {
     // Tighten rather than reject: a directory that is ours but too permissive
     // is recoverable, and this is the common case when an earlier version
     // created it.
+    //
+    // What a `chmod` cannot do is answer for what is already inside, and this
+    // is where that half is settled — the same policy the plugin host keeps
+    // over its own directory, written down in AGENTS.md. There the file at
+    // stake is authority and is deleted; here nothing in the directory is
+    // authority, and the only thing another account could have planted is
+    // media under a key this daemon would then serve as the account's own
+    // photo. That is a cache: dropping it costs a refetch and nothing else.
     let mode = meta.permissions().mode() & 0o777;
     if mode != 0o700 {
         log::warn!("tightening {} from {mode:o} to 700", dir.display());
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("restricting {}", dir.display()))?;
+        if let Some(media) = oxidezap_ipc::media_dir()
+            && media.exists()
+        {
+            log::warn!(
+                "and clearing {}: a directory others could write is one they could \
+                 have put media in",
+                media.display()
+            );
+            if let Err(e) = std::fs::remove_dir_all(&media) {
+                log::warn!("{} could not be cleared ({e})", media.display());
+            }
+        }
     }
     Ok(())
 }

@@ -251,6 +251,18 @@ profile here repeats it deliberately.
   `<pair-device>` from the handler that runs inline, and then sit there with
   no code on screen. `net::abort_requested` is the rule stated once: a value
   sent is an abort, a sender dropped is a detachment and waits forever.
+- **A directory that was open is one whose contents are suspect.** Tightening
+  the mode closes the door behind whatever is already inside, so the question
+  after a `chmod` is what that is. Authority is deleted — the plugin host
+  removes an `approvals.json` it finds in a directory another account could
+  have written, because a `chmod` now does not make that file the user's
+  answer. A cache is cleared for the same reason and at no cost: the daemon
+  drops the media directory when it has to tighten its state directory, since
+  a file planted under a content key would be served to the window as this
+  account's own photo, and everything in there can be fetched again. And a
+  directory that cannot be made private at all is refused: `usable_state_dir`
+  runs without one rather than trusting it.
+
 - **Nothing stops the daemon but `main`.** The tray's Quit and an IPC
   `Shutdown` ask through `shutdown::request`; ending the process from a D-Bus
   callback or a connection task would skip disconnecting the session and
