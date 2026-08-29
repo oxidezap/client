@@ -361,7 +361,10 @@ mod tests {
         );
 
         assert!(!StatusSelection::None.is(""), "nothing is open");
-        assert!(!StatusSelection::Mine.is(""), "and our own is not a contact");
+        assert!(
+            !StatusSelection::Mine.is(""),
+            "and our own is not a contact"
+        );
         assert!(StatusSelection::Author("a@s.whatsapp.net".to_string()).is("a@s.whatsapp.net"));
     }
 }

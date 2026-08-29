@@ -431,7 +431,10 @@ mod tests {
 
         // And written back, or the next save would drop what was typed in.
         let written = settings.to_file();
-        assert_eq!(written.colors.get("scrim").map(String::as_str), Some("#101010"));
+        assert_eq!(
+            written.colors.get("scrim").map(String::as_str),
+            Some("#101010")
+        );
     }
 
     #[test]

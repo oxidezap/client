@@ -1822,7 +1822,6 @@ impl ReadTracker {
             .observe(message);
     }
 
-
     /// Where a read action for `jid` must stop, if the daemon knows.
     fn boundary(&self, jid: &str) -> Option<ReadBoundary> {
         self.chats.get(jid).and_then(ChatReads::boundary)

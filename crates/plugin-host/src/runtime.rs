@@ -82,9 +82,8 @@ impl Runtime {
         // exists, so the sandbox's memory bound does not cover any of it. One
         // downloaded file with an enormous section would otherwise exhaust
         // the daemon during startup and take the account down with it.
-        let too_big = |size: u64| {
-            anyhow!("it is {size} bytes, past the {MAX_MODULE_BYTES} a plugin may be")
-        };
+        let too_big =
+            |size: u64| anyhow!("it is {size} bytes, past the {MAX_MODULE_BYTES} a plugin may be");
         let size = std::fs::metadata(path)
             .with_context(|| format!("reading {}", path.display()))?
             .len();

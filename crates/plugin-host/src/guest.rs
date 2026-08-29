@@ -1036,10 +1036,7 @@ fn widget(node: &abi::ui::Node) -> PluginNode {
 ///
 /// See [`Guest::daemon_wait`]. Every command goes through here, so there is
 /// one place the subtraction can be got wrong.
-fn commanded(
-    c: &mut Caller<'_, Guest>,
-    run: impl FnOnce(&dyn Commands) -> Outcome,
-) -> i32 {
+fn commanded(c: &mut Caller<'_, Guest>, run: impl FnOnce(&dyn Commands) -> Outcome) -> i32 {
     let commands = Arc::clone(&c.data().commands);
     let started = std::time::Instant::now();
     let outcome = run(commands.as_ref());
