@@ -342,14 +342,21 @@ impl WhatsAppClient {
     /// into it, which is the partial wipe the delete-the-whole-file rule
     /// exists to prevent, arrived at from the other end.
     ///
-    /// A flush is a barrier in that queue, so awaiting one is awaiting
-    /// everything enqueued before it. Taking the handle is the other half: it
-    /// drops the sender the session held, so nothing enqueues anything after.
+    /// `ChatStore::close` is what is awaited rather than a flush, and the
+    /// difference is the whole point: a flush says the queue is caught up, and
+    /// the writer answers it and goes straight back to waiting with
+    /// `SharedSqlite` still open. A close does not come back — it answers
+    /// after the loop has broken and the handle is dropped — and an open
+    /// handle is exactly what the deletion cannot run against here, because
+    /// this store's browser VFS writes changed blocks *after* the commit and
+    /// a page still held could land behind the delete and put the file back.
+    /// Taking the handle is the other half: it drops the sender the session
+    /// held, so nothing enqueues anything after.
     async fn drain_chat_store(&self, grace: std::time::Duration) -> bool {
         let Some(store) = self.chat_store.lock().await.take() else {
             return true;
         };
-        match crate::exec::with_timeout(store.flush(), grace).await {
+        match crate::exec::with_timeout(store.close(), grace).await {
             Some(Ok(())) => true,
             // Answered, and that is what is being asked. A batch that rolled
             // back is a write that never landed and a writer that panicked is

@@ -84,6 +84,13 @@ pub(crate) enum WriterMsg {
     // String, not StoreError: one batch outcome fans out to many waiters and
     // StoreError is not Clone.
     Flush(oneshot::Sender<std::result::Result<(), String>>),
+    /// A flush that the writer does not come back from.
+    ///
+    /// Answered after the loop has broken and the database handle is dropped,
+    /// so a caller awaiting it knows the writer is gone rather than merely
+    /// caught up — which a flush cannot say, since the writer answers one and
+    /// goes straight back to waiting with the handle still open.
+    Stop(oneshot::Sender<()>),
 }
 
 /// SQLite-backed chat/message/contact history, materialized from the client's
@@ -391,6 +398,32 @@ impl ChatStore {
     /// so a failure that dropped someone else's earlier writes still reports
     /// here (conservative: a false failure is possible, a false success is
     /// not).
+    /// Commit everything enqueued before this call, then stop the writer and
+    /// let go of the database.
+    ///
+    /// [`flush`](Self::flush) is the wrong tool where the database is about to
+    /// be deleted: it says the queue is caught up, and the writer answers it
+    /// and goes straight back to waiting with `SharedSqlite` still open. This
+    /// one does not come back — the answer is sent after the loop has broken
+    /// and the handle is dropped, so a caller that awaits it knows nothing
+    /// here is holding the file any more.
+    ///
+    /// One way: the store takes no further writes afterwards.
+    ///
+    /// # Errors
+    ///
+    /// The writer is already gone, which for every caller means the same thing
+    /// as success and is reported rather than hidden because only the caller
+    /// knows whether it expected to be first.
+    pub async fn close(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(WriterMsg::Stop(tx))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?;
+        rx.await
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
     pub async fn flush(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -628,12 +661,19 @@ async fn writer_loop(
     while let Some(first) = rx.recv().await {
         let mut batch = Vec::with_capacity(8);
         let mut flushes = Vec::new();
+        let mut stopping = None;
         // A Flush is a batch BARRIER: stop draining there, so writes enqueued
         // after a caller's flush() can neither commit ahead of that call's
-        // answer nor drag the awaited writes down with a later failure.
+        // answer nor drag the awaited writes down with a later failure. A Stop
+        // is the same barrier and the last one: whatever was enqueued ahead of
+        // it is written, and nothing after it ever is.
         let mut queue_msg = |msg: WriterMsg, batch: &mut Vec<WriterMsg>| match msg {
             WriterMsg::Flush(done) => {
                 flushes.push(done);
+                true
+            }
+            WriterMsg::Stop(done) => {
+                stopping = Some(done);
                 true
             }
             other => {
@@ -685,15 +725,26 @@ async fn writer_loop(
                 }
             }
         }
-        if flushes.is_empty() {
-            continue;
+        if !flushes.is_empty() {
+            let outcome = match pending_error.take() {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
+            for done in flushes {
+                let _ = done.send(outcome.clone());
+            }
         }
-        let outcome = match pending_error.take() {
-            Some(e) => Err(e),
-            None => Ok(()),
-        };
-        for done in flushes {
-            let _ = done.send(outcome.clone());
+        if let Some(done) = stopping {
+            // The handle goes before the answer, because the answer is what a
+            // caller about to delete the database waits on and the handle is
+            // what it is waiting to be rid of. Answering first would let that
+            // deletion start against a connection this task still held open —
+            // and this store's browser VFS writes changed blocks *after* the
+            // commit, so a page it was still holding could land behind the
+            // delete and put the file back.
+            drop(db);
+            let _ = done.send(());
+            return;
         }
     }
 }
@@ -928,7 +979,8 @@ fn apply_writer_msg(
             }
             Ok(())
         }
-        WriterMsg::Flush(_) => Ok(()),
+        // Barriers, both: neither ever reaches a batch.
+        WriterMsg::Flush(_) | WriterMsg::Stop(_) => Ok(()),
     }
 }
 
