@@ -913,7 +913,11 @@ impl Chat {
         // missed call still arrives unread, which is the one that earns a
         // badge.
         if !message.is_from_me && !message.is_read {
-            self.unread_count += 1;
+            // Saturating for the reason `StateSnapshot::total_unread` gives
+            // for its own sum: a pathological count must not render as a
+            // small number, and here a raw add would panic in debug and wrap
+            // in release before it ever got there.
+            self.unread_count = self.unread_count.saturating_add(1);
         }
 
         if is_newer_or_same {
@@ -1127,6 +1131,22 @@ mod tests {
             "hi".into(),
         ));
         assert_eq!(chat.unread_count, 1, "a real arrival still counts");
+    }
+
+    /// The total this feeds saturates and says why: a pathological count must
+    /// not render as a small number. The increment did not, so it panicked in
+    /// debug and wrapped to 0 in release before the total ever saw it.
+    #[test]
+    fn an_arrival_at_the_ceiling_does_not_wrap_the_badge() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        chat.unread_count = u32::MAX;
+
+        chat.add_message(ChatMessage::new_incoming(
+            "m1".into(),
+            "a".into(),
+            "hi".into(),
+        ));
+        assert_eq!(chat.unread_count, u32::MAX);
     }
 
     /// A message to your own number has been read by the only person who could
