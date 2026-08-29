@@ -173,3 +173,77 @@ fn render_detail(
             )
         })
 }
+
+/// A refusal, which is an answer rather than an outage.
+///
+/// Everything here differs from [`render_error_view`] for the same reason:
+/// nothing is being attempted. There is no countdown, because no timer is
+/// armed; the sentence is the reason itself rather than "can't reach
+/// WhatsApp", because WhatsApp was never the problem; and there is no *Work
+/// offline*, because that reads the local history and this window is the one
+/// that could not open the database — the other tab has it. What is left is
+/// the one action that can actually change the answer, once the person has
+/// done the thing the sentence asks of them.
+pub fn render_refused_view(
+    reason: &str,
+    show_detail: bool,
+    entity: Entity<WhatsAppApp>,
+    cx: &App,
+) -> impl IntoElement {
+    let metrics = cx.product().metrics;
+    let retry_entity = entity.clone();
+    let detail = reason.to_string();
+
+    centered_view("refused-screen", metrics.space_xxl())
+        .child(
+            div()
+                .size(metrics.avatar_call())
+                .rounded_full()
+                .bg(cx.theme().secondary)
+                .border_1()
+                .border_color(cx.theme().border)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(IconName::Info)
+                        .size(metrics.icon())
+                        .text_color(cx.theme().muted_foreground),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(metrics.space_md())
+                .max_w(metrics.call_card_width_wide())
+                .text_center()
+                .child(
+                    div()
+                        .text_size(metrics.text_heading())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(cx.theme().foreground)
+                        .child("This window won't open the account"),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.text_secondary())
+                        .text_color(cx.theme().muted_foreground)
+                        // The reason itself. It is written for a person —
+                        // that is the whole reason it travels as a sentence
+                        // rather than a code — so putting a headline in front
+                        // of it would only add a claim it does not make.
+                        .child(detail.clone()),
+                ),
+        )
+        .child(
+            Button::new("retry")
+                .label("Try again")
+                .primary()
+                .on_click(move |_, _, cx| {
+                    retry_entity.update(cx, |this, cx| this.retry_connection(cx));
+                }),
+        )
+        .child(render_detail(detail, show_detail, entity, metrics, cx))
+}

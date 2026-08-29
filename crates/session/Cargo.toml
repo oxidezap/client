@@ -15,12 +15,77 @@ log = { workspace = true }
 oxidezap-audio = { workspace = true }
 oxidezap-chat-store = { workspace = true, features = ["search"] }
 oxidezap-core = { workspace = true }
-oxidezap-video = { workspace = true }
 # A 64-bit counter, through portable-atomic rather than std (see /clippy.toml).
 portable-atomic = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
 
+# The library, twice, because the two targets need different halves of it.
+#
+# Same git source and same branch as every other library crate — that rule is
+# about revisions moving together, and these do. What differs is the feature
+# set, which `workspace = true` can only add to: the defaults pull the Tokio
+# transport, the ureq client and `tokio/net`, and `tokio/net` is `mio`, which
+# says outright that it does not build for this target. So the browser build
+# takes none of them and supplies its own through the library's own plugin
+# traits.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# The camera and the encoder, which are a platform each: nokhwa is V4L2,
+# AVFoundation and Media Foundation, and OpenH264 is C. A browser has a camera
+# too, and reaches it through `getUserMedia` and `VideoEncoder` — a binding
+# rather than a build, which is why this is not a feature flag on one crate.
+oxidezap-video = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 whatsapp-rust = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+# Directly, because the library no longer re-exports it: `sqlite-storage` is
+# one of the defaults dropped above. Same crate the chat store opens, and
+# without the `bundled-sqlite` that wants a C toolchain — diesel supplies
+# SQLite itself on this target.
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+# The browser, bound from Rust: the WebSocket, `fetch` and `setTimeout` that
+# stand in for the transport, the HTTP client and the runtime the defaults
+# would have supplied.
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = "1"
+futures-channel = "0.3"
+# `or`, for racing a future against its own cancellation.
+futures-lite = "2"
+getrandom = { workspace = true }
+getrandom_02 = { workspace = true }
+js-sys = "0.3"
+# One field out of the version feed. See `net/web.rs`.
+serde_json = { workspace = true, features = ["std"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "CloseEvent",
+    "Event",
+    "Headers",
+    "MessageEvent",
+    "Request",
+    "RequestInit",
+    "Response",
+    "WebSocket",
+    "Window",
+] }
+# SQLite's own answer to "what is a file", which is the only answer a browser
+# can give: there is no path, there is a VFS. `sqlite-wasm-rs` is what diesel
+# already links against on this target — naming it here adds no second copy —
+# and `sqlite-wasm-vfs` is where the durable one lives. See `src/store/`.
+sqlite-wasm-rs = { version = "0.5", default-features = false }
+sqlite-wasm-vfs = "0.2"
+
+# The cancellation semantics `net::abort_requested` decides are the same on
+# both targets — a `oneshot` and nothing else — so the test that pins them
+# runs on the host, where `cargo test` already is. Only the test needs these
+# here; the page's build gets them from the wasm section above.
+[dev-dependencies]
+futures-channel = "0.3"
+futures-lite = "2"
 
 [lints]
 workspace = true

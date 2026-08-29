@@ -103,6 +103,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "accessory"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc86a613208ca7d144ca24f6ec49c5cdfa5c05a46f2f7ab5880ff99371f165de"
+dependencies = [
+ "macroific 3.0.1",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2082,6 +2094,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "delegate-display"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54e3a499943fd5180aeffcb708164ffb22125ceeccb05491b5297981d37d6249"
+dependencies = [
+ "impartial-ord",
+ "itoa",
+ "macroific 3.0.1",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "der-parser"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2236,7 +2262,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2499,7 +2525,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2567,6 +2593,18 @@ dependencies = [
  "bit-set 0.8.0",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "fancy_constructor"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a8211ab12c36b63c269e17873331dc1da196a3edb7a5c79015677ef972da34a"
+dependencies = [
+ "macroific 3.0.1",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -3879,7 +3917,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -4067,6 +4105,51 @@ name = "imgref"
 version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89194689a993ab15268672e99e7b0e19da2da3268ac682e8f02d29d4d1434cd7"
+
+[[package]]
+name = "impartial-ord"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc680e03d1a08bdc1c01b60e0c39723430ced63d8cabd93cee0449b6ba916a25"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
+name = "indexed_db_futures"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69ff41758cbd104e91033bb53bc449bec7eea65652960c81eddf3fc146ecea19"
+dependencies = [
+ "accessory",
+ "cfg-if 1.0.4",
+ "delegate-display",
+ "derive_more",
+ "fancy_constructor",
+ "indexed_db_futures_macros_internal",
+ "js-sys",
+ "sealed 0.6.0",
+ "smallvec",
+ "thiserror 2.0.20",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "indexed_db_futures_macros_internal"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caeba94923b68f254abef921cea7e7698bf4675fdd89d7c58bf1ed885b49a27d"
+dependencies = [
+ "macroific 2.0.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "indexmap"
@@ -4690,6 +4773,102 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
+name = "macroific"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89f276537b4b8f981bf1c13d79470980f71134b7bdcc5e6e911e910e556b0285"
+dependencies = [
+ "macroific_attr_parse 2.0.0",
+ "macroific_core 2.0.0",
+ "macroific_macro 2.0.0",
+]
+
+[[package]]
+name = "macroific"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c437abb3bf40939b00d1dff858ed2050d948bc230dee39546ed16795fcf10ec2"
+dependencies = [
+ "macroific_attr_parse 3.0.1",
+ "macroific_core 3.0.1",
+ "macroific_macro 3.0.1",
+]
+
+[[package]]
+name = "macroific_attr_parse"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad4023761b45fcd36abed8fb7ae6a80456b0a38102d55e89a57d9a594a236be9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "sealed 0.6.0",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "macroific_attr_parse"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeb7a82ec1aa16094da719be18615d79cb2574b037358e4e6c6d96eedcff3a93"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "sealed 0.7.0",
+ "syn 3.0.4",
+]
+
+[[package]]
+name = "macroific_core"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0a7594d3c14916fa55bef7e9d18c5daa9ed410dd37504251e4b75bbdeec33e3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "sealed 0.6.0",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "macroific_core"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26c8e789484d2fa216eee9d5e0565ba80ccda389bcf0e111143a7b8f4792336e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "sealed 0.7.0",
+ "syn 3.0.4",
+]
+
+[[package]]
+name = "macroific_macro"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4da6f2ed796261b0a74e2b52b42c693bb6dee1effba3a482c49592659f824b3b"
+dependencies = [
+ "macroific_attr_parse 2.0.0",
+ "macroific_core 2.0.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "macroific_macro"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e30d63cb102648965753f0d47a6ab171b1cbb1fb5c363f4784ea986782fc7b77"
+dependencies = [
+ "macroific_attr_parse 3.0.1",
+ "macroific_core 3.0.1",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5228,7 +5407,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5914,6 +6093,9 @@ dependencies = [
  "anyhow",
  "async-channel",
  "cpal",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
+ "js-sys",
  "log",
  "ogg",
  "opus",
@@ -5921,6 +6103,9 @@ dependencies = [
  "ringbuf",
  "tokio",
  "wacore",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -5932,6 +6117,8 @@ dependencies = [
  "diesel",
  "diesel_migrations",
  "flate2",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "log",
  "portable-atomic",
  "serde_json",
@@ -5940,6 +6127,7 @@ dependencies = [
  "wacore",
  "wacore-binary",
  "waproto",
+ "wasm-bindgen-futures",
  "whatsapp-rust-sqlite-storage",
 ]
 
@@ -5949,6 +6137,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "log",
  "serde",
  "serde_json",
@@ -5962,8 +6152,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "env_logger",
+ "futures-channel",
+ "futures-util",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
+ "js-sys",
  "ksni",
  "log",
  "oxidezap-core",
@@ -5973,9 +6169,14 @@ dependencies = [
  "portable-atomic",
  "rustix 1.1.4",
  "serde_json",
+ "sha1 0.11.0",
  "tokio",
+ "tokio-tungstenite",
  "wacore",
  "wacore-binary",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "windows-sys 0.61.2",
 ]
 
@@ -5986,17 +6187,21 @@ dependencies = [
  "anyhow",
  "chrono",
  "env_logger",
+ "futures-lite",
+ "getrandom 0.4.3",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
  "image",
  "indexmap",
+ "js-sys",
  "log",
  "mp4",
  "openh264",
  "oxidezap-audio",
  "oxidezap-core",
+ "oxidezap-daemon",
  "oxidezap-ipc",
  "portable-atomic",
  "qrcode",
@@ -6008,19 +6213,30 @@ dependencies = [
  "symphonia",
  "tokio",
  "wacore",
- "whatsapp-rust",
+ "wacore-binary",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
 name = "oxidezap-ipc"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
+ "futures-lite",
+ "js-sys",
  "libc",
+ "log",
  "oxidezap-core",
  "rustix 1.1.4",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "windows-sys 0.61.2",
 ]
 
@@ -6059,15 +6275,30 @@ dependencies = [
 name = "oxidezap-session"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-channel",
+ "async-trait",
+ "bytes",
+ "futures-channel",
+ "futures-lite",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
+ "js-sys",
  "log",
  "oxidezap-audio",
  "oxidezap-chat-store",
  "oxidezap-core",
  "oxidezap-video",
  "portable-atomic",
+ "serde_json",
+ "sqlite-wasm-rs",
+ "sqlite-wasm-vfs",
  "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "whatsapp-rust",
+ "whatsapp-rust-sqlite-storage",
 ]
 
 [[package]]
@@ -6643,7 +6874,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7381,7 +7612,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7595,6 +7826,28 @@ name = "seahash"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
+
+[[package]]
+name = "sealed"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f968c5ea23d555e670b449c1c5e7b2fc399fdaec1d304a17cd48e288abc107"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "sealed"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b68e2ea526d9fb32f23ca8894fb5da9e743f34c2f41701f0501dc8a25c4b343"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
 
 [[package]]
 name = "security-framework"
@@ -8041,6 +8294,22 @@ dependencies = [
  "js-sys",
  "rsqlite-vfs",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "sqlite-wasm-vfs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f7a5c9ac229421d577bb5a9bb59048838509958b218dd4e0b3c1214a87c361e"
+dependencies = [
+ "indexed_db_futures",
+ "js-sys",
+ "rsqlite-vfs",
+ "thiserror 2.0.20",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -8496,10 +8765,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8723,6 +8992,18 @@ dependencies = [
  "futures-util",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
 ]
 
 [[package]]
@@ -8983,6 +9264,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 dependencies = [
  "core_maths",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.5",
+ "sha1 0.10.7",
+ "thiserror 2.0.20",
+ "utf-8",
 ]
 
 [[package]]
@@ -9351,7 +9649,7 @@ dependencies = [
 [[package]]
 name = "wacore"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm",
@@ -9401,7 +9699,7 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "anyhow",
  "buffa",
@@ -9422,7 +9720,7 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "bytes",
  "compact_str",
@@ -9439,7 +9737,7 @@ dependencies = [
 [[package]]
 name = "wacore-derive"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9449,7 +9747,7 @@ dependencies = [
 [[package]]
 name = "wacore-libsignal"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "aes 0.9.2",
  "async-lock",
@@ -9480,7 +9778,7 @@ dependencies = [
 [[package]]
 name = "wacore-noise"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "anyhow",
  "buffa",
@@ -9523,7 +9821,7 @@ dependencies = [
 [[package]]
 name = "waproto"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "buffa",
  "buffa-build",
@@ -10035,7 +10333,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -10077,7 +10375,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-sqlite-storage"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "async-trait",
  "buffa",
@@ -10097,7 +10395,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-tokio-transport"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -10117,7 +10415,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-ureq-http-client"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#6966ddc25d4f896cfefa8fb7aa2025ca824ce37f"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#1ace865716726daec8d0f00335453fcb8de35d1b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10179,7 +10477,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

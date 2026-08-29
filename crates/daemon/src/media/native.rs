@@ -12,10 +12,13 @@
 //! bookkeeping, just files whose names say what is in them.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
+
+use super::{CACHE_EPOCH, WIPE_LOCK, Wipe, is_staged_upload};
+#[cfg(test)]
+use super::{download_key, message_key};
 
 /// How much media the cache may hold before the oldest is dropped.
 ///
@@ -32,52 +35,48 @@ const CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// quadratic in the size of the account.
 const SWEEP_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
 
-/// The key under which a message's own media is cached.
+/// Claim `key` for a delivery, if it is here.
 ///
-/// The message id is already unique and already stable across restarts, so it
-/// is the address. Prefixed to keep it from colliding with a download's key,
-/// which is addressed by content rather than by message.
+/// The same question as [`has`] on this side, and answered the same way,
+/// because the front end this cache was built for opens the file itself:
+/// there is nothing between promising it and handing it over for anything to
+/// close. The distinction is the page's, where the cache is a map somebody
+/// else is sweeping.
 ///
-/// The prefix also says *what* is under it: only full media is cached, so a
-/// hit is the real thing. It reads `f-` rather than `m-` because an earlier
-/// build wrote fallback thumbnails under the message key too, and a viewer
-/// that opened one of those showed a blur at full size. Changing the prefix
-/// orphans those files rather than trusting them; the budget sweep clears
-/// them in its own time.
-pub fn message_key(message_id: &str) -> String {
-    format!("f-{}", sanitize(message_id))
+/// A browser attached to *this* daemon is the case that does not fit, and it
+/// is worth naming rather than leaving the sentence above to imply it away:
+/// there the bytes cross as HTTP, so the promise and the read are two round
+/// trips with a gap between them. What can delete a file in that gap is a
+/// `ClearMediaCache` and not the budget sweep — the sweep drops the oldest,
+/// and a key just promised was just written — so the window is somebody
+/// pressing "clear cached media" in the same millisecond as their own
+/// download. What it costs is one refetch: the renderer draws media it does
+/// not have as an offer to download, which is what it already does for
+/// anything the daemon never cached. Closing it means giving this cache the
+/// index its first line says it does not have; see AGENTS.md.
+pub fn claim(key: &str) -> bool {
+    has(key)
 }
 
-/// The key under which a downloadable's bytes are cached.
+/// The same as [`put`], for a caller that already owns the only copy.
 ///
-/// Its SHA-256 is the encrypted file's identity, so the same media shared into
-/// two chats is downloaded once. Truncated: 128 bits is far past collision
-/// range for a cache and keeps the name short enough to read.
-pub fn download_key(file_enc_sha256: &[u8]) -> String {
-    let mut key = String::from("d-");
-    for byte in file_enc_sha256.iter().take(16) {
-        use std::fmt::Write as _;
-        let _ = write!(key, "{byte:02x}");
-    }
-    key
+/// Nothing to save here — the bytes are written to a file either way — so
+/// this simply forwards. It exists because on the page both copies live in
+/// one linear memory with a ceiling, and a large download can be a
+/// meaningful fraction of it.
+pub fn put_owned(key: &str, bytes: Vec<u8>) -> Result<String> {
+    put(key, &bytes)
 }
 
-/// Keep a key to the characters [`oxidezap_ipc::media_path`] accepts.
+/// Cache `bytes` under `key`, droppable from the moment they land.
 ///
-/// Message ids come off the network. One carrying a separator would name a
-/// file outside the cache, and the daemon writes as the user who owns the
-/// session.
-fn sanitize(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '.'
-            }
-        })
-        .take(120)
-        .collect()
+/// The same call as [`put`] here. The distinction exists for the page, whose
+/// cache is its own heap and whose sweep therefore has to know which entries
+/// are somebody's pending answer; this side writes a file, and the budget
+/// sweep runs on its own schedule against a disk that is two orders of
+/// magnitude larger.
+pub fn put_evictable(key: &str, bytes: &[u8]) -> Result<String> {
+    put(key, bytes)
 }
 
 /// Write `bytes` under `key`, unless they are already there.
@@ -216,90 +215,6 @@ pub fn cache_usage() -> (u64, u64) {
         })
 }
 
-/// How much of the directory a wipe is entitled to.
-///
-/// The directory holds two different things under one roof. `f-` and `d-` are
-/// the cache: bytes the daemon fetched, which it can always fetch again.
-/// `u-` is not — it is a payload a front end staged for a send that has not
-/// run yet, and the only copy of it. Deleting one turns an unrelated "clear
-/// cached media" into a voice note that fails with "no audio cached".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Wipe {
-    /// Cached downloads only.
-    Cache,
-    /// Everything, staged uploads included: the account is going, and so is
-    /// anything that was going to be sent under it.
-    Everything,
-}
-
-impl Wipe {
-    /// Whether a file named `name` is this wipe's to take.
-    fn takes(self, name: &str) -> bool {
-        match self {
-            Self::Everything => true,
-            Self::Cache => name.starts_with("f-") || name.starts_with("d-"),
-        }
-    }
-}
-
-/// A payload a front end staged for a send that has not run yet.
-///
-/// The one thing under this roof that is not a cache: there is no other copy,
-/// so nothing may drop it to reclaim space. Asked directly rather than through
-/// [`Wipe::Cache`], which is deliberately narrower — it names the two prefixes
-/// a "clear cached media" is entitled to, and the budget sweep has to reclaim
-/// more than that.
-fn is_staged_upload(name: &str) -> bool {
-    name.starts_with("u-")
-}
-
-/// Which cache the writers still in flight think they are writing into.
-///
-/// A download dispatched before a wipe finishes after it, and the eager cache
-/// of an inbound message can be queued across one. Neither can be cancelled,
-/// so the answer is the same as everywhere else in this codebase: bump a
-/// number and let the writer notice.
-static CACHE_EPOCH: AtomicUsize = AtomicUsize::new(0);
-
-/// Held across a wipe, and across an epoch-checked write.
-///
-/// The epoch alone is only a check-then-act: an eager writer could read a
-/// matching epoch, a wipe could then bump it and delete everything, and the
-/// writer's rename could land afterwards — repopulating a directory the user
-/// had just been told was empty. Nothing else in this module needs the lock,
-/// because nothing else claims to be ordered against a wipe.
-static WIPE_LOCK: Mutex<()> = Mutex::new(());
-
-/// What to hand back to [`put_since`] later.
-pub fn epoch() -> usize {
-    CACHE_EPOCH.load(Ordering::SeqCst)
-}
-
-/// Cache `bytes` unless the cache has been cleared since `epoch`.
-///
-/// For writes nobody is waiting on — the eager cache of an inbound message,
-/// which the front end can always fetch on demand instead. A download somebody
-/// *asked* for uses [`put`]: the file is how those bytes are delivered, not
-/// merely where they are remembered, so refusing it would fail the download
-/// rather than keep the directory tidy.
-pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
-    // Held across the check *and* the write, so a wipe cannot land between
-    // them. See `WIPE_LOCK`.
-    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if CACHE_EPOCH.load(Ordering::SeqCst) != epoch {
-        anyhow::bail!("the media cache was cleared while this was being prepared");
-    }
-    put(key, bytes)
-}
-
-/// Delete the cached files this wipe is entitled to.
-///
-/// Part of "clear data and pair again", and not optional there: the store is
-/// one file, but the media beside it is a directory that can hold half a
-/// gigabyte of the *previous* account's photos, videos and documents. Leaving
-/// it in place means pairing a different account onto a cache of someone
-/// else's pictures, with no control anywhere that clears them.
-///
 /// Best-effort per entry: one unreadable file must not abandon the rest.
 pub fn wipe(scope: Wipe) -> Result<()> {
     // For the whole wipe, so an epoch-checked write is either wholly before

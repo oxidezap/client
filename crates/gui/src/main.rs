@@ -9,6 +9,7 @@
 mod app;
 mod assets;
 mod components;
+mod platform;
 mod responsive;
 mod session;
 mod theme;
@@ -23,80 +24,70 @@ use gpui_component::Root;
 
 use crate::app::{WhatsAppApp, init_app_bindings};
 
+/// The window, on whatever this was built for.
+///
+/// On the desktop this is the process entry point. Built for wasm and run
+/// through `wasm-bindgen`, the same function becomes the module's start
+/// function — which is why the platform differences below are `cfg`s inside
+/// it rather than two entry points that would drift.
 fn main() {
-    // The renderer, the bus and the text shaper all narrate at debug level,
-    // and none of it is about this app. `cosmic_text` in particular reports
-    // every family it walks past while looking for a glyph — "failed to find
-    // family 'FreeSans'" is it working, not it failing, and one message with
-    // an unusual script produces a dozen. Turning `RUST_LOG=debug` on to look
-    // at *our* logs should not bury them. An explicit `RUST_LOG` still wins:
-    // these are floors for modules the user did not ask about.
-    let mut logger = env_logger::Builder::new();
-    // Floors first, environment second. A later directive replaces an earlier
-    // one for the same target, so parsing `RUST_LOG` before these turned
-    // `RUST_LOG=cosmic_text=debug` back into `warn` — the one request that
-    // could only have been deliberate was the one that was ignored.
-    for quiet in [
-        "blade_graphics",
-        "naga",
-        "zbus",
-        "tracing",
-        "gpui",
-        "cosmic_text",
-        "wgpu_core",
-        "wgpu_hal",
-        "font_kit",
-    ] {
-        logger.filter_module(quiet, log::LevelFilter::Warn);
-    }
-    logger.parse_env(env_logger::Env::default().default_filter_or("info"));
-    logger.init();
+    crate::platform::logging();
+    // Before anything reads it: the first read is what settles the default.
+    crate::platform::clocks();
+    open_the_window();
+}
 
-    gpui_platform::application()
-        .with_assets(assets::Assets)
-        .run(|cx: &mut App| {
-            gpui_component::init(cx);
-            // Reads ~/.config/oxidezap/theme.json over a preset. Cannot fail: a
-            // missing or malformed file resolves to the product default and
-            // reports what it could not honour in Settings.
-            theme::init(cx);
-            init_app_bindings(cx);
+fn open_the_window() {
+    let launch = |cx: &mut App| {
+        gpui_component::init(cx);
+        // Reads ~/.config/oxidezap/theme.json over a preset. Cannot fail: a
+        // missing or malformed file resolves to the product default and
+        // reports what it could not honour in Settings.
+        theme::init(cx);
+        init_app_bindings(cx);
 
-            let bounds = Bounds::centered(None, opening_size(cx), cx);
+        let bounds = Bounds::centered(None, opening_size(cx), cx);
 
-            if let Err(error) = cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(gpui::TitlebarOptions {
-                        title: Some(SharedString::from("WhatsApp")),
-                        ..Default::default()
-                    }),
+        if let Err(error) = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some(SharedString::from("WhatsApp")),
                     ..Default::default()
-                },
-                |window, cx| {
-                    let view = cx.new(WhatsAppApp::new);
-                    // The theme file is watched for the window's whole life,
-                    // not for the part of it that is pairing. Armed from the
-                    // pairing screen alone, a window that opened onto an
-                    // already-linked daemon — the ordinary case, since the
-                    // daemon outlives the window — never polled it at all,
-                    // and edits to an existing `theme.json` did nothing until
-                    // the next restart.
-                    view.update(cx, |app, cx| {
-                        app.watch_theme_file(cx);
-                        // After the window exists, so the ten seconds a cold
-                        // start can spend waiting for a daemon to come up are
-                        // spent under the loading screen rather than in front
-                        // of nothing.
-                        app.start(cx);
-                    });
-                    cx.new(|cx| Root::new(view, window, cx))
-                },
-            ) {
-                log::error!("Failed to open main window: {error}");
-                cx.quit();
-            }
-        });
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                let view = cx.new(WhatsAppApp::new);
+                // The theme file is watched for the window's whole life,
+                // not for the part of it that is pairing. Armed from the
+                // pairing screen alone, a window that opened onto an
+                // already-linked daemon — the ordinary case, since the
+                // daemon outlives the window — never polled it at all,
+                // and edits to an existing `theme.json` did nothing until
+                // the next restart.
+                view.update(cx, |app, cx| {
+                    app.watch_theme_file(cx);
+                    // After the window exists, so the ten seconds a cold
+                    // start can spend waiting for a daemon to come up are
+                    // spent under the loading screen rather than in front
+                    // of nothing.
+                    app.start(cx);
+                });
+                cx.new(|cx| Root::new(view, window, cx))
+            },
+        ) {
+            log::error!("Failed to open main window: {error}");
+            cx.quit();
+        }
+    };
+
+    let application = crate::platform::application().with_assets(assets::Assets);
+
+    // Who owns the run loop is a platform question, and it is answered
+    // beneath `platform/` like every other one: a desktop blocks here for the
+    // life of the process and a page hands the loop back to the browser.
+    crate::platform::run(application, launch);
 }
 
 /// How big the window opens.

@@ -367,9 +367,8 @@ fn render_theme_file(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let path = settings
-        .config_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "no config directory — set $XDG_CONFIG_HOME or $HOME".to_string());
+        .config_location()
+        .unwrap_or_else(|| "nowhere to keep a theme on this platform".to_string());
     let problems = settings.draft.problems.clone();
     let is_dirty = settings.is_dirty();
 

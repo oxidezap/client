@@ -120,6 +120,29 @@ use std::path::PathBuf;
 /// [`PairingCode`]: crate::PairingCode
 pub const PROTOCOL_VERSION: u32 = 19;
 
+/// Where the daemon's web bridge listens when nobody says otherwise.
+///
+/// A page cannot open a Unix socket and has no filesystem to find one in, so
+/// the bridge is a TCP port — which means it needs a number both ends agree
+/// on without being told. Not configurable *by default*: the daemon takes an
+/// address and a page takes `?daemon=`, and this is only what each falls back
+/// to.
+pub const DEFAULT_WEB_PORT: u16 = 9527;
+
+/// The path the bridge's socket answers on.
+///
+/// A path rather than the bare root, so the media route below can share the
+/// port: one origin, one thing to point a page at.
+pub const WEB_SOCKET_PATH: &str = "/ws";
+
+/// The path the bridge serves cached media under.
+///
+/// Media never travels as a frame (see [`media_path`]), which on the desktop
+/// means a file both processes can open. A page shares no filesystem with the
+/// daemon, so the same bytes are served over HTTP instead — the sideband
+/// stays a sideband, it just changes carrier.
+pub const WEB_MEDIA_PATH: &str = "/media";
+
 /// Only a Unix endpoint is a file with a name in a directory.
 #[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
@@ -264,6 +287,17 @@ fn user_suffix() -> Option<String> {
 #[cfg(not(any(unix, windows)))]
 fn user_suffix() -> Option<String> {
     None
+}
+
+/// Where the web bridge's shared secret lives.
+///
+/// In the same per-user directory as the socket, and for the same reason: a
+/// loopback TCP port is reachable by every account on the machine, while that
+/// directory is the user's own. The token is what carries the socket's
+/// per-user guarantee onto a port that has none. See `daemon/listener/web.rs`.
+#[must_use]
+pub fn web_token_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("web.token"))
 }
 
 #[cfg(test)]

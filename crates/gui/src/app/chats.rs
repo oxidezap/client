@@ -7,7 +7,7 @@ use oxidezap_core::Chat;
 use super::chat_row::ChatRow;
 use super::{WhatsAppApp, newest_shared_message};
 use log::info;
-use whatsapp_rust::wacore_binary::jid::observe_str;
+use wacore_binary::jid::observe_str;
 
 /// Which conversations the sidebar is showing.
 ///

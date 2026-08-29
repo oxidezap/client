@@ -6911,3 +6911,33 @@ async fn batched_reads_answer_what_the_single_ones_do() {
         "nothing asked for is nothing read"
     );
 }
+
+/// A close writes what was queued and then really is the end.
+///
+/// The two halves are one guarantee: a caller closes because it is about to
+/// delete the database, so it needs the queue committed *and* the writer gone.
+/// A flush only gives the first — the writer answers one and goes back to
+/// waiting with the connection still open — which is why this is a separate
+/// call rather than a flag on that one.
+#[tokio::test]
+async fn a_close_commits_what_was_queued_and_ends_the_writer() {
+    let (_store, chat_store) = test_store().await;
+
+    let info = incoming_info(PEER, PEER, "MSG-CLOSE", 1_700_000_000);
+    chat_store
+        .handler()
+        .handle_event(Arc::new(message_event(wa::Message::text("tchau"), info)));
+
+    chat_store.close().await.expect("close");
+
+    // Enqueued before the close, so it is written: a close is a barrier, not a
+    // cancellation.
+    let messages = chat_store.messages(&jid(PEER), None, 10).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text.as_deref(), Some("tchau"));
+
+    // And the writer is gone rather than idle, which is the half a flush
+    // cannot report. Both calls answer through the queue, so both say so.
+    assert!(chat_store.flush().await.is_err());
+    assert!(chat_store.close().await.is_err());
+}

@@ -1,5 +1,10 @@
 //! WhatsApp client wrapper for UI integration
 
+/// Voice calls, which are the one part of the session a page cannot run.
+mod calls;
+
+use calls::CallRegistry;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -8,18 +13,23 @@ use oxidezap_chat_store::{ChatEntry, ChatStore, StoreChange};
 use tokio::sync::{Mutex, mpsc};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
+// The same type either way; only the road to it differs. On a desktop the
+// library re-exports it, and in a browser that re-export is behind a default
+// feature the wasm build drops — so it is named at its own crate there.
+#[cfg(not(target_family = "wasm"))]
 use whatsapp_rust::store::SqliteStore;
-use whatsapp_rust::voip::{CallEvent, CallHandle, CallTermination, VideoState, VideoUpgradeToken};
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
-use whatsapp_rust::wacore::types::events::Event;
+use whatsapp_rust::wacore::types::events::{ChannelEventHandler, Event};
 use whatsapp_rust::wacore::types::presence::{
     ChatPresence as WaChatPresence, ChatPresenceMedia, ReceiptType,
 };
 use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
 use whatsapp_rust::waproto::whatsapp as wa;
+#[cfg(target_family = "wasm")]
+use whatsapp_rust_sqlite_storage::SqliteStore;
 
-use oxidezap_audio::{spawn_mic, spawn_speaker};
+use crate::exec::{Executor, Task};
 use oxidezap_core::{
     Availability, CallVideoFrame, Chat, ChatMessage, ComposingKind, DownloadableMedia,
     IncomingCall, MediaContent, MediaType, MessageStatus, SystemNotice, UiEvent, VideoStream,
@@ -28,83 +38,17 @@ use oxidezap_core::{
 
 use crate::names::NameBook;
 use crate::quoting::quoted_from;
-use crate::video::{self, CameraLost, LocalVideo, VideoPublisher, VideoSenderSlot};
+use crate::video::{self, CameraLost, VideoPublisher, VideoSenderSlot};
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
-/// Resolve a stable per-user path for the SQLite database. A CWD-relative
-/// path would silently split state between launch methods (desktop launcher
-/// vs terminal), so prefer the platform data dir and only fall back to the
-/// working directory when no home is known.
-pub fn resolve_database_path() -> String {
-    resolve_database_dir()
-        .map(|dir| dir.join(DB_FILE).to_string_lossy().into_owned())
-        .unwrap_or_else(|| DB_FILE.to_string())
-}
+use crate::store::settings as store_settings;
 
-const DB_FILE: &str = "whatsapp.db";
+/// Where the store lives on this platform. See [`crate::store`].
+pub use crate::store::{database_path as resolve_database_path, prepare as prepare_store};
 
-/// Per-user data directory, under the platform data root.
-///
-/// No fallback to the old `whatsapp-rust-desktop` name: this app has never
-/// shipped a release, so there is no installed base to migrate and carrying
-/// lookup code for one would be permanent dead weight.
-const DATA_DIR: &str = "oxidezap";
-
-/// Delete the local session: device identity, Signal state and chat history all
-/// live in the one SQLite file.
-///
-/// Called after the server ends the session, where reconnecting is pointless —
-/// the credentials are dead and pairing mints a new device. A partial wipe is
-/// not an option: chat rows are keyed by device id, so keeping them would
-/// orphan every one of them behind the new device anyway.
-pub fn wipe_local_state() -> std::io::Result<()> {
-    let Some(dir) = resolve_database_dir() else {
-        return Ok(());
-    };
-    // -wal and -shm hold committed pages SQLite would replay into a fresh file.
-    for suffix in ["", "-wal", "-shm"] {
-        let path = dir.join(format!("{DB_FILE}{suffix}"));
-        match std::fs::remove_file(&path) {
-            Ok(()) => info!("Removed {}", path.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-fn resolve_database_dir() -> Option<std::path::PathBuf> {
-    let not_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(std::path::PathBuf::from(v));
-    let data_root = if cfg!(target_os = "macos") {
-        std::env::var_os("HOME")
-            .and_then(not_empty)
-            .map(|home| home.join("Library/Application Support"))
-    } else if cfg!(target_os = "windows") {
-        std::env::var_os("LOCALAPPDATA")
-            .and_then(not_empty)
-            .or_else(|| {
-                std::env::var_os("USERPROFILE")
-                    .and_then(not_empty)
-                    .map(|profile| profile.join("AppData").join("Local"))
-            })
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .and_then(not_empty)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .and_then(not_empty)
-                    .map(|home| home.join(".local/share"))
-            })
-    };
-
-    let dir = data_root.map(|root| root.join(DATA_DIR))?;
-    // SQLite won't create missing parent directories itself.
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!("Failed to create data dir: {e}; using CWD-relative {DB_FILE}");
-        return None;
-    }
-    Some(dir)
-}
+/// Delete the local session: device identity, Signal state and chat history
+/// all live in the one SQLite file.
+pub use crate::store::wipe as wipe_local_state;
 
 /// User-facing copy for a server-ended session. The server sometimes supplies
 /// its own text (account locks do); prefer it, and otherwise say plainly which
@@ -275,197 +219,16 @@ fn parse_chat_cursor(token: &str) -> Option<oxidezap_chat_store::ChatCursor> {
 
 pub type ReadBoundary = (i64, Vec<(String, bool, Option<String>)>);
 
-type CallAudio = (
-    async_channel::Receiver<Vec<i16>>,
-    async_channel::Sender<Vec<i16>>,
-);
-
-async fn open_call_audio() -> Result<CallAudio, String> {
-    tokio::task::spawn_blocking(|| {
-        let mic = spawn_mic().map_err(|e| e.to_string())?;
-        let speaker = spawn_speaker().map_err(|e| e.to_string())?;
-        Ok((mic, speaker))
-    })
-    .await
-    .map_err(|e| format!("audio setup task failed: {e}"))?
-}
-
-/// Whether an offer asked for video.
-///
-/// Read off the offer rather than trusted from the front end: what the card
-/// was drawn as and what the caller actually offered are two different
-/// claims, and only one of them decides whether a video answer is even legal
-/// (the library refuses `.video()` on an audio offer).
-fn offered_video(offer: &WaIncomingCall) -> bool {
-    matches!(&offer.action, CallAction::Offer { is_video, .. } if *is_video)
-}
-
 fn participant_keyed_chat(jid: &Jid) -> bool {
     jid.is_group() || jid.is_broadcast_list() || jid.is_status_broadcast()
-}
-
-/// Clears an accept from `accepting` however its task ends.
-///
-/// A guard rather than a line at each exit: the accept path returns from a
-/// dozen places — a device that would not open, a refusal, a hangup — and the
-/// set is the only thing that tells an ending call there is somebody to leave
-/// a note for. One missed exit leaves a note nobody will ever read, for a
-/// call that will never come back.
-struct AcceptGuard {
-    calls: CallRegistry,
-    call_id: String,
-}
-
-impl Drop for AcceptGuard {
-    fn drop(&mut self) {
-        let calls = self.calls.clone();
-        let call_id = std::mem::take(&mut self.call_id);
-        tokio::spawn(async move {
-            calls.accepting.lock().await.remove(&call_id);
-            // Along with any note left for it: the accept is over, and a
-            // marker outliving it would cancel nothing but grow the set.
-            calls.cancelled.lock().await.remove(&call_id);
-        });
-    }
-}
-
-/// What became of a camera handed to [`WhatsAppClient::hold_camera`].
-///
-/// Three answers rather than a `bool`, because only one of them leaves the
-/// peer holding a pane open: a call that ended is one nobody is announcing
-/// anything to, and a device that died on a live call is a direction the far
-/// side still believes in.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Camera {
-    Held,
-    CallEnded,
-    Died,
-}
-
-/// Live call state shared between the event pump and the UI action methods.
-#[derive(Clone, Default)]
-pub struct CallRegistry {
-    /// Ringing offers by call id, consumed by accept/decline.
-    pending: Arc<Mutex<HashMap<String, Arc<WaIncomingCall>>>>,
-    /// Media-live calls by call id.
-    active: Arc<Mutex<HashMap<String, Arc<CallHandle>>>>,
-    /// Ids cancelled before any handle existed, by whichever side ended it:
-    /// the UI's placeholder while `start_call` is still connecting, and a
-    /// call ended remotely while an accept is still opening a device. The
-    /// paths that produce a handle consume this as they register one.
-    cancelled: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// Accepts that have taken an offer and have no handle yet.
-    ///
-    /// Answering opens a camera, and the first time it opens a permission
-    /// prompt: seconds in which the caller can hang up, another device can
-    /// take the call, or the server can end it. Those arrive as events that
-    /// look for something to remove and find nothing — the offer has left
-    /// `pending` and no handle is in `active` — so this is what tells them
-    /// there is somebody to leave a note for.
-    accepting: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// One mute lane per live call. Pruned against `active` where it grows,
-    /// so a call that ends takes its lane with it without every teardown
-    /// path having to remember.
-    mute: Arc<std::sync::Mutex<HashMap<String, Arc<MuteLane>>>>,
-    /// The camera feeding each call whose local direction is on. Absent is
-    /// the whole of "our video is off": there is no second flag to disagree
-    /// with, and removing the entry is what closes the device.
-    cameras: Arc<Mutex<HashMap<String, LocalVideo>>>,
-    /// One camera lane per live call, swept where it grows, like the mute
-    /// lanes above.
-    video: Arc<std::sync::Mutex<HashMap<String, Arc<VideoLane>>>>,
-    /// A peer's outstanding request to turn a call into a video one.
-    ///
-    /// Kept here rather than handed to the front end because the token is
-    /// what binds an answer to *that* request, and only this process can use
-    /// it. Turning the camera on while one is parked answers it; turning it
-    /// on with none parked asks a question of our own.
-    upgrades: Arc<Mutex<HashMap<String, VideoUpgradeToken>>>,
-    /// Calls with an upgrade of *ours* still waiting on an answer.
-    ///
-    /// Presence, not identity, and that is the whole of it: the library does
-    /// not match a refusal to the request it refuses. Its handler tears the
-    /// local plane down whenever *some* request of ours is outstanding —
-    /// whichever camera is attached by then — and ignores the stanza
-    /// entirely when none is. So the question this has to answer is "did the
-    /// library just release our endpoints", and this flag is exactly that.
-    /// Keying on the camera the request went out with would leave a camera
-    /// registered and drawn after its media plane was already gone, which is
-    /// the same lie in the other direction.
-    upgrading: Arc<Mutex<std::collections::HashSet<String>>>,
-}
-
-/// What keeps a call's mute requests in the order the daemon took them.
-///
-/// Spawning is not sequencing: two requests spawned in order can start in
-/// either one, and the last to reach the wire wins. That is how a rapid
-/// unmute-then-mute could leave the microphone open under a state — and every
-/// window — showing it muted, with both tasks finding the device in the state
-/// they themselves had asked for and so correcting nothing.
-#[derive(Default)]
-struct MuteLane {
-    /// The newest request, stamped on the caller's thread *before* its task
-    /// exists. That is the only place the order still exists.
-    ///
-    /// A `std` lock on purpose: it is taken from a synchronous method and
-    /// never held across an await.
-    intent: std::sync::Mutex<MuteIntent>,
-    /// One announcement in flight per call. The library serializes its own
-    /// transitions, but it serializes them in arrival order, which is the
-    /// order this exists to stop trusting.
-    lane: Mutex<()>,
-}
-
-impl CallRegistry {
-    /// Note that a call ended for an accept that has not registered a handle
-    /// yet, so it stops instead of answering a call nobody is on.
-    ///
-    /// Only for an accept actually in flight: the marker is consumed by the
-    /// registration, and one left for a call nobody is answering is an entry
-    /// nothing ever removes.
-    async fn abandon(&self, call_id: &str) {
-        if self.accepting.lock().await.contains(call_id) {
-            self.cancelled.lock().await.insert(call_id.to_string());
-        }
-    }
-}
-
-/// What keeps a call's camera requests in the order the daemon took them.
-///
-/// The same problem the mute lane exists for, and worse: opening a camera is
-/// device work — tens of milliseconds, and the first time a permission
-/// prompt — so two requests spawned in order routinely *start* in the other.
-/// Without a stamp taken before the spawn, an "off" that overtook an "on"
-/// would leave the device open under a state saying it was closed, and a
-/// second window's request could open a camera the first had just released.
-#[derive(Default)]
-struct VideoLane {
-    /// The newest request, stamped on the caller's thread before its task
-    /// exists. That is the only place the order still exists.
-    intent: std::sync::Mutex<VideoIntent>,
-    /// One camera transition in flight per call: the device itself is the
-    /// resource being serialized, and two opens of it race in the driver.
-    lane: Mutex<()>,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct VideoIntent {
-    seq: u64,
-    on: bool,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct MuteIntent {
-    /// Bumped per request, so a task can ask whether it is still the newest.
-    seq: u64,
-    muted: bool,
 }
 
 /// WhatsApp client wrapper that manages the connection and provides
 /// a clean interface for UI operations.
 pub struct WhatsAppClient {
-    /// Tokio runtime for async operations
-    runtime: Arc<tokio::runtime::Runtime>,
+    /// Where the session's work runs: a runtime on a thread of its own on a
+    /// desktop, the page's event loop in a browser. See [`crate::exec`].
+    exec: Executor,
     /// Shared client reference
     client_handle: ClientHandle,
     /// Shared UI event sender for sending events from operations like start_call
@@ -492,8 +255,8 @@ pub struct WhatsAppClient {
     /// the way the load that produced the chat list did.
     names: NameBookHandle,
     /// Tears down `run_client` on retry: without it the replaced client's
-    /// thread would keep its runtime and SQLite pool alive forever (bot.run()
-    /// reconnects internally and never returns on its own).
+    /// loop would keep the executor and the SQLite pool alive forever
+    /// (bot.run() reconnects internally and never returns on its own).
     shutdown: Arc<tokio::sync::Notify>,
     /// Asks the history reloader for a full pass.
     ///
@@ -502,30 +265,18 @@ pub struct WhatsAppClient {
     /// no chats and nothing has changed, so nothing would arrive until the
     /// next message did.
     reload: Arc<tokio::sync::Notify>,
-    /// The session thread, kept joinable.
-    ///
-    /// `shutdown()` only asks it to stop; the thread still has to disconnect
-    /// and close SQLite. Without a handle to wait on, a process that exits
-    /// right after asking can die mid-teardown, because Rust does not wait for
-    /// threads when `main` returns.
-    worker: Option<std::thread::JoinHandle<()>>,
     /// Whether the client has been started
     started: bool,
 }
 
 impl WhatsAppClient {
-    /// Create a new WhatsApp client wrapper. Errors when the tokio runtime
-    /// can't be built (resource exhaustion) so a retry can route to the
-    /// error screen instead of panicking the UI thread.
+    /// Create a new WhatsApp client wrapper. Errors when the executor cannot
+    /// be built — a desktop builds a runtime, which resource exhaustion can
+    /// refuse — so a retry can route to the error screen instead of panicking
+    /// the thread that asked.
     pub fn new() -> std::io::Result<Self> {
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?,
-        );
-
         Ok(Self {
-            runtime,
+            exec: Executor::new()?,
             client_handle: Arc::new(Mutex::new(None)),
             ui_sender: Arc::new(Mutex::new(None)),
             calls: CallRegistry::default(),
@@ -537,47 +288,90 @@ impl WhatsAppClient {
             names: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             reload: Arc::new(tokio::sync::Notify::new()),
-            worker: None,
             started: false,
         })
     }
 
-    /// Stop the background run loop so its thread exits and the runtime and
-    /// SQLite handles drop. Idempotent; a signal fired before the loop is up
-    /// still lands (notify_one stores a permit).
+    /// Stop the background run loop, so the executor and the SQLite handles
+    /// drop with it. Idempotent; a signal fired before the loop is up still
+    /// lands (notify_one stores a permit).
     pub fn shutdown(&self) {
         self.shutdown.notify_one();
     }
 
-    /// Ask the session to stop and wait for it to finish closing.
+    /// Ask the session to stop, wait for it to finish closing, and let it go.
     ///
     /// The wait is what separates this from [`shutdown`](Self::shutdown): the
-    /// thread still has to disconnect the socket and close SQLite, and a
-    /// caller that exits without waiting can cut that short. Bounded, so a
-    /// wedged session delays exit rather than preventing it.
+    /// session still has to disconnect the socket and close SQLite, and a
+    /// caller that walks away without waiting can cut that short. Bounded, so
+    /// a wedged session delays a teardown rather than preventing it.
     ///
-    /// Returns whether the thread finished within `timeout`.
-    pub fn shutdown_and_join(&mut self, timeout: std::time::Duration) -> bool {
+    /// Takes the client, because letting go of it is part of the answer and
+    /// is itself a platform question: on a desktop the executor owns a Tokio
+    /// runtime, and tokio refuses to drop one inside an async context. That
+    /// drop happens where the wait does, which on a desktop is a blocking
+    /// thread and on a page is here.
+    ///
+    /// Returns whether it finished within `grace`. On the ordinary path that
+    /// is only worth logging; on the "clear data and pair again" path it
+    /// decides whether anything may be deleted at all.
+    pub async fn close(mut self, grace: std::time::Duration) -> bool {
         self.shutdown();
-        let Some(handle) = self.worker.take() else {
-            return true;
-        };
-
-        // `JoinHandle` has no timed join, so wait on a channel the joining
-        // thread signals instead: the session still gets to finish, and a
-        // stuck one cannot hold the process open forever.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = handle.join();
-            let _ = tx.send(());
-        });
-        rx.recv_timeout(timeout).is_ok()
+        let finished = self.exec.join(grace).await;
+        if !finished {
+            warn!("session did not finish closing within {grace:?}");
+        }
+        let drained = self.drain_chat_store(grace).await;
+        crate::exec::let_go(self).await;
+        finished && drained
     }
 
-    /// Get the runtime handle for UI async operations
-    #[allow(dead_code)]
-    pub fn runtime(&self) -> Arc<tokio::runtime::Runtime> {
-        self.runtime.clone()
+    /// Commit whatever the chat store's writer is still holding.
+    ///
+    /// It is the one task the executor does not own. `ChatStore` spawns its
+    /// writer itself — that queue is the store's own ordering guarantee, not
+    /// the session's — so [`join`](crate::exec::Executor::join) above says
+    /// nothing about it.
+    ///
+    /// On a desktop that is invisible, because letting go of the client drops
+    /// the runtime the task was spawned on and the task goes with it. A page
+    /// has no runtime to drop: the writer lives on the browser's event loop
+    /// and outlives this call. And what follows this call on the one path
+    /// that matters is deleting the database — so an account reset could
+    /// unlink the store while the old account's writer was still draining
+    /// into it, which is the partial wipe the delete-the-whole-file rule
+    /// exists to prevent, arrived at from the other end.
+    ///
+    /// `ChatStore::close` is what is awaited rather than a flush, and the
+    /// difference is the whole point: a flush says the queue is caught up, and
+    /// the writer answers it and goes straight back to waiting with
+    /// `SharedSqlite` still open. A close does not come back — it answers
+    /// after the loop has broken and the handle is dropped — and an open
+    /// handle is exactly what the deletion cannot run against here, because
+    /// this store's browser VFS writes changed blocks *after* the commit and
+    /// a page still held could land behind the delete and put the file back.
+    /// Taking the handle is the other half: it drops the sender the session
+    /// held, so nothing enqueues anything after.
+    async fn drain_chat_store(&self, grace: std::time::Duration) -> bool {
+        let Some(store) = self.chat_store.lock().await.take() else {
+            return true;
+        };
+        match crate::exec::with_timeout(store.close(), grace).await {
+            Some(Ok(())) => true,
+            // Answered, and that is what is being asked. A batch that rolled
+            // back is a write that never landed and a writer that panicked is
+            // one that will never write again; neither is a hand still on the
+            // database, so neither is a reason to refuse the wipe and leave
+            // the person unable to pair again.
+            Some(Err(e)) => {
+                warn!("the chat store did not close cleanly: {e}");
+                true
+            }
+            None => {
+                warn!("the chat store was still writing after {grace:?}");
+                false
+            }
+        }
     }
 
     /// Get the client handle for sending messages
@@ -604,6 +398,11 @@ impl WhatsAppClient {
         rx
     }
 
+    /// Where a camera's finished frames go.
+    ///
+    /// Unused where there is no camera: the callers are the call methods, and
+    /// a page's are refusals. The same is true of [`Self::camera_lost`] below.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     fn video_publisher(&self) -> VideoPublisher {
         VideoPublisher {
             sender: Arc::clone(&self.video_tx),
@@ -631,14 +430,18 @@ impl WhatsAppClient {
     /// Built per call rather than held, because it is a closure over the two
     /// things the teardown needs and a runtime to run it on — and because the
     /// only caller is the one opening a device.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     fn camera_lost(&self) -> CameraLost {
         let calls = self.calls.clone();
         let ui_sender = self.ui_sender.clone();
-        let runtime = self.runtime.clone();
+        // A spawner rather than the executor: this is reported from whichever
+        // thread noticed the device go, which is not one the executor knows
+        // about, so there is no ambient one to find.
+        let spawner = self.exec.spawner();
         Arc::new(move |call_id: String, camera_id| {
             let calls = calls.clone();
             let ui_sender = ui_sender.clone();
-            runtime.spawn(async move {
+            spawner.spawn(async move {
                 // The device is already gone; what is left is to stop
                 // claiming otherwise — and to name the camera that died,
                 // because this runs on a spawned task and a user who turned
@@ -664,39 +467,31 @@ impl WhatsAppClient {
         let calls = self.calls.clone();
         let chat_store = self.chat_store.clone();
         let names = self.names.clone();
-        let runtime = self.runtime.clone();
         let shutdown = self.shutdown.clone();
         let reload = self.reload.clone();
 
-        let spawned = std::thread::Builder::new()
-            .name("oxidezap-session".to_string())
-            .spawn(move || {
-                runtime.block_on(async move {
-                    {
-                        let mut guard = ui_sender.lock().await;
-                        *guard = Some(ui_tx.clone());
-                    }
-                    Self::run_client(
-                        ui_tx,
-                        Shared {
-                            client_handle,
-                            calls,
-                            chat_store_handle: chat_store,
-                            names_handle: names,
-                            ui_sender: ui_sender.clone(),
-                            shutdown,
-                            reload,
-                        },
-                    )
-                    .await;
-                });
-            });
-        match spawned {
-            Ok(handle) => self.worker = Some(handle),
-            Err(_) => {
-                self.started = false;
-                return Err("failed to spawn WhatsApp client thread");
+        let started = self.exec.start("oxidezap-session", async move {
+            {
+                let mut guard = ui_sender.lock().await;
+                *guard = Some(ui_tx.clone());
             }
+            Self::run_client(
+                ui_tx,
+                Shared {
+                    client_handle,
+                    calls,
+                    chat_store_handle: chat_store,
+                    names_handle: names,
+                    ui_sender: ui_sender.clone(),
+                    shutdown,
+                    reload,
+                },
+            )
+            .await;
+        });
+        if started.is_err() {
+            self.started = false;
+            return Err("failed to start the WhatsApp session");
         }
 
         Ok(ui_rx)
@@ -713,9 +508,19 @@ impl WhatsAppClient {
             shutdown,
             reload,
         } = shared;
+        // Whatever this platform has to do before a database can be opened
+        // at all. Here rather than at the caller, because forgetting it is
+        // not a failure anybody would see: a browser without its VFS opens a
+        // database in memory quite happily and loses the account when the tab
+        // closes.
+        if let Err(e) = crate::store::prepare().await {
+            error!("Failed to prepare the store: {e}");
+            let _ = ui_tx.send(UiEvent::Error(format!("Database error: {e}")));
+            return;
+        }
         // Device store + durable chat history share one SQLite file (one pool,
         // one WAL writer).
-        let db_path = match tokio::task::spawn_blocking(resolve_database_path).await {
+        let db_path = match crate::exec::unblock(resolve_database_path).await {
             Ok(path) => path,
             Err(e) => {
                 error!("Failed to resolve database path: {e}");
@@ -724,10 +529,15 @@ impl WhatsAppClient {
             }
         };
         info!("Opening data database");
-        let backend = match SqliteStore::new(&db_path).await {
+        let backend = match SqliteStore::with_config(&db_path, store_settings()).await {
             Ok(store) => store,
             Err(e) => {
-                error!("Failed to create SQLite backend: {}", e);
+                // With the chain, not just the head. `StoreError`'s own
+                // Display is a category ("database connection error") and
+                // what went wrong is always in its source — which on a page
+                // is the only thing there is to go on, since there is no
+                // database file anybody can open afterwards and look at.
+                error!("Failed to create SQLite backend: {}", because(&e));
                 let _ = ui_tx.send(UiEvent::Error(format!("Database error: {}", e)));
                 return;
             }
@@ -735,7 +545,7 @@ impl WhatsAppClient {
         let chat_store = match ChatStore::new(&backend).await {
             Ok(store) => store,
             Err(e) => {
-                error!("Failed to open chat store: {}", e);
+                error!("Failed to open chat store: {}", because(&e));
                 let _ = ui_tx.send(UiEvent::Error(format!("Database error: {}", e)));
                 return;
             }
@@ -757,27 +567,22 @@ impl WhatsAppClient {
             *guard = Some(names.clone());
         }
 
-        let ui_tx_clone = ui_tx.clone();
-        let calls_clone = calls.clone();
-        let ui_sender_clone = ui_sender.clone();
-        let names_clone = names.clone();
-
-        // Transport, HTTP client and runtime come from the default cargo
-        // features (Tokio WebSocket, ureq, Tokio).
-        let bot = match Bot::builder()
-            .with_backend(backend)
-            .on_event(move |event, client| {
-                let ui_tx = ui_tx_clone.clone();
-                let calls = calls_clone.clone();
-                let ui_sender = ui_sender_clone.clone();
-                let names = names_clone.clone();
-                async move {
-                    Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
-                }
-            })
-            .build()
-            .await
-        {
+        // Transport, HTTP client and runtime come from whichever platform
+        // this is: the library's default features on a desktop, `web-sys`
+        // bindings in a page. See `crate::net`.
+        //
+        // The version is not among them, and used to be: `sw.js` is
+        // unreachable from a page — no `Access-Control-Allow-Origin`, and its
+        // `Sec-Fetch-Site` gate is a header a browser will not let anyone set
+        // — so this side fetched the number from a CDN feed and announced it
+        // with `with_version`. The library resolves it per target now, off
+        // the Facebook JS SDK bundle where Meta publishes the same `www`
+        // revision cross-origin, so the answer belongs there again. Ours was
+        // worse than redundant: `with_version` is an override, and an
+        // override makes the library skip its own resolution *and* the
+        // day-long cache stamp behind it.
+        let builder = crate::net::with_platform_plugins(Bot::builder()).with_backend(backend);
+        let bot = match builder.build().await {
             Ok(bot) => bot,
             Err(e) => {
                 error!("Failed to build bot: {}", e);
@@ -807,6 +612,80 @@ impl WhatsAppClient {
             .subscribe_handler(chat_store.handler())
             .detach();
 
+        // And so does the UI, through the same door rather than the builder's
+        // `on_event`. The closure registrars want a `Send` future, which is a
+        // bound a page cannot meet: the `Arc<Client>` a handler is handed is
+        // not `Send` there, because the transport it holds is a
+        // `web_sys::WebSocket`. `EventHandler` is the surface the library
+        // already relaxed for this, and the chat store above was using it
+        // before we were.
+        //
+        // Nothing is missed by subscribing after the build: `bot.run()` is
+        // what connects, and this is the same window the store's own
+        // subscription sits in. The channel is unbounded and delivery is a
+        // `try_send`, so a slow reader cannot back up the dispatch path — and
+        // one task per event keeps the concurrent delivery the builder was
+        // giving us, rather than quietly turning the event stream serial.
+        let (events, incoming) = ChannelEventHandler::new();
+        // What tells this session's own tasks that it is over.
+        //
+        // A desktop session ends by dropping the runtime it was built on,
+        // which takes every task on it. A page has no such runtime: a
+        // `spawn_local` task is never cancelled by anything, so one that holds
+        // an `Arc<ChatStore>` or a client handle keeps them alive for the life
+        // of the tab — and "clear data and pair again" then deletes the
+        // database out from under a connection somebody still has open.
+        //
+        // Both long-lived children below watch this. A `watch` rather than a
+        // `Notify` because dropping the sender is itself the signal: whichever
+        // way `run_client` returns, including a panic on the way out, the
+        // children wake and stop. There is no notification for a task to have
+        // been too late to register for.
+        // Named, not `_`: a `_` binding drops at once, which would end the
+        // session before it began. This one is never sent on and never read —
+        // holding it until `run_client` returns is the whole of its job.
+        let (_session_over, stopping) = tokio::sync::watch::channel(());
+
+        bot.client().subscribe_handler(events).detach();
+        {
+            let client = bot.client();
+            let ui_tx = ui_tx.clone();
+            let calls = calls.clone();
+            let ui_sender = ui_sender.clone();
+            let names = names.clone();
+            let mut stopping = stopping.clone();
+            crate::exec::spawn_owned(async move {
+                loop {
+                    let event = tokio::select! {
+                        event = incoming.recv() => match event {
+                            Ok(event) => event,
+                            Err(_) => break,
+                        },
+                        // The session has gone. Anything still queued belongs
+                        // to an account this task no longer speaks for.
+                        _ = stopping.changed() => break,
+                    };
+                    // The kind, and only the kind. It is `Copy`, carries no
+                    // payload and names the variant, which makes this the one
+                    // account of the event stream that can be pasted into an
+                    // issue: a `Debug` of the event itself would be somebody's
+                    // messages. Worth having at all because a session that
+                    // goes quiet is otherwise indistinguishable from one with
+                    // nothing to say — the arms below speak only for the
+                    // variants they handle.
+                    debug!("client event: {:?}", event.kind());
+                    let client = client.clone();
+                    let ui_tx = ui_tx.clone();
+                    let calls = calls.clone();
+                    let ui_sender = ui_sender.clone();
+                    let names = names.clone();
+                    crate::exec::spawn_owned(async move {
+                        Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
+                    });
+                }
+            });
+        }
+
         // Re-hydrate the UI off the store's invalidation stream instead of raw
         // client events: changes are emitted only after commit, so a reload can
         // never observe pre-commit state (no flush barrier, no dispatch-order
@@ -819,6 +698,7 @@ impl WhatsAppClient {
             &ui_tx,
             reload,
             names,
+            stopping,
         );
 
         // Store client reference for UI to use
@@ -835,7 +715,12 @@ impl WhatsAppClient {
         // to exit (letting block_on return drops the runtime + SQLite pool).
         let client = bot.client();
         tokio::select! {
-            _ = bot.run() => {}
+            // Said out loud, because this is a session ending. `run`
+            // reconnects internally, so it returns only when there is nothing
+            // left to try — and returning quietly left a window sitting on
+            // "Connecting to WhatsApp" with a console that had stopped saying
+            // anything at all, which reads as a hang rather than as a stop.
+            () = bot.run() => info!("the WhatsApp session ended"),
             _ = shutdown.notified() => {
                 // Graceful stop: flushes state and closes the transport. The
                 // dropped run future is not awaited out instead, because a
@@ -904,11 +789,7 @@ impl WhatsAppClient {
                     }
                     info!("Incoming call from {}", call.from.observe());
                     let offer = Arc::new(call.clone());
-                    calls
-                        .pending
-                        .lock()
-                        .await
-                        .insert(call_id.clone(), offer.clone());
+                    calls.offer(call_id.clone(), offer.clone());
                     let caller_jid = normalize_chat_jid(&client, &call.from.to_string()).await;
                     let caller_name = call
                         .notify
@@ -934,15 +815,13 @@ impl WhatsAppClient {
                     // and a ringing call has no live state for a camera to be
                     // recorded against. This is the first moment it does —
                     // after the acceptance above, which is what creates it.
-                    if let Some(local) = calls.cameras.lock().await.get(call_id) {
-                        // The call has somewhere to be drawn, and needs a
-                        // point to start decoding from. Until this moment it
-                        // was ringing: no window had a live call to put
-                        // either direction in, so nothing was published and
-                        // the next unit alone references frames no decoder
-                        // starting now has ever seen.
-                        local.drawable();
-                        local.request_keyframe();
+                    // The call has somewhere to be drawn, and needs a point
+                    // to start decoding from. Until this moment it was
+                    // ringing: no window had a live call to put either
+                    // direction in, so nothing was published and the next
+                    // unit alone references frames no decoder starting now
+                    // has ever seen.
+                    if calls.camera_became_drawable(call_id) {
                         let _ = ui_tx.send(UiEvent::CallVideoChanged {
                             call_id: call_id.clone(),
                             stream: VideoStream::Local,
@@ -952,22 +831,12 @@ impl WhatsAppClient {
                 }
                 CallAction::Reject { call_id, .. } => {
                     info!("Call {} rejected by peer", call_id);
-                    calls.pending.lock().await.remove(call_id);
-                    calls.abandon(call_id).await;
+                    calls.ended_remotely(call_id);
                     let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                 }
                 CallAction::Terminate { call_id, .. } => {
                     info!("Call {} terminated by peer", call_id);
-                    calls.pending.lock().await.remove(call_id);
-                    calls.abandon(call_id).await;
-                    if let Some(handle) = calls.active.lock().await.remove(call_id) {
-                        // `hangup_local`, not `terminate`: the peer is the
-                        // side that ended this, and answering their
-                        // `<terminate>` with one of our own says nothing they
-                        // do not already know. Only the local media task and
-                        // the registry entry are left to drop.
-                        tokio::spawn(async move { handle.hangup_local().await });
-                    }
+                    calls.ended_remotely(call_id);
                     let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                 }
                 _ => {}
@@ -978,14 +847,12 @@ impl WhatsAppClient {
                     missed.call_id,
                     missed.from.observe()
                 );
-                calls.pending.lock().await.remove(&missed.call_id);
-                calls.abandon(&missed.call_id).await;
+                calls.ended_remotely(&missed.call_id);
                 let _ = ui_tx.send(UiEvent::CallEnded(missed.call_id.clone()));
             }
             Event::CallEndedElsewhere(ended) => {
                 info!("Call {} handled on another device", ended.call_id);
-                calls.pending.lock().await.remove(&ended.call_id);
-                calls.abandon(&ended.call_id).await;
+                calls.ended_remotely(&ended.call_id);
                 let _ = ui_tx.send(UiEvent::CallEndedElsewhere(ended.call_id.clone()));
             }
             Event::Messages(batch) => {
@@ -1573,15 +1440,14 @@ impl WhatsAppClient {
         content: &str,
         local_id: String,
         quoted: Option<oxidezap_core::QuotedMessage>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Task<()> {
         let client_handle = self.client_handle.clone();
         let chat_store = self.chat_store.clone();
         let ui_sender = self.ui_sender.clone();
         let jid_str = jid_str.to_string();
         let content = content.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let jid: Jid = match jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -1663,9 +1529,8 @@ impl WhatsAppClient {
     ) -> tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let client_handle = self.client_handle.clone();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             // Clone the Arc and release the mutex: a slow network call
             // here must not queue every other client action behind it.
             let client = client_handle.lock().await.clone();
@@ -1703,14 +1568,13 @@ impl WhatsAppClient {
         waveform: Vec<u8>,
         local_id: String,
         quoted: Option<oxidezap_core::QuotedMessage>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Task<()> {
         let chat_store = self.chat_store.clone();
         let ui_sender = self.ui_sender.clone();
         let client_handle = self.client_handle.clone();
         let jid_str = jid_str.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let jid: Jid = match jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -1813,9 +1677,8 @@ impl WhatsAppClient {
     pub fn send_composing(&self, jid_str: &str) {
         let client_handle = self.client_handle.clone();
         let jid_str = jid_str.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let jid: Jid = match jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -1837,9 +1700,8 @@ impl WhatsAppClient {
     pub fn send_paused(&self, jid_str: &str) {
         let client_handle = self.client_handle.clone();
         let jid_str = jid_str.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let jid: Jid = match jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -1869,12 +1731,11 @@ impl WhatsAppClient {
         &self,
         chat_jid_str: &str,
         messages: Vec<(String, String)>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Task<()> {
         let client_handle = self.client_handle.clone();
         let chat_jid_str = chat_jid_str.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             // Inside the task, not before it: the caller gets a handle it can
             // await either way, rather than having to special-case nothing to
             // do.
@@ -1948,11 +1809,11 @@ impl WhatsAppClient {
         jid: String,
         before: Option<String>,
         limit: i64,
-    ) -> tokio::task::JoinHandle<Result<Page<ChatMessage>, String>> {
+    ) -> Task<Result<Page<ChatMessage>, String>> {
         let chat_store = self.chat_store.clone();
         let client_handle = self.client_handle.clone();
         let names = self.names.clone();
-        self.runtime.spawn(async move {
+        self.exec.spawn(async move {
             let Some(store) = chat_store.lock().await.clone() else {
                 return Err("no chat store yet".to_string());
             };
@@ -2007,11 +1868,11 @@ impl WhatsAppClient {
         &self,
         after: Option<String>,
         limit: i64,
-    ) -> tokio::task::JoinHandle<Result<Page<oxidezap_core::Chat>, String>> {
+    ) -> Task<Result<Page<oxidezap_core::Chat>, String>> {
         let chat_store = self.chat_store.clone();
         let client_handle = self.client_handle.clone();
         let names = self.names.clone();
-        self.runtime.spawn(async move {
+        self.exec.spawn(async move {
             let Some(store) = chat_store.lock().await.clone() else {
                 return Err("no chat store yet".to_string());
             };
@@ -2081,9 +1942,9 @@ impl WhatsAppClient {
     /// broadcast and every attached front end learns about the view through
     /// the history it already knows how to recover. Nothing has to be told
     /// separately, and nothing is lost if a client is behind.
-    pub fn mark_status_watched(&self, message_ids: Vec<String>) -> tokio::task::JoinHandle<bool> {
+    pub fn mark_status_watched(&self, message_ids: Vec<String>) -> Task<bool> {
         let chat_store = self.chat_store.clone();
-        self.runtime.spawn(async move {
+        self.exec.spawn(async move {
             let Some(store) = chat_store.lock().await.clone() else {
                 warn!("no chat store yet; a watched status update was not recorded");
                 return false;
@@ -2118,12 +1979,11 @@ impl WhatsAppClient {
         &self,
         chat_jid_str: &str,
         last_displayed: Option<ReadBoundary>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Task<()> {
         let client_handle = self.client_handle.clone();
         let chat_jid_str = chat_jid_str.to_string();
-        let runtime = self.runtime.clone();
 
-        runtime.spawn(async move {
+        self.exec.spawn(async move {
             let chat_jid: Jid = match chat_jid_str.parse() {
                 Ok(j) => j,
                 Err(e) => {
@@ -2144,1193 +2004,6 @@ impl WhatsAppClient {
                 warn!("Failed to mark chat {} as read: {}", chat_jid.observe(), e);
             }
         })
-    }
-
-    /// Accept an incoming call: signaling, callKey decrypt, relay connect and
-    /// the audio engine are all inside `client.voip().accept(..)`; this side
-    /// only supplies the cpal mic/speaker bridge.
-    pub fn accept_call(&self, call_id: &str, with_video: bool) {
-        let client_handle = self.client_handle.clone();
-        let calls = self.calls.clone();
-        let ui_sender = self.ui_sender.clone();
-        let publish = self.video_publisher();
-        let lost = self.camera_lost();
-        let call_id = call_id.to_string();
-        let runtime = self.runtime.clone();
-
-        runtime.spawn(async move {
-            let Some(client) = client_handle.lock().await.clone() else {
-                error!("Client not available for accepting call");
-                return;
-            };
-            // From the moment the offer leaves `pending` there is neither an
-            // offer nor a handle for anything ending this call to act on, and
-            // this is what it acts on instead — marked *before* the offer is
-            // consumed, under the lock that consumes it. Two steps leave a
-            // moment where a remote termination finds no offer and no accept,
-            // leaves no note, and the accept goes on to answer a call nobody
-            // is on.
-            let offer = {
-                let mut pending = calls.pending.lock().await;
-                if pending.contains_key(&call_id) {
-                    calls.accepting.lock().await.insert(call_id.clone());
-                }
-                pending.remove(&call_id)
-            };
-            let Some(offer) = offer else {
-                warn!("No pending offer for call {}", call_id);
-                return;
-            };
-            let _accepting = AcceptGuard {
-                calls: calls.clone(),
-                call_id: call_id.clone(),
-            };
-            let (mic, speaker) = match open_call_audio().await {
-                Ok(audio) => audio,
-                Err(err) => {
-                    error!("Audio device setup failed: {err}");
-                    // The offer is consumed and no accept went out: reject
-                    // so the caller stops ringing instead of waiting out
-                    // the timeout.
-                    if let Err(e) = client.voip().reject(&offer).await {
-                        error!(
-                            "Failed to reject call {} after audio failure: {}",
-                            call_id, e
-                        );
-                    }
-                    Self::notify_call_ended(&ui_sender, &call_id).await;
-                    return;
-                }
-            };
-            // The camera is opened before the accept goes out, so an offer
-            // answered with video is one this side can actually send. A
-            // camera that will not open is not a reason to refuse the call:
-            // the answer is audio, which is exactly what a phone does when
-            // its camera is busy.
-            let video = if with_video {
-                match video::open(video::slot(&call_id), publish, lost).await {
-                    Ok(video) => Some(video),
-                    Err(err) => {
-                        warn!("Answering call {call_id} without video: {err}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let (local, endpoints) = match video {
-                Some((local, endpoints)) => (Some(local), Some(endpoints)),
-                None => (None, None),
-            };
-
-            // Ended while the camera was opening — hung up here, hung up by
-            // the caller, or taken on another device. Seconds, the first time
-            // a permission prompt, and the `<accept>` below would answer a
-            // call nobody is on any more. The registration consumes the same
-            // marker under a lock; this is only about not sending the stanza.
-            if calls.cancelled.lock().await.contains(&call_id) {
-                info!("Call {} ended before its media came up", call_id);
-                if let Some(local) = local {
-                    local.stop().await;
-                }
-                Self::notify_call_ended(&ui_sender, &call_id).await;
-                return;
-            }
-
-            let endpoints_attached = endpoints.is_some();
-            let voip = client.voip();
-            let accept = voip.accept(&offer).audio(mic, speaker);
-            let accept = match endpoints {
-                Some(endpoints) => accept.video(endpoints.source, endpoints.sink),
-                None => accept,
-            };
-            let answered_with_video = endpoints_attached;
-            match accept.start().await {
-                Ok(handle) => {
-                    let handle = Arc::new(handle);
-                    // Hung up while the camera was opening. Answering a video
-                    // call waits on a device — and, the first time, on a
-                    // permission prompt — with the card already gone from
-                    // every window, so a call registered here would be one
-                    // nobody could see or end.
-                    //
-                    // Both under the `active` lock, and in the order
-                    // `cancel_call` takes them: it looks for a live handle
-                    // and, finding none, leaves the marker instead. Checking
-                    // the marker and registering the handle as two steps
-                    // leaves a gap in between where a hangup does neither.
-                    let registered = {
-                        let mut active = calls.active.lock().await;
-                        if calls.cancelled.lock().await.remove(&call_id) {
-                            false
-                        } else {
-                            active.insert(call_id.clone(), handle.clone());
-                            true
-                        }
-                    };
-                    if !registered {
-                        info!("Call {} was hung up while its media came up", call_id);
-                        if let Some(local) = local {
-                            local.stop().await;
-                        }
-                        log_termination(&call_id, handle.terminate().await);
-                        return;
-                    }
-                    info!("Call {} media live", handle.call_id());
-                    // What this call turned out to be. The state was built
-                    // from the offer the moment the answer was given, and a
-                    // camera that would not open answers a video offer as a
-                    // voice call rather than refusing it — which only this
-                    // side knows.
-                    if let Some(tx) = ui_sender.lock().await.as_ref() {
-                        let _ = tx.send(UiEvent::CallAnswered {
-                            call_id: call_id.clone(),
-                            is_video: answered_with_video,
-                        });
-                    }
-                    if let Some(local) = local {
-                        // There is a call to draw into now — and the encoder
-                        // has been running since before the accept went out,
-                        // with its opening IDR published nowhere. The decoder
-                        // that starts on the first frame to arrive has
-                        // nothing to start from until the next one, seconds
-                        // away, so it is asked for here.
-                        local.drawable();
-                        local.request_keyframe();
-                        match Self::hold_camera(&calls, &call_id, local).await {
-                            Camera::Held => {
-                                Self::announce_video(
-                                    &ui_sender,
-                                    &call_id,
-                                    VideoStream::Local,
-                                    true,
-                                )
-                                .await;
-                            }
-                            // The accept said this call had video, so the peer
-                            // is holding a pane open for a device that is
-                            // gone. Nothing was announced here, so the state
-                            // already says what is true on this side.
-                            Camera::Died => Self::stop_peer_video(&handle, &call_id).await,
-                            Camera::CallEnded => {}
-                        }
-                    }
-                    // A call offered as video has the caller's camera on by
-                    // definition; the peer's own `<video>` corrects this if
-                    // they turn it off. Only when this side answered *with*
-                    // video, though: an offer answered without endpoints has
-                    // no plane for their frames to arrive on, and a window
-                    // told otherwise waits out the call in front of a pane
-                    // nothing can ever fill.
-                    if answered_with_video && offered_video(&offer) {
-                        Self::announce_video(&ui_sender, &call_id, VideoStream::Remote, true).await;
-                    }
-                    Self::watch_call(handle, calls.clone(), ui_sender.clone());
-                }
-                Err(e) => {
-                    error!("Failed to start call media for {}: {}", call_id, e);
-                    if let Some(local) = local {
-                        local.stop().await;
-                    }
-                    Self::notify_call_ended(&ui_sender, &call_id).await;
-                }
-            }
-        });
-    }
-
-    /// Ask every live camera for a keyframe, because somebody is about to
-    /// draw who has never seen one.
-    ///
-    /// A window attaching mid-call subscribes to the stream where it happens
-    /// to be, which is a P-frame referencing units published before it was
-    /// listening. Its decoder can do nothing with those, so the self-view
-    /// stays empty until the encoder's own periodic IDR — seconds, on a
-    /// picture the person just opened a window to see. The same rule every
-    /// other moment a decoder is born follows.
-    ///
-    /// Every camera rather than one call's: this is asked when a subscriber
-    /// arrives, and a subscriber draws whatever the daemon is holding.
-    pub fn request_video_keyframe(&self) {
-        let calls = self.calls.clone();
-        self.runtime.spawn(async move {
-            for local in calls.cameras.lock().await.values() {
-                local.request_keyframe();
-            }
-        });
-    }
-
-    /// Turn this side's camera on or off during a live call.
-    ///
-    /// The two directions of a call's video are independent and each side
-    /// owns its own, so this is only ever about ours. Turning it on answers
-    /// the peer's request when there is one parked — the token is what binds
-    /// the answer to that request — and asks one of our own when there is
-    /// not.
-    ///
-    /// Like mute, what is published is what the device ended up doing rather
-    /// than what was asked for: a camera that will not open, or an
-    /// announcement the peer never got, would otherwise leave a front end
-    /// drawing a picture nobody is being sent.
-    pub fn set_call_video(&self, call_id: &str, on: bool) {
-        let calls = self.calls.clone();
-        let ui_sender = self.ui_sender.clone();
-        let publish = self.video_publisher();
-        let lost = self.camera_lost();
-        let call_id = call_id.to_string();
-        let runtime = self.runtime.clone();
-
-        // Before the spawn, because after it the order is gone. See
-        // [`VideoLane`].
-        let (lane, seq) = {
-            let lane = Self::video_lane(&calls, &call_id);
-            let mut intent = lane.intent.lock().expect("video intent poisoned");
-            intent.seq += 1;
-            intent.on = on;
-            let seq = intent.seq;
-            drop(intent);
-            (lane, seq)
-        };
-
-        runtime.spawn(async move {
-            let handle = {
-                let active = calls.active.lock().await;
-                let handle = active.get(&call_id).cloned();
-                // Where the lane map grows is where it is swept.
-                calls
-                    .video
-                    .lock()
-                    .expect("video lanes poisoned")
-                    .retain(|id, _| active.contains_key(id));
-                handle
-            };
-            let Some(handle) = handle else {
-                debug!("set_call_video: no live handle for {}", call_id);
-                // Answered rather than dropped. A window draws the camera as
-                // coming on the moment it is asked, and it clears that on the
-                // settle — so a request that arrives in the seconds between
-                // the state saying a call is live and this side registering
-                // its handle would otherwise leave the control lit for the
-                // rest of the call, and its next click asking to turn off a
-                // camera that was never opened. What the registry holds is
-                // nothing, which is exactly what is said.
-                Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
-                return;
-            };
-
-            let _serialized = lane.lane.lock().await;
-            // A newer request either has already run or is queued behind us
-            // on this lane; either way it, and not this one, is what the
-            // device should end up saying. Staying silent is the point: a
-            // superseded task that announced its own value would restore it
-            // over the newer one.
-            if lane.intent.lock().expect("video intent poisoned").seq != seq {
-                return;
-            }
-
-            if !on {
-                // Taken out of the registry before it is waited on, rather
-                // than under an `if let` that holds the lock for the wait:
-                // closing a device means waiting for its capture thread, and
-                // every other call's bookkeeping would queue behind it.
-                let held = calls.cameras.lock().await.remove(&call_id);
-                if let Some(local) = held {
-                    // The device is released first, matching `stop_video`
-                    // itself: the user asked for the camera to go off, and a
-                    // failed stanza must not leave it running.
-                    local.stop().await;
-                }
-                Self::stop_peer_video(&handle, &call_id).await;
-                // `stop_video` clears the library's pending request, so a
-                // refusal after it is one the library ignores — and so is
-                // this.
-                calls.upgrading.lock().await.remove(&call_id);
-                Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
-                return;
-            }
-
-            if calls.cameras.lock().await.contains_key(&call_id) {
-                // Already on. Said again rather than returning silently: this
-                // is the newest request, and what it costs to restate is
-                // nothing — the daemon publishes no frame for a state that
-                // did not change.
-                Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
-                return;
-            }
-            let (local, endpoints) = match video::open(video::slot(&call_id), publish, lost).await {
-                Ok(video) => video,
-                Err(err) => {
-                    error!("Camera setup failed for call {call_id}: {err}");
-                    // Said out loud rather than left silent: the front end
-                    // drew the camera as coming on the moment it was asked.
-                    Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
-                    return;
-                }
-            };
-            // Asked again, because opening a device is where the time goes —
-            // tens of milliseconds, the first time a permission prompt — and
-            // the lane held whatever came after us off for all of it. Going
-            // on from here is not a word that can be taken back: it spends
-            // the peer's upgrade token and starts transmitting, which the
-            // "off" queued behind us would then have to undo.
-            if lane.intent.lock().expect("video intent poisoned").seq != seq {
-                local.stop().await;
-                return;
-            }
-            // Consuming the token *is* the answer, so the question goes with
-            // it — every window drawing it has to stop.
-            let answering = calls.upgrades.lock().await.remove(&call_id);
-            if answering.is_some() {
-                Self::announce_video_request(&ui_sender, &call_id, false).await;
-            }
-            // Whether the peer owes us an answer: an upgrade we asked for is
-            // accepted or refused seconds later, and what that answer means
-            // depends on a request of ours still being outstanding when it
-            // lands. Answering one of *theirs* owes nothing.
-            let ours_to_be_answered = answering.is_none();
-            // Recorded before the request goes out, for the reason every
-            // other intent here is stamped before its task exists: the reply
-            // is not ours to schedule. `start_video` puts `<video_state>` on
-            // the wire and the peer's refusal comes back on the event stream,
-            // which is a different task — so a fast peer, or a signaling
-            // error answered by return, lands its reject while this is still
-            // awaiting, finds nothing outstanding and lets the camera stand
-            // while the library has already released the plane under it.
-            // Registering late cannot be made safe by ordering; registering
-            // early can, because every path out of here that is not a camera
-            // held withdraws it again.
-            if ours_to_be_answered {
-                calls.upgrading.lock().await.insert(call_id.clone());
-            }
-            let started = match answering {
-                Some(token) => {
-                    handle
-                        .accept_video(token, endpoints.source, endpoints.sink)
-                        .await
-                }
-                None => handle.start_video(endpoints.source, endpoints.sink).await,
-            };
-            match started {
-                Ok(()) => {
-                    // And asked once more, because signaling is another await
-                    // and the newest request is the only one that may speak.
-                    // Unlike the check before it this one has something to
-                    // undo: the direction is negotiated, so the peer is told
-                    // it stopped as well as the device being closed — an
-                    // "off" queued behind us would otherwise find a camera
-                    // that was never registered, no picture of its own to
-                    // stop, and a peer still holding a pane open.
-                    if lane.intent.lock().expect("video intent poisoned").seq != seq {
-                        local.stop().await;
-                        Self::stop_peer_video(&handle, &call_id).await;
-                        calls.upgrading.lock().await.remove(&call_id);
-                        return;
-                    }
-                    // The call is already live, so the self-view has had
-                    // somewhere to land since before the camera opened — and
-                    // it had nowhere to land while the announcement was on
-                    // the wire, which is where the opening IDR went. Whoever
-                    // draws this starts a decoder on the first frame that
-                    // arrives and can do nothing with it until a keyframe,
-                    // which is otherwise the periodic one, seconds away.
-                    local.drawable();
-                    local.request_keyframe();
-                    // The announcement landed and the device may not have
-                    // survived it: the peer has this direction enabled and is
-                    // waiting on a picture, and `settle_video` below says off
-                    // only on this side. A call that ended in the meantime has
-                    // nobody to tell.
-                    //
-                    // Either way there is no camera left for a refusal to take
-                    // down, so the question we registered before asking it is
-                    // withdrawn — a reject arriving later belongs to nothing
-                    // of ours, which is exactly what its handler tests for.
-                    match Self::hold_camera(&calls, &call_id, local).await {
-                        Camera::Died => {
-                            Self::stop_peer_video(&handle, &call_id).await;
-                            calls.upgrading.lock().await.remove(&call_id);
-                        }
-                        Camera::CallEnded => {
-                            calls.upgrading.lock().await.remove(&call_id);
-                        }
-                        Camera::Held => {}
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to start video on call {}: {}", call_id, e);
-                    local.stop().await;
-                    calls.upgrading.lock().await.remove(&call_id);
-                }
-            }
-            Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
-        });
-    }
-
-    /// Publish what the camera *is*, once the newest request has reached it.
-    ///
-    /// Read back from the registry rather than from what was asked for, which
-    /// is the same rule mute follows and for the same reason: a camera that
-    /// would not open, or an announcement the peer never got, leaves the
-    /// device somewhere the request did not choose, and the front end has
-    /// already drawn what it asked for.
-    ///
-    /// Silent when a newer request has arrived meanwhile: that one speaks
-    /// after it has reached the device, which is what makes it the last word.
-    async fn settle_video(
-        calls: &CallRegistry,
-        ui_sender: &UiEventSender,
-        call_id: &str,
-        seq: u64,
-        lane: &VideoLane,
-    ) {
-        if lane.intent.lock().expect("video intent poisoned").seq != seq {
-            return;
-        }
-        let settled = calls.cameras.lock().await.contains_key(call_id);
-        Self::announce_video(ui_sender, call_id, VideoStream::Local, settled).await;
-    }
-
-    /// Close this side's camera and say so, for the reasons that are not a
-    /// request: the device died, or the peer refused the upgrade it was
-    /// opened for.
-    ///
-    /// `only` names the camera the teardown was scheduled for, where it was
-    /// scheduled at all — the work is spawned, and the camera in the registry
-    /// may be a later one. `None` means "whatever is there now", which is
-    /// right for something learned from the peer in the moment.
-    async fn stop_local_video(
-        calls: &CallRegistry,
-        ui_sender: &UiEventSender,
-        call_id: &str,
-        only: Option<crate::video::CameraId>,
-    ) {
-        // On the call's own lane, like a request, and for the same reason a
-        // request is: closing a device and telling the peer are two awaits,
-        // and a camera turned on between them would have its media plane
-        // stopped and be published as off. The identity check below is what
-        // decides whether *this* cleanup still has something to do; the lane
-        // is what keeps that answer true for as long as it takes to act on
-        // it. Blocking here delays this one call's events and nothing else:
-        // the lane is per call, and the library's event queue is unbounded.
-        let lane = Self::video_lane(calls, call_id);
-        let _serialized = lane.lane.lock().await;
-        let local = {
-            let mut cameras = calls.cameras.lock().await;
-            match cameras.get(call_id) {
-                Some(held) if only.is_none_or(|wanted| held.camera_id() == wanted) => {
-                    cameras.remove(call_id)
-                }
-                _ => return,
-            }
-        };
-        let Some(local) = local else { return };
-        local.stop().await;
-        // Cloned out from under the lock: telling the peer is a stanza on the
-        // wire, and holding the registry across it stalls every other call's
-        // bookkeeping behind one peer — the same reason `set_call_muted`
-        // takes its handle this way.
-        let handle = calls.active.lock().await.get(call_id).cloned();
-        if let Some(handle) = handle {
-            Self::stop_peer_video(&handle, call_id).await;
-        }
-        Self::announce_video(ui_sender, call_id, VideoStream::Local, false).await;
-    }
-
-    /// Put a camera in the registry, or take it straight back down when
-    /// there is nothing left to hold it for.
-    ///
-    /// Both questions — is the device still there, is the call still there —
-    /// are asked *after* the insertion and under the lock the teardowns take,
-    /// and that is the whole of it. Asked before, each leaves a window in
-    /// which the cleanup runs against a registry this camera is not in yet:
-    /// it finds nothing to remove and finishes, and the entry made a moment
-    /// later is the one nothing ever comes back for — the device staying
-    /// open, with its light on, until the daemon exits.
-    ///
-    /// Under the lock the answers are true for long enough to act on. The
-    /// pump clears `alive` before it reports a loss, so a dead camera is
-    /// either already gone from the map or visible right here; and
-    /// `watch_call_end` clears `active` before it reaches for `cameras`, so a
-    /// call still in `active` is one whose teardown has not passed this point
-    /// and will find what was just put there.
-    async fn hold_camera(calls: &CallRegistry, call_id: &str, local: LocalVideo) -> Camera {
-        let taken = {
-            let mut cameras = calls.cameras.lock().await;
-            cameras.insert(call_id.to_string(), local);
-            let ended = !calls.active.lock().await.contains_key(call_id);
-            let dead = !cameras.get(call_id).is_some_and(LocalVideo::alive);
-            if ended || dead {
-                cameras.remove(call_id).map(|held| (held, ended))
-            } else {
-                None
-            }
-        };
-        let Some((taken, ended)) = taken else {
-            return Camera::Held;
-        };
-        taken.stop().await;
-        if ended {
-            info!("Call {call_id} ended while its camera was being wired up");
-            Camera::CallEnded
-        } else {
-            warn!("The camera on call {call_id} died while it was being wired up");
-            Camera::Died
-        }
-    }
-
-    /// Tell the peer this side's video has stopped, and say so if it could
-    /// not be told: a direction they still believe is live is one they hold a
-    /// pane open for.
-    async fn stop_peer_video(handle: &CallHandle, call_id: &str) {
-        if let Err(e) = handle.stop_video().await {
-            warn!(
-                "Failed to tell the peer video stopped on {}: {}",
-                call_id, e
-            );
-        }
-    }
-
-    /// The lane serializing one call's camera transitions, made if nothing
-    /// has wanted it yet. Swept where it grows — see [`Self::set_call_video`].
-    fn video_lane(calls: &CallRegistry, call_id: &str) -> Arc<VideoLane> {
-        calls
-            .video
-            .lock()
-            .expect("video lanes poisoned")
-            .entry(call_id.to_string())
-            .or_default()
-            .clone()
-    }
-
-    /// Drop a parked upgrade request and tell every window it is gone.
-    ///
-    /// Both halves or neither: the token is what an answer is bound to, and a
-    /// front end still offering to answer a request the session can no longer
-    /// act on would produce a camera turning on for nobody.
-    async fn withdraw_video_request(
-        calls: &CallRegistry,
-        ui_sender: &UiEventSender,
-        call_id: &str,
-    ) {
-        if calls.upgrades.lock().await.remove(call_id).is_some() {
-            Self::announce_video_request(ui_sender, call_id, false).await;
-        }
-    }
-
-    async fn announce_video_request(ui_sender: &UiEventSender, call_id: &str, pending: bool) {
-        if let Some(tx) = ui_sender.lock().await.as_ref() {
-            let _ = tx.send(UiEvent::CallVideoRequested {
-                call_id: call_id.to_string(),
-                pending,
-            });
-        }
-    }
-
-    async fn announce_video(
-        ui_sender: &UiEventSender,
-        call_id: &str,
-        stream: VideoStream,
-        on: bool,
-    ) {
-        if let Some(tx) = ui_sender.lock().await.as_ref() {
-            let _ = tx.send(UiEvent::CallVideoChanged {
-                call_id: call_id.to_string(),
-                stream,
-                on,
-            });
-        }
-    }
-
-    /// Decline an incoming call (sends the reject signaling).
-    pub fn decline_call(&self, call_id: &str) {
-        let client_handle = self.client_handle.clone();
-        let calls = self.calls.clone();
-        let call_id = call_id.to_string();
-        let runtime = self.runtime.clone();
-
-        runtime.spawn(async move {
-            let Some(client) = client_handle.lock().await.clone() else {
-                error!("Client not available for declining call");
-                return;
-            };
-            let Some(offer) = calls.pending.lock().await.remove(&call_id) else {
-                warn!("No pending offer for call {}", call_id);
-                return;
-            };
-            match client.voip().reject(&offer).await {
-                Ok(()) => info!("Call {} declined", call_id),
-                Err(e) => error!("Failed to decline call {}: {}", call_id, e),
-            }
-        });
-    }
-
-    /// Place an outgoing 1:1 call. Device discovery, callKey encrypt, offer
-    /// send and the relay/engine lifecycle are inside `client.voip().call(..)`.
-    ///
-    /// `is_video` reaches the wire: the offer itself says which kind of call
-    /// this is, and it says so because the endpoints were attached before it
-    /// went out. A video call whose camera would not open is placed as a
-    /// voice call rather than not placed at all — the point of the call is
-    /// to reach the person.
-    pub fn start_call(&self, recipient_jid_str: &str, is_video: bool, placeholder_id: String) {
-        let client_handle = self.client_handle.clone();
-        let calls = self.calls.clone();
-        let ui_sender = self.ui_sender.clone();
-        let publish = self.video_publisher();
-        let lost = self.camera_lost();
-        let recipient_jid = recipient_jid_str.to_string();
-        let runtime = self.runtime.clone();
-
-        runtime.spawn(async move {
-            let notify_failure = |error: String| {
-                let ui_sender = ui_sender.clone();
-                let recipient_jid = recipient_jid.clone();
-                // A cancel may have landed for a call that will never
-                // start; consume the marker so the set doesn't grow.
-                let calls = calls.clone();
-                let placeholder_id = placeholder_id.clone();
-                async move {
-                    calls.cancelled.lock().await.remove(&placeholder_id);
-                    error!(
-                        "Failed to start call to {}: {}",
-                        observe_str(&recipient_jid),
-                        error
-                    );
-                    if let Some(tx) = ui_sender.lock().await.as_ref() {
-                        let _ = tx.send(UiEvent::OutgoingCallFailed {
-                            recipient_jid,
-                            error,
-                        });
-                    }
-                }
-            };
-
-            let jid: Jid = match recipient_jid.parse() {
-                Ok(j) => j,
-                Err(e) => {
-                    notify_failure(format!("invalid JID: {e}")).await;
-                    return;
-                }
-            };
-            let Some(client) = client_handle.lock().await.clone() else {
-                notify_failure("client not available".to_string()).await;
-                return;
-            };
-            let (mic, speaker) = match open_call_audio().await {
-                Ok(audio) => audio,
-                Err(err) => {
-                    notify_failure(format!("audio device setup failed: {err}")).await;
-                    return;
-                }
-            };
-
-            // Opened under the placeholder id: the server has not named the
-            // call yet, and the frames this produces are addressed to the
-            // call the front end already drew.
-            let video = if is_video {
-                match video::open(video::slot(&placeholder_id), publish, lost).await {
-                    Ok(video) => Some(video),
-                    Err(err) => {
-                        warn!(
-                            "Placing the call to {} without video: {err}",
-                            observe_str(&recipient_jid)
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let (local, endpoints) = match video {
-                Some((local, endpoints)) => (Some(local), Some(endpoints)),
-                None => (None, None),
-            };
-            // What the offer will say, decided by what is attached to it
-            // rather than by what was asked for. Read here because the
-            // endpoints are about to be handed away.
-            let endpoints_attached = endpoints.is_some();
-
-            let voip = client.voip();
-            let outgoing = voip.call(&jid).audio(mic, speaker);
-            let outgoing = match endpoints {
-                Some(endpoints) => outgoing.video(endpoints.source, endpoints.sink),
-                None => outgoing,
-            };
-
-            // Cancelled while the camera was opening — a device, and the
-            // first time a permission prompt, is seconds in which the user
-            // can change their mind. Checked *before* the offer goes out: the
-            // peer would otherwise ring for a call that was called off, and
-            // be told to stop moments later.
-            if calls.cancelled.lock().await.remove(&placeholder_id) {
-                info!(
-                    "Outgoing call to {} cancelled while its camera opened",
-                    observe_str(&recipient_jid)
-                );
-                if let Some(local) = local {
-                    local.stop().await;
-                }
-                return;
-            }
-
-            match outgoing.start().await {
-                Ok(handle) => {
-                    let call_id = handle.call_id().to_string();
-                    let handle = Arc::new(handle);
-                    // Cancelled while still connecting: the UI only knew the
-                    // placeholder id, so honor it here — and consume the
-                    // marker under the `active` lock, in the order
-                    // `cancel_call` takes them. As two steps there is a moment
-                    // where a cancel finds no handle and this finds no marker,
-                    // and what is left is a call ringing at the far end that
-                    // no window has ever been told the name of.
-                    let registered = {
-                        let mut active = calls.active.lock().await;
-                        if calls.cancelled.lock().await.remove(&placeholder_id) {
-                            false
-                        } else {
-                            active.insert(call_id.clone(), handle.clone());
-                            true
-                        }
-                    };
-                    if !registered {
-                        info!("Outgoing call {} cancelled before start", call_id);
-                        if let Some(local) = local {
-                            local.stop().await;
-                        }
-                        // The offer is already out: every device it rang is
-                        // ringing, and dropping our side silently would leave
-                        // them at it until their own transport gave up.
-                        // `terminate` is what tells them, and it tears this
-                        // side down whether or not the stanzas landed.
-                        log_termination(&call_id, handle.terminate().await);
-                        return;
-                    }
-                    info!(
-                        "Outgoing call {} to {} offered",
-                        call_id,
-                        observe_str(&recipient_jid)
-                    );
-                    if let Some(local) = local {
-                        // A camera that died while the offer was going out
-                        // reported its loss under the placeholder id, against
-                        // a registry it was never in: nothing was torn down,
-                        // and the entry made here would be the one nothing
-                        // ever comes back for.
-                        // The frames were being addressed to the placeholder
-                        // the window drew; from here they carry the name the
-                        // server gave the call. A reader keeps one decoder per
-                        // call and cannot tell a rename from a different call,
-                        // so it starts a fresh one — which has nothing to
-                        // decode until a keyframe. This is that keyframe.
-                        local.rename(&call_id);
-                        local.request_keyframe();
-                        // Nothing to tell the peer if it did not survive: the
-                        // call is ringing, and what it was offered as is
-                        // already out.
-                        Self::hold_camera(&calls, &call_id, local).await;
-                    }
-                    Self::watch_call(handle, calls.clone(), ui_sender.clone());
-                    // The rename first: everything after it is addressed by
-                    // the id the server gave the call, and a front end told
-                    // its camera was on under an id it has not adopted yet
-                    // would drop the news.
-                    if let Some(tx) = ui_sender.lock().await.as_ref() {
-                        let _ = tx.send(UiEvent::OutgoingCallStarted {
-                            call_id: call_id.clone(),
-                            recipient_jid,
-                            placeholder_id,
-                            // What went out, not what was asked for: a video
-                            // call whose camera would not open was placed as
-                            // a voice call, and the state drawn from the
-                            // request would otherwise hold video panes open
-                            // on a call with no camera and write the
-                            // conversation's record as a video call.
-                            is_video: endpoints_attached,
-                        });
-                    }
-                    // Not announced here: the call is ringing, and a ringing
-                    // call has no live state to record a camera against. The
-                    // peer's `<accept>` is the first moment there is one, and
-                    // that is where it is said.
-                }
-                Err(e) => {
-                    if let Some(local) = local {
-                        local.stop().await;
-                    }
-                    notify_failure(e.to_string()).await;
-                }
-            }
-        });
-    }
-
-    /// Hang up / cancel a call we started or answered.
-    pub fn cancel_call(&self, call_id: &str) {
-        let calls = self.calls.clone();
-        let call_id = call_id.to_string();
-        let runtime = self.runtime.clone();
-
-        runtime.spawn(async move {
-            // Still ringing and never answered: nothing live to hang up.
-            calls.pending.lock().await.remove(&call_id);
-            if let Some(handle) = calls.active.lock().await.remove(&call_id) {
-                log_termination(&call_id, handle.terminate().await);
-            } else {
-                // No handle yet (start_call still connecting under a UI
-                // placeholder id): remember the cancel so it lands.
-                debug!("cancel_call: no live handle for {}, deferring", call_id);
-                calls.cancelled.lock().await.insert(call_id);
-            }
-        });
-    }
-
-    /// Mute or unmute the microphone of a live call, and tell the peer.
-    ///
-    /// The library commits the two directions around the `<mute_v2>` rather
-    /// than at one point — a mute applies before the announcement, an unmute
-    /// only once it is out — so whichever half is lost, the microphone is
-    /// never live while the peer is being shown a muted one. What that costs
-    /// is that a failed announcement leaves the device in a state nobody
-    /// asked for, and the front end has already drawn the state it asked for.
-    /// So the handle is asked what it really holds and the answer is
-    /// published — always, not only when it differs: what makes the state
-    /// trustworthy is that the *last* request to reach the device is the one
-    /// that speaks last, and a task that only spoke on disagreement would
-    /// leave a failed announcement's answer standing over a later success.
-    /// It costs nothing, because a call state that does not change sends no
-    /// frame.
-    ///
-    /// The request is stamped here, on the caller's thread, and the work is
-    /// what gets spawned — see [`MuteLane`]. A task compares the device
-    /// against the *newest* request rather than its own, because its own is
-    /// exactly what a superseded task must not restore.
-    ///
-    /// A call still ringing has nowhere to publish the state, and answering
-    /// does not replay it. That is not a gap here: mute is offered on an
-    /// active call only ([`oxidezap_core::CallState::set_muted`] matches the
-    /// live stage), so nothing can be chosen while it rings.
-    pub fn set_call_muted(&self, call_id: &str, muted: bool) {
-        let calls = self.calls.clone();
-        let ui_sender = self.ui_sender.clone();
-        let call_id = call_id.to_string();
-        let runtime = self.runtime.clone();
-
-        // Before the spawn, because after it the order is gone.
-        let (lane, seq) = {
-            let mut lanes = calls.mute.lock().expect("mute lanes poisoned");
-            let lane = lanes.entry(call_id.clone()).or_default().clone();
-            let mut intent = lane.intent.lock().expect("mute intent poisoned");
-            intent.seq += 1;
-            intent.muted = muted;
-            let seq = intent.seq;
-            drop(intent);
-            (lane, seq)
-        };
-
-        runtime.spawn(async move {
-            // Cloned out from under the lock: `set_muted` waits on the call's
-            // answer-transition lane, and holding the registry across that
-            // would stall every other call's bookkeeping behind one peer.
-            let handle = {
-                let active = calls.active.lock().await;
-                let handle = active.get(&call_id).cloned();
-                // Where the lane map grows is where it is swept.
-                calls
-                    .mute
-                    .lock()
-                    .expect("mute lanes poisoned")
-                    .retain(|id, _| active.contains_key(id));
-                handle
-            };
-            let Some(handle) = handle else {
-                debug!("set_call_muted: no live handle for {}", call_id);
-                return;
-            };
-
-            let _serialized = lane.lane.lock().await;
-            // A newer request either has already run or is blocked on the
-            // lane behind us; either way it, and not this one, is what the
-            // device should end up saying.
-            let want = *lane.intent.lock().expect("mute intent poisoned");
-            if want.seq != seq {
-                return;
-            }
-            if let Err(e) = handle.set_muted(want.muted).await {
-                warn!(
-                    "Failed to announce {} on call {}: {}",
-                    if want.muted { "mute" } else { "unmute" },
-                    call_id,
-                    e
-                );
-            }
-            // Superseded while announcing: the request behind us is about to
-            // set the state anyway, and a word from here would describe a
-            // device that is already on its way somewhere else. It speaks
-            // after it has arrived, which is what makes it the last word.
-            if lane.intent.lock().expect("mute intent poisoned").seq != seq {
-                return;
-            }
-            // Said whether or not it is news, and this is why. A correction
-            // sent only on disagreement is unversioned, and the daemon writes
-            // a request's optimistic state before that request is even
-            // stamped here — so a *failed* announcement could publish its
-            // truth into the window belonging to the retry queued behind it,
-            // and the retry, succeeding, would find agreement and say
-            // nothing. The state would then hold the failure's answer over
-            // the success's device. Speaking unconditionally makes the newest
-            // request the one that closes the exchange, and costs nothing:
-            // the daemon publishes no frame for a state that did not change.
-            let settled = handle.is_muted();
-            if let Some(tx) = ui_sender.lock().await.as_ref() {
-                let _ = tx.send(UiEvent::CallMuteChanged {
-                    call_id,
-                    muted: settled,
-                });
-            }
-        });
-    }
-
-    /// Follow a live call: its own event stream while it runs, and its
-    /// ending.
-    ///
-    /// One entry point rather than two spawns at every call site, because
-    /// every path that produces a handle owes both — a call watched for its
-    /// ending but not its events is one whose camera nobody turns off.
-    fn watch_call(handle: Arc<CallHandle>, calls: CallRegistry, ui_sender: UiEventSender) {
-        Self::watch_call_events(handle.clone(), calls.clone(), ui_sender.clone());
-        Self::watch_call_end(handle, calls, ui_sender);
-    }
-
-    /// The call's own event stream: what the peer says about its video, and
-    /// what the network says about ours.
-    fn watch_call_events(handle: Arc<CallHandle>, calls: CallRegistry, ui_sender: UiEventSender) {
-        tokio::spawn(async move {
-            let events = handle.events();
-            let call_id = handle.call_id().to_string();
-            while let Ok(event) = events.recv().await {
-                match event {
-                    CallEvent::VideoStateChanged {
-                        state,
-                        upgrade_token,
-                        ..
-                    } => {
-                        Self::observe_peer_video(
-                            &calls,
-                            &ui_sender,
-                            &call_id,
-                            state,
-                            upgrade_token,
-                        )
-                        .await;
-                    }
-                    // The peer has lost our stream and is asking for a point
-                    // it can start from. Sending it more P-frames it cannot
-                    // decode is the one thing that certainly does not help.
-                    CallEvent::RtcpReceived {
-                        reports_video,
-                        feedback,
-                        ..
-                    } if reports_video && feedback.iter().any(reports_loss) => {
-                        if let Some(local) = calls.cameras.lock().await.get(&call_id) {
-                            local.request_keyframe();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            debug!("event stream for call {call_id} closed");
-        });
-    }
-
-    /// Fold one `<video state=N>` from the peer into what this side holds.
-    async fn observe_peer_video(
-        calls: &CallRegistry,
-        ui_sender: &UiEventSender,
-        call_id: &str,
-        state: VideoState,
-        upgrade_token: Option<VideoUpgradeToken>,
-    ) {
-        if peer_can_receive_video(state)
-            && let Some(local) = calls.cameras.lock().await.get(call_id)
-        {
-            local.request_keyframe();
-        }
-        match state {
-            // A request rather than a change: the answer is a person turning
-            // their own camera on, and the token is what binds that answer to
-            // this request. Without a token there is nothing to answer with —
-            // the signaling state machine has already resolved it — so it is
-            // not offered as a question.
-            VideoState::UpgradeRequest | VideoState::UpgradeRequestV2 => {
-                let Some(token) = upgrade_token else { return };
-                calls
-                    .upgrades
-                    .lock()
-                    .await
-                    .insert(call_id.to_string(), token);
-                Self::announce_video_request(ui_sender, call_id, true).await;
-            }
-            VideoState::Enabled => {
-                // Whatever we were waiting on an answer for has had one.
-                calls.upgrading.lock().await.remove(call_id);
-                Self::announce_video(ui_sender, call_id, VideoStream::Remote, true).await;
-            }
-            // Paused is drawn the same as off, and deliberately: a peer whose
-            // app went to the background sends nothing, and a pane held open
-            // for it would be a frozen frame nobody can tell from a live one.
-            VideoState::Stopped
-            | VideoState::Disabled
-            | VideoState::Paused
-            | VideoState::Error
-            | VideoState::UnknownPeer => {
-                Self::withdraw_video_request(calls, ui_sender, call_id).await;
-                Self::announce_video(ui_sender, call_id, VideoStream::Remote, false).await;
-            }
-            // Our own upgrade was refused, or ran out of time waiting to be
-            // answered. The camera was opened and announced when the request
-            // went out — the library holds it off the wire until the peer
-            // accepts — so a refusal that only closed the question would
-            // leave the device open and encoding for the rest of the call,
-            // with every window saying our video was on.
-            VideoState::UpgradeReject | VideoState::UpgradeRejectByTimeout => {
-                Self::withdraw_video_request(calls, ui_sender, call_id).await;
-                // Only while a request of ours is outstanding, and then for
-                // whatever camera is held — which is what the library does
-                // with the same stanza: it tears the attached plane down when
-                // some request of ours is pending, and ignores the refusal
-                // when none is. One arriving after our upgrade was already
-                // answered belongs to nothing here, and stopping the camera
-                // on it would take down one nobody refused.
-                if calls.upgrading.lock().await.remove(call_id) {
-                    Self::stop_local_video(calls, ui_sender, call_id, None).await;
-                } else {
-                    debug!("Refused video upgrade on {call_id} answers nothing of ours");
-                }
-            }
-            // Their request, withdrawn or timed out. Nothing about either
-            // camera changed; what has changed is that there is no longer a
-            // question on the table, and a front end still drawing one would
-            // be pointing at a peer who has stopped waiting.
-            VideoState::UpgradeCancel | VideoState::UpgradeCancelByTimeout => {
-                Self::withdraw_video_request(calls, ui_sender, call_id).await;
-            }
-            // The peer took the upgrade, so nothing of ours is outstanding
-            // and a refusal landing after it answers something else.
-            VideoState::UpgradeAccept => {
-                calls.upgrading.lock().await.remove(call_id);
-            }
-            // `UpgradeAccept` is answered by the `Enabled` that follows it,
-            // which is the state that actually says a camera is on.
-            _ => {}
-        }
-    }
-
-    /// Watch a live call until it ends (peer hangup, network loss, local
-    /// hangup) and clear it from the registry + UI.
-    fn watch_call_end(handle: Arc<CallHandle>, calls: CallRegistry, ui_sender: UiEventSender) {
-        tokio::spawn(async move {
-            handle.wait_ended().await;
-            let call_id = handle.call_id().to_string();
-            calls.active.lock().await.remove(&call_id);
-            // The camera outlives nothing: a call that ended with video on
-            // would otherwise keep the device open, with its light on, for
-            // as long as the process lived.
-            let camera = calls.cameras.lock().await.remove(&call_id);
-            calls.upgrades.lock().await.remove(&call_id);
-            calls.upgrading.lock().await.remove(&call_id);
-            calls
-                .video
-                .lock()
-                .expect("video lanes poisoned")
-                .remove(&call_id);
-            if let Some(camera) = camera {
-                camera.stop().await;
-            }
-            // Every call that ever had a handle drains through here, whatever
-            // ended it, so this is where a lane is paid for. The sweep in
-            // `set_call_muted` is not made redundant by it: a window that fell
-            // behind can stamp a request against a call this watcher has
-            // already run for, and that lane has no second ending to be
-            // removed on.
-            calls
-                .mute
-                .lock()
-                .expect("mute lanes poisoned")
-                .remove(&call_id);
-            Self::notify_call_ended(&ui_sender, &call_id).await;
-        });
-    }
-
-    async fn notify_call_ended(ui_sender: &UiEventSender, call_id: &str) {
-        if let Some(tx) = ui_sender.lock().await.as_ref() {
-            let _ = tx.send(UiEvent::CallEnded(call_id.to_string()));
-        }
-    }
-}
-
-/// RTCP payload-specific feedback (RFC 4585), which is the *class* PLI and
-/// FIR belong to.
-const RTCP_PAYLOAD_FEEDBACK: u8 = 206;
-/// Picture Loss Indication: the peer cannot decode what we are sending.
-const RTCP_FMT_PLI: u8 = 1;
-/// Full Intra Request, which asks for the same thing more emphatically.
-const RTCP_FMT_FIR: u8 = 4;
-
-/// Whether one feedback message says the peer has lost our picture.
-///
-/// The packet type alone does not: 206 also carries REMB bandwidth estimates
-/// and other formats a healthy call sends continuously, and treating those as
-/// loss would emit a keyframe at the RTCP reporting rate — large frames, over
-/// and over, defeating the very bitrate control they are reported against.
-fn reports_loss(feedback: &whatsapp_rust::wacore::voip::rtcp::RtcpFeedback) -> bool {
-    feedback.packet_type == RTCP_PAYLOAD_FEEDBACK
-        && matches!(feedback.fmt, RTCP_FMT_PLI | RTCP_FMT_FIR)
-}
-
-/// Whether this peer state is a decoder of theirs being born on *our*
-/// stream.
-///
-/// The same rule the window's own decoders follow, applied to the one on the
-/// far side: an upgrade holds our video off the wire until the peer accepts,
-/// so the accept is the first moment they have anywhere to put it — and what
-/// they receive from there references units encoded while nobody was
-/// listening. Our encoder emits an IDR every few seconds on its own, so
-/// without this the picture arrives when it arrives, which is a peer looking
-/// at a blank pane for up to a GOP after answering.
-///
-/// `Enabled` as well as `UpgradeAccept`, because either can be the stanza that
-/// ungates us: the library takes an `Enabled` from a peer who skipped the
-/// accept as the answer to our request. It is also what a peer sends for their
-/// own camera and their own rotations, so this asks for a keyframe more often
-/// than strictly needed — one extra frame against a picture that never starts.
-fn peer_can_receive_video(state: VideoState) -> bool {
-    matches!(state, VideoState::UpgradeAccept | VideoState::Enabled)
-}
-
-/// Say what a hangup achieved.
-///
-/// The local side is down in every case, so this reports rather than fails: a
-/// call the peer was never told about is still over here, and the difference
-/// is only how long they keep ringing. A still-ringing call is addressed per
-/// device, which is why "some, not all" is one of the answers.
-fn log_termination(call_id: &str, outcome: CallTermination) {
-    match outcome {
-        CallTermination::PeerNotified => info!("Call {} hung up", call_id),
-        CallTermination::PartlyNotified {
-            notified,
-            unconfirmed,
-        } => warn!(
-            "Call {} hung up; {} device(s) told, {} unconfirmed",
-            call_id, notified, unconfirmed
-        ),
-        CallTermination::LocalOnly(error) => warn!(
-            "Call {} hung up locally; the peer was not told: {}",
-            call_id, error
-        ),
-        CallTermination::AlreadyEnded => debug!("Call {} was already over", call_id),
-        // `CallTermination` is `#[non_exhaustive]`: a variant added upstream
-        // is still an ended call here, and the local side is down in every
-        // one of them.
-        other => info!("Call {} hung up: {:?}", call_id, other),
     }
 }
 
@@ -3474,7 +2147,13 @@ impl WhatsAppClient {
     const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
     /// One task for the whole session: chat-store invalidations -> debounced
-    /// load_history -> HistoryLoaded. Exits when the store or the UI goes away.
+    /// load_history -> HistoryLoaded.
+    ///
+    /// Exits when the session does, which is `stopping` and not the store: it
+    /// holds an `Arc<ChatStore>` itself, and that store owns the sender its
+    /// receiver is waiting on — so "the store went away" is a thing this task
+    /// makes impossible by existing. On a desktop that never showed, because
+    /// dropping the runtime took the task with it; on a page nothing does.
     fn spawn_history_reloader(
         mut changes: tokio::sync::broadcast::Receiver<oxidezap_chat_store::StoreChange>,
         chat_store: Arc<ChatStore>,
@@ -3482,12 +2161,13 @@ impl WhatsAppClient {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
         reload: Arc<tokio::sync::Notify>,
         names: Arc<NameBook>,
+        mut stopping: tokio::sync::watch::Receiver<()>,
     ) {
         use tokio::sync::broadcast::error::RecvError;
 
         let client = bot.client();
         let ui_tx = ui_tx.clone();
-        tokio::spawn(async move {
+        crate::exec::spawn_owned(async move {
             let mut open = true;
             while open {
                 let mut scope = ReloadScope::empty();
@@ -3505,6 +2185,10 @@ impl WhatsAppClient {
                         scope.widen(None);
                         asked = true;
                     }
+                    // Without a final load: the session is going, and a
+                    // reload would read a store that is about to be deleted
+                    // and publish it at a front end that has already left.
+                    _ = stopping.changed() => break,
                 }
                 // Drain the burst; a quiet window flushes the reload.
                 //
@@ -3523,17 +2207,18 @@ impl WhatsAppClient {
                 // the asker waits out the whole sync.
                 while !asked {
                     tokio::select! {
-                        change = tokio::time::timeout(Self::RELOAD_DEBOUNCE, changes.recv()) => {
+                        _ = stopping.changed() => return,
+                        change = crate::exec::with_timeout(changes.recv(), Self::RELOAD_DEBOUNCE) => {
                             match change {
-                                Ok(Ok(change)) => scope.widen(Some(&change)),
-                                Ok(Err(RecvError::Lagged(_))) => scope.widen(None),
-                                Ok(Err(RecvError::Closed)) => {
+                                Some(Ok(change)) => scope.widen(Some(&change)),
+                                Some(Err(RecvError::Lagged(_))) => scope.widen(None),
+                                Some(Err(RecvError::Closed)) => {
                                     // Reload once more: these changes were committed.
                                     open = false;
                                     break;
                                 }
                                 // The quiet window: flush what has piled up.
-                                Err(_) => break,
+                                None => break,
                             }
                         }
                         () = reload.notified() => {
@@ -4500,9 +3185,25 @@ async fn normalize_chat_jid(client: &Client, jid_str: &str) -> String {
 impl Drop for WhatsAppClient {
     fn drop(&mut self) {
         // A dropped wrapper can never be shut down explicitly anymore; free
-        // its background thread instead of leaking the runtime + DB pool.
+        // its loop instead of leaking the executor + DB pool.
         self.shutdown.notify_one();
     }
+}
+
+/// An error and everything under it, on one line.
+///
+/// The store's errors are categories with the cause hung off `source`, and a
+/// browser has no database file to open afterwards and inspect — so a report
+/// that stops at the category is a report nobody can act on.
+fn because(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        use std::fmt::Write as _;
+        let _ = write!(text, ": {cause}");
+        source = cause.source();
+    }
+    text
 }
 
 #[cfg(test)]
@@ -4510,10 +3211,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ChatEntry, ChatStore, Client, LoadedHistory, MuteLane, NameBook, ReadBoundary, ReloadScope,
-        SqliteStore, StoreChange, VideoState, WhatsAppClient, apply_status_views, chat_cursor,
-        media_metadata, merge_alias_history_messages, message_cursor, parse_chat_cursor,
-        parse_message_cursor, peer_can_receive_video, read_message_range, reports_loss,
+        ChatEntry, ChatStore, Client, LoadedHistory, NameBook, ReadBoundary, ReloadScope,
+        SqliteStore, StoreChange, WhatsAppClient, apply_status_views, chat_cursor, media_metadata,
+        merge_alias_history_messages, message_cursor, parse_chat_cursor, parse_message_cursor,
+        read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
     use std::sync::Arc;
@@ -4521,109 +3222,6 @@ mod tests {
     use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
     use whatsapp_rust::wacore_binary::Jid;
     use whatsapp_rust::waproto::whatsapp as wa;
-
-    /// A keyframe is asked for when the peer says it lost the picture, and
-    /// not when it says anything else on the same channel.
-    ///
-    /// Payload-specific feedback (206) is a *class*: REMB bandwidth estimates
-    /// ride it too, continuously, on a call that is going perfectly well.
-    /// Treating the class as loss emits an IDR at the reporting rate — large
-    /// frames, over and over, against the very bitrate those reports exist to
-    /// manage.
-    #[test]
-    fn only_a_lost_picture_asks_for_a_keyframe() {
-        use whatsapp_rust::wacore::voip::rtcp::RtcpFeedback;
-
-        let feedback = |packet_type, fmt| RtcpFeedback {
-            packet_type,
-            fmt,
-            sender_ssrc: 1,
-            media_ssrc: 2,
-            fci: Vec::new(),
-        };
-        // Picture Loss Indication and Full Intra Request.
-        assert!(reports_loss(&feedback(206, 1)));
-        assert!(reports_loss(&feedback(206, 4)));
-        // REMB is 206/15, and a healthy call sends it forever.
-        assert!(!reports_loss(&feedback(206, 15)));
-        assert!(!reports_loss(&feedback(206, 3)));
-        // Transport feedback (205) carries its own format 1, which is a NACK
-        // and not a request to start over.
-        assert!(!reports_loss(&feedback(205, 1)));
-        assert!(!reports_loss(&feedback(200, 4)));
-    }
-
-    /// The states that mean the peer now has somewhere to put our video, and
-    /// so has a decoder that has never seen a keyframe.
-    ///
-    /// An upgrade we initiated is held off the wire until they accept, so
-    /// everything encoded before that accept is a reference they do not have.
-    #[test]
-    fn a_peer_that_can_receive_is_asked_for_a_fresh_start() {
-        assert!(peer_can_receive_video(VideoState::UpgradeAccept));
-        assert!(peer_can_receive_video(VideoState::Enabled));
-        // Nothing on the far side is waiting for a picture in any of these.
-        for quiet in [
-            VideoState::Stopped,
-            VideoState::Disabled,
-            VideoState::Paused,
-            VideoState::UpgradeRequest,
-            VideoState::UpgradeRequestV2,
-            VideoState::UpgradeReject,
-            VideoState::UpgradeRejectByTimeout,
-            VideoState::UpgradeCancel,
-            VideoState::UpgradeCancelByTimeout,
-            VideoState::UnknownPeer,
-            VideoState::Error,
-        ] {
-            assert!(!peer_can_receive_video(quiet), "{quiet:?}");
-        }
-    }
-
-    /// Stamp a request the way `set_call_muted` does, on the caller's thread.
-    fn request(lane: &MuteLane, muted: bool) -> u64 {
-        let mut intent = lane.intent.lock().unwrap();
-        intent.seq += 1;
-        intent.muted = muted;
-        intent.seq
-    }
-
-    /// Two toggles in quick succession are spawned as two tasks, and spawn
-    /// order is not run order. Run the wrong way round, each task saw the
-    /// device holding the value it had itself asked for and corrected
-    /// nothing — so an unmute that executed last left the microphone open
-    /// under a state, and every window, still showing it muted.
-    ///
-    /// The order survives because it is stamped before the tasks exist, and a
-    /// task that is no longer the newest does nothing at all.
-    #[test]
-    fn only_the_newest_mute_request_reaches_the_device() {
-        let lane = MuteLane::default();
-        // Muted, and the user changes their mind twice.
-        let unmute = request(&lane, false);
-        let remute = request(&lane, true);
-
-        // Whichever task wins the lane, the gate answers the same way.
-        let newest = *lane.intent.lock().unwrap();
-        assert_ne!(unmute, remute);
-        assert_eq!(newest.seq, remute, "the last request is the live one");
-        assert!(newest.muted, "and it is the one the device must end on");
-        assert_ne!(
-            newest.seq, unmute,
-            "the superseded task yields instead of restoring its own value"
-        );
-    }
-
-    /// A lone request is nobody's stale task: it applies, and it is the one
-    /// that answers for what the device really did.
-    #[test]
-    fn a_single_mute_request_is_the_newest_one() {
-        let lane = MuteLane::default();
-        let seq = request(&lane, true);
-        let newest = *lane.intent.lock().unwrap();
-        assert_eq!(newest.seq, seq);
-        assert!(newest.muted);
-    }
 
     /// A name book with nothing behind its handle: the history paths hand the
     /// store in with every call, and only the live paths read it from there.

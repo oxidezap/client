@@ -7,7 +7,7 @@ use super::*;
 
 impl WhatsAppApp {
     /// Update a message's media data (used to cache downloaded media)
-    fn update_message_media_data(&mut self, message_id: &str, data: Vec<u8>) {
+    fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>) {
         // Find the message in any chat and update its media data
         let mut touched: Option<String> = None;
         for chat in &mut self.chats {
@@ -16,7 +16,7 @@ impl WhatsAppApp {
                     // Bytes and the metadata that describes them, together:
                     // decoding a WebP sticker as the `image/jpeg` its poster
                     // frame claimed fails every time.
-                    media.adopt_full_bytes(Arc::new(data));
+                    media.adopt_full_bytes(data);
                     // Drop any render-cached image built from the old bytes
                     self.decoded_images.borrow_mut().shift_remove(message_id);
                     info!("Cached media data for message {}", message_id);
@@ -62,9 +62,18 @@ impl WhatsAppApp {
     /// Get the currently playing audio message ID (if audio is playing)
     pub fn playing_message_id(&self) -> Option<&str> {
         match &self.active_media {
-            // Gated on the stream so a paused voice note renders as paused;
-            // resume still works because toggle_audio matches on active_media.
-            ActiveMedia::Audio { message_id } if self.audio_player.is_playing() => Some(message_id),
+            // `is_active`, which is the same question [`Self::toggle_audio`]
+            // asks — and they have to be the same question or the control
+            // lies about what tapping it does. `is_playing` is false for the
+            // whole of a decode, so a note the browser had accepted but not
+            // yet started drew a Play icon while the tap behind it went to
+            // `pause()`: the second tap on a control that looked idle was
+            // what stopped the note from ever starting.
+            //
+            // A paused note still renders as paused, which is what this was
+            // gated for: `is_active` is playing *or on its way*, and a pause
+            // during a decode sets `pending_pause`, which takes it out.
+            ActiveMedia::Audio { message_id } if self.audio_player.is_active() => Some(message_id),
             _ => None,
         }
     }
@@ -149,7 +158,14 @@ impl WhatsAppApp {
                 })
         {
             let at = self.audio_player.progress();
-            let was_playing = self.audio_player.is_playing();
+            // `is_active`, not `is_playing`: on the web a clip is neither
+            // playing nor paused for the whole of a decode, and `is_playing`
+            // is false throughout it. Reading that as "was paused" made the
+            // restart bank a `pending_pause`, so changing speed on a note
+            // that had been tapped but had not started yet meant it never
+            // started at all. What a play/pause control has to ask is whether
+            // the clip is playing *or going to*, which is this.
+            let was_playing = self.audio_player.is_active();
             self.play_audio(message_id, (*bytes).clone(), cx);
             self.audio_player.seek(at);
             if !was_playing {
@@ -163,7 +179,12 @@ impl WhatsAppApp {
     ///
     /// Position is read from the player rather than counted here, so a late
     /// or dropped frame costs smoothness and never accuracy. Stops as soon as
-    /// nothing is playing.
+    /// nothing is playing — or is *about* to be: on the web a clip is handed
+    /// to the browser to decode and `play` returns before there is any sound,
+    /// so a tick that asked only whether audio was playing ended on its first
+    /// pass and left the button, the clock and the waveform frozen for the
+    /// whole note. `is_loading` is that gap, and it is false everywhere the
+    /// decoder is synchronous.
     pub(super) fn ensure_playback_tick(&mut self, cx: &mut Context<Self>) {
         if self.playback_tick.is_some() {
             return;
@@ -172,15 +193,15 @@ impl WhatsAppApp {
             loop {
                 // ~15fps: the playhead only has to look continuous, and a
                 // voice note is not worth a frame-rate repaint of the list.
-                smol::Timer::after(std::time::Duration::from_millis(66)).await;
-                let playing = entity.update(cx, |app, cx| {
+                crate::platform::sleep(std::time::Duration::from_millis(66)).await;
+                let running = entity.update(cx, |app, cx| {
                     let playing = app.audio_player.is_playing();
                     if playing {
                         cx.notify();
                     }
-                    playing
+                    playing || app.audio_player.is_loading()
                 });
-                match playing {
+                match running {
                     Ok(true) => continue,
                     Ok(false) | Err(_) => break,
                 }
@@ -269,8 +290,12 @@ impl WhatsAppApp {
         cx: &mut Context<Self>,
     ) {
         if self.active_media.is_playing(&message_id) && self.active_media.is_audio() {
-            // Same message - toggle play/pause
-            if self.audio_player.is_playing() {
+            // Same message - toggle play/pause. `is_active` rather than
+            // `is_playing`: a clip the browser is still decoding is not
+            // playing yet but is on its way, and reading that as "resume"
+            // ignored the tap and let the decode start what it had just been
+            // asked to stop.
+            if self.audio_player.is_active() {
                 self.audio_player.pause();
             } else {
                 self.audio_player.resume();
@@ -291,9 +316,11 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
-        // If already playing this audio message, just toggle
+        // If already playing this audio message, just toggle. `is_active`
+        // for the same reason as above: a decode in flight is a note on its
+        // way, and a tap during it means stop.
         if self.active_media.is_playing(&message_id) && self.active_media.is_audio() {
-            if self.audio_player.is_playing() {
+            if self.audio_player.is_active() {
                 self.audio_player.pause();
             } else {
                 self.audio_player.resume();
@@ -302,6 +329,13 @@ impl WhatsAppApp {
             cx.notify();
             return;
         }
+
+        // Here, in the gesture, and not where the sound starts. A browser
+        // grants an audio context permission to play only under a transient
+        // user activation, and this path downloads the note first — so by the
+        // time anything is decoded the click that authorised it has expired.
+        // Free where a sound card needs no permission.
+        self.audio_player.unlock();
 
         // A second tap while the first is still in flight downloads the note
         // twice, and both answers still match `pending_media_request` — so the
@@ -342,7 +376,11 @@ impl WhatsAppApp {
                         // Autoplay only if the user hasn't started other media
                         // since this download began.
                         if app.pending_media_request.as_deref() == Some(msg_id.as_str()) {
-                            app.play_audio(msg_id, data, cx);
+                            // Cloned, as at every other call site: the
+                            // player takes the bytes, and a voice note is
+                            // small enough that owning one is not the copy
+                            // worth avoiding.
+                            app.play_audio(msg_id, (*data).clone(), cx);
                         } else {
                             cx.notify();
                         }
@@ -451,15 +489,10 @@ impl WhatsAppApp {
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
-                Ok(data) => {
-                    let saved = cx
-                        .background_spawn(async move { save_to_downloads(&file_name, &data) })
-                        .await;
-                    match saved {
-                        Ok(_) => info!("Document {} saved", message_id),
-                        Err(e) => warn!("Failed to save document {}: {}", message_id, e),
-                    }
-                }
+                Ok(data) => match hand_to_user(cx, file_name, data).await {
+                    Ok(where_it_went) => info!("Document {message_id} saved to {where_it_went}"),
+                    Err(e) => warn!("Failed to save document {message_id}: {e}"),
+                },
                 Err(e) => error!("Failed to download document {}: {}", message_id, e),
             }
             let _ = entity.update(cx, |app, cx| {
@@ -498,12 +531,9 @@ impl WhatsAppApp {
         let id = message_id.to_string();
 
         cx.spawn(async move |_entity: WeakEntity<Self>, cx| {
-            let saved = cx
-                .background_spawn(async move { save_to_downloads(&file_name, &data) })
-                .await;
-            match saved {
-                Ok(path) => info!("Saved {} to {}", id, path.display()),
-                Err(e) => warn!("Failed to save {}: {}", id, e),
+            match hand_to_user(cx, file_name, data).await {
+                Ok(where_it_went) => info!("Saved {id} to {where_it_went}"),
+                Err(e) => warn!("Failed to save {id}: {e}"),
             }
         })
         .detach();
@@ -672,6 +702,19 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
+        // Before the download, not after the decode. Fetching a clip this
+        // build cannot decode spends the whole WhatsApp download and the
+        // loopback transfer to reach an answer that was fixed when the binary
+        // was built.
+        if !crate::video::CAN_DECODE {
+            self.video_players
+                .entry(message_id)
+                .or_default()
+                .set_error("Video cannot be played in the browser".to_string());
+            cx.notify();
+            return;
+        }
+
         let Some(client) = &self.client else {
             warn!("Cannot download video: client is unavailable");
             return;
@@ -756,7 +799,8 @@ impl WhatsAppApp {
                                 let audio_for_play = audio;
                                 cx.spawn(async move |entity: WeakEntity<Self>, cx| {
                                     // Wait one frame (~16ms at 60fps) for GPUI to decode the first frame
-                                    smol::Timer::after(std::time::Duration::from_millis(16)).await;
+                                    crate::platform::sleep(std::time::Duration::from_millis(16))
+                                        .await;
 
                                     let _ = entity.update(cx, |app, cx| {
                                         // Skip autoplay when the user started
@@ -820,5 +864,24 @@ impl WhatsAppApp {
         .detach();
 
         cx.notify();
+    }
+}
+
+/// Put a file where the user keeps things, on whichever thread can.
+///
+/// The desktop write is blocking I/O and belongs off the UI thread. The web
+/// one reaches for `document`, which exists on one thread only — and gpui's
+/// background executor is a real worker there — so it has to stay. One place
+/// asks; the call sites above do not care.
+async fn hand_to_user(
+    cx: &mut gpui::AsyncApp,
+    file_name: String,
+    data: std::sync::Arc<Vec<u8>>,
+) -> Result<String, String> {
+    if crate::platform::download::SAVES_OFF_THREAD {
+        cx.background_spawn(async move { crate::platform::download::save(&file_name, &data) })
+            .await
+    } else {
+        crate::platform::download::save(&file_name, &data)
     }
 }

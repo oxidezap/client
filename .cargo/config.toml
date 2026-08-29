@@ -1,4 +1,17 @@
 [env]
+# The C the wasm build links, which is SQLite's amalgamation.
+#
+# `--shared-memory` under the wasm target below is not optional — gpui_web
+# runs its executor on real workers — and the linker refuses it against any
+# object not built for threads: "--shared-memory is disallowed by sqlite3.o
+# because it was not compiled with 'atomics' or 'bulk-memory' features". So
+# the C is built with them too. They say nothing about SQLite's own locking,
+# which stays off (`SQLITE_THREADSAFE=0` in that crate): one agent owns the
+# database, and these are about what the *module* may do rather than what the
+# library may be asked to do.
+#
+# `cc` reads this per target, so it reaches the wasm build and nothing else.
+CFLAGS_wasm32_unknown_unknown = "-matomics -mbulk-memory"
 # Trim bundled-SQLite subsystems nothing here touches. FTS5 stays: the chat
 # store's `search` feature builds its index on it. Shared cache stays:
 # sqlite-storage's in-memory mode shares one DB across the pool via
@@ -28,4 +41,33 @@ rustflags = [
     # Drop the legacy SysV .hash section; glibc has preferred .gnu.hash since
     # 2.5 and lld emits both by default.
     "-Clink-arg=-Wl,--hash-style=gnu",
+]
+
+# The web front end. Everything here is what `gpui_web` requires of a page: it
+# runs its background executor on real workers, which on wasm means threads
+# over a `SharedArrayBuffer` — so the module has to be built with the atomics
+# proposal on, import its memory rather than define it, and export the thread
+# local symbols the worker bootstrap initializes. Without these the module
+# links, loads, and then has no executor.
+#
+# `build-std` is deliberately NOT set here. It has to be passed on the command
+# line (`-Z build-std=std,panic_abort`, which `web/build.sh` and the Pages
+# workflow both do), because a `[unstable]` table in this file applies to
+# every build — including the native one, which is meant to stay on stable.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    # Web Locks, which is how one tab claims the account the way a daemon
+    # claims a directory. The API is shipped in every browser that matters;
+    # what is unstable is `web-sys`'s binding for it, and this is the flag
+    # that crate asks for. Contained to this target, like everything else
+    # here.
+    "--cfg", "web_sys_unstable_apis",
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--max-memory=1073741824",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__tls_base",
 ]

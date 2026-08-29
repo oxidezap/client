@@ -9,10 +9,40 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+log = { workspace = true }
 oxidezap-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
+
+# The write half of every transport is a `Link`, and on the web that is a
+# queue into the task holding the socket rather than the socket itself. On a
+# byte stream it is a mutex, which needs nothing.
+[target.'cfg(target_family = "wasm")'.dependencies]
+# A oneshot to say the socket closed, and `or` to race the writer's receive
+# against it: a writer parked on a receive is not woken by a closed socket.
+futures-channel = "0.3"
+futures-lite = "2"
+js-sys = "0.3"
+tokio = { workspace = true, features = ["sync"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "AbortController",
+    "AbortSignal",
+    "CloseEvent",
+    "Event",
+    "Location",
+    "MessageEvent",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Url",
+    "WebSocket",
+    "Document",
+    "Element",
+    "Window",
+] }
 
 # The uid for the `TMPDIR` fallback, and the peer's uid to check that the
 # daemon answering is ours.

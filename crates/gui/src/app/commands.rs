@@ -397,8 +397,8 @@ impl WhatsAppApp {
             return;
         };
         match crate::theme::config::save(&settings.draft) {
-            Ok(path) => {
-                info!("Wrote theme to {}", path.display());
+            Ok(location) => {
+                info!("Wrote theme to {location}");
                 // Cleared *before* the copy, or `original` keeps the warnings
                 // the save just made untrue: reverting in the same session, or
                 // closing and reopening Settings, resurrected complaints about
@@ -407,7 +407,7 @@ impl WhatsAppApp {
                 settings.original = settings.draft.clone();
             }
             Err(err) => {
-                error!("Could not write theme.json: {err}");
+                error!("Could not save the theme: {err}");
                 settings.draft.problems = vec![format!("could not save: {err}")];
             }
         }

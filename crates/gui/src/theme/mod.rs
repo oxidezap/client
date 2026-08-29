@@ -26,9 +26,6 @@ pub mod config;
 pub mod metrics;
 pub mod palette;
 
-use std::path::PathBuf;
-use std::time::SystemTime;
-
 use gpui::{App, Global, Hsla, Pixels, Size, rgb};
 
 pub use config::ThemeSettings;
@@ -54,15 +51,15 @@ pub struct ProductTheme {
     /// Whatever the config file asked for that could not be honoured. Empty
     /// when the file is absent or fully applied.
     pub problems: Vec<String>,
-    /// Where the file lives, or `None` when there is no config directory to
-    /// look in.
-    pub path: Option<PathBuf>,
-    /// Last-modified stamp the current palette was read from, so an edit made
-    /// outside the app can be noticed without re-parsing every tick. Moved
-    /// only by a read of the file: an install of settings this process
-    /// already had must carry the old stamp forward, or it claims to have
+    /// Where the theme document is kept, or `None` when there is nowhere to
+    /// keep one. A description rather than a path: on the web it is not one.
+    pub location: Option<String>,
+    /// The document's version when the current palette was read from it, so
+    /// an edit made outside the app can be noticed without re-parsing every
+    /// tick. Moved only by a read: an install of settings this process
+    /// already had must carry the old version forward, or it claims to have
     /// read an edit it never looked at.
-    pub loaded_at: Option<SystemTime>,
+    pub loaded_at: Option<config::Revision>,
 }
 
 impl Global for ProductTheme {}
@@ -72,9 +69,9 @@ impl ProductTheme {
         settings: ThemeSettings,
         fit: f32,
         metrics: Metrics,
-        loaded_at: Option<SystemTime>,
+        loaded_at: Option<config::Revision>,
     ) -> Self {
-        let path = config::config_path();
+        let location = config::config_location();
         Self {
             metrics,
             base_font_size: settings.font_size,
@@ -82,7 +79,7 @@ impl ProductTheme {
             palette: settings.palette,
             preset: settings.preset,
             problems: settings.problems,
-            path,
+            location,
             loaded_at,
         }
     }
@@ -133,9 +130,7 @@ pub fn init(cx: &mut App) {
     // is being parsed then shows a newer time than this one and is picked up
     // by the next poll, where a stamp taken afterwards would have claimed to
     // have already read it.
-    let loaded_at = config::config_path()
-        .as_deref()
-        .and_then(config::modified_at);
+    let loaded_at = config::revision();
     let settings = config::load();
     for problem in &settings.problems {
         log::warn!("theme.json: {problem}");
@@ -188,13 +183,13 @@ pub fn fit_to_viewport(viewport: Size<Pixels>, cx: &mut App) -> bool {
 /// The stamp is passed in rather than taken from the file here, because only
 /// a *read* of the file may claim to have read it: a reinstall of settings
 /// this process already had — a viewport fit crossing a step, a preset picked
-/// in the editor — that stamped itself with the file's current time would
+/// in the editor — that stamped itself with the document's current version would
 /// answer "already loaded" for an edit it never looked at, and
 /// [`reload_if_changed`] would skip it for the life of the process.
 fn install_resolved(
     settings: ThemeSettings,
     fit: f32,
-    loaded_at: Option<SystemTime>,
+    loaded_at: Option<config::Revision>,
     cx: &mut App,
 ) {
     // Resolved once and handed to both. `Metrics` is what bounds a base font
@@ -213,7 +208,7 @@ fn install_resolved(
 ///
 /// No file means nothing can change, and the poll can stop.
 pub fn watches_a_file(cx: &App) -> bool {
-    cx.global::<ProductTheme>().path.is_some()
+    cx.global::<ProductTheme>().location.is_some()
 }
 
 /// Reinstall the theme if the file changed on disk since it was last read.
@@ -225,14 +220,14 @@ pub fn watches_a_file(cx: &App) -> bool {
 ///
 /// Returns whether the theme was replaced, so the caller knows to refresh.
 pub fn reload_if_changed(cx: &mut App) -> bool {
-    let Some(path) = cx.global::<ProductTheme>().path.clone() else {
+    if cx.global::<ProductTheme>().location.is_none() {
         return false;
-    };
-    let modified = config::modified_at(&path);
+    }
+    let modified = config::revision();
     if modified == cx.global::<ProductTheme>().loaded_at {
         return false;
     }
-    let settings = config::load_from(&path);
+    let settings = config::load();
     for problem in &settings.problems {
         log::warn!("theme.json: {problem}");
     }

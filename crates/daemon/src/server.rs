@@ -5,24 +5,28 @@
 //! through [`StateHub`], which is what keeps two clients from racing each
 //! other into an inconsistent view.
 
+#[cfg(not(target_family = "wasm"))]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use oxidezap_ipc::{
     CallAction, ClientRequest, DaemonMessage, PROTOCOL_VERSION, ProtocolError, Request, RequestId,
-    endpoint_path, lock_path, state_dir,
 };
+#[cfg(not(target_family = "wasm"))]
+use oxidezap_ipc::{endpoint_path, lock_path, state_dir};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf,
     WriteHalf,
 };
 use tokio::sync::broadcast::error::RecvError;
 
+#[cfg(not(target_family = "wasm"))]
 use crate::listener::Listener;
 use crate::session_bridge::{Action, CommandOutcome, Commands, Outbox, SessionCommand};
 use crate::state::StateHub;
 
+#[cfg(not(target_family = "wasm"))]
 /// This process's claim on being *the* daemon for this user.
 ///
 /// Taken before anything touches the account. Holding it is what makes a
@@ -32,6 +36,7 @@ pub struct Claim {
     _lock: StartupLock,
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Prepare the socket directory and take the per-user lock.
 ///
 /// Separate from [`run`], and called first, for two reasons that both come
@@ -70,6 +75,20 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// silently dropped connection, so the client can tell why.
 pub const MAX_CLIENTS: usize = 32;
 
+/// The admission cap, shared by every transport that serves front ends.
+///
+/// One count across all of them, not one each: the descriptors, the tasks and
+/// the per-connection buffers come out of the same process however a client
+/// arrived. A second endpoint with a cap of its own would double what a
+/// reconnect loop can hold open.
+pub type ClientSlots = Arc<tokio::sync::Semaphore>;
+
+/// A fresh set of them.
+#[must_use]
+pub fn client_slots() -> ClientSlots {
+    Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS))
+}
+
 /// How many frames may queue for one connection's own answers.
 ///
 /// Only downloads land here, and a front end asks for as many as it has
@@ -78,6 +97,7 @@ pub const MAX_CLIENTS: usize = 32;
 /// bytes are already in the cache.
 const OUTBOX_CAPACITY: usize = 64;
 
+#[cfg(not(target_family = "wasm"))]
 /// Serve until the future is dropped.
 ///
 /// Borrows the claim rather than taking it: this future is a `select!` branch
@@ -89,12 +109,11 @@ pub async fn run(
     hub: Arc<StateHub>,
     plugins: Arc<oxidezap_plugin_host::Plugins>,
     commands: Commands,
+    slots: ClientSlots,
 ) -> Result<()> {
     let path = claim.path.clone();
     let mut listener = Listener::bind(&path)?;
     log::info!("listening on {}", path.display());
-
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
 
     loop {
         let stream = match listener.accept().await {
@@ -109,7 +128,7 @@ pub async fn run(
                 // Without this, an EMFILE that persists spins the loop at
                 // full speed; the descriptors it is waiting on are freed by
                 // other tasks, which need to be scheduled.
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                oxidezap_session::sleep(std::time::Duration::from_millis(50)).await;
                 continue;
             }
             Err(e) => return Err(e).context("accepting a client"),
@@ -134,6 +153,7 @@ pub async fn run(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Whether an `accept` failure describes one connection rather than the
 /// listener.
 fn is_transient_accept_error(e: &std::io::Error) -> bool {
@@ -144,19 +164,40 @@ fn is_transient_accept_error(e: &std::io::Error) -> bool {
     ) || matches!(e.raw_os_error(), Some(EMFILE | ENFILE))
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Out of descriptors, for this process and for the machine. Spelled out
 /// because neither has an `std::io::ErrorKind`: both land in
 /// `Uncategorized`, which is unstable to match on.
 const EMFILE: i32 = 24;
+#[cfg(not(target_family = "wasm"))]
 const ENFILE: i32 = 23;
 
+#[cfg(not(target_family = "wasm"))]
 /// Tell a client we are full, then close.
+///
+/// Public because the web bridge refuses the same way and for the same
+/// reason: a refused client should learn why rather than watch its
+/// connection drop.
 ///
 /// Spawned rather than written inline: the accept loop must not wait on a
 /// peer. The task is still bounded — one small frame into a socket nobody has
 /// had a chance to fill, then done — so a refused client costs a write, not a
 /// slot.
-async fn reject<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
+/// The refusal, as a frame, for a transport that has to deliver it itself.
+///
+/// The socket listener writes it onto the stream; the web bridge has to
+/// complete a WebSocket upgrade first, so it needs the frame rather than the
+/// writing.
+///
+/// # Errors
+///
+/// The frame could not be serialized.
+pub(crate) fn too_many_clients_frame() -> Result<String> {
+    error_frame(None, ProtocolError::TooManyClients { limit: MAX_CLIENTS })
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) async fn reject<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
     log::warn!("refusing a client: already serving {MAX_CLIENTS}");
     let (_, mut writer) = tokio::io::split(stream);
     if let Ok(frame) = error_frame(None, ProtocolError::TooManyClients { limit: MAX_CLIENTS }) {
@@ -164,6 +205,7 @@ async fn reject<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// An exclusive lock on this user's daemon, released when the file closes.
 struct StartupLock {
     _file: std::fs::File,
@@ -221,11 +263,12 @@ fn acquire_startup_lock(path: &Path) -> Result<StartupLock> {
     Ok(StartupLock { _file: file })
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(not(any(unix, windows)), not(target_family = "wasm")))]
 fn acquire_startup_lock(_path: &Path) -> Result<StartupLock> {
     anyhow::bail!("no way to take a startup lock on this platform")
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Create the socket directory, or verify an existing one is safe to use.
 ///
 /// The socket carries control of a WhatsApp session. Under `XDG_RUNTIME_DIR`
@@ -280,12 +323,13 @@ fn prepare_state_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[cfg(unix)]
 fn current_uid() -> u32 {
     rustix::process::getuid().as_raw()
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_family = "wasm")))]
 fn prepare_state_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
 }
@@ -296,7 +340,7 @@ fn prepare_state_dir(dir: &Path) -> Result<()> {
 /// give a long-lived front end an artificial EOF once its small, valid
 /// requests happened to add up. Requests are tiny; a megabyte is far past any
 /// legitimate one and still cheap to refuse.
-const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Read one newline-delimited frame, bounded independently of every other.
 ///
@@ -378,7 +422,17 @@ enum FrameRead {
     TooLong,
 }
 
-async fn serve_client<S>(
+/// One front end, from the handshake to the close.
+///
+/// Generic over the stream, and reached from two places: the local endpoint's
+/// accept loop, and the web bridge — which hands it one end of an in-process
+/// duplex and moves the lines across a WebSocket. Everything about the
+/// protocol lives here, so the second transport adds no second copy of it.
+///
+/// # Errors
+///
+/// The connection ended, or the peer said something unrecoverable.
+pub(crate) async fn serve_client<S>(
     stream: S,
     hub: Arc<StateHub>,
     plugins: Arc<oxidezap_plugin_host::Plugins>,
@@ -399,17 +453,17 @@ where
     // a task and a descriptor and given nothing back. A peer that connects
     // and says nothing would otherwise sit here for as long as it liked, and
     // a reconnect loop doing it would take the listener down with it.
-    let attached = match tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
+    let attached = match oxidezap_session::with_timeout(
         handshake(&mut reader, &mut writer, &mut buf),
+        HANDSHAKE_TIMEOUT,
     )
     .await
     {
-        Ok(result) => match result? {
+        Some(result) => match result? {
             Some(attached) => attached,
             None => return Ok(()),
         },
-        Err(_) => {
+        None => {
             log::debug!("client never completed its handshake within {HANDSHAKE_TIMEOUT:?}");
             let frame = malformed("no hello within the handshake window")?;
             // Best effort: a peer that never spoke may not be reading either.
@@ -1079,6 +1133,19 @@ fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<St
 
 /// The store's footprint: the database plus the journal files SQLite would
 /// replay into it. All three are the same data, so all three are counted.
+///
+/// # Zero on a page, deliberately
+///
+/// A browser's database is in a VFS rather than on a filesystem, so every
+/// `metadata` here fails and the sum is 0 — which Settings shows as `0 B`.
+/// Wrong, and it is the least bad of the three answers available. The size is
+/// `page_count * page_size`, which needs a query, and this handler is
+/// synchronous by the shape of the protocol; the VFS's own `export_db` would
+/// answer by copying the whole database into memory, which is precisely what
+/// everything else on this side goes out of its way not to do. Fixing it
+/// properly means an async usage query through `session/store/`, and that is
+/// a wider change than a number in a settings pane is worth today. Recorded
+/// in `AGENTS.md` under what is left.
 fn database_bytes() -> u64 {
     let base = oxidezap_session::resolve_database_path();
     ["", "-wal", "-shm"]
@@ -1802,8 +1869,28 @@ mod tests {
 
     /// Two daemons starting together can both see a stale socket; the lock is
     /// what stops the second from unlinking the first's freshly bound one.
+    ///
+    /// # Why the release is waited for rather than asserted outright
+    ///
+    /// `flock` is released when the *last* descriptor on the open file
+    /// description closes, and a `fork` anywhere in this process duplicates
+    /// every one of them: between the fork and the exec that clears them,
+    /// a child holds a copy of this lock and closing ours releases nothing.
+    /// Measured outside the suite at ~5% of attempts against a single
+    /// spawning thread, and it is what failed this test on macOS while Linux
+    /// got away with it.
+    ///
+    /// [`crate::one_at_a_time`] keeps this away from the tests that spawn,
+    /// which is worth doing on its own — but it cannot cover a fork this
+    /// crate does not make, and a test that fails when some library forks
+    /// beside it is testing the wrong thing. The property is that the lock
+    /// does not *outlive its holder*: a copy in a child that is microseconds
+    /// from exec is not the holder, so the wait is what separates the two.
+    /// A lock genuinely never released still fails, which is the bug this
+    /// test exists for.
     #[test]
     fn the_startup_lock_is_exclusive() {
+        let _exclusive = crate::one_at_a_time();
         let dir = std::env::temp_dir().join(format!("oxidezap-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1839,16 +1926,25 @@ mod tests {
         // The library's clock, which is what this repo uses everywhere: a
         // test that moved time would move this with it.
         let deadline = wacore::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last = None;
         let regained = loop {
             match acquire_startup_lock(&socket) {
                 Ok(lock) => break Some(lock),
-                Err(_) if wacore::time::Instant::now() < deadline => {
+                Err(e) if wacore::time::Instant::now() < deadline => {
+                    last = Some(e);
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                Err(_) => break None,
+                Err(e) => {
+                    last = Some(e);
+                    break None;
+                }
             }
         };
-        assert!(regained.is_some(), "lock outlived its holder");
+        assert!(
+            regained.is_some(),
+            "lock outlived its holder: {}",
+            last.map_or_else(|| "no reason given".to_string(), |e| e.to_string())
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

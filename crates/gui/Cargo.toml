@@ -8,6 +8,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+# One entry point, two targets. Built for the host this is the desktop
+# window; built for `wasm32-unknown-unknown` and run through `wasm-bindgen`
+# the same `main` becomes the module's start function, which is what trunk
+# builds from `web/index.html`.
 [[bin]]
 name = "oxidezap"
 path = "src/main.rs"
@@ -15,7 +19,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["std", "clock"] }
-env_logger = "0.11"
 
 # UI framework: GPUI upstream + gpui-component. gpui-component leaves its gpui
 # dep unpinned (tracks zed HEAD), and cargo forbids [patch]-pinning a source to
@@ -25,14 +28,12 @@ env_logger = "0.11"
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component.git" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Ordered maps for deterministic cache eviction
 indexmap = "2"
 log = { workspace = true }
 mp4 = "0.14"
-openh264 = "0.9" # H.264 software decoder
 
 oxidezap-audio = { workspace = true }
 oxidezap-core = { workspace = true }
@@ -41,13 +42,19 @@ oxidezap-core = { workspace = true }
 oxidezap-ipc = { workspace = true }
 portable-atomic = { workspace = true }
 qrcode = "0.14"
-rust-embed = "8"
+# `include-exclude` is not a default feature, and the icon set is selected
+# with `#[include]`. It resolves on the host through another crate in the
+# graph turning it on, and nothing does that for the web — where the same
+# attributes then fail to compile rather than being quietly ignored.
+rust-embed = { version = "8", features = ["include-exclude", "interpolate-folder-path"] }
 # theme.json: the palette is data, so it needs a schema and a parser.
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 smallvec = "1"
-# Async utilities (GPUI-compatible timers)
-smol = "2"
+# Racing two futures, and nothing else. The executor-free half of `smol`,
+# which is all the window ever used it for besides timers — and the only half
+# that builds for a page, since `smol`'s timer is an epoll loop.
+futures-lite = { version = "2", default-features = false, features = ["std"] }
 # Decodes the AAC track lifted out of an MP4 video. The container is demuxed by
 # the `mp4` crate and voice notes are Opus (handled in `oxidezap-audio`), so
 # only the AAC codec and the ISO-MP4 reader are reachable from here. Every
@@ -57,9 +64,59 @@ symphonia = { version = "0.6", default-features = false, features = ["aac", "iso
 # needs a runtime to drive it.
 tokio = { workspace = true, features = ["sync"] }
 
-# `wacore::time` rather than std clocks, which /clippy.toml disallows.
+# `wacore::time` rather than std clocks, which /clippy.toml disallows, and
+# `Jid` parsing for the header. The satellites directly rather than through
+# `whatsapp-rust`, which re-exports both: a front end has not owned a session
+# since the daemon took it over, and depending on the client to reach two type
+# modules dragged the whole Tokio runtime, transport and VoIP stack in behind
+# them — none of which a browser has, and none of which the window ever
+# called.
 wacore = { workspace = true }
-whatsapp-rust = { workspace = true }
+wacore-binary = { workspace = true }
+
+# The desktop window. Everything here needs an operating system underneath it:
+# a windowing system to draw on, a sound card to open, a C decoder to link, an
+# environment variable to read a log filter out of.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+env_logger = "0.11"
+# Timers, on a platform that has a reactor to run them on.
+smol = "2"
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+openh264 = "0.9" # H.264 software decoder
+
+# The same window as a page. `gpui_platform` picks the web backend by target,
+# so the dependency differs only in the features a browser has no use for —
+# there is no font-kit, no X11 and no Wayland behind a canvas.
+[target.'cfg(target_family = "wasm")'.dependencies]
+# The daemon, as a library, because in a page it is not a process: there is no
+# socket to reach one over and nothing to start. `embedded::start` is the same
+# state hub, bridge and protocol a desktop front end talks to across a socket,
+# running in this address space — so the rule this looks like it breaks holds
+# exactly as before. There is one session per user, and the window owns none
+# of it.
+oxidezap-daemon = { workspace = true }
+# One tab has to be able to tell itself apart from another; see `front_end_id`.
+getrandom = { workspace = true }
+js-sys = "0.3"
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "console",
+    "Navigator",
+    "UserActivation",
+    "Blob",
+    "BlobPropertyBag",
+    "Document",
+    "Element",
+    "HtmlAnchorElement",
+    "HtmlElement",
+    "Location",
+    "Storage",
+    "Url",
+    "Performance",
+    "Window",
+] }
 
 [lints]
 workspace = true

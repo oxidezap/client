@@ -200,12 +200,33 @@ enum Answer {
 /// session would be torn down by `Drop` with nobody waiting for its thread to
 /// disconnect and close SQLite. Owning the signal is what makes the teardown
 /// below reachable on every exit path.
+/// Whether the session is on its way out and must not be handed to anybody
+/// new.
+///
+/// `ForgetSession` is deferred rather than done where it is accepted — the
+/// file to delete is the one the session still has open — so between the
+/// command being taken and the loop ending, this bridge is alive, reading
+/// commands, and about to wipe the store. A caller that measured "alive" by
+/// the command channel being open would attach to it and be served the
+/// account it just asked to have deleted.
+///
+/// Process-global because a process has one session; the one reader is
+/// [`crate::embedded`], which cannot see this bridge's own state.
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the running session has begun going away.
+pub fn stopping() -> bool {
+    STOPPING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub async fn run(
     hub: Arc<StateHub>,
     plugins: Arc<oxidezap_plugin_host::Plugins>,
     mut commands: tokio::sync::mpsc::Receiver<SessionCommand>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    // This session is new, whatever the last one was doing.
+    STOPPING.store(false, std::sync::atomic::Ordering::SeqCst);
     let mut client = WhatsAppClient::new().context("opening the local store")?;
     let mut events = client
         .start()
@@ -266,23 +287,15 @@ pub async fn run(
 
     // Reached whether the session ended on its own or a signal arrived.
     //
-    // On a blocking thread, for two reasons that both end in a panic
-    // otherwise: joining the session thread blocks, and dropping the client
-    // drops the tokio runtime it owns, which tokio refuses inside an async
-    // context ("Cannot drop a runtime in a context where blocking is not
-    // allowed").
+    // Both of the things that would panic here — a join that blocks and the
+    // drop of a tokio runtime inside an async context — belong to the client
+    // rather than to this loop, so it does them: see `WhatsAppClient::close`.
     let grace = if bridge.forget {
         FORGET_GRACE
     } else {
         SHUTDOWN_GRACE
     };
-    let closed = match tokio::task::spawn_blocking(move || close(client, grace)).await {
-        Ok(closed) => closed,
-        Err(e) => {
-            log::error!("session teardown did not complete: {e}");
-            false
-        }
-    };
+    let closed = client.close(grace).await;
 
     // Before the plugins are joined, and this ordering is the whole of it: a
     // plugin thread that issued a command is parked on its answer, and the
@@ -295,13 +308,22 @@ pub async fn run(
 
     // Plugins next, and for exactly the reason the publisher is joined
     // below: one still in a handler can write its settings file, and that
-    // file sits in a directory the wipe is about to remove. Joining is
-    // blocking, so it goes on a blocking thread like the rest of the
-    // teardown.
+    // file sits in a directory the wipe is about to remove.
+    //
+    // Through `unblock` rather than `spawn_blocking`, because this line is
+    // reached in a page too: a browser has no blocking pool, so the call
+    // that was meant to join threads would instead panic here — before the
+    // publisher is joined and before the store is deleted, which is the
+    // whole of what this teardown exists to order. `unblock` is a hand-off
+    // on a desktop and a plain call in a page, which is right on both: what
+    // it runs there is `Plugins::none`, with no thread to join.
     {
         let plugins = Arc::clone(&bridge.plugins);
-        if let Err(e) = tokio::task::spawn_blocking(move || plugins.shutdown()).await {
-            log::error!("the plugin threads did not finish: {e}");
+        if oxidezap_session::unblock(move || plugins.shutdown())
+            .await
+            .is_err()
+        {
+            log::error!("the plugin threads did not finish");
         }
     }
 
@@ -309,10 +331,8 @@ pub async fn run(
     // one is: the publisher writes this account's media, and a wipe that
     // starts while it is still draining its queue deletes a directory that
     // is about to be written into again.
-    if let Some(publisher) = bridge.stop_publishing()
-        && let Err(e) = tokio::task::spawn_blocking(move || publisher.join()).await
-    {
-        log::error!("the publish thread did not finish: {e}");
+    if let Some(publisher) = bridge.stop_publishing() {
+        publisher.join().await;
     }
 
     /// Whether the record of what the user allowed each plugin is gone.
@@ -364,7 +384,7 @@ pub async fn run(
              Start oxidezap again and repeat \"clear data and pair again\"."
         );
     } else if bridge.forget {
-        match oxidezap_session::wipe_local_state() {
+        match oxidezap_session::wipe_local_state().await {
             Ok(()) => log::info!("local state wiped; pair again on the next start"),
             Err(e) => log::error!("could not wipe local state: {e}"),
         }
@@ -408,20 +428,6 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// is to skip the wipe rather than to race it.
 const FORGET_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Stop the session and wait for its thread, so the socket is closed and
-/// SQLite is flushed before the process goes away.
-///
-/// Returns whether it actually finished. On the ordinary path that answer is
-/// only worth logging; on the forget path it decides whether anything may be
-/// deleted at all.
-pub fn close(mut client: WhatsAppClient, grace: std::time::Duration) -> bool {
-    let closed = client.shutdown_and_join(grace);
-    if !closed {
-        log::warn!("session did not finish closing within {grace:?}");
-    }
-    closed
-}
-
 /// Everything the event loop carries between one event and the next.
 struct Bridge {
     hub: Arc<StateHub>,
@@ -447,7 +453,7 @@ struct Bridge {
     /// The publisher, kept joinable rather than detached. It writes the media
     /// a session event carries, and forgetting the session deletes exactly
     /// the directory it writes into.
-    publisher: Option<std::thread::JoinHandle<()>>,
+    publisher: Option<crate::publisher::Handle>,
     reads: ReadTracker,
     in_flight: Arc<Semaphore>,
     /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
@@ -461,24 +467,8 @@ impl Bridge {
         // is the event loop draining the session's own unbounded channel, so a
         // limit here could only stall the loop this exists to unblock or drop
         // events no client could then recover.
-        let (publish, mut queue) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
-        let hub_for_publisher = Arc::clone(&hub);
-        let publisher = std::thread::Builder::new()
-            .name("oxidezap-publish".to_string())
-            .spawn(move || {
-                while let Some(mut event) = queue.blocking_recv() {
-                    externalize_media(&mut event);
-                    match serde_json::to_string(&DaemonMessage::Session {
-                        event: Box::new(event),
-                    }) {
-                        Ok(frame) => hub_for_publisher.publish_session(frame),
-                        Err(e) => log::error!("dropping unserializable session event: {e}"),
-                    }
-                }
-            })
-            // A daemon that cannot spawn a thread is a daemon that will not
-            // get far; failing here beats doing the writes on a worker.
-            .expect("spawning the publish thread");
+        let (publish, queue) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
+        let publisher = crate::publisher::start(Arc::clone(&hub), queue);
 
         Self {
             hub,
@@ -499,7 +489,7 @@ impl Bridge {
     /// be in there. Deleting the directory while that thread is working
     /// through the backlog recreates the very bytes the wipe exists to
     /// remove, moments after it finishes.
-    fn stop_publishing(&mut self) -> Option<std::thread::JoinHandle<()>> {
+    fn stop_publishing(&mut self) -> Option<crate::publisher::Handle> {
         // The thread ends when its last sender is gone, and this is it.
         self.publish = None;
         self.publisher.take()
@@ -602,6 +592,14 @@ impl Bridge {
             // missed.
             UiEvent::CallEndedElsewhere(id) => self.hub.calls(|s| {
                 s.end_elsewhere(id);
+            }),
+            // Marked before it is ended, because ending is what publishes the
+            // removal and the explanation has to be in that same frame — a
+            // reason arriving after the record it was meant to change is no
+            // reason at all.
+            UiEvent::CallUnrecorded(id) => self.hub.calls(|s| {
+                s.mark_unrecorded(id);
+                s.end(id);
             }),
             UiEvent::AccountUpdated { name, jid, lid } => {
                 self.hub.set_account(oxidezap_ipc::AccountIdentity {
@@ -1037,6 +1035,10 @@ impl Bridge {
             // that, and reusing that path is what makes the ordering hold.
             Action::ForgetSession => {
                 self.forget = true;
+                // Said out loud, because somebody else has to hear it: on a
+                // page a front end reconnects the instant it sends this, and
+                // whatever answers must not be the session that is leaving.
+                STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
                 CommandOutcome::Accepted
             }
         }
@@ -1057,7 +1059,11 @@ impl Bridge {
         let key = crate::media::download_key(&media.file_enc_sha256);
         // Already here: the same media shared into two chats, or a front end
         // that restarted. No network, no permit, no wait.
-        if crate::media::has(&key) {
+        //
+        // Claimed rather than asked about, because the next line promises it:
+        // an entry nothing is holding can be swept between this answer and
+        // the front end reading it. See `media::claim`.
+        if crate::media::claim(&key) {
             answer_now(&answer_to, downloaded(id, Ok(key)));
             return CommandOutcome::Accepted;
         }
@@ -1066,9 +1072,9 @@ impl Bridge {
             return too_busy();
         };
         let bytes = client.download_downloadable_media(media);
-        tokio::spawn(async move {
+        oxidezap_session::spawn(async move {
             let result = match bytes.await {
-                Ok(Ok(bytes)) => crate::media::put(&key, &bytes).map_err(|e| e.to_string()),
+                Ok(Ok(bytes)) => crate::media::put_owned(&key, bytes).map_err(|e| e.to_string()),
                 Ok(Err(e)) => Err(e),
                 // The session went away mid-download.
                 Err(_) => Err("the session stopped before the download finished".to_string()),
@@ -1336,8 +1342,8 @@ impl Bridge {
 /// where it was taken; a task that outlives this one holds it until every
 /// handle has resolved. `JoinHandle` errors are the session's runtime going
 /// away, which is a shutdown, not something to report.
-fn hold<const N: usize>(permit: OwnedSemaphorePermit, work: [tokio::task::JoinHandle<()>; N]) {
-    tokio::spawn(async move {
+fn hold<const N: usize>(permit: OwnedSemaphorePermit, work: [oxidezap_session::Task<()>; N]) {
+    oxidezap_session::spawn(async move {
         for handle in work {
             let _ = handle.await;
         }
@@ -1360,7 +1366,7 @@ fn too_busy() -> CommandOutcome {
 /// Writing is skipped for anything already cached, which is most of it after
 /// the first attach: a message's media is addressed by its message id, and a
 /// message's media does not change.
-fn externalize_media(event: &mut UiEvent) {
+pub(crate) fn externalize_media(event: &mut UiEvent) {
     // Read once for the whole event: this runs on the publish thread behind
     // an unbounded queue, so a clear can land between being handed the event
     // and writing its media. See `media::put_since`.
@@ -1452,7 +1458,7 @@ fn answer_now(answer_to: &Outbox, frame: String) {
     use tokio::sync::mpsc::error::TrySendError;
     if let Err(TrySendError::Full(frame)) = answer_to.try_send(frame) {
         let outbox = answer_to.clone();
-        tokio::spawn(async move {
+        oxidezap_session::spawn(async move {
             let _ = outbox.send(frame).await;
         });
     }

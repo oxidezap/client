@@ -1,0 +1,135 @@
+//! The browser's store: IndexedDB, through the relaxed VFS.
+//!
+//! One name and no directory. The VFS *is* the namespace — it is private to
+//! this origin and holds nothing but our database — so a path would be a
+//! second naming scheme over a flat store that already has one.
+//!
+//! # Why this one and not OPFS
+//!
+//! SQLite's durable VFS on the web is OPFS through a synchronous access
+//! handle, and that handle exists in a dedicated worker and nowhere else.
+//! This one works in the window, which is where the session runs today, and
+//! it is the reason it can run there at all.
+//!
+//! What it costs is *when* a write lands rather than whether it does. The
+//! database is held in memory and changed blocks are written to IndexedDB
+//! after the fact, so a tab killed between a commit and its flush loses that
+//! commit — which for chat history is a message that comes back on the next
+//! hydration, and for Signal state is a ratchet that has to re-establish. The
+//! flush is observable (`WaitCommit`), so this is a window that can be closed
+//! rather than a guarantee that is gone.
+//!
+//! Moving the session into a worker and this to OPFS is the hardening, and it
+//! changes nothing above [`super`] — which is the whole reason that interface
+//! is shaped the way it is.
+
+use std::cell::OnceCell;
+
+use log::info;
+use sqlite_wasm_rs::WasmOsCallback;
+use sqlite_wasm_vfs::relaxed_idb::{RelaxedIdbCfg, RelaxedIdbUtil, install};
+
+use super::DB_FILE;
+
+thread_local! {
+    /// The installed store, kept for the deletions [`wipe`] does.
+    ///
+    /// Thread-local rather than global because it is neither `Send` nor
+    /// `Sync` — it holds JS objects — and because the whole arrangement rests
+    /// on one agent owning the database. SQLite is compiled here with
+    /// `SQLITE_THREADSAFE=0`, so a second thread reaching for this is not a
+    /// race to make unlikely; it is one to make impossible.
+    static STORE: OnceCell<RelaxedIdbUtil> = const { OnceCell::new() };
+}
+
+/// The database's name inside the store.
+pub fn database_path() -> String {
+    DB_FILE.to_string()
+}
+
+/// Install the VFS, make it the default, and read the database into memory.
+///
+/// Before any connection is opened, and once per agent. Both halves matter:
+/// SQLite chooses a VFS when a database is opened, so one installed
+/// afterwards would hold nothing while the open database sat in memory and
+/// vanished with the tab; and IndexedDB reads are asynchronous while SQLite's
+/// are not, so the file has to be there before the first query rather than
+/// fetched during it.
+///
+/// # Errors
+///
+/// The browser refused IndexedDB — a private window with storage disabled,
+/// or a quota already spent.
+pub async fn prepare() -> Result<(), String> {
+    let store = install::<WasmOsCallback>(&RelaxedIdbCfg::default(), true)
+        .await
+        .map_err(|e| format!("the browser would not open a store: {e:?}"))?;
+    store
+        .preload_db(vec![DB_FILE.to_string()])
+        .await
+        .map_err(|e| format!("the store is there but would not load: {e:?}"))?;
+    info!(
+        "opened the browser store, holding {} file(s)",
+        store.count()
+    );
+    // Kept for [`wipe`], and only the first one needs keeping: `install`
+    // registers the VFS under `vfs_name` once and every later call finds it
+    // registered and hands back another `RelaxedIdbUtil` over the *same*
+    // `&'static VfsAppData` — so a second handle is not a second store, and
+    // the one already here deletes out of the pool the newest preload filled.
+    // Which is why the refused `set` is discarded rather than repaired:
+    // `prepare` runs again after "clear data and pair again", and swapping
+    // handles there would be swapping a thing for itself.
+    STORE.with(|cell| {
+        let _ = cell.set(store);
+    });
+    Ok(())
+}
+
+/// Delete the local session.
+///
+/// Awaited to the flush, unlike an ordinary write: this one is followed by
+/// pairing a new device, and a delete still sitting in memory when the tab
+/// reloads would put the dead account straight back.
+pub async fn wipe() -> std::io::Result<()> {
+    let commit = STORE.with(|cell| {
+        let Some(store) = cell.get() else {
+            // Nothing installed, so nothing was ever written.
+            return Ok(None);
+        };
+        store
+            .delete_db(DB_FILE)
+            .map(Some)
+            .map_err(|e| std::io::Error::other(format!("could not remove {DB_FILE}: {e:?}")))
+    })?;
+    if let Some(commit) = commit {
+        commit
+            .await
+            .map_err(|e| std::io::Error::other(format!("the deletion did not land: {e:?}")))?;
+        info!("Removed {DB_FILE}");
+    }
+    Ok(())
+}
+
+/// How the database is opened here, which is one setting away from the
+/// defaults and not a matter of taste.
+///
+/// `PRAGMA synchronous` is refused by this VFS at anything but `off` — it
+/// answers the file-control with "relaxed-idb vfs only supports
+/// synchronous=off" — and the store's default asks for `normal`, so the
+/// connection was rejected while being configured and the page opened no
+/// database at all.
+///
+/// Refusing it is the honest thing for the VFS to do rather than a limitation
+/// to work around: `synchronous` is a promise about when a write has reached
+/// the disk, and this store *has no disk at the moment of the write*. The
+/// database is memory and the changed blocks go to IndexedDB afterwards, so
+/// there is no ordering here for the pragma to describe. Saying `off` is
+/// saying what is already true; the durability window is the module's own
+/// subject, above.
+pub fn settings() -> whatsapp_rust_sqlite_storage::SqliteStoreConfig {
+    whatsapp_rust_sqlite_storage::SqliteStoreConfig {
+        synchronous: whatsapp_rust_sqlite_storage::Synchronous::Off,
+        ..Default::default()
+    }
+}

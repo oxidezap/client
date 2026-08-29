@@ -1,0 +1,23 @@
+# The web build.
+#
+# Trunk drives cargo for `wasm32-unknown-unknown` and runs `wasm-bindgen` over
+# the result; `index.html` names the binary. Everything that is *not* trunk's
+# business — the atomics and shared-memory link flags gpui_web needs, and the
+# `build-std` that goes with them — lives in /.cargo/config.toml and in
+# `build.sh` beside this file, so `trunk build` and the Pages workflow are
+# running the same thing.
+
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+
+# What the deployed page gets from a service worker instead, because GitHub
+# Pages will not set headers. Locally there is no reason to make the browser
+# go through one: these are the real thing.
+[serve.headers]
+"Cross-Origin-Embedder-Policy" = "require-corp"
+"Cross-Origin-Opener-Policy" = "same-origin"

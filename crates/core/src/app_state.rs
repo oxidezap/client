@@ -93,6 +93,20 @@ pub enum AppState {
     /// ever, with the failure logged where nobody looks.
     Offline,
     Error(String),
+    /// This window may not hold the account, and no amount of waiting
+    /// changes that.
+    ///
+    /// Distinct from [`Error`](Self::Error) for the reason
+    /// [`LoggedOut`](Self::LoggedOut) is: that state is an outage, and the
+    /// screen it draws promises to keep trying. Here there is nothing to keep
+    /// trying — another tab holds this account, or this is a preview that has
+    /// not been told it may keep one — and the answer changes only when a
+    /// person does something. Drawing it as an outage would make two false
+    /// claims at once: that WhatsApp could not be reached, and that we are
+    /// still working on it.
+    Refused {
+        reason: String,
+    },
     /// The server ended the session (401 and friends). Distinct from
     /// [`Error`](Self::Error) because retrying is useless: the stored
     /// credentials are dead and only a fresh pairing can recover, which means

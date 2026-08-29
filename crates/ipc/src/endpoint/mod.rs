@@ -1,175 +1,92 @@
-//! Connecting to the daemon, on whatever local transport the platform has.
+//! Connecting to the daemon, on whatever transport this front end has.
 //!
-//! A Unix socket where there is one, a named pipe on Windows. Both are
-//! byte streams a client reads and writes with `std::io`, so everything above
-//! this — the framing, the requests, the whole protocol — is the same code on
-//! both, and a front end never mentions either.
+//! Two of them are byte streams a process opens — a Unix socket and a Windows
+//! named pipe — and live in [`stream`]. The third is a WebSocket, which is
+//! what a page has instead of either, and lives in [`web`].
 //!
-//! Blocking, and deliberately: a newline-delimited protocol over a local
-//! transport needs one thread to read and a lock to serialize writes, not a
-//! runtime. The daemon is the side that has thousands of things happening at
-//! once; a client has one.
-//!
-//! Those two threads run *at the same time*, which is a requirement on the
-//! transport rather than a detail of the caller — [`Endpoint::split`] is where
-//! it is written down, because a platform can quietly fail to provide it. See
-//! the `overlapped` module for the one that did.
+//! This module and `daemon/listener/` are the whole of the platform split
+//! (see /AGENTS.md): a transport is added *here*, so that the framing, the
+//! requests and the protocol above them stay written once. What the three
+//! share on the way out is [`crate::Link`]; what they do not share is the way
+//! in, because a process parks a thread in a read and a page is handed a
+//! callback, and pretending those are one shape would cost more than it saves.
 
-use std::io::{Read, Write};
+/// The transports an operating system provides.
+#[cfg(not(target_family = "wasm"))]
+mod stream;
+/// The transport a browser tab provides.
+#[cfg(target_family = "wasm")]
+pub mod web;
 
-#[cfg(windows)]
-mod overlapped;
+#[cfg(not(target_family = "wasm"))]
+pub use stream::{Endpoint, Reader, Writer};
 
-/// A connection to the daemon, before it is put to work.
+/// Whether a host names this machine.
 ///
-/// Not readable or writable itself: it becomes a [`Reader`] and a [`Writer`],
-/// and the point of making that a step is that the two are used from different
-/// threads at once. A transport that cannot do that is broken for this
-/// protocol, and there is now one place that says so.
-pub struct Endpoint(Inner);
-
-/// The half a reader thread parks in.
-pub struct Reader(Inner);
-
-/// The half everything else writes through, behind a lock.
-pub struct Writer(Inner);
-
-#[cfg(unix)]
-type Inner = std::os::unix::net::UnixStream;
-
-/// A named pipe, opened overlapped.
+/// A parsed hostname, so there is no port and no userinfo left to be confused
+/// by — and `localhost.example.com` is simply a different string.
 ///
-/// Windows has no `std` named-pipe client, and a pipe *is* openable by name
-/// with the ordinary file API — but that gives a synchronous handle, on which
-/// Windows serializes reads against writes and deadlocks this protocol. See
-/// [`overlapped`].
-#[cfg(windows)]
-type Inner = overlapped::Overlapped;
-
-impl Endpoint {
-    /// Connect to the daemon, or report why not.
-    ///
-    /// `ErrorKind::NotFound` and `ErrorKind::ConnectionRefused` both mean
-    /// "nothing is listening" — the first because a Unix socket is a
-    /// filesystem entry that may not exist, the second because it may exist
-    /// and be stale. A caller deciding whether to start a daemon should treat
-    /// them alike.
-    pub fn connect() -> std::io::Result<Self> {
-        let path = crate::endpoint_path().ok_or_else(|| {
-            std::io::Error::other("no per-user directory to look for the daemon in")
-        })?;
-        Self::connect_at(&path)
+/// The address half goes through `IpAddr::is_loopback` rather than a list of
+/// literals, because that is the test the *daemon* applies to the address it
+/// was told to bind: `--web 127.0.0.2:9527` is accepted there and the whole
+/// of `127.0.0.0/8` is loopback. Recognising only `127.0.0.1` here left a
+/// bridge the person had deliberately enabled unreachable from the browser
+/// while satisfying the daemon's own boundary. One rule, applied on both
+/// sides.
+/// Its one caller is the web endpoint; the tests below are why it lives here.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
     }
+    // Unwrapped, because `Url::hostname` hands back an IPv6 literal without
+    // its brackets while a hand-written host may keep them.
+    let named = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    named
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
 
-    /// Connect to an endpoint by name.
-    ///
-    /// [`connect`](Self::connect) is this with the daemon's own name. Taking
-    /// one is what lets a test stand up a real endpoint of its own — which
-    /// matters more than it sounds, because the difference between the two
-    /// platforms here is a runtime one that no amount of compiling catches.
-    pub fn connect_at(path: &std::path::Path) -> std::io::Result<Self> {
-        #[cfg(unix)]
-        {
-            let stream = Inner::connect(path)?;
-            check_peer(&stream)?;
-            Ok(Self(stream))
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_host;
 
-            // Read and write, because the pipe is duplex and opening it for
-            // one direction would half-connect. Overlapped, because the two
-            // directions are used at once and a synchronous handle will not
-            // have that — see `overlapped`.
-            let pipe = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(overlapped::FILE_FLAG_OVERLAPPED)
-                .open(path)?;
-            overlapped::Overlapped::new(pipe).map(Self)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = path;
-            Err(std::io::Error::other("no local transport on this platform"))
+    /// Here rather than beside its one caller in [`web`], for the reason a
+    /// `wasm32`-only test is no test at all: it runs nowhere.
+    #[test]
+    fn every_loopback_address_names_this_machine() {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            // The rest of `127.0.0.0/8`, which the daemon accepts as a bind
+            // address and this used to refuse as a destination.
+            "127.0.0.2",
+            "127.1.2.3",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(is_loopback_host(host), "{host} is loopback");
         }
     }
 
-    /// The two ends, for the two threads that use them.
-    ///
-    /// One thread parks in a read for as long as the connection lives, and the
-    /// rest of the program writes while it does. Both of those are true at the
-    /// same time — which reads like a caller's business and is not: on Windows
-    /// a synchronous handle makes the write wait for the read, so a request
-    /// waits for an answer to the request. Splitting here is what gives that
-    /// requirement somewhere to be stated and checked.
-    pub fn split(self) -> std::io::Result<(Reader, Writer)> {
-        let writer = self.0.try_clone()?;
-        Ok((Reader(self.0), Writer(writer)))
-    }
-}
-
-impl Read for Reader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-impl Write for Writer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-/// Refuse a daemon that is not us.
-///
-/// The socket lives at a predictable path, and where `XDG_RUNTIME_DIR` is
-/// unset that path is under `/tmp` — where another local user can create the
-/// directory first and bind a socket of their own. The daemon checks the
-/// directory it creates; a client that simply connects checks nothing, and
-/// would hand its session requests, message text included, to whoever
-/// answered. The kernel knows who that is, so ask it.
-#[cfg(unix)]
-fn check_peer(stream: &Inner) -> std::io::Result<()> {
-    let peer = peer_uid(stream)?;
-    let us = rustix::process::getuid().as_raw();
-    if peer == us {
-        return Ok(());
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        format!(
-            "the daemon socket is owned by uid {peer}, not by us ({us}); refusing to talk to it"
-        ),
-    ))
-}
-
-/// Who is on the other end, as the kernel sees it.
-///
-/// Two calls for one question, because Unix never agreed on it: Linux answers
-/// `SO_PEERCRED`, and everyone else answers `getpeereid`. Both are read off
-/// the connected socket rather than taken on trust, which is the point.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn peer_uid(stream: &Inner) -> std::io::Result<u32> {
-    Ok(rustix::net::sockopt::socket_peercred(stream)?.uid.as_raw())
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn peer_uid(stream: &Inner) -> std::io::Result<u32> {
-    use std::os::fd::AsRawFd as _;
-
-    let mut uid = 0;
-    let mut gid = 0;
-    // SAFETY: a connected socket's fd, and two out-pointers to locals.
-    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    if rc == 0 {
-        Ok(uid)
-    } else {
-        Err(std::io::Error::last_os_error())
+    #[test]
+    fn nothing_else_does() {
+        for host in [
+            "",
+            "example.com",
+            // A name that merely starts the same way. The whole point of
+            // testing the parsed hostname is that this is a different string.
+            "localhost.example.com",
+            "127.0.0.1.example.com",
+            "10.0.0.1",
+            "0.0.0.0",
+            "192.168.1.10",
+            "2001:db8::1",
+        ] {
+            assert!(!is_loopback_host(host), "{host} is not loopback");
+        }
     }
 }

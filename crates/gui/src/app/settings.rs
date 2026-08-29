@@ -96,9 +96,9 @@ impl SettingsState {
             || self.draft.font_size != self.original.font_size
     }
 
-    /// Where the theme file lives, for the "Reveal" affordance.
-    pub fn config_path(&self) -> Option<std::path::PathBuf> {
-        config::config_path()
+    /// Where the theme document is kept, for the pane that names it.
+    pub fn config_location(&self) -> Option<String> {
+        config::config_location()
     }
 
     /// What Save would write, as text.

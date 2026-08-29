@@ -10,9 +10,13 @@
 
 use std::sync::Arc;
 
-use oxidezap_plugin_host::{Commands, Outcome, Plugins, Sink};
+#[cfg(not(target_family = "wasm"))]
+use oxidezap_plugin_host::{Commands, Outcome};
+use oxidezap_plugin_host::{Plugins, Sink};
 
-use crate::session_bridge::{Action, CommandOutcome, Commands as SessionCommands, SessionCommand};
+use crate::session_bridge::Commands as SessionCommands;
+#[cfg(not(target_family = "wasm"))]
+use crate::session_bridge::{Action, CommandOutcome, SessionCommand};
 use crate::state::StateHub;
 
 /// Build the plugin host, or an empty one when there is nowhere to look.
@@ -22,6 +26,39 @@ use crate::state::StateHub;
 /// daemon that would not start.
 pub fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
     let sink = publishing_to(hub);
+
+    // A page runs no plugins, and this is where that is decided rather than
+    // where it would otherwise happen by accident. Two things are missing and
+    // only one of them is a folder: a plugin gets its own OS thread and its
+    // own wasmi `Store`, and a tab has no threads to give it — the same fact
+    // r2d2 ran into, and the reason `Plugins::load` would publish a set of
+    // entries every one of which reads "its thread could not be started".
+    // There is nowhere to discover a module from either, and nowhere to keep
+    // an approval so the answer survives a reload.
+    //
+    // Left as an early return with a reason instead of relying on
+    // `default_dir` answering `None`, which it does here only because a
+    // browser has no `HOME`: a refusal that depends on an environment
+    // variable being absent is one that comes back the moment somebody sets
+    // it. What the *front end* draws in place of a plugin list is its own
+    // (`platform::plugins_unavailable`); this is the daemon half, and the two
+    // have to agree.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = commands;
+        log::info!("plugins need a daemon with threads and a filesystem; this page has neither");
+        return Arc::new(Plugins::none(sink));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        start_here(sink, commands)
+    }
+}
+
+/// The half that needs a filesystem.
+#[cfg(not(target_family = "wasm"))]
+fn start_here(sink: Sink, commands: SessionCommands) -> Arc<Plugins> {
     let Some(dir) = oxidezap_plugin_host::default_dir() else {
         log::debug!("no per-user data directory, so no plugins");
         return Arc::new(Plugins::none(sink));
@@ -49,10 +86,17 @@ fn publishing_to(hub: &Arc<StateHub>) -> Sink {
 }
 
 /// The plugin host's view of the session.
+///
+/// Native only, because it is the thing a plugin thread calls into and a page
+/// starts no plugin threads. Left out rather than compiled and unused, so
+/// `blocking_send` — which a browser's single agent may not make — is not
+/// reachable from a page's build at all.
+#[cfg(not(target_family = "wasm"))]
 struct Bridge {
     commands: SessionCommands,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Bridge {
     /// Hand one action to the session and wait for what it made of it.
     ///
@@ -81,6 +125,7 @@ impl Bridge {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Commands for Bridge {
     fn send_text(&self, jid: &str, text: &str, quoted: Option<&str>) -> Outcome {
         self.ask(Action::SendText {

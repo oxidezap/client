@@ -328,7 +328,7 @@ use crate::components::{
     AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft, new_timeline_state,
 };
 use log::{debug, error, info, warn};
-use whatsapp_rust::wacore_binary::jid::{Jid, JidExt, observe_str};
+use wacore_binary::jid::{Jid, JidExt, observe_str};
 
 use crate::responsive::{MobilePanel, ResponsiveLayout};
 use crate::session::{FromDaemon, Session};
@@ -338,8 +338,8 @@ use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
 use crate::views::pairing::generate_qr_png;
 use crate::views::{
     render_call_overlay, render_connected_view, render_connecting_view, render_error_view,
-    render_loading_view, render_logged_out_view, render_pairing_view, render_settings_view,
-    render_syncing_view,
+    render_loading_view, render_logged_out_view, render_pairing_view, render_refused_view,
+    render_settings_view, render_syncing_view,
 };
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
@@ -374,13 +374,17 @@ const MAX_VIDEO_PLAYERS: usize = 10;
 const MAX_DECODED_IMAGES: usize = 50;
 
 /// Download timeout in seconds (for audio/video downloads)
-const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
+/// How long a download somebody asked for is allowed to take.
+///
+/// Public because the web front end has to fetch the bytes over HTTP before
+/// it can answer the request, and doing that under a shorter deadline than
+/// this one would make the allowance a fiction — see `session::web::prefetch`.
+pub(crate) const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 
 /// Download media with timeout - returns Ok(data) or Err(error message)
 async fn download_with_timeout(
-    download_rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
-) -> Result<Vec<u8>, String> {
-    let timeout = smol::Timer::after(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS));
+    download_rx: tokio::sync::oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, String>>,
+) -> Result<std::sync::Arc<Vec<u8>>, String> {
     let download = async {
         download_rx
             .await
@@ -388,18 +392,14 @@ async fn download_with_timeout(
     };
 
     // Race between download and timeout
-    smol::future::or(async { Some(download.await) }, async {
-        timeout.await;
-        None
-    })
+    crate::platform::with_timeout(
+        download,
+        std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS),
+    )
     .await
     .ok_or_else(|| "Download timed out".to_string())?
 }
 
-/// Write a downloaded document into the user's Downloads directory
-/// ($XDG_DOWNLOAD_DIR, then $HOME or %USERPROFILE% + /Downloads, then the CWD
-/// like the database fallback when no home is known) and return the path
-/// written.
 /// A name for media the sender never named.
 ///
 /// The message id keeps two photos from the same conversation out of each
@@ -425,88 +425,6 @@ fn default_media_name(message_id: &str, mime_type: &str) -> String {
         .rev()
         .collect();
     format!("oxidezap-{suffix}.{extension}")
-}
-
-fn save_to_downloads(file_name: &str, data: &[u8]) -> std::io::Result<std::path::PathBuf> {
-    use std::io::Write;
-    use std::path::PathBuf;
-
-    let not_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(PathBuf::from(v));
-    let dir = std::env::var_os("XDG_DOWNLOAD_DIR")
-        .and_then(not_empty)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .and_then(not_empty)
-                .or_else(|| std::env::var_os("USERPROFILE").and_then(not_empty))
-                .map(|home| home.join("Downloads"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    std::fs::create_dir_all(&dir)?;
-
-    // The name comes off the wire: strip path separators (and `:`, which on
-    // Windows makes a drive-relative path) so a hostile sender can't traverse
-    // out of the directory.
-    let sanitized: String = file_name
-        .chars()
-        .map(|c| {
-            if std::path::is_separator(c) || c == '\\' || c == ':' || c.is_control() {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let name = match sanitized.trim() {
-        "" | "." | ".." => "document",
-        trimmed => trimmed,
-    };
-
-    // Windows treats device basenames (CON, NUL, COM1…) as reserved for any
-    // extension; prefix them so the save can't resolve to a device.
-    let stem = name
-        .split_once('.')
-        .map_or(name, |(stem, _)| stem)
-        .trim_end_matches([' ', '.'])
-        .to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.as_bytes()[3].is_ascii_digit());
-    let name = if reserved {
-        format!("_{name}")
-    } else {
-        name.to_string()
-    };
-
-    // create_new + " (n)" suffixing so a download never clobbers an existing
-    // file of the same name.
-    for attempt in 0..1000u32 {
-        let candidate = if attempt == 0 {
-            name.to_string()
-        } else {
-            match name.rsplit_once('.') {
-                Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({attempt}).{ext}"),
-                _ => format!("{name} ({attempt})"),
-            }
-        };
-        let path = dir.join(candidate);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(data)?;
-                return Ok(path);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "too many downloads with the same name",
-    ))
 }
 
 /// Currently active media playback (mutual exclusion: only one media at a time)
@@ -891,10 +809,7 @@ pub struct WhatsAppApp {
 
 impl WhatsAppApp {
     /// Spawn the event handling task that processes UI events from the WhatsApp client
-    fn spawn_event_task(
-        mut ui_rx: tokio::sync::mpsc::Receiver<FromDaemon>,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
+    fn spawn_event_task(mut ui_rx: crate::session::Events, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(message) = ui_rx.recv().await {
                 let result = match message {
@@ -2237,17 +2152,28 @@ impl WhatsAppApp {
         self.client.take();
         self.event_task.take();
 
-        // Off the UI thread: connecting can mean starting a daemon and
-        // waiting for it to listen, which is a spinner rather than a frozen
-        // window only if it happens somewhere else. A failure routes back to
-        // the error screen, where retry stays available.
+        // A failure routes back to the error screen, where retry stays
+        // available.
         self.reconnect_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let connected = cx.background_spawn(async { Session::connect() }).await;
+            let connected = Session::attach(cx).await;
             let _ = entity.update(cx, |app, cx| {
                 match connected {
                     Ok((client, ui_rx)) => {
                         app.event_task = Some(Self::spawn_event_task(ui_rx, cx));
                         app.client = Some(client);
+                    }
+                    Err(e) if Session::is_settled(&e) => {
+                        // A refusal, not a failure to reach anything: another
+                        // tab holds this account, or this preview has not been
+                        // told it may keep one. Said in its own words — a
+                        // "Failed to reach the daemon" in front of it would be
+                        // the one sentence that is not true — and with no
+                        // timer behind it, because the next attempt would get
+                        // the same answer and the one after that would take an
+                        // account the moment somebody else's tab closed.
+                        app.app_state = AppState::Refused {
+                            reason: e.to_string(),
+                        };
                     }
                     Err(e) => {
                         app.app_state = AppState::Error(format!("Failed to reach the daemon: {e}"));
@@ -2341,7 +2267,7 @@ impl WhatsAppApp {
     /// could rename the wrong one), and a timestamp plus a counter collides
     /// across processes: two windows on the same daemon each start their
     /// counter at zero, and the daemon broadcasts every assignment to both.
-    /// The process id is what keeps them apart, and it also namespaces the
+    /// [`crate::platform::front_end_id`] is what keeps them apart, and it also namespaces the
     /// media-cache file a voice note is staged in.
     fn next_local_id(prefix: &str) -> String {
         use portable_atomic::AtomicU64;
@@ -2349,8 +2275,8 @@ impl WhatsAppApp {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         format!(
             "{prefix}_{}_{}_{}",
-            std::process::id(),
-            whatsapp_rust::wacore::time::now_millis(),
+            crate::platform::front_end_id(),
+            wacore::time::now_millis(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         )
     }
@@ -2463,7 +2389,7 @@ impl WhatsAppApp {
                 }
 
                 // Wait for next frame (~30 fps)
-                smol::Timer::after(std::time::Duration::from_millis(33)).await;
+                crate::platform::sleep(std::time::Duration::from_millis(33)).await;
 
                 // Update frame
                 let should_stop = entity
@@ -2916,7 +2842,7 @@ impl WhatsAppApp {
         }
         self.heartbeat = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
-                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                crate::platform::sleep(std::time::Duration::from_secs(1)).await;
                 // A `stat` unless the stamp moved, which is why polling a
                 // file a person edits by hand is affordable.
                 let (theme_changed, watching) = cx.update(|cx| {
@@ -3050,6 +2976,9 @@ impl Render for WhatsAppApp {
                 cx,
             )
             .into_any_element(),
+            AppState::Refused { reason } => {
+                render_refused_view(reason, self.error_detail_open, entity, cx).into_any_element()
+            }
             AppState::LoggedOut { message } => {
                 render_logged_out_view(message, entity, cx).into_any_element()
             }

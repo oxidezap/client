@@ -74,16 +74,22 @@ fn plugins(
 ) -> AnyElement {
     let ctx = crate::components::PluginContext { entity, metrics };
     if app.plugins().is_empty() {
+        // Two different empty lists, and only one of them is waiting for a
+        // file. Where the daemon cannot run plugins at all, advice about a
+        // folder is advice nobody can take — see
+        // [`crate::platform::plugins_unavailable`].
+        let (heading, detail) = crate::platform::plugins_unavailable().map_or_else(
+            || {
+                (
+                    "None loaded",
+                    "Drop a .wasm file in the plugins folder and restart".to_string(),
+                )
+            },
+            |why| ("Not available here", why.to_string()),
+        );
         return group(
             label("PLUGINS", metrics, cx),
-            card(
-                vec![(
-                    "None loaded".to_string(),
-                    "Drop a .wasm file in the plugins folder and restart".to_string(),
-                )],
-                metrics,
-                cx,
-            ),
+            card(vec![(heading.to_string(), detail)], metrics, cx),
             metrics,
         )
         .into_any_element();

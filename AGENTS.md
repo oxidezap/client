@@ -6,6 +6,10 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 
 - **oxidezap-core**: domain types (chats, messages, calls, UI events). No UI, no I/O.
 - **oxidezap-audio**: capture, playback, Opus encoding, waveforms. cpal; no UI.
+  On the web the sound card and the codec are the browser's: playback is real
+  (`decodeAudioData` takes exactly the bytes the daemon sends) and recording is
+  refused up front, because libopus is C and capturing samples nothing could
+  encode is a recording UI that always fails at the end.
 - **oxidezap-chat-store**: materializes the library's event stream into chats,
   messages, receipts and an FTS5 search index. Owns its schema and migrations;
   consumes only the library's public event surface. Extracted from
@@ -16,16 +20,31 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   belongs to whoever draws.
 - **oxidezap-session**: the WhatsApp connection: events, sends, store hydration.
   Knows nothing about how anything is drawn, and nothing about IPC either —
-  the daemon translates requests onto its methods.
+  the daemon translates requests onto its methods. Three of its modules are
+  platform splits rather than logic — `net/` is the transport and HTTP client
+  a page has to supply, `exec/` is where its tasks run, and `video/` is the
+  camera — and the calls are a fourth, in `whatsapp/calls/`. Above them the
+  session names no platform.
 - **oxidezap-ipc**: the wire protocol between the daemon and its front ends,
   plus the blocking client end of the transport (`Endpoint`). No runtime: a
   front end needs one thread to read and a lock to serialize writes, and the
   daemon is the side with thousands of things happening at once. The domain
   types in `oxidezap-core` *are* the wire format; this crate adds the framing
   around them.
-- **oxidezap-daemon**: binary `oxidezapd`. The only process that opens the
-  store or holds a WhatsApp connection. Serves front ends over a per-user Unix
-  socket and carries a tray presence.
+- **oxidezap-daemon**: a library and the binary `oxidezapd` around it. The
+  library is everything the daemon *does* — the state every front end
+  observes, the bridge that turns their requests into session calls, and the
+  protocol spoken down a byte stream — and it builds for
+  `wasm32-unknown-unknown`. The binary is the process: the socket, the tray,
+  the signals, the directory it claims, all gated to the platforms that have
+  them.
+  The split is not tidiness. A page has the first half and none of the
+  second, but it can run a dedicated worker — and a worker holding a session
+  and speaking this protocol down a port *is* a daemon by every definition
+  that matters here: one session per user, in one place, and a front end that
+  holds none. It is also the only way to keep the store: SQLite's persistent
+  VFS on the web is OPFS through a synchronous access handle, which exists in
+  a dedicated worker and nowhere else.
 - **oxidezap-plugin-abi**: the wasm ABI — its constants and the widget-tree
   codec. No dependencies and `no_std`, because it is compiled into the daemon
   *and* into every plugin, including ones with no allocator.
@@ -58,9 +77,19 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 - **oxidezap-gui**: GPUI front end, binary `oxidezap`. Talks to the daemon and
   starts one if none is listening. Owns video decode, which writes straight
   into `gpui::RenderImage` and is not reusable off GPUI.
+  The same crate builds for `wasm32-unknown-unknown`, where `main` becomes the
+  module's start function and the differences live in `platform/` — one
+  function the interface calls, two implementations behind it, no `cfg`
+  anywhere above. A component never learns that browsers exist, for the same
+  reason it never learns that small screens do.
 
 A front end depends on ipc/core/audio and never on session: there is exactly
-one WhatsApp session per user, and it lives in the daemon.
+one WhatsApp session per user, and it lives in the daemon. On the web it
+depends on the *daemon* as well, and that is the same rule rather than an
+exception to it — a page has no process to reach one in, so it starts one in
+its own address space through `daemon::embedded`. The session is still the
+daemon's, the window still owns none of it, and the protocol between them is
+the protocol a socket carries everywhere else.
 
 `examples/` holds plugins, and is excluded from the workspace: they build for
 `wasm32-unknown-unknown` and link imports only the daemon provides, so a
@@ -100,6 +129,45 @@ cp target/wasm32-unknown-unknown/release/autoreply.wasm ~/.local/share/oxidezap/
 cd ../.. && cargo test -p oxidezap-plugin-host --all-features -- --ignored
 ```
 
+The same window as a page:
+
+```bash
+# Needs nightly: `-Z build-std` is nightly-only, and the standard library has
+# to be rebuilt with the atomics target feature on — gpui_web runs its
+# background executor on real workers, and the prebuilt std is not compiled
+# for that. The link flags are in /.cargo/config.toml.
+rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown
+cargo install trunk
+
+# Serves on http://127.0.0.1:8080 with the two isolation headers set. On
+# GitHub Pages a service worker adds them instead, because a static host has
+# no way to.
+# Through the script: trunk cannot forward arguments to cargo, so it is what
+# sets the toolchain and `CARGO_UNSTABLE_BUILD_STD`.
+TRUNK_ACTION=serve ./web/build.sh
+
+# And the daemon it attaches to. `--web` alone is loopback on the port the
+# page looks for; localhost is served without being named. It logs where the
+# token file is, not the token — that is a bearer credential and a log is
+# what people paste into issues. The token goes after a `#`, never a `?`: a
+# query reaches whoever served the page, a fragment never leaves the browser.
+cargo run --bin oxidezapd -- --web
+```
+
+Type-checking the web build without the whole bundle:
+
+```bash
+cargo +nightly check -p oxidezap-gui --target wasm32-unknown-unknown -Z build-std=std,panic_abort
+```
+
+The session builds for that target too, and is checked separately because
+nothing in the page depends on it yet — a break there would otherwise go
+unnoticed until something does:
+
+```bash
+cargo +nightly check -p oxidezap-session --target wasm32-unknown-unknown -Z build-std=std,panic_abort
+```
+
 Stable Rust. Debug builds keep gpui at opt-level 3, because without it the UI is
 unusable.
 
@@ -116,7 +184,7 @@ profile here repeats it deliberately.
 
 ## Gotchas
 
-- **The platform split lives in exactly two places.** `ipc/endpoint.rs` is the
+- **The platform split lives in exactly two places.** `ipc/endpoint/` is the
   client end and `daemon/listener/` is the server end; everything above them
   — framing, requests, the whole protocol — is written once. A Unix socket is
   a filesystem entry that survives a crash and a named pipe is a name that
@@ -126,6 +194,59 @@ profile here repeats it deliberately.
   socket inherits a `0700` directory. A client checks who answered, too: the
   socket sits at a predictable path, and under the `/tmp` fallback another
   user can get there first.
+  A third transport joined them rather than becoming a third place:
+  `endpoint/web.rs` and `listener/web.rs` are a WebSocket, because a page can
+  open neither of the others. What every transport shares on the way out is
+  `ipc::Link`, one `Send + Sync` handle with the platform's own object behind
+  it — load-bearing on the web, where a `web_sys::WebSocket` is neither and so
+  cannot be held beside a front end's state at all; it holds a queue into the
+  task that owns one instead. What they do not share is the way *in*: a
+  process parks a thread in a read and a page is handed a callback, so the
+  read halves stay apart and what they meet at is `session/frames.rs`, which
+  is the whole protocol state machine and is written once.
+  The server side repeats none of it either — `serve_client` was already
+  generic over `AsyncRead + AsyncWrite`, so the bridge hands it one end of a
+  `tokio::io::duplex` and moves the lines across as text frames.
+- **A loopback port is not a Unix socket, and the difference is the whole of
+  the web bridge's design.** A socket has file permissions and a peer uid to
+  check; a TCP port has neither, and a WebSocket is not subject to the
+  same-origin policy — so any page in the user's browser can open one to
+  `ws://127.0.0.1` and would otherwise be handed the message history and the
+  ability to send. Hence: off unless asked for (`--web`), loopback unless told
+  otherwise, and every browser origin refused unless named (`--web-allow`),
+  excepting localhost, which is the developer's own `trunk serve`. But an
+  origin is not the admission check and could not be: a loopback port is
+  reachable by *every account on the machine*, while the socket sits in a
+  `0700` directory and answers a peer uid — so reaching the socket proves
+  being this user and reaching the port proves nothing, and any local account
+  can write `Origin: http://localhost`, which is a string. A token in that
+  same per-user directory is what carries the guarantee across: drawn once and
+  kept, so a bookmarked URL survives a restart; required on the upgrade and on
+  media alike, since a photo is as much the account's as a frame is; compared
+  without an early return, so the matching prefix is not something a caller
+  can time; and answered with a `404` rather than a `403`, because an endpoint
+  the caller may not open has no reason to confirm it is there. A request with
+  no `Origin` is not a browser — a page cannot suppress the header — so it is
+  served on a loopback bind, and still only with the token. A non-loopback
+  bind is an error rather than a warning: there the header is a string the
+  client picks and the traffic is cleartext, so remote access is a tunnel's
+  job. Both endpoints draw on one admission
+  count, because a client costs the same descriptors and tasks however it
+  arrived; the web one claims its slot at the upgrade rather than at accept,
+  since the same port serves media and a photo is not a front end.
+- **An abort is something said, not something let go of.** The library's
+  `AbortHandle` tells its two endings apart by whether it *calls* the closure
+  it boxes — `abort()`, and `Drop`, call it; `detach()` drops it uncalled —
+  so a runtime that cancels by dropping the sender makes `.detach()` mean the
+  opposite of what it says. The web runtime did, and the tokio one does not
+  (dropping a `JoinHandle` detaches), so it went unseen on a desktop and was
+  total in a page: `runtime.spawn(…).detach()` is how the library runs nearly
+  everything fire-and-forget — the QR rotation, inbound message handling, the
+  bot's own subscriptions — and every one of them was cancelled before its
+  first poll. What a page did instead was handshake, ack the server's
+  `<pair-device>` from the handler that runs inline, and then sit there with
+  no code on screen. `net::abort_requested` is the rule stated once: a value
+  sent is an abort, a sender dropped is a detachment and waits forever.
 - **Nothing stops the daemon but `main`.** The tray's Quit and an IPC
   `Shutdown` ask through `shutdown::request`; ending the process from a D-Bus
   callback or a connection task would skip disconnecting the session and
@@ -920,6 +1041,122 @@ column that is only centred is clipped at *both* ends the moment it outgrows
 the window — which is how a 640px-tall screen showed the middle of the pairing
 screen, with the title above the glass and the pair code below it.
 
+## The web front end
+
+The page runs the whole client: the session, the store and the window. It can
+attach to an `oxidezapd` the visitor runs instead — over the same protocol the
+desktop window speaks, and worth preferring, since a desktop daemon holds
+calls, keeps plugins, survives the tab and keeps the keys out of a browser's
+storage — but it no longer needs one. The export stays static either way: nothing here needs a
+server to be *hosted*. `.github/workflows/pages.yml` builds and publishes it.
+
+The daemon a page runs is the daemon, minus the process:
+`daemon::embedded::start` assembles the state hub and the session bridge and
+hands the front end one end of a `tokio::io::duplex`, which `serve_client`
+already accepted — so the page speaks the same frames down a pipe that the
+desktop speaks down a socket, and not one line of protocol is written twice.
+
+**Plugins are the daemon's, so a page gets whichever daemon's it is talking
+to.** Attached to an `oxidezapd`, all of it: the web bridge hands
+`serve_client` the same `Plugins` the socket does, so a plugin's interface
+arrives in the snapshot, its buttons act through `PluginAction`, and its
+permission prompt is answered through `PluginApproval` — not one line of that
+is a second implementation, because the protocol already carried it. Holding
+its own session, none, for the reason in the table below, and the front end
+says which of the two it is rather than drawing an empty list: one place
+decides (`platform::plugins_unavailable`) and it is the mirror of the daemon's
+own (`daemon::plugins::start`). Two halves of one fact, so they are written to
+be read together — a page that drew "drop a .wasm in the plugins folder" is
+giving instructions about a folder it does not have.
+
+**Which tab holds the account is claimed, not assumed.** `daemon/claim/` is a
+lock file on the desktop and a Web Lock in a browser, taken with `ifAvailable`
+so a second tab is told *now* rather than queued — a queued tab looks like one
+that is starting, and would silently take the account the moment the first
+closed. What it costs is that the refusal has to survive the trip up: it
+reaches the window as `ErrorKind::AlreadyExists`, `Session::is_settled` names
+it, and it lands in `AppState::Refused` rather than `Error`. That distinction
+is the whole point — the error screen is for an outage, and it promises to
+keep trying, offers *Work offline*, and arms a countdown. All three are false
+for a refusal: nothing was unreachable, nothing is still trying, and *Work
+offline* reads a database this window is precisely the one that could not
+open. A retrying tab also reintroduces, one layer above the lock, the exact
+behaviour `ifAvailable` was chosen to prevent.
+
+**The store round-trips, and that was measured rather than assumed.** A page
+that had never been visited opens the VFS holding 0 files; one that comes back
+after the tab closed opens it holding 1. Worth stating because the failure
+mode is invisible without it: a browser with no VFS installed opens the
+database in memory quite happily, behaves identically all session, and loses
+the account with the tab.
+
+What a page cannot do, and says so rather than pretending. Measured on
+nightly for `wasm32-unknown-unknown` rather than assumed:
+
+| | wasm |
+|---|---|
+| `tokio` `sync`/`rt`/`macros`/`io-util` | yes |
+| `tokio` `time` | compiles, traps — see below |
+| `tokio` `net` (mio) | no |
+| `smol` | no — `async-io` is an epoll loop, via `rustix`/`errno` |
+| `cpal` | yes |
+| `opus`, `openh264` (both C) | no |
+| `symphonia` (aac/mp4), `mp4`, `ogg`, `ringbuf` | yes |
+| `wasmi` | yes — but see `std::thread` below |
+| `std::thread::spawn` | no |
+
+`time` is the row worth reading twice, because it is the one that says
+compiling is not the question. `tokio::time`'s clock is
+`std::time::Instant::now()` with nothing under it on this target, so a `sleep`
+or a `timeout` links, loads, and traps the first time it is awaited — "time
+not implemented on this platform", taking the task with it. The session's own
+waiting goes through `exec::sleep` and `exec::with_timeout` instead, and
+nothing above them names a clock. The same fact reaches chrono, whose
+`wasmbind` feature is what puts `Utc::now()` on the browser's `Date`; it is
+one of chrono's defaults and this workspace turns defaults off, so it is named
+at the root.
+
+`std::thread::spawn` is the row that decides the plugins, and it is worth
+separating from the one above it: `wasmi` compiles here quite happily — a
+wasm interpreter inside a wasm module is nothing unusual — so the reason a
+page runs no plugins is not the interpreter. It is that the host gives each
+plugin an OS thread and a bounded queue it blocks on, and a page has neither
+to give; the same fact r2d2 ran into — twice, since the pool's *management*
+threads are a second spawn behind the connection ones, and
+`scheduled-thread-pool` unwraps that one. Both are the library's to answer and
+it does, in `storages/sqlite-storage/src/pool.rs`: on the web a "pool" is one
+connection behind a lock, keeping r2d2's own spelling so the store above it is
+written once. `Builder::spawn` answering an error is
+already handled — the entry is published and then stopped, with the reason
+beside it — so a page that tried would draw a list of plugins that all failed
+identically. It does not try: `daemon::plugins::start` returns
+`Plugins::none` with that written down, rather than arriving there by way of
+a browser having no `HOME`.
+
+So voice notes play and video does not; recording is refused where it starts
+rather than where it would fail; calls stay in the daemon, which is where the
+microphone already was, and so do plugins, for the same kind of reason. WebCodecs (`web_sys::VideoDecoder`) and
+`MediaRecorder` are the ways back in for the last two, and both are Rust
+bindings rather than JavaScript — they are API changes rather than backends,
+which is why neither is done here.
+
+**A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
+is there because cross-origin isolation needs two response headers GitHub Pages
+will not set, and the price is that it also caches the bundle: an ordinary
+reload of a published page serves the *old* `.js`, so a build that fixed
+something looks exactly like one that did not. Unregister it (Application →
+Service Workers) and hard-reload, or check the hash in the bundle's filename
+before believing a test of the deployed page. `trunk serve` has no service
+worker, which is the other reason to reproduce there first.
+
+Every browser API in the tree is bound through `web-sys`/`js-sys` from Rust:
+the WebSocket, `fetch`, `setTimeout`, WebAudio, `localStorage`, the download
+anchor. The one piece of hand-written JavaScript is
+`web/coi-serviceworker.js`, and it exists because cross-origin isolation
+needs two response headers and GitHub Pages will not set them — a service
+worker is the only thing that can, and a service worker is a JavaScript file
+by definition.
+
 ## Still to do
 
 - **Spacing is still absolute.** ~28 `px(...)` literals where the guides want
@@ -927,11 +1164,85 @@ screen, with the title above the glass and the pair code below it.
 - **`WhatsAppApp` still owns all state**, though it is now split across
   `app/{events,recording,calls_ctl,media_ctl}.rs` rather than one file. The
   guides want per-feature entities; that is a bigger change than moving code.
-- **Two large files outside the GUI**: `session/whatsapp.rs` (~2.3k) and
-  `chat-store/store.rs` (~3.1k).
+- **Two large files outside the GUI**: `session/whatsapp/mod.rs` (~3.7k) and
+  `chat-store/store.rs` (~3.2k). The calls came out of the first one and the
+  video plane never went in, so what is left is the event pump, hydration and
+  the paged reads — three things rather than one file.
+- **The session runs in the browser, and pairing is measured now.** A page
+  with no daemon named starts its own, and the whole of it works against
+  WhatsApp: the VFS opens, the store and its migrations run, `ChatStore` comes
+  up, the library's client dials `wss://web.whatsapp.com/ws/chat`, the QR is
+  drawn, a phone scans it, and messages go out and come back. The upgrade
+  succeeds from a page served off `https://oxidezap.github.io`, which is a
+  public origin and not WhatsApp's own — a WebSocket upgrade is not subject to
+  the same-origin policy, and the server declines to make it one.
+  What stood between the handshake and the QR was `AbortHandle`, above, and it
+  is worth remembering how it looked: everything a log could show was working.
+  The socket opened, the handshake completed, the server's `<pair-device>`
+  arrived and was acked. Only the ack is inline; the six refs are rotated by a
+  detached task, and a detached task was one this page cancelled. So the
+  failure presented as a page that connects perfectly and pairs never.
+  Durability is the other half. The window's VFS is relaxed-IndexedDB, which
+  writes changed blocks after the commit rather than during it, so a tab killed
+  in that window loses the commit — a message that comes back on the next
+  hydration, or a ratchet that has to re-establish. The durable answer is OPFS
+  through a synchronous access handle, which exists in a dedicated worker and
+  nowhere else, so it arrives with the worker. It changes nothing above
+  `session/store/`, which is why that interface is three functions.
+- **A page holds no plugins, and the way in is a worker rather than a
+  backend.** The interpreter is not the obstacle — `wasmi` builds for this
+  target — the thread-per-plugin scheduler is, along with there being no
+  directory to discover a module from and no file to keep an approval in. All
+  three have the same answer and it is the one the store is already waiting
+  on: a dedicated worker per plugin, its queue a `postMessage` port instead of
+  a `sync_channel`, its module and its approvals in OPFS. That is a second
+  scheduler rather than a second backend, which is why it is not done here and
+  why the front end says so instead. What a page *can* do meanwhile it already
+  does: attach to an `oxidezapd` and get that daemon's plugins whole.
+- **Video is not decoded on the web**, in a message or in a call, **and voice
+  notes are not recorded there.** All three are the same cause — the decoder
+  and the encoder are C — and each has a browser-native answer that is a Rust
+  binding: `web_sys::VideoDecoder` and `MediaRecorder`. Each is an API change
+  rather than a backend swap, because one is asynchronous where
+  `StreamingVideoDecoder` is pulled by index, and the other hands back encoded
+  bytes where `RecordedAudio` is samples. `video/call_unsupported.rs` is what
+  a page has meanwhile: the names, and frames dropped where they arrive.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
+- **A failed save says nothing to the person who asked.** On the web a
+  document is fetched before it is handed over, and the browser's transient
+  activation can expire while that happens — the second tap works, because the
+  bytes are cached by then, but the first one just stops. It is logged and
+  nowhere else, because the only user-visible error state the app has is
+  `AppState::Error`, which leaves the connected view and schedules a reconnect:
+  far worse than silence for something this small. What is missing is a
+  transient surface — a toast, a line on the row — and it should be designed
+  once rather than invented for this.
+- **A promised file is not a held file, once the reader is a browser.** The
+  daemon's media cache is files and no index — the front end it was written
+  for opens them itself, so `claim` can be `has` and there is no window
+  between promising a key and handing it over. A page attached to that daemon
+  reads over HTTP instead, which makes the promise and the read two round
+  trips, and a `ClearMediaCache` landing between them deletes a file already
+  reported as downloaded. Not the budget sweep, which drops the oldest and so
+  never the key just written; and the cost is one refetch, since media the
+  renderer does not have is drawn as an offer to download. Closing it means
+  the native cache keeping claims the way the page's does, which is the index
+  that module opens by saying it does not have — worth it only if somebody
+  meets it.
+- **Nothing evicts the media a conversation is holding.** A message keeps its
+  full bytes in `MediaContent::data` for as long as the row is loaded, and
+  `Chat::add_message` has no ceiling — so the two media budgets that do exist
+  (the daemon's 512 MiB of disk, the page's 48 MiB map) bound what is
+  *cached*, not what the interface is retaining. The sweep can drop an entry
+  whose bytes are still alive through a message that names them. On a desktop
+  that is a long-running window growing; in a tab it is a linear memory with a
+  one-gigabyte ceiling, so the web is where it will be felt first. What is
+  missing is a policy — dematerialize media on rows that are far off screen,
+  and re-fetch on demand as the renderer already does for media it never had.
+  Predates the web build and is not made worse by it: sharing one `Arc` per
+  payload rather than a copy per row moved in the other direction.
 - **A withdrawal is applied before it is written down, and that is a trade.**
   A revocation clears the shared mask first and persists second, so the very
   next command a draining backlog attempts is already refused. The cost is a

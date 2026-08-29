@@ -11,16 +11,46 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-channel = "2"
-cpal = "0.18"
 log = { workspace = true }
+portable-atomic = { workspace = true }
+# Channels and timers only on the web, where there is no thread pool to build
+# a multi-threaded runtime on. The feature list below adds the rest.
+tokio = { workspace = true, features = ["sync"] }
+wacore = { workspace = true }
+
+# The sound card, and the codec that talks to it. `cpal` does have a WebAudio
+# backend and would compile — `opus`, `ogg` and `ringbuf` sit behind it here
+# anyway, because libopus is C and a voice note that cannot be encoded is not
+# one worth capturing. See `src/web/mod.rs`.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+cpal = "0.18"
 ogg = "0.9"
 # Kept on the same major as the library's voip-libopus dependency: two
 # semver-incompatible wrappers would each link their own copy of libopus.
 opus = "0.4"
-portable-atomic = { workspace = true }
 ringbuf = "0.5"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
-wacore = { workspace = true }
+
+# Playback, through the decoder and mixer a browser already has.
+[target.'cfg(target_family = "wasm")'.dependencies]
+# Not called from here: `wacore` reaches for OS entropy and neither major of
+# `getrandom` will build for the web until its backend is named. Declared in
+# every crate that is built for wasm on its own, because feature unification
+# only reaches as far as the package being built.
+getrandom = { workspace = true }
+getrandom_02 = { workspace = true }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "AudioBuffer",
+    "AudioBufferSourceNode",
+    "AudioContext",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioParam",
+    "AudioScheduledSourceNode",
+] }
 
 [lints]
 workspace = true

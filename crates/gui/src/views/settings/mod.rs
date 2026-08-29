@@ -354,9 +354,11 @@ fn description_for(section: SettingsSection) -> Option<&'static str> {
         }
         SettingsSection::Privacy => Some("This device's identity, and how to start over."),
         SettingsSection::Storage => Some("What this client keeps on disk."),
-        SettingsSection::Plugins => {
-            Some("Loaded from the plugins folder. Each one says what it may do.")
-        }
+        SettingsSection::Plugins => Some(if crate::platform::plugins_unavailable().is_some() {
+            "What a daemon can run beside the session."
+        } else {
+            "Loaded from the plugins folder. Each one says what it may do."
+        }),
         _ => None,
     }
 }

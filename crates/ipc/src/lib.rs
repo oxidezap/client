@@ -16,16 +16,29 @@
 //! subscribe first and snapshot second, which loses nothing, and the duplicate
 //! window resolves on the client with a comparison rather than a lock.
 
+// Every client-side transport lives under `endpoint`, whatever it is made of:
+// a Unix socket, a Windows named pipe, or — where the front end is a page — a
+// WebSocket. That is the whole of the platform split on this side (see
+// /AGENTS.md); everything above it gets [`Link`] and never mentions any of
+// them.
 mod endpoint;
+mod link;
 mod protocol;
 mod transport;
 #[cfg(windows)]
 pub mod windows_user;
 
+#[cfg(target_family = "wasm")]
+pub use endpoint::web;
+#[cfg(not(target_family = "wasm"))]
 pub use endpoint::{Endpoint, Reader, Writer};
+pub use link::Link;
 pub use protocol::{
     AccountIdentity, CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent,
     DaemonMessage, MessagePreview, PageCursor, PairingCode, ProtocolError, Request, RequestId,
     StateSnapshot, StateVersion,
 };
-pub use transport::{PROTOCOL_VERSION, endpoint_path, lock_path, media_dir, media_path, state_dir};
+pub use transport::{
+    DEFAULT_WEB_PORT, PROTOCOL_VERSION, WEB_MEDIA_PATH, WEB_SOCKET_PATH, endpoint_path, lock_path,
+    media_dir, media_path, state_dir, web_token_path,
+};

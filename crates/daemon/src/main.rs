@@ -1,19 +1,10 @@
 //! `oxidezapd`: holds the WhatsApp session, shows a tray presence, and serves
 //! front ends over a local socket.
 //!
-//! The session, the socket and the tray never touch each other's state. They
-//! meet at [`state::StateHub`], which is the only thing that mutates, and each
-//! observes it through the channel that suits it.
+//! The process around [`oxidezap_daemon`], which is where everything it
+//! actually does lives — see that crate's own note for why the two are apart.
 
-mod listener;
-mod media;
-mod plugins;
-mod server;
-mod session_bridge;
-mod shutdown;
-mod state;
-mod tray;
-mod window;
+use oxidezap_daemon::{listener, plugins, server, session_bridge, shutdown, state, tray};
 
 use std::sync::Arc;
 
@@ -105,8 +96,47 @@ async fn run() -> Result<()> {
         })
     };
 
+    // Off unless asked for. The local endpoint is protected by the
+    // filesystem and a peer uid check; a TCP port is protected by neither,
+    // so it exists only where somebody said it should. See `bridge`.
+    // One cap across both endpoints: a client costs the same descriptors and
+    // tasks however it arrived, so a second allowance would double what a
+    // reconnect loop can hold open.
+    let slots = server::client_slots();
+
+    // The token is read (or drawn) here rather than inside the bridge, so a
+    // per-user directory that cannot be written stops the endpoint from
+    // existing at all instead of producing one nobody can be admitted to.
+    let web = match Options::from_args().web {
+        Some(options) => match listener::web::token() {
+            Ok(token) => Some(listener::web::Config {
+                addr: options.addr,
+                allowed_origins: options.allowed_origins,
+                token,
+            }),
+            Err(e) => {
+                log::error!("the web bridge is off: {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
+    let mut bridge = web.map(|config| {
+        let hub = Arc::clone(&hub);
+        let plugins = Arc::clone(&plugins);
+        let commands = commands.clone();
+        let slots = Arc::clone(&slots);
+        tokio::spawn(async move { listener::web::run(config, hub, plugins, commands, slots).await })
+    });
+
     let server_outcome = tokio::select! {
-        result = server::run(&claim, Arc::clone(&hub), Arc::clone(&plugins), commands) => {
+        result = server::run(
+            &claim,
+            Arc::clone(&hub),
+            Arc::clone(&plugins),
+            commands,
+            Arc::clone(&slots),
+        ) => {
             // Fatal, and it has to reach the exit code: a supervisor that sees
             // status zero treats a daemon nobody can connect to as a clean
             // stop and never restarts it.
@@ -118,6 +148,18 @@ async fn run() -> Result<()> {
         // `Connecting` snapshot for a session that does not exist.
         joined = &mut session => {
             return finish(joined, tray, Ok(()));
+        }
+        // A bridge that cannot bind is a front end nobody can reach, and it
+        // was asked for explicitly — so it fails the daemon rather than
+        // leaving a browser waiting on a port nothing is listening on. Only
+        // polled where there is one: an always-pending branch is what a
+        // `select!` over an `Option` needs to avoid, and `if let` on the
+        // handle is how.
+        joined = async { bridge.as_mut().expect("a bridge to poll").await }, if bridge.is_some() => {
+            match joined {
+                Ok(result) => result.context("web bridge stopped"),
+                Err(e) => Err(anyhow::anyhow!("the web bridge panicked: {e}")),
+            }
         }
         () = termination.recv() => {
             log::info!("shutting down");
@@ -194,5 +236,208 @@ impl Termination {
             _ = tokio::signal::ctrl_c() => {}
             () = shutdown::requested() => {}
         }
+    }
+}
+
+/// What the daemon was asked for on the command line.
+///
+/// Hand-parsed rather than through an argument crate: there are two flags,
+/// both about the same optional endpoint, and a dependency that exists to
+/// read them would be larger than the thing it reads.
+#[derive(Debug, Default)]
+struct Options {
+    /// The web bridge, where one was asked for.
+    web: Option<WebOptions>,
+}
+
+/// What the command line says about the bridge.
+///
+/// Not [`listener::web::Config`] itself, which also carries the token: that
+/// is read from disk or drawn, which is I/O, and parsing arguments is not the
+/// place for it. Keeping them apart is also what stops a token from being
+/// defaulted — an empty one would compare equal to an empty one, which is the
+/// admission check answering yes to everybody.
+#[derive(Debug)]
+struct WebOptions {
+    addr: std::net::SocketAddr,
+    allowed_origins: Vec<String>,
+}
+
+impl Options {
+    fn from_args() -> Self {
+        Self::parse(std::env::args().skip(1))
+    }
+
+    fn parse(args: impl Iterator<Item = String>) -> Self {
+        let mut addr: Option<String> = None;
+        let mut enabled = false;
+        let mut allowed_origins = Vec::new();
+
+        let mut args = args.peekable();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                // The address is optional: `--web` alone is the loopback
+                // default, which is what a person trying it out wants and
+                // what the page looks for without being told.
+                "--web" => {
+                    enabled = true;
+                    if args.peek().is_some_and(|next| !next.starts_with("--")) {
+                        addr = args.next();
+                    }
+                }
+                "--web-allow" => {
+                    enabled = true;
+                    // A flag is not an origin. Swallowing one would both lose
+                    // the flag and put `--web` in the allow list — and an
+                    // allow list with anything in it is what lets a client
+                    // that sends no `Origin` at all attach, so a typo here
+                    // would quietly widen who may reach the session.
+                    match args.peek() {
+                        Some(next) if !next.starts_with("--") => {
+                            if let Some(origin) = args.next() {
+                                allowed_origins.push(origin);
+                            }
+                        }
+                        _ => log::warn!("--web-allow needs an origin after it; ignoring it"),
+                    }
+                }
+                other => {
+                    if let Some(value) = other.strip_prefix("--web=") {
+                        enabled = true;
+                        addr = Some(value.to_string());
+                    } else if let Some(value) = other.strip_prefix("--web-allow=") {
+                        enabled = true;
+                        allowed_origins.push(value.to_string());
+                    } else {
+                        log::warn!("ignoring an argument this daemon does not know: {other}");
+                    }
+                }
+            }
+        }
+
+        if !enabled {
+            return Self::default();
+        }
+
+        let addr = addr.unwrap_or_else(|| format!("127.0.0.1:{}", oxidezap_ipc::DEFAULT_WEB_PORT));
+        match addr.parse() {
+            Ok(addr) => Self {
+                web: Some(WebOptions {
+                    addr,
+                    allowed_origins,
+                }),
+            },
+            Err(e) => {
+                // Refusing to start would be worse: the local endpoint is the
+                // one that matters and it is unaffected. The bridge was asked
+                // for, so its absence is said loudly.
+                log::error!("--web {addr} is not an address ({e}); the web bridge is off");
+                Self::default()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Options {
+        Options::parse(args.iter().map(|a| (*a).to_string()))
+    }
+
+    /// Off unless asked for. The bridge is a TCP port with no peer check;
+    /// the whole design rests on it not existing by default.
+    #[test]
+    fn the_bridge_is_off_unless_it_is_asked_for() {
+        assert!(parse(&[]).web.is_none());
+    }
+
+    /// `--web` alone is loopback on the port the page looks for, which is
+    /// what makes trying it out a one-word change.
+    #[test]
+    fn a_bare_flag_is_the_loopback_default() {
+        let config = parse(&["--web"]).web.expect("a bridge");
+        assert_eq!(
+            config.addr.to_string(),
+            format!("127.0.0.1:{}", oxidezap_ipc::DEFAULT_WEB_PORT)
+        );
+        assert!(config.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn an_address_may_be_given_either_way() {
+        for args in [
+            vec!["--web", "127.0.0.1:1234"],
+            vec!["--web=127.0.0.1:1234"],
+        ] {
+            let config = parse(&args).web.expect("a bridge");
+            assert_eq!(config.addr.to_string(), "127.0.0.1:1234");
+        }
+    }
+
+    /// Naming an origin is itself a reason to run the bridge: a person who
+    /// says which page may attach has said they want one.
+    #[test]
+    fn naming_an_origin_turns_the_bridge_on() {
+        let config = parse(&["--web-allow", "https://oxidezap.github.io"])
+            .web
+            .expect("a bridge");
+        assert_eq!(config.allowed_origins, ["https://oxidezap.github.io"]);
+    }
+
+    #[test]
+    fn origins_accumulate() {
+        let config = parse(&[
+            "--web",
+            "--web-allow=https://a.example",
+            "--web-allow",
+            "https://b.example",
+        ])
+        .web
+        .expect("a bridge");
+        assert_eq!(
+            config.allowed_origins,
+            ["https://a.example", "https://b.example"]
+        );
+    }
+
+    /// `--web-allow` takes an origin, and a flag is not one. Swallowing the
+    /// next flag would lose it *and* put it in the allow list — and a
+    /// non-empty allow list is what lets an `Origin`-less client attach.
+    #[test]
+    fn a_following_flag_is_not_mistaken_for_an_origin() {
+        let config = parse(&["--web-allow", "--web"]).web.expect("a bridge");
+        assert!(
+            config.allowed_origins.is_empty(),
+            "a flag was taken for an origin: {:?}",
+            config.allowed_origins
+        );
+        assert_eq!(
+            config.addr.to_string(),
+            format!("127.0.0.1:{}", oxidezap_ipc::DEFAULT_WEB_PORT),
+            "the swallowed flag was lost"
+        );
+    }
+
+    /// An address that will not parse turns the bridge off rather than the
+    /// daemon: the local endpoint is unaffected and is the one that matters.
+    #[test]
+    fn an_unparsable_address_leaves_the_daemon_running() {
+        assert!(parse(&["--web", "not-an-address"]).web.is_none());
+    }
+
+    /// `--web` takes an optional address, so a following flag must not be
+    /// swallowed as one.
+    #[test]
+    fn a_following_flag_is_not_mistaken_for_an_address() {
+        let config = parse(&["--web", "--web-allow", "https://a.example"])
+            .web
+            .expect("a bridge");
+        assert_eq!(
+            config.addr.to_string(),
+            format!("127.0.0.1:{}", oxidezap_ipc::DEFAULT_WEB_PORT)
+        );
+        assert_eq!(config.allowed_origins, ["https://a.example"]);
     }
 }

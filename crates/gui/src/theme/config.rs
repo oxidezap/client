@@ -9,8 +9,10 @@
 //! [`ThemeSettings`]; everything it could not honour comes back alongside it in
 //! [`ThemeSettings::problems`] for Settings to show.
 
+use crate::platform::prefs;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+
+pub use prefs::Revision;
 
 use serde::{Deserialize, Serialize};
 
@@ -226,48 +228,29 @@ fn apply_overrides(
     }
 }
 
-/// `$XDG_CONFIG_HOME/oxidezap/theme.json`, falling back to `~/.config`.
+/// Where the theme document is kept, in words a person can act on.
 ///
-/// `None` means there is nowhere to look, which is not an error: the product
-/// default applies and Settings reports the file as unavailable rather than
-/// offering to edit a path that cannot exist.
-pub fn config_path() -> Option<PathBuf> {
-    let not_empty = |value: std::ffi::OsString| (!value.is_empty()).then(|| PathBuf::from(value));
-    let dir = std::env::var_os("XDG_CONFIG_HOME")
-        .and_then(not_empty)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .and_then(not_empty)
-                .or_else(|| std::env::var_os("USERPROFILE").and_then(not_empty))
-                .map(|home| home.join(".config"))
-        })?;
-    Some(dir.join("oxidezap").join("theme.json"))
+/// `None` means there is nowhere to keep one, which is not an error: the
+/// product default applies and Settings reports the theme as unavailable
+/// rather than offering to edit something that cannot exist.
+///
+/// A description rather than a path, because on one of the two platforms it
+/// is not a path — see [`crate::platform::prefs`].
+pub fn config_location() -> Option<String> {
+    prefs::location()
 }
 
-/// Read and resolve the theme file. A missing file is the default; an
+/// Read and resolve the theme document. A missing one is the default; an
 /// unreadable or malformed one is the default plus a problem to show.
 pub fn load() -> ThemeSettings {
-    let Some(path) = config_path() else {
-        return ThemeSettings::default();
-    };
-    load_from(&path)
-}
-
-pub fn load_from(path: &Path) -> ThemeSettings {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        // Absent is the normal case, not a problem worth reporting.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return ThemeSettings::default();
-        }
-        Err(err) => {
-            return ThemeSettings {
-                problems: vec![format!("could not read {}: {err}", path.display())],
-                ..ThemeSettings::default()
-            };
-        }
-    };
-    parse(&raw)
+    match prefs::read() {
+        Ok(Some(raw)) => parse(&raw),
+        Ok(None) => ThemeSettings::default(),
+        Err(problem) => ThemeSettings {
+            problems: vec![problem],
+            ..ThemeSettings::default()
+        },
+    }
 }
 
 /// Resolve theme text, so the Settings editor validates exactly what `load`
@@ -282,26 +265,19 @@ pub fn parse(raw: &str) -> ThemeSettings {
     }
 }
 
-/// Write settings back, creating the directory if needed.
-pub fn save(settings: &ThemeSettings) -> std::io::Result<PathBuf> {
-    let path = config_path().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no config directory: set $XDG_CONFIG_HOME or $HOME",
-        )
-    })?;
-    save_to(&path, settings)?;
-    Ok(path)
-}
-
-pub fn save_to(path: &Path, settings: &ThemeSettings) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+/// Write settings back, wherever they are kept.
+///
+/// Returns where they landed, for the message that says so.
+///
+/// # Errors
+///
+/// Nowhere to keep them, or keeping them failed.
+pub fn save(settings: &ThemeSettings) -> Result<String, String> {
     let mut json = serde_json::to_string_pretty(&settings.to_file())
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        .map_err(|err| format!("this theme cannot be written: {err}"))?;
     json.push('\n');
-    std::fs::write(path, json)
+    prefs::write(&json)?;
+    Ok(prefs::location().unwrap_or_else(|| "the theme store".to_string()))
 }
 
 /// The theme as it would be written, for showing rather than saving.
@@ -314,11 +290,10 @@ pub fn preview(settings: &ThemeSettings) -> String {
         .unwrap_or_else(|err| format!("// this theme cannot be written: {err}"))
 }
 
-/// The file's last-modified time, used to notice an edit made outside the app.
-pub fn modified_at(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
+/// The document's current version, used to notice an edit made outside the
+/// app. Compared, never interpreted — see [`prefs::Revision`].
+pub fn revision() -> Option<prefs::Revision> {
+    prefs::revision()
 }
 
 #[cfg(test)]
@@ -330,9 +305,13 @@ mod tests {
         parse(raw)
     }
 
+    /// Absence resolves to the product default with nothing to report, which
+    /// is what makes a first run on a machine with no theme document quiet.
+    /// Asserted against the empty document rather than a missing one, because
+    /// the store is what decides absence now and a test may not have one.
     #[test]
-    fn absent_file_is_the_product_default() {
-        let settings = load_from(Path::new("/nonexistent/oxidezap/theme.json"));
+    fn nothing_configured_is_the_product_default() {
+        let settings = ThemeSettings::default();
         assert_eq!(settings.preset, Preset::TokyoNight);
         assert_eq!(settings.palette, TOKYO_NIGHT);
         assert!(settings.problems.is_empty(), "absence is not a problem");

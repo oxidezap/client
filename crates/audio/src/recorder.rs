@@ -3,18 +3,11 @@
 //! Captures audio from the default input device at 48kHz mono.
 //! The samples are stored and can be resampled to 16kHz for Opus encoding.
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, FromSample, Sample as _, SampleFormat, SizedSample, Stream, StreamConfig};
-use log::{error, info, warn};
-use wacore::time::Instant;
-
 /// Target sample rate for Opus encoding (WhatsApp standard)
 pub const TARGET_SAMPLE_RATE: u32 = 16000;
 
 /// Capture sample rate (most hardware supports this)
+#[cfg(not(target_family = "wasm"))]
 const CAPTURE_SAMPLE_RATE: u32 = 48000;
 
 pub struct RecordedAudio {
@@ -98,250 +91,360 @@ impl RecordedAudio {
     }
 }
 
-/// How much of the tail the meter averages: ~150ms at the capture rate.
-/// Short enough to follow speech, long enough not to flicker.
-const LEVEL_WINDOW: usize = (CAPTURE_SAMPLE_RATE as usize * 150) / 1000;
-
-/// Root-mean-square of a slice, scaled so ordinary speech lands mid-meter.
+/// Opening a microphone, which is a thing only an operating system has.
 ///
-/// The bare RMS of a voice sits around 0.05–0.2, which would leave the meter
-/// looking dead; the gain is the difference between a meter and a decoration.
-fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum: f32 = samples.iter().map(|s| s * s).sum();
-    ((sum / samples.len() as f32).sqrt() * LEVEL_GAIN).clamp(0.0, 1.0)
-}
+/// Gathered into one module so the recording that a page cannot do is absent
+/// rather than stubbed line by line, and so the types above it —
+/// [`RecordedAudio`], [`RecorderError`] — stay shared: the web backend
+/// answers in exactly the same vocabulary.
+#[cfg(not(target_family = "wasm"))]
+mod capture {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-/// Chosen so a normal speaking voice fills roughly half the meter.
-const LEVEL_GAIN: f32 = 4.0;
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::{Device, FromSample, Sample as _, SampleFormat, SizedSample, Stream, StreamConfig};
+    use log::{error, info, warn};
+    use wacore::time::Instant;
 
-pub struct AudioRecorder {
-    stream: Option<Stream>,
-    samples: Arc<Mutex<Vec<f32>>>,
-    is_recording: bool,
-    start_time: Option<Instant>,
-    device: Option<Device>,
-    config: Option<StreamConfig>,
-    sample_format: SampleFormat,
-    sample_rate: u32,
-}
+    use super::{CAPTURE_SAMPLE_RATE, RecordedAudio, RecorderError};
 
-impl Default for AudioRecorder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+    /// How much of the tail the meter averages: ~150ms at the capture rate.
+    /// Short enough to follow speech, long enough not to flicker.
+    const LEVEL_WINDOW: usize = (CAPTURE_SAMPLE_RATE as usize * 150) / 1000;
 
-impl AudioRecorder {
-    pub fn new() -> Self {
-        Self {
-            stream: None,
-            samples: Arc::new(Mutex::new(Vec::new())),
-            is_recording: false,
-            start_time: None,
-            device: None,
-            config: None,
-            sample_format: SampleFormat::F32,
-            sample_rate: CAPTURE_SAMPLE_RATE,
-        }
-    }
-
-    pub fn init(&mut self) -> Result<(), RecorderError> {
-        let host = cpal::default_host();
-
-        let device = host
-            .default_input_device()
-            .ok_or(RecorderError::NoInputDevice)?;
-
-        info!("Using default input device");
-
-        let supported = device
-            .supported_input_configs()
-            .map_err(|e| RecorderError::DeviceError(e.to_string()))?;
-
-        // Prefer F32 (native to our buffer), but i16/u16-only mics still
-        // record: the callback converts per sample. Format outranks 48kHz
-        // support, which outranks mono: multichannel is downmixed anyway,
-        // while a low capture rate permanently costs voice bandwidth.
-        let mut best: Option<(u8, _)> = None;
-        for config in supported {
-            if !matches!(
-                config.sample_format(),
-                SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
-            ) {
-                continue;
-            }
-            let supports_rate = config.min_sample_rate() <= CAPTURE_SAMPLE_RATE
-                && config.max_sample_rate() >= CAPTURE_SAMPLE_RATE;
-            // Capture rate outranks sample format: every accepted format is
-            // converted to f32 anyway, so preferring an F32 config that cannot
-            // reach CAPTURE_SAMPLE_RATE would throw away voice bandwidth for
-            // nothing.
-            let score = u8::from(supports_rate) * 4
-                + u8::from(config.sample_format() == SampleFormat::F32) * 2
-                + u8::from(config.channels() == 1);
-            if best.as_ref().is_none_or(|(s, _)| score > *s) {
-                let candidate = if supports_rate {
-                    config.with_sample_rate(CAPTURE_SAMPLE_RATE)
-                } else {
-                    config.with_max_sample_rate()
-                };
-                best = Some((score, candidate));
-            }
-        }
-
-        let supported_config = best
-            .map(|(_, c)| c)
-            .ok_or(RecorderError::NoSupportedConfig)?;
-
-        self.sample_format = supported_config.sample_format();
-        let stream_config: StreamConfig = supported_config.into();
-        self.sample_rate = stream_config.sample_rate;
-
-        info!(
-            "Audio config: {} Hz, {} channel(s), {:?}",
-            stream_config.sample_rate, stream_config.channels, self.sample_format
-        );
-
-        self.device = Some(device);
-        self.config = Some(stream_config);
-
-        Ok(())
-    }
-
-    pub fn start(&mut self) -> Result<(), RecorderError> {
-        if self.is_recording {
-            return Err(RecorderError::AlreadyRecording);
-        }
-
-        if self.device.is_none() {
-            self.init()?;
-        }
-
-        let device = self.device.as_ref().ok_or(RecorderError::NotInitialized)?;
-        let config = self.config.ok_or(RecorderError::NotInitialized)?;
-
-        if let Ok(mut samples) = self.samples.lock() {
-            samples.clear();
-        }
-
-        let samples = self.samples.clone();
-
-        let stream = match self.sample_format {
-            SampleFormat::F32 => build_input_stream::<f32>(device, config, samples),
-            SampleFormat::I16 => build_input_stream::<i16>(device, config, samples),
-            SampleFormat::U16 => build_input_stream::<u16>(device, config, samples),
-            other => Err(RecorderError::StreamError(format!(
-                "unsupported input sample format {other:?}"
-            ))),
-        }?;
-
-        stream
-            .play()
-            .inspect_err(|_| {
-                self.device = None;
-                self.config = None;
-            })
-            .map_err(|e| RecorderError::StreamError(e.to_string()))?;
-
-        self.stream = Some(stream);
-        self.is_recording = true;
-        self.start_time = Some(Instant::now());
-
-        info!("Recording started");
-        Ok(())
-    }
-
-    /// The input level right now, 0..=1, for a meter.
+    /// Root-mean-square of a slice, scaled so ordinary speech lands mid-meter.
     ///
-    /// Read off the tail of what has been captured rather than from a second
-    /// tap on the device: the callback is already writing every sample here,
-    /// and a meter that opened its own stream would be a second consumer of a
-    /// microphone the user only agreed to share once.
-    ///
-    /// RMS, not peak: a peak meter is pinned by a single click and says
-    /// nothing about whether a voice is being picked up.
-    pub fn level(&self) -> f32 {
-        let Ok(samples) = self.samples.lock() else {
+    /// The bare RMS of a voice sits around 0.05–0.2, which would leave the meter
+    /// looking dead; the gain is the difference between a meter and a decoration.
+    fn rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
             return 0.0;
-        };
-        let from = samples.len().saturating_sub(LEVEL_WINDOW);
-        rms(&samples[from..])
+        }
+        let sum: f32 = samples.iter().map(|s| s * s).sum();
+        ((sum / samples.len() as f32).sqrt() * LEVEL_GAIN).clamp(0.0, 1.0)
     }
 
-    pub fn stop(&mut self) -> Result<RecordedAudio, RecorderError> {
-        if !self.is_recording {
-            return Err(RecorderError::NotRecording);
+    /// Chosen so a normal speaking voice fills roughly half the meter.
+    const LEVEL_GAIN: f32 = 4.0;
+
+    pub struct AudioRecorder {
+        stream: Option<Stream>,
+        samples: Arc<Mutex<Vec<f32>>>,
+        is_recording: bool,
+        start_time: Option<Instant>,
+        device: Option<Device>,
+        config: Option<StreamConfig>,
+        sample_format: SampleFormat,
+        sample_rate: u32,
+    }
+
+    impl Default for AudioRecorder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl AudioRecorder {
+        pub fn new() -> Self {
+            Self {
+                stream: None,
+                samples: Arc::new(Mutex::new(Vec::new())),
+                is_recording: false,
+                start_time: None,
+                device: None,
+                config: None,
+                sample_format: SampleFormat::F32,
+                sample_rate: CAPTURE_SAMPLE_RATE,
+            }
         }
 
-        self.stream.take();
-        self.is_recording = false;
+        pub fn init(&mut self) -> Result<(), RecorderError> {
+            let host = cpal::default_host();
 
-        let duration = self.start_time.map_or(Duration::ZERO, |t| t.elapsed());
-        let samples = self.samples.lock().map(|b| b.clone()).unwrap_or_default();
+            let device = host
+                .default_input_device()
+                .ok_or(RecorderError::NoInputDevice)?;
 
-        info!(
-            "Recording stopped: {} samples, {:.1}s",
-            samples.len(),
-            duration.as_secs_f32()
-        );
+            info!("Using default input device");
 
-        Ok(RecordedAudio {
-            samples,
-            sample_rate: self.sample_rate,
-            duration_secs: duration.as_secs() as u32,
-        })
-    }
+            let supported = device
+                .supported_input_configs()
+                .map_err(|e| RecorderError::DeviceError(e.to_string()))?;
 
-    pub fn cancel(&mut self) {
-        self.stream.take();
-        self.is_recording = false;
-        self.start_time = None;
-        if let Ok(mut samples) = self.samples.lock() {
-            samples.clear();
-        }
-        warn!("Recording cancelled");
-    }
-}
-
-/// Build the input stream for the device's sample format, converting to f32
-/// in the callback (same dispatch as the player's output path).
-fn build_input_stream<T: SizedSample>(
-    device: &Device,
-    config: StreamConfig,
-    samples: Arc<Mutex<Vec<f32>>>,
-) -> Result<Stream, RecorderError>
-where
-    f32: FromSample<T>,
-{
-    let channels = config.channels as usize;
-    device
-        .build_input_stream(
-            config,
-            move |data: &[T], _: &cpal::InputCallbackInfo| {
-                let Ok(mut buffer) = samples.lock() else {
-                    return;
-                };
-                if channels == 1 {
-                    buffer.extend(data.iter().map(|&s| f32::from_sample(s)));
-                } else {
-                    // Downmix to mono
-                    for chunk in data.chunks(channels) {
-                        let mono: f32 = chunk.iter().map(|&s| f32::from_sample(s)).sum::<f32>()
-                            / channels as f32;
-                        buffer.push(mono);
-                    }
+            // Prefer F32 (native to our buffer), but i16/u16-only mics still
+            // record: the callback converts per sample. Format outranks 48kHz
+            // support, which outranks mono: multichannel is downmixed anyway,
+            // while a low capture rate permanently costs voice bandwidth.
+            let mut best: Option<(u8, _)> = None;
+            for config in supported {
+                if !matches!(
+                    config.sample_format(),
+                    SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
+                ) {
+                    continue;
                 }
-            },
-            move |err| {
-                error!("Audio input stream error: {}", err);
-            },
-            None,
-        )
-        .map_err(|e| RecorderError::StreamError(e.to_string()))
+                let supports_rate = config.min_sample_rate() <= CAPTURE_SAMPLE_RATE
+                    && config.max_sample_rate() >= CAPTURE_SAMPLE_RATE;
+                // Capture rate outranks sample format: every accepted format is
+                // converted to f32 anyway, so preferring an F32 config that cannot
+                // reach CAPTURE_SAMPLE_RATE would throw away voice bandwidth for
+                // nothing.
+                let score = u8::from(supports_rate) * 4
+                    + u8::from(config.sample_format() == SampleFormat::F32) * 2
+                    + u8::from(config.channels() == 1);
+                if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                    let candidate = if supports_rate {
+                        config.with_sample_rate(CAPTURE_SAMPLE_RATE)
+                    } else {
+                        config.with_max_sample_rate()
+                    };
+                    best = Some((score, candidate));
+                }
+            }
+
+            let supported_config = best
+                .map(|(_, c)| c)
+                .ok_or(RecorderError::NoSupportedConfig)?;
+
+            self.sample_format = supported_config.sample_format();
+            let stream_config: StreamConfig = supported_config.into();
+            self.sample_rate = stream_config.sample_rate;
+
+            info!(
+                "Audio config: {} Hz, {} channel(s), {:?}",
+                stream_config.sample_rate, stream_config.channels, self.sample_format
+            );
+
+            self.device = Some(device);
+            self.config = Some(stream_config);
+
+            Ok(())
+        }
+
+        pub fn start(&mut self) -> Result<(), RecorderError> {
+            if self.is_recording {
+                return Err(RecorderError::AlreadyRecording);
+            }
+
+            if self.device.is_none() {
+                self.init()?;
+            }
+
+            let device = self.device.as_ref().ok_or(RecorderError::NotInitialized)?;
+            let config = self.config.ok_or(RecorderError::NotInitialized)?;
+
+            if let Ok(mut samples) = self.samples.lock() {
+                samples.clear();
+            }
+
+            let samples = self.samples.clone();
+
+            let stream = match self.sample_format {
+                SampleFormat::F32 => build_input_stream::<f32>(device, config, samples),
+                SampleFormat::I16 => build_input_stream::<i16>(device, config, samples),
+                SampleFormat::U16 => build_input_stream::<u16>(device, config, samples),
+                other => Err(RecorderError::StreamError(format!(
+                    "unsupported input sample format {other:?}"
+                ))),
+            }?;
+
+            stream
+                .play()
+                .inspect_err(|_| {
+                    self.device = None;
+                    self.config = None;
+                })
+                .map_err(|e| RecorderError::StreamError(e.to_string()))?;
+
+            self.stream = Some(stream);
+            self.is_recording = true;
+            self.start_time = Some(Instant::now());
+
+            info!("Recording started");
+            Ok(())
+        }
+
+        /// The input level right now, 0..=1, for a meter.
+        ///
+        /// Read off the tail of what has been captured rather than from a second
+        /// tap on the device: the callback is already writing every sample here,
+        /// and a meter that opened its own stream would be a second consumer of a
+        /// microphone the user only agreed to share once.
+        ///
+        /// RMS, not peak: a peak meter is pinned by a single click and says
+        /// nothing about whether a voice is being picked up.
+        pub fn level(&self) -> f32 {
+            let Ok(samples) = self.samples.lock() else {
+                return 0.0;
+            };
+            let from = samples.len().saturating_sub(LEVEL_WINDOW);
+            rms(&samples[from..])
+        }
+
+        pub fn stop(&mut self) -> Result<RecordedAudio, RecorderError> {
+            if !self.is_recording {
+                return Err(RecorderError::NotRecording);
+            }
+
+            self.stream.take();
+            self.is_recording = false;
+
+            let duration = self.start_time.map_or(Duration::ZERO, |t| t.elapsed());
+            let samples = self.samples.lock().map(|b| b.clone()).unwrap_or_default();
+
+            info!(
+                "Recording stopped: {} samples, {:.1}s",
+                samples.len(),
+                duration.as_secs_f32()
+            );
+
+            Ok(RecordedAudio {
+                samples,
+                sample_rate: self.sample_rate,
+                duration_secs: duration.as_secs() as u32,
+            })
+        }
+
+        pub fn cancel(&mut self) {
+            self.stream.take();
+            self.is_recording = false;
+            self.start_time = None;
+            if let Ok(mut samples) = self.samples.lock() {
+                samples.clear();
+            }
+            warn!("Recording cancelled");
+        }
+    }
+
+    /// Build the input stream for the device's sample format, converting to f32
+    /// in the callback (same dispatch as the player's output path).
+    fn build_input_stream<T: SizedSample>(
+        device: &Device,
+        config: StreamConfig,
+        samples: Arc<Mutex<Vec<f32>>>,
+    ) -> Result<Stream, RecorderError>
+    where
+        f32: FromSample<T>,
+    {
+        let channels = config.channels as usize;
+        device
+            .build_input_stream(
+                config,
+                move |data: &[T], _: &cpal::InputCallbackInfo| {
+                    let Ok(mut buffer) = samples.lock() else {
+                        return;
+                    };
+                    if channels == 1 {
+                        buffer.extend(data.iter().map(|&s| f32::from_sample(s)));
+                    } else {
+                        // Downmix to mono
+                        for chunk in data.chunks(channels) {
+                            let mono: f32 = chunk.iter().map(|&s| f32::from_sample(s)).sum::<f32>()
+                                / channels as f32;
+                            buffer.push(mono);
+                        }
+                    }
+                },
+                move |err| {
+                    error!("Audio input stream error: {}", err);
+                },
+                None,
+            )
+            .map_err(|e| RecorderError::StreamError(e.to_string()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::rms;
+
+        #[test]
+        fn silence_reads_as_nothing() {
+            assert_eq!(rms(&[]), 0.0);
+            assert_eq!(rms(&[0.0; 128]), 0.0);
+        }
+
+        #[test]
+        fn a_speaking_level_lands_in_the_middle_of_the_meter() {
+            // ~0.12 RMS is an ordinary speaking voice off a laptop microphone.
+            let level = rms(&[0.12; 512]);
+            assert!(
+                (0.3..0.7).contains(&level),
+                "expected a mid-meter reading, got {level}"
+            );
+        }
+
+        #[test]
+        fn a_loud_burst_pins_the_meter_without_passing_it() {
+            assert_eq!(rms(&[1.0; 512]), 1.0);
+            assert_eq!(rms(&[-1.0; 512]), 1.0);
+        }
+
+        use super::*;
+
+        #[test]
+        fn resample_interpolates_between_source_samples() {
+            // A linear ramp resamples to exact fractional positions; the old
+            // nearest-neighbor drop would return [0.0, 1.0, 3.0, 4.0].
+            let audio = RecordedAudio {
+                samples: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+                sample_rate: 24_000,
+                duration_secs: 0,
+            };
+            assert_eq!(audio.resample_to_16khz(), vec![0.0, 1.5, 3.0, 4.5]);
+        }
+
+        #[test]
+        fn resample_decimation_has_unity_dc_gain() {
+            // The FIR taps are normalized to unity DC gain: a constant signal
+            // must come out at the same level (edges included — they clamp to
+            // the boundary sample, so even they see pure DC).
+            let audio = RecordedAudio {
+                samples: vec![0.5; 4800],
+                sample_rate: 48_000,
+                duration_secs: 0,
+            };
+            let out = audio.resample_to_16khz();
+            assert_eq!(out.len(), 1600);
+            for &s in &out {
+                assert!((s - 0.5).abs() < 1e-3, "DC gain drifted: {s}");
+            }
+        }
+
+        #[test]
+        fn resample_decimation_attenuates_aliasing_band() {
+            // 12kHz at 48k folds to 4kHz after naive 3:1 decimation — squarely
+            // in the voice band. The low-pass must crush it while passing 1kHz
+            // essentially untouched.
+            let rate = 48_000u32;
+            let tone = |freq: f32| -> RecordedAudio {
+                RecordedAudio {
+                    samples: (0..rate as usize)
+                        .map(|i| (std::f32::consts::TAU * freq * i as f32 / rate as f32).sin())
+                        .collect(),
+                    sample_rate: rate,
+                    duration_secs: 1,
+                }
+            };
+            let rms = |samples: &[f32]| -> f32 {
+                (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+            };
+            let low = tone(1_000.0).resample_to_16khz();
+            let high = tone(12_000.0).resample_to_16khz();
+            // Skip the clamped edges; a full-scale sine has ~0.707 rms.
+            let low_rms = rms(&low[100..low.len() - 100]);
+            let high_rms = rms(&high[100..high.len() - 100]);
+            assert!(low_rms > 0.65, "1kHz should pass through, rms {low_rms}");
+            assert!(
+                high_rms < 0.02,
+                "12kHz should alias-filter to near silence, rms {high_rms}"
+            );
+        }
+    }
 }
+
+#[cfg(not(target_family = "wasm"))]
+pub use capture::AudioRecorder;
 
 #[derive(Debug)]
 pub enum RecorderError {
@@ -369,91 +472,3 @@ impl std::fmt::Display for RecorderError {
 }
 
 impl std::error::Error for RecorderError {}
-
-#[cfg(test)]
-mod tests {
-    use super::rms;
-
-    #[test]
-    fn silence_reads_as_nothing() {
-        assert_eq!(rms(&[]), 0.0);
-        assert_eq!(rms(&[0.0; 128]), 0.0);
-    }
-
-    #[test]
-    fn a_speaking_level_lands_in_the_middle_of_the_meter() {
-        // ~0.12 RMS is an ordinary speaking voice off a laptop microphone.
-        let level = rms(&[0.12; 512]);
-        assert!(
-            (0.3..0.7).contains(&level),
-            "expected a mid-meter reading, got {level}"
-        );
-    }
-
-    #[test]
-    fn a_loud_burst_pins_the_meter_without_passing_it() {
-        assert_eq!(rms(&[1.0; 512]), 1.0);
-        assert_eq!(rms(&[-1.0; 512]), 1.0);
-    }
-
-    use super::*;
-
-    #[test]
-    fn resample_interpolates_between_source_samples() {
-        // A linear ramp resamples to exact fractional positions; the old
-        // nearest-neighbor drop would return [0.0, 1.0, 3.0, 4.0].
-        let audio = RecordedAudio {
-            samples: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
-            sample_rate: 24_000,
-            duration_secs: 0,
-        };
-        assert_eq!(audio.resample_to_16khz(), vec![0.0, 1.5, 3.0, 4.5]);
-    }
-
-    #[test]
-    fn resample_decimation_has_unity_dc_gain() {
-        // The FIR taps are normalized to unity DC gain: a constant signal
-        // must come out at the same level (edges included — they clamp to
-        // the boundary sample, so even they see pure DC).
-        let audio = RecordedAudio {
-            samples: vec![0.5; 4800],
-            sample_rate: 48_000,
-            duration_secs: 0,
-        };
-        let out = audio.resample_to_16khz();
-        assert_eq!(out.len(), 1600);
-        for &s in &out {
-            assert!((s - 0.5).abs() < 1e-3, "DC gain drifted: {s}");
-        }
-    }
-
-    #[test]
-    fn resample_decimation_attenuates_aliasing_band() {
-        // 12kHz at 48k folds to 4kHz after naive 3:1 decimation — squarely
-        // in the voice band. The low-pass must crush it while passing 1kHz
-        // essentially untouched.
-        let rate = 48_000u32;
-        let tone = |freq: f32| -> RecordedAudio {
-            RecordedAudio {
-                samples: (0..rate as usize)
-                    .map(|i| (std::f32::consts::TAU * freq * i as f32 / rate as f32).sin())
-                    .collect(),
-                sample_rate: rate,
-                duration_secs: 1,
-            }
-        };
-        let rms = |samples: &[f32]| -> f32 {
-            (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
-        };
-        let low = tone(1_000.0).resample_to_16khz();
-        let high = tone(12_000.0).resample_to_16khz();
-        // Skip the clamped edges; a full-scale sine has ~0.707 rms.
-        let low_rms = rms(&low[100..low.len() - 100]);
-        let high_rms = rms(&high[100..high.len() - 100]);
-        assert!(low_rms > 0.65, "1kHz should pass through, rms {low_rms}");
-        assert!(
-            high_rms < 0.02,
-            "12kHz should alias-filter to near silence, rms {high_rms}"
-        );
-    }
-}

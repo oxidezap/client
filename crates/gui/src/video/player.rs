@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gpui::RenderImage;
 use tokio::sync::oneshot;
-use whatsapp_rust::wacore::time::Instant;
+use wacore::time::Instant;
 
 use super::audio::VideoAudio;
 use super::streaming::StreamingVideoDecoder;

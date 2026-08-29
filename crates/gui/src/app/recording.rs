@@ -32,7 +32,7 @@ impl WhatsAppApp {
         }
         self.recording_tick = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
-                smol::Timer::after(std::time::Duration::from_millis(RECORDING_TICK_MS)).await;
+                crate::platform::sleep(std::time::Duration::from_millis(RECORDING_TICK_MS)).await;
                 let keep_going = entity.update(cx, |app, cx| {
                     if !app.is_recording() {
                         return false;
@@ -67,6 +67,14 @@ impl WhatsAppApp {
 
         if self.recording_state != RecordingState::Idle {
             warn!("Audio recording is already active");
+            return;
+        }
+
+        // Refused where nothing can come of it. The composer already draws
+        // the microphone disabled there, so this is the keyboard route and
+        // anything else that reaches the action directly.
+        if !oxidezap_audio::CAN_RECORD {
+            warn!("this build cannot record a voice note");
             return;
         }
 

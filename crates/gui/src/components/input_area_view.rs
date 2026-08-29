@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use whatsapp_rust::wacore::time::Instant;
+use wacore::time::Instant;
 
 use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, div, prelude::*};
 use gpui_component::{
@@ -195,7 +195,7 @@ impl InputAreaView {
 
         self.typing_monitor_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
-                smol::Timer::after(TYPING_MONITOR_INTERVAL).await;
+                crate::platform::sleep(TYPING_MONITOR_INTERVAL).await;
 
                 let should_stop = entity
                     .update(cx, |view, cx| {
@@ -445,14 +445,27 @@ impl InputAreaView {
                     })
                     .into_any_element()
             } else {
+                // Drawn disabled where nothing can come of pressing it, with
+                // the reason in the tooltip. A control that looks live and
+                // does nothing is the worse answer: the browser has no Opus
+                // encoder, and that is knowable before the microphone is ever
+                // asked for.
+                let can_record = oxidezap_audio::CAN_RECORD;
                 Button::new("ptt")
                     .icon(ProductIcon::Mic)
                     .ghost()
-                    .tooltip("Hold to record a voice message")
+                    .disabled(!can_record)
+                    .tooltip(if can_record {
+                        "Hold to record a voice message"
+                    } else {
+                        "Voice messages cannot be recorded in the browser"
+                    })
                     .w(control)
                     .h(control)
-                    .on_click(move |_, _window, cx| {
-                        record_entity.update(cx, |view, cx| view.toggle_recording(cx));
+                    .when(can_record, |button| {
+                        button.on_click(move |_, _window, cx| {
+                            record_entity.update(cx, |view, cx| view.toggle_recording(cx));
+                        })
                     })
                     .into_any_element()
             })

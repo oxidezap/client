@@ -16,7 +16,7 @@ impl WhatsAppApp {
     /// Seconds until the automatic retry, or `None` when none is scheduled.
     pub fn retry_countdown(&self) -> Option<u64> {
         self.retry_at.map(|at| {
-            let now = whatsapp_rust::wacore::time::now_utc();
+            let now = wacore::time::now_utc();
             (at - now).num_seconds().max(0) as u64
         })
     }
@@ -49,14 +49,12 @@ impl WhatsAppApp {
         if self.retry_at.is_some() {
             return;
         }
-        self.retry_at = Some(
-            whatsapp_rust::wacore::time::now_utc()
-                + chrono::Duration::seconds(RETRY_AFTER_SECS as i64),
-        );
+        self.retry_at =
+            Some(wacore::time::now_utc() + chrono::Duration::seconds(RETRY_AFTER_SECS as i64));
 
         self.retry_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
-                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                crate::platform::sleep(std::time::Duration::from_secs(1)).await;
                 let fire = entity.update(cx, |app, cx| {
                     // Left the error screen: the retry is moot and the timer
                     // should not fire into a connected app.
