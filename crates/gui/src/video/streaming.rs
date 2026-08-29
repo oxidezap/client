@@ -132,6 +132,23 @@ pub(super) fn write_bgra_rotated(
     }
 }
 
+/// How many bytes one decoded frame needs, or `None` if it may not have them.
+///
+/// The geometry is the *decoder's*, never the container's. `avc1` carries a
+/// declared width and height; the sequence parameter set carries the ones the
+/// picture was actually coded against, and openh264 allocates from the second
+/// and asserts that the target buffer matches it. A remux, a crop or an
+/// anamorphic clip is enough to make the two disagree, and a buffer sized
+/// from the declaration then kills the window. The pixel budget is applied
+/// here for the same reason: applied to a number a file declares, it bounds
+/// nothing the decoder went on to allocate.
+fn frame_byte_len(width: usize, height: usize) -> Option<usize> {
+    width
+        .checked_mul(height)
+        .filter(|&pixels| pixels != 0 && pixels <= MAX_VIDEO_PIXELS)?
+        .checked_mul(4)
+}
+
 /// A decoded video frame, BGRA8-encoded and ready to hand to `gpui::img`.
 #[derive(Clone)]
 pub struct StreamingFrame {
@@ -157,9 +174,6 @@ pub struct StreamingVideoDecoder {
     samples: Vec<H264Sample>,
     /// SPS/PPS NAL units (needed to initialize decoder)
     sps_pps: Vec<u8>,
-    /// Coded frame dimensions, as the decoder produces them.
-    width: u32,
-    height: u32,
     /// Display rotation from the track matrix, applied to every kept frame.
     rotation: Rotation,
     /// Frame duration
@@ -177,9 +191,11 @@ pub struct StreamingVideoDecoder {
     /// Reusable RGBA scratch the decoder writes into, kept across frames: the
     /// buffer handed to `RenderImage` is a second one, because the channel
     /// swap and the rotation both read the source while writing elsewhere.
+    ///
+    /// Resized when a frame's own geometry says to; see [`frame_byte_len`].
     rgba_buffer: Vec<u8>,
-    /// Precomputed `width * height * 4`; size of both buffers.
-    rgba_byte_len: usize,
+    /// What the last frame was, so an unchanged one reuses the buffer.
+    frame_size: (usize, usize),
 }
 
 impl StreamingVideoDecoder {
@@ -376,20 +392,28 @@ impl StreamingVideoDecoder {
             (1.0 - yuv_frame_size as f64 / bgra_frame_size as f64) * 100.0
         );
 
+        // The container's declaration was bounded above; this is the number
+        // the decoder will actually allocate from, read before it is handed
+        // one. A unit carrying no parameter set declares no geometry.
+        if let Some((coded_width, coded_height)) = super::sps::coded_size(&sps_pps)
+            && frame_byte_len(coded_width as usize, coded_height as usize).is_none()
+        {
+            return Err(anyhow!(
+                "Coded video dimensions out of range: {}x{}",
+                coded_width,
+                coded_height
+            ));
+        }
+
         // Create decoder
         let decoder = Decoder::new().context("Failed to create H.264 decoder")?;
 
         // Extract audio
         let audio = Self::extract_audio(mp4_data);
 
-        // pixel_count is bounded above, so this cannot overflow.
-        let rgba_byte_len = pixel_count * 4;
-
         Ok(Self {
             samples,
             sps_pps,
-            width,
-            height,
             rotation,
             frame_duration,
             duration,
@@ -397,8 +421,9 @@ impl StreamingVideoDecoder {
             last_decoded_index: -1,
             current_frame: None,
             audio,
-            rgba_buffer: vec![0u8; rgba_byte_len],
-            rgba_byte_len,
+            // Sized by the first frame that arrives, from its own geometry.
+            rgba_buffer: Vec::new(),
+            frame_size: (0, 0),
         })
     }
 
@@ -620,22 +645,37 @@ impl StreamingVideoDecoder {
 
                 // Only materialize a frame if the caller wants to keep it
                 if keep_output {
+                    let (frame_width, frame_height) = yuv.dimensions();
+                    let Some(byte_len) = frame_byte_len(frame_width, frame_height) else {
+                        log::warn!("refusing a {frame_width}x{frame_height} video frame");
+                        return;
+                    };
+                    if self.frame_size != (frame_width, frame_height) {
+                        self.rgba_buffer = vec![0u8; byte_len];
+                        self.frame_size = (frame_width, frame_height);
+                    }
+
                     // openh264 writes RGBA directly (SIMD path `write_rgba8_f32x8`
                     // when the host supports it, scalar fallback otherwise).
                     yuv.write_rgba8(&mut self.rgba_buffer);
 
                     // `RenderImage` reads the buffer as BGRA, and the frame
                     // still has to be turned the way the track says.
-                    let mut owned = vec![0u8; self.rgba_byte_len];
+                    let mut owned = vec![0u8; byte_len];
                     write_bgra_rotated(
                         &self.rgba_buffer,
-                        self.width as usize,
-                        self.height as usize,
+                        frame_width,
+                        frame_height,
                         self.rotation,
                         &mut owned,
                     );
-                    let (display_width, display_height) = self.display_size();
-                    let Some(image) = RgbaImage::from_raw(display_width, display_height, owned)
+                    let (display_width, display_height) = if self.rotation.transposes() {
+                        (frame_height, frame_width)
+                    } else {
+                        (frame_width, frame_height)
+                    };
+                    let Some(image) =
+                        RgbaImage::from_raw(display_width as u32, display_height as u32, owned)
                     else {
                         log::warn!(
                             "Frame {}: RgbaImage::from_raw failed (size mismatch)",
@@ -656,7 +696,7 @@ impl StreamingVideoDecoder {
                     if index == 0 {
                         log::info!(
                             "First frame BGRA created: {} bytes ({}x{}, rotation={:?})",
-                            self.rgba_byte_len,
+                            byte_len,
                             display_width,
                             display_height,
                             self.rotation
@@ -725,15 +765,6 @@ impl StreamingVideoDecoder {
 
                 self.last_decoded_index = index as i32;
             }
-        }
-    }
-
-    /// Frame geometry as drawn: the coded size, transposed by a quarter turn.
-    fn display_size(&self) -> (u32, u32) {
-        if self.rotation.transposes() {
-            (self.height, self.width)
-        } else {
-            (self.width, self.height)
         }
     }
 
@@ -808,6 +839,73 @@ impl StreamingVideoDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The crash a `.mp4` used to cause, and the sizing that stops it.
+    ///
+    /// `avc1` declares a size and the picture is coded against another; a
+    /// remux or a crop is enough. openh264 asserts that the RGBA target
+    /// matches what it decoded, so a buffer taken from the declaration ends
+    /// the process rather than the playback.
+    ///
+    /// Encoded and decoded for real, because a hand-built picture would only
+    /// prove that this test agrees with itself.
+    #[test]
+    fn a_frame_larger_than_the_container_declared_does_not_panic() {
+        use openh264::encoder::{Encoder, EncoderConfig};
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+
+        let (coded_width, coded_height) = (128usize, 96usize);
+        let mut encoder =
+            Encoder::with_api_config(openh264::OpenH264API::from_source(), EncoderConfig::new())
+                .expect("encoder");
+        let pixels = vec![0u8; coded_width * coded_height * 3];
+        let unit = encoder
+            .encode(&YUVBuffer::from_rgb8_source(RgbSliceU8::new(
+                &pixels,
+                (coded_width, coded_height),
+            )))
+            .expect("encode")
+            .to_vec();
+
+        let mut decoder = Decoder::new().expect("decoder");
+        let yuv = decoder
+            .decode(&unit)
+            .expect("decode")
+            .expect("a keyframe decodes to a picture");
+        let (width, height) = yuv.dimensions();
+
+        // What the container claimed, which is not what came out.
+        let declared = (64usize, 48usize);
+        assert_ne!(declared, (width, height));
+        assert_ne!(
+            frame_byte_len(declared.0, declared.1),
+            frame_byte_len(width, height),
+            "the two sizes have to disagree for this to be testing anything"
+        );
+
+        // The call that used to end the window, against the buffer this
+        // pipeline now hands it.
+        let byte_len = frame_byte_len(width, height).expect("within budget");
+        let mut rgba = vec![0u8; byte_len];
+        yuv.write_rgba8(&mut rgba);
+
+        let mut turned = vec![0u8; byte_len];
+        write_bgra_rotated(&rgba, width, height, Rotation::None, &mut turned);
+        assert!(
+            RgbaImage::from_raw(width as u32, height as u32, turned).is_some(),
+            "the image is drawn at the size it decoded at"
+        );
+    }
+
+    /// The budget is on the picture, and a frame that has none is not one.
+    #[test]
+    fn a_frame_outside_the_budget_gets_no_buffer() {
+        assert_eq!(frame_byte_len(1280, 720), Some(1280 * 720 * 4));
+        assert_eq!(frame_byte_len(0, 720), None);
+        assert_eq!(frame_byte_len(1280, 0), None);
+        assert_eq!(frame_byte_len(7681, 4320), None);
+        assert_eq!(frame_byte_len(usize::MAX, 2), None);
+    }
 
     #[test]
     fn identity_matrix_is_no_rotation() {
