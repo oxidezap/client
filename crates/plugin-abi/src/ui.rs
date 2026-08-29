@@ -356,6 +356,15 @@ mod parse {
         TooBig,
         /// Children hung off a widget that is drawn without any.
         Childless(u8),
+        /// An action id that was not valid UTF-8.
+        ///
+        /// A label is decoded lossily, and an id may not be: an id is
+        /// compared, not read. A replacement character put in a broken byte's
+        /// place gives the front end an id the plugin will never recognise
+        /// coming back, so its own button answers nothing — where refusing
+        /// the tree says what is wrong while the plugin's author can still
+        /// fix it.
+        MangledId,
         /// The padding byte was not zero.
         ///
         /// Refused rather than ignored, so the byte stays free to mean
@@ -372,6 +381,7 @@ mod parse {
                 Self::Truncated => f.write_str("the ui tree ends mid-node"),
                 Self::Trailing => f.write_str("bytes after the last root node"),
                 Self::Reserved(v) => write!(f, "reserved byte {v}, expected 0"),
+                Self::MangledId => f.write_str("an action id that is not valid utf-8"),
                 Self::Childless(kind) => {
                     write!(f, "widget kind {kind} is drawn without children")
                 }
@@ -461,7 +471,7 @@ mod parse {
             if children != 0 && !kind::holds_children(kind) {
                 return Err(ParseError::Childless(kind));
             }
-            let id = self.string()?;
+            let id = self.ident()?;
             let label = self.string()?;
             let value = self.string()?;
 
@@ -501,6 +511,30 @@ mod parse {
         }
 
         fn string(&mut self) -> Result<String, ParseError> {
+            let raw = self.raw()?;
+            // Lossy rather than an error: a label with a broken code point is
+            // a bug in the plugin's own string handling, and refusing its
+            // whole interface over one is a worse answer than drawing a
+            // replacement character where the mistake is.
+            Ok(String::from_utf8_lossy(raw).into_owned())
+        }
+
+        /// An action id, which is decoded strictly.
+        ///
+        /// The opposite trade from a label, because an id is never read by
+        /// anybody: it goes out with the tree and comes back on the press,
+        /// and the plugin recognises it by comparison. Substituting a
+        /// replacement character for a broken byte hands the front end an id
+        /// that is *almost* the one declared — pressed, matched against
+        /// nothing, and silently doing nothing at all — where a label with
+        /// the same mistake is still a label somebody can read around.
+        fn ident(&mut self) -> Result<String, ParseError> {
+            let raw = self.raw()?;
+            String::from_utf8(raw.to_vec()).map_err(|_| ParseError::MangledId)
+        }
+
+        /// The bytes of one length-prefixed string, unvalidated.
+        fn raw(&mut self) -> Result<&[u8], ParseError> {
             let len = self.u32()? as usize;
             if len > MAX_TEXT {
                 return Err(ParseError::TooBig);
@@ -508,11 +542,7 @@ mod parse {
             let end = self.at.checked_add(len).ok_or(ParseError::Truncated)?;
             let raw = self.bytes.get(self.at..end).ok_or(ParseError::Truncated)?;
             self.at = end;
-            // Lossy rather than an error: a label with a broken code point is
-            // a bug in the plugin's own string handling, and refusing its
-            // whole interface over one is a worse answer than drawing a
-            // replacement character where the mistake is.
-            Ok(String::from_utf8_lossy(raw).into_owned())
+            Ok(raw)
         }
 
         fn u8(&mut self) -> Result<u8, ParseError> {
@@ -711,6 +741,36 @@ mod tests {
         // about the byte rather than about anything else being wrong.
         bytes[8] = 0;
         assert!(parse(&bytes).is_ok());
+    }
+
+    /// A broken byte in an id is refused and the same byte in a label is
+    /// drawn around. The two are decoded differently on purpose: a label is
+    /// read by a person, an id is compared by the plugin that wrote it.
+    #[test]
+    fn a_mangled_id_is_refused_and_a_mangled_label_is_not() {
+        // One button, with each of the three strings given explicitly so a
+        // byte can be invalid where a `&str` could not carry one.
+        let tree = |id: &[u8], label: &[u8]| {
+            let mut bytes = vec![FORMAT];
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&[kind::BUTTON, slot::CHAT_HEADER, flags::ENABLED, 0]);
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            for text in [id, label, b""] {
+                bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(text);
+            }
+            parse(&bytes)
+        };
+
+        // 0xff is not a byte any UTF-8 sequence contains.
+        assert_eq!(
+            tree(b"tr\xffanslate", b"Traduzir"),
+            Err(ParseError::MangledId)
+        );
+
+        let drawn = tree(b"translate", b"Trad\xffuzir").expect("a label is decoded lossily");
+        assert_eq!(drawn[0].id, "translate");
+        assert_eq!(drawn[0].label, "Trad\u{fffd}uzir");
     }
 
     /// A slot number this build does not draw is refused, not dropped. A

@@ -995,6 +995,51 @@ fn a_plugin_cannot_grow_its_timer_list_across_calls() {
     });
 }
 
+/// Asks for one timer at the far end of the `i64` and says which answer it
+/// got, so the test reads the host's refusal rather than inferring it.
+const ARMS_AN_ETERNAL_TIMER: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_timer_set"    (func $timer (param i64 i64) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "a@s.whatsapp.net")
+  (data (i32.const 64) "refusedarmed")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))         ;; messages
+    (call $caps (i64.const 33))             ;; caps::SEND | caps::TIMERS
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (if (i32.lt_s (call $timer (i64.const 9223372036854775807) (i64.const 1)) (i32.const 0))
+      (then (drop (call $send (i32.const 0) (i32.const 16) (i32.const 64) (i32.const 7))))
+      (else (drop (call $send (i32.const 0) (i32.const 16) (i32.const 71) (i32.const 5)))))
+    (i32.const 0))
+)"#;
+
+/// A delay past the ceiling is refused rather than clamped or armed.
+///
+/// `i64::MAX` milliseconds is a quarter of a billion years, which saturates
+/// the monotonic clock it would be added to: the timer never comes due and
+/// holds one of the sixteen a plugin may have for the life of the process. A
+/// plugin that disarms itself by an arithmetic mistake is told about it.
+#[test]
+fn a_timer_past_the_far_end_of_time_is_refused() {
+    let dir = TempDir::new("eternal-timer");
+    dir.plugin("patient", &versioned(ARMS_AN_ETERNAL_TIMER));
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    plugins.observe(&message("a@s.whatsapp.net", "tick"));
+    until("an answer", || !commands.sent().is_empty());
+    assert_eq!(
+        commands.sent()[0].1,
+        "refused",
+        "a delay no clock can represent is not a timer"
+    );
+}
+
 /// A plugin that wants nothing but to draw: no account capability at all.
 fn draws_only() -> String {
     let mut buf = vec![0u8; 512];
@@ -1674,15 +1719,14 @@ fn a_plugin_that_wakes_itself_forever_is_held_to_its_share() {
 
     // Each callback marks itself before spinning, so this counts how many
     // actually ran. The bound is measured rather than guessed: over this
-    // window an unthrottled plugin gets through about sixteen callbacks and a
-    // throttled one about six, so ten separates them with room on both sides.
-    // Six seconds because the debt is paid off incrementally — a shorter
-    // window catches the throttle mid-convergence and the two are a factor of
-    // two apart, which is not a margin.
+    // window an unthrottled plugin gets through sixteen callbacks and a
+    // throttled one three, so six separates them with room on both sides —
+    // twice what the throttle produced here and under half of what removing
+    // it does, which is the margin a timing test on a loaded runner needs.
     std::thread::sleep(Duration::from_secs(6));
     let ran = commands.sent().len();
     assert!(
-        ran <= 10,
+        ran <= 6,
         "a plugin waking itself forever ran {ran} times in six seconds, which is not a share"
     );
     assert!(

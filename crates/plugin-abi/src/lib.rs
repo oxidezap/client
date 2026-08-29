@@ -143,6 +143,9 @@ pub mod imports {
     pub const KV_SET: &str = "oxi_kv_set";
     /// `fn(delay_ms: i64, token: i64) -> i32` — deliver
     /// [`super::kinds::TIMER`] carrying `token`, once, after `delay_ms`.
+    /// The host holds a floor under the delay and a ceiling over it: a
+    /// delay past the ceiling is refused rather than armed, because one at
+    /// the far end of the `i64` is a deadline no monotonic clock can hold.
     pub const TIMER_SET: &str = "oxi_timer_set";
 
     // Free to everyone: neither reveals anything the plugin was not already

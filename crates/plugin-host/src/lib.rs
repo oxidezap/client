@@ -593,6 +593,15 @@ impl Duty {
 
     /// Hold the plugin back until it is inside its share again.
     ///
+    /// The wait is what the *window* still needs, not what the plugin is over
+    /// by: sleeping counts against elapsed time and not against busy time, so
+    /// a second of work in a second wants nine more seconds of window to be a
+    /// tenth of it — sleeping the nine-tenths it was over by leaves the same
+    /// second of work inside 1.9, which is half the thread and not a tenth of
+    /// it. `busy / MAX_DUTY` is how long the window has to be for what has
+    /// already been spent to fit in the share, and what is left to wait is
+    /// that minus what has already passed.
+    ///
     /// Slept in slices so shutdown is not waiting on the whole debt: a plugin
     /// being throttled is still a plugin the daemon has to be able to join.
     fn wait_its_turn(&mut self, stopping: &AtomicBool) {
@@ -602,8 +611,11 @@ impl Duty {
             self.busy = std::time::Duration::ZERO;
             return;
         }
-        let allowed = elapsed.mul_f64(MAX_DUTY);
-        let Some(over) = self.busy.checked_sub(allowed) else {
+        // Never zero: `MAX_DUTY` is a constant tenth, so this is a
+        // multiplication by ten and cannot be an infinity or a NaN for any
+        // duration a thread can actually have run for.
+        let window_wanted = self.busy.div_f64(MAX_DUTY);
+        let Some(over) = window_wanted.checked_sub(elapsed) else {
             return;
         };
         let mut left = over.min(DUTY_WINDOW);

@@ -428,7 +428,9 @@ pub fn set(key: &str, value: &str) -> Outcome {
 /// Needs `abi::caps::TIMERS`.
 ///
 /// The host holds a floor under the delay: a plugin cannot re-arm its way
-/// into spinning its own thread.
+/// into spinning its own thread. And a ceiling — a week — because past it a
+/// delay is not a time any clock can hold, so an arithmetic mistake here is
+/// [`Outcome::Refused`] rather than a timer that never fires.
 pub fn after(delay_ms: i64, token: i64) -> Outcome {
     Outcome::of(raw::timer_set(delay_ms, token))
 }

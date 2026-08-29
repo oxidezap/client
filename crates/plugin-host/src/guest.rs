@@ -88,6 +88,18 @@ const MAX_COMMANDS_PER_CALL: usize = 32;
 /// spin.
 const MIN_TIMER_MS: i64 = 100;
 
+/// The longest timer a plugin may set.
+///
+/// A ceiling because a delay is an `i64` of milliseconds and the far end of
+/// that range is not a time: `i64::MAX` is a quarter of a billion years, and
+/// a deadline that far out saturates the monotonic clock it is added to. What
+/// it costs is not a crash — `wacore`'s `Instant` saturates rather than
+/// overflowing — but one of [`MAX_TIMERS`] held forever by a wake-up that can
+/// never come due, which is a plugin quietly disarming itself. A week is
+/// past every honest period a plugin has: a heartbeat, an hourly poll, a
+/// daily digest.
+const MAX_TIMER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 /// Which half of a plugin's life it is in.
 ///
 /// A plugin declares itself during `oxi_init` and only then. Letting it
@@ -633,6 +645,15 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             }
             let guest = c.data_mut();
             if guest.pending_timers + guest.timers.len() >= MAX_TIMERS {
+                return abi::outcome::REFUSED;
+            }
+            // Refused rather than clamped, unlike the floor: a delay under
+            // the floor is a plugin asking for "as soon as possible" and
+            // getting it, while one past the ceiling is a plugin asking for a
+            // time — and answering it with a week would fire a timer it never
+            // asked for. Told, so an arithmetic mistake in the guest is a
+            // refusal its author can see rather than a slot silently gone.
+            if delay_ms > MAX_TIMER_MS {
                 return abi::outcome::REFUSED;
             }
             guest.timers.push((delay_ms.max(MIN_TIMER_MS), token));
