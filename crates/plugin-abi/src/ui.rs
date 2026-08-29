@@ -395,6 +395,13 @@ mod parse {
     /// whole tree on the first thing that does not add up is the only answer
     /// that cannot half-apply — a plugin's interface is all of it or none.
     pub fn parse(bytes: &[u8]) -> Result<Vec<Node>, ParseError> {
+        // The host already refuses a longer read, but this is a public
+        // function and `MAX_BYTES` is this format's limit rather than that
+        // caller's: a 256-node tree of long strings fits the per-node rules
+        // and still exceeds it.
+        if bytes.len() > super::MAX_BYTES {
+            return Err(ParseError::TooBig);
+        }
         let mut r = Reader {
             bytes,
             at: 0,
@@ -674,6 +681,21 @@ mod tests {
     /// mean something later: a reader that ignored it would let payloads
     /// carrying a value circulate, and the day it acquires a meaning those
     /// become trees whose author never agreed to it.
+    /// `MAX_BYTES` is the format's limit, not one caller's: a tree that
+    /// satisfies every per-node rule can still be longer than this format
+    /// says a tree may be.
+    #[test]
+    fn a_payload_past_the_format_limit_is_refused() {
+        let mut bytes = write(|w| {
+            w.leaf(kind::LABEL, slot::SETTINGS, flags::ENABLED, "", "x", "");
+        })
+        .expect("fits");
+        assert!(parse(&bytes).is_ok(), "and it parses at its own size");
+
+        bytes.resize(MAX_BYTES + 1, 0);
+        assert_eq!(parse(&bytes), Err(ParseError::TooBig));
+    }
+
     #[test]
     fn a_non_zero_reserved_byte_is_refused() {
         let mut bytes = vec![FORMAT];

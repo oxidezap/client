@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use wacore::time::Instant;
 
 use oxidezap_core::{PluginAction, PluginSurface, UiEvent};
 use oxidezap_plugin_abi as abi;
@@ -297,32 +298,41 @@ impl Plugins {
         self.registry.surfaces()
     }
 
+    /// Whether any running plugin would be handed this event.
+    ///
+    /// Cheap, and asked before the caller has spent anything on it: the
+    /// daemon clones the session's event to keep it past `translate`, and a
+    /// history load carries every chat with its messages. A message-only
+    /// plugin would otherwise pay for every receipt in the account, and a
+    /// stopped one for everything, since a stopped worker stays in the list.
+    #[must_use]
+    pub fn wants(&self, event: &UiEvent) -> bool {
+        let Some(kind) = event::kind_of(event) else {
+            return false;
+        };
+        self.workers
+            .iter()
+            .any(|w| w.wants(kind) && self.registry.is_running(&w.id))
+    }
+
     /// Hand a session event to whoever asked for its kind.
     ///
     /// Converted once and shared: the cost of an event with five plugins
     /// attached is one conversion and five refcount bumps, not five
     /// conversions — and with none attached, nothing at all.
-    pub fn observe(&self, event: &UiEvent) {
-        // Asked before anything is built, because converting is the expensive
-        // half: a receipt clones its whole list of message ids, and an
-        // account's ordinary traffic is receipts and presence. A plugin
-        // subscribed to messages alone paid for every one of them and the
-        // loop then threw the result away — and went on paying after every
-        // plugin had stopped, since a stopped worker stays in this list.
-        let Some(kind) = event::kind_of(event) else {
-            return;
-        };
-        if !self
-            .workers
-            .iter()
-            .any(|w| w.wants(kind) && self.registry.is_running(&w.id))
-        {
+    pub fn observe(&self, original: &UiEvent) {
+        if !self.wants(original) {
             return;
         }
-        let Some(event) = event::from_session(event) else {
+        let Some(event) = event::from_session(original) else {
             return;
         };
-        debug_assert_eq!(event.kind, kind, "the filter and the conversion agree");
+        debug_assert_eq!(
+            Some(event.kind),
+            event::kind_of(original),
+            "the filter and the conversion agree"
+        );
+        let kind = event.kind;
         let event = Arc::new(event);
         for worker in &self.workers {
             if !worker.wants(kind) {
@@ -537,17 +547,40 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Turn the delays a call asked for into deadlines.
+///
+/// Monotonic, because `oxi_timer_set` takes a *delay*: a wall-clock deadline
+/// moves with the clock, so an NTP correction fires the timer early or holds
+/// it back by the whole adjustment. The library's `Instant`, so a test that
+/// moves time moves these too.
+fn deadlines(asked: Vec<(i64, i64)>) -> Vec<(Instant, i64)> {
+    let now = Instant::now();
+    asked
+        .into_iter()
+        .map(|(delay, token)| {
+            (
+                now + std::time::Duration::from_millis(delay.unsigned_abs()),
+                token,
+            )
+        })
+        .collect()
+}
+
 /// One plugin's whole life: take a job or a due timer, run it, apply what it
 /// asked for.
 fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stopping: &AtomicBool) {
-    // Deadlines as milliseconds rather than instants, because the clock here
-    // is the library's pluggable one and a test that moves time has to move
-    // these with it.
+    // Deadlines as monotonic instants rather than wall-clock milliseconds.
+    // `oxi_timer_set` takes a *delay*, and a wall-clock deadline moves with
+    // the clock: an NTP correction or somebody setting the date fires the
+    // timer early or holds it back by the whole adjustment. The library's
+    // `Instant` rather than std's, so a test that moves time still moves
+    // these with it — which is what `oxi_now_ms` is for, and it is the only
+    // thing that should be a wall clock.
     //
     // Seeded from `oxi_init`, because a plugin whose whole job is periodic
     // arms its first timer there and subscribes to no event at all: dropping
     // these would leave it waiting for a wake-up nobody was going to send.
-    let mut timers: Vec<(i64, i64)> = runtime.take_initial_timers();
+    let mut timers: Vec<(Instant, i64)> = runtime.take_initial_timers();
 
     while let Some(job) = take(jobs, &mut timers, stopping) {
         // Asked before the call, not only after it: a plugin stopped by its
@@ -569,10 +602,7 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
                 if let Some(roots) = effects.ui {
                     registry.set_roots(&runtime.id, roots);
                 }
-                let now = wacore::time::now_millis();
-                for (delay, token) in effects.timers {
-                    timers.push((now.saturating_add(delay), token));
-                }
+                timers.extend(deadlines(effects.timers));
             }
             // The only way a plugin is disabled by its own doing. A trap is
             // fuel exhausted, memory refused, or the plugin running off the
@@ -589,12 +619,16 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
 
 /// The next thing to hand the plugin: a queued job, or a timer that has come
 /// due. `None` when there is nothing left and never will be.
-fn take(jobs: &Receiver<Job>, timers: &mut Vec<(i64, i64)>, stopping: &AtomicBool) -> Option<Job> {
+fn take(
+    jobs: &Receiver<Job>,
+    timers: &mut Vec<(Instant, i64)>,
+    stopping: &AtomicBool,
+) -> Option<Job> {
     loop {
         if stopping.load(Ordering::Relaxed) {
             return None;
         }
-        let now = wacore::time::now_millis();
+        let now = Instant::now();
         // The soonest, which is not necessarily the first: timers are armed
         // in the order a handler asked for them and fire in the order they
         // come due.
@@ -612,7 +646,7 @@ fn take(jobs: &Receiver<Job>, timers: &mut Vec<(i64, i64)>, stopping: &AtomicBoo
                 )));
             }
             Some((_, due)) => {
-                let wait = std::time::Duration::from_millis(due.saturating_sub(now).unsigned_abs());
+                let wait = due.saturating_duration_since(now);
                 match jobs.recv_timeout(wait) {
                     Ok(job) => job,
                     // The timer is due now; go round and fire it.
@@ -697,6 +731,28 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+/// Make a rename into `dir` survive losing power.
+///
+/// Syncing the temporary file persists its *contents*; the directory entry
+/// that gives it its name is separate metadata, and POSIX says nothing about
+/// when that reaches the disk. So a machine that loses power after a
+/// revocation's rename can come back with the previous `approvals.json` and
+/// the capability it granted — which is not the narrow window it looks like,
+/// because nothing bounds how long the entry sits unflushed.
+///
+/// Best-effort: a filesystem that refuses to open a directory for this is one
+/// where the alternative is refusing to record permissions at all.
+pub(crate) fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(handle) = std::fs::File::open(dir)
+        && let Err(e) = handle.sync_all()
+    {
+        log::debug!("could not flush {}: {e}", dir.display());
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// The id a file carries: `autoreply.wasm` is `autoreply`.

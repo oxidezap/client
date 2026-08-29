@@ -168,9 +168,17 @@ impl Approvals {
             std::process::id(),
             std::thread::current().id()
         ));
-        if let Err(e) =
-            crate::write_private(&temp, &json).and_then(|()| std::fs::rename(&temp, path))
-        {
+        let landed = crate::write_private(&temp, &json)
+            .and_then(|()| std::fs::rename(&temp, path))
+            .inspect(|()| {
+                // The rename is metadata, and syncing the file did not
+                // persist it. Without this a revocation can be undone by
+                // losing power, whatever this function then returns.
+                if let Some(dir) = path.parent() {
+                    crate::sync_dir(dir);
+                }
+            });
+        if let Err(e) = landed {
             // Fail closed. Leaving the previous file is the tempting answer
             // and it is the wrong one: the write that most matters is a
             // *withdrawal*, and a stale file that outlives one hands the

@@ -200,8 +200,15 @@ impl Kv {
             std::process::id(),
             std::thread::current().id()
         ));
-        let outcome =
-            crate::write_private(&temp, &json).and_then(|()| std::fs::rename(&temp, &self.path));
+        let outcome = crate::write_private(&temp, &json)
+            .and_then(|()| std::fs::rename(&temp, &self.path))
+            .inspect(|()| {
+                // As the approvals file does it, and for the same reason:
+                // syncing the contents does not persist the name.
+                if let Some(dir) = self.path.parent() {
+                    crate::sync_dir(dir);
+                }
+            });
         if let Err(e) = outcome {
             if !self.complained {
                 self.complained = true;

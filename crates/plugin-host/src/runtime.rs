@@ -18,6 +18,7 @@ use crate::event::Event;
 use crate::guest::{Guest, Phase};
 use crate::kv::Kv;
 use crate::{Commands, MAX_MODULE_BYTES, MAX_TABLE_ELEMENTS, MAX_TABLES, MEMORY_LIMIT};
+use wacore::time::Instant;
 
 /// How much work one `oxi_on_event` may do.
 ///
@@ -141,6 +142,7 @@ impl Runtime {
                 unknown_kinds: false,
                 unknown_caps: false,
                 logged_bytes: 0,
+                commands_issued: 0,
                 trees_published: 0,
                 kv,
                 commands,
@@ -252,12 +254,8 @@ impl Runtime {
     /// plugin whose whole job is periodic arms its first timer there and
     /// subscribes to no event at all, so dropping these would leave it
     /// waiting for a wake-up nobody was going to send.
-    pub fn take_initial_timers(&mut self) -> Vec<(i64, i64)> {
-        let now = wacore::time::now_millis();
-        std::mem::take(&mut self.store.data_mut().timers)
-            .into_iter()
-            .map(|(delay, token)| (now.saturating_add(delay), token))
-            .collect()
+    pub fn take_initial_timers(&mut self) -> Vec<(Instant, i64)> {
+        crate::deadlines(std::mem::take(&mut self.store.data_mut().timers))
     }
 
     /// The tree the plugin published during `oxi_init`, if any.
@@ -299,6 +297,7 @@ impl Runtime {
             let guest = self.store.data_mut();
             guest.logged_bytes = 0;
             guest.trees_published = 0;
+            guest.commands_issued = 0;
         }
 
         let outcome = self.on_event.call(&mut self.store, (kind, 0));

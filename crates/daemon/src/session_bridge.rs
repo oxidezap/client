@@ -628,11 +628,11 @@ impl Bridge {
         // and with nothing to make it ask again.
         let pending = self.hub.wants_session_events().then(|| event.clone());
         // Kept for the plugins, which are told once the state below is
-        // written; `translate` consumes the event. Cloned only when there is
-        // somebody to tell: a history load carries every chat with its
-        // messages, a receipt carries a whole list of ids, and the ordinary
-        // account has no plugins at all.
-        let observed = (!self.plugins.is_empty()).then(|| event.clone());
+        // written; `translate` consumes the event. Cloned only when one of
+        // them would actually be handed it — not merely when any are loaded:
+        // a history load carries every chat with its messages, a receipt a
+        // whole list of ids, and a message-only plugin wants none of it.
+        let observed = self.plugins.wants(&event).then(|| event.clone());
 
         for change in self.translate(event) {
             // A chat that left the store owes nothing and will never be read

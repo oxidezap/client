@@ -69,6 +69,16 @@ const MAX_LOG_BYTES_PER_CALL: usize = 64 * 1024;
 /// generous for anything honest.
 const MAX_UI_PER_CALL: usize = 16;
 
+/// How many account commands one call may issue.
+///
+/// Each one crosses into the daemon and the session spawns work for it — a
+/// typing indicator becomes a stanza — while the import itself costs the
+/// guest a handful of instructions. So a loop over `oxi_typing` in one
+/// handler is an unbounded number of tasks and stanzas bought with almost no
+/// fuel. Generous for anything honest: a handler answering one event sends
+/// once, twice if it also marks it read.
+const MAX_COMMANDS_PER_CALL: usize = 32;
+
 /// The shortest timer a plugin may set.
 ///
 /// A floor rather than a fuel charge: fuel is spent inside a call, and a
@@ -151,6 +161,8 @@ pub struct Guest {
     /// which the loader turns into a refusal once `oxi_init` returns.
     pub unknown_caps: bool,
     pub logged_bytes: usize,
+    /// How many account commands this call has issued.
+    pub commands_issued: usize,
     pub trees_published: usize,
     pub kv: Kv,
     pub commands: Arc<dyn Commands>,
@@ -183,6 +195,19 @@ impl Guest {
     /// Whether this plugin may do `cap` right now.
     fn allows(&self, cap: i64) -> bool {
         self.phase != Phase::Loading && self.caps() & cap != 0
+    }
+
+    /// Take one of this call's command budget, or refuse.
+    ///
+    /// Counted rather than priced, because the cost is on the far side: the
+    /// session spawns work per command and fuel only pays for the handful of
+    /// guest instructions around the import.
+    fn spend_command(&mut self) -> bool {
+        if self.commands_issued >= MAX_COMMANDS_PER_CALL {
+            return false;
+        }
+        self.commands_issued += 1;
+        true
     }
 
     /// The value behind the event handle.
@@ -285,9 +310,14 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                     // A name is drawn in a list beside other plugins'; one
                     // long enough to push them off the screen is not a name.
                     let name: String = name.chars().take(64).collect();
-                    if !name.trim().is_empty() {
-                        c.data_mut().name = Some(name);
+                    // Refused rather than dropped. Answering ACCEPTED and
+                    // then keeping the plugin's id left whoever wrote it
+                    // looking for why their name never appeared — the same
+                    // failure a silently ignored slot is refused for.
+                    if name.trim().is_empty() {
+                        return abi::outcome::INVALID;
                     }
+                    c.data_mut().name = Some(name);
                     abi::outcome::ACCEPTED
                 }
                 Err(code) => code,
@@ -387,6 +417,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if !c.data().allows(abi::caps::SEND) {
                 return abi::outcome::DENIED;
             }
+            if !c.data_mut().spend_command() {
+                return abi::outcome::STATE;
+            }
             let (jid, text) = match (
                 read_str(&mut c, jid, jid_len),
                 read_str(&mut c, text, text_len),
@@ -419,6 +452,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if !c.data().allows(abi::caps::SEND) {
                 return abi::outcome::DENIED;
             }
+            if !c.data_mut().spend_command() {
+                return abi::outcome::STATE;
+            }
             let (Ok(jid), Ok(text), Ok(quoted)) = (
                 read_str(&mut c, jid, jid_len),
                 read_str(&mut c, text, text_len),
@@ -444,6 +480,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if !c.data().allows(abi::caps::MARK_READ) {
                 return abi::outcome::DENIED;
             }
+            if !c.data_mut().spend_command() {
+                return abi::outcome::STATE;
+            }
             let (Ok(jid), Ok(id)) = (read_str(&mut c, jid, jid_len), read_str(&mut c, id, id_len))
             else {
                 return abi::outcome::INVALID;
@@ -467,6 +506,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             }
             if !c.data().allows(abi::caps::TYPING) {
                 return abi::outcome::DENIED;
+            }
+            if !c.data_mut().spend_command() {
+                return abi::outcome::STATE;
             }
             let Ok(jid) = read_str(&mut c, jid, jid_len) else {
                 return abi::outcome::INVALID;

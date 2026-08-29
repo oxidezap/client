@@ -145,7 +145,9 @@ profile here repeats it deliberately.
   component model, which is the trade the ABI is built around.
 - **A plugin's whole outside world is the `oxidezap` import module.** There is
   no WASI — not a restricted one, none — so a `.wasm` a user downloaded cannot
-  read the disk or open a socket because no function exists that would. That
+  open a path or a socket because no function exists that would. It has
+  storage, but not the *filesystem*: `oxi_kv_get`/`oxi_kv_set` are a map the
+  host keeps in a file the plugin cannot name. That
   is a structural guarantee rather than a policy, and it is the reason the ABI
   has no `oxi_http_fetch`: adding one turns that sentence into a promise about
   configuration, and half the interesting plugins want it, which is exactly
@@ -822,7 +824,12 @@ screen, with the title above the glass and the pair code below it.
   closes both, because closing the crash window means the write happening
   first. Protecting the account that is running now is the side worth taking;
   the failed-write path already removes the file rather than leave a stale
-  grant, so only an actual crash, in that window, reverts anything.
+  grant, so only an actual crash, in that window, reverts anything. Which is
+  also why the *rename* is made durable: syncing the temporary file persists
+  its contents and not the directory entry that names it, so without a sync
+  of the parent a revocation could be undone by losing power at any point
+  after it looked finished — a far wider window than the one above, and the
+  half of this that is fixable rather than a trade.
 - **A withdrawal does not reach a command already in flight.** The mask is
   read live, so the *next* command a plugin attempts is checked against the
   answer — but the check and the send are two steps, and the send parks on a
@@ -839,12 +846,16 @@ screen, with the title above the glass and the pair code below it.
   field committed empty arrive indistinguishable from a field the event never
   had. Smuggling the difference into string presence would break the rule for
   every reader; carrying it needs a field that says so.
-- **A plugin never sees what this process sends.** `kinds::MESSAGE` is what
-  *arrives*, including a message this account wrote on another device — but a
-  send made through this daemon is announced as an id assignment, not as a
-  message, so a plugin keeping a record of a conversation has a hole in it
-  exactly where its own replies go. Synthesizing one is not free: the same
-  message returns through sync, and a plugin would see it twice.
+- **A plugin never sees what this process sends, at the time it is sent.**
+  `kinds::MESSAGE` is what *arrives*, including a message this account wrote
+  on another device — but a send made through this daemon is announced as an
+  id assignment, not as a message, so nothing reaches a plugin at send time
+  and one keeping a record of a conversation has a hole in it exactly where
+  its own replies go. Whether the same message comes back later is the
+  server's business rather than a promise: when it does, through a history
+  sync, it arrives as an ordinary `MESSAGE` with `FROM_ME` set. Which is why
+  synthesizing one at send time is not free — a plugin would see the ones
+  that do come back twice.
 - **A plugin's reply quotes an empty message.** `oxi_send_reply` names an id
   and nothing else, which is all the ABI gives a plugin — but the session
   does not re-read the original: `quote_context` puts the preview, the sender
