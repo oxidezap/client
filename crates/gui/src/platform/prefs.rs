@@ -138,6 +138,11 @@ mod native {
 
 #[cfg(target_family = "wasm")]
 mod web {
+    use std::cell::{Cell, RefCell};
+
+    use wasm_bindgen::JsCast as _;
+    use wasm_bindgen::prelude::Closure;
+
     /// The key the document is kept under.
     ///
     /// Namespaced, because a page shares its origin's storage with anything
@@ -174,24 +179,84 @@ mod web {
         })?;
         storage
             .set_item(KEY, document)
-            .map_err(|e| format!("could not save the theme: {e:?}"))
+            .map_err(|e| format!("could not save the theme: {e:?}"))?;
+        // This page's own write does not raise a `storage` event here — the
+        // event is for the *other* tabs — so the memo is told directly.
+        MEMO.with(|memo| memo.set(Some(hash(document))));
+        Ok(())
     }
 
-    /// A hash of the document.
-    ///
-    /// There is no modification time to read: the store answers "what does it
-    /// say", not "when did it change". Hashing the answer gives a number that
-    /// moves exactly when the document does, which is all the poll compares.
-    /// It costs a read of a document measured in kilobytes, once a second.
-    pub fn revision() -> Option<super::Revision> {
-        let document = read().ok().flatten()?;
-        // FNV-1a: a few lines, no dependency, and nothing here is defending
-        // against anyone choosing the input — the document is the user's own.
+    thread_local! {
+        /// The revision last computed, kept so the poll is not I/O.
+        ///
+        /// `None` means "ask the store": nothing has been read yet, or
+        /// another tab wrote and the listener below cleared it.
+        static MEMO: Cell<Option<super::Revision>> = const { Cell::new(None) };
+        /// The listener that clears it, held for the life of the page.
+        static ELSEWHERE: RefCell<Option<Closure<dyn FnMut(web_sys::StorageEvent)>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// FNV-1a: a few lines, no dependency, and nothing here is defending
+    /// against anyone choosing the input — the document is the user's own.
+    fn hash(document: &str) -> super::Revision {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in document.as_bytes() {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        Some(hash)
+        hash
+    }
+
+    /// A number that moves exactly when the document does.
+    ///
+    /// There is no modification time to read: the store answers "what does it
+    /// say", not "when did it change". So the answer is a hash — but not one
+    /// recomputed off a fresh `getItem` every second. `localStorage` is
+    /// synchronous I/O on the thread that draws, and a large theme pasted
+    /// into Settings turned a 1 Hz poll into a stall a person could see.
+    ///
+    /// The two ways the document can change are both announced: this page's
+    /// own [`write`], and another tab's, which arrives as a `storage` event.
+    /// Anything else — a browser that will not fire the event, a first call —
+    /// falls through to the read.
+    pub fn revision() -> Option<super::Revision> {
+        watch_other_tabs();
+        if let Some(known) = MEMO.with(Cell::get) {
+            return Some(known);
+        }
+        let revision = hash(&read().ok().flatten()?);
+        MEMO.with(|memo| memo.set(Some(revision)));
+        Some(revision)
+    }
+
+    /// Clear the memo whenever another tab writes the theme.
+    ///
+    /// Registered on the first ask rather than at startup, so a build that
+    /// never looks at the theme never listens for it.
+    fn watch_other_tabs() {
+        ELSEWHERE.with(|held| {
+            if held.borrow().is_some() {
+                return;
+            }
+            let Some(window) = web_sys::window() else {
+                return;
+            };
+            let changed = Closure::<dyn FnMut(web_sys::StorageEvent)>::new(
+                move |event: web_sys::StorageEvent| {
+                    // `key` is `None` for a whole-store clear, which changes
+                    // this document as surely as writing it does.
+                    if event.key().is_none_or(|key| key == KEY) {
+                        MEMO.with(|memo| memo.set(None));
+                    }
+                },
+            );
+            if window
+                .add_event_listener_with_callback("storage", changed.as_ref().unchecked_ref())
+                .is_ok()
+            {
+                *held.borrow_mut() = Some(changed);
+            }
+        });
     }
 }
