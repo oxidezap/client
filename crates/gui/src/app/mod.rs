@@ -1783,6 +1783,17 @@ impl WhatsAppApp {
         // position outliving its chat is a conversation that never asks for
         // its history again.
         self.forget_chat_paging(&gone);
+        for jid in &gone {
+            // A read owed by a chat that has left is a read nobody is waiting
+            // for. Kept, it is spent by the first merge that brings the chat
+            // back — archived elsewhere and unarchived months later — and
+            // marks messages nobody has looked at, which is the opposite of
+            // what a read is bounded by.
+            self.owed_reads.remove(jid);
+            // And a draft for a conversation that is gone has nowhere to be
+            // typed, let alone sent.
+            self.drafts.remove(jid);
+        }
         self.forget_missing_selection();
         // The viewer names a chat and a message in it, and resolves them every
         // frame: one left open over a chat that has just gone draws nothing,
