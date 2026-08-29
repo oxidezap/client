@@ -308,13 +308,22 @@ pub async fn run(
 
     // Plugins next, and for exactly the reason the publisher is joined
     // below: one still in a handler can write its settings file, and that
-    // file sits in a directory the wipe is about to remove. Joining is
-    // blocking, so it goes on a blocking thread like the rest of the
-    // teardown.
+    // file sits in a directory the wipe is about to remove.
+    //
+    // Through `unblock` rather than `spawn_blocking`, because this line is
+    // reached in a page too: a browser has no blocking pool, so the call
+    // that was meant to join threads would instead panic here — before the
+    // publisher is joined and before the store is deleted, which is the
+    // whole of what this teardown exists to order. `unblock` is a hand-off
+    // on a desktop and a plain call in a page, which is right on both: what
+    // it runs there is `Plugins::none`, with no thread to join.
     {
         let plugins = Arc::clone(&bridge.plugins);
-        if let Err(e) = tokio::task::spawn_blocking(move || plugins.shutdown()).await {
-            log::error!("the plugin threads did not finish: {e}");
+        if oxidezap_session::unblock(move || plugins.shutdown())
+            .await
+            .is_err()
+        {
+            log::error!("the plugin threads did not finish");
         }
     }
 

@@ -77,6 +77,24 @@ pub async fn start() -> Result<DuplexStream, StartFailed> {
 // a browser object that belongs to the agent that took it.
 thread_local! {
     static SERVICE: RefCell<Option<Service>> = const { RefCell::new(None) };
+    /// Whether a session's bridge has been spawned and has not returned.
+    ///
+    /// Not the same question as "is its command channel open", which is what
+    /// [`running`] used to ask: `session_bridge::run` drops the receiver
+    /// *first* and then joins the plugins, joins the publisher and deletes
+    /// the database. Between those, the channel reads closed while the
+    /// account is still being taken apart.
+    static RUNNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a bridge is between dropping its commands and returning.
+///
+/// The window "clear data and pair again" runs in, on the side the front end
+/// cannot see: it sends the command and reconnects at once, and what it must
+/// not be handed is a fresh session opening the database the old one is
+/// deleting.
+fn tearing_down() -> bool {
+    RUNNING.with(std::cell::Cell::get)
 }
 
 /// What one page's daemon consists of, minus the connections.
@@ -145,10 +163,20 @@ async fn service() -> Result<
     // is meant to be what `plugins::start` says it is and nothing else.
     let plugins = crate::plugins::start(&hub, commands.clone());
 
+    // Raised before the bridge exists and lowered only once it has returned,
+    // which is a longer span than the command channel measures — see
+    // [`tearing_down`].
+    RUNNING.with(|running| running.set(true));
     oxidezap_session::spawn({
         let hub = Arc::clone(&hub);
         let plugins = Arc::clone(&plugins);
-        async move { session_bridge::run(hub, plugins, command_rx, stopped).await }
+        async move {
+            let outcome = session_bridge::run(hub, plugins, command_rx, stopped).await;
+            // After `run`, not inside it: what this says is "the teardown is
+            // over", and the teardown is the last thing `run` does.
+            RUNNING.with(|running| running.set(false));
+            outcome
+        }
     });
 
     SERVICE.with(|cell| {
@@ -180,11 +208,23 @@ fn running() -> Result<Option<Running>, StartFailed> {
     SERVICE.with(|cell| {
         let mut slot = cell.borrow_mut();
 
+        let closed = slot.as_ref().is_some_and(|s| s.commands.is_closed());
+
+        // Closed, but not finished. `run` drops the command receiver before
+        // it joins the plugins, joins the publisher and wipes the store, so
+        // a closed channel is the *start* of the teardown rather than proof
+        // of its end. Forgetting the entry here would skip the guard below
+        // and hand the next caller a session that opens the database the old
+        // one is in the middle of deleting.
+        if closed && tearing_down() {
+            return Err(StartFailed::Stopping);
+        }
+
         // Gone: the bridge exited, so its receiver is dropped. Forgetting the
         // entry is what lets the next caller build a fresh session; the claim
         // it will run under is this one, because the account did not stop
         // being this page's when its bridge did.
-        if slot.as_ref().is_some_and(|s| s.commands.is_closed()) {
+        if closed {
             *slot = None;
         }
 
