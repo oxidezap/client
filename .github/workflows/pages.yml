@@ -375,7 +375,17 @@ jobs:
   # when the pull request closes, merged or not.
   take-down:
     name: Take the preview down
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    # Same-repository only, matching `publish` above: a fork's pull request
+    # never had a preview to remove, and a fork-triggered job is handed a
+    # read-only token — so this would spend its retries pushing a branch it
+    # cannot write and end red on somebody else's contribution closing. The
+    # removal claims its ordinal whether or not it finds a directory, which
+    # makes the push unconditional and this condition load-bearing rather
+    # than tidy.
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: write

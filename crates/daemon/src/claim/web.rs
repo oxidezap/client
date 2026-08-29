@@ -32,10 +32,6 @@ const LOCK: &str = "oxidezap-session";
 pub(crate) struct Claim {
     /// Resolves the callback's promise, releasing the lock.
     release: Option<futures_channel::oneshot::Sender<()>>,
-    /// The callback, kept alive because the browser still holds a reference
-    /// to it. A `Closure` dropped while JS can still call it is a panic
-    /// rather than a missed call.
-    _held: Closure<dyn FnMut(wasm_bindgen::JsValue) -> js_sys::Promise>,
 }
 
 impl Drop for Claim {
@@ -112,6 +108,19 @@ pub(crate) async fn take() -> Result<Claim, String> {
     // sender is gone. What is watched for here is the other path: a rejection
     // that means the callback will never run at all.
     wasm_bindgen_futures::spawn_local(async move {
+        // The callback lives here, and nowhere the caller can drop it.
+        //
+        // A `Closure` freed while the browser still holds a reference is a
+        // panic rather than a missed call, and the browser holds this one
+        // until the request's promise settles. Held by the granted `Claim`,
+        // it was a caller's to lose: `retry_connection` replaces its task,
+        // which drops the `attach` future this is awaited inside — two Retry
+        // clicks before a rerender is enough — and the lock manager would
+        // then call into a closure that had gone with it. This task is
+        // detached and outlives every one of those, and it ends exactly when
+        // the browser is finished: the promise settles on a refusal at once,
+        // and on a grant when the `Claim` is dropped and the lock released.
+        let _held = callback;
         if let Err(e) = JsFuture::from(request).await
             && let Some(tell) = rejected.borrow_mut().take()
         {
@@ -122,7 +131,6 @@ pub(crate) async fn take() -> Result<Claim, String> {
     match was_granted.await {
         Ok(Answer::Granted) => Ok(Claim {
             release: Some(release),
-            _held: callback,
         }),
         Ok(Answer::Failed(detail)) => Err(format!(
             "The browser would not give this page a lock on the account: {detail}"

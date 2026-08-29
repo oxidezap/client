@@ -62,9 +62,18 @@ impl WhatsAppApp {
     /// Get the currently playing audio message ID (if audio is playing)
     pub fn playing_message_id(&self) -> Option<&str> {
         match &self.active_media {
-            // Gated on the stream so a paused voice note renders as paused;
-            // resume still works because toggle_audio matches on active_media.
-            ActiveMedia::Audio { message_id } if self.audio_player.is_playing() => Some(message_id),
+            // `is_active`, which is the same question [`Self::toggle_audio`]
+            // asks — and they have to be the same question or the control
+            // lies about what tapping it does. `is_playing` is false for the
+            // whole of a decode, so a note the browser had accepted but not
+            // yet started drew a Play icon while the tap behind it went to
+            // `pause()`: the second tap on a control that looked idle was
+            // what stopped the note from ever starting.
+            //
+            // A paused note still renders as paused, which is what this was
+            // gated for: `is_active` is playing *or on its way*, and a pause
+            // during a decode sets `pending_pause`, which takes it out.
+            ActiveMedia::Audio { message_id } if self.audio_player.is_active() => Some(message_id),
             _ => None,
         }
     }
