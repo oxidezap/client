@@ -151,6 +151,19 @@ struct H264Sample {
     is_keyframe: bool,
 }
 
+/// The newest keyframe at or before `index`, which is the earliest sample a
+/// decoder starting fresh can make sense of.
+///
+/// Falls back to the start of the stream when nothing before the target
+/// declares itself one: decoding from there is what a backward seek used to
+/// do unconditionally, and it is the only answer that is always right.
+fn keyframe_at_or_before(samples: &[H264Sample], index: usize) -> usize {
+    (0..=index.min(samples.len().saturating_sub(1)))
+        .rev()
+        .find(|&ix| samples[ix].is_keyframe)
+        .unwrap_or(0)
+}
+
 /// Streaming video decoder that decodes frames on-demand.
 pub struct StreamingVideoDecoder {
     /// H.264 samples (Annex B format) - compressed, small
@@ -550,9 +563,14 @@ impl StreamingVideoDecoder {
             // Moving forward - continue from where we are
             (self.last_decoded_index + 1) as usize
         } else {
-            // Moving backward - need to reset decoder and start from beginning
+            // Backwards: the decoder's state is no use, so it is rebuilt — but
+            // from the keyframe the target is coded against rather than from
+            // the start of the file. Each sample already knows whether it is
+            // one; nothing asked. Dragging into the middle of three minutes at
+            // thirty frames a second re-decoded about 2700 frames, on the
+            // thread that draws the window.
             self.reset_decoder();
-            0
+            keyframe_at_or_before(&self.samples, target_index)
         };
 
         // Decode frames from start_index to target_index
@@ -808,6 +826,34 @@ impl StreamingVideoDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A backward drag rebuilt the decoder and fed it every sample from the
+    /// start of the file — about 2700 of them for the middle of three minutes
+    /// at thirty frames a second, on the thread that draws the window. Each
+    /// sample already knew whether it was a keyframe.
+    #[test]
+    fn a_backward_seek_starts_at_the_keyframe_it_can_start_from() {
+        let samples: Vec<H264Sample> = (0..3000)
+            .map(|ix| H264Sample {
+                data: Vec::new(),
+                is_keyframe: ix % 60 == 0,
+            })
+            .collect();
+
+        assert_eq!(keyframe_at_or_before(&samples, 2700), 2700);
+        assert_eq!(keyframe_at_or_before(&samples, 2699), 2640);
+        assert_eq!(keyframe_at_or_before(&samples, 0), 0);
+
+        // Nothing declares itself one: from the start, which is what a
+        // backward seek always did.
+        let opaque: Vec<H264Sample> = (0..10)
+            .map(|_| H264Sample {
+                data: Vec::new(),
+                is_keyframe: false,
+            })
+            .collect();
+        assert_eq!(keyframe_at_or_before(&opaque, 9), 0);
+    }
 
     #[test]
     fn identity_matrix_is_no_rotation() {
