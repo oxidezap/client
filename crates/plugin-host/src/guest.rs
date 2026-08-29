@@ -923,31 +923,6 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if line > MAX_LOG_BYTES as usize {
                 return;
             }
-            // And a budget across the whole call, checked against what this
-            // line *needs* rather than against what is already spent: the
-            // latter is a threshold, not a limit, and lets the line that
-            // crosses it through in full. Silently, past it: a line saying
-            // "you have logged too much" is another line.
-            // A smaller allowance until the loader has accepted the module.
-            let per_call = if c.data().phase == Phase::Init {
-                MAX_LOG_BYTES_FOR_INIT
-            } else {
-                MAX_LOG_BYTES_PER_CALL
-            };
-            let spent = &mut c.data_mut().logged_bytes;
-            if line > per_call.saturating_sub(*spent) {
-                return;
-            }
-            *spent += line;
-            // And across calls, which the per-call cap says nothing about: a
-            // plugin waking itself sixteen times a second spends a fresh
-            // allowance every time, and filling a disk is not something the
-            // duty cycle notices — writing a line is fast, not long.
-            let budget = &mut c.data_mut().log_budget;
-            let elapsed = budget.window_began.elapsed();
-            if !budget.spend(elapsed, line) {
-                return;
-            }
             let Ok(line) = read_str(&mut c, ptr, len) else {
                 return;
             };
@@ -961,6 +936,37 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // ANSI escape rewrites a terminal's idea of what it is showing
             // just as well as a newline does.
             let line = escape_controls(&line);
+            // Charged for what is written, which is what the budget is a
+            // bound on: every control byte becomes five or six characters, so
+            // billing the length the guest passed let two kilobytes of `0x01`
+            // write twelve — six times the allowance, from an import that
+            // costs no capability at all.
+            let written = line.len();
+            // A budget across the whole call, checked against what this line
+            // *needs* rather than against what is already spent: the latter is
+            // a threshold, not a limit, and lets the line that crosses it
+            // through in full. Silently, past it: a line saying "you have
+            // logged too much" is another line.
+            // A smaller allowance until the loader has accepted the module.
+            let per_call = if c.data().phase == Phase::Init {
+                MAX_LOG_BYTES_FOR_INIT
+            } else {
+                MAX_LOG_BYTES_PER_CALL
+            };
+            let spent = &mut c.data_mut().logged_bytes;
+            if written > per_call.saturating_sub(*spent) {
+                return;
+            }
+            *spent += written;
+            // And across calls, which the per-call cap says nothing about: a
+            // plugin waking itself sixteen times a second spends a fresh
+            // allowance every time, and filling a disk is not something the
+            // duty cycle notices — writing a line is fast, not long.
+            let budget = &mut c.data_mut().log_budget;
+            let elapsed = budget.window_began.elapsed();
+            if !budget.spend(elapsed, written) {
+                return;
+            }
             let id = &c.data().id;
             // Prefixed, always. A plugin's line in the daemon's log is
             // otherwise indistinguishable from the daemon's own, and the
@@ -1301,5 +1307,22 @@ mod tests {
             escape_controls("answered 3 messages"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// The budget bounds what a plugin leaves behind, so it has to be charged
+    /// for what is written: every control byte becomes five or six characters,
+    /// and billing the length the guest passed let a line write six times its
+    /// own allowance — from an import that costs no capability at all.
+    #[test]
+    fn a_log_line_costs_what_it_writes() {
+        let control = "\u{1}".repeat(2048);
+        assert_eq!(control.len(), 2048);
+        let written = escape_controls(&control);
+        assert!(
+            written.len() >= control.len() * 5,
+            "{} escaped to {}",
+            control.len(),
+            written.len()
+        );
     }
 }
