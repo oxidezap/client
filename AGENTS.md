@@ -1140,6 +1140,15 @@ microphone already was, and so do plugins, for the same kind of reason. WebCodec
 bindings rather than JavaScript — they are API changes rather than backends,
 which is why neither is done here.
 
+**A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
+is there because cross-origin isolation needs two response headers GitHub Pages
+will not set, and the price is that it also caches the bundle: an ordinary
+reload of a published page serves the *old* `.js`, so a build that fixed
+something looks exactly like one that did not. Unregister it (Application →
+Service Workers) and hard-reload, or check the hash in the bundle's filename
+before believing a test of the deployed page. `trunk serve` has no service
+worker, which is the other reason to reproduce there first.
+
 Every browser API in the tree is bound through `web-sys`/`js-sys` from Rust:
 the WebSocket, `fetch`, `setTimeout`, WebAudio, `localStorage`, the download
 anchor. The one piece of hand-written JavaScript is
@@ -1159,21 +1168,20 @@ by definition.
   `chat-store/store.rs` (~3.2k). The calls came out of the first one and the
   video plane never went in, so what is left is the event pump, hydration and
   the paged reads — three things rather than one file.
-- **The session runs in the browser; pairing is what nobody has measured.**
-  A page with no daemon named starts its own: the VFS opens, the store and its
-  migrations run, `ChatStore` comes up and the library's client is created and
-  dials `wss://web.whatsapp.com/ws/chat`, with its own backoff behind it. That
-  upgrade succeeds from a page served off `https://oxidezap.github.io`, which
-  is a public origin and not WhatsApp's own — a WebSocket upgrade is not
-  subject to the same-origin policy, and the server declines to make it one.
-  The handshake's first message is measured too, against a stubbed endpoint:
-  the page puts 43 bytes on the wire — `WA` `06 03 00 00` and then a
-  `HandshakeMessage` whose `client_hello.ephemeral` is 32 bytes — which is a
-  well-formed ClientHello and means the X25519 keypair, the protobuf and the
-  transport all work in wasm. What is past it cannot be measured anywhere but
-  against WhatsApp: the client pins the server's static key, so a stub can
-  answer the upgrade and nothing after it. The QR, and a phone answering it,
-  are what is left.
+- **The session runs in the browser, and pairing is measured now.** A page
+  with no daemon named starts its own, and the whole of it works against
+  WhatsApp: the VFS opens, the store and its migrations run, `ChatStore` comes
+  up, the library's client dials `wss://web.whatsapp.com/ws/chat`, the QR is
+  drawn, a phone scans it, and messages go out and come back. The upgrade
+  succeeds from a page served off `https://oxidezap.github.io`, which is a
+  public origin and not WhatsApp's own — a WebSocket upgrade is not subject to
+  the same-origin policy, and the server declines to make it one.
+  What stood between the handshake and the QR was `AbortHandle`, above, and it
+  is worth remembering how it looked: everything a log could show was working.
+  The socket opened, the handshake completed, the server's `<pair-device>`
+  arrived and was acked. Only the ack is inline; the six refs are rotated by a
+  detached task, and a detached task was one this page cancelled. So the
+  failure presented as a page that connects perfectly and pairs never.
   Durability is the other half. The window's VFS is relaxed-IndexedDB, which
   writes changed blocks after the commit rather than during it, so a tab killed
   in that window loses the commit — a message that comes back on the next
