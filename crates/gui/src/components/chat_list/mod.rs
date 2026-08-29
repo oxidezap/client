@@ -2,6 +2,7 @@
 
 mod filters;
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -43,6 +44,32 @@ pub struct AccountSummary {
     pub name: String,
     pub status: String,
     pub is_healthy: bool,
+}
+
+/// One size per row, reused while the geometry and the count hold.
+///
+/// A thread local because this is the window's own thread and the value is a
+/// per-frame convenience rather than state anybody owns; the key is
+/// everything the sizes are derived from, so a base-font change or a resize
+/// rebuilds them and nothing else does.
+fn row_sizes(rows: usize, width: Pixels, height: Pixels) -> Rc<Vec<Size<Pixels>>> {
+    thread_local! {
+        static SIZES: RefCell<Option<(usize, Pixels, Pixels, Rc<Vec<Size<Pixels>>>)>> =
+            const { RefCell::new(None) };
+    }
+    SIZES.with(|held| {
+        let mut held = held.borrow_mut();
+        if let Some((count, w, h, sizes)) = held.as_ref()
+            && *count == rows
+            && *w == width
+            && *h == height
+        {
+            return Rc::clone(sizes);
+        }
+        let sizes: Rc<Vec<Size<Pixels>>> = Rc::new(vec![size(width, height); rows]);
+        *held = Some((rows, width, height, Rc::clone(&sizes)));
+        sizes
+    })
 }
 
 pub fn render_chat_list(
@@ -209,12 +236,11 @@ fn render_rows(
 
     // Row sizes are resolved geometry, so they have to be rebuilt whenever the
     // metrics behind them move — the cache keys on rem size and density for
-    // exactly that reason.
-    let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
-        (0..rows.len())
-            .map(|_| size(layout.sidebar_width(), row_height))
-            .collect(),
-    );
+    // exactly that reason. Kept between frames because they move rarely and
+    // the vector is one entry per loaded conversation: rebuilt per frame, a
+    // paged account allocated and filled thousands of identical entries to
+    // draw a dozen rows, which is the opposite of what a virtual list is for.
+    let item_sizes = row_sizes(rows.len(), layout.sidebar_width(), row_height);
 
     div().size_full().overflow_hidden().relative().map(|el| {
         if rows.is_empty() {
@@ -375,4 +401,28 @@ fn render_account(account: AccountSummary, metrics: Metrics, cx: &App) -> impl I
                         ),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::px;
+
+    /// One entry per loaded conversation, rebuilt for every frame that draws
+    /// a dozen rows. The sizes move when the geometry does and not otherwise.
+    #[test]
+    fn the_row_sizes_are_built_once_per_geometry() {
+        let first = row_sizes(2000, px(320.0), px(64.0));
+        let again = row_sizes(2000, px(320.0), px(64.0));
+        assert!(
+            Rc::ptr_eq(&first, &again),
+            "the same list, the same frame's worth of geometry"
+        );
+        assert_eq!(first.len(), 2000);
+
+        let wider = row_sizes(2000, px(400.0), px(64.0));
+        assert!(!Rc::ptr_eq(&first, &wider), "a resize rebuilds them");
+        let fewer = row_sizes(1999, px(400.0), px(64.0));
+        assert!(!Rc::ptr_eq(&wider, &fewer), "and so does a row leaving");
+    }
 }
