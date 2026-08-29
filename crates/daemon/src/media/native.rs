@@ -37,10 +37,23 @@ const SWEEP_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Claim `key` for a delivery, if it is here.
 ///
-/// The same question as [`has`] on this side, and answered the same way: the
-/// front end opens the file itself, so there is no window between promising
-/// it and handing it over for anything to close. The distinction is the
-/// page's, where the cache is a map somebody else is sweeping.
+/// The same question as [`has`] on this side, and answered the same way,
+/// because the front end this cache was built for opens the file itself:
+/// there is nothing between promising it and handing it over for anything to
+/// close. The distinction is the page's, where the cache is a map somebody
+/// else is sweeping.
+///
+/// A browser attached to *this* daemon is the case that does not fit, and it
+/// is worth naming rather than leaving the sentence above to imply it away:
+/// there the bytes cross as HTTP, so the promise and the read are two round
+/// trips with a gap between them. What can delete a file in that gap is a
+/// `ClearMediaCache` and not the budget sweep — the sweep drops the oldest,
+/// and a key just promised was just written — so the window is somebody
+/// pressing "clear cached media" in the same millisecond as their own
+/// download. What it costs is one refetch: the renderer draws media it does
+/// not have as an offer to download, which is what it already does for
+/// anything the daemon never cached. Closing it means giving this cache the
+/// index its first line says it does not have; see AGENTS.md.
 pub fn claim(key: &str) -> bool {
     has(key)
 }

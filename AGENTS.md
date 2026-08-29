@@ -1211,6 +1211,18 @@ by definition.
   far worse than silence for something this small. What is missing is a
   transient surface — a toast, a line on the row — and it should be designed
   once rather than invented for this.
+- **A promised file is not a held file, once the reader is a browser.** The
+  daemon's media cache is files and no index — the front end it was written
+  for opens them itself, so `claim` can be `has` and there is no window
+  between promising a key and handing it over. A page attached to that daemon
+  reads over HTTP instead, which makes the promise and the read two round
+  trips, and a `ClearMediaCache` landing between them deletes a file already
+  reported as downloaded. Not the budget sweep, which drops the oldest and so
+  never the key just written; and the cost is one refetch, since media the
+  renderer does not have is drawn as an offer to download. Closing it means
+  the native cache keeping claims the way the page's does, which is the index
+  that module opens by saying it does not have — worth it only if somebody
+  meets it.
 - **Nothing evicts the media a conversation is holding.** A message keeps its
   full bytes in `MediaContent::data` for as long as the row is loaded, and
   `Chat::add_message` has no ceiling — so the two media budgets that do exist
