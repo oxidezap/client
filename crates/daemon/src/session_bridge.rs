@@ -1706,6 +1706,13 @@ struct ChatReads {
     /// Incoming messages still unread, shaped as `send_read_receipts` wants
     /// them.
     unread: VecDeque<(String, String)>,
+    /// Every incoming message this chat has been handed, receipt owed or not.
+    ///
+    /// Separate from `unread` because that one is drained when the receipts
+    /// go out: after a read, it remembers nothing, and a redelivery of a
+    /// message already read would come back as a first sighting and put the
+    /// badge up over it. Ids only, and bounded the same way.
+    seen: VecDeque<String>,
 }
 
 impl ChatReads {
@@ -1732,10 +1739,16 @@ impl ChatReads {
             ));
         }
 
-        if message.is_from_me
-            || message.is_read
-            || self.unread.iter().any(|(id, _)| *id == message.id)
-        {
+        if message.is_from_me || self.seen.iter().any(|id| *id == message.id) {
+            return false;
+        }
+        self.seen.push_back(message.id.clone());
+        if self.seen.len() > MAX_TRACKED_UNREAD {
+            self.seen.pop_front();
+        }
+        // Seen either way: a message the store already reports as read is one
+        // this chat has been handed, and owes no receipt for.
+        if message.is_read {
             return false;
         }
         self.unread
@@ -1975,6 +1988,37 @@ mod tests {
             bridge.reads.take_receipts("1@s.whatsapp.net").len(),
             1,
             "and the badge agrees with the receipts this side owes"
+        );
+    }
+
+    /// The receipts a chat owes are drained when they go out, so they cannot
+    /// also be the memory of what it has seen: a redelivery after the read
+    /// found nothing to match, counted as a first sighting, and put the badge
+    /// back up over a message the user had already read.
+    #[test]
+    fn a_redelivery_after_the_read_does_not_raise_the_badge_again() {
+        let mut bridge = bridge();
+        let arrival = || {
+            received(
+                "1@s.whatsapp.net",
+                message("m1", "1@s.whatsapp.net", 10, false, false),
+                None,
+            )
+        };
+        bridge.observe(arrival());
+        // What marking the chat read does to this side.
+        assert_eq!(bridge.reads.take_receipts("1@s.whatsapp.net").len(), 1);
+
+        bridge.observe(arrival());
+
+        assert_eq!(
+            bridge.hub.chat("1@s.whatsapp.net").unwrap().unread,
+            1,
+            "the badge is not raised a second time by the same message"
+        );
+        assert!(
+            bridge.reads.take_receipts("1@s.whatsapp.net").is_empty(),
+            "and no second receipt is owed for it"
         );
     }
 
