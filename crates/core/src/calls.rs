@@ -815,10 +815,16 @@ impl CallState {
     }
 
     /// The call to a recipient failed before it ever got an id.
+    ///
+    /// A final removal like its two siblings, so whoever was parked comes
+    /// forward: a stage cleared without promoting them is somebody ringing
+    /// with no card, no Accept and no Decline anywhere — and `is_busy` then
+    /// answering "no call" is how a second one gets placed over them.
     pub fn dismiss_outgoing_for_recipient(&mut self, recipient_jid: &str) -> bool {
         if matches!(&self.stage, Some(Stage::Outgoing(call)) if call.recipient_jid == recipient_jid)
         {
             self.stage = None;
+            self.promote_waiting();
             return true;
         }
         false
@@ -887,6 +893,17 @@ mod tests {
             Some("THEIRS")
         );
         assert!(cancelled.waiting().is_none());
+
+        // The call this device placed failing before it ever had an id.
+        let mut unplaced = CallState::default();
+        unplaced.set_outgoing(outgoing("NEVER-RANG"));
+        assert_eq!(unplaced.set_incoming(incoming("THEIRS")), Admission::Parked);
+        assert!(unplaced.dismiss_outgoing_for_recipient("b@s.whatsapp.net"));
+        assert_eq!(
+            unplaced.incoming().map(|c| c.call_id.as_str()),
+            Some("THEIRS")
+        );
+        assert!(unplaced.waiting().is_none());
 
         // And refusing the *parked* one leaves the call in front alone.
         let mut parked = CallState::default();
