@@ -121,7 +121,11 @@ cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxideza
 # A plugin. Its own workspace, its own target, and the file's name is its id.
 # `examples/template` is the same three commands; `cargo test` in either runs
 # its handlers against the SDK's test host, with no daemon and no wasm.
-cd examples/autoreply && cargo build --release --target wasm32-unknown-unknown
+# `RUSTFLAGS=` because the root's `.cargo/config.toml` sets `+atomics` and
+# `--shared-memory` for this target — that target is the *web front end* — and
+# cargo joins those into any build under this directory. A plugin built with
+# them has a shared memory, which the host refuses outright.
+cd examples/autoreply && RUSTFLAGS= cargo build --release --target wasm32-unknown-unknown
 cp target/wasm32-unknown-unknown/release/autoreply.wasm ~/.local/share/oxidezap/plugins/
 # And the one test that exercises the real SDK against the real host. Back at
 # the root first: the example is its own workspace and the root excludes it, so
