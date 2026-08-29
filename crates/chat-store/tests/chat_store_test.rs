@@ -6483,6 +6483,79 @@ async fn mark_send_failed_fails_pending_row_only() {
     assert_eq!(msg.status, MessageStatus::ServerAck);
 }
 
+/// A failure is terminal. `ERROR` is 0, so every "never move backwards"
+/// guard here (`status < SERVER_ACK`, `status < DELIVERY_ACK`) admitted it
+/// from below: a delivery receipt or a positive ack arriving after the row
+/// had failed showed the user a send as delivered that the UI had already
+/// reported as failed.
+#[tokio::test]
+async fn a_late_receipt_does_not_revive_a_failed_send() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    for id in ["OUT-NACKED", "OUT-ACKED"] {
+        chat_store
+            .record_outgoing(
+                &chat,
+                id,
+                &wa::Message::text("oi"),
+                Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+            )
+            .unwrap();
+    }
+    // One failed by the server, one by this side. Both end in `Error`.
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-NACKED".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .error("479".to_string())
+                .build(),
+        )],
+    )
+    .await;
+    chat_store.mark_send_failed(&chat, "OUT-ACKED").unwrap();
+    chat_store.flush().await.unwrap();
+
+    // The peer's receipt, arriving late, and the ack the nack raced.
+    feed(
+        &chat_store,
+        [
+            Event::Receipt(
+                Receipt::builder()
+                    .source(MessageSource {
+                        chat: chat.clone(),
+                        sender: chat.clone(),
+                        ..Default::default()
+                    })
+                    .message_ids(vec!["OUT-NACKED".to_string(), "OUT-ACKED".to_string()])
+                    .timestamp(Utc.timestamp_opt(1_700_000_300, 0).unwrap())
+                    .r#type(ReceiptType::Delivered)
+                    .offline(false)
+                    .build(),
+            ),
+            Event::ServerAck(
+                ServerAck::builder()
+                    .id("OUT-ACKED".to_string())
+                    .class("message".to_string())
+                    .from(chat.clone())
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+
+    for id in ["OUT-NACKED", "OUT-ACKED"] {
+        assert_eq!(
+            chat_store.message(&chat, id).await.unwrap().unwrap().status,
+            MessageStatus::Error,
+            "{id} was reported as failed, so nothing may show it as delivered"
+        );
+    }
+}
+
 const STATUS_BROADCAST: &str = "status@broadcast";
 
 /// A watched status update is its own row's ack moved to `Read` — the same
