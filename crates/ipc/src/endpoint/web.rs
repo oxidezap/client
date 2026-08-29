@@ -112,44 +112,37 @@ pub enum FromSocket {
     Closed(String),
 }
 
-/// What the socket says, and the one thing it says out of turn.
+/// What the socket says, in the order it says it, plus the one fact that
+/// travels beside the queue rather than in it.
 ///
-/// The queue keeps arrival order, because a frame that came before a close
-/// has to be handled before the close is. An *overflow* is the exception and
-/// has to be: the backlog it is announcing is precisely the backlog this page
-/// could not get through, so putting the ending behind it would leave the
-/// front end's pending requests waiting out the very frames that caused the
-/// problem — a media budget apiece — after the socket had already gone. So it
-/// jumps the queue, and the backlog is abandoned with it. Nothing is lost by
-/// that: the connection is over, `Frames::finish` fails every request at
-/// once, and the views that asked ask again.
+/// Nothing jumps the queue. Every ending — an ordinary close and an
+/// overflow alike — is delivered behind the frames that arrived before it,
+/// because a frame is not always recoverable: state carries a version and
+/// comes back in a snapshot, but a `SendFailed` or a window request is news,
+/// and a reconnect brings back no copy of it. A backlog abandoned to reach
+/// the ending sooner is that news thrown away.
+///
+/// What does travel out of band is [`connection_ended`](Self::connection_ended),
+/// which is a different claim: not *what* happened but *that* the socket has
+/// already gone, true while the reader is still working through the backlog.
+/// That is what makes delivering the ending in order affordable — see the
+/// method.
 pub struct Inbound {
     queued: Receiver<FromSocket>,
-    over: Rc<RefCell<Overflow>>,
     ended: Rc<Cell<bool>>,
-}
-
-/// Whether the queue filled, and whether the reader has been told.
-enum Overflow {
-    /// Nothing has gone wrong; the queue is the whole story.
-    None,
-    /// It filled, and the reader has not asked since.
-    Announced(String),
-    /// The reader has been told, so nothing after this is worth handing over.
-    Told,
 }
 
 impl Inbound {
     /// Whether the socket has already gone, ahead of the queue saying so.
     ///
-    /// The frames still queued are worth applying — a `SendFailed` or a
-    /// window request rides a channel nothing recovers, so dropping the
-    /// backlog would lose it — but the *media* they name is not worth
-    /// waiting for: it is fetched from a bridge that has just closed, and a
-    /// budget spent per frame is what would put two hours between the socket
-    /// going and the front end's pending requests being failed. A reader that
-    /// asks this can drain in order and skip the sideband, which the renderer
-    /// already draws as an offer to download.
+    /// The frames still queued are worth applying, for the reason above. What
+    /// is not worth waiting for is the *media* they name: it is fetched from
+    /// a bridge that has just closed, and a budget spent per frame is what
+    /// would put hours between the socket going and the front end's pending
+    /// requests being failed. A reader that asks this drains in order and
+    /// skips the optional sideband, which the renderer already draws as an
+    /// offer to download — but keeps fetching a `Downloaded`, which is
+    /// somebody's answer rather than a frame's decoration.
     #[must_use]
     pub fn connection_ended(&self) -> bool {
         self.ended.get()
@@ -157,19 +150,8 @@ impl Inbound {
 
     /// The next thing that happened, oldest first.
     ///
-    /// `None` once the connection is over.
+    /// `None` once the sender is gone and the queue is empty.
     pub async fn recv(&mut self) -> Option<FromSocket> {
-        {
-            let mut over = self.over.borrow_mut();
-            match std::mem::replace(&mut *over, Overflow::Told) {
-                // Put back: the read is a peek in the ordinary case.
-                Overflow::None => *over = Overflow::None,
-                Overflow::Announced(why) => return Some(FromSocket::Closed(why)),
-                // Already said. Whatever is still queued arrived on a
-                // connection that has ended and belongs to nobody.
-                Overflow::Told => return None,
-            }
-        }
         self.queued.recv().await
     }
 }
@@ -201,11 +183,9 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
 
     let (inbound, queued) = channel::<FromSocket>(MAX_QUEUED_FRAMES);
     let (outbound, mut to_send) = tokio::sync::mpsc::unbounded_channel::<String>();
-    // Out of band, so the ending does not queue behind the backlog it is
-    // about. See [`Inbound`].
-    let over = Rc::new(RefCell::new(Overflow::None));
-    // Also out of band, and a different question: this one is true while
-    // frames the reader still has to apply are queued behind it.
+    // Out of band: true from the moment the socket is done, while the frames
+    // the reader still has to apply are queued behind it. See
+    // [`Inbound::connection_ended`].
     let ended = Rc::new(Cell::new(false));
 
     // Shared with the `onopen` callback so a frame written before the socket
@@ -249,11 +229,12 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
 
     let message_callback = {
         let inbound = inbound.clone();
-        let over = Rc::clone(&over);
         let ended = Rc::clone(&ended);
         let socket_here = socket.clone();
         let message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if !matches!(*over.borrow(), Overflow::None) {
+            // Whatever else arrives on a socket already being torn down is
+            // past the bound that ended it, so it is not queued at all.
+            if ended.get() {
                 return;
             }
             // Text only. The daemon speaks JSON and a binary frame would be
@@ -271,10 +252,17 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
                     "the daemon is sending frames faster than this page can apply them; \
                      ending the connection"
                 );
-                *over.borrow_mut() = Overflow::Announced(
-                    "the daemon sent frames faster than this page could apply them".to_string(),
-                );
+                // Set first, so the frames already queued drain without
+                // paying for their media — which is what makes announcing
+                // the ending *behind* them affordable rather than a wait
+                // measured in hours.
                 ended.set(true);
+                deliver(
+                    &inbound,
+                    FromSocket::Closed(
+                        "the daemon sent frames faster than this page could apply them".to_string(),
+                    ),
+                );
                 let _ = socket_here.close();
             }
         });
@@ -375,14 +363,7 @@ pub fn connect(url: &str) -> Result<(Link, Inbound), String> {
         drop(error_callback);
     });
 
-    Ok((
-        Link::over_socket(outbound),
-        Inbound {
-            queued,
-            over,
-            ended,
-        },
-    ))
+    Ok((Link::over_socket(outbound), Inbound { queued, ended }))
 }
 
 /// Put one event on the queue, waiting for room only where waiting is right.
