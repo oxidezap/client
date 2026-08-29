@@ -82,6 +82,17 @@ const MAX_UI_PER_CALL: usize = 16;
 /// three orders of magnitude under it.
 pub(crate) const MAX_LOG_BYTES_PER_WINDOW: usize = 256 * 1024;
 
+/// How much a plugin may log before the loader has accepted it.
+///
+/// `oxi_init` runs before the module is known to be loadable at all: it can
+/// still declare an unknown capability, declare twice, or simply refuse — and
+/// a module that never loads writes its lines on *every* start, for as long
+/// as the file sits in the folder. Kept rather than suppressed, because these
+/// are the only lines that say why somebody's plugin will not start, and the
+/// author is the person reading them. Smaller, because a plugin that has not
+/// been accepted has less to say.
+const MAX_LOG_BYTES_FOR_INIT: usize = 4 * 1024;
+
 /// How long a rolling allowance is measured over. The duty cycle's window,
 /// because it is the same question about different resources.
 const ROLLING_WINDOW: std::time::Duration = crate::DUTY_WINDOW;
@@ -856,8 +867,14 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // latter is a threshold, not a limit, and lets the line that
             // crosses it through in full. Silently, past it: a line saying
             // "you have logged too much" is another line.
+            // A smaller allowance until the loader has accepted the module.
+            let per_call = if c.data().phase == Phase::Init {
+                MAX_LOG_BYTES_FOR_INIT
+            } else {
+                MAX_LOG_BYTES_PER_CALL
+            };
             let spent = &mut c.data_mut().logged_bytes;
-            if line > MAX_LOG_BYTES_PER_CALL.saturating_sub(*spent) {
+            if line > per_call.saturating_sub(*spent) {
                 return;
             }
             *spent += line;

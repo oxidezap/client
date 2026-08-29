@@ -33,7 +33,17 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   the sandbox, and the host half of the ABI. One OS thread, one wasmi `Store`
   and one bounded queue per plugin.
 - **oxidezap-plugin**: the Rust SDK a plugin is written against. Not a
-  dependency of anything here; it exists to be built for wasm32.
+  dependency of anything here; it exists to be built for wasm32. What it adds
+  over the raw imports is what the compiler can check: two mask types so a
+  capability cannot be passed where a set of event kinds goes, a `Setup` whose
+  methods vanish once used so declaring twice is a missing method rather than
+  a refusal at load, a size carried on each field so a read does not pick one,
+  and a UI builder whose sections take closures so there is no `end` to
+  forget. All of it monomorphizes away — the example is still a few kilobytes.
+  Its `testing` feature answers the imports from a table a test owns, which is
+  the only way to run a handler without the daemon; `raw::Ptr` exists for it,
+  because an address is an `i32` on wasm32 and truncates to nothing anywhere
+  else.
 - **oxidezap-gui**: GPUI front end, binary `oxidezap`. Talks to the daemon and
   starts one if none is listening. Owns video decode, which writes straight
   into `gpui::RenderImage` and is not reusable off GPUI.

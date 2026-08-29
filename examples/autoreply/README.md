@@ -17,15 +17,36 @@ loads as `autoreply`.
 Set `OXIDEZAP_PLUGIN_DIR` to load from somewhere else, which is what you want
 while writing one.
 
+## Testing it
+
+Its handlers run under `cargo test`, against the SDK's test host rather than
+the daemon:
+
+```bash
+cargo test
+```
+
+That host answers the same sixteen imports from a table the test owns, so a
+handler can be given a message and asked what it did. It is not the daemon —
+nothing there enforces fuel, capabilities or approval, and a command is
+recorded rather than sent — so a handler that passes here can still be refused
+in the sandbox. What it checks is the half you wrote.
+
 ## What it shows
 
-* **Declaring itself.** `setup` names the plugin, subscribes to messages only,
-  and asks for exactly three capabilities. That list is what a user is shown
-  before they enable it, so asking for less is the whole point of asking.
+* **Declaring itself, once.** `setup` names the plugin, subscribes to messages
+  only, and asks for exactly three capabilities. That list is what a user is
+  shown before they enable it, so asking for less is the whole point of
+  asking — and each of the three may be said only once, which the *type*
+  enforces: `name` is not a method on what `name` returns.
 * **Reading an event without allocating.** `Text<N>` is a fixed buffer on the
-  stack; a field nobody reads costs nothing at all.
-* **Publishing an interface.** The tree is built with `abi::ui::Writer` into a
+  stack; a field nobody reads costs nothing at all. The `N` comes from the
+  field rather than from the call site, and `whole()` is how a read says
+  "all of it or nothing" — a JID that did not fit is not a shorter JID, it is
+  somebody else.
+* **Publishing an interface.** The tree is built with `ui::publish` into a
   buffer this crate owns — no allocator anywhere — and republished whenever
-  something in it changes.
+  something in it changes. A section takes a closure, so there is no `end` to
+  forget and the widgets inside it have no slot to pass.
 * **Answering its own widgets.** A `UI_ACTION` arrives as an ordinary event
   and the toggle's new state is written straight to storage.

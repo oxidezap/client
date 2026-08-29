@@ -7,27 +7,34 @@
 //! entire point of the ABI it wraps.
 //!
 //! ```ignore
-//! use oxidezap_plugin::{abi, plugin, Event, send_text, Text};
+//! use oxidezap_plugin::{abi, fields, plugin, Caps, Declared, Event, Kinds, Setup, send_text};
 //!
 //! plugin!(init = setup, event = handle);
 //!
-//! fn setup(p: &mut Setup) {
-//!     p.name("Autoreply");
-//!     p.subscribe(abi::kinds::bit(abi::kinds::MESSAGE));
-//!     p.capabilities(abi::caps::SEND);
+//! // Each of these is said once, and the type is what says so: a second
+//! // `name` is a method that is not there rather than a refusal at load.
+//! fn setup(p: Setup) -> impl Declared {
+//!     p.name("Autoreply")
+//!         .subscribe(Kinds::MESSAGE)
+//!         .capabilities(Caps::SEND)
 //! }
 //!
 //! fn handle(ev: &Event) {
-//!     if ev.kind() != abi::kinds::MESSAGE || ev.flag(abi::fields::FROM_ME) {
+//!     if ev.kind() != abi::kinds::MESSAGE || ev.flag(fields::FROM_ME) {
 //!         return;
 //!     }
-//!     let text = ev.text::<256>(abi::fields::TEXT);
-//!     if text.as_str().contains("ping") {
-//!         let chat = ev.text::<128>(abi::fields::CHAT_JID);
-//!         send_text(chat.as_str(), "pong");
+//!     // No size at the call site: the field carries the room it needs.
+//!     if ev.text(fields::TEXT).as_str().contains("ping") {
+//!         // `whole`, because a JID that did not fit is somebody else.
+//!         if let Some(chat) = ev.text(fields::CHAT_JID).whole() {
+//!             send_text(chat, "pong");
+//!         }
 //!     }
 //! }
 //! ```
+//!
+//! Handlers are testable without a daemon: the `testing` feature answers the
+//! imports from a table your test owns. See [`testing`].
 //!
 //! # Reading without allocating
 //!
@@ -47,12 +54,199 @@
 //! plugin's id.
 
 #![no_std]
+// The test host records what a plugin asked for, which means a heap and a
+// thread-local. Never in a plugin's own build: a `.wasm` links the real
+// imports and carries neither.
+#[cfg(all(not(target_arch = "wasm32"), feature = "testing"))]
+extern crate std;
 
 pub use oxidezap_plugin_abi as abi;
 
 mod raw;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "testing"))]
+pub mod testing;
+
 pub use raw::{level, log, now_ms};
+
+// ---- typed masks ---------------------------------------------------------
+
+/// What a plugin may do, as a value rather than as an integer.
+///
+/// `subscribe` and `capabilities` both used to take an `i64`, so
+/// `p.subscribe(caps::SEND)` compiled and was discovered — if at all — at
+/// runtime, as a plugin hearing about the wrong events. These are two
+/// different sets and now two different types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caps(i64);
+
+impl Caps {
+    /// Nothing at all, which is what a plugin that only watches asks for.
+    pub const NONE: Self = Self(0);
+    /// Send messages, as this account.
+    pub const SEND: Self = Self(abi::caps::SEND);
+    /// Mark somebody's messages read.
+    pub const MARK_READ: Self = Self(abi::caps::MARK_READ);
+    /// Show a typing indicator.
+    pub const TYPING: Self = Self(abi::caps::TYPING);
+    /// Draw buttons and settings.
+    pub const UI: Self = Self(abi::caps::UI);
+    /// Keep its own settings across restarts.
+    pub const STORAGE: Self = Self(abi::caps::STORAGE);
+    /// Wake itself on a timer.
+    pub const TIMERS: Self = Self(abi::caps::TIMERS);
+
+    /// The mask the ABI carries.
+    #[must_use]
+    pub const fn bits(self) -> i64 {
+        self.0
+    }
+}
+
+impl core::ops::BitOr for Caps {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// Which events a plugin is handed.
+///
+/// A set of kinds, not a set of capabilities: asking for kinds it never looks
+/// at makes the daemon convert and queue an account's whole traffic for
+/// nothing, and receipts and presence are most of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kinds(i64);
+
+impl Kinds {
+    pub const NONE: Self = Self(0);
+    pub const MESSAGE: Self = Self(abi::kinds::bit(abi::kinds::MESSAGE));
+    pub const CONNECTION: Self = Self(abi::kinds::bit(abi::kinds::CONNECTION));
+    pub const RECEIPT: Self = Self(abi::kinds::bit(abi::kinds::RECEIPT));
+    pub const REACTION: Self = Self(abi::kinds::bit(abi::kinds::REACTION));
+    pub const PRESENCE: Self = Self(abi::kinds::bit(abi::kinds::PRESENCE));
+    pub const CALL: Self = Self(abi::kinds::bit(abi::kinds::CALL));
+    /// Somebody used one of this plugin's own widgets. Delivered whatever
+    /// this asks for — a plugin that draws is told when its controls are
+    /// used — but naming it here is what makes a handler's `match` honest.
+    pub const UI_ACTION: Self = Self(abi::kinds::bit(abi::kinds::UI_ACTION));
+    /// A timer this plugin armed. Delivered whatever this asks for, for the
+    /// same reason.
+    pub const TIMER: Self = Self(abi::kinds::bit(abi::kinds::TIMER));
+
+    #[must_use]
+    pub const fn bits(self) -> i64 {
+        self.0
+    }
+}
+
+impl core::ops::BitOr for Kinds {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+// ---- fields, with the room they need -------------------------------------
+
+/// A field, and how much room reading it wants.
+///
+/// The size used to be chosen at every call site — `ev.text::<128>(CHAT_JID)`
+/// — which put a correctness question in the caller's hands each time: a JID
+/// that did not fit is not a shorter JID, it is somebody else. Carrying it on
+/// the field means the number is decided once, next to what it describes, and
+/// inferred everywhere it is read.
+///
+/// It is a recommendation rather than a rule: [`sized`](Self::sized) asks for
+/// a different one where a plugin knows better.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Field<const N: usize>(i32);
+
+impl<const N: usize> Field<N> {
+    /// A field this table does not name, at a size of your choosing.
+    #[must_use]
+    pub const fn new(id: i32) -> Self {
+        Self(id)
+    }
+
+    /// The same field, read into a buffer of a different size.
+    #[must_use]
+    pub const fn sized<const M: usize>(self) -> Field<M> {
+        Field(self.0)
+    }
+
+    /// The number the ABI carries.
+    #[must_use]
+    pub const fn id(self) -> i32 {
+        self.0
+    }
+}
+
+/// Every field an event can carry, with the room a read of it wants.
+///
+/// The sizes are what the thing actually is: a JID and a message id are
+/// bounded by the protocol, a message body is not and gets a generous page,
+/// and a widget's id is as long as the plugin's own names.
+pub mod fields {
+    use super::Field;
+    use oxidezap_plugin_abi as abi;
+
+    /// The chat an event happened in.
+    pub const CHAT_JID: Field<128> = Field::new(abi::fields::CHAT_JID);
+    /// Whether that chat is a group.
+    pub const IS_GROUP: Field<1> = Field::new(abi::fields::IS_GROUP);
+    /// The message's id, which a reply quotes.
+    pub const MESSAGE_ID: Field<128> = Field::new(abi::fields::MESSAGE_ID);
+    /// What it says.
+    pub const TEXT: Field<1024> = Field::new(abi::fields::TEXT);
+    /// Whether this account wrote it.
+    pub const FROM_ME: Field<1> = Field::new(abi::fields::FROM_ME);
+    /// When, in milliseconds.
+    pub const TIMESTAMP_MS: Field<1> = Field::new(abi::fields::TIMESTAMP_MS);
+    /// Who wrote it, in a group.
+    pub const SENDER_JID: Field<128> = Field::new(abi::fields::SENDER_JID);
+    /// What they are called.
+    pub const SENDER_NAME: Field<128> = Field::new(abi::fields::SENDER_NAME);
+    /// Whether its author has taken it back.
+    pub const REVOKED: Field<1> = Field::new(abi::fields::REVOKED);
+    /// What kind of attachment it carries, if any.
+    pub const MEDIA_KIND: Field<32> = Field::new(abi::fields::MEDIA_KIND);
+    /// The message this one quotes.
+    pub const QUOTED_ID: Field<128> = Field::new(abi::fields::QUOTED_ID);
+
+    /// The connection's state.
+    pub const CONNECTION_STATE: Field<32> = Field::new(abi::fields::CONNECTION_STATE);
+    /// Why it changed.
+    pub const REASON: Field<256> = Field::new(abi::fields::REASON);
+
+    /// Whether a receipt is a delivery or a read.
+    pub const RECEIPT_KIND: Field<32> = Field::new(abi::fields::RECEIPT_KIND);
+    /// The messages it covers. A list: read it with `Event::count` and
+    /// `Event::at`.
+    pub const MESSAGE_IDS: Field<128> = Field::new(abi::fields::MESSAGE_IDS);
+
+    /// A reaction's emoji. Empty when the reaction was removed.
+    pub const EMOJI: Field<32> = Field::new(abi::fields::EMOJI);
+    /// Whether somebody is typing, rather than having stopped.
+    pub const COMPOSING: Field<1> = Field::new(abi::fields::COMPOSING);
+
+    /// The call this is about.
+    pub const CALL_ID: Field<128> = Field::new(abi::fields::CALL_ID);
+    /// What happened to it.
+    pub const CALL_EVENT: Field<32> = Field::new(abi::fields::CALL_EVENT);
+    /// Whether it carries video.
+    pub const CALL_IS_VIDEO: Field<1> = Field::new(abi::fields::CALL_IS_VIDEO);
+    /// Who is on the other end.
+    pub const PEER_JID: Field<128> = Field::new(abi::fields::PEER_JID);
+
+    /// Which of this plugin's widgets was used.
+    pub const ACTION_ID: Field<64> = Field::new(abi::fields::ACTION_ID);
+    /// What it now holds. A setting is a keyword or a sentence.
+    pub const ACTION_VALUE: Field<256> = Field::new(abi::fields::ACTION_VALUE);
+
+    /// The token a timer was armed with.
+    pub const TIMER_TOKEN: Field<1> = Field::new(abi::fields::TIMER_TOKEN);
+}
 
 /// What a command answered.
 ///
@@ -117,6 +311,24 @@ pub struct Text<const N: usize> {
 }
 
 impl<const N: usize> Text<N> {
+    /// A value this side already has, as the same type a read returns.
+    ///
+    /// For a default: `kv::text` hands back either what was stored or this,
+    /// and a caller should not have to tell the two apart.
+    #[must_use]
+    pub fn of(text: &str) -> Self {
+        let mut out = Self::absent();
+        out.present = true;
+        out.full = text.len();
+        out.len = if text.len() <= N {
+            text.len()
+        } else {
+            whole_characters(text.as_bytes(), N)
+        };
+        out.buf[..out.len].copy_from_slice(&text.as_bytes()[..out.len]);
+        out
+    }
+
     fn absent() -> Self {
         Self {
             buf: [0; N],
@@ -148,6 +360,21 @@ impl<const N: usize> Text<N> {
     #[must_use]
     pub fn present(&self) -> bool {
         self.present
+    }
+
+    /// The value, but only when all of it fit.
+    ///
+    /// The companion to [`as_str`](Self::as_str), which hands back what was
+    /// read whether or not that is everything. Which of the two to use is a
+    /// question about the field: a JID that did not fit is not a shorter JID,
+    /// it is somebody else, while a label that did not fit is still a label.
+    #[must_use]
+    pub fn whole(&self) -> Option<&str> {
+        if self.complete() {
+            Some(self.as_str())
+        } else {
+            None
+        }
     }
 
     /// Whether the whole value fit.
@@ -203,33 +430,37 @@ impl Event {
 
     /// Read a string field into `N` bytes of stack.
     #[must_use]
-    pub fn text<const N: usize>(&self, field: i32) -> Text<N> {
+    pub fn text<const N: usize>(&self, field: Field<N>) -> Text<N> {
+        let field = field.id();
         read_into(|ptr, cap| unsafe { raw::field_str(self.handle, field, ptr, cap) })
     }
 
     /// Read an integer field. Absent reads back as `0`, by the ABI's absence
     /// rule.
     #[must_use]
-    pub fn int(&self, field: i32) -> i64 {
+    pub fn int<const N: usize>(&self, field: Field<N>) -> i64 {
+        let field = field.id();
         raw::field_i64(self.handle, field)
     }
 
     /// Read a boolean field. Absent reads back as `false`.
     #[must_use]
-    pub fn flag(&self, field: i32) -> bool {
-        self.int(field) != 0
+    pub fn flag<const N: usize>(&self, field: Field<N>) -> bool {
+        raw::field_i64(self.handle, field.id()) != 0
     }
 
     /// How many elements a repeated field has.
     #[must_use]
-    pub fn count(&self, field: i32) -> usize {
+    pub fn count<const N: usize>(&self, field: Field<N>) -> usize {
+        let field = field.id();
         let n = raw::field_len(self.handle, field);
         if n < 0 { 0 } else { n as usize }
     }
 
     /// One element of a repeated field, as a string.
     #[must_use]
-    pub fn at<const N: usize>(&self, field: i32, index: usize) -> Text<N> {
+    pub fn at<const N: usize>(&self, field: Field<N>, index: usize) -> Text<N> {
+        let field = field.id();
         let index = if index > i32::MAX as usize {
             return Text::absent();
         } else {
@@ -245,7 +476,7 @@ impl Event {
 
 /// The shared shape of every "write into my buffer and tell me the real
 /// length" call.
-fn read_into<const N: usize>(mut call: impl FnMut(i32, i32) -> i32) -> Text<N> {
+fn read_into<const N: usize>(mut call: impl FnMut(raw::Ptr, i32) -> i32) -> Text<N> {
     let mut out = Text::<N>::absent();
     // `N` is a const generic, so this bound is checked at the one place it
     // could go wrong rather than at every call site.
@@ -254,7 +485,7 @@ fn read_into<const N: usize>(mut call: impl FnMut(i32, i32) -> i32) -> Text<N> {
     } else {
         N as i32
     };
-    let full = call(out.buf.as_mut_ptr() as i32, cap);
+    let full = call(raw::into(&mut out.buf), cap);
     if full < 0 {
         return out;
     }
@@ -310,48 +541,81 @@ fn whole_characters(buf: &[u8], end: usize) -> usize {
 
 /// What a plugin declares about itself, during `oxi_init` and only then.
 ///
-/// A builder rather than a return value because it is a list that will grow,
-/// and because what a user is shown before enabling a plugin should be one
-/// readable block in its source.
-pub struct Setup {
+/// A builder that *consumes* itself, and whose methods exist only while the
+/// thing they declare is still undeclared: calling `name` twice is not a
+/// runtime refusal, it is a method that is not there. That matters because
+/// these imports answer nothing — the host records a second declaration and
+/// the loader refuses the module, which is a plugin that does not run and an
+/// author reading a log line to find out why. The compiler is a better place
+/// to be told.
+///
+/// ```ignore
+/// fn setup(p: Setup) -> impl Declared {
+///     p.name("Auto-reply")
+///         .subscribe(Kinds::MESSAGE)
+///         .capabilities(Caps::SEND | Caps::UI | Caps::STORAGE)
+/// }
+/// ```
+pub struct Declaring<const NAMED: bool, const SUBSCRIBED: bool, const ASKED: bool> {
     _private: (),
 }
 
-impl Setup {
+/// What [`plugin!`] hands the init function: everything still to be said.
+pub type Setup = Declaring<false, false, false>;
+
+/// The end of a declaration, whatever was declared.
+///
+/// Implemented for every state, so an init function returns `impl Declared`
+/// and says nothing about which of the three it used.
+pub trait Declared {}
+
+impl<const N: bool, const S: bool, const A: bool> Declared for Declaring<N, S, A> {}
+
+impl Declaring<false, false, false> {
     /// Only [`plugin!`] makes one, and only inside `oxi_init`.
     #[must_use]
     #[doc(hidden)]
     pub fn new() -> Self {
         Self { _private: () }
     }
+}
 
-    /// The name a user sees beside this plugin's settings.
-    ///
-    /// Said once. A second call is refused and the first name stands — the
-    /// same rule the capability declaration holds to, and for the same
-    /// reason on the host's side: answering one is a read and an allocation
-    /// that no fuel pays for.
-    pub fn name(&mut self, name: &str) {
-        unsafe { raw::set_name(name.as_ptr() as i32, name.len() as i32) };
-    }
-
-    /// Which event kinds to be handed. Build it from `abi::kinds::bit`.
-    pub fn subscribe(&mut self, mask: i64) {
-        raw::subscribe(mask);
-    }
-
-    /// What this plugin may do. Build it from `abi::caps`.
-    ///
-    /// Asking for less is the whole value of asking at all: this is the
-    /// sentence a user reads before deciding to run a file they downloaded.
-    pub fn capabilities(&mut self, mask: i64) {
-        raw::request_caps(mask);
+impl Default for Declaring<false, false, false> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl Default for Setup {
-    fn default() -> Self {
-        Self::new()
+impl<const S: bool, const A: bool> Declaring<false, S, A> {
+    /// The name a user sees beside this plugin's settings.
+    #[must_use]
+    pub fn name(self, name: &str) -> Declaring<true, S, A> {
+        unsafe { raw::set_name(raw::at(name.as_bytes()), name.len() as i32) };
+        Declaring { _private: () }
+    }
+}
+
+impl<const N: bool, const A: bool> Declaring<N, false, A> {
+    /// Which event kinds to be handed.
+    ///
+    /// One call, so build the set with `|`: a second mask would replace the
+    /// first rather than add to it, which is why there is no second call.
+    #[must_use]
+    pub fn subscribe(self, kinds: Kinds) -> Declaring<N, true, A> {
+        raw::subscribe(kinds.bits());
+        Declaring { _private: () }
+    }
+}
+
+impl<const N: bool, const S: bool> Declaring<N, S, false> {
+    /// What this plugin may do.
+    ///
+    /// Asking for less is the whole value of asking at all: this is the
+    /// sentence a user reads before deciding to run a file they downloaded.
+    #[must_use]
+    pub fn capabilities(self, caps: Caps) -> Declaring<N, S, true> {
+        raw::request_caps(caps.bits());
+        Declaring { _private: () }
     }
 }
 
@@ -361,9 +625,9 @@ impl Default for Setup {
 pub fn send_text(jid: &str, text: &str) -> Outcome {
     Outcome::of(unsafe {
         raw::send_text(
-            jid.as_ptr() as i32,
+            raw::at(jid.as_bytes()),
             jid.len() as i32,
-            text.as_ptr() as i32,
+            raw::at(text.as_bytes()),
             text.len() as i32,
         )
     })
@@ -373,11 +637,11 @@ pub fn send_text(jid: &str, text: &str) -> Outcome {
 pub fn send_reply(jid: &str, text: &str, quoted_id: &str) -> Outcome {
     Outcome::of(unsafe {
         raw::send_reply(
-            jid.as_ptr() as i32,
+            raw::at(jid.as_bytes()),
             jid.len() as i32,
-            text.as_ptr() as i32,
+            raw::at(text.as_bytes()),
             text.len() as i32,
-            quoted_id.as_ptr() as i32,
+            raw::at(quoted_id.as_bytes()),
             quoted_id.len() as i32,
         )
     })
@@ -389,9 +653,9 @@ pub fn mark_read(jid: &str, message_id: Option<&str>) -> Outcome {
     let id = message_id.unwrap_or("");
     Outcome::of(unsafe {
         raw::mark_read(
-            jid.as_ptr() as i32,
+            raw::at(jid.as_bytes()),
             jid.len() as i32,
-            id.as_ptr() as i32,
+            raw::at(id.as_bytes()),
             id.len() as i32,
         )
     })
@@ -399,7 +663,13 @@ pub fn mark_read(jid: &str, message_id: Option<&str>) -> Outcome {
 
 /// Show or clear a typing indicator in a chat. Needs `abi::caps::TYPING`.
 pub fn typing(jid: &str, composing: bool) -> Outcome {
-    Outcome::of(unsafe { raw::typing(jid.as_ptr() as i32, jid.len() as i32, i32::from(composing)) })
+    Outcome::of(unsafe {
+        raw::typing(
+            raw::at(jid.as_bytes()),
+            jid.len() as i32,
+            i32::from(composing),
+        )
+    })
 }
 
 /// Publish this plugin's whole interface, replacing whatever it drew before.
@@ -407,13 +677,15 @@ pub fn typing(jid: &str, composing: bool) -> Outcome {
 /// Build `tree` with [`abi::ui::Writer`] over a buffer of your own. Needs
 /// `abi::caps::UI`.
 pub fn set_ui(tree: &[u8]) -> Outcome {
-    Outcome::of(unsafe { raw::ui_set(tree.as_ptr() as i32, tree.len() as i32) })
+    Outcome::of(unsafe { raw::ui_set(raw::at(tree), tree.len() as i32) })
 }
 
 /// Read a stored value. Needs `abi::caps::STORAGE`.
 #[must_use]
 pub fn get<const N: usize>(key: &str) -> Text<N> {
-    read_into(|ptr, cap| unsafe { raw::kv_get(key.as_ptr() as i32, key.len() as i32, ptr, cap) })
+    read_into(|ptr, cap| unsafe {
+        raw::kv_get(raw::at(key.as_bytes()), key.len() as i32, ptr, cap)
+    })
 }
 
 /// Store a value, or remove it when `value` is empty. Needs
@@ -421,12 +693,168 @@ pub fn get<const N: usize>(key: &str) -> Text<N> {
 pub fn set(key: &str, value: &str) -> Outcome {
     Outcome::of(unsafe {
         raw::kv_set(
-            key.as_ptr() as i32,
+            raw::at(key.as_bytes()),
             key.len() as i32,
-            value.as_ptr() as i32,
+            raw::at(value.as_bytes()),
             value.len() as i32,
         )
     })
+}
+
+/// A plugin's own small store, in the shapes a plugin actually keeps.
+///
+/// Values are strings on the wire, because that is what the ABI carries. The
+/// `"1"`/`"0"` pair a toggle arrives as is this module's business rather than
+/// every plugin's, spelled once here instead of at each call site.
+pub mod kv {
+    use super::{Outcome, Text, get, set};
+
+    /// A stored flag. Absent reads back as `false`, by the absence rule.
+    #[must_use]
+    pub fn flag(key: &str) -> bool {
+        get::<2>(key).as_str() == "1"
+    }
+
+    /// Store a flag. Needs [`Caps::STORAGE`](super::Caps::STORAGE).
+    pub fn set_flag(key: &str, on: bool) -> Outcome {
+        set(key, if on { "1" } else { "0" })
+    }
+
+    /// A stored setting, or `fallback` when nothing is stored.
+    ///
+    /// One size for the read and for what a plugin writes back, because two
+    /// would mean a value kept whole and matched on its first `N` bytes.
+    #[must_use]
+    pub fn text<const N: usize>(key: &str, fallback: &str) -> Text<N> {
+        let stored = get::<N>(key);
+        if stored.is_empty() {
+            Text::of(fallback)
+        } else {
+            stored
+        }
+    }
+}
+
+/// Building the small tree a plugin publishes.
+///
+/// The encoder underneath takes `begin`/`end` pairs and a buffer whose size
+/// the caller picks: an unbalanced pair is a malformed tree the daemon
+/// refuses, and a slot on a child is one it refuses differently. Here a
+/// section takes a closure, so there is no `end` to forget, and a widget
+/// inside one has no slot to pass because children do not have one.
+pub mod ui {
+    use super::{Outcome, abi, set_ui};
+
+    pub use oxidezap_plugin_abi::ui::slot;
+
+    /// A plugin's whole interface, under construction.
+    pub struct Canvas<'a> {
+        writer: abi::ui::Writer<'a>,
+    }
+
+    /// The inside of a section, where widgets have no slot of their own.
+    pub struct Group<'a, 'b> {
+        canvas: &'b mut Canvas<'a>,
+    }
+
+    /// Build a tree in `N` bytes of stack and publish it. Needs
+    /// [`Caps::UI`](super::Caps::UI).
+    ///
+    /// Whole every time, never a delta: the daemon compares what arrives
+    /// against what it holds and publishes nothing when they match, so
+    /// redrawing on every change costs a comparison rather than a frame.
+    pub fn publish<const N: usize>(build: impl FnOnce(&mut Canvas)) -> Outcome {
+        let mut buf = [0u8; N];
+        let mut canvas = Canvas {
+            writer: abi::ui::Writer::new(&mut buf),
+        };
+        build(&mut canvas);
+        let Ok(len) = canvas.writer.finish() else {
+            // The tree outgrew the buffer this call gave it, which is the
+            // plugin's own number and its own mistake to hear about.
+            return Outcome::Invalid;
+        };
+        set_ui(&buf[..len])
+    }
+
+    impl Canvas<'_> {
+        /// A button on its own, in a slot.
+        pub fn button(&mut self, slot: u8, id: &str, label: &str) {
+            self.writer.leaf(
+                abi::ui::kind::BUTTON,
+                slot,
+                abi::ui::flags::ENABLED,
+                id,
+                label,
+                "",
+            );
+        }
+
+        /// A group of widgets under a heading.
+        ///
+        /// Closed for you: the `end` that used to be the caller's to remember
+        /// is this function returning.
+        pub fn section(&mut self, slot: u8, label: &str, build: impl FnOnce(&mut Group)) {
+            self.writer.begin(
+                abi::ui::kind::SECTION,
+                slot,
+                abi::ui::flags::ENABLED,
+                "",
+                label,
+                "",
+            );
+            build(&mut Group { canvas: self });
+            self.writer.end();
+        }
+    }
+
+    impl Group<'_, '_> {
+        /// A switch. `on` is what it shows, `live` whether it may be used.
+        pub fn toggle(&mut self, id: &str, label: &str, on: bool, live: bool) {
+            let flags = if live { abi::ui::flags::ENABLED } else { 0 }
+                | if on { abi::ui::flags::CHECKED } else { 0 };
+            self.canvas.writer.leaf(
+                abi::ui::kind::TOGGLE,
+                abi::ui::slot::NONE,
+                flags,
+                id,
+                label,
+                if on { "1" } else { "0" },
+            );
+        }
+
+        /// A box somebody types in. Its commit arrives as an action.
+        pub fn field(&mut self, id: &str, label: &str, value: &str, live: bool) {
+            let flags = if live { abi::ui::flags::ENABLED } else { 0 };
+            self.canvas.writer.leaf(
+                abi::ui::kind::TEXT_FIELD,
+                abi::ui::slot::NONE,
+                flags,
+                id,
+                label,
+                value,
+            );
+        }
+
+        /// A line of text. Carries no id, because nothing can be done to it.
+        pub fn label(&mut self, text: &str) {
+            self.canvas
+                .writer
+                .leaf(abi::ui::kind::LABEL, abi::ui::slot::NONE, 0, "", text, "");
+        }
+
+        /// A button inside a section.
+        pub fn button(&mut self, id: &str, label: &str) {
+            self.canvas.writer.leaf(
+                abi::ui::kind::BUTTON,
+                abi::ui::slot::NONE,
+                abi::ui::flags::ENABLED,
+                id,
+                label,
+                "",
+            );
+        }
+    }
 }
 
 /// Ask to be called back with `abi::kinds::TIMER` carrying `token`, once.
@@ -450,7 +878,7 @@ pub fn after(delay_ms: i64, token: i64) -> Outcome {
 /// oxidezap_plugin::plugin!(init = setup, event = handle);
 /// ```
 ///
-/// `init` is `fn(&mut Setup)` and `event` is `fn(&Event)`.
+/// `init` is `fn(Setup) -> impl Declared` and `event` is `fn(&Event)`.
 #[macro_export]
 macro_rules! plugin {
     (init = $init:path, event = $on_event:path $(,)?) => {
@@ -465,10 +893,14 @@ macro_rules! plugin {
 
         #[unsafe(no_mangle)]
         pub extern "C" fn oxi_init() -> i32 {
-            let mut setup = $crate::Setup::new();
-            let f: fn(&mut $crate::Setup) = $init;
-            f(&mut setup);
-            0
+            // Generic over what the declaration ended as, because the type
+            // says which of the three things were said and the macro has no
+            // business caring.
+            fn declare<D: $crate::Declared>(f: fn($crate::Setup) -> D) -> i32 {
+                let _ = f($crate::Setup::new());
+                0
+            }
+            declare($init)
         }
 
         #[unsafe(no_mangle)]
@@ -483,7 +915,51 @@ macro_rules! plugin {
 
 #[cfg(test)]
 mod tests {
-    use super::whole_characters;
+    use super::{Caps, Field, Kinds, Text, fields, whole_characters};
+
+    /// Two sets, two types. `subscribe(Caps::SEND)` used to compile — both
+    /// took an `i64` — and a plugin discovered it by never hearing about the
+    /// events it meant to ask for.
+    #[test]
+    fn a_capability_is_not_an_event_kind() {
+        assert_eq!(
+            (Caps::SEND | Caps::UI).bits(),
+            oxidezap_plugin_abi::caps::SEND | oxidezap_plugin_abi::caps::UI
+        );
+        assert_eq!(
+            Kinds::MESSAGE.bits(),
+            oxidezap_plugin_abi::kinds::bit(oxidezap_plugin_abi::kinds::MESSAGE)
+        );
+        // The two masks are the same integer here, and that is the point:
+        // nothing but the type tells them apart.
+        assert_eq!(Caps::SEND.bits(), Kinds::NONE.bits() | 1);
+    }
+
+    /// The size travels with the field, so a read does not pick one.
+    #[test]
+    fn a_field_carries_the_room_it_needs() {
+        let jid: Field<128> = fields::CHAT_JID;
+        assert_eq!(jid.id(), oxidezap_plugin_abi::fields::CHAT_JID);
+        // And a plugin that knows better says so, without changing which
+        // field it is reading.
+        let bigger: Field<4096> = fields::TEXT.sized::<4096>();
+        assert_eq!(bigger.id(), oxidezap_plugin_abi::fields::TEXT);
+    }
+
+    /// `whole` is the question `as_str` does not ask.
+    #[test]
+    fn a_value_that_did_not_fit_is_not_a_shorter_value() {
+        let fits: Text<16> = Text::of("5511999@s.wa");
+        assert_eq!(fits.whole(), Some("5511999@s.wa"));
+
+        let cut: Text<4> = Text::of("5511999@s.whatsapp.net");
+        assert_eq!(
+            cut.whole(),
+            None,
+            "somebody else's number, not a shorter one"
+        );
+        assert_eq!(cut.as_str(), "5511", "still readable, for a label");
+    }
 
     /// A value that fit is never trimmed, whatever it holds.
     #[test]

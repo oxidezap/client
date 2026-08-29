@@ -1816,6 +1816,50 @@ fn a_directory_that_is_not_there_is_simply_empty() {
     assert!(crate::discover(&missing).is_empty());
 }
 
+/// Stores one setting on its first message and never asks for anything else.
+const STORES_ONCE: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_kv_set"       (func $set (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "kv")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))
+    (call $caps (i64.const 16))   ;; caps::STORAGE
+    ;; A first write during init, so the one below is inside the interval.
+    (drop (call $set (i32.const 0) (i32.const 1) (i32.const 1) (i32.const 1)))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param i32) (param i32) (result i32)
+    (drop (call $set (i32.const 0) (i32.const 1) (i32.const 0) (i32.const 2)))
+    (i32.const 0))
+)"#;
+
+/// A write held back for the interval is written by the *worker*, not by the
+/// next call — because a plugin that changes one setting and then hears
+/// nothing again has no next call, which is exactly what one person flipping
+/// one toggle produces.
+#[test]
+fn a_deferred_setting_is_written_without_another_event() {
+    let dir = TempDir::new("deferred-kv");
+    dir.plugin("saver", &versioned(STORES_ONCE));
+    let state = dir.0.join("state");
+    let published = Published::default();
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state),
+        Arc::new(Recorder::new(Outcome::Accepted)),
+        published.sink(),
+    );
+    published.settles("the plugin to be listed", |s| !s.is_empty());
+
+    // One message, one changed setting — and then nothing at all.
+    plugins.observe(&message("a@s.whatsapp.net", "go"));
+    until("the deferred write to land on its own", || {
+        std::fs::read_to_string(state.join("kv-saver.json")).is_ok_and(|s| s.contains("kv"))
+    });
+}
+
 /// A plugin's own settings file gets the question the approvals file gets.
 /// Weaker stakes — settings grant nothing — but a file another account wrote
 /// still *steers* the plugin, and an autoreply reading somebody else's list

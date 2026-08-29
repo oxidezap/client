@@ -228,6 +228,24 @@ impl Kv {
         self.write_out();
     }
 
+    /// When the pending change may be written, if there is one.
+    ///
+    /// The worker asks before it goes to sleep. A commit held back for the
+    /// interval used to wait for the *next* call, and a plugin that changes a
+    /// setting and then hears nothing again has no next call — so the change
+    /// sat in memory for as long as the plugin was quiet, which is exactly
+    /// the case a person flipping one toggle produces.
+    #[must_use]
+    pub fn due_at(&self) -> Option<wacore::time::Instant> {
+        if !self.dirty {
+            return None;
+        }
+        Some(match self.wrote_at {
+            Some(at) => at + MIN_WRITE_INTERVAL,
+            None => wacore::time::Instant::now(),
+        })
+    }
+
     /// Write what is pending, whatever the interval says.
     ///
     /// For the one place where there is no next commit: a plugin that is

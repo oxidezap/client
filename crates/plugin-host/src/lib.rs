@@ -769,7 +769,20 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
     // is spending. See `MAX_DUTY`.
     let mut duty = Duty::new();
 
-    while let Some(job) = take(jobs, &mut timers, stopping) {
+    loop {
+        // What this plugin still owes the disk, so the wait below is bounded
+        // by it. Without that, a settings change held back for the write
+        // interval waited for the *next* call — and a plugin that changed one
+        // and then heard nothing again has no next call, so it sat in memory
+        // for as long as the plugin was quiet.
+        let job = match take(jobs, &mut timers, runtime.settings_due(), stopping) {
+            Next::Job(job) => job,
+            Next::Flush => {
+                runtime.flush_settings();
+                continue;
+            }
+            Next::Done => break,
+        };
         duty.wait_its_turn(stopping);
         // Asked before the call, not only after it: a plugin stopped by its
         // queue overflowing still has a live thread and a backlog, and
@@ -814,16 +827,27 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
     runtime.flush_settings();
 }
 
+/// What the worker should do next.
+enum Next {
+    /// Hand this to the plugin.
+    Job(Job),
+    /// Nothing to run, and the settings it changed are due to be written.
+    Flush,
+    /// Nothing left, and there never will be.
+    Done,
+}
+
 /// The next thing to hand the plugin: a queued job, or a timer that has come
-/// due. `None` when there is nothing left and never will be.
+/// due — or, when neither is ready before `flush_at`, the pending write.
 fn take(
     jobs: &Receiver<Job>,
     timers: &mut Vec<(Instant, i64)>,
+    flush_at: Option<Instant>,
     stopping: &AtomicBool,
-) -> Option<Job> {
+) -> Next {
     loop {
         if stopping.load(Ordering::Relaxed) {
-            return None;
+            return Next::Done;
         }
         let now = Instant::now();
         // The soonest, which is not necessarily the first: timers are armed
@@ -835,25 +859,38 @@ fn take(
             .min_by_key(|(_, (due, _))| *due)
             .map(|(index, (due, _))| (index, *due));
 
-        let job = match soonest {
-            Some((index, due)) if due <= now => {
-                let (_, token) = timers.swap_remove(index);
-                return Some(Job::Event(Arc::new(
-                    Event::new(abi::kinds::TIMER).int(abi::fields::TIMER_TOKEN, token),
-                )));
-            }
-            Some((_, due)) => {
-                let wait = due.saturating_duration_since(now);
-                match jobs.recv_timeout(wait) {
-                    Ok(job) => job,
-                    // The timer is due now; go round and fire it.
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
-                }
-            }
-            None => jobs.recv().ok()?,
+        if let Some((index, due)) = soonest
+            && due <= now
+        {
+            let (_, token) = timers.swap_remove(index);
+            return Next::Job(Job::Event(Arc::new(
+                Event::new(abi::kinds::TIMER).int(abi::fields::TIMER_TOKEN, token),
+            )));
+        }
+        if flush_at.is_some_and(|at| at <= now) {
+            return Next::Flush;
+        }
+
+        // The soonest of the two deadlines, because either one ending the
+        // wait is something to do. A write that came due while the plugin was
+        // idle is the whole reason this takes a deadline at all.
+        let deadline = match (soonest.map(|(_, due)| due), flush_at) {
+            (Some(timer), Some(flush)) => Some(timer.min(flush)),
+            (only, None) | (None, only) => only,
         };
-        return Some(job);
+        let job = match deadline {
+            Some(due) => match jobs.recv_timeout(due.saturating_duration_since(now)) {
+                Ok(job) => job,
+                // Something is due now; go round and do it.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Next::Done,
+            },
+            None => match jobs.recv() {
+                Ok(job) => job,
+                Err(_) => return Next::Done,
+            },
+        };
+        return Next::Job(job);
     }
 }
 

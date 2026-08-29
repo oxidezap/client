@@ -297,6 +297,12 @@ impl Runtime {
     /// out that does: a plugin returning a non-zero answer has said something
     /// went wrong with one event, which is its business, while a trap means
     /// it ran out of fuel, out of memory, or off the end of its own logic.
+    /// When this plugin's pending settings may be written, if any are.
+    #[must_use]
+    pub fn settings_due(&self) -> Option<wacore::time::Instant> {
+        self.store.data().kv.due_at()
+    }
+
     /// The last write, for the plugin that has no next call.
     ///
     /// A commit that came too soon after the previous one leaves the change

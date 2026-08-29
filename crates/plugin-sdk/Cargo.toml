@@ -14,5 +14,11 @@ repository.workspace = true
 [dependencies]
 oxidezap-plugin-abi = { workspace = true }
 
+# A host to run a plugin's handlers against under `cargo test`. Off by
+# default and never in a plugin's own build: a `.wasm` links the real imports,
+# and this needs `std` and a heap to record what was asked for.
+[features]
+testing = ["oxidezap-plugin-abi/std"]
+
 [lints]
 workspace = true
