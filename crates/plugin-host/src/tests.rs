@@ -1465,6 +1465,105 @@ fn a_plugins_settings_are_written_once_a_call_rather_than_once_a_key() {
     );
 }
 
+/// The rule itself: a directory the host cannot make private is refused,
+/// and refused *before* anything is read out of it.
+///
+/// Its ordering — securing before reading — is the half a test cannot reach:
+/// forcing a `chmod` to fail on a directory this process owns needs another
+/// user, which a unit test does not have. What is checked here is the answer
+/// the ordering exists to give.
+#[test]
+fn a_directory_that_cannot_be_made_private_is_refused() {
+    let dir = TempDir::new("usable-state");
+    assert_eq!(crate::usable_state_dir(None), None, "nowhere to keep it");
+
+    let good = dir.0.join("state");
+    assert_eq!(
+        crate::usable_state_dir(Some(&good)),
+        Some(good.as_path()),
+        "a directory it can create and lock down is its own"
+    );
+
+    // A file where the directory would go: it cannot be created, so it
+    // cannot be made private, so it is not used.
+    let blocker = dir.0.join("blocked");
+    std::fs::write(&blocker, b"not a directory").expect("writable");
+    assert_eq!(crate::usable_state_dir(Some(&blocker.join("state"))), None);
+}
+
+/// A state directory that cannot be made private is not used at all.
+///
+/// `approvals.json` says what each plugin may do to the account, so a
+/// directory another local user can write is one where that file says what
+/// somebody else decided. Fails closed: nothing is read from it, nothing is
+/// written to it, and the plugin runs unapproved.
+#[test]
+fn a_state_directory_that_cannot_be_secured_is_not_used() {
+    let dir = TempDir::new("unsecurable-state");
+    dir.plugin("autoreply", &pong());
+    // A file where the directory would go, so creating it cannot succeed —
+    // the same answer the host must give a directory it cannot chmod.
+    let blocker = dir.0.join("blocked");
+    std::fs::write(&blocker, b"not a directory").expect("writable");
+    let state = blocker.join("state");
+
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state),
+        Arc::new(Arc::clone(&commands)),
+        published.sink(),
+    );
+
+    let surfaces = published.settles("the plugin to be listed", |s| !s.is_empty());
+    assert!(
+        surfaces[0].is_running(),
+        "the plugin still runs: it can draw and it can keep settings in memory"
+    );
+    assert!(
+        !surfaces[0].approved,
+        "but nothing it does to the account is allowed on an approval file this \
+         daemon could not vouch for"
+    );
+
+    // And it stays refused in practice, not only in the surface.
+    plugins.observe(&message("a@s.whatsapp.net", "ping"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(commands.sent().is_empty(), "no send went out");
+}
+
+/// Every bound in the host is per plugin; the count is the bound on the sum.
+/// A directory holding more than the daemon will run costs it nothing past
+/// the limit — not a thread, not a queue, not a wasmi store.
+#[test]
+fn a_directory_of_plugins_is_bounded_by_how_many_will_run() {
+    let dir = TempDir::new("too-many");
+    let wasm = pong();
+    for i in 0..crate::MAX_PLUGINS + 4 {
+        dir.plugin(&format!("p{i:03}"), &wasm);
+    }
+
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(plugins.ids().len(), crate::MAX_PLUGINS);
+}
+
+/// Everything the plugin host keeps is account-scoped, and the store it
+/// belongs beside is under `%LOCALAPPDATA%`. A roaming profile would carry an
+/// approval to a machine holding a different account.
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_state_does_not_roam() {
+    let local = std::env::var_os("LOCALAPPDATA").expect("windows sets this");
+    let state = crate::default_state_dir().expect("a state dir");
+    assert!(
+        state.starts_with(std::path::Path::new(&local)),
+        "{} is not under %LOCALAPPDATA%",
+        state.display()
+    );
+}
+
 /// A plugin's store holds whatever it kept, and an autoreply's list of who it
 /// has answered is a list of people. Per-user state means this user.
 #[cfg(unix)]

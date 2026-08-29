@@ -100,6 +100,18 @@ const MAX_DUTY: f64 = 0.10;
 /// within seconds rather than minutes.
 const DUTY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many plugins may run at once.
+///
+/// Every per-plugin bound in here is per plugin: a wasmi store, a queue of
+/// five hundred events and an OS thread are all spent before the module runs
+/// an instruction, so a directory holding a thousand individually harmless
+/// modules — a bundle unpacked into it, a copy loop somebody got wrong —
+/// costs a thousand threads and a thousand queues before the daemon opens
+/// its socket. The count is the bound on the sum, as `MAX_DUTY` is for time.
+/// Far past what anybody runs: the point of a limit here is that the number
+/// is finite, not that it is small.
+const MAX_PLUGINS: usize = 32;
+
 /// How many events may wait for one plugin.
 ///
 /// Deep enough to absorb a burst of arrivals while a handler is working, and
@@ -206,18 +218,11 @@ impl Plugins {
         // The approvals live beside the daemon's own state and never in a
         // plugin's key-value store: one that could write its own approval has
         // none.
+        let state_dir = usable_state_dir(state_dir);
+
         let registry = Arc::new(Registry::new(sink, Approvals::open(state_dir)));
         let stopping = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::new();
-
-        if let Some(state_dir) = state_dir
-            && let Err(e) = create_private_dir(state_dir)
-        {
-            log::warn!(
-                "cannot create {}: {e}. Plugin settings will not survive a restart.",
-                state_dir.display()
-            );
-        }
 
         let mut taken: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for path in discover(dir) {
@@ -237,6 +242,13 @@ impl Plugins {
             // of them while the other kept its own copy of the mask and went
             // on acting. Refused rather than disambiguated, because a name
             // this host invented is not one anybody could approve.
+            if workers.len() >= MAX_PLUGINS {
+                log::warn!(
+                    "not loading {} or anything after it: {MAX_PLUGINS} plugins are already                      running, which is the most this daemon will hold",
+                    path.display()
+                );
+                break;
+            }
             if !taken.insert(id.clone()) {
                 log::warn!(
                     "skipping {}: another file already claims the plugin id `{id}`",
@@ -779,7 +791,47 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
 /// settings are the old account's data, but a leftover approval is a plugin
 /// acting on a *new* account under permission given for the old one.
 pub fn forget_approvals(state_dir: &Path) -> std::io::Result<()> {
-    std::fs::remove_file(state_dir.join(approvals::FILE_NAME))
+    std::fs::remove_file(state_dir.join(approvals::FILE_NAME))?;
+    // The same reason a revocation's rename is flushed: unlinking removes a
+    // directory entry, which is metadata POSIX says nothing about the timing
+    // of. Losing power after this returned and before the entry reached the
+    // disk brings `approvals.json` back — and the caller has by then wiped
+    // the credentials, so what comes back is the old account's grants over
+    // whoever pairs next. Flushed here rather than by the caller, because
+    // this function's answer is what "retired" means.
+    sync_dir(state_dir);
+    Ok(())
+}
+
+/// The state directory, if this daemon can make it its own.
+///
+/// Asked *before* anything is read out of it, and answering `None` is what
+/// makes the check worth anything: `approvals.json` says what each plugin may
+/// do to the account, so a directory another local account can write is one
+/// where that file says what somebody else decided. Reading it first and
+/// tightening the mode afterwards — which is what this used to do — put the
+/// mask in memory before the permissions changed, and a repair that failed
+/// was a line in a log that nothing acted on.
+///
+/// `None` fails closed rather than refusing to run the plugins: they draw and
+/// keep settings in memory, and everything that touches the account is
+/// unapproved until somebody says yes in this session. A plugin that cannot
+/// store a preference is a smaller problem than one acting on a permission
+/// nobody here granted.
+fn usable_state_dir(dir: Option<&Path>) -> Option<&Path> {
+    let dir = dir?;
+    match create_private_dir(dir) {
+        Ok(()) => Some(dir),
+        Err(e) => {
+            log::warn!(
+                "not using {}: {e}. Plugin settings will not survive a restart, and \
+                 permissions must be granted again — a directory this daemon cannot \
+                 make private is one whose recorded approvals are not the user's.",
+                dir.display()
+            );
+            None
+        }
+    }
 }
 
 /// Make a directory only this user can enter.
@@ -887,10 +939,28 @@ pub fn default_state_dir() -> Option<PathBuf> {
     data_dir().map(|d| d.join("oxidezap").join("plugin-state"))
 }
 
+/// The root under which the plugins and their state live.
+///
+/// On Windows this is `%LOCALAPPDATA%` and deliberately not `%APPDATA%`,
+/// which is the same choice `oxidezap-session` makes for the store — and it
+/// has to be the same one. A roaming profile follows the user to another
+/// machine, so approvals kept there arrive beside a daemon holding a
+/// *different* paired account, where a plugin with the matching id and mask
+/// is allowed to act under consent given for an account that is not this
+/// one. The plugins travel with it, so the file and the module it names
+/// would both be there. Everything in here is account-scoped; none of it may
+/// roam.
 fn data_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        std::env::var_os("APPDATA").map(PathBuf::from)
+        let not_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(PathBuf::from(v));
+        std::env::var_os("LOCALAPPDATA")
+            .and_then(not_empty)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .and_then(not_empty)
+                    .map(|profile| profile.join("AppData").join("Local"))
+            })
     }
     #[cfg(target_os = "macos")]
     {
