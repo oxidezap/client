@@ -1063,8 +1063,20 @@ async fn handle_request(
             // than spawned loose, so the acknowledgement still means the
             // answer is recorded.
             let plugins = Arc::clone(plugins);
-            let _ = tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved)).await;
-            acted(Ok(()))
+            // The answer is read, not dropped. `approve` takes a mutex and
+            // writes and renames a file; a panic in there left the client
+            // acknowledged for a permission the disk never received, with
+            // Settings drawing a state nothing had recorded and no line in
+            // the log.
+            match tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved)).await {
+                Ok(()) => acted(Ok(())),
+                Err(e) => {
+                    log::error!("recording a plugin approval failed: {e}");
+                    acted(Err(ProtocolError::Refused {
+                        detail: "the approval could not be recorded".to_string(),
+                    }))
+                }
+            }
         }
         // The acknowledgement goes out first; see the caller.
         ClientRequest::Shutdown => Answer {
