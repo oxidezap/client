@@ -1796,11 +1796,29 @@ impl ReadTracker {
             }
             UiEvent::HistoryLoaded { chats, .. } => {
                 for chat in chats {
-                    // Rebuilt rather than merged: the load is the store's
-                    // answer for this chat, so a message it now reports as
-                    // read must stop being something we send a receipt for.
                     let reads = self.chats.entry(chat.jid.clone()).or_default();
-                    *reads = ChatReads::default();
+                    // The receipts are the store's answer either way: a
+                    // message it now reports as read must stop being one we
+                    // owe a receipt for.
+                    reads.unread.clear();
+                    // The boundary is only the store's answer when the load
+                    // reaches it. The same rule `observe` holds one message at
+                    // a time: a page older than what this side holds says
+                    // nothing about where the chat ends, and rebuilding from
+                    // one let the boundary recede — the window then named a
+                    // message it had just drawn in a read the daemon refused,
+                    // which is a badge that clears locally, sends no receipt
+                    // and comes back on the next hydration. A chat the store
+                    // reports with nothing in it is the one case where
+                    // receding is the answer.
+                    let newest = chat
+                        .messages
+                        .iter()
+                        .map(|message| message.timestamp.timestamp())
+                        .max();
+                    if newest.is_none_or(|newest| newest >= reads.newest_secs) {
+                        *reads = ChatReads::default();
+                    }
                     for message in &chat.messages {
                         reads.observe(message);
                     }
@@ -2804,6 +2822,36 @@ mod tests {
         assert!(
             bridge.reads().take_receipts("1@s.whatsapp.net").is_empty(),
             "read elsewhere, so nothing is owed"
+        );
+    }
+
+    /// A load that stops short of what this side has already seen says
+    /// nothing about where the chat ends. Rebuilding the boundary from it let
+    /// it recede, and the window's read then named a message it had just
+    /// drawn and was refused for it.
+    #[test]
+    fn an_older_page_does_not_move_the_boundary_back() {
+        let mut bridge = bridge();
+        bridge.observe(received(
+            "1@s.whatsapp.net",
+            message("newest", "1@s.whatsapp.net", 200, false, false),
+            None,
+        ));
+
+        bridge.observe(loaded(vec![stored_chat(
+            "1@s.whatsapp.net",
+            1,
+            vec![message("older", "1@s.whatsapp.net", 100, false, false)],
+        )]));
+
+        let (secs, ids) = bridge
+            .reads()
+            .boundary("1@s.whatsapp.net")
+            .expect("the chat still ends where it ended");
+        assert_eq!(secs, 200);
+        assert_eq!(
+            ids.iter().map(|(id, ..)| id.as_str()).collect::<Vec<_>>(),
+            ["newest"]
         );
     }
 
