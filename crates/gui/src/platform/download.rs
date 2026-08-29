@@ -45,12 +45,16 @@ mod web {
     /// Hand the bytes to the browser's own download machinery.
     ///
     /// A blob, an object URL, and an `<a download>` clicked from script. The
-    /// anchor joins the document for the length of the click and comes out
-    /// again: a detached one is ignored outright by some browsers, and an
-    /// empty one draws nothing while it is there. The URL outlives the
-    /// click by a tick, because the download is queued rather than performed
-    /// — revoking it in the same turn is what made a save answer `Ok` and
-    /// write nothing.
+    /// anchor joins the document for the length of the click and is taken out
+    /// again: a detached anchor's click is ignored outright by some engines,
+    /// and one that stays is a link the page grew and never lost.
+    ///
+    /// The object URL outlives the call by a few seconds rather than being
+    /// revoked under it. Only the *navigation* is synchronous with `click()`;
+    /// the read behind it is not, so revoking on the next line races the
+    /// browser to its own blob and loses often enough to land a zero-byte
+    /// file. The timer is the whole fix, and a leaked URL costs one blob until
+    /// the tab goes.
     pub fn save(file_name: &str, data: &[u8]) -> Result<String, String> {
         let window = web_sys::window().ok_or("no window to save from")?;
         let document = window.document().ok_or("no document to save from")?;
@@ -76,19 +80,15 @@ mod web {
             .map_err(|_| "the browser made something that is not a link".to_string())?;
         anchor.set_href(&url);
         anchor.set_download(file_name);
+        // `style` is not on the element trait, so the attribute is the way to
+        // say it: an anchor in the document is one that could otherwise be
+        // laid out, and a save should not reflow the page it was asked from.
+        let _ = anchor.set_attribute("style", "display:none");
+
         let _ = body.append_child(&anchor);
         anchor.click();
         let _ = body.remove_child(&anchor);
-
-        // A tick later, not now. The click queues a fetch of the object URL
-        // and returns before it runs, so a revocation in this turn races it —
-        // and the race is lost quietly, as a saved file of zero bytes or one
-        // the browser reports as missing.
-        let deferred = url.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            crate::platform::sleep(std::time::Duration::from_millis(0)).await;
-            let _ = web_sys::Url::revoke_object_url(&deferred);
-        });
+        revoke_later(&window, url);
 
         // Asked *after* the click, because a click is all we get to make and
         // a blocked one does not say so — `click()` returns the same nothing
@@ -110,6 +110,35 @@ mod web {
         }
 
         Ok(format!("{file_name} (your browser's downloads)"))
+    }
+
+    /// Drop the object URL once the browser has had time to read it.
+    ///
+    /// Deferred rather than immediate, and the delay is generous because the
+    /// only cost of being late is one blob and the cost of being early is the
+    /// download itself. If the timer cannot be set the URL is simply kept:
+    /// leaking it is the safe end of this trade.
+    fn revoke_later(window: &web_sys::Window, url: String) {
+        use wasm_bindgen::closure::Closure;
+
+        /// Long enough for a browser to start reading a blob it has already
+        /// been navigated to.
+        const GRACE_MILLIS: i32 = 60_000;
+
+        let revoke = Closure::once(move || {
+            let _ = web_sys::Url::revoke_object_url(&url);
+        });
+        if window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                revoke.as_ref().unchecked_ref(),
+                GRACE_MILLIS,
+            )
+            .is_ok()
+        {
+            // The timer holds the only reference the callback needs, and it
+            // fires once: forgetting it is what keeps it alive until then.
+            revoke.forget();
+        }
     }
 
     /// Whether the page still holds the user's permission to act on its own.
