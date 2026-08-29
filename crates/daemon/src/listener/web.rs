@@ -29,10 +29,10 @@
 //! It is therefore opt-in (`--web`), bound to loopback unless told otherwise,
 //! and refuses any browser origin that was not named (`--web-allow`) —
 //! excepting `localhost` and `127.0.0.1`, which are the developer's own
-//! `trunk serve`. A request with no `Origin` at all is not a browser and is
-//! left to the same rule, because a page cannot suppress the header and a
-//! hand-written client that omits it should not be privileged over one that
-//! sends it.
+//! `trunk serve`. The token is the admission check; the origin only narrows
+//! who can probe. A request carrying no `Origin` is not necessarily something
+//! other than a browser — an `<img>`, a `<script>` or a form GET sends none —
+//! so it is served on a loopback bind and still only with the token.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -711,9 +711,12 @@ impl Request {
     /// what stops one from being probed for.
     fn origin_allowed(&self, config: &Config) -> bool {
         let Some(origin) = &self.origin else {
-            // Not a browser: a page cannot suppress `Origin`. So this is
-            // something else on this machine — `run` refuses to bind anywhere
-            // else — and it still has to know the token.
+            // A missing `Origin` says nothing about who is asking: an
+            // `<img src>`, a `<script src>` and a form GET are all browser
+            // requests that carry none. So this branch is not "not a
+            // browser", it is "nothing to check" — which is why the token
+            // is what admits it, and why this is served only on a loopback
+            // bind, where `run` already refuses to be anywhere else.
             return config.addr.ip().is_loopback();
         };
         if is_loopback_origin(origin) {
@@ -923,8 +926,9 @@ mod tests {
         );
     }
 
-    /// A client that sends no `Origin` is not a page — a page cannot suppress
-    /// it — so it is served only where the reach is the machine itself.
+    /// A client that sends no `Origin` carries nothing to check, so it is
+    /// served only where the reach is the machine itself — and still only
+    /// with the token.
     #[test]
     fn a_client_with_no_origin_is_served_only_on_loopback() {
         assert!(request(None).origin_allowed(&config(&[])));

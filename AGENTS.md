@@ -226,8 +226,9 @@ profile here repeats it deliberately.
   without an early return, so the matching prefix is not something a caller
   can time; and answered with a `404` rather than a `403`, because an endpoint
   the caller may not open has no reason to confirm it is there. A request with
-  no `Origin` is not a browser — a page cannot suppress the header — so it is
-  served on a loopback bind, and still only with the token. A non-loopback
+  no `Origin` carries nothing to check — an `<img>`, a `<script>` and a form
+  GET are browser requests that send none — so it is served on a loopback
+  bind, and still only with the token, which is the whole admission check. A non-loopback
   bind is an error rather than a warning: there the header is a string the
   client picks and the traffic is cleartext, so remote access is a tunnel's
   job. Both endpoints draw on one admission
