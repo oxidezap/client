@@ -1823,39 +1823,57 @@ impl WhatsAppClient {
             let Some(names) = names.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let chat: Jid = jid.parse().map_err(|_| "not a chat address".to_string())?;
-            let before = before
-                .map(|cursor| parse_message_cursor(&cursor).ok_or("unreadable cursor".to_string()))
-                .transpose()?;
+            Self::message_page(&store, &client, &names, jid, before, limit).await
+        })
+    }
 
-            let limit = limit.clamp(1, Self::MESSAGE_PAGE);
-            let mut page = store
-                .messages(&chat, before, limit)
-                .await
-                .map_err(|e| e.to_string())?;
-            // A page shorter than it asked for is the start of the
-            // conversation: there is nothing older to name a cursor with.
-            let next = ((page.len() as i64) == limit)
-                .then(|| page.last().map(message_cursor))
-                .flatten();
-            page.reverse(); // the store returns newest-first; a timeline is drawn the other way
-            let mut messages: Vec<ChatMessage> =
-                page.into_iter().map(stored_to_chat_message).collect();
-            Self::hydrate_reactions(&store, &client, &names, &chat, &mut messages).await;
-            if chat.is_group() || chat.is_status_broadcast() {
-                Self::hydrate_sender_names(
-                    &store,
-                    &client,
-                    &mut messages,
-                    &names,
-                    chat.is_status_broadcast(),
-                )
-                .await;
-            }
-            Ok(Page {
-                items: messages,
-                next,
-            })
+    async fn message_page(
+        store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        names: &NameBook,
+        jid: String,
+        before: Option<String>,
+        limit: i64,
+    ) -> Result<Page<ChatMessage>, String> {
+        let chat: Jid = jid.parse().map_err(|_| "not a chat address".to_string())?;
+        let before = before
+            .map(|cursor| parse_message_cursor(&cursor).ok_or("unreadable cursor".to_string()))
+            .transpose()?;
+
+        let limit = limit.clamp(1, Self::MESSAGE_PAGE);
+        let mut page = store
+            .messages(&chat, before.clone(), limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        // A page shorter than it asked for is the start of the
+        // conversation: there is nothing older to name a cursor with.
+        let next = ((page.len() as i64) == limit)
+            .then(|| page.last().map(message_cursor))
+            .flatten();
+        page.reverse(); // the store returns newest-first; a timeline is drawn the other way
+        let mut messages: Vec<ChatMessage> = page.into_iter().map(stored_to_chat_message).collect();
+        Self::hydrate_reactions(store, client, names, &chat, &mut messages).await;
+        if chat.is_group() || chat.is_status_broadcast() {
+            Self::hydrate_sender_names(
+                store,
+                client,
+                &mut messages,
+                names,
+                chat.is_status_broadcast(),
+            )
+            .await;
+        }
+        // Exactly what the attach load does to its rows, which is what the
+        // paragraph above promises: a page hydrated any other way is one whose
+        // unread tail nobody ever sends a receipt for.
+        let unread = store
+            .unread_before(&chat, before)
+            .await
+            .map_err(|e| e.to_string())?;
+        mark_unread_tail(&mut messages, unread.clamp(0, u32::MAX as i64) as u32);
+        Ok(Page {
+            items: messages,
+            next,
         })
     }
 
@@ -2416,16 +2434,7 @@ impl WhatsAppClient {
                 }
                 // Each alias still needs its unread tail marked for receipts,
                 // but PN/LID counters describe the same logical chat.
-                let mut remaining = entry.unread_count.max(0) as u32;
-                for msg in msgs.iter_mut().rev() {
-                    if remaining == 0 {
-                        break;
-                    }
-                    if !msg.is_from_me {
-                        msg.is_read = false;
-                        remaining -= 1;
-                    }
-                }
+                mark_unread_tail(&mut msgs, entry.unread_count.max(0) as u32);
                 merge_alias_history_messages(existing, msgs, entry.unread_count.max(0) as u32);
                 // A page is assigned rather than added a row at a time, so
                 // the naming `add_message` does per row has to be run over it.
@@ -2462,19 +2471,7 @@ impl WhatsAppClient {
                 )
                 .await;
             }
-            // The newest `unread_count` incoming messages are the unread ones;
-            // select_chat only sends read receipts for !is_read, so hydrated
-            // unread must not come up pre-read.
-            let mut remaining = chat.unread_count;
-            for msg in chat.messages.iter_mut().rev() {
-                if remaining == 0 {
-                    break;
-                }
-                if !msg.is_from_me {
-                    msg.is_read = false;
-                    remaining -= 1;
-                }
-            }
+            mark_unread_tail(&mut chat.messages, chat.unread_count);
             // After the sender names, because the best answer for "who wrote
             // the message this is replying to" is usually the reply's own
             // neighbour, and it has only just been named.
@@ -2919,6 +2916,31 @@ fn effective_sticker(msg: &wa::Message) -> Option<&wa::message::StickerMessage> 
     })
 }
 
+/// Un-read the newest `unread` incoming rows of a hydrated page.
+///
+/// [`stored_to_chat_message`] reads an incoming row back as read, because the
+/// store keeps read state on the chat's counter and not on the row — so every
+/// caller that hydrates stored rows owes this correction. Skipping it hands a
+/// front end a page in which nothing is unread: the read it then asks for
+/// names messages the daemon was told were already seen, no receipt goes out,
+/// and the badge comes back on the next hydration.
+///
+/// Returns whatever budget the page did not spend, for a caller walking a
+/// PN/LID pair a page at a time.
+fn mark_unread_tail(messages: &mut [ChatMessage], unread: u32) -> u32 {
+    let mut remaining = unread;
+    for msg in messages.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        if !msg.is_from_me {
+            msg.is_read = false;
+            remaining -= 1;
+        }
+    }
+    remaining
+}
+
 fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage) -> ChatMessage {
     // The stored proto still carries the media envelope: hydrate thumbnails +
     // download info so historical media renders and stays fetchable, instead
@@ -3302,6 +3324,38 @@ mod tests {
                 .await
                 .expect("history loads");
         assert_eq!(chats[0].last_message.as_deref(), Some("bom dia"));
+    }
+
+    /// A page opened on a chat nobody has read comes back saying every row in
+    /// it has been read, so the read the front end then asks for names
+    /// messages the daemon was told were already seen and no receipt goes out.
+    #[tokio::test]
+    async fn a_page_of_an_unread_chat_comes_back_unread() {
+        let (chat_store, client) = test_session("page-unread").await;
+        for (n, id) in ["MSG-P1", "MSG-P2", "MSG-P3"].iter().enumerate() {
+            feed(
+                &chat_store,
+                incoming(wa::Message::text("oi"), id, 1_700_000_000 + n as i64),
+            )
+            .await;
+        }
+
+        let page = WhatsAppClient::message_page(
+            &chat_store,
+            &client,
+            &book(),
+            TEST_PEER.to_string(),
+            None,
+            50,
+        )
+        .await
+        .expect("page loads");
+
+        assert_eq!(page.items.len(), 3);
+        assert!(
+            page.items.iter().all(|m| !m.is_read),
+            "nothing in the chat has been read, so nothing in its page may say it was"
+        );
     }
 
     const TEST_PEER: &str = "559900000001@s.whatsapp.net";

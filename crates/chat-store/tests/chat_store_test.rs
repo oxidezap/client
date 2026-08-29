@@ -10,7 +10,7 @@ use std::time::Duration;
 use buffa::MessageField;
 use chrono::{Datelike, TimeZone, Utc};
 use diesel::RunQueryDsl;
-use oxidezap_chat_store::{ChatStore, MessageKind, MessageStatus, StoreChange};
+use oxidezap_chat_store::{ChatStore, MessageCursor, MessageKind, MessageStatus, StoreChange};
 use wacore::proto_helpers::MessageBuilderExt;
 use wacore::types::events::{
     BatchOrigin, Event, InboundMessage, LazyHistorySync, MessageBatch, Receipt, ServerAck,
@@ -2233,6 +2233,59 @@ async fn mark_read_range_preserves_newer_unread() {
     )
     .await;
     assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}
+
+/// The unread tail is the chat's newest incoming rows, so a caller paging
+/// back past them must be told the tail is spent rather than marking a second
+/// copy of it on every older page.
+#[tokio::test]
+async fn the_unread_tail_does_not_repeat_on_an_older_page() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        (0..4).map(|n| {
+            message_event(
+                wa::Message::text("oi"),
+                incoming_info(PEER, PEER, &format!("MSG-U{n}"), 1_700_000_000 + n),
+            )
+        }),
+    )
+    .await;
+    // Two of the four read from another device, so the tail is the two newest.
+    feed(
+        &chat_store,
+        [Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    message_range: range_up_to(1_700_000_001),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 2);
+
+    let newest = chat_store.messages(&jid(PEER), None, 2).await.unwrap();
+    assert_eq!(
+        chat_store.unread_before(&jid(PEER), None).await.unwrap(),
+        2,
+        "the newest page carries the whole tail"
+    );
+
+    let cursor = MessageCursor::from(newest.last().unwrap());
+    assert_eq!(
+        chat_store
+            .unread_before(&jid(PEER), Some(cursor))
+            .await
+            .unwrap(),
+        0,
+        "the page behind the tail owes no receipts"
+    );
 }
 
 #[tokio::test]

@@ -388,6 +388,68 @@ impl ChatStore {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// How many of a chat's incoming rows are still unread once `before` has
+    /// been paged past.
+    ///
+    /// Read state is per chat rather than per row, so whoever turns stored
+    /// rows into messages has to place the unread tail itself: it is the
+    /// newest incoming rows, and this is how many of them the caller's page
+    /// still owes. On the newest page that is just the counter; on an older
+    /// one it is the counter less the incoming rows in front of it.
+    ///
+    /// Both halves in one read, because a page already costs a permit, a
+    /// blocking task and a snapshot transaction, and asking separately would
+    /// spend two more. Counted over every key the chat is filed under, the
+    /// same set the page itself is read over, or half a split PN/LID pair
+    /// answers for the whole thread.
+    pub async fn unread_before(&self, chat: &Jid, before: Option<MessageCursor>) -> Result<i64> {
+        let device_id = self.device_id();
+        let chat = chat.to_string();
+        let total: i64 = self
+            .db()
+            .read(move |conn| {
+                use schema::chats::dsl as chats;
+                use schema::messages::dsl as msgs;
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
+                let counts: Vec<i32> = chats::chats
+                    .filter(
+                        chats::device_id
+                            .eq(device_id)
+                            .and(chats::jid.eq_any(keys.clone())),
+                    )
+                    .select(chats::unread_count)
+                    .load(conn)
+                    .map_err(db_err)?;
+                // -1 is "manually marked unread", which is a badge and not a
+                // tail of rows: it owes no receipts.
+                let unread: i64 = counts.iter().map(|c| (*c).max(0) as i64).sum();
+                let Some(cursor) = before else {
+                    return Ok(unread);
+                };
+                let ahead: i64 = msgs::messages
+                    .filter(
+                        msgs::device_id
+                            .eq(device_id)
+                            .and(msgs::chat_jid.eq_any(keys))
+                            .and(msgs::from_me.eq(false))
+                            .and(
+                                msgs::timestamp_ms
+                                    .gt(cursor.timestamp_ms)
+                                    .or(msgs::timestamp_ms
+                                        .eq(cursor.timestamp_ms)
+                                        .and(msgs::rowid.ge(cursor.seq))),
+                            ),
+                    )
+                    .count()
+                    .get_result(conn)
+                    .map_err(db_err)?;
+                Ok((unread - ahead).max(0))
+            })
+            .await?;
+        Ok(total)
+    }
+
     /// One page of a chat's messages, newest first. Pass the cursor of the
     /// oldest message you already have to get the page before it.
     ///
