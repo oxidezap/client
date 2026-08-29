@@ -600,7 +600,7 @@ impl WhatsAppApp {
         while cache.len() >= MAX_DECODED_IMAGES {
             let Some(at) = cache
                 .keys()
-                .position(|key| !pinned.iter().any(|id| *id == Some(key.as_str())))
+                .position(|key| !pinned.contains(&Some(key.as_str())))
             else {
                 // Everything left is being drawn. Never reached with a cap
                 // this far above the two things that can be pinned; the entry

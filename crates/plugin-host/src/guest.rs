@@ -1038,7 +1038,7 @@ fn widget(node: &abi::ui::Node) -> PluginNode {
 /// one place the subtraction can be got wrong.
 fn commanded(c: &mut Caller<'_, Guest>, run: impl FnOnce(&dyn Commands) -> Outcome) -> i32 {
     let commands = Arc::clone(&c.data().commands);
-    let started = std::time::Instant::now();
+    let started = wacore::time::Instant::now();
     let outcome = run(commands.as_ref());
     c.data_mut().daemon_wait += started.elapsed();
     code(outcome)

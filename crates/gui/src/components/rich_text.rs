@@ -90,7 +90,7 @@ mod tests {
         let marked = "*thanks*, that _works_ for me — see `run.sh`";
 
         for (what, source) in [("plain", plain), ("marked", marked)] {
-            let started = std::time::Instant::now();
+            let started = wacore::time::Instant::now();
             let mut runs = 0;
             for _ in 0..FRAMES {
                 for _ in 0..BUBBLES {
@@ -105,7 +105,7 @@ mod tests {
             );
         }
 
-        let started = std::time::Instant::now();
+        let started = wacore::time::Instant::now();
         let mut callable = 0;
         for _ in 0..FRAMES {
             callable += usize::from(

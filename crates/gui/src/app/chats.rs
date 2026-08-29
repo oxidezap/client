@@ -306,14 +306,14 @@ mod tests {
         // lands and where a scan from the front pays the most.
         let page: Vec<String> = held.iter().rev().take(PAGE).cloned().collect();
 
-        let started = std::time::Instant::now();
+        let started = wacore::time::Instant::now();
         let mut found = 0;
         for jid in &page {
             found += usize::from(held.iter().any(|held| held == jid));
         }
         let scanning = started.elapsed();
 
-        let started = std::time::Instant::now();
+        let started = wacore::time::Instant::now();
         let index: HashMap<&str, usize> = held
             .iter()
             .enumerate()
@@ -355,7 +355,7 @@ mod tests {
             .collect();
         let query = "contact 9";
 
-        let started = std::time::Instant::now();
+        let started = wacore::time::Instant::now();
         let mut kept = 0;
         for _ in 0..PASSES {
             kept += chats
