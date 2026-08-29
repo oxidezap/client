@@ -1697,9 +1697,14 @@ impl WhatsAppClient {
                 calls.park_upgrade(call_id, token);
                 Self::announce_video_request(ui_sender, call_id, true).await;
             }
+            // Their camera, not our answer. `Enabled` is what a peer sends
+            // for their own camera and their own rotations, so retiring our
+            // outstanding question on it leaves a later refusal answering
+            // nothing here while the library has already released the plane
+            // under it: the device stays open, encoding for nobody, drawn as
+            // live. Only the two stanzas that are addressed to our request
+            // retire it.
             VideoState::Enabled => {
-                // Whatever we were waiting on an answer for has had one.
-                calls.end_upgrade(call_id);
                 Self::announce_video(ui_sender, call_id, VideoStream::Remote, true).await;
             }
             // Paused is drawn the same as off, and deliberately: a peer whose
@@ -1841,6 +1846,25 @@ fn log_termination(call_id: &str, outcome: CallTermination) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer turning their own camera on is not an answer to ours. Taken as
+    /// one, the refusal that follows finds nothing outstanding, leaves
+    /// `stop_local_video` unrun, and the camera stands open with its light on
+    /// over a media plane the library has already released.
+    #[tokio::test]
+    async fn a_peers_own_camera_does_not_answer_our_upgrade() {
+        let calls = CallRegistry::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ui: UiEventSender = Arc::new(Mutex::new(Some(tx)));
+
+        calls.begin_upgrade("call-1");
+        WhatsAppClient::observe_peer_video(&calls, &ui, "call-1", VideoState::Enabled, None).await;
+
+        assert!(
+            calls.end_upgrade("call-1"),
+            "our upgrade is still waiting on an answer of its own"
+        );
+    }
 
     /// Stamp a request the way `set_call_muted` does, on the caller's thread.
     fn request(lane: &MuteLane, muted: bool) -> u64 {
