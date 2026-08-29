@@ -396,7 +396,16 @@ impl InputAreaView {
     ) -> impl IntoElement {
         let entity = cx.entity().clone();
         let record_entity = entity.clone();
-        let has_text = !self.input.read(cx).text().to_string().trim().is_empty();
+        // Asked of the rope rather than of a copy of it. `text()` hands back
+        // the document itself; `to_string` copied all of it, on every
+        // keystroke, to answer whether the send button or the microphone
+        // belongs here.
+        let has_text = self
+            .input
+            .read(cx)
+            .text()
+            .chars()
+            .any(|c| !c.is_whitespace());
 
         div()
             .flex()
