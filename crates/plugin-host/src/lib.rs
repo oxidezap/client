@@ -112,6 +112,15 @@ const DUTY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 /// is finite, not that it is small.
 const MAX_PLUGINS: usize = 32;
 
+/// The longest value a widget's use may carry.
+///
+/// The window refuses a longer one before it sends; this is the same number
+/// asked on the side that has to *hold* it. `QUEUE_DEPTH` counts items, so
+/// without this a front end submitting a valid action carrying most of the
+/// daemon's frame limit could park hundreds of megabytes in one plugin's
+/// queue — and a plugin being throttled is exactly one whose queue fills.
+const MAX_ACTION_BYTES: usize = 64 * 1024;
+
 /// How many events may wait for one plugin.
 ///
 /// Deep enough to absorb a burst of arrivals while a handler is working, and
@@ -389,6 +398,27 @@ impl Plugins {
             log::debug!(
                 "plugin {}: an action for `{}`, which it does not currently draw",
                 action.plugin,
+                action.action
+            );
+            return;
+        }
+        // And the value is bounded before it is cloned into a queued event.
+        // The queue is five hundred deep and counts *items*, so a front end
+        // submitting a valid action carrying most of a megabyte — the
+        // daemon's whole frame limit — could park half a gigabyte in one
+        // plugin's queue while that plugin is throttled or slow. A setting is
+        // a keyword or a sentence; the window refuses anything longer before
+        // it sends, and this is the same number asked on the side that has to
+        // hold it.
+        if action
+            .value
+            .as_ref()
+            .is_some_and(|v| v.len() > MAX_ACTION_BYTES)
+        {
+            log::debug!(
+                "plugin {}: refusing a {} byte value for `{}`",
+                action.plugin,
+                action.value.as_ref().map_or(0, String::len),
                 action.action
             );
             return;
@@ -776,6 +806,12 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
             }
         }
     }
+    // Whatever the last call left pending. A commit that came too soon after
+    // the one before it leaves the change dirty for the *next* call to write,
+    // and a plugin that has stopped — traps, shutdown, its queue overflowing
+    // — has no next call. Its settings are the one thing here meant to
+    // outlive it.
+    runtime.flush_settings();
 }
 
 /// The next thing to hand the plugin: a queued job, or a timer that has come

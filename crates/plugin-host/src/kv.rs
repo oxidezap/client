@@ -24,6 +24,20 @@ const MAX_BYTES: usize = 256 * 1024;
 /// The longest key or value.
 pub(crate) const MAX_ENTRY: usize = 8 * 1024;
 
+/// The shortest time between two writes of this file.
+///
+/// One write per call bounds what *one* handler costs, and a plugin gives
+/// itself handlers: sixteen timers at the hundred-millisecond floor, each
+/// changing one byte, is a hundred and sixty serializations, `fsync`s,
+/// renames and directory flushes a second — per plugin, for a store nobody
+/// asked to keep. So a commit that comes too soon leaves the change dirty
+/// and the next one writes it; nothing is lost, because dirty is exactly
+/// what "not on disk yet" means everywhere else in this file.
+///
+/// A second, because that is the scale of the thing being protected: a
+/// person flipping a toggle waits nothing, and a plugin looping waits.
+const MIN_WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// One plugin's key-value pairs, mirrored to a file.
 ///
 /// Held in memory and written through on every change. A plugin's whole store
@@ -38,6 +52,10 @@ pub struct Kv {
     complained: bool,
     /// What the entries weigh, kept as a running total. See [`Kv::size`].
     bytes: usize,
+    /// When this file was last written, so a plugin that changes a key on
+    /// every callback does not turn its own timer into disk I/O. See
+    /// [`MIN_WRITE_INTERVAL`].
+    wrote_at: Option<wacore::time::Instant>,
     /// Whether anything has changed since the last write.
     ///
     /// A `set` no longer writes; [`commit`](Self::commit) does, once, after
@@ -83,6 +101,7 @@ impl Kv {
                 entries: BTreeMap::new(),
                 bytes: 0,
                 complained: false,
+                wrote_at: None,
                 dirty: false,
             };
         }
@@ -100,6 +119,7 @@ impl Kv {
                 entries: BTreeMap::new(),
                 bytes: 0,
                 complained: false,
+                wrote_at: None,
                 dirty: false,
             };
         }
@@ -119,6 +139,7 @@ impl Kv {
             bytes: Self::size(&entries),
             entries,
             complained: false,
+            wrote_at: None,
             dirty: false,
         }
     }
@@ -135,6 +156,7 @@ impl Kv {
             entries: BTreeMap::new(),
             bytes: 0,
             complained: false,
+            wrote_at: None,
             dirty: false,
         }
     }
@@ -194,12 +216,34 @@ impl Kv {
     /// plugin can ask for: it may set a key a million times and still cost
     /// one file.
     pub fn commit(&mut self) {
+        // Too soon since the last one is not "never": the change stays dirty
+        // and the next commit — the next event, the next timer, or the flush
+        // when this plugin stops — writes it.
+        if self
+            .wrote_at
+            .is_some_and(|at| at.elapsed() < MIN_WRITE_INTERVAL)
+        {
+            return;
+        }
+        self.write_out();
+    }
+
+    /// Write what is pending, whatever the interval says.
+    ///
+    /// For the one place where there is no next commit: a plugin that is
+    /// stopping. Everything else goes through [`commit`](Self::commit).
+    pub fn flush_pending(&mut self) {
+        self.write_out();
+    }
+
+    fn write_out(&mut self) {
         if self.dirty {
             // Cleared only by a write that landed. Taking the flag first
             // meant a full disk lost the change silently: the map held it,
             // nothing was dirty any more, and the next restart read back the
             // older file.
             self.dirty = !self.flush();
+            self.wrote_at = Some(wacore::time::Instant::now());
         }
     }
 
@@ -307,6 +351,34 @@ mod tests {
 
         let kv = Kv::open(&dir.0, "autoreply");
         assert_eq!(kv.get("greeting"), Some("oi"));
+    }
+
+    /// One write per call bounds one handler, and a plugin gives itself
+    /// handlers: sixteen timers at the floor, each changing a byte, is a
+    /// hundred and sixty serializations, `fsync`s and renames a second. A
+    /// commit that comes too soon leaves the change dirty for the next one.
+    #[test]
+    fn a_plugin_cannot_turn_its_own_timer_into_disk_writes() {
+        let dir = TempDir::new("debounce");
+        let path = dir.0.join("kv-p.json");
+        let mut kv = Kv::open(&dir.0, "p");
+
+        kv.set("k", "first");
+        kv.commit();
+        assert!(path.exists(), "the first write is not held back");
+
+        // The next call, immediately: changed in memory, not on disk.
+        kv.set("k", "second");
+        kv.commit();
+        assert_eq!(
+            Kv::open(&dir.0, "p").get("k"),
+            Some("first"),
+            "too soon after the last write, so it stays dirty"
+        );
+
+        // And nothing is lost: the plugin stopping writes what is pending.
+        kv.flush_pending();
+        assert_eq!(Kv::open(&dir.0, "p").get("k"), Some("second"));
     }
 
     #[test]

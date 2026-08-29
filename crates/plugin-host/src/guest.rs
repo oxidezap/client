@@ -80,45 +80,63 @@ const MAX_UI_PER_CALL: usize = 16;
 ///
 /// Generous for anything honest: a plugin that logs a line per message is
 /// three orders of magnitude under it.
-const MAX_LOG_BYTES_PER_WINDOW: usize = 256 * 1024;
+pub(crate) const MAX_LOG_BYTES_PER_WINDOW: usize = 256 * 1024;
 
-/// How long that allowance is measured over. The duty cycle's window, because
-/// it is the same question about a different resource.
-const LOG_WINDOW: std::time::Duration = crate::DUTY_WINDOW;
+/// How long a rolling allowance is measured over. The duty cycle's window,
+/// because it is the same question about different resources.
+const ROLLING_WINDOW: std::time::Duration = crate::DUTY_WINDOW;
 
-/// What one plugin has logged, and when its window began.
+/// How many account commands a plugin may issue over that window.
 ///
-/// Separated from the import so the rule is a function of a duration rather
+/// The per-call cap sees one handler. A plugin approved for `TYPING` and
+/// declaring `TIMERS` — which needs nobody's yes — can hold sixteen timers at
+/// the hundred-millisecond floor and spend a fresh allowance in each, and a
+/// typing update is a task and a stanza the moment it is accepted. Far past
+/// any honest handler: answering every message in a busy account is a
+/// fraction of this.
+pub(crate) const MAX_COMMANDS_PER_WINDOW: usize = 256;
+
+/// What one plugin has spent of something, and when its window began.
+///
+/// A per-call budget bounds one handler and nothing else, and a plugin needs
+/// nobody's permission to arm a timer: sixteen callbacks a second, each
+/// spending a fresh allowance, is the per-call cap answered sixteen times.
+/// This is the same question asked of the sum, and `MAX_DUTY` is its twin —
+/// that one bounds the time a plugin spends, this one what it spends it on.
+///
+/// Separated from the imports so the rule is a function of a duration rather
 /// than of a clock: a window that has been open for eleven seconds is not
 /// something a test can wait for, and the arithmetic is the whole point.
-pub struct LogBudget {
+pub struct Rolling {
     pub window_began: wacore::time::Instant,
+    allowance: usize,
     spent: usize,
 }
 
-impl LogBudget {
-    pub fn new() -> Self {
+impl Rolling {
+    pub fn new(allowance: usize) -> Self {
         Self {
             window_began: wacore::time::Instant::now(),
+            allowance,
             spent: 0,
         }
     }
 
-    /// Whether a line of `len` bytes may be written, given how long the
-    /// window has been open, and charge it if so.
+    /// Whether `amount` may be spent, given how long the window has been
+    /// open, and charge it if so.
     ///
-    /// Asked against what the line *needs* rather than against what is
-    /// already spent: the latter is a threshold rather than a limit, and lets
-    /// the line that crosses it through in full.
-    fn spend(&mut self, elapsed: std::time::Duration, len: usize) -> bool {
-        if elapsed >= LOG_WINDOW {
+    /// Asked against what is *needed* rather than against what is already
+    /// spent: the latter is a threshold rather than a limit, and lets the one
+    /// that crosses it through in full.
+    fn spend(&mut self, elapsed: std::time::Duration, amount: usize) -> bool {
+        if elapsed >= ROLLING_WINDOW {
             self.window_began = wacore::time::Instant::now();
             self.spent = 0;
         }
-        if len > MAX_LOG_BYTES_PER_WINDOW.saturating_sub(self.spent) {
+        if amount > self.allowance.saturating_sub(self.spent) {
             return false;
         }
-        self.spent += len;
+        self.spent += amount;
         true
     }
 }
@@ -242,8 +260,15 @@ pub struct Guest {
     pub unknown_caps: bool,
     /// Whether it declared its capabilities more than once.
     pub declared_twice: bool,
-    /// What this plugin has logged across calls. See [`LogBudget`].
-    pub log_budget: LogBudget,
+    /// Whether `oxi_subscribe` has been attempted, and whether more than
+    /// once. An `Option` for the reason [`named`](Self::named) is one.
+    pub subscribed: Option<bool>,
+    pub subscribed_twice: bool,
+    /// What this plugin has logged across calls. See [`Rolling`].
+    pub log_budget: Rolling,
+    /// What this plugin has commanded across calls. See
+    /// [`MAX_COMMANDS_PER_WINDOW`].
+    pub command_budget: Rolling,
     /// Whether `oxi_set_name` has been *attempted*. An `Option` so the one
     /// call is claimed and answered in a single step, with no window in
     /// which two would both find it free.
@@ -297,6 +322,13 @@ impl Guest {
         if self.commands_issued >= MAX_COMMANDS_PER_CALL {
             return false;
         }
+        // And across calls, which the per-call cap says nothing about: the
+        // allowance resets on every delivery, and a plugin gives itself
+        // deliveries.
+        let elapsed = self.command_budget.window_began.elapsed();
+        if !self.command_budget.spend(elapsed, 1) {
+            return false;
+        }
         self.commands_issued += 1;
         true
     }
@@ -345,6 +377,18 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // the plugin once `oxi_init` is done.
             let known = (1i64 << abi::kinds::COUNT) - 1;
             let guest = c.data_mut();
+            // Once, like the capability declaration. Replacing the first mask
+            // with the second is what this used to do, silently and with no
+            // answer to say so: a plugin whose setup is split across two
+            // helpers — one subscribing to messages, the other to reactions —
+            // loaded looking healthy and never heard about the first kind
+            // again. Refused by the loader rather than combined, because the
+            // two masks are two sentences and nothing here can tell which one
+            // its author meant.
+            if guest.subscribed.replace(true) == Some(true) {
+                guest.subscribed_twice = true;
+                return;
+            }
             if mask & !known != 0 {
                 guest.unknown_kinds = true;
                 return;
@@ -822,7 +866,8 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // allowance every time, and filling a disk is not something the
             // duty cycle notices — writing a line is fast, not long.
             let budget = &mut c.data_mut().log_budget;
-            if !budget.spend(budget.window_began.elapsed(), line) {
+            let elapsed = budget.window_began.elapsed();
+            if !budget.spend(elapsed, line) {
                 return;
             }
             let Ok(line) = read_str(&mut c, ptr, len) else {
@@ -1054,7 +1099,7 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
 
 #[cfg(test)]
 mod tests {
-    use super::{LogBudget, MAX_LOG_BYTES_PER_WINDOW, escape_controls};
+    use super::{MAX_LOG_BYTES_PER_WINDOW, Rolling, escape_controls};
 
     /// The per-call cap bounds one handler. A plugin needs nobody's
     /// permission to arm a timer, so it can spend a fresh one sixteen times a
@@ -1064,7 +1109,7 @@ mod tests {
     fn a_plugin_cannot_log_forever_by_waking_itself() {
         use std::time::Duration;
 
-        let mut budget = LogBudget::new();
+        let mut budget = Rolling::new(MAX_LOG_BYTES_PER_WINDOW);
         let line = 2048;
         let fits = MAX_LOG_BYTES_PER_WINDOW / line;
 
@@ -1082,7 +1127,24 @@ mod tests {
         );
 
         // The window turning over is what gives it back.
-        assert!(budget.spend(super::LOG_WINDOW, line));
+        assert!(budget.spend(super::ROLLING_WINDOW, line));
+    }
+
+    /// The same budget bounds account commands, and for the same reason: the
+    /// per-call cap is answered once per callback, and a plugin decides how
+    /// many callbacks it gets.
+    #[test]
+    fn account_commands_are_bounded_across_calls_too() {
+        use std::time::Duration;
+
+        let mut budget = Rolling::new(super::MAX_COMMANDS_PER_WINDOW);
+        for _ in 0..super::MAX_COMMANDS_PER_WINDOW {
+            assert!(budget.spend(Duration::from_millis(100), 1));
+        }
+        assert!(
+            !budget.spend(Duration::from_secs(1), 1),
+            "sixteen callbacks a second do not each get a fresh allowance"
+        );
     }
 
     /// A plugin's line is one line. Embedding a newline would otherwise

@@ -190,8 +190,8 @@ profile here repeats it deliberately.
   because withdrawing has to bite *now*: an answer queued behind a backlog
   would let a plugin send through five hundred banked events while Settings
   already read "not allowed", and the plugin that most needs stopping is the
-  one whose queue is full. Declaring is a single act, once — and so is
-  naming — for the same reason: a plugin that declares the narrow mask it was approved for, sends,
+  one whose queue is full. Declaring is a single act, once — and so are
+  naming and subscribing — for the same reason: a plugin that declares the narrow mask it was approved for, sends,
   and *then* widens has already sent, and the wider surface reading as
   unapproved afterwards is no use to the message. Nor does any of it start at
   instantiation — a start section and `oxi_abi_version` are code the loader

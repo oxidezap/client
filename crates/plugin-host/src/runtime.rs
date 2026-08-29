@@ -144,7 +144,10 @@ impl Runtime {
                 unknown_caps: false,
                 declared_twice: false,
                 named: None,
-                log_budget: crate::guest::LogBudget::new(),
+                log_budget: crate::guest::Rolling::new(crate::guest::MAX_LOG_BYTES_PER_WINDOW),
+                command_budget: crate::guest::Rolling::new(crate::guest::MAX_COMMANDS_PER_WINDOW),
+                subscribed: None,
+                subscribed_twice: false,
                 logged_bytes: 0,
                 commands_issued: 0,
                 trees_published: 0,
@@ -237,6 +240,12 @@ impl Runtime {
         // Refused for the same reason an unknown capability is: what Settings
         // would ask about is not what the plugin wrote, and the half that was
         // dropped comes back as commands denied forever.
+        if store.data().subscribed_twice {
+            return Err(anyhow!(
+                "it subscribed more than once; a plugin says which events it wants in one \
+                 call, because a second mask replaces the first rather than adding to it"
+            ));
+        }
         if store.data().declared_twice {
             return Err(anyhow!(
                 "it declared its capabilities more than once; a plugin says what it wants                  in one call, because that is the sentence somebody is asked about"
@@ -288,6 +297,16 @@ impl Runtime {
     /// out that does: a plugin returning a non-zero answer has said something
     /// went wrong with one event, which is its business, while a trap means
     /// it ran out of fuel, out of memory, or off the end of its own logic.
+    /// The last write, for the plugin that has no next call.
+    ///
+    /// A commit that came too soon after the previous one leaves the change
+    /// dirty for the next one to write, which is what keeps a plugin's timer
+    /// from being disk I/O — and a plugin that stops has no next one. Its
+    /// settings are the one thing here that is meant to outlive it.
+    pub fn flush_settings(&mut self) {
+        self.store.data_mut().kv.flush_pending();
+    }
+
     pub fn deliver(&mut self, event: Arc<Event>, pending_timers: usize) -> Result<Effects> {
         let kind = event.kind;
         {

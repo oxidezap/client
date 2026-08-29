@@ -1650,6 +1650,40 @@ fn a_refused_name_still_spends_the_one_attempt() {
     });
 }
 
+/// Subscribes twice, which used to replace the first mask with the second.
+const SUBSCRIBES_TWICE: &str = r#"(module
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (memory (export "memory") 1)
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $subscribe (i64.const 2))   ;; messages
+    (call $subscribe (i64.const 4))   ;; and, meaning to add, replacing
+    (call $caps (i64.const 8))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param i32) (param i32) (result i32) (i32.const 0))
+)"#;
+
+/// A plugin says which events it wants in one call.
+///
+/// The import answers nothing, so a second mask silently replacing the first
+/// is a plugin whose setup was split across two helpers loading healthy and
+/// never hearing about one of the two kinds again.
+#[test]
+fn a_plugin_subscribes_once() {
+    let dir = TempDir::new("subscribes-twice");
+    dir.plugin("split", &versioned(SUBSCRIBES_TWICE));
+    dir.plugin("autoreply", &pong());
+
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(
+        plugins.ids(),
+        vec!["autoreply"],
+        "refused rather than loaded hearing about half of what it asked for"
+    );
+}
+
 /// A plugin names itself once.
 ///
 /// The second call is refused *before* the string is read, which is the
@@ -1812,6 +1846,44 @@ fn settings_another_user_could_have_written_are_not_read() {
         crate::kv::Kv::open(&dir.0, "autoreply").get("keyword"),
         Some("ping")
     );
+}
+
+/// A widget's use carries a value, and the queue that holds it counts items.
+/// A front end submitting one near the daemon's frame limit could park
+/// hundreds of megabytes in a plugin's queue — and a plugin being throttled
+/// is exactly one whose queue fills.
+#[test]
+fn an_action_carrying_more_than_a_setting_is_refused() {
+    let dir = TempDir::new("huge-action");
+    dir.plugin("greeter", &draws());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+    published.settles("the interface", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: Some("x".repeat(crate::MAX_ACTION_BYTES + 1)),
+        chat_jid: Some("5511999@s.whatsapp.net".into()),
+        slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(commands.sent().is_empty(), "never reached the plugin");
+
+    // And one of an honest size still does, so this is about the length.
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: Some("x".repeat(crate::MAX_ACTION_BYTES)),
+        chat_jid: Some("5511999@s.whatsapp.net".into()),
+        slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
+    });
+    until("the greeting", || commands.sent().len() == 1);
 }
 
 /// A plugin another local account could replace is not loaded.
