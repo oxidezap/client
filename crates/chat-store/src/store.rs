@@ -917,20 +917,19 @@ fn apply_writer_msg(
                 target_id,
                 *target_from_me,
                 target_participant.as_deref(),
-            )? {
+            )? && apply_reaction(
+                conn,
+                device_id,
+                &chat_str,
+                target_id,
                 // Own reactors are stored as the empty JID, the same sentinel
                 // used by history sync for key.from_me reactions.
-                apply_reaction(
-                    conn,
-                    device_id,
-                    &chat_str,
-                    target_id,
-                    "",
-                    emoji,
-                    *timestamp_ms,
-                )?;
+                "",
+                emoji,
+                *timestamp_ms,
+            )? {
+                cs.message_chats.insert(chat_str);
             }
-            cs.message_chats.insert(chat_str);
             Ok(())
         }
         WriterMsg::StatusWatched { chat, msg_ids } => {
@@ -1173,6 +1172,16 @@ fn apply_event(
                 .then(|| update.timestamp.timestamp_millis());
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
+            // Only when it is news, the same rule the subject change already
+            // holds: the server redistributes app-state mutations on every
+            // resync, and a pin the row already carries would buy a full
+            // chat-list reload — the one load that may prune.
+            let stored: Option<i64> = chat_row(device_id, &chat)
+                .select(schema::chats::pinned_at)
+                .first(conn)?;
+            if stored == pinned_at {
+                return Ok(());
+            }
             diesel::update(chat_row(device_id, &chat))
                 .set(schema::chats::pinned_at.eq(pinned_at))
                 .execute(conn)?;
@@ -1195,6 +1204,12 @@ fn apply_event(
             };
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
+            let stored: Option<i64> = chat_row(device_id, &chat)
+                .select(schema::chats::muted_until)
+                .first(conn)?;
+            if stored == muted_until {
+                return Ok(());
+            }
             diesel::update(chat_row(device_id, &chat))
                 .set(schema::chats::muted_until.eq(muted_until))
                 .execute(conn)?;
@@ -1204,8 +1219,15 @@ fn apply_event(
         Event::ArchiveUpdate(update) => {
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
+            let archived = update.action.archived.unwrap_or(false);
+            let stored: bool = chat_row(device_id, &chat)
+                .select(schema::chats::archived)
+                .first(conn)?;
+            if stored == archived {
+                return Ok(());
+            }
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::archived.eq(update.action.archived.unwrap_or(false)))
+                .set(schema::chats::archived.eq(archived))
                 .execute(conn)?;
             cs.chats = true;
             Ok(())
@@ -1250,36 +1272,47 @@ fn apply_event(
                 match advanced {
                     Some(state) => {
                         let unread = count_unread(conn, device_id, &chat, &state)?;
-                        diesel::update(chat_row(device_id, &chat))
-                            .set(schema::chats::unread_count.eq(unread))
-                            .execute(conn)?;
+                        set_unread_count(conn, device_id, &chat, unread, cs)?;
                     }
                     // Cursor didn't move (re-reading an already-read chat),
                     // but a read still clears a manual-unread marker.
                     None => {
                         let state = read_state(conn, device_id, &chat)?;
                         let unread = count_unread(conn, device_id, &chat, &state)?;
-                        diesel::update(
+                        let cleared = diesel::update(
                             chat_row(device_id, &chat)
                                 .filter(schema::chats::unread_count.eq(UNREAD_MARKER)),
                         )
                         .set(schema::chats::unread_count.eq(unread))
                         .execute(conn)?;
+                        // A replay of a read this chat already holds writes
+                        // nothing, and the same rule the `ReadSelf` arm keeps
+                        // applies: no write, no reload.
+                        if cleared > 0 {
+                            cs.chats = true;
+                        }
                     }
                 }
             } else {
-                diesel::update(chat_row(device_id, &chat))
-                    .set(schema::chats::unread_count.eq(UNREAD_MARKER))
-                    .execute(conn)?;
+                set_unread_count(conn, device_id, &chat, UNREAD_MARKER, cs)?;
             }
-            cs.chats = true;
             Ok(())
         }
         Event::StarUpdate(update) => {
             let chat =
                 crate::lid::route_chat_key(conn, device_id, &update.chat_jid.to_string(), cs)?;
+            let starred = update.action.starred.unwrap_or(false);
+            let stored: Option<bool> = message_row(device_id, &chat, &update.message_id)
+                .select(schema::messages::starred)
+                .first(conn)
+                .optional()?;
+            // A row we do not hold, or one already starred this way: nothing
+            // to reload for.
+            if stored != Some(!starred) {
+                return Ok(());
+            }
             diesel::update(message_row(device_id, &chat, &update.message_id))
-                .set(schema::messages::starred.eq(update.action.starred.unwrap_or(false)))
+                .set(schema::messages::starred.eq(starred))
                 .execute(conn)?;
             cs.message_chats.insert(chat);
             Ok(())
@@ -1463,8 +1496,9 @@ fn apply_inbound(
             cs.message_chats.insert(chat);
         }
         MessageOp::Reaction { target_id, emoji } => {
-            apply_reaction(conn, device_id, &chat, &target_id, &sender, &emoji, ts_ms)?;
-            cs.message_chats.insert(chat);
+            if apply_reaction(conn, device_id, &chat, &target_id, &sender, &emoji, ts_ms)? {
+                cs.message_chats.insert(chat);
+            }
         }
         MessageOp::Edit {
             target_id,
@@ -1791,12 +1825,32 @@ fn apply_reaction(
     sender: &str,
     emoji: &str,
     ts_ms: i64,
-) -> QueryResult<()> {
+) -> QueryResult<bool> {
     use schema::reactions::dsl;
+    // What this sender already holds, so a redelivery says so rather than
+    // buying a reload: an invalidation is a claim that something changed, and
+    // the server repeats app-state mutations on every resync.
+    let held: Option<(String, i64)> = dsl::reactions
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq(chat))
+                .and(dsl::msg_id.eq(target_id))
+                .and(dsl::sender_jid.eq(sender)),
+        )
+        .select((dsl::emoji, dsl::ts_ms))
+        .first(conn)
+        .optional()?;
+    if held
+        .as_ref()
+        .is_some_and(|(held, held_ts)| held == emoji && *held_ts == ts_ms)
+    {
+        return Ok(false);
+    }
     // Empty emoji is a removal tombstone, not a deletion: retaining its
     // timestamp prevents an older history chunk from resurrecting the prior
     // reaction. The read API hides these rows.
-    diesel::insert_into(dsl::reactions)
+    let inserted = diesel::insert_into(dsl::reactions)
         .values((
             dsl::device_id.eq(device_id),
             dsl::chat_jid.eq(chat),
@@ -1809,7 +1863,7 @@ fn apply_reaction(
         .execute(conn)?;
     // Latest reaction per sender wins; a stale copy (e.g. from a history
     // chunk) must not replace either a newer live reaction or its tombstone.
-    diesel::update(
+    let updated = diesel::update(
         dsl::reactions.filter(
             dsl::device_id
                 .eq(device_id)
@@ -1821,7 +1875,7 @@ fn apply_reaction(
     )
     .set((dsl::emoji.eq(emoji), dsl::ts_ms.eq(ts_ms)))
     .execute(conn)?;
-    Ok(())
+    Ok(inserted > 0 || updated > 0)
 }
 
 fn apply_receipt(
@@ -3047,6 +3101,32 @@ type ChatRowFilter<'a> = diesel::dsl::Filter<
         diesel::dsl::Eq<schema::chats::jid, &'a str>,
     >,
 >;
+
+/// Write a chat's unread count, and say so only when it moved.
+///
+/// The server redistributes app-state mutations on every resync, so a read
+/// this chat already holds arrives again and again; claiming a change for one
+/// buys a full chat-list reload, which is the only load allowed to prune.
+fn set_unread_count(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    unread: i32,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    let stored: Option<i32> = chat_row(device_id, chat)
+        .select(schema::chats::unread_count)
+        .first(conn)
+        .optional()?;
+    if stored == Some(unread) {
+        return Ok(());
+    }
+    diesel::update(chat_row(device_id, chat))
+        .set(schema::chats::unread_count.eq(unread))
+        .execute(conn)?;
+    cs.chats = true;
+    Ok(())
+}
 
 fn chat_row(device_id: i32, chat: &str) -> ChatRowFilter<'_> {
     schema::chats::table.filter(

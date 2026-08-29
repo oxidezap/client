@@ -6632,6 +6632,44 @@ async fn a_view_never_regresses_a_row() {
     );
 }
 
+/// The server redistributes app-state mutations on every resync. A pin the
+/// row already carries changes nothing, and the reload it used to buy is the
+/// only load allowed to prune the chat list.
+#[tokio::test]
+async fn a_redelivered_pin_buys_no_reload() {
+    let (_store, chat_store) = test_store().await;
+    let pin = |ts: i64| {
+        Event::PinUpdate(
+            wacore::types::events::PinUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(Utc.timestamp_opt(ts, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::PinAction {
+                    pinned: Some(true),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )
+    };
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("hello"),
+            incoming_info(PEER, PEER, "MSG-PIN-1", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    feed(&chat_store, [pin(1_700_000_050)]).await;
+    let mut changes = chat_store.subscribe();
+    // The same pin again, as a resync redelivers it.
+    feed(&chat_store, [pin(1_700_000_050)]).await;
+    assert!(
+        changes.try_recv().is_err(),
+        "a pin the row already holds moved nothing and must buy no reload"
+    );
+}
+
 /// An invalidation is a claim that something changed. Re-watching an update
 /// changes nothing, and a reload bought for nothing is what the rule exists
 /// to prevent.
