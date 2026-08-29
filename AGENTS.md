@@ -1209,6 +1209,21 @@ by definition.
   scheduler rather than a second backend, which is why it is not done here and
   why the front end says so instead. What a page *can* do meanwhile it already
   does: attach to an `oxidezapd` and get that daemon's plugins whole.
+- **A page with its own session cannot send media, and the reason is upstream.**
+  `BrowserHttpClient` implements `execute` and nothing else, which the trait
+  allows: the streaming paths default to refusing. But the library's upload
+  never asks. `upload_media_with_retry` sends the body through a closure that
+  calls `execute_upload` unconditionally, and nothing anywhere reads
+  `supports_upload_streaming` except the ureq client that sets it. So a photo
+  or a voice note sent from a page's own session fails with "Upload streaming
+  not supported by this HTTP client", whatever this side does about staging.
+  A browser cannot answer `execute_upload` either: it is synchronous, must be
+  called from a blocking context, and `fetch` is neither. The fix is a
+  buffered fallback in the library, taken when the client declares no upload
+  streaming, and it is a change to `whatsapp-rust` rather than to anything
+  here. Attached to an `oxidezapd` the question does not arise, because the
+  daemon holds the ureq client and does the upload.
+
 - **Video is not decoded on the web**, in a message or in a call, **and voice
   notes are not recorded there.** All three are the same cause — the decoder
   and the encoder are C — and each has a browser-native answer that is a Rust
