@@ -321,8 +321,50 @@ impl WhatsAppClient {
         if !finished {
             warn!("session did not finish closing within {grace:?}");
         }
+        let drained = self.drain_chat_store(grace).await;
         crate::exec::let_go(self).await;
-        finished
+        finished && drained
+    }
+
+    /// Commit whatever the chat store's writer is still holding.
+    ///
+    /// It is the one task the executor does not own. `ChatStore` spawns its
+    /// writer itself — that queue is the store's own ordering guarantee, not
+    /// the session's — so [`join`](crate::exec::Executor::join) above says
+    /// nothing about it.
+    ///
+    /// On a desktop that is invisible, because letting go of the client drops
+    /// the runtime the task was spawned on and the task goes with it. A page
+    /// has no runtime to drop: the writer lives on the browser's event loop
+    /// and outlives this call. And what follows this call on the one path
+    /// that matters is deleting the database — so an account reset could
+    /// unlink the store while the old account's writer was still draining
+    /// into it, which is the partial wipe the delete-the-whole-file rule
+    /// exists to prevent, arrived at from the other end.
+    ///
+    /// A flush is a barrier in that queue, so awaiting one is awaiting
+    /// everything enqueued before it. Taking the handle is the other half: it
+    /// drops the sender the session held, so nothing enqueues anything after.
+    async fn drain_chat_store(&self, grace: std::time::Duration) -> bool {
+        let Some(store) = self.chat_store.lock().await.take() else {
+            return true;
+        };
+        match crate::exec::with_timeout(store.flush(), grace).await {
+            Some(Ok(())) => true,
+            // Answered, and that is what is being asked. A batch that rolled
+            // back is a write that never landed and a writer that panicked is
+            // one that will never write again; neither is a hand still on the
+            // database, so neither is a reason to refuse the wipe and leave
+            // the person unable to pair again.
+            Some(Err(e)) => {
+                warn!("the chat store did not close cleanly: {e}");
+                true
+            }
+            None => {
+                warn!("the chat store was still writing after {grace:?}");
+                false
+            }
+        }
     }
 
     /// Get the client handle for sending messages

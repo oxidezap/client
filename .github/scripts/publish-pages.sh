@@ -185,14 +185,25 @@ if [ "$held" -gt "$ordinal" ]; then
 fi
 
 if [ "$remove" = true ]; then
-    if [ ! -d "$work/$target" ]; then
-        echo "nothing to remove at $target"
-        exit 0
+    if [ -d "$work/$target" ]; then
+        rm -rf "${work:?}/$target"
+        # An empty `pr/` left behind is not wrong, but it is litter.
+        rmdir "$work/$(dirname "$target")" 2>/dev/null || true
+        message="Remove the preview at $target"
+    else
+        # Nothing to delete, and that is precisely when the claim below is
+        # load-bearing. A pull request closed before its first publisher
+        # reached this branch finds no directory here — and leaving without
+        # recording the removal's ordinal lets that publisher, still building,
+        # read no claim, pass the check and create the closed pull request's
+        # preview. Nothing comes back for it: a teardown is a single event.
+        #
+        # So the removal is claimed whether or not it removed anything. What
+        # this branch says is not "a directory was deleted" but "this ordinal
+        # owns this target, and it owns nothing".
+        echo "nothing to remove at $target; recording the removal anyway"
+        message="Claim the removal of $target"
     fi
-    rm -rf "${work:?}/$target"
-    # An empty `pr/` left behind is not wrong, but it is litter.
-    rmdir "$work/$(dirname "$target")" 2>/dev/null || true
-    message="Remove the preview at $target"
 else
     [ -d "$bundle_dir" ] || { echo "no ./bundle to publish" >&2; exit 1; }
     if [ "$target" = "." ]; then
