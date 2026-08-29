@@ -102,6 +102,19 @@ pub fn survives_complete_load(
 pub struct ChatListCache {
     /// Chat count the snapshot was taken at, for invalidation.
     pub chat_count: usize,
+    /// What [`WhatsAppApp::invalidate_chat_cache`] had been called this many
+    /// times when the snapshot was taken.
+    ///
+    /// The whole point of asking this rather than comparing counts: a count
+    /// can only be compared after the list has been filtered, which is where
+    /// the work is — a `to_lowercase` of the name and of the JID per chat
+    /// while a search is running, spent on every frame to conclude that
+    /// nothing had changed.
+    pub version: u64,
+    /// How many chats there were in total, unfiltered. `Vec::len`, so it is
+    /// free, and it catches an addition or a removal that reached the list
+    /// without announcing itself.
+    pub chats_len: usize,
     pub rows: Arc<[ChatRow]>,
 }
 
@@ -253,5 +266,49 @@ mod tests {
     fn filter_ids_are_stable_and_distinct() {
         let ids: Vec<&str> = ChatFilter::ALL.iter().map(|f| f.id()).collect();
         assert_eq!(ids, vec!["all", "unread", "groups"]);
+    }
+
+    /// A stopwatch rather than an assertion: what the sidebar's search filter
+    /// costs for one pass over an account's chats.
+    ///
+    /// The number that matters is how often it is paid. `get_chat_list_cache`
+    /// is called at least twice a frame and used to run this before it could
+    /// compare the count it produced, so an idle window at 60 fps spent it
+    /// 120 times a second on a list nothing had touched. With the cache
+    /// answering from a version and a length, both O(1), an unchanged list
+    /// pays it zero times.
+    ///
+    /// `cargo test -p oxidezap-gui -- --ignored --nocapture chat_filter_costs`
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn chat_filter_costs() {
+        const CHATS: usize = 1_000;
+        const PASSES: usize = 100;
+
+        let chats: Vec<Chat> = (0..CHATS)
+            .map(|i| {
+                let mut chat = Chat::new(format!("55990000{i:04}@s.whatsapp.net"));
+                chat.name = format!("Contact {i}");
+                chat
+            })
+            .collect();
+        let query = "contact 9";
+
+        let started = std::time::Instant::now();
+        let mut kept = 0;
+        for _ in 0..PASSES {
+            kept += chats
+                .iter()
+                .filter(|chat| {
+                    chat.name.to_lowercase().contains(query)
+                        || chat.jid.to_lowercase().contains(query)
+                })
+                .count();
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "{CHATS} chats, {PASSES} passes: {elapsed:?} ({:?} per pass, {kept} kept)",
+            elapsed / PASSES as u32
+        );
     }
 }
