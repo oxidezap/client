@@ -152,10 +152,22 @@ mod imp {
         gpui_platform::application_with_web_backend(requested_backend())
     }
 
-    /// WebGPU, WebGL, or whichever the browser prefers.
+    /// WebGL by default, and WebGPU for anyone who asks.
     ///
-    /// `?backend=webgl` forces the fallback. A page is served to machines nobody
-    /// has tested on, and "the window is black" is otherwise unactionable.
+    /// Not the browser's preference, which is what `Auto` asks for and what
+    /// this used to pass. On a machine whose WebGPU *probes* fine, `Auto`
+    /// selects it and the first pipeline it builds can still fail —
+    /// `CreateGraphicsPipelines failed with VK_ERROR_UNKNOWN … [RenderPipeline
+    /// "quads"]` — which reaches wgpu as an "Unexpected error" panic and takes
+    /// the device with it. Measured, on an ordinary Intel/Mesa laptop through
+    /// a released Chrome: the session behind it went on opening the store and
+    /// building the client, into a window that would never draw again.
+    ///
+    /// A probe cannot catch that, because the probe passed. So the default is
+    /// the backend that has worked everywhere it has been tried, and the
+    /// faster one is a query away for anyone who wants it. Both directions
+    /// are named, because "the window is black" is otherwise unactionable
+    /// from either side.
     fn requested_backend() -> gpui_platform::WebBackendPreference {
         let search = web_sys::window()
             .and_then(|window| window.location().search().ok())
@@ -168,10 +180,10 @@ mod imp {
         };
         if asked("webgpu") {
             gpui_platform::WebBackendPreference::WebGpu
-        } else if asked("webgl") {
-            gpui_platform::WebBackendPreference::WebGl
-        } else {
+        } else if asked("auto") {
             gpui_platform::WebBackendPreference::Auto
+        } else {
+            gpui_platform::WebBackendPreference::WebGl
         }
     }
 }

@@ -179,6 +179,11 @@ What the web build cannot do, and reports rather than pretends:
   `wasm32-unknown-unknown`. Clips keep their thumbnail and say so.
 * **No recording voice notes.** A voice note is Opus, and libopus is C too.
   Playback works, because the browser decodes Opus itself.
+* **WebGL by default, WebGPU on request.** `?backend=webgpu` asks for the
+  faster one and `?backend=auto` for whatever the browser prefers. The
+  default is the conservative one because WebGPU can pass its own probe and
+  then fail building a pipeline, which reaches wgpu as a panic and leaves a
+  window that never draws — observed on an ordinary Intel/Mesa laptop.
 * **Calls need a daemon, and then have no picture.** Where the page is
   attached to an `oxidezapd` — `#daemon=ws://…` — calls work: they ring in the
   daemon, which is where the microphone and the codec already were, so the
