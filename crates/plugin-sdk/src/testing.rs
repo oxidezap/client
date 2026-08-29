@@ -14,9 +14,12 @@
 //! writes: which field it reads, what it decides, and what it asks for.
 //!
 //! ```ignore
+//! use oxidezap_plugin::testing::{Event as In, Host};
+//!
 //! let mut host = Host::new();
+//! host.init(setup);
 //! host.store("enabled", "1");
-//! host.deliver(Message::from("5511999@s.whatsapp.net", "ping"));
+//! host.deliver(In::message("5511999@s.whatsapp.net", "ping"), handle);
 //! assert_eq!(host.sent(), [("5511999@s.whatsapp.net".into(), "pong".into())]);
 //! ```
 
