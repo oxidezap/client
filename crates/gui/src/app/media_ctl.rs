@@ -721,20 +721,34 @@ impl WhatsAppApp {
         };
         let download_rx = client.download_downloadable_media(downloadable);
 
+        // Before the stop, which is what clears it: asked afterwards, this was
+        // always `None`, so the filter below protected nothing.
+        let playing = self.playing_video_id().map(str::to_string);
+
         // Stop any currently playing media (mutual exclusion)
         self.stop_current_media();
         self.pending_media_request = Some(message_id.clone());
 
-        // Evict old video players if cache is full (excluding currently playing)
+        // Evict old video players if the cache is full, sparing the one that
+        // was playing, this one, and any still on their way. A player removed
+        // mid-flight is one the detached task cannot find when its bytes
+        // arrive: `load` and `set_error` both become no-ops, the decoded
+        // download is dropped in silence, and the bubble goes back to
+        // offering the download it had just made.
         if self.video_players.len() >= MAX_VIDEO_PLAYERS {
-            // Remove players that aren't currently playing, up to half the limit
-            let current_playing = self.playing_video_id().map(|s| s.to_string());
             let to_remove: Vec<_> = self
                 .video_players
-                .keys()
-                .filter(|k| Some(*k) != current_playing.as_ref() && **k != message_id)
+                .iter()
+                .filter(|(id, player)| {
+                    Some(id.as_str()) != playing.as_deref()
+                        && **id != message_id
+                        && !matches!(
+                            player.state(),
+                            VideoPlayerState::Downloading | VideoPlayerState::Decoding
+                        )
+                })
+                .map(|(id, _)| id.clone())
                 .take(MAX_VIDEO_PLAYERS / 2)
-                .cloned()
                 .collect();
             for key in to_remove {
                 self.video_players.remove(&key);
