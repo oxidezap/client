@@ -689,6 +689,48 @@ fn pressing_a_plugins_button_reaches_the_plugin_with_the_open_chat() {
     );
 }
 
+/// Every other job on a plugin's queue comes from the account; a press comes
+/// from a front end. Overflowing the queue *stops* a plugin, permanently and
+/// with no way back short of restarting the daemon, so an unbounded press
+/// meant any client could disable any approved plugin by pressing hard
+/// enough. The excess is refused and the plugin goes on running.
+#[test]
+fn a_flood_of_presses_does_not_disable_the_plugin() {
+    let dir = TempDir::new("press-flood");
+    dir.plugin("greeter", &draws());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+    published.settles("the interface", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+
+    // Held inside the first command, so the queue fills behind it the way it
+    // would behind a slow plugin.
+    commands.close_gate();
+    let press = || PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: None,
+        chat_jid: Some("5511999@s.whatsapp.net".into()),
+        slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
+    };
+    for _ in 0..(QUEUE_DEPTH * 4) {
+        plugins.act(&press());
+    }
+    commands.open_gate();
+
+    let surfaces = published.settles("the plugin to answer", |s| {
+        s.first().is_some_and(|p| !p.roots.is_empty())
+    });
+    assert!(
+        surfaces[0].is_running(),
+        "a plugin the user approved is not disabled by somebody pressing hard: {:?}",
+        surfaces[0].stopped
+    );
+}
+
 #[test]
 fn an_action_for_a_plugin_that_is_not_loaded_is_ignored() {
     let dir = TempDir::new("stray");

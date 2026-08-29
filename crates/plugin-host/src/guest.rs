@@ -139,7 +139,7 @@ impl Rolling {
     /// Asked against what is *needed* rather than against what is already
     /// spent: the latter is a threshold rather than a limit, and lets the one
     /// that crosses it through in full.
-    fn spend(&mut self, elapsed: std::time::Duration, amount: usize) -> bool {
+    pub(crate) fn spend(&mut self, elapsed: std::time::Duration, amount: usize) -> bool {
         if elapsed >= ROLLING_WINDOW {
             self.window_began = wacore::time::Instant::now();
             self.spent = 0;

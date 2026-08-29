@@ -122,6 +122,20 @@ const MAX_PLUGINS: usize = 32;
 /// queue — and a plugin being throttled is exactly one whose queue fills.
 const MAX_ACTION_BYTES: usize = 64 * 1024;
 
+/// How many widget presses one plugin may be handed per rolling window.
+///
+/// Everything else on this queue comes from the account. A press comes from
+/// a front end, which is the one producer somebody outside this process can
+/// run at will, and a full queue does not drop a press: it *stops the plugin
+/// for good*, with nothing short of restarting the daemon to bring it back.
+/// So `QUEUE_DEPTH` valid actions faster than the plugin drains them turn
+/// load into the permanent, silent disabling of a plugin the user approved.
+/// Refusing the excess is the bound; the plugin keeps running.
+///
+/// Far past a person: pressing something ten times a second for the whole
+/// window is a fifth of this, and the window is shared with nothing else.
+const MAX_ACTIONS_PER_WINDOW: usize = 512;
+
 /// How many events may wait for one plugin.
 ///
 /// Deep enough to absorb a burst of arrivals while a handler is working, and
@@ -205,6 +219,9 @@ struct Worker {
     /// the plugin that most needs its permissions taken away is exactly the
     /// one whose queue is full.
     granted: Arc<AtomicI64>,
+    /// What this plugin's widget presses have spent this window. See
+    /// [`MAX_ACTIONS_PER_WINDOW`].
+    actions: Mutex<crate::guest::Rolling>,
 }
 
 /// What arrives on a plugin's queue.
@@ -453,6 +470,22 @@ impl Plugins {
                 return;
             }
         };
+        // And how many of them, per window. Overflowing this queue stops the
+        // plugin permanently, so an unbounded press is a front end able to
+        // disable any approved plugin by pressing hard enough. Refused here
+        // instead, where the plugin goes on running.
+        {
+            let mut actions = worker.actions.lock().expect("action budget poisoned");
+            let elapsed = actions.window_began.elapsed();
+            if !actions.spend(elapsed, 1) {
+                log::debug!(
+                    "plugin {}: refusing `{}`, more than {MAX_ACTIONS_PER_WINDOW} actions this window",
+                    action.plugin,
+                    action.action
+                );
+                return;
+            }
+        }
         let event = Event::new(abi::kinds::UI_ACTION)
             .str(abi::fields::ACTION_ID, action.action.clone())
             .str(
@@ -645,6 +678,7 @@ fn start(
         queue: Mutex::new(Some(queue)),
         thread: Mutex::new(thread),
         granted,
+        actions: Mutex::new(crate::guest::Rolling::new(MAX_ACTIONS_PER_WINDOW)),
     }
 }
 
