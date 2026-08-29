@@ -1265,18 +1265,25 @@ impl WhatsAppApp {
         // all because this is the frame's one pass over the timeline and it
         // already holds the list.
         //
-        // And only of a list that is already this conversation's. There is
-        // one of them for whichever chat is on screen, so on the frame a
-        // reader opens a new one it still holds the geometry of the one they
-        // left — and a chat left near its top would have every chat opened
-        // after it ask for a page of history nobody had scrolled to, on the
-        // frame it opened. The anchor is what the list describes; until it
-        // names this chat there is nothing here to ask about.
-        if self
-            .timeline_anchor
-            .as_ref()
-            .is_some_and(|anchor| anchor.jid == chat_jid)
-            && self.timeline_nearing_start()
+        // And only of a list that is already this conversation's, drawn in
+        // this frame. There is one list for whichever chat is on screen, so
+        // on the frame a reader opens a new one it still holds the geometry
+        // of the one they left — and a chat left near its top would have
+        // every chat opened after it ask for a page of history nobody had
+        // scrolled to. The selection outlives the screen, too: a phone's Back
+        // leaves it standing, as do Status and the fullscreen viewer, and the
+        // measurements freeze where the reader left them — so a conversation
+        // nobody is looking at went on asking for a page every frame, for
+        // ever, since a list with nothing to scroll answers "at the top"
+        // permanently. `visible_chat` is what this frame decided it draws, and
+        // it is written in the same pass, above this.
+        if timeline_may_page(
+            self.visible_chat.as_deref(),
+            self.timeline_anchor
+                .as_ref()
+                .map(|anchor| anchor.jid.as_str()),
+            chat_jid,
+        ) && self.timeline_nearing_start()
         {
             self.want_older_messages(chat_jid);
         }
@@ -3017,6 +3024,23 @@ fn slot_newest_first(rest: &[Chat], at: Option<chrono::DateTime<chrono::Utc>>) -
         .unwrap_or(rest.len())
 }
 
+/// Whether the timeline this frame is building may ask for the page before
+/// it.
+///
+/// Both halves, and they are different questions. `anchored` is about the
+/// list's geometry: there is one list for whichever chat is on screen, so on
+/// the frame a reader opens a new conversation it still holds the
+/// measurements of the one they left, and a chat left near its top would have
+/// every chat opened after it ask for history nobody had scrolled to.
+/// `visible` is about the screen: the selection outlives it — a phone's Back
+/// leaves it standing, and so do Status and the fullscreen viewer — while the
+/// measurements stay frozen where the reader left them, so a conversation
+/// nobody is drawing went on asking for a page every frame, for ever, since a
+/// list with nothing to scroll answers "at the top" permanently.
+fn timeline_may_page(visible: Option<&str>, anchored: Option<&str>, chat_jid: &str) -> bool {
+    visible == Some(chat_jid) && anchored == Some(chat_jid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3070,6 +3094,41 @@ mod tests {
             rem: 16.0,
             width: 600.0,
         }
+    }
+
+    /// The selection outlives the screen — Back on a phone, a trip to Status,
+    /// the fullscreen viewer — and the list keeps the measurements the reader
+    /// left it with. A conversation nobody draws therefore went on asking for
+    /// a page of history every frame, for ever, since a list with nothing to
+    /// scroll answers "at the top" permanently.
+    #[test]
+    fn a_conversation_nobody_draws_asks_for_nothing() {
+        assert!(timeline_may_page(
+            Some("a@s.whatsapp.net"),
+            Some("a@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        assert!(!timeline_may_page(
+            None,
+            Some("a@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        assert!(!timeline_may_page(
+            Some("b@s.whatsapp.net"),
+            Some("a@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        // And the list still has to be describing this chat's rows.
+        assert!(!timeline_may_page(
+            Some("a@s.whatsapp.net"),
+            Some("b@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        assert!(!timeline_may_page(
+            Some("a@s.whatsapp.net"),
+            None,
+            "a@s.whatsapp.net"
+        ));
     }
 
     /// A page of older history arrives in front of every message the list
