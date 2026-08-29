@@ -146,6 +146,7 @@ impl Runtime {
                 named: None,
                 log_budget: crate::guest::Rolling::new(crate::guest::MAX_LOG_BYTES_PER_WINDOW),
                 command_budget: crate::guest::Rolling::new(crate::guest::MAX_COMMANDS_PER_WINDOW),
+                ui_budget: crate::guest::Rolling::new(crate::guest::MAX_UI_BYTES_PER_WINDOW),
                 subscribed: None,
                 subscribed_twice: false,
                 logged_bytes: 0,

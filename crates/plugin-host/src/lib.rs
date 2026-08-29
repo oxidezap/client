@@ -827,13 +827,23 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
         // message and grow this vector without limit.
         let started = Instant::now();
         let outcome = runtime.deliver(event, timers.len());
-        duty.spent(started.elapsed());
-        match outcome {
+        let published = match outcome {
             Ok(effects) => {
+                // Inside the measurement, because it is this plugin's work
+                // and it is not small: `set_roots` clones every plugin's tree,
+                // spends a state version and broadcasts to every front end.
+                // Closed before it, none of that counted against `MAX_DUTY`.
                 if let Some(roots) = effects.ui {
                     registry.set_roots(&runtime.id, roots);
                 }
-                timers.extend(deadlines(effects.timers));
+                Ok(effects.timers)
+            }
+            Err(e) => Err(e),
+        };
+        duty.spent(started.elapsed());
+        match published {
+            Ok(armed) => {
+                timers.extend(deadlines(armed));
             }
             // The only way a plugin is disabled by its own doing. A trap is
             // fuel exhausted, memory refused, or the plugin running off the
