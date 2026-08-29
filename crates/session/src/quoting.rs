@@ -19,8 +19,14 @@ pub fn quoted_from(message: &wa::Message) -> Option<QuotedMessage> {
     // A quote needs the original's id to be worth anything: without it there
     // is nothing to jump to and nothing to key the snapshot on.
     let message_id = context.stanza_id.clone()?;
-    let quoted = context.quoted_message.as_option()?;
-    let base = quoted.get_base_message();
+    // The body is optional and the id is not, deliberately: a resend, or a
+    // reply to something large, carries the linkage without the original.
+    // Dropping the whole quote there left the reply drawn as an ordinary
+    // message, with nothing to say it was a reply and nowhere to jump to.
+    let base = context
+        .quoted_message
+        .as_option()
+        .map(|quoted| quoted.get_base_message());
 
     let sender = context.participant.clone().unwrap_or_default();
     Some(QuotedMessage {
@@ -32,11 +38,10 @@ pub fn quoted_from(message: &wa::Message) -> Option<QuotedMessage> {
         sender_name: String::new(),
         sender,
         preview: base
-            .text_content()
-            .or_else(|| base.get_caption())
+            .and_then(|base| base.text_content().or_else(|| base.get_caption()))
             .unwrap_or_default()
             .to_string(),
-        kind: quoted_kind(base),
+        kind: base.and_then(quoted_kind),
     })
 }
 
@@ -170,6 +175,22 @@ mod tests {
         let quoted = quoted_from(&message).expect("a video note can be a reply");
         assert_eq!(quoted.message_id, "ORIGINAL");
         assert_eq!(quoted.preview, "ping");
+    }
+
+    /// A resend, or a reply to something large, carries the linkage without
+    /// the quoted body. The jump target is in hand either way.
+    #[test]
+    fn a_reply_without_the_quoted_body_keeps_its_jump_target() {
+        let message = text_reply(wa::ContextInfo {
+            stanza_id: Some("ORIGINAL".to_string()),
+            participant: Some("a@s.whatsapp.net".to_string()),
+            ..Default::default()
+        });
+        let quoted = quoted_from(&message).expect("the linkage is the quote");
+        assert_eq!(quoted.message_id, "ORIGINAL");
+        assert_eq!(quoted.sender, "a@s.whatsapp.net");
+        assert_eq!(quoted.preview, "");
+        assert_eq!(quoted.kind, None);
     }
 
     #[test]
