@@ -574,6 +574,7 @@ fn pressing_a_plugins_button_reaches_the_plugin_with_the_open_chat() {
         action: "greet".into(),
         value: None,
         chat_jid: Some("5511999@s.whatsapp.net".into()),
+        slot: PluginSlot::ChatHeader,
     });
 
     until("the greeting", || commands.sent().len() == 1);
@@ -597,6 +598,7 @@ fn an_action_for_a_plugin_that_is_not_loaded_is_ignored() {
         action: "x".into(),
         value: None,
         chat_jid: None,
+        slot: PluginSlot::Settings,
     });
 }
 
@@ -621,17 +623,33 @@ fn an_action_for_a_widget_the_plugin_does_not_draw_is_ignored() {
         action: "farewell".into(),
         value: None,
         chat_jid: Some("5511999@s.whatsapp.net".into()),
+        slot: PluginSlot::ChatHeader,
     });
     std::thread::sleep(Duration::from_millis(200));
     assert!(commands.sent().is_empty());
 
-    // And the one it does draw still works, so this is about the id rather
-    // than about actions having stopped arriving.
+    // Nor in a slot it does not draw it in. One plugin may use the same id in
+    // a header and in its settings panel — two widgets — so withdrawing one
+    // must not leave the other vouching for it.
+    plugins.act(&PluginAction {
+        plugin: "greeter".into(),
+        action: "greet".into(),
+        value: None,
+        chat_jid: None,
+        slot: PluginSlot::Settings,
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(commands.sent().is_empty());
+
+    // And the one it does draw, where it draws it, still works — so this is
+    // about the id and the slot rather than about actions having stopped
+    // arriving.
     plugins.act(&PluginAction {
         plugin: "greeter".into(),
         action: "greet".into(),
         value: None,
         chat_jid: Some("5511999@s.whatsapp.net".into()),
+        slot: PluginSlot::ChatHeader,
     });
     until("the greeting", || commands.sent().len() == 1);
 }
@@ -791,6 +809,7 @@ fn the_example_plugin_loads_and_answers_its_own_widgets() {
         action: "enabled".into(),
         value: Some("1".into()),
         chat_jid: None,
+        slot: PluginSlot::Settings,
     });
     published.settles("the toggle to come back on", |s| {
         s.first()

@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use oxidezap_core::{PluginNode, PluginRoot, PluginSurface};
+use oxidezap_core::{PluginNode, PluginRoot, PluginSlot, PluginSurface};
 use oxidezap_plugin_abi as abi;
 
 use crate::approvals::Approvals;
@@ -156,11 +156,19 @@ impl Registry {
     /// disabled, is answered by the window that still shows the last one.
     /// The tree the daemon holds is what a plugin published, so it is also
     /// the only honest answer to "is this thing still there".
+    ///
+    /// In the slot the action says it came from, because one plugin may draw
+    /// the same id in a header and in its settings panel — two widgets, and
+    /// withdrawing one of them must not leave the other vouching for it.
     #[must_use]
-    pub fn draws(&self, id: &str, action: &str) -> bool {
-        self.lock()
-            .get(id)
-            .is_some_and(|entry| entry.roots.iter().any(|root| usable(&root.node, action)))
+    pub fn draws(&self, id: &str, action: &str, slot: PluginSlot) -> bool {
+        self.lock().get(id).is_some_and(|entry| {
+            entry
+                .roots
+                .iter()
+                .filter(|root| root.slot == slot)
+                .any(|root| usable(&root.node, action))
+        })
     }
 
     /// Whether this plugin is still allowed to run.

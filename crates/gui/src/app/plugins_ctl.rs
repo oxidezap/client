@@ -217,7 +217,7 @@ impl WhatsAppApp {
             PluginSlot::Settings => None,
         };
         if let Some(client) = self.client.as_ref() {
-            client.plugin_action(plugin, action, value, chat);
+            client.plugin_action(plugin, action, value, chat, slot);
         }
         // Nothing changes here: what the plugin makes of it comes back as a
         // republished tree, or as nothing at all. Drawing an optimistic

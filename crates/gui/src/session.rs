@@ -668,6 +668,7 @@ impl Session {
         action: &str,
         value: Option<String>,
         chat_jid: Option<String>,
+        slot: oxidezap_core::PluginSlot,
     ) {
         self.tell(ClientRequest::PluginAction {
             action: oxidezap_core::PluginAction {
@@ -675,6 +676,7 @@ impl Session {
                 action: action.to_string(),
                 value,
                 chat_jid,
+                slot,
             },
         });
     }

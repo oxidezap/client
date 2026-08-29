@@ -69,6 +69,20 @@ const MAX_LOG_BYTES_PER_CALL: usize = 64 * 1024;
 /// generous for anything honest.
 const MAX_UI_PER_CALL: usize = 16;
 
+/// How many bytes one call may push through the key-value store.
+///
+/// Measured in bytes rather than in calls, because what is unpriced here is
+/// the copying: every `oxi_kv_set` reads the key and the value out of guest
+/// memory and the store clones both again, none of which fuel sees. The
+/// store's own budget bounds what is *kept*, and this bounds what is moved —
+/// a plugin rewriting one 8 KiB key in a loop keeps nothing and can still
+/// spend the daemon's startup on memcpy, since `oxi_init` carries two
+/// hundred million fuel and needs nobody's permission to use `STORAGE`.
+///
+/// A megabyte is far past any honest handler: a settings panel writes a few
+/// keys of a few hundred bytes when somebody presses something.
+const MAX_KV_BYTES_PER_CALL: usize = 1024 * 1024;
+
 /// How many account commands one call may issue.
 ///
 /// Each one crosses into the daemon and the session spawns work for it — a
@@ -175,6 +189,9 @@ pub struct Guest {
     /// Whether it declared its capabilities more than once.
     pub declared_twice: bool,
     pub logged_bytes: usize,
+    /// Key and value bytes this call has pushed into the store. See
+    /// [`MAX_KV_BYTES_PER_CALL`].
+    pub kv_bytes: usize,
     /// How many account commands this call has issued.
     pub commands_issued: usize,
     pub trees_published: usize,
@@ -629,6 +646,17 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if too_big(key_len) || too_big(val_len) {
                 return abi::outcome::REFUSED;
             }
+            // And the same question about the call as a whole. One entry is
+            // bounded; the number of them was not, so a loop rewriting one
+            // key kept nothing and still moved as much memory as it liked —
+            // the store's budget bounds what is *kept*, and this bounds what
+            // is copied to keep it.
+            let spent = &mut c.data_mut().kv_bytes;
+            let asked = key_len as usize + val_len as usize;
+            if asked > MAX_KV_BYTES_PER_CALL.saturating_sub(*spent) {
+                return abi::outcome::REFUSED;
+            }
+            *spent += asked;
             let (Ok(key), Ok(value)) = (
                 read_str(&mut c, key, key_len),
                 read_str(&mut c, val, val_len),

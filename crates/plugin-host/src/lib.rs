@@ -389,7 +389,10 @@ impl Plugins {
         // through, which is a handler asked about a widget that does not
         // exist. The tree the registry holds is what the plugin last said,
         // so it is the only honest answer to whether the thing is there.
-        if !self.registry.draws(&action.plugin, &action.action) {
+        if !self
+            .registry
+            .draws(&action.plugin, &action.action, action.slot)
+        {
             log::debug!(
                 "plugin {}: an action for `{}`, which it does not currently draw",
                 action.plugin,

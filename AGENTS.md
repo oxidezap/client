@@ -310,7 +310,11 @@ profile here repeats it deliberately.
   than against the plugin merely being loaded: a front end's frame can be
   older than the daemon's, so a second window still showing a button since
   withdrawn or greyed out would land as a real press, and an id the plugin
-  never published would reach a handler as a widget that does not exist.
+  never published would reach a handler as a widget that does not exist. In
+  the slot the action says it came from, because one plugin may draw the same
+  id in a header and in its settings panel: withdrawing one of them must not
+  leave the other vouching for it, which is why the slot travels on the
+  action rather than being guessed from whether a chat came with it.
   The open chat travels on the action rather than being looked up,
   because the daemon does not know it — two windows can have different
   conversations open, and a header button is about the one the person pressing
@@ -915,6 +919,18 @@ screen, with the title above the glass and the pair code below it.
   is one import, and each turns the categorical sentence in the gotchas above
   into a policy — so it wants a declared destination, a prompt at enable time,
   and a decision of its own.
+- **A plugin's tree is state, and state frames are the ring's to hold.** Every
+  change to any plugin publishes the *whole* set — that is what makes a
+  mid-stream join safe, and it is also what a stalled client's 256-frame
+  backlog then holds a copy of. The arithmetic is `MAX_PLUGINS` trees of
+  `ui::MAX_BYTES`, decoded, times `BROADCAST_CAPACITY`: hundreds of megabytes
+  in the worst case, transiently, before that client is cut to a `Resync`.
+  Bounded and recoverable, but larger than it should be, and the plugin half
+  is the half somebody else writes. Coalescing pending frames or publishing
+  per-plugin deltas would fix it and is a change to the state protocol —
+  every frame there carries a version and a client's whole recovery story is
+  built on their being contiguous — so it is a decision of its own rather
+  than something to bolt onto the plugin path.
 - **Plugins are not reloadable, and there is no message interception.** A
   plugin with state, reloaded under itself mid-conversation, is a separate
   problem; restarting `oxidezapd` is the answer for now and it is cheap. And a

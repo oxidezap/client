@@ -140,6 +140,7 @@ impl Runtime {
                 timers: Vec::new(),
                 pending_timers: 0,
                 unknown_kinds: false,
+                kv_bytes: 0,
                 unknown_caps: false,
                 declared_twice: false,
                 logged_bytes: 0,
@@ -309,6 +310,7 @@ impl Runtime {
             guest.logged_bytes = 0;
             guest.trees_published = 0;
             guest.commands_issued = 0;
+            guest.kv_bytes = 0;
         }
 
         let outcome = self.on_event.call(&mut self.store, (kind, 0));

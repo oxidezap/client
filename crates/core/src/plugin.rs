@@ -184,4 +184,12 @@ pub struct PluginAction {
     /// The conversation the window had open, for a slot that has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_jid: Option<String>,
+    /// Where the widget was drawn.
+    ///
+    /// Carried rather than inferred from `chat_jid`, because a plugin may
+    /// draw the same id in both slots — the daemon checks an action against
+    /// the tree it currently publishes, and "somewhere in the tree" is the
+    /// wrong question when the header copy has been withdrawn and the
+    /// settings copy has not.
+    pub slot: PluginSlot,
 }
