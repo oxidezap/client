@@ -373,6 +373,15 @@ const MAX_VIDEO_PLAYERS: usize = 10;
 /// Maximum number of sticker images to keep cached
 const MAX_DECODED_IMAGES: usize = 50;
 
+/// How many conversations keep their built timeline.
+///
+/// Each entry holds the rows *and* a second full copy of the history they
+/// index into, so this map grew by a whole conversation for every one opened
+/// — walking fifty long chats left fifty histories resident, with nothing
+/// but an account reset to clear them. The other two caches beside it are
+/// bounded for the same reason; this one was not.
+const MAX_CACHED_TIMELINES: usize = 8;
+
 /// Download timeout in seconds (for audio/video downloads)
 /// How long a download somebody asked for is allowed to take.
 ///
@@ -1252,9 +1261,9 @@ impl WhatsAppApp {
         };
         let rows = cached.unwrap_or_else(|| {
             let built = MessageListCache::new(messages, is_group, typing);
-            self.message_list_cache
-                .borrow_mut()
-                .insert(chat_jid.to_string(), built.clone());
+            let mut cache = self.message_list_cache.borrow_mut();
+            cache.insert(chat_jid.to_string(), built.clone());
+            evict_stale_timelines(&mut cache, chat_jid);
             built
         });
 
@@ -3014,6 +3023,30 @@ impl Render for WhatsAppApp {
 ///
 /// `None` is older than any timestamp, so an empty conversation lands at the
 /// end — the same place `Reverse(last_message_time)` puts it.
+/// Drop the least recently built timelines, sparing the one on screen.
+///
+/// The build number is a monotonic counter stamped when a timeline is built,
+/// so the smallest ones are the conversations nothing has touched for
+/// longest. Rebuilding one costs a pass over its rows, which is what opening
+/// a conversation already pays.
+fn evict_stale_timelines(cache: &mut HashMap<String, MessageListCache>, keep: &str) {
+    if cache.len() <= MAX_CACHED_TIMELINES {
+        return;
+    }
+    let mut by_age: Vec<(usize, String)> = cache
+        .iter()
+        .filter(|(jid, _)| jid.as_str() != keep)
+        .map(|(jid, rows)| (rows.build, jid.clone()))
+        .collect();
+    by_age.sort_unstable();
+    for (_, jid) in by_age
+        .into_iter()
+        .take(cache.len().saturating_sub(MAX_CACHED_TIMELINES))
+    {
+        cache.remove(&jid);
+    }
+}
+
 fn slot_newest_first(rest: &[Chat], at: Option<chrono::DateTime<chrono::Utc>>) -> usize {
     rest.iter()
         .position(|other| other.last_message_time < at)
@@ -3294,6 +3327,29 @@ mod tests {
         // older than the chat above it.
         let rest = [chat("b", Some(30)), chat("c", Some(10))];
         assert_eq!(slot_newest_first(&rest, at(20)), 1);
+    }
+
+    /// Each entry holds a second full copy of the conversation, and nothing
+    /// but an account reset used to remove one: fifty long chats opened left
+    /// fifty histories resident.
+    #[test]
+    fn only_so_many_conversations_keep_their_rows() {
+        let mut cache: HashMap<String, MessageListCache> = HashMap::new();
+        for n in 0..MAX_CACHED_TIMELINES + 5 {
+            let jid = format!("{n}@s.whatsapp.net");
+            cache.insert(jid.clone(), timeline_of(&["m1", "m2"]));
+            evict_stale_timelines(&mut cache, &jid);
+        }
+        assert_eq!(cache.len(), MAX_CACHED_TIMELINES);
+        let newest = format!("{}@s.whatsapp.net", MAX_CACHED_TIMELINES + 4);
+        assert!(
+            cache.contains_key(&newest),
+            "the conversation on screen is never the one dropped"
+        );
+        assert!(
+            !cache.contains_key("0@s.whatsapp.net"),
+            "the oldest build goes first"
+        );
     }
 
     /// The catch-up case: an offline drain delivers conversations in whatever
