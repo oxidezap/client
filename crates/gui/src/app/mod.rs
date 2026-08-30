@@ -891,6 +891,12 @@ impl WhatsAppApp {
                     }),
                     // The tray's "Open", or another front end asking on a
                     // user's behalf. One window, so there is one to raise.
+                    // The connection ended, and why. One screen drew three
+                    // different endings as an outage that would be retried;
+                    // this carries which one it was.
+                    FromDaemon::Ended(fault) => entity.update(cx, |app, cx| {
+                        app.connection_ended(fault, cx);
+                    }),
                     FromDaemon::ShowWindow => {
                         cx.update(|cx| {
                             if let Some(window) = cx.windows().first() {
@@ -2146,8 +2152,9 @@ impl WhatsAppApp {
         self.forget_account_state(window, cx);
 
         if !asked {
-            self.app_state =
-                AppState::Error("Not connected to the daemon, so nothing was cleared".to_string());
+            self.app_state = AppState::Error(crate::session::Fault::unreachable(
+                "not connected to the daemon, so nothing was cleared",
+            ));
             cx.notify();
             return;
         }
@@ -2191,7 +2198,9 @@ impl WhatsAppApp {
                         };
                     }
                     Err(e) => {
-                        app.app_state = AppState::Error(format!("Failed to reach the daemon: {e}"));
+                        app.app_state = AppState::Error(crate::session::Fault::unreachable(
+                            format!("failed to reach the daemon: {e}"),
+                        ));
                         // The error screen says "we'll keep trying", and this
                         // is the attempt that was doing the trying: the timer
                         // that fired it has already ended. Without arming the
@@ -2983,8 +2992,8 @@ impl Render for WhatsAppApp {
             AppState::Connected | AppState::Offline => {
                 render_connected_view(self, window, cx).into_any_element()
             }
-            AppState::Error(msg) => render_error_view(
-                msg,
+            AppState::Error(fault) => render_error_view(
+                fault,
                 self.retry_countdown(),
                 self.error_detail_open,
                 entity,

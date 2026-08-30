@@ -161,18 +161,12 @@ impl WhatsAppApp {
                 cx.notify();
             }
             UiEvent::Disconnected(reason) => {
-                self.leave_connected_view(cx);
-                self.app_state = AppState::Error(reason);
-                // The screen offers a retry; arming it is what makes the
-                // countdown on that button mean something.
-                self.schedule_retry(cx);
-                cx.notify();
+                // Nothing diagnosed it, so it is the outage the screen was
+                // written for.
+                self.connection_ended(oxidezap_core::Fault::unreachable(reason), cx);
             }
             UiEvent::Error(msg) => {
-                self.leave_connected_view(cx);
-                self.app_state = AppState::Error(msg);
-                self.schedule_retry(cx);
-                cx.notify();
+                self.connection_ended(oxidezap_core::Fault::unreachable(msg), cx);
             }
             UiEvent::MessageReceived {
                 chat_jid,

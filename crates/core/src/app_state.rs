@@ -73,6 +73,61 @@ impl<T> Issued<T> {
     }
 }
 
+/// Why a connection ended, in the terms the screen has to draw it in.
+///
+/// Three endings reached one `UiEvent::Error` and one screen: "Can't reach
+/// WhatsApp… We'll keep trying to reconnect", with the real reason folded
+/// behind "Technical detail". Two of them are diagnosed and neither is that.
+/// A resync means the daemon is right there and this window fell behind — the
+/// way out is to attach again, which takes no fifteen seconds of waiting. A
+/// protocol mismatch means the retry the screen promises will fail in exactly
+/// the same way forever, and the one thing that helps — quit and start again
+/// — was the part hidden behind the fold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fault {
+    /// The headline.
+    pub headline: &'static str,
+    /// What it means and what happens next, in that order.
+    pub body: &'static str,
+    /// The raw reason, for the fold.
+    pub detail: String,
+    /// Whether reconnecting is the way out of this one.
+    pub retry: bool,
+}
+
+impl Fault {
+    /// The one nothing diagnosed: the socket went, and it may come back.
+    pub fn unreachable(detail: impl Into<String>) -> Self {
+        Self {
+            headline: "Can't reach WhatsApp",
+            body: "Your messages are safe on this device. We'll keep trying to reconnect.",
+            detail: detail.into(),
+            retry: true,
+        }
+    }
+
+    /// This window fell behind the daemon's stream.
+    pub fn fell_behind(detail: impl Into<String>) -> Self {
+        Self {
+            headline: "Reconnecting to the background service",
+            body: "This window fell behind and is attaching again. Nothing has been lost.",
+            detail: detail.into(),
+            retry: true,
+        }
+    }
+
+    /// The window and the daemon are different builds.
+    pub fn mismatched(detail: impl Into<String>) -> Self {
+        Self {
+            headline: "This window and the background service disagree",
+            body: "They are different versions. Quit oxidezap completely and start it \
+                   again; reconnecting will not help.",
+            detail: detail.into(),
+            retry: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppState {
     Loading,
@@ -92,7 +147,7 @@ pub enum AppState {
     /// would draw a bubble the daemon has no session to send — pending for
     /// ever, with the failure logged where nobody looks.
     Offline,
-    Error(String),
+    Error(Fault),
     /// This window may not hold the account, and no amount of waiting
     /// changes that.
     ///
@@ -135,8 +190,8 @@ impl AppState {
     }
 
     pub fn error_message(&self) -> Option<&str> {
-        if let Self::Error(msg) = self {
-            Some(msg)
+        if let Self::Error(fault) = self {
+            Some(&fault.detail)
         } else {
             None
         }

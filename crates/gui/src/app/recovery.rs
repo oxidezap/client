@@ -4,6 +4,8 @@
 //! retry now, wait for the automatic retry, or stop waiting and read what is
 //! already on this device.
 
+use oxidezap_core::Fault;
+
 use super::*;
 
 /// How long to wait before retrying by itself.
@@ -19,6 +21,23 @@ impl WhatsAppApp {
             let now = wacore::time::now_utc();
             (at - now).num_seconds().max(0) as u64
         })
+    }
+
+    /// This connection is over, and this is what it was.
+    ///
+    /// One place, because the screen's promise depends on which: an outage is
+    /// retried and a countdown means something; a window that fell behind is
+    /// reattaching and there is nothing to count; a version mismatch will
+    /// fail the same way forever, so arming a retry is a promise this cannot
+    /// keep.
+    pub(super) fn connection_ended(&mut self, fault: Fault, cx: &mut Context<Self>) {
+        self.leave_connected_view(cx);
+        let retry = fault.retry;
+        self.app_state = AppState::Error(fault);
+        if retry {
+            self.schedule_retry(cx);
+        }
+        cx.notify();
     }
 
     pub fn toggle_error_detail(&mut self, cx: &mut Context<Self>) {

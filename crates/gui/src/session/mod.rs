@@ -60,6 +60,8 @@ pub struct StorageUsage {
 /// client attached to are things the *daemon* says to a front end. Keeping
 /// them apart is what stops the session's vocabulary from growing terms only
 /// one transport uses.
+pub use oxidezap_core::Fault;
+
 pub enum FromDaemon {
     /// Something the session said.
     Session(Box<UiEvent>),
@@ -80,6 +82,9 @@ pub enum FromDaemon {
     Plugins(Vec<oxidezap_core::PluginSurface>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
+    /// This connection is over, and why — in terms the screen can draw
+    /// rather than one line of prose for three different endings.
+    Ended(Fault),
     /// One page of a conversation, for the timeline that asked for it.
     ///
     /// Older rows than the window holds, or the first ones it has: which of
