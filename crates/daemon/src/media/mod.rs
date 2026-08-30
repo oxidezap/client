@@ -14,7 +14,7 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
-pub use platform::{cache_usage, claim, has, put, put_owned, take};
+pub use platform::{cache_usage, claim, has, take};
 /// Read without removing, where the front end is this process. See `web.rs`.
 #[cfg(target_family = "wasm")]
 pub use platform::{deliver, read};
@@ -166,6 +166,26 @@ pub fn epoch() -> usize {
 /// *asked* for uses [`put`]: the file is how those bytes are delivered, not
 /// merely where they are remembered, so refusing it would fail the download
 /// rather than keep the directory tidy.
+pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
+    // Here rather than in the backend, for the reason `wipe` states: the lock
+    // belongs to the entry points. A backend that took it too would deadlock
+    // the one caller that already holds it — `put_since`, below — and that
+    // caller is every inbound message with media in it.
+    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    platform::put(key, bytes)
+}
+
+/// The same, for a caller that already owns the only copy. See
+/// [`platform::put_owned`].
+///
+/// # Errors
+///
+/// Whatever the platform's write answers.
+pub fn put_owned(key: &str, bytes: Vec<u8>) -> Result<String> {
+    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    platform::put_owned(key, bytes)
+}
+
 pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
     // Held across the check *and* the write, so a wipe cannot land between
     // them. See `WIPE_LOCK`.
@@ -233,6 +253,34 @@ mod tests {
             put_since(before, "f-3EB0ABC", b"the bytes of a photo").is_err(),
             "the cache was cleared after this write was prepared"
         );
+    }
+
+    /// The lock belongs to the entry point, and only to it.
+    ///
+    /// A backend that took `WIPE_LOCK` for its own rename deadlocked the one
+    /// caller already holding it, which is every inbound message carrying
+    /// media: the publish thread stopped there and never came back. On a
+    /// thread of its own with a deadline, so the failure is this assertion
+    /// rather than a suite that hangs.
+    #[test]
+    fn a_write_that_checked_the_epoch_still_reaches_the_disk() {
+        let Some(dir) = oxidezap_ipc::state_dir() else {
+            return; // Nowhere to write, so nothing to race over.
+        };
+        let _ = std::fs::create_dir_all(&dir);
+
+        let (done, answered) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(put_since(epoch(), "f-3EB0LOCKCHECK", b"a photo"));
+        });
+        let landed = answered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the write never answered: the lock was taken twice");
+
+        assert!(landed.is_ok(), "the write itself failed: {landed:?}");
+        if let Some(path) = oxidezap_ipc::media_path("f-3EB0LOCKCHECK") {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// The epoch is what a writer in flight compares against, so a clear that

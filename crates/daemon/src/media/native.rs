@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use super::{IN_PROGRESS_PREFIX, WIPE_LOCK, Wipe, is_in_progress, is_staged_upload};
+use super::{IN_PROGRESS_PREFIX, Wipe, is_in_progress, is_staged_upload};
 
 /// How much media the cache may hold before the oldest is dropped.
 ///
@@ -99,15 +99,13 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
     // a download in flight as theirs to delete.
     let temp = dir.join(format!("{IN_PROGRESS_PREFIX}{}", write_ticket()));
     std::fs::write(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
-    // The rename under the wipe lock, so the file is either wholly before a
-    // clear — and taken by it — or wholly after. What it cannot cover is the
-    // caller's answer, which is a round trip later: a clear landing there
-    // costs one refetch, since media the renderer does not have is drawn as
-    // an offer to download. See `claim`.
-    let renamed = {
-        let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::fs::rename(&temp, &path)
-    };
+    // The rename happens under the wipe lock, which every entry point in
+    // `media` takes before calling here: the file is either wholly before a
+    // clear — and taken by it — or wholly after. What that cannot cover is
+    // the caller's answer, which is a round trip later; a clear landing
+    // there costs one refetch, since media the renderer does not have is
+    // drawn as an offer to download. See `claim`.
+    let renamed = std::fs::rename(&temp, &path);
     if let Err(e) = renamed {
         // Windows will not rename onto an existing file, and two clients
         // asking for the same uncached media both miss the check above. The
