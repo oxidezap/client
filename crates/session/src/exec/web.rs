@@ -129,11 +129,61 @@ impl Executor {
     }
 }
 
+/// Whichever global this code is running on, asked only for its timers.
+///
+/// A window and a worker both have `setTimeout` and neither shares an
+/// interface that says so, so the two are named once here rather than at
+/// every call. The session runs on both: the store's durable VFS is a
+/// worker-only API, so the session follows it there.
+enum TimerScope {
+    Window(web_sys::Window),
+    Worker(web_sys::WorkerGlobalScope),
+}
+
+impl TimerScope {
+    /// The global this task is on, or `None` somewhere that is neither.
+    fn current() -> Option<Self> {
+        if let Some(window) = web_sys::window() {
+            return Some(Self::Window(window));
+        }
+        js_sys::global()
+            .dyn_into::<web_sys::WorkerGlobalScope>()
+            .ok()
+            .map(Self::Worker)
+    }
+
+    fn set_timeout(
+        &self,
+        fire: &js_sys::Function,
+        millis: i32,
+    ) -> Result<i32, wasm_bindgen::JsValue> {
+        match self {
+            Self::Window(w) => {
+                w.set_timeout_with_callback_and_timeout_and_arguments_0(fire, millis)
+            }
+            Self::Worker(w) => {
+                w.set_timeout_with_callback_and_timeout_and_arguments_0(fire, millis)
+            }
+        }
+    }
+
+    fn clear_timeout(&self, handle: i32) {
+        match self {
+            Self::Window(w) => w.clear_timeout_with_handle(handle),
+            Self::Worker(w) => w.clear_timeout_with_handle(handle),
+        }
+    }
+}
+
 /// `setTimeout`, as a future.
 ///
-/// Resolves immediately where no timer can be armed — a worker with no
-/// `window` — rather than never, because a future that never completes holds
-/// whatever is awaiting it for the life of the page.
+/// Parks forever where no timer can be armed, and never returns early. Every
+/// caller here is a backoff or a rotation, so a sleep that resolves
+/// immediately is not a missed wait but a loop with nothing between its
+/// iterations: the QR refresh and every reconnect delay become a spin that
+/// starves the loop they are running on. Holding the future is the survivable
+/// end of that, and it is what the window's own clock chose for the same
+/// reason.
 pub async fn sleep(duration: Duration) {
     /// Disarms the timer when the sleep is dropped.
     ///
@@ -141,20 +191,21 @@ pub async fn sleep(duration: Duration) {
     /// freed, which is a wasm-bindgen panic rather than a missed wakeup — and
     /// this is raced against something that routinely wins.
     struct Timer {
+        scope: TimerScope,
         handle: i32,
         _fire: Closure<dyn FnMut()>,
     }
 
     impl Drop for Timer {
         fn drop(&mut self) {
-            if let Some(window) = web_sys::window() {
-                window.clear_timeout_with_handle(self.handle);
-            }
+            self.scope.clear_timeout(self.handle);
         }
     }
 
     let (tx, rx) = futures_channel::oneshot::channel::<()>();
-    let Some(window) = web_sys::window() else {
+    let Some(scope) = TimerScope::current() else {
+        log::error!("no global to arm a timer on: parking this wait rather than spinning");
+        std::future::pending::<()>().await;
         return;
     };
     let mut tx = Some(tx);
@@ -163,13 +214,16 @@ pub async fn sleep(duration: Duration) {
             let _ = tx.send(());
         }
     });
-    let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+    let Ok(handle) = scope.set_timeout(
         fire.as_ref().unchecked_ref(),
         i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
     ) else {
+        log::error!("the browser refused a timer: parking this wait rather than spinning");
+        std::future::pending::<()>().await;
         return;
     };
     let _timer = Timer {
+        scope,
         handle,
         _fire: fire,
     };
