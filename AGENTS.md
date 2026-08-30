@@ -1073,6 +1073,23 @@ own (`daemon::plugins::start`). Two halves of one fact, so they are written to
 be read together — a page that drew "drop a .wasm in the plugins folder" is
 giving instructions about a folder it does not have.
 
+**Media crosses the bridge in both directions.** The daemon's web endpoint
+served media and nothing else, so a page attached to an `oxidezapd` could read
+a photo and hand it nothing: `MediaCache::stage` refused, and a voice note
+recorded there would have failed at the staging rather than at the send. The
+mirror route is a `PUT` narrowed three ways, because a write endpoint on the
+process holding the account deserves more than a read one — only `u-` keys, so
+a caller cannot replace the bytes behind a photo already drawn out of the
+daemon's own cache; a declared length, since the length decides how much is
+read; and a ceiling checked against it before a byte arrives, because unlike a
+served file this payload is read into memory whole.
+Ordering is the harder half and it is `stage_then`: the daemon opens the
+payload when it handles the request, so a frame that overtakes its own upload
+names a file that is not there. The continuation therefore belongs to the
+implementation — it runs before returning wherever staging is a local write,
+and from the upload's own completion where it is not — and the request id is
+still reserved in the order the person acted in. Only the frame waits.
+
 **Which tab holds the account is claimed, not assumed.** `daemon/claim/` is a
 lock file on the desktop and a Web Lock in a browser, taken with `ifAvailable`
 so a second tab is told *now* rather than queued — a queued tab looks like one
@@ -1271,15 +1288,16 @@ by definition.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
-- **A failed save says nothing to the person who asked.** On the web a
-  document is fetched before it is handed over, and the browser's transient
-  activation can expire while that happens — the second tap works, because the
-  bytes are cached by then, but the first one just stops. It is logged and
-  nowhere else, because the only user-visible error state the app has is
-  `AppState::Error`, which leaves the connected view and schedules a reconnect:
-  far worse than silence for something this small. What is missing is a
-  transient surface — a toast, a line on the row — and it should be designed
-  once rather than invented for this.
+- **Only some failures reach the person who asked.** `app/notices.rs` is the
+  transient surface the app had been missing: one sentence, expiring on its
+  own, changing no state, drawn by the root over whatever screen is up — the
+  other end of the scale from `AppState::Error`, which leaves the connected
+  view and schedules a reconnect and is catastrophic for a save that did not
+  start. A failed save and a failed recording go through it.
+  What still does not is anything the *daemon* refused: a front end learns
+  only `Accepted`, and a refusal reaching the window would need a field on the
+  wire. `SendFailed` is the one exception, and it is against a chat rather
+  than against the request.
 - **A promised file is not a held file, once the reader is a browser.** The
   daemon's media cache is files and no index — the front end it was written
   for opens them itself, so `claim` can be `has` and there is no window
