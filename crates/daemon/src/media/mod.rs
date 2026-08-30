@@ -14,6 +14,8 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
+#[cfg(not(target_family = "wasm"))]
+pub use platform::reclaim_stale_uploads;
 pub use platform::{cache_usage, claim, has, put, put_owned, take};
 /// Read without removing, where the front end is this process. See `web.rs`.
 #[cfg(target_family = "wasm")]
@@ -106,7 +108,31 @@ impl Wipe {
 /// a "clear cached media" is entitled to, and the budget sweep has to reclaim
 /// more than that.
 pub(super) fn is_staged_upload(name: &str) -> bool {
-    name.starts_with("u-")
+    oxidezap_ipc::is_staged_key(name)
+}
+
+/// What a staged upload is called while it is still being written.
+///
+/// The write goes to this name and is renamed onto the key, so that the key
+/// holds the whole payload or nothing. Named with a leading dot because
+/// `media_path` refuses one, which is what keeps a caller from reading a
+/// half-written payload or deleting it out from under the rename.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) const STAGING_PARTIAL_PREFIX: &str = ".staging-";
+
+/// A staged upload that has not finished crossing the bridge.
+///
+/// It has to be spared and reclaimed for the same two reasons a finished one
+/// is, and neither is served by leaving it to the budget sweep's default. It
+/// is the only copy of a payload somebody is waiting to send, so evicting it
+/// mid-write breaks the rename and fails a voice note over a full cache; and
+/// it counts toward no budget it could be dropped for, since a partial is
+/// written by the front end rather than through `put`. But sparing alone
+/// leaks: a connection that dies mid-`PUT` leaves one with nothing else to
+/// remove it, which is why the age rule takes these too.
+#[cfg(not(target_family = "wasm"))]
+pub(super) fn is_staging_partial(name: &str) -> bool {
+    name.starts_with(STAGING_PARTIAL_PREFIX)
 }
 /// Which cache the writers still in flight think they are writing into.
 ///
@@ -239,6 +265,22 @@ mod tests {
             !is_staged_upload("m-3EB0ABC"),
             "an orphan of the build that wrote thumbnails under the message key"
         );
+    }
+
+    /// A partial is spared the budget and taken by the age rule, which is the
+    /// pairing that matters: sparing alone leaks an upload whose connection
+    /// died, and taking alone drops one that is still being written.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn a_partial_is_spared_the_budget_and_reclaimed_on_age() {
+        let partial = format!("{STAGING_PARTIAL_PREFIX}7-u-local_audio-7");
+        assert!(is_staging_partial(&partial));
+        assert!(
+            !is_staged_upload(&partial),
+            "it is not addressable as a key, and the two rules ask separately"
+        );
+        assert!(!is_staging_partial("u-local_audio-7"));
+        assert!(!is_staging_partial("f-3EB0ABC"));
     }
 
     /// The account is going, and so is anything that was going to be sent

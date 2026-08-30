@@ -39,6 +39,21 @@ use crate::Link;
 /// bound a hang rather than to police a slow link.
 const MEDIA_TIMEOUT_MS: i32 = 30_000;
 
+/// How long staging a payload may take.
+///
+/// Longer than a read, because this one has no second chance: media the page
+/// failed to fetch is drawn as an offer to download again, and a recording
+/// that fails to stage is a message the person already watched themselves
+/// send.
+const UPLOAD_TIMEOUT_MS: i32 = 60_000;
+
+/// How long a discard may take before it is given up on.
+///
+/// Far shorter than an upload, because this carries no body: it is one
+/// request naming a key the daemon already holds. What is behind it is a send
+/// that has already failed, so waiting a minute for the cleanup buys nothing.
+const DISCARD_TIMEOUT_MS: i32 = 10_000;
+
 /// A `setTimeout` that aborts a fetch, cleared when the fetch finishes first.
 struct FetchDeadline {
     handle: i32,
@@ -882,6 +897,95 @@ fn decode_component(value: &str) -> Option<String> {
 /// A key the daemon does not hold, or a bridge that is not answering.
 pub async fn fetch_media(base: &str, key: &str) -> Result<Vec<u8>, String> {
     fetch_media_within(base, key, MEDIA_TIMEOUT_MS, u64::MAX).await
+}
+
+/// Hand the daemon a payload it is about to be asked to send.
+///
+/// The mirror of [`fetch_media`], and the only direction a page writes. A
+/// voice note exists only in the tab's memory until this lands, and the
+/// request naming the key must not go out before it does, so the caller waits
+/// on this rather than firing it alongside.
+///
+/// `PUT` because the key names the payload and staging it twice is the same
+/// act twice. The bridge takes only `u-` keys, so this cannot reach the
+/// daemon's own cache of what it fetched.
+///
+/// # Errors
+///
+/// The browser refused the request, the bridge refused the payload, or the
+/// deadline passed.
+pub async fn upload_media(base: &str, key: &str, bytes: &[u8]) -> Result<(), String> {
+    use wasm_bindgen_futures::JsFuture;
+
+    let window = web_sys::window().ok_or("no window to upload from")?;
+    let url = format!(
+        "{base}/{}{}",
+        js_sys::encode_uri_component(key),
+        media_token()
+    );
+
+    // Copied into a JS array rather than viewed: a view over wasm memory is
+    // invalidated by any allocation the fetch machinery makes, and the body
+    // outlives this call.
+    let body = js_sys::Uint8Array::from(bytes);
+
+    let abort = web_sys::AbortController::new()
+        .map_err(|e| format!("could not arm an upload timeout: {e:?}"))?;
+    let options = web_sys::RequestInit::new();
+    options.set_method("PUT");
+    options.set_body(&body);
+    options.set_signal(Some(&abort.signal()));
+    let _timeout = FetchDeadline::arm(&window, &abort, UPLOAD_TIMEOUT_MS)?;
+
+    let response = JsFuture::from(window.fetch_with_str_and_init(&url, &options))
+        .await
+        .map_err(|e| format!("could not reach the daemon's media bridge: {e:?}"))?
+        .dyn_into::<web_sys::Response>()
+        .map_err(|_| {
+            "the media bridge answered with something that is not a response".to_string()
+        })?;
+    if !response.ok() {
+        return Err(format!(
+            "the daemon would not take that payload ({})",
+            response.status()
+        ));
+    }
+    Ok(())
+}
+
+/// Drop a payload the daemon staged for a send that is not going to run.
+///
+/// Best effort and unawaited by its caller: the send has already failed, and
+/// what this prevents is a file nothing will read staying until the account
+/// is wiped — staged uploads are deliberately spared by the cache sweep.
+pub async fn discard_media(base: &str, key: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let url = format!(
+        "{base}/{}{}",
+        js_sys::encode_uri_component(key),
+        media_token()
+    );
+    let options = web_sys::RequestInit::new();
+    options.set_method("DELETE");
+    // Under a deadline like every other request here. Nothing awaits *this*
+    // for an answer, but the task holding it is one the staging path can be
+    // waiting behind, and a fetch with no signal is one a daemon that has
+    // stopped answering never resolves.
+    let Ok(abort) = web_sys::AbortController::new() else {
+        return;
+    };
+    options.set_signal(Some(&abort.signal()));
+    let Ok(_timeout) = FetchDeadline::arm(&window, &abort, DISCARD_TIMEOUT_MS) else {
+        return;
+    };
+    if let Ok(promise) = window
+        .fetch_with_str_and_init(&url, &options)
+        .dyn_into::<js_sys::Promise>()
+    {
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
 }
 
 /// The same, under a deadline the caller chooses.

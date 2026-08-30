@@ -7,9 +7,13 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 - **oxidezap-core**: domain types (chats, messages, calls, UI events). No UI, no I/O.
 - **oxidezap-audio**: capture, playback, Opus encoding, waveforms. cpal; no UI.
   On the web the sound card and the codec are the browser's: playback is real
-  (`decodeAudioData` takes exactly the bytes the daemon sends) and recording is
-  refused up front, because libopus is C and capturing samples nothing could
-  encode is a recording UI that always fails at the end.
+  (`decodeAudioData` takes exactly the bytes the daemon sends) and so is
+  recording, through WebAudio for the capture and `AudioEncoder` for the
+  codec. `ogg_opus` is the container both platforms write, because only the
+  codec was ever missing — which is also why `MediaRecorder` is *not* the
+  route in: it produces a container the browser picks (WebM on Chrome, MP4 on
+  Safari) where a voice note is Opus in OGG, so it would have meant a demuxer
+  to undo it.
 - **oxidezap-chat-store**: materializes the library's event stream into chats,
   messages, receipts and an FTS5 search index. Owns its schema and migrations;
   consumes only the library's public event surface. Extracted from
@@ -1127,6 +1131,41 @@ own (`daemon::plugins::start`). Two halves of one fact, so they are written to
 be read together — a page that drew "drop a .wasm in the plugins folder" is
 giving instructions about a folder it does not have.
 
+**Media crosses the bridge in both directions.** The daemon's web endpoint
+served media and nothing else, so a page attached to an `oxidezapd` could read
+a photo and hand it nothing: `MediaCache::stage` refused, and a voice note
+recorded there would have failed at the staging rather than at the send. The
+mirror route is a `PUT` narrowed three ways, because a write endpoint on the
+process holding the account deserves more than a read one — only `u-` keys, so
+a caller cannot replace the bytes behind a photo already drawn out of the
+daemon's own cache; a declared length, since the length decides how much is
+read; and a ceiling checked against it before a byte arrives, because unlike a
+served file this payload is read into memory whole.
+Ordering is the harder half and it is `stage_then`: the daemon opens the
+payload when it handles the request, so a frame that overtakes its own upload
+names a file that is not there. The continuation therefore belongs to the
+implementation — it runs before returning wherever staging is a local write,
+and from the upload's own completion where it is not — and the request id is
+still reserved in the order the person acted in. Only the frame waits.
+And what it waits *in* is a queue of places rather than a count: two notes can
+be staging at once and their uploads finish in whatever order the network
+settles them, so a send takes its position when it is made and the upload only
+fills it. Counting them instead told whichever finished first that it was the
+head of the queue, which is the same bug one level down, record two notes and
+let the shorter one land first, and they arrive reversed.
+A discard is the mirror and has the same hazard: a `DELETE` issued while the
+`PUT` is still crossing can be overtaken by it, leaving the payload staged
+with nothing that will ever read it. So a send abandoned mid-upload is
+*recorded* rather than removed, and the upload's own completion is what
+removes it, one decision, made after the write it is undoing.
+And what waits in that queue is a frame *and the reservation it answers for*,
+because the connection can end while it waits: `Frames::finish` fails every
+reservation and knows nothing about the outbox, and the `Link` it holds is a
+clone that does not necessarily refuse a later write. Without the id a line
+typed behind a voice note reaches the daemon after the window has already
+drawn it as failed. A frame carrying no id is fire-and-forget and writing it
+late costs nothing.
+
 **Which tab holds the account is claimed, not assumed.** `daemon/claim/` is a
 lock file on the desktop and a Web Lock in a browser, taken with `ifAvailable`
 so a second tab is told *now* rather than queued — a queued tab looks like one
@@ -1191,12 +1230,36 @@ identically. It does not try: `daemon::plugins::start` returns
 `Plugins::none` with that written down, rather than arriving there by way of
 a browser having no `HOME`.
 
-So voice notes play and video does not; recording is refused where it starts
-rather than where it would fail; calls stay in the daemon, which is where the
-microphone already was, and so do plugins, for the same kind of reason. WebCodecs (`web_sys::VideoDecoder`) and
-`MediaRecorder` are the ways back in for the last two, and both are Rust
-bindings rather than JavaScript — they are API changes rather than backends,
-which is why neither is done here.
+So voice notes play and record, and a video in a conversation decodes through
+the browser's own H.264 (`web_sys::VideoDecoder`, bound from Rust like every
+other browser API here); calls stay in the daemon, which is where the
+microphone already was, and so do plugins, for the same kind of reason.
+
+Whether a page can record is a question about the *browser* rather than about
+the build, which is why `can_record()` is a function where `CAN_RECORD` was a
+constant: the encoder is `AudioEncoder`, and an older browser may not have it.
+Asked before the microphone is offered either way, because a control that is
+drawn and then always fails is worse than one that is not drawn.
+
+A call's video decodes the same way, through the same module, and obeys the
+same stream rules the desktop path does — a decoder born mid-stream waits for
+a keyframe, a gap makes it wait again, the peer's parameter set is read before
+the decoder is allowed to allocate from it, and their orientation is *undone*
+rather than repeated. What it does not have is the thread per direction, and
+does not need one: `VideoDecoder` is already asynchronous, so the work the
+thread was there to move off the caller happens off it anyway. It is only
+reachable attached to an `oxidezapd`, which is where calls happen at all.
+
+The video decoder is worth reading as the shape it is rather than as a
+backend swap. openh264 is *pulled* — hand it an access unit, get a picture on
+the same line — and `VideoDecoder` is pushed, with the pixel read out of a
+frame asynchronous on top of that. What makes the player above survive
+unchanged is that playback is already a timer asking for the frame it is
+about to paint: a seek feeds the decoder and returns, and the picture lands on
+a later ask. `video/geometry.rs` and `video/demux.rs` are what the two
+decoders share, which is everything except the decode — the pixel budget, the
+rotation, the channel order, the container walk — because a second copy of
+those is a second set of answers to drift apart.
 
 Declining is the exception, and the exception is instructive. A page cannot
 answer a call, but it *does* tell the caller to stop ringing: `client.voip()`
@@ -1236,6 +1299,18 @@ by definition.
   `chat-store/store.rs` (~3.2k). The calls came out of the first one and the
   video plane never went in, so what is left is the event pump, hydration and
   the paged reads — three things rather than one file.
+- **The session still runs on the window's own thread.** Two of the three
+  things that wanted a dedicated worker are in place: `exec::sleep` arms its
+  timer on a worker global as readily as on a window, and `store/web.rs` asks
+  for the OPFS handle before falling back, so both backends are written and
+  the pragma and the wipe already dispatch on which answered. What is left is
+  the move itself — `daemon::embedded` assembled inside a worker, with the
+  front end's `Link` a `MessagePort` rather than a `tokio::io::duplex` — and
+  it is the expensive half: the session, the store and the bridge all change
+  address space at once, and the page that works today is the thing at risk
+  if it is got wrong. `wasm_thread` is already in the tree through gpui, so
+  the spawn is not the obstacle; the restructuring is.
+
 - **The session runs in the browser, and pairing is measured now.** A page
   with no daemon named starts its own, and the whole of it works against
   WhatsApp: the VFS opens, the store and its migrations run, `ChatStore` comes
@@ -1257,12 +1332,17 @@ by definition.
   *observable*: the VFS answers for an import, a deletion and a clear, and
   hands back nothing for the writes a session makes — so a quota the browser
   refuses has nowhere to be reported, and the account behaves perfectly all
-  session and is gone on the next load. What the store does about that is say
-  the headroom out loud when it opens, which is a warning rather than a fix.
-  The durable answer is OPFS
-  through a synchronous access handle, which exists in a dedicated worker and
-  nowhere else, so it arrives with the worker. It changes nothing above
-  `session/store/`, which is why that interface is three functions.
+  session and is gone on the next load. What the store does about that is ask
+  the browser to keep this origin and say the headroom out loud when it opens,
+  which is a warning rather than a fix.
+  The durable answer is OPFS through a synchronous access handle, and
+  `prepare` asks for it *first* rather than assuming: the handle is specified
+  to exist in a dedicated worker and nowhere else, so in the window the ask is
+  normally refused and the IndexedDB store above is what a page gets. Asking
+  costs one refused call at startup and is what makes moving the session into
+  a worker a change of where this runs rather than a change to what it does —
+  the backend decides the `synchronous` pragma and how a wipe deletes, and
+  nothing above `session/store/` learns which one answered.
 - **A page holds no plugins, and the way in is a worker rather than a
   backend.** The interpreter is not the obstacle — `wasmi` builds for this
   target — the thread-per-plugin scheduler is, along with there being no
@@ -1288,26 +1368,62 @@ by definition.
   here. Attached to an `oxidezapd` the question does not arise, because the
   daemon holds the ureq client and does the upload.
 
-- **Video is not decoded on the web**, in a message or in a call, **and voice
-  notes are not recorded there.** All three are the same cause — the decoder
-  and the encoder are C — and each has a browser-native answer that is a Rust
-  binding: `web_sys::VideoDecoder` and `MediaRecorder`. Each is an API change
-  rather than a backend swap, because one is asynchronous where
-  `StreamingVideoDecoder` is pulled by index, and the other hands back encoded
-  bytes where `RecordedAudio` is samples. `video/call_unsupported.rs` is what
-  a page has meanwhile: the names, and frames dropped where they arrive.
+- **A page's own session cannot send the media it can now record.** See the
+  upload note above: the recording, the staging and the container are all in
+  place, and `execute_upload` upstream is what a voice note from an
+  own-session page still runs into. Attached to an `oxidezapd` it goes.
+  Which is why the microphone is not offered there. `platform::capabilities`
+  is the twin of `platform::plugins` and answers the same shape of question:
+  each is `None` or the sentence to draw instead, and each is about the
+  platform and the session rather than about a file or a moment, which is what
+  makes it safe to ask *before* the control is offered. Asking early is the
+  whole value. A composer that drew the microphone on an own-session page let
+  somebody record a whole voice note and lose it at the send, which is the
+  worse of the two ways to learn this, and the file already said so about the
+  browsers with no Opus encoder. The same module answers for video, and there
+  the ordering is the point: a decoder is built from the parameter sets, so a
+  browser with no `VideoDecoder` was otherwise found out only after the whole
+  attachment had been fetched and demuxed, and the bubble draws that as Retry
+ , every press paying the download again to reach the same permanent answer.
+- **A page prepares a recording on the window's own thread.** `app/recording.rs`
+  hands the desktop's waveform and encode to `cx.background_spawn`, which is
+  where work measured in hundreds of millions of operations belongs. The web
+  path does not: `stop` spawns a local task that runs the 63-tap resampler and
+  the waveform generator to completion before its first await, so a long note
+  holds the window while it does. gpui's background executor runs on real
+  workers here, so the destination exists; what does not is a seam, because
+  the pure-Rust half and the `AudioEncoder` half are one task inside the audio
+  crate and only the first of them may leave the window. Splitting the
+  resampler instead is the wrong half to reach for: a 63-tap filter carries
+  state across any boundary it is cut at, so chunking it changes the audio.
+  Bounded meanwhile by the ten-minute ceiling, which is what makes it a stall
+  rather than a hang.
+- **A video with B-frames is stamped in the wrong order.** `stamp_of` labels
+  each access unit with its decode-order index, and `collect` reads that label
+  back as the picture's position. The two agree exactly while decode order is
+  presentation order, which is every baseline stream and so every video
+  WhatsApp itself sends. They stop agreeing the moment an attachment carries
+  B-frames: WebCodecs answers in presentation order, so the labels come back
+  out of sequence and the timeline reads a picture as a position it does not
+  hold. What it needs is the composition offset the container already carries
+  (`Mp4Sample::rendering_offset`) as the stamp, kept apart from the decode
+  cursor the feed loop walks, which makes a seek a search for the decode
+  samples a presentation position depends on rather than a range. That is the
+  timeline's indexing model rather than a patch to it, and verifying it wants
+  a B-frame fixture this tree has none of.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
-- **A failed save says nothing to the person who asked.** On the web a
-  document is fetched before it is handed over, and the browser's transient
-  activation can expire while that happens — the second tap works, because the
-  bytes are cached by then, but the first one just stops. It is logged and
-  nowhere else, because the only user-visible error state the app has is
-  `AppState::Error`, which leaves the connected view and schedules a reconnect:
-  far worse than silence for something this small. What is missing is a
-  transient surface — a toast, a line on the row — and it should be designed
-  once rather than invented for this.
+- **Only some failures reach the person who asked.** `app/notices.rs` is the
+  transient surface the app had been missing: one sentence, expiring on its
+  own, changing no state, drawn by the root over whatever screen is up — the
+  other end of the scale from `AppState::Error`, which leaves the connected
+  view and schedules a reconnect and is catastrophic for a save that did not
+  start. A failed save and a failed recording go through it.
+  What still does not is anything the *daemon* refused: a front end learns
+  only `Accepted`, and a refusal reaching the window would need a field on the
+  wire. `SendFailed` is the one exception, and it is against a chat rather
+  than against the request.
 - **A promised file is not a held file, once the reader is a browser.** The
   daemon's media cache is files and no index — the front end it was written
   for opens them itself, so `claim` can be `has` and there is no window

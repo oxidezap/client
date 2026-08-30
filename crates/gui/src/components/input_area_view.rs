@@ -114,6 +114,13 @@ pub struct InputAreaView {
     /// Task that monitors typing state
     #[allow(dead_code)]
     typing_monitor_task: Option<Task<()>>,
+    /// Whether a voice note can be recorded here at all.
+    ///
+    /// Asked once rather than per frame: on the web the answer is whether the
+    /// browser has an Opus encoder, which is a `AudioEncoder` constructed,
+    /// configured and closed, real work, on every render of the composer,
+    /// for a value that cannot change while the tab is open.
+    can_record: bool,
 }
 
 impl EventEmitter<InputAreaEvent> for InputAreaView {}
@@ -145,6 +152,14 @@ impl InputAreaView {
             touch_target: None,
             typing_state: TypingState::default(),
             typing_monitor_task: None,
+            // Both halves of the journey, because either one failing makes
+            // the control a promise it cannot keep: the browser has to have
+            // an encoder, and the session has to have somewhere to send what
+            // it encodes. A page holding its own account has the first and
+            // not the second, and recording a whole voice note to lose it at
+            // the send is the worse of the two ways to find that out.
+            can_record: oxidezap_audio::can_record()
+                && crate::platform::media_send_unavailable().is_none(),
         }
     }
 
@@ -450,7 +465,7 @@ impl InputAreaView {
                 // does nothing is the worse answer: the browser has no Opus
                 // encoder, and that is knowable before the microphone is ever
                 // asked for.
-                let can_record = oxidezap_audio::CAN_RECORD;
+                let can_record = self.can_record;
                 Button::new("ptt")
                     .icon(ProductIcon::Mic)
                     .ghost()
@@ -458,7 +473,11 @@ impl InputAreaView {
                     .tooltip(if can_record {
                         "Hold to record a voice message"
                     } else {
-                        "Voice messages cannot be recorded in the browser"
+                        // Which half is missing, since the two have different
+                        // answers: one is the browser and the other is a
+                        // daemon this page could be pointed at.
+                        crate::platform::media_send_unavailable()
+                            .unwrap_or("Voice messages cannot be recorded in this browser")
                     })
                     .w(control)
                     .h(control)

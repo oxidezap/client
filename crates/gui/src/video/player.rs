@@ -164,6 +164,18 @@ impl VideoPlayer {
         self.completion_tx = None;
     }
 
+    /// Give up the codec session while this player is not the one playing.
+    ///
+    /// Separate from `stop`, which is where a poster frame is asked for and
+    /// so is exactly where the decoder is still needed. This is for a player
+    /// the cache is keeping around: what cost a download stays, and the
+    /// session a browser allows only a few of goes back.
+    pub fn release_decoder(&mut self) {
+        if let Some(decoder) = &mut self.decoder {
+            decoder.release();
+        }
+    }
+
     pub fn current_time(&self) -> Duration {
         self.playback_start
             .map(|start| start.elapsed())
@@ -177,7 +189,12 @@ impl VideoPlayer {
             return false;
         };
         if self.state != VideoPlayerState::Playing {
-            return false;
+            // A picture asked for is not a picture in hand. On a push decoder
+            // `seek` and `reset` return having *asked*, and the answer lands
+            // on a later poll, so a stop that only polled once went on
+            // showing the last frame where the desktop, whose decode is
+            // inline, shows the first.
+            return self.update_current_frame();
         }
 
         let current_time = self.current_time();
@@ -199,6 +216,15 @@ impl VideoPlayer {
     }
 
     fn update_current_frame(&mut self) -> bool {
+        // Asked every poll, because on a push decoder the failure arrives
+        // long after the call that caused it: a chunk refused, the error
+        // callback firing, a copy that would not complete. Without this the
+        // player stays in `Playing` with no picture and nothing to say, which
+        // is the one outcome worse than an error.
+        if let Some(reason) = self.decoder.as_ref().and_then(|d| d.failure()) {
+            self.set_error(reason);
+            return false;
+        }
         let Some(decoder) = &self.decoder else {
             return false;
         };

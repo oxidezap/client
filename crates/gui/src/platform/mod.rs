@@ -6,6 +6,7 @@
 //! never learns that browsers exist for the same reason it never learns that
 //! small screens do.
 
+mod capabilities;
 pub mod clock;
 pub mod download;
 pub mod identity;
@@ -15,6 +16,7 @@ pub mod plugins;
 pub mod prefs;
 pub mod startup;
 
+pub use capabilities::{media_send_unavailable, video_decode_unavailable};
 pub use clock::{sleep, with_timeout};
 pub use identity::front_end_id;
 pub use launch::run;

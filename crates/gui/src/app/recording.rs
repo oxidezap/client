@@ -72,20 +72,46 @@ impl WhatsAppApp {
 
         // Refused where nothing can come of it. The composer already draws
         // the microphone disabled there, so this is the keyboard route and
-        // anything else that reaches the action directly.
-        if !oxidezap_audio::CAN_RECORD {
+        // anything else that reaches the action directly. Both halves, for
+        // the reason the composer asks both: an encoder the browser does not
+        // have, and a session with nowhere to send what it encodes, are two
+        // ways for the same press to end in a recording that is lost.
+        if let Some(reason) = crate::platform::media_send_unavailable() {
+            warn!("this session cannot send a voice note: {reason}");
+            self.notify_user(reason.to_string(), crate::app::notices::Tone::Problem, cx);
+            return;
+        }
+        if !oxidezap_audio::can_record() {
             warn!("this build cannot record a voice note");
+            self.notify_user(
+                "Voice messages cannot be recorded in this browser.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             return;
         }
 
-        // Initialize and start recording
+        // Initialize and start recording. Said out loud on both paths: a
+        // microphone the browser refused, or a device that will not open, is
+        // a press that otherwise does nothing at all, the composer stays as
+        // it was, with the reason only in the log.
         if let Err(e) = self.audio_recorder.init() {
             error!("Failed to initialize audio recorder: {}", e);
+            self.notify_user(
+                "The microphone could not be opened.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             return;
         }
 
         if let Err(e) = self.audio_recorder.start() {
             error!("Failed to start recording: {}", e);
+            self.notify_user(
+                "Recording could not be started.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             return;
         }
 
@@ -108,6 +134,15 @@ impl WhatsAppApp {
         // Check if connected before attempting to send
         if !self.is_connected() {
             warn!("Cannot send audio: not connected");
+            // Said before it is thrown away. This is the path where somebody
+            // has already spoken into the microphone, so a recording that
+            // vanishes with the reason only in a log is the worst of the
+            // three ways this can end.
+            self.notify_user(
+                "That recording could not be sent: not connected.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             self.cancel_recording(cx);
             return;
         }
@@ -128,10 +163,15 @@ impl WhatsAppApp {
         cx.notify();
 
         // Stop recording and get audio data
-        let recorded = match self.audio_recorder.stop() {
-            Ok(audio) => audio,
+        let recording = match self.audio_recorder.stop() {
+            Ok(recording) => recording,
             Err(e) => {
                 error!("Failed to stop recording: {}", e);
+                self.notify_user(
+                    "The recording could not be stopped.".to_string(),
+                    crate::app::notices::Tone::Problem,
+                    cx,
+                );
                 self.recording_state = RecordingState::Idle;
                 // Every abort path must reset the input area too, or it keeps
                 // rendering the recording UI forever.
@@ -141,23 +181,13 @@ impl WhatsAppApp {
             }
         };
 
-        // Check minimum duration (1 second)
-        if recorded.duration_secs < 1 {
-            warn!("Recording too short, discarding");
-            self.recording_state = RecordingState::Idle;
-            self.update_input_recording(cx);
-            cx.notify();
-            return;
-        }
-
-        info!(
-            "Recording stopped: {} samples, {}s",
-            recorded.samples.len(),
-            recorded.duration_secs
-        );
-
         if self.client.is_none() {
             warn!("Cannot send audio: not connected to the daemon");
+            self.notify_user(
+                "That recording could not be sent: not connected.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             self.recording_state = RecordingState::Idle;
             self.update_input_recording(cx);
             cx.notify();
@@ -169,17 +199,7 @@ impl WhatsAppApp {
         // was started for is still the current one.
         let epoch = self.recording_epoch;
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            // GPUI's own background pool. This used to borrow the session's
-            // tokio runtime, which was only ever within reach because the
-            // session lived in this process.
-            let encoded = cx
-                .background_spawn(async move {
-                    let waveform = generate_waveform(&recorded.samples);
-                    encode_to_opus_ogg(&recorded)
-                        .map(|ogg| (ogg, waveform, recorded.duration_secs))
-                        .map_err(|error| error.to_string())
-                })
-                .await;
+            let encoded = Self::finish(cx, recording).await;
             let _ = entity.update(cx, |app, cx| {
                 // A disconnect, a logout or a plain cancel while the encoder
                 // ran makes this note something nobody is waiting for. Sending
@@ -195,6 +215,48 @@ impl WhatsAppApp {
         })
         .detach();
     }
+    /// Turn a stopped recording into the note that gets sent.
+    ///
+    /// The two arms are the two platforms, and the difference is *when* the
+    /// encode happens rather than what it produces. A desktop hands back samples
+    /// and this encodes them on the background pool, which is real work and
+    /// belongs off the UI thread. A browser encoded as it captured, so there is
+    /// nothing to do but wait for the last packets to flush.
+    ///
+    /// The minimum-duration guard lives here rather than before the stop, because
+    /// only one of the two knows how long the recording was without waiting for
+    /// it.
+    async fn finish(
+        cx: &mut gpui::AsyncApp,
+        recording: oxidezap_audio::Recording,
+    ) -> Result<(Vec<u8>, Vec<u8>, u32), String> {
+        use gpui::AppContext as _;
+
+        let (bytes, waveform, duration_secs) = match recording {
+            oxidezap_audio::Recording::Samples(recorded) => {
+                cx.background_spawn(async move {
+                    let waveform = generate_waveform(&recorded.samples);
+                    encode_to_opus_ogg(&recorded)
+                        .map(|ogg| (ogg, waveform, recorded.duration_secs))
+                        .map_err(|error| error.to_string())
+                })
+                .await?
+            }
+            oxidezap_audio::Recording::Pending(pending) => {
+                let note = pending
+                    .await
+                    .map_err(|_| "the recording ended before it was encoded".to_string())?
+                    .map_err(|e| e.to_string())?;
+                (note.bytes, note.waveform, note.duration_secs)
+            }
+        };
+
+        if duration_secs < 1 {
+            return Err("that recording was too short to send".to_string());
+        }
+        Ok((bytes, waveform, duration_secs))
+    }
+
     fn finish_recording_send(
         &mut self,
         jid: String,
@@ -206,6 +268,11 @@ impl WhatsAppApp {
             Ok(encoded) => encoded,
             Err(error) => {
                 error!("Failed to encode audio: {error}");
+                // The person watched themselves record this, so its
+                // disappearance needs a sentence. Every message reaching here
+                // is written for a reader: a refused microphone, a recording
+                // too short to send, an encoder that stopped.
+                self.notify_user(error, crate::app::notices::Tone::Problem, cx);
                 self.recording_state = RecordingState::Idle;
                 self.update_input_recording(cx);
                 cx.notify();
@@ -215,6 +282,11 @@ impl WhatsAppApp {
 
         let Some(client) = &self.client else {
             warn!("Cannot send audio: client is unavailable");
+            self.notify_user(
+                "That recording could not be sent: not connected.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             self.recording_state = RecordingState::Idle;
             self.update_input_recording(cx);
             cx.notify();

@@ -395,33 +395,23 @@ pub(super) fn parse(line: &str) -> Option<DaemonMessage> {
 /// inside the frame and never calls this.
 #[cfg(target_family = "wasm")]
 pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<String> {
-    use oxidezap_core::MediaType;
-
     fn key_of(media: &Option<MediaContent>, into: &mut Vec<String>) {
         let Some(media) = media else { return };
+        // A film this build cannot play is a film not worth fetching. There
+        // used to be a skip here against `CAN_DECODE`, and retiring that
+        // constant removed it correctly: the answer had become yes on every
+        // build. What replaced it is a question about the *browser*, and
+        // `capabilities` was wired only into the play path, so a history full
+        // of cached videos spent the whole frame-media budget on files no
+        // press could ever open.
+        if media.media_type == oxidezap_core::MediaType::Video
+            && crate::platform::video_decode_unavailable().is_some()
+        {
+            return;
+        }
         let Some(key) = media.cache_key.clone() else {
             return;
         };
-        // A key this build could not use if it had the bytes, whichever of
-        // the two names it under.
-        //
-        // Neither prefix means "thumbnail": `f-` addresses full media by
-        // message and `d-` addresses the same bytes by content — the `f` is
-        // there *because* it promises full, which is what stopped a blur from
-        // taking a photo's place in the cache. An inbound clip whose eager
-        // download succeeded is written under `f-`, so skipping only `d-`
-        // still pulled whole MP4s down to hand them to a decoder that does
-        // not exist here, ahead of the frame they belong to and inside its
-        // budget.
-        //
-        // Nothing is lost by skipping both. A fallback thumbnail is never
-        // externalized — `cache_media` refuses to cache a preview, and the
-        // bytes themselves are `#[serde(skip)]` — so for a page a video row's
-        // key names the film or nothing at all, and the row draws "video is
-        // not supported here" either way.
-        if media.media_type == MediaType::Video && !crate::video::CAN_DECODE {
-            return;
-        }
         into.push(key);
     }
 

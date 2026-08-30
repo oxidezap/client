@@ -14,6 +14,13 @@
 
 use std::sync::Arc;
 
+/// What to do once a payload is staged, or once staging has failed.
+///
+/// Boxed because it is handed across a trait whose implementations finish at
+/// different times, and `Send` because the native cache is written from
+/// whichever thread made the request.
+pub type StageThen = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
+
 /// Where a front end finds the bytes a frame only named.
 ///
 /// `Send + Sync` because the native reader thread holds one while the UI
@@ -65,9 +72,24 @@ pub trait MediaCache: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Where there is no shared place to stage into — a page cannot hand the
-    /// daemon a file — which is also why nothing on that platform records.
+    /// Nowhere to write, or the write failed.
     fn stage(&self, key: &str, bytes: &[u8]) -> Result<(), String>;
+
+    /// Stage, and only then run `then`.
+    ///
+    /// Staging is a local write where the daemon shares a filesystem and a
+    /// round trip where it does not, and the request naming the key may not go
+    /// out before the bytes have landed — the daemon reads the payload when it
+    /// handles the request, so a frame that overtakes its own upload names a
+    /// file that is not there yet.
+    ///
+    /// So the continuation belongs to the implementation rather than to the
+    /// caller. Where staging is synchronous this runs `then` before returning
+    /// and the ordering is exactly what it always was; where it is not, the
+    /// caller's frame is sent from the upload's own completion.
+    fn stage_then(&self, key: &str, bytes: Vec<u8>, then: StageThen) {
+        then(self.stage(key, &bytes));
+    }
 
     /// Drop a staged payload whose request is never going to run.
     ///
@@ -115,6 +137,19 @@ impl MediaCache for Directory {
 #[derive(Default)]
 pub struct Fetched {
     bytes: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
+    /// Keys whose upload is in flight, and whether the send was abandoned
+    /// while it was.
+    ///
+    /// A `DELETE` issued while the `PUT` is still going is a race the daemon
+    /// cannot settle: the two are separate requests and the write can land
+    /// after the removal, leaving the payload staged with nothing that will
+    /// ever read it. So a discard during an upload is *recorded* rather than
+    /// sent, and the upload's own completion is what removes it, one place
+    /// deciding, after the write it is undoing.
+    ///
+    /// Shared rather than borrowed: the completion that reads it runs in a
+    /// spawned task, which cannot borrow this cache.
+    uploading: Arc<std::sync::Mutex<std::collections::HashMap<String, bool>>>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -166,19 +201,86 @@ impl MediaCache for Fetched {
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
     }
 
+    /// Refused, because staging from a page is not synchronous.
+    ///
+    /// The bytes go to the daemon over HTTP, which cannot be awaited from
+    /// here. [`stage_then`](MediaCache::stage_then) is the one that works, and
+    /// this stays as the loud failure for anything that has not been moved
+    /// onto it — silently going out naming a payload that is not there is the
+    /// outcome worth refusing.
     fn stage(&self, _key: &str, _bytes: &[u8]) -> Result<(), String> {
-        // Nothing to stage into: the daemon reads a file and a page has no
-        // filesystem to put one in. Recording is unavailable on this platform
-        // for the same reason, so nothing reaches here in practice — but a
-        // send that somehow did must fail loudly rather than silently go out
-        // naming bytes that are not there.
-        Err("a page cannot stage a payload for the daemon".to_string())
+        Err("a page stages over HTTP, which cannot be awaited here".to_string())
     }
 
+    /// Upload, then continue.
+    ///
+    /// The page's own copy is dropped when this finishes either way: on
+    /// success the daemon holds it, and on failure the send is not going to
+    /// run. A tab's memory has a ceiling and a voice note is the one payload
+    /// this side allocates whole.
+    fn stage_then(&self, key: &str, bytes: Vec<u8>, then: StageThen) {
+        let key = key.to_string();
+        let base = oxidezap_ipc::web::media_base_url();
+        self.uploading
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), false);
+        let uploading = Arc::clone(&self.uploading);
+        wasm_bindgen_futures::spawn_local(async move {
+            let staged = oxidezap_ipc::web::upload_media(&base, &key, &bytes).await;
+            let abandoned = uploading
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+                .unwrap_or(false);
+            if abandoned {
+                // Answered before the cleanup, not after it. `then` is what
+                // releases this send's place in the outbox, and the discard
+                // below carries a deadline: a daemon that stops answering the
+                // `DELETE` would otherwise hold every frame queued behind an
+                // abandoned voice note for the whole of it. Nothing in the
+                // cleanup changes the answer.
+                then(Err("that send was abandoned".to_string()));
+                // The payload is really there now, so this is the removal the
+                // discard could not safely make at the time.
+                if staged.is_ok() {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        oxidezap_ipc::web::discard_media(&base, &key).await;
+                    });
+                }
+                return;
+            }
+            then(staged);
+        });
+    }
+
+    /// Both copies: the page's, and the daemon's if one was staged.
+    ///
+    /// A staged payload is the one thing this side writes to the *other* end,
+    /// so forgetting it locally is only half the job — the daemon spares
+    /// staged uploads from its cache sweep, so a send abandoned after the
+    /// upload landed would leave that file until the account is wiped.
     fn discard(&self, key: &str) {
         self.bytes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key);
+        if !oxidezap_ipc::is_staged_key(key) {
+            return;
+        }
+        {
+            // Still on its way: marked instead of removed, because a `DELETE`
+            // that overtakes its own `PUT` leaves the payload staged for ever.
+            let mut uploading = self.uploading.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(abandoned) = uploading.get_mut(key) {
+                *abandoned = true;
+                return;
+            }
+        }
+        let key = key.to_string();
+        let base = oxidezap_ipc::web::media_base_url();
+        wasm_bindgen_futures::spawn_local(async move {
+            oxidezap_ipc::web::discard_media(&base, &key).await;
+        });
     }
 }
