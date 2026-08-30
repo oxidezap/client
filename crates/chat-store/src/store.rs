@@ -2597,10 +2597,7 @@ fn apply_history_conversation(
                     .pinned
                     .map(|p| peer_timestamp_ms(p.into()))
                     .filter(|&p| p > 0)),
-                dsl::muted_until.eq(conv
-                    .mute_end_time
-                    .map(|m| peer_timestamp_ms(m.into()))
-                    .filter(|&m| m > 0)),
+                dsl::muted_until.eq(conv.mute_end_time.map(peer_timestamp_ms).filter(|&m| m > 0)),
                 dsl::archived.eq(conv.archived.unwrap_or(false)),
                 dsl::ephemeral_expiration.eq(conv.ephemeral_expiration.map(|e| e as i32)),
             ))
