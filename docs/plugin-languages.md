@@ -27,14 +27,17 @@ sentence in `AGENTS.md` — a plugin's whole outside world is the `oxidezap`
 module — rather than a build flag.
 
 **The budgets are small on purpose.** 4 MiB of linear memory, 200 M fuel for
-init, 50 M per call, and a tenth of a core over a rolling ten seconds. An
-embedded JS engine spends the first two on existing.
+init, 50 M per call, and a tenth of a core over a rolling ten seconds.
 
-**And wasmi is itself an interpreter.** A QuickJS module here is an
-interpreter interpreting an interpreter, under a 10 % duty share. That is the
-argument that outlives every version number below: it is not that the engine
-is too big for the module limit — 869 KiB against 32 MiB is nothing — it is
-that the work it does is priced twice and then rationed.
+**And wasmi is itself an interpreter**, so an embedded JS engine is an
+interpreter interpreting an interpreter, its work priced twice and then
+rationed. This document's first draft called that the argument outliving
+every version number below, and then measured it: QuickJS running a real
+handler spends 5.5 % of one call's fuel and 1.4 MiB of the 4 MiB. The
+prediction was wrong, and the measurement is in *What real TypeScript costs*
+below. What the budgets do rule out is anything embedding SpiderMonkey, and
+what actually blocks QuickJS turned out to be three smaller things nobody had
+predicted at all.
 
 Nothing rules out an *approach* on taste. What rules things out is that list.
 
@@ -42,10 +45,10 @@ Nothing rules out an *approach* on taste. What rules things out is that list.
 
 | | What it is | Verdict here |
 |---|---|---|
-| [AssemblyScript](https://www.assemblyscript.org/) | Strict TypeScript subset → core wasm, via Binaryen | **Works today.** Measured below: 541 bytes, imports only from `oxidezap`. |
+| [AssemblyScript](https://www.assemblyscript.org/) | A language with TypeScript's syntax → core wasm, via Binaryen | **Smallest by far** (541 B–9 KiB, imports only `oxidezap`) and **not TypeScript**: no `any`, unions, `for…of`, destructuring, exceptions, regex, `JSON` or `async`. |
 | [Porffor](https://github.com/CanadaHonk/porffor) | AOT JS/TS engine: JS → IR → C → native or wasm | **Measured, and no.** 328 KiB for a ten-line handler, eight WASI imports, `_start` as its only export, and `setjmp` under every `throw`. |
 | [jz](https://github.com/dy/jz) | "Good parts" JS subset → wasm, no runtime, no GC | Right shape, wrong domain: numeric/DSP code, not strings and objects. |
-| [Javy](https://github.com/bytecodealliance/javy) / [Extism js-pdk](https://github.com/extism/js-pdk) | QuickJS in wasm, snapshotted with Wizer | Real JavaScript, at the cost of WASI imports, the memory budget and double interpretation. |
+| [Javy](https://github.com/bytecodealliance/javy) / [Extism js-pdk](https://github.com/extism/js-pdk) | QuickJS in wasm, snapshotted with Wizer | **The only route to real TypeScript, and it fits**: measured at 5.5 % of a call's fuel and 1.4 MiB of the 4 MiB, needing a WASI shim, wasmi's SIMD feature and a QuickJS plugin of our own. |
 | [Jawsm](https://github.com/drogus/jawsm) | JS → wasm, no interpreter, Rust | Blocked: built on wasm-GC, exception handling and tail calls. Two of the three are what wasmi lacks. |
 | [Wasmnizer-ts](https://github.com/intel/Wasmnizer-ts) | Intel's TypeScript → WasmGC toolchain | Blocked, and by three at once: WasmGC, exception handling and stringref. |
 | [ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS) / StarlingMonkey | SpiderMonkey embedding → wasm component | Blocked twice: the component model is the trade this ABI is built around, and the embedding is ~8 MB. |
@@ -138,6 +141,55 @@ and `Event::which`, and TypeScript's type system can express every one of
 those. That is an `oxidezap-plugin-as` package, and it is a day of work rather
 than a research question.
 
+## AssemblyScript is not TypeScript
+
+The section above is about what the *compiler* produces. This one is about
+what an author has to write, and the answer decides more than the byte counts
+do: **AssemblyScript is a separate language that borrows TypeScript's
+syntax.** A `.ts` file that `tsc` accepts is, more often than not, refused by
+`asc` — not because it is bad TypeScript, but because the construct does not
+exist in the language.
+
+Measured by compiling one construct at a time with `asc` 0.28. Every "no"
+below is a first-line compiler error, not a runtime surprise:
+
+| Construct | `asc` |
+|---|---|
+| `any` | **no** — `TS2304: Cannot find name 'any'` |
+| union types (`i32 \| string`) | **no** — `AS100: Not implemented: union types` |
+| `string \| null` | yes — references are nullable, so this one narrows |
+| optional properties (`b?: bool`) | **no** — `AS219: Optional properties are not supported` |
+| object literals (`{ a: 1, b: 2 }`) | **no** — every object is a class |
+| `for (const x of xs)` | **no** — `AS100: Not implemented: Iterators` |
+| destructuring, array or object (`const [a, b] = xs`) | **no** — `TS1003` |
+| spread (`[...xs, 3]`) | **no** — `AS100: Not implemented: Spread operator` |
+| `??` (nullish coalescing) | **no** — `TS1109: Expression expected` |
+| `try` / `catch` | **no** — `AS100: Not implemented: Exceptions` |
+| `throw` | yes — but it aborts; nothing can catch it |
+| regular expressions | **no** — `AS100: Not implemented: Regular expressions` |
+| `JSON.parse` / `JSON.stringify` | **no** — `TS2304: Cannot find name 'JSON'` |
+| `async` / `await`, promises | **no** — parse error |
+| closures over a parameter | **no** — `TS2454: Variable 'k' is used before being assigned` |
+| closures over a `const` in scope | yes |
+| structural typing (`class P` where an `interface Named` is wanted) | **no** — `implements` is required; typing is nominal |
+| anything from npm (`import { x } from "fs"`) | **no** — there is no npm, only `~lib` |
+| classes, getters, generics, `Map`, template literals, `filter`/`map`/`reduce`, `enum`, default parameters, `interface` + `implements`, `Date.now`, string methods | yes |
+
+The right hand column is not a to-do list. `any` and unions are absent
+because there are no runtime types to switch on; exceptions are absent
+because there is no unwinder; `for…of` is absent because there is no iterator
+protocol; structural typing is absent because objects are laid out like C
+structs. Each is a consequence of compiling to a 9 KiB module with no engine
+in it — which is exactly the property that made the numbers above possible.
+
+So an author does not write TypeScript with a few libraries missing. They
+write a statically typed, nominally typed, exception-free, `any`-free
+language whose numbers are `i32` and `f64` rather than `number`, and they
+find that out one error at a time, from `tsc`-shaped error codes, in code
+that looks like TypeScript. **If the goal is "people write normal TypeScript",
+AssemblyScript does not meet it** — and the value it does have, a real 9 KiB
+module, is a different goal.
+
 ## Porffor, measured
 
 Porffor is the project worth asking about, and it is now the one with numbers
@@ -214,35 +266,83 @@ under development, and it would also unblock Jawsm), and Porffor grows a
 reactor-shaped wasm output with importable host functions. Neither is ours to
 do, and neither is far-fetched.
 
-## Javy, and what running real JavaScript would cost
+## What real TypeScript costs, measured
 
-The only route that runs JavaScript as written — npm-shaped code, `JSON`,
-regexes, closures — is an embedded engine, and Javy is the mature one:
-QuickJS-ng compiled to wasm, the user's script parsed at build time and the
-whole VM snapshotted with Wizer so nothing parses at startup. Static linking
-is ~869 KiB; dynamic linking gets the per-plugin module to 1–16 KiB by
-importing a shared `javy_quickjs_provider` module, which the host would have
-to supply.
+There is exactly one way to run TypeScript that `tsc` accepts: strip the types
+(`tsc`, `esbuild`) and run the JavaScript in an engine. So the question is not
+which compiler — it is whether a JS engine fits inside this host's budgets.
+Nobody here had measured that, and the guess in an earlier draft of this
+document was wrong.
 
-Four costs, in the order they would bite:
+The measurement: the handler from the section above — interfaces, optional
+properties, a union return, `filter`/`find`, `??`, destructuring, a template
+literal, a regex `split`, `Map`, `JSON.stringify` — bundled by esbuild (634
+bytes of JS), built with Javy 6.0.0, and run under **wasmi 1.1 with this
+daemon's own numbers**: fuel metering on, a 4 MiB `StoreLimits`, and a
+hand-written shim for the nine WASI imports (~60 lines; `fd_write` to a
+buffer, the rest zeroed).
 
-1. WASI imports for stdin/stdout, which either get stubbed in the host or the
-   categorical sentence in `AGENTS.md` stops being true.
-2. The 4 MiB memory limit, against an engine sized for hundreds of KiB of
-   heap before the plugin's own data. Not obviously fatal; unmeasured.
-3. Fuel. Wizer removes the parse, not the instantiation, and 200 M fuel for
-   init is a budget written for a module that memsets a scratch buffer.
-4. The duty share. Interpreted JS inside an interpreted host, rationed to a
-   tenth of a core, is the cost that does not go away with tuning.
+| | |
+|---|---|
+| module, static linking | 1,284,838 B (1.22 MiB) — of 32 MiB allowed |
+| module, dynamic linking | **1,453 B**, against a shared 1.26 MiB QuickJS provider |
+| memory | 22 pages, **1,408 KiB** — of 4 MiB allowed |
+| instantiation | 0 fuel, ~1 ms (Wizer snapshotted the engine) |
+| one call, running the real handler | **2,765,416 fuel — 5.5 % of the per-call budget**, 5 ms |
+| output | `{"out":"pong (1) !apf"}` — correct, regex and all |
 
-It is a coherent thing to want and it is a different product decision from
-"which compiler" — closer in kind to `oxi_http_fetch` than to a build flag.
+It fits. Not "fits if we raise the limits": it fits inside the limits as
+written, with the whole language present — regexes, exceptions, `any`,
+promises, closures, npm-shaped code.
+
+Four things stand between that and a plugin, none of them the ones this
+document previously predicted:
+
+1. **wasmi rejects the module as built.** `SIMD support is not enabled` —
+   QuickJS-ng uses SIMD, and wasmi puts SIMD behind a cargo feature that
+   `default-features = false` leaves off. One line in `Cargo.toml`, and a
+   deliberate widening of what any plugin may contain.
+2. **Nine WASI imports.** Sixty lines of shim, or the categorical sentence in
+   `AGENTS.md` stops being true. The shim is the smaller half: what it means
+   is that "no WASI" becomes "no WASI except the nine we answer".
+3. **A Javy export is one-shot.** Measured: the first call to an exported
+   function runs; every call after it traps with *out of bounds memory
+   access* at ~500 fuel. Javy's model is an instance per invocation, which is
+   cheap for it (1 ms, 0 fuel) and wrong for us — a plugin's `Map` of counts,
+   and everything else it holds between events, would not survive to the next
+   one. Reaching a plugin that keeps state means our own QuickJS build rather
+   than the shipped Javy one.
+4. **Nothing bridges the ABI.** A Javy export takes no arguments and returns
+   nothing, and the JS inside cannot call `oxi_send_text` because no binding
+   for it exists. Those bindings are what a *custom Javy plugin* is
+   (`javy-plugin-api`), and building one is precisely what Extism's js-pdk
+   did.
+
+Which reframes the project. If "people write normal TypeScript" is the
+requirement, the thing to build is **not a compiler** — it is a QuickJS
+plugin: a Rust crate compiled to wasm that keeps a JS context alive across
+calls and exposes the eighteen `oxi_*` imports as JS globals. Every plugin
+then ships as ~1.5 KiB of bytecode against one provider module the daemon
+ships with itself, and the fuel and memory numbers above are what it costs.
+That is weeks of work against a compiler's years, and it is the only route
+measured here that ends with a `.ts` file `tsc` would accept.
+
+What it costs in exchange is the sentence this sandbox has been able to make
+so far: a plugin would carry a JS engine, the host would answer WASI calls,
+SIMD would be allowed, and the interpreter-in-an-interpreter overhead is real
+even though it turned out to be 5.5 % rather than the disaster predicted here.
+That is a product decision — the same shape as `oxi_http_fetch` — and it
+should be made deliberately rather than as a consequence of picking a
+toolchain.
 
 ## Writing our own, in Rust
 
 The honest version of "let's build a minimal TS/JS → wasm compiler in Rust,
 maybe on [oxc](https://oxc.rs/)": the front end is the part that is free, and
-it is not the part that decides the project.
+it is not the part that decides the project. Read this after *What real
+TypeScript costs* — if the requirement is TypeScript that `tsc` accepts, a
+compiler is the wrong project and an engine is the right one, and what
+follows is about the other requirement.
 
 oxc gives a `.ts`/`.tsx` parser that passes Test262 and 99 % of the
 TypeScript suite, plus semantic analysis, scopes and symbol resolution — and
@@ -292,13 +392,26 @@ smaller project than writing a compiler by three orders of magnitude.
 
 ## What a decision needs
 
-- An `oxidezap-plugin-as` SDK and an `examples/` plugin built with it, which
-  is what turns "AssemblyScript works" into something somebody can copy. The
-  Rust SDK's value is the two mask types, the `Setup` whose methods vanish
-  once used, the per-field sizes and `Event::which`; TypeScript's type system
-  expresses every one of those.
-- A line in `docs/plugin-abi.md` naming the start-section trap, since it is
-  the first thing an AssemblyScript author hits and nothing in the ABI says
-  the loader will run that code with every import refusing.
-- Nothing further on Porffor until wasmi has exception handling. The
-  measurements above are the record of why.
+The two goals are in tension and one of them has to be picked first.
+
+- **"A plugin should be tiny and the sandbox absolute"** → AssemblyScript,
+  today, with an `oxidezap-plugin-as` SDK and an `examples/` plugin built
+  with it. 9 KiB, zero non-`oxidezap` imports, no WASI, no SIMD, no engine —
+  and authors write AssemblyScript, which they have to be told plainly rather
+  than sold as TypeScript.
+- **"People write normal TypeScript"** → a QuickJS plugin of our own, on
+  `javy-plugin-api` or `rquickjs`, keeping a context alive across calls and
+  exposing the `oxi_*` imports as JS globals. ~1.5 KiB per plugin against one
+  provider module, 5.5 % of a call's fuel, 1.4 MiB of the 4 MiB — at the cost
+  of nine answered WASI imports, wasmi's SIMD feature, and an engine inside
+  the sandbox.
+
+Both are real. What is not real is getting both from one toolchain, and the
+measurements above are the record of why.
+
+Whichever is picked, one line belongs in `docs/plugin-abi.md` either way:
+the loader runs a module's start section with every import refusing, which is
+the first thing a non-Rust author hits — AssemblyScript emits one for
+something as ordinary as a string constant.
+
+Nothing further on Porffor until wasmi has exception handling.
