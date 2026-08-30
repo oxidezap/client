@@ -666,8 +666,25 @@ impl Session {
                 ),
                 Err(e) => {
                     // The queue behind this send is waiting on a frame that
-                    // is never going to be written.
-                    let _ = release(&link, &outbox, &pending, ticket, None);
+                    // is never going to be written. Releasing it can fail in
+                    // turn, and what that leaves is the same as anywhere
+                    // else: reservations nobody will ever answer, with the
+                    // views that made them waiting for good. Answered here
+                    // rather than discarded, exactly as `deliver` does.
+                    if let Err(Unwritten { lost, reason }) =
+                        release(&link, &outbox, &pending, ticket, None)
+                    {
+                        error!("could not reach the daemon: {reason}");
+                        for lost in lost {
+                            fail_reserved(
+                                &pending,
+                                &events,
+                                &media,
+                                lost,
+                                format!("could not reach the daemon: {reason}"),
+                            );
+                        }
+                    }
                     fail_reserved(
                         &pending,
                         &events,

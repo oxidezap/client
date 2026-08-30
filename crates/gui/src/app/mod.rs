@@ -1569,6 +1569,12 @@ impl WhatsAppApp {
         // a pane is exactly the kind of thing a reset exists to remove.
         self.call_pictures = CallPictures::default();
         self.call_video_asked = None;
+        // And the notices, which are drawn by the root over every screen and
+        // so outlive the view they were raised in. "That recording could not
+        // be sent" is about an account that has gone, shown to whoever pairs
+        // next, and a reset is a departure rather than a clear.
+        self.notices.clear();
+        self.notice_task = None;
         // What the *old* account occupied, and the query that is still
         // measuring it. Settings survives the reset, so a completion landing
         // after it would show the previous account's database and media under
@@ -2473,6 +2479,24 @@ impl WhatsAppApp {
     // ========== Video Playback ==========
 
     /// Start the video frame update task
+    /// Give back the codec session of every player that is not playing.
+    ///
+    /// A `VideoDecoder` is hardware and a browser allows a handful, while the
+    /// window caches players so a clip replays without re-fetching. Called
+    /// where one video becomes the one playing, and again where playback
+    /// ends: `stop` is not the place, because that is where a poster frame is
+    /// asked for and so where the decoder is still needed, but once the
+    /// settling polls are done nothing is waiting on it. What cost a download
+    /// stays and only the session goes.
+    fn release_idle_decoders(&mut self) {
+        let playing = self.playing_video_id().map(|s| s.to_string());
+        for (id, player) in &mut self.video_players {
+            if Some(id) != playing.as_ref() {
+                player.release_decoder();
+            }
+        }
+    }
+
     fn start_video_update_task(&mut self, cx: &mut Context<Self>) {
         // Cancel any existing task
         self.video_update_task = None;
@@ -2486,12 +2510,7 @@ impl WhatsAppApp {
         // which is where a poster frame is asked for and so is where the
         // decoder is still needed. What cost a download stays; only the
         // session goes, and it is rebuilt from the samples on the next play.
-        let playing = self.playing_video_id().map(|s| s.to_string());
-        for (id, player) in &mut self.video_players {
-            if Some(id) != playing.as_ref() {
-                player.release_decoder();
-            }
-        }
+        self.release_idle_decoders();
 
         // Get completion receiver from current video player
         // Clone the message_id first to avoid borrow conflicts
@@ -2525,6 +2544,11 @@ impl WhatsAppApp {
                             // Video completed naturally
                             let _ = entity.update(cx, |app, cx| {
                                 app.active_media = ActiveMedia::None;
+                                // After the clear, not before it: the sweep
+                                // spares whatever is playing, and what has
+                                // just finished stops being that only once
+                                // `active_media` says so.
+                                app.release_idle_decoders();
                                 app.video_update_task = None;
                                 app.audio_player.stop();
                                 // Ownership must not survive the sink: a stale
@@ -2576,6 +2600,11 @@ impl WhatsAppApp {
                 if should_stop {
                     let _ = entity.update(cx, |app, cx| {
                         app.active_media = ActiveMedia::None;
+                        // After the clear and after the settling polls: the
+                        // sweep spares whatever is playing, and a poster
+                        // frame still on its way has landed by now. A codec
+                        // session is hardware a browser allows a handful of.
+                        app.release_idle_decoders();
                         app.video_update_task = None;
                         app.audio_player.stop();
                         app.audio = AudioHolder::None;

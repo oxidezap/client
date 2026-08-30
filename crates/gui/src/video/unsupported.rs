@@ -103,6 +103,14 @@ pub struct StreamingVideoDecoder {
     /// every later poll then saw the index as already current and returned —
     /// so a scrub stopped on the frame the replay started at.
     shown_stamp: Option<i32>,
+    /// Why the codec session could not be opened again, if it could not.
+    ///
+    /// A rebuild failure is not the decoder's own failure, because there is
+    /// no decoder to hold it: `failure()` asks the session, and after a
+    /// release there is none to ask. Logged alone, the player went on
+    /// thinking itself playable, kept the frame it had, and waited for a
+    /// picture nothing was going to produce. Cleared by a rebuild that works.
+    rebuild_failed: Option<String>,
     current_frame: Option<StreamingFrame>,
     audio: Option<VideoAudio>,
 }
@@ -145,6 +153,7 @@ impl StreamingVideoDecoder {
             last_fed_index: -1,
             needs_parameter_sets: true,
             shown_stamp: None,
+            rebuild_failed: None,
             current_frame: None,
             audio: prepared.audio,
         })
@@ -165,10 +174,13 @@ impl StreamingVideoDecoder {
                     self.last_fed_index = -1;
                     self.needs_parameter_sets = true;
                     self.shown_stamp = None;
+                    self.rebuild_failed = None;
                     self.decoder = Some(built);
                 }
                 Err(e) => {
                     log::warn!("could not open a decoder for this video again: {e}");
+                    self.rebuild_failed =
+                        Some(format!("this video could not be opened again: {e}"));
                     return None;
                 }
             }
@@ -183,6 +195,8 @@ impl StreamingVideoDecoder {
     /// goes, so a conversation full of clips does not hold one each.
     pub fn release(&mut self) {
         self.decoder = None;
+        // A release is not a failure, and the next play is entitled to try.
+        self.rebuild_failed = None;
         self.last_fed_index = -1;
         self.needs_parameter_sets = true;
         self.shown_stamp = None;
@@ -498,7 +512,10 @@ impl StreamingVideoDecoder {
     /// that would not complete — otherwise leaves it playing with no picture
     /// and nothing to say.
     pub fn failure(&self) -> Option<String> {
-        self.decoder.as_ref().and_then(webcodecs::Decoder::failure)
+        // The rebuild first, because it is the case with no decoder to ask.
+        self.rebuild_failed
+            .clone()
+            .or_else(|| self.decoder.as_ref().and_then(webcodecs::Decoder::failure))
     }
 
     /// The newest decoded frame, if one has arrived yet.
