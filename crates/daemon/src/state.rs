@@ -183,6 +183,14 @@ pub struct StateHub {
     /// A TUI or a notifier attached to summaries would otherwise make
     /// [`crate::window::show`] believe there was a window to raise.
     windows: std::sync::atomic::AtomicUsize,
+    /// Which account this is, counted up every time one leaves.
+    ///
+    /// A store read is answered from a task of its own, so a page of the old
+    /// account's chats can still be in flight when the account goes. Landing
+    /// afterwards it would put those summaries back into a hub that had just
+    /// been emptied, where the next pairing's first snapshot carries them.
+    /// A task reads this before it asks and again before it applies.
+    account: std::sync::atomic::AtomicUsize,
 }
 
 /// One attached client that owns a window, counted while it is connected.
@@ -225,6 +233,7 @@ impl StateHub {
             video,
             tray,
             windows: std::sync::atomic::AtomicUsize::new(0),
+            account: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -366,6 +375,14 @@ impl StateHub {
         inner.account = None;
         inner.calls = oxidezap_core::CallState::new();
         inner.version = inner.version.next();
+        self.account
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Which account the hub is holding, for a task that has to outlive its
+    /// own answer. See [`Self::forget_account`].
+    pub fn account_generation(&self) -> usize {
+        self.account.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Record what the plugins are now, and tell everyone.
@@ -726,6 +743,25 @@ mod tests {
                 group_jid: None,
             })
             .build()
+    }
+
+    /// A store read is answered from a task of its own, so a page of the old
+    /// account's chats can be in flight when the account goes. The task reads
+    /// this before it applies; without it, the summaries it carries land in a
+    /// hub that has just been emptied and the next pairing's first snapshot
+    /// hands them to a window.
+    #[test]
+    fn an_account_leaving_is_something_a_late_answer_can_tell() {
+        let hub = StateHub::new();
+        let before = hub.account_generation();
+
+        hub.forget_account();
+
+        assert_ne!(
+            hub.account_generation(),
+            before,
+            "a page asked for under the old account must be able to say so"
+        );
     }
 
     /// A window can attach before there is an account to name: during

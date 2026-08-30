@@ -763,6 +763,12 @@ impl Bridge {
                     limit.map_or(WhatsAppClient::MESSAGE_PAGE, i64::from),
                 );
                 let reads = Arc::clone(&self.reads);
+                // Which account asked. A page of the old one's history
+                // landing after it left would be folded into a tracker that
+                // had just forgotten it, and the next account would carry the
+                // previous one's boundaries. See [`StateHub::forget_account`].
+                let asked_as = self.hub.account_generation();
+                let hub = Arc::clone(&self.hub);
                 oxidezap_session::spawn(async move {
                     let answer = match page.await {
                         Ok(Ok(mut page)) => {
@@ -777,7 +783,7 @@ impl Bridge {
                             // window naming a message from a page nobody told
                             // the daemon about is refused, and the badge comes
                             // back on the next hydration.
-                            {
+                            if hub.account_generation() == asked_as {
                                 let mut reads =
                                     reads.lock().unwrap_or_else(|held| held.into_inner());
                                 for message in &page.items {
@@ -811,10 +817,14 @@ impl Bridge {
                 );
                 let reads = Arc::clone(&self.reads);
                 let hub = Arc::clone(&self.hub);
+                // As above: a page of the departed account's chats must not
+                // be put back into a hub that has just been emptied of it.
+                let asked_as = hub.account_generation();
                 oxidezap_session::spawn(async move {
                     let answer = match page.await {
                         Ok(Ok(mut page)) => {
                             let epoch = crate::media::epoch();
+                            let still_ours = hub.account_generation() == asked_as;
                             // The same rule. A chat past the attach window is
                             // in no snapshot, and a read for one is refused
                             // with "no such chat" until this side has been
@@ -827,6 +837,9 @@ impl Bridge {
                             // back on the next hydration.
                             for chat in &mut page.items {
                                 externalize_messages(epoch, &mut chat.messages);
+                                if !still_ours {
+                                    continue;
+                                }
                                 let mut reads =
                                     reads.lock().unwrap_or_else(|held| held.into_inner());
                                 for message in &chat.messages {
