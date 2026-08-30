@@ -117,7 +117,13 @@ pub fn apply(level: LogLevel) {
     // Both, and in this order. `set_max_level` is what `log`'s macros check
     // before they build a record at all, so a level raised without it costs
     // nothing and changes nothing.
-    log::set_max_level(level.filter());
+    //
+    // And never below what `RUST_LOG` named a target for: that maximum is
+    // checked before a record exists and knows no targets, so a process at
+    // `info` with `RUST_LOG=oxidezap_session=debug` would drop the debug
+    // records at the macro and never reach the filter that wants them. The
+    // logger is still what decides which of them are written.
+    log::set_max_level(level.filter().max(imp::named_ceiling()));
 }
 
 /// Write the choice down, so the next start makes it again.
@@ -144,6 +150,8 @@ pub fn set(level: LogLevel) -> Result<(), String> {
 
 #[cfg(not(target_family = "wasm"))]
 mod imp {
+    use std::sync::OnceLock;
+
     use super::LogLevel;
 
     /// What a desktop reads a level out of.
@@ -175,6 +183,52 @@ mod imp {
             .next_back()
     }
 
+    /// A `target=level` directive out of `RUST_LOG`, as this module needs to
+    /// read them itself.
+    ///
+    /// `env_filter` parses these too and answers with them, and that answer
+    /// is still what runs — this second reading exists only to know *that* a
+    /// target was named, which is a question its `Filter` does not expose.
+    /// See [`Dynamic::named`] for why the difference matters.
+    fn named_targets(directives: &str) -> Vec<(String, log::LevelFilter)> {
+        directives
+            .split(',')
+            // The regex half of a filter (`directives/regex`) is the inner
+            // logger's business and never a target's name.
+            .filter_map(|directive| directive.split('/').next())
+            .filter_map(|directive| directive.split_once('='))
+            .filter_map(|(target, level)| {
+                let target = target.trim();
+                // A bare `=level` names nothing, and neither does a level
+                // this crate cannot read.
+                (!target.is_empty())
+                    .then(|| Some((target.to_string(), level.trim().parse().ok()?)))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// The loudest level `RUST_LOG` named a target for.
+    ///
+    /// `Off` when it named none, which is the ordinary case. Read on every
+    /// [`apply`](super::apply) and so memoized — the environment cannot
+    /// change under a running process in any way this crate would honour,
+    /// since the filter was built from it once.
+    pub(super) fn named_ceiling() -> log::LevelFilter {
+        static CEILING: OnceLock<log::LevelFilter> = OnceLock::new();
+        *CEILING.get_or_init(|| {
+            directives()
+                .map(|directives| {
+                    named_targets(&directives)
+                        .into_iter()
+                        .map(|(_, level)| level)
+                        .max()
+                        .unwrap_or(log::LevelFilter::Off)
+                })
+                .unwrap_or(log::LevelFilter::Off)
+        })
+    }
+
     pub(super) fn install(quiet: &'static [&'static str]) {
         let mut builder = env_logger::Builder::new();
         // Floors first, environment second. A later directive replaces an
@@ -185,21 +239,26 @@ mod imp {
         for module in quiet {
             builder.filter_module(module, log::LevelFilter::Warn);
         }
-        if let Some(directives) = directives() {
-            builder.parse_filters(&directives);
-        }
+        let named = match directives() {
+            Some(directives) => {
+                builder.parse_filters(&directives);
+                named_targets(&directives)
+            }
+            None => Vec::new(),
+        };
         // And the global level is ours, not this filter's. That is the whole
         // reason there is a logger here rather than `env_logger::init`: a
         // filter built at startup answers with the level it was built with
         // forever, so a level raised at runtime was refused underneath
         // `log`'s own maximum, which had already let it through. Trace here
-        // means the inner logger only ever answers the per-module question;
-        // `LEVEL` answers the other one, and the `RUST_LOG` level it was
-        // built from is still honoured — as this run's starting value, in
-        // `activate`.
+        // leaves the inner filter answering only the per-target question —
+        // the floors, the `RUST_LOG` directives and its regex — and `LEVEL`
+        // answers the other one. The `RUST_LOG` level this was built from is
+        // still honoured, as this run's starting value in `activate`.
         builder.filter_level(log::LevelFilter::Trace);
         let logger = Dynamic {
             inner: builder.build(),
+            named,
         };
         // A refusal means somebody has already installed a logger, which in
         // this process would be a bug rather than a condition to handle —
@@ -208,23 +267,59 @@ mod imp {
         let _ = log::set_boxed_logger(Box::new(logger));
     }
 
-    /// `env_logger`'s formatting and per-module filter, under a level that
+    /// `env_logger`'s formatting and per-target filter, under a level that
     /// can move.
     struct Dynamic {
         inner: env_logger::Logger,
+        /// The targets `RUST_LOG` named, and how loud each was asked to be.
+        named: Vec<(String, log::LevelFilter)>,
+    }
+
+    impl Dynamic {
+        /// Whether `RUST_LOG` asked for this record by name.
+        ///
+        /// The dynamic level is a gate over everything *nobody named*, and
+        /// only that. `RUST_LOG=oxidezap_session=debug` says how loud one
+        /// target should be and nothing about how loud the process is — so
+        /// it leaves `forced` empty and the stored choice in force, and a
+        /// gate that treated the stored choice as a ceiling would refuse the
+        /// very records that directive was written to see. The inner filter
+        /// already answers such a target correctly; this is what lets the
+        /// answer through.
+        ///
+        /// Longest prefix wins, which is `env_filter`'s own rule: a
+        /// directive for `oxidezap_session` and one for
+        /// `oxidezap_session::whatsapp` are two answers about one record, and
+        /// the more specific one is the one that was meant.
+        fn named(&self, metadata: &log::Metadata<'_>) -> bool {
+            let target = metadata.target();
+            self.named
+                .iter()
+                .filter(|(name, _)| target == name || target.starts_with(&format!("{name}::")))
+                .max_by_key(|(name, _)| name.len())
+                .is_some_and(|(_, level)| metadata.level() <= *level)
+        }
+
+        /// Whether the level in force lets this record through.
+        ///
+        /// Two questions, and the inner filter answers the other one: what a
+        /// target was *held down* to. Both have to say yes.
+        fn allowed(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= super::current().filter() || self.named(metadata)
+        }
     }
 
     impl log::Log for Dynamic {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= super::current().filter() && self.inner.enabled(metadata)
+            self.allowed(metadata) && self.inner.enabled(metadata)
         }
 
         fn log(&self, record: &log::Record<'_>) {
-            if record.level() > super::current().filter() {
+            if !self.allowed(record.metadata()) {
                 return;
             }
             // The inner logger checks its own filter, which is where the
-            // module floors live.
+            // floors, the `RUST_LOG` directives and its regex live.
             self.inner.log(record);
         }
 
@@ -235,7 +330,7 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{LogLevel, global_level};
+        use super::{LogLevel, global_level, named_targets};
 
         /// The level with no module on it is the global one, and the last
         /// wins — which is `env_filter`'s rule, not one invented here.
@@ -247,6 +342,27 @@ mod imp {
                 Some(LogLevel::Warn)
             );
             assert_eq!(global_level("info,debug"), Some(LogLevel::Debug));
+        }
+
+        /// A target named in `RUST_LOG` is one the dynamic gate has to let
+        /// through, so it has to be recognised as named — including when it
+        /// arrives beside a global level or a regex.
+        #[test]
+        fn the_targets_a_filter_names_are_read_back() {
+            assert_eq!(
+                named_targets("info,oxidezap_session=debug"),
+                vec![("oxidezap_session".to_string(), log::LevelFilter::Debug)]
+            );
+            assert_eq!(
+                named_targets("gpui=warn,naga=off/some regex"),
+                vec![
+                    ("gpui".to_string(), log::LevelFilter::Warn),
+                    ("naga".to_string(), log::LevelFilter::Off),
+                ]
+            );
+            // A bare level names nothing, and neither does an unreadable one.
+            assert!(named_targets("debug").is_empty());
+            assert!(named_targets("gpui=verbose").is_empty());
         }
 
         /// A filter that only names targets says nothing about how loud the
@@ -300,6 +416,12 @@ mod imp {
         // An unreadable value is no answer rather than an error: this runs
         // before there is anywhere to report one.
         parameter("log")?.parse().ok()
+    }
+
+    /// A page has no per-target filter to raise anything above the level in
+    /// force: `?log=` is one level for everything.
+    pub(super) const fn named_ceiling() -> log::LevelFilter {
+        log::LevelFilter::Off
     }
 
     /// One `name=value` out of the page's query string.
