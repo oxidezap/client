@@ -172,6 +172,22 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
         match decoder.decode(&packet) {
             Ok(decoded) => {
                 decoded.copy_to_vec_interleaved(&mut frame);
+                // The bound above is on the *packets*, and this is where the
+                // cost actually is: an AAC packet is a few hundred bytes and
+                // decodes to 1024 samples a channel, so a low-bitrate track
+                // inside every ceiling so far still expands into billions of
+                // `f32`. Truncated rather than refused, which is what this
+                // function already does with a frame it cannot describe: a
+                // video with its first hours of sound is better than a tab
+                // that aborted opening it.
+                if all_samples.len() + frame.len() > MAX_DECODED_SAMPLES {
+                    log::warn!(
+                        "truncating a video's audio at {} samples: the track decodes to more \
+                         than this build will hold",
+                        all_samples.len()
+                    );
+                    break;
+                }
                 all_samples.extend_from_slice(&frame);
             }
             Err(e) => {
@@ -212,6 +228,20 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
         sample_rate,
     })
 }
+
+/// The most decoded audio a video attachment may expand into.
+///
+/// The packet ceiling is not this one, and the difference is the whole
+/// reason both exist: a packet is a few hundred bytes of metadata and
+/// decodes to 1024 samples per channel, so a track that satisfies every
+/// bound on the *compressed* side still expands by three orders of
+/// magnitude. On the web that is a linear memory with a fixed roof, where
+/// running out aborts rather than fails.
+///
+/// Ten minutes of stereo at 48 kHz, interleaved, which is 230 MB of `f32`
+/// and far past any video anybody sends through a chat. The retained copy
+/// is mono and so half of it.
+const MAX_DECODED_SAMPLES: usize = 48_000 * 2 * 600;
 
 /// The largest an ADTS frame may say it is: the length field is 13 bits.
 const MAX_ADTS_FRAME: usize = (1 << 13) - 1;
@@ -268,7 +298,37 @@ fn wrap_aac_as_adts(frames: &[Vec<u8>], sample_rate: u32, channels: u8) -> Vec<u
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ADTS_FRAME, wrap_aac_as_adts};
+    use super::{MAX_ADTS_FRAME, MAX_DECODED_SAMPLES, wrap_aac_as_adts};
+
+    /// The compressed ceiling is not the decoded one, and the gap between
+    /// them is why both exist.
+    ///
+    /// Bounding the packet count bounds the metadata. It says nothing about
+    /// what those packets expand into: an AAC packet is a few hundred bytes
+    /// and decodes to 1024 samples a channel, so a track satisfying every
+    /// bound on the compressed side still grows by three orders of magnitude.
+    /// Written down as a test because this is the second ceiling that turned
+    /// out to be measuring the wrong thing, and the next reader deserves the
+    /// arithmetic rather than the conclusion.
+    #[test]
+    fn the_packet_ceiling_does_not_bound_what_the_packets_decode_to() {
+        // What the packet ceiling alone would allow, at one AAC frame's worth
+        // of stereo output per packet: two billion `f32`, which is eight
+        // gigabytes and something like thirty-five times the decoded bound.
+        let unbounded = super::super::demux::MAX_TRACK_SAMPLES * 1024 * 2;
+        assert!(
+            unbounded > MAX_DECODED_SAMPLES * 10,
+            "the decoded ceiling has to be the binding one by a wide margin: \
+             {unbounded} against {MAX_DECODED_SAMPLES}"
+        );
+
+        // And it is a size somebody can hold: well under a gigabyte of `f32`.
+        let bytes = MAX_DECODED_SAMPLES * std::mem::size_of::<f32>();
+        assert!(
+            bytes < 512 * 1024 * 1024,
+            "{bytes} bytes is too much to hold"
+        );
+    }
 
     /// The `aac_frame_length` field is 13 bits and the masks that build it
     /// drop what does not fit, so an oversized frame produced a header
