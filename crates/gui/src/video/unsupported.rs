@@ -37,8 +37,7 @@ use mp4::{Mp4Reader, TrackType};
 
 use super::audio::VideoAudio;
 use super::demux::{
-    H264Sample, avcc_to_annexb, build_sps_pps_annexb, is_keyframe, keyframe_at_or_before,
-    stamp_micros,
+    H264Sample, avcc_to_annexb, build_sps_pps_annexb, is_keyframe, keyframe_at_or_before, stamp_of,
 };
 use super::geometry::Rotation;
 use super::webcodecs;
@@ -316,11 +315,8 @@ impl StreamingVideoDecoder {
             } else {
                 sample.data.clone()
             };
-            self.decoder.decode(
-                &unit,
-                stamp_micros(index, self.frame_duration),
-                sample.is_keyframe,
-            );
+            self.decoder
+                .decode(&unit, stamp_of(index), sample.is_keyframe);
             self.last_fed_index = index as i32;
         }
         self.collect();
@@ -341,25 +337,16 @@ impl StreamingVideoDecoder {
             return;
         }
         self.shown_stamp = Some(stamp);
+        // The stamp *is* the index, so nothing has to be inverted. The
+        // position shown is computed from it rather than carried on the
+        // picture, because a WebCodecs timestamp is a label and this one is
+        // deliberately not a clock.
+        let index = usize::try_from(stamp.max(0)).unwrap_or(0);
         self.current_frame = Some(StreamingFrame {
             image: picture.image,
-            timestamp: Duration::from_micros(picture.timestamp_micros.max(0) as u64),
-            index: self.index_of(stamp),
+            timestamp: self.frame_duration.mul_f64(index as f64),
+            index: index.min(self.samples.len().saturating_sub(1)),
         });
-    }
-
-    /// Which sample a stamp came from.
-    ///
-    /// The inverse of `stamp_micros`, and rounded rather than divided exactly
-    /// because a decoder may hand back the timestamp it was given or one it
-    /// derived. Clamped to the samples that exist.
-    fn index_of(&self, stamp: i32) -> usize {
-        let per_frame = self.frame_duration.as_secs_f64() * 1_000_000.0;
-        if per_frame <= 0.0 {
-            return 0;
-        }
-        let index = (f64::from(stamp) / per_frame).round().max(0.0) as usize;
-        index.min(self.samples.len().saturating_sub(1))
     }
 
     /// Why the decoder stopped, if it has.

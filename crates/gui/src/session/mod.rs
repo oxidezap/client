@@ -256,6 +256,27 @@ impl Awaiting {
 
 type Pending = Arc<Mutex<HashMap<RequestId, Awaiting>>>;
 
+/// Frames waiting for a staged payload ahead of them.
+///
+/// `serve_client` reads frames in arrival order and the request id only
+/// correlates the *answer*, so the order they are written in is the order
+/// things happen in. A staged send is written from its upload's completion,
+/// which means anything sent meanwhile would otherwise overtake it: finish a
+/// voice note, type a line, and the recipient reads the line first.
+///
+/// So while a staging is in flight everything queues behind it. On a desktop
+/// staging completes before the call that started it returns, so `holding` is
+/// raised and cleared inside one call and nothing ever queues.
+#[derive(Default)]
+struct Outbox {
+    /// How many staged sends have not yet been written.
+    holding: usize,
+    /// Serialized frames waiting for them, oldest first.
+    waiting: std::collections::VecDeque<Vec<u8>>,
+}
+
+type Sending = Arc<Mutex<Outbox>>;
+
 /// What ends this connection's reader when the connection is dropped.
 ///
 /// The read half is not the writer's to drop: it belongs to whatever the
@@ -295,6 +316,8 @@ pub struct Session {
     /// other one, and the two are used at the same time.
     link: Link,
     pending: Pending,
+    /// Keeps the wire in the order the person acted in. See [`Outbox`].
+    outbox: Sending,
     next_id: AtomicU64,
     /// Where the bytes a frame only names live.
     ///
@@ -405,6 +428,7 @@ impl Session {
         Self {
             link,
             pending: Pending::default(),
+            outbox: Sending::default(),
             next_id: AtomicU64::new(1),
             media,
             events,
@@ -474,7 +498,7 @@ impl Session {
 
     fn send_frame(&self, request: &Request) -> std::io::Result<()> {
         let frame = serde_json::to_vec(request).map_err(std::io::Error::other)?;
-        self.link.send_line(&frame)
+        write_or_queue(&self.link, &self.outbox, frame)
     }
 
     /// Send and log rather than propagate.
@@ -493,11 +517,13 @@ impl Session {
         let id = self.reserve(waiting);
         deliver(
             &self.link,
+            &self.outbox,
             &self.pending,
             &self.events,
             &self.media,
             id,
             request,
+            Delivery::Ordinary,
         );
         id
     }
@@ -574,7 +600,14 @@ impl Session {
             local_id,
             staged: Some(upload.clone()),
         });
+        // Claimed before the upload begins, so anything sent while it runs
+        // queues behind it rather than overtaking it on the wire.
+        self.outbox
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .holding += 1;
         let link = self.link.clone();
+        let outbox = Arc::clone(&self.outbox);
         let pending = Arc::clone(&self.pending);
         let events = self.events.clone();
         let media = Arc::clone(&self.media);
@@ -582,14 +615,28 @@ impl Session {
             &upload,
             audio,
             Box::new(move |staged| match staged {
-                Ok(()) => deliver(&link, &pending, &events, &media, id, request),
-                Err(e) => fail_reserved(
+                Ok(()) => deliver(
+                    &link,
+                    &outbox,
                     &pending,
                     &events,
                     &media,
                     id,
-                    format!("could not stage the recording: {e}"),
+                    request,
+                    Delivery::Staged,
                 ),
+                Err(e) => {
+                    // The queue behind this send is waiting on a frame that
+                    // is never going to be written.
+                    let _ = release(&link, &outbox, None);
+                    fail_reserved(
+                        &pending,
+                        &events,
+                        &media,
+                        id,
+                        format!("could not stage the recording: {e}"),
+                    );
+                }
             }),
         );
     }
@@ -832,6 +879,58 @@ impl Session {
     }
 }
 
+/// Write a frame, or hold it behind a staged send that has not gone yet.
+///
+/// See [`Outbox`]: the wire's order is the order things happen in, so nothing
+/// may overtake a send that is waiting on its payload.
+fn write_or_queue(link: &Link, outbox: &Sending, frame: Vec<u8>) -> std::io::Result<()> {
+    {
+        let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
+        if outbox.holding > 0 {
+            outbox.waiting.push_back(frame);
+            return Ok(());
+        }
+    }
+    link.send_line(&frame)
+}
+
+/// Write a staged send's frame and release whatever queued behind it.
+///
+/// The queue is drained after this frame and in order, which is the whole
+/// point; a write that fails takes the rest with it, because they were
+/// waiting on a connection that has gone.
+fn release(link: &Link, outbox: &Sending, frame: Option<Vec<u8>>) -> std::io::Result<()> {
+    let mut queued = {
+        let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
+        outbox.holding = outbox.holding.saturating_sub(1);
+        if outbox.holding > 0 {
+            // Another staged send is still ahead of the rest.
+            return frame.map_or(Ok(()), |frame| {
+                outbox.waiting.push_front(frame);
+                Ok(())
+            });
+        }
+        std::mem::take(&mut outbox.waiting)
+    };
+    if let Some(frame) = frame {
+        queued.push_front(frame);
+    }
+    for frame in queued {
+        link.send_line(&frame)?;
+    }
+    Ok(())
+}
+
+/// Whether this frame is the one the outbox is holding for.
+///
+/// A staged send *is* the head of the queue and releases what is behind it; an
+/// ordinary one queues like anything else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Ordinary,
+    Staged,
+}
+
 /// Write a reserved request's frame, and answer for it if it will not go.
 ///
 /// A free function rather than a method because the staged path sends from a
@@ -840,11 +939,13 @@ impl Session {
 /// the part that must not drift.
 fn deliver(
     link: &Link,
+    outbox: &Sending,
     pending: &Pending,
     events: &EventSink,
     media: &Arc<dyn MediaCache>,
     id: RequestId,
     request: ClientRequest,
+    how: Delivery,
 ) {
     // Still ours to send. A staged request is delivered from the upload's
     // completion, and the connection can end in between — `Frames::finish`
@@ -857,6 +958,10 @@ fn deliver(
         .unwrap_or_else(|e| e.into_inner())
         .contains_key(&id)
     {
+        // Nothing to send, but the queue behind it is still waiting.
+        if how == Delivery::Staged {
+            let _ = release(link, outbox, None);
+        }
         return;
     }
     let frame = match serde_json::to_vec(&Request {
@@ -865,11 +970,18 @@ fn deliver(
     }) {
         Ok(frame) => frame,
         Err(e) => {
+            if how == Delivery::Staged {
+                let _ = release(link, outbox, None);
+            }
             fail_reserved(pending, events, media, id, format!("unserializable: {e}"));
             return;
         }
     };
-    if let Err(e) = link.send_line(&frame) {
+    let written = match how {
+        Delivery::Staged => release(link, outbox, Some(frame)),
+        Delivery::Ordinary => write_or_queue(link, outbox, frame),
+    };
+    if let Err(e) = written {
         error!("could not reach the daemon: {e}");
         fail_reserved(
             pending,
@@ -955,6 +1067,57 @@ fn sanitize(id: &str) -> String {
 mod tests {
     use super::*;
     use oxidezap_core::MediaContent;
+
+    /// A staged send holds the wire until its payload has gone.
+    ///
+    /// The order frames are written in is the order things happen in, so a
+    /// line typed while a voice note is uploading must not reach the
+    /// recipient first.
+    #[test]
+    fn nothing_overtakes_a_send_that_is_still_staging() {
+        let outbox = Sending::default();
+        outbox.lock().expect("fresh lock").holding += 1;
+
+        // Two ordinary frames while the staging is in flight.
+        let mut held = outbox.lock().expect("fresh lock");
+        assert_eq!(held.holding, 1);
+        held.waiting.push_back(b"text-one".to_vec());
+        held.waiting.push_back(b"text-two".to_vec());
+        drop(held);
+
+        // The staged frame goes first, then the two in the order they were
+        // asked for.
+        let mut released = {
+            let mut held = outbox.lock().expect("fresh lock");
+            held.holding -= 1;
+            std::mem::take(&mut held.waiting)
+        };
+        released.push_front(b"voice-note".to_vec());
+        assert_eq!(
+            released.into_iter().collect::<Vec<_>>(),
+            vec![
+                b"voice-note".to_vec(),
+                b"text-one".to_vec(),
+                b"text-two".to_vec()
+            ]
+        );
+    }
+
+    /// A second staged send keeps the queue closed: releasing one of two must
+    /// not let the rest past the other.
+    #[test]
+    fn two_staged_sends_both_have_to_land_before_the_queue_drains() {
+        let outbox = Sending::default();
+        {
+            let mut held = outbox.lock().expect("fresh lock");
+            held.holding = 2;
+            held.waiting.push_back(b"text".to_vec());
+        }
+        let mut held = outbox.lock().expect("fresh lock");
+        held.holding -= 1;
+        assert_eq!(held.holding, 1, "one staged send is still outstanding");
+        assert_eq!(held.waiting.len(), 1, "so the queue stays closed");
+    }
 
     /// The recording's key is a local id, which the front end composes; it
     /// still has to be a plain file name.

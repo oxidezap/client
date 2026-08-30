@@ -96,20 +96,20 @@ pub(super) fn keyframe_at_or_before(samples: &[H264Sample], index: usize) -> usi
         .unwrap_or(0)
 }
 
-/// The microsecond stamp a sample is fed under.
+/// The stamp a sample is fed under, which is its own index.
 ///
-/// Derived from the index so a decoder's output can be mapped back to one.
-/// Saturating because the WebCodecs binding takes an `i32`, which runs out at
-/// about half an hour: past that the stamp stops being unique, and the newest
-/// picture is whatever came last, which is what the slot would have answered
-/// anyway.
-pub(super) fn stamp_micros(index: usize, frame_duration: std::time::Duration) -> i32 {
-    let micros = index as f64 * frame_duration.as_secs_f64() * 1_000_000.0;
-    if micros >= f64::from(i32::MAX) {
-        i32::MAX
-    } else {
-        micros as i32
-    }
+/// A WebCodecs timestamp is a label rather than a clock — nothing but this
+/// side reads it — so the index is the one value that stays unique for the
+/// whole track. Microseconds would not: the binding takes an `i32`, which
+/// runs out around thirty-six minutes, and every frame past that would carry
+/// the same stamp. A reader keying on the stamp to tell one picture from the
+/// next then sees them all as the same picture and freezes on the first,
+/// while playback goes on advancing.
+///
+/// The displayed position is computed from the index instead; see
+/// `StreamingFrame::timestamp`.
+pub(super) fn stamp_of(index: usize) -> i32 {
+    i32::try_from(index).unwrap_or(i32::MAX)
 }
 
 #[cfg(test)]
@@ -160,7 +160,6 @@ mod tests {
 #[cfg(test)]
 mod seek_tests {
     use super::*;
-    use std::time::Duration;
 
     fn samples(keyframes: &[bool]) -> Vec<H264Sample> {
         keyframes
@@ -191,13 +190,17 @@ mod seek_tests {
         );
     }
 
-    /// The stamp maps a decoded picture back to a sample and must not wrap:
-    /// an i32 of microseconds runs out at about half an hour.
+    /// The stamp is what tells one decoded picture from the next, so it has
+    /// to stay unique for the whole track. Microseconds in an `i32` do not:
+    /// they run out around thirty-six minutes and every later frame would
+    /// carry the same one.
     #[test]
-    fn a_long_video_saturates_rather_than_wrapping() {
-        let frame = Duration::from_secs_f64(1.0 / 30.0);
-        assert_eq!(stamp_micros(0, frame), 0);
-        assert!(stamp_micros(30, frame) > 0);
-        assert_eq!(stamp_micros(usize::MAX, frame), i32::MAX);
+    fn every_sample_of_a_long_video_has_its_own_stamp() {
+        assert_eq!(stamp_of(0), 0);
+        assert_eq!(stamp_of(1), 1);
+        // Half an hour at 30fps, where a microsecond stamp would already be
+        // within sight of its ceiling.
+        assert_eq!(stamp_of(54_000), 54_000);
+        assert_ne!(stamp_of(54_000), stamp_of(54_001));
     }
 }

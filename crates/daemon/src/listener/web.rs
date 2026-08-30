@@ -90,6 +90,27 @@ const MAX_HEAD: usize = 16 * 1024;
 /// through here — a voice note or a photo, never a film.
 const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How long a staged payload has to arrive once its head has been read.
+///
+/// The head has [`HEAD_TIMEOUT`]; the body needs its own, and for a sharper
+/// reason: this read holds a [`MAX_PENDING`] permit *and* a buffer of the
+/// declared size while it waits. A client killed mid-upload — no attacker
+/// required — otherwise parks both until the process ends, and enough of them
+/// leave the daemon refusing every new connection including a front end's.
+const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many payloads may be in memory at once.
+///
+/// The per-payload ceiling bounds one upload and [`MAX_PENDING`] bounds the
+/// connections, so without this the product is what the process holding the
+/// account can be made to hold. `serve_media` streams for exactly this reason
+/// and staging cannot, so it gets a bound instead.
+const MAX_CONCURRENT_UPLOADS: usize = 4;
+
+/// The permits [`MAX_CONCURRENT_UPLOADS`] hands out.
+static UPLOAD_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_UPLOADS);
+
 /// How many connections may be *waiting to say who they are*.
 ///
 /// [`ClientSlots`] counts front ends, and a front end is something that has
@@ -604,11 +625,26 @@ async fn receive_media(
     // Checked above; named here because the read below needs the number.
     let length = length.unwrap_or(0);
 
+    // One at a time, up to the bound: this is the read that holds a payload in
+    // the daemon's memory, and the permit is taken before the buffer exists.
+    let Ok(_slot) = UPLOAD_SLOTS.try_acquire() else {
+        log::warn!("refusing an upload to {key}: too many already in flight");
+        return respond(
+            stream.get_mut(),
+            503,
+            "text/plain",
+            origin,
+            b"too many uploads in flight",
+        )
+        .await;
+    };
+
     // Exactly the declared length, so a client that promises less than it
     // sends leaves the surplus in the socket rather than in the file, and one
     // that promises more is cut off by the read rather than trusted.
     let mut body = vec![0u8; usize::try_from(length).unwrap_or(0)];
-    if let Err(e) = stream.read_exact(&mut body).await {
+    let read = tokio::time::timeout(BODY_TIMEOUT, stream.read_exact(&mut body)).await;
+    if let Err(e) = read.map_err(std::io::Error::from).and_then(|inner| inner) {
         log::warn!("an upload to {key} ended early: {e}");
         return respond(
             stream.get_mut(),
@@ -633,8 +669,21 @@ async fn receive_media(
         )
         .await;
     }
-    if let Err(e) = tokio::fs::write(&path, &body).await {
+    // Written beside the target and renamed onto it. Reading the whole body
+    // first stops a short *client* from leaving a partial file; it does not
+    // stop a crash or a full disk part way through the write, and what that
+    // leaves is a valid-looking key holding a truncated voice note, which the
+    // daemon then opens when it handles the send. A rename within one
+    // directory is atomic, so the key holds the whole payload or nothing.
+    let partial = path.with_extension("partial");
+    let staged = async {
+        tokio::fs::write(&partial, &body).await?;
+        tokio::fs::rename(&partial, &path).await
+    }
+    .await;
+    if let Err(e) = staged {
         log::error!("could not stage {key}: {e}");
+        let _ = tokio::fs::remove_file(&partial).await;
         return respond(
             stream.get_mut(),
             500,
@@ -655,7 +704,7 @@ async fn receive_media(
 /// not there, because the caller is discarding rather than asking.
 async fn discard_media(stream: &mut TcpStream, key: &str, origin: Option<&str>) -> Result<()> {
     let key = percent_decode(key);
-    if !key.starts_with("u-") {
+    if !is_staged(&key) {
         log::warn!("refusing to discard {key}: only staged payloads may be removed");
         return respond(
             stream,
@@ -683,12 +732,21 @@ async fn discard_media(stream: &mut TcpStream, key: &str, origin: Option<&str>) 
 /// prefix is what keeps a caller out of the daemon's own cache, and the
 /// length is what keeps an upload from being unbounded. A guard worth having
 /// is a guard worth testing without a socket.
+/// Whether this key names a payload a caller staged, and may therefore write
+/// or remove.
+///
+/// `f-` and `d-` are the daemon's own cache of what it fetched and can fetch
+/// again; those are not a caller's to replace or delete.
+fn is_staged(key: &str) -> bool {
+    key.starts_with("u-")
+}
+
 fn staging_refusal(key: &str, length: Option<u64>) -> Option<(u16, &'static str)> {
     // `f-` and `d-` are the daemon's cache of what it fetched and can fetch
     // again; writing those would let a caller replace the bytes behind a
     // photo already on screen. `u-` is a payload whose only copy is the one
     // being sent, and nothing else writes there.
-    if !key.starts_with("u-") {
+    if !is_staged(key) {
         return Some((403, "only staged payloads may be written"));
     }
     let Some(length) = length else {
@@ -1085,10 +1143,10 @@ mod tests {
     /// is not a caller's to delete either.
     #[test]
     fn only_staged_keys_may_be_discarded() {
-        for key in ["f-abc", "d-abc", "abc"] {
-            assert!(!key.starts_with("u-"), "{key} should not be removable");
+        for key in ["f-abc", "d-abc", "abc", "approvals"] {
+            assert!(!is_staged(key), "{key} should not be removable");
         }
-        assert!("u-abc".starts_with("u-"));
+        assert!(is_staged("u-abc"));
     }
 
     /// The check this endpoint exists behind. A WebSocket is not subject to

@@ -94,12 +94,55 @@ struct Teardown {
 
 impl Drop for Teardown {
     fn drop(&mut self) {
-        for track in self.stream.get_tracks().iter() {
-            if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
-                track.stop();
-            }
-        }
+        stop_tracks(&self.stream);
         let _ = self.context.close();
+    }
+}
+
+/// Stops the tracks it holds unless the recording took them.
+///
+/// Between `getUserMedia` answering and the graph being wired there are four
+/// fallible steps, and on every one of them the microphone is already live.
+struct Tracks(web_sys::MediaStream);
+
+impl Tracks {
+    /// Hand the stream over to something that will close it.
+    fn disarm(self) -> web_sys::MediaStream {
+        let stream = self.0.clone();
+        std::mem::forget(self);
+        stream
+    }
+}
+
+impl Drop for Tracks {
+    fn drop(&mut self) {
+        stop_tracks(&self.0);
+    }
+}
+
+/// The same for the context, which holds the hardware open in its own right.
+struct Closing(web_sys::AudioContext);
+
+impl Closing {
+    fn disarm(self) -> web_sys::AudioContext {
+        let context = self.0.clone();
+        std::mem::forget(self);
+        context
+    }
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        let _ = self.0.close();
+    }
+}
+
+/// Stop every track of a capture stream.
+fn stop_tracks(stream: &web_sys::MediaStream) {
+    for track in stream.get_tracks().iter() {
+        if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
+            track.stop();
+        }
     }
 }
 
@@ -288,12 +331,21 @@ async fn open_microphone(capture: &Rc<RefCell<Capture>>, generation: u64) -> Res
     .dyn_into::<web_sys::MediaStream>()
     .map_err(|_| "the browser opened something that is not a stream".to_string())?;
 
+    // Owned from here on. Every `?` below is a path where the permission has
+    // already been granted and the tracks are already live, so a failure that
+    // merely dropped the JS wrapper would leave the microphone open with its
+    // indicator on and nothing holding it.
+    let held = Tracks(stream);
+
     let context = web_sys::AudioContext::new()
         .map_err(|e| format!("no audio context to record with: {e:?}"))?;
+    let context = Closing(context);
     let source = context
-        .create_media_stream_source(&stream)
+        .0
+        .create_media_stream_source(&held.0)
         .map_err(|e| format!("the microphone could not be attached: {e:?}"))?;
     let node = context
+        .0
         .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
             CAPTURE_CHUNK,
             1,
@@ -329,27 +381,19 @@ async fn open_microphone(capture: &Rc<RefCell<Capture>>, generation: u64) -> Res
     // even though nothing here wants to hear the input: the output buffer is
     // left untouched and therefore silent, so this feeds the speakers zeros
     // rather than the microphone.
-    node.connect_with_audio_node(&context.destination())
+    node.connect_with_audio_node(&context.0.destination())
         .map_err(|e| format!("the capture graph would not run: {e:?}"))?;
 
-    let mut held = capture.borrow_mut();
-    // Stopped or cancelled while the prompt was up. The teardown is built and
-    // dropped rather than never built, because it is what knows how to close
-    // the track and the context.
-    if held.generation != generation {
-        drop(Teardown {
-            context,
-            stream,
-            _on_audio: on_audio,
-            _node: node,
-            _source: source,
-        });
+    let mut capture = capture.borrow_mut();
+    // Stopped or cancelled while the prompt was up: the guards below go out of
+    // scope with everything they hold, which is what closes the device.
+    if capture.generation != generation {
         return Ok(());
     }
-    held.sample_rate = context.sample_rate() as u32;
-    held.teardown = Some(Teardown {
-        context,
-        stream,
+    capture.sample_rate = context.0.sample_rate() as u32;
+    capture.teardown = Some(Teardown {
+        context: context.disarm(),
+        stream: held.disarm(),
         _on_audio: on_audio,
         _node: node,
         _source: source,
@@ -466,6 +510,10 @@ async fn encode_opus(samples: &[f32]) -> Result<Vec<Vec<u8>>, RecorderError> {
         // short of the granule the header promises: a note reported as
         // encoded and truncated when it is played.
         let Ok(audio) = web_sys::AudioData::new(&init) else {
+            // Closed before returning: the browser holds references to the
+            // two closures below, and dropping them while it can still call
+            // one is a call into freed memory, which takes the tab.
+            let _ = encoder.close();
             return Err(RecorderError::DeviceError(
                 "the browser would not take a frame of the recording".to_string(),
             ));
@@ -473,6 +521,7 @@ async fn encode_opus(samples: &[f32]) -> Result<Vec<Vec<u8>>, RecorderError> {
         let encoded = encoder.encode(&audio);
         audio.close();
         if let Err(e) = encoded {
+            let _ = encoder.close();
             return Err(RecorderError::DeviceError(format!(
                 "the browser refused a frame of the recording: {e:?}"
             )));
@@ -500,26 +549,35 @@ async fn encode_opus(samples: &[f32]) -> Result<Vec<Vec<u8>>, RecorderError> {
     Ok(packets)
 }
 
-/// Root mean square of a block, which is what the meter draws.
+/// What the desktop meter multiplies by, and why this one has to as well.
+///
+/// Both values reach the same `render_level`, so a bare RMS here would draw a
+/// quarter of the bar for the same voice: an ordinary speaking voice is about
+/// 0.12 RMS, which is a decoration rather than a meter.
+const LEVEL_GAIN: f32 = 4.0;
+
+/// Root mean square of a block, scaled the way the meter is drawn.
 fn rms(block: &[f32]) -> f32 {
     if block.is_empty() {
         return 0.0;
     }
     let sum: f32 = block.iter().map(|s| s * s).sum();
-    (sum / block.len() as f32).sqrt()
+    ((sum / block.len() as f32).sqrt() * LEVEL_GAIN).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Silence reads as no level, and a full-scale block as one: the meter is
-    /// drawn straight from this.
+    /// Silence reads as no level, and the gain is the desktop's: both values
+    /// reach the same meter, so this one has to be scaled the same way.
     #[test]
-    fn the_level_is_the_root_mean_square() {
+    fn the_level_is_the_gained_root_mean_square() {
         assert_eq!(rms(&[]), 0.0);
         assert_eq!(rms(&[0.0, 0.0, 0.0]), 0.0);
+        // Full scale is already past the top of the meter, so it clamps.
         assert!((rms(&[1.0, -1.0, 1.0, -1.0]) - 1.0).abs() < f32::EPSILON);
-        assert!((rms(&[0.5, -0.5]) - 0.5).abs() < f32::EPSILON);
+        // An ordinary speaking voice: about half the bar, not an eighth.
+        assert!((rms(&[0.12, -0.12]) - 0.48).abs() < 1e-5);
     }
 }
