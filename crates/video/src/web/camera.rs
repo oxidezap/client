@@ -25,6 +25,9 @@ const FRAME_DEPTH: usize = 2;
 /// The microsecond clock `VideoFrame` timestamps count in.
 const MICROS_PER_SECOND: f64 = 1_000_000.0;
 
+/// The millisecond clock `setInterval` and `Date::now` count in.
+const MILLIS_PER_SECOND: f64 = 1000.0;
+
 /// Whether this browser has a camera and an H.264 encoder at all.
 ///
 /// Asked before a call is offered as a video call rather than after, the same
@@ -286,6 +289,10 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
     let timer = window
         .set_interval_with_callback_and_timeout_and_arguments_0(
             on_tick.as_ref().unchecked_ref(),
+            // Truncated deliberately, so the timer runs slightly early and
+            // the fractional deadline in `tick` decides which firings become
+            // frames. Rounding up would make it run *late*, which a deadline
+            // cannot correct.
             i32::try_from(1000 / quality.fps.max(1)).unwrap_or(50),
         )
         .map_err(|e| anyhow!("the capture timer would not start: {}", describe(&e)))?;
@@ -494,11 +501,33 @@ fn tick(
     // of the page's timer into the stream.
     let frames = Rc::new(Cell::new(0u64));
     let step = MICROS_PER_SECOND / f64::from(quality.fps.max(1));
+    // `setInterval` takes whole milliseconds, so the timer is armed at the
+    // truncated period and runs *fast* — 33 ms is 30.3 fps, 16 ms is 62.5.
+    // The stamps above advance by exactly the negotiated stride whatever the
+    // timer does, so the two disagree by a fraction of a percent that
+    // accumulates: over a long call the video's own clock walks away from the
+    // audio's. The truncation cannot be taken out of `setInterval`, so the
+    // frames are gated on a fractional deadline instead — the timer may fire
+    // early, and a tick that arrives before its frame is due does nothing.
+    let period_ms = MILLIS_PER_SECOND / f64::from(quality.fps.max(1));
+    let due = Rc::new(Cell::new(f64::NEG_INFINITY));
     let complained = Rc::new(RefCell::new(false));
     Closure::<dyn FnMut()>::new(move || {
         if encoder.state() != web_sys::CodecState::Configured {
             return;
         }
+        let now = js_sys::Date::now();
+        if now < due.get() {
+            return;
+        }
+        // From the deadline rather than from `now`, so the fractional
+        // remainder carries: advancing by the period from whenever the timer
+        // happened to fire is the drift this exists to remove. Re-anchored
+        // when the timer has been away for more than a frame — a backgrounded
+        // tab throttles to seconds, and a schedule catching up on that debt
+        // would run flat out for as long as it was gone.
+        let next = due.get() + period_ms;
+        due.set(if next < now { now + period_ms } else { next });
         // A queue that is growing means the encoder is behind the timer, and
         // handing it more is how a page turns a slow machine into an
         // unbounded backlog. Skipping is what the desktop's bounded channel
