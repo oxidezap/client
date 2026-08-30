@@ -191,28 +191,27 @@ would cross the network in the clear.
 
 What the web build cannot do, and reports rather than pretends:
 
-* **No video.** The H.264 decoder is a C library and does not build for
-  `wasm32-unknown-unknown`. Clips keep their thumbnail and say so.
-* **No recording voice notes.** A voice note is Opus, and libopus is C too.
-  Playback works, because the browser decodes Opus itself.
+* **No sending media on its own.** A page attached to an `oxidezapd` sends
+  through it — the payload is staged over the bridge and the daemon uploads
+  it. One holding its own session cannot upload at all: the library's upload
+  path has no route a browser can take, so the microphone is not offered
+  there rather than offered and always failing at the send.
 * **WebGL by default, WebGPU on request.** `?backend=webgpu` asks for the
   faster one and `?backend=auto` for whatever the browser prefers. The
   default is the conservative one because WebGPU can pass its own probe and
   then fail building a pipeline, which reaches wgpu as a panic and leaves a
   window that never draws — observed on an ordinary Intel/Mesa laptop.
-* **Calls need a daemon, and then have no picture.** Where the page is
-  attached to an `oxidezapd` — `#daemon=ws://…` — calls work: they ring in the
-  daemon, which is where the microphone and the codec already were, so the
-  page places and answers them like any other front end, and a call still runs
-  with every window closed. What it cannot do even then is *decode* the
-  picture, for the same reason it cannot decode a clip, so a video call's
-  panes say the picture needs the desktop app rather than waiting on one that
-  is not coming.
+* **Calls need a daemon.** Where the page is attached to an `oxidezapd` —
+  `#daemon=ws://…` — calls work: they ring in the daemon, which is where the
+  microphone and the codec already were, so the page places and answers them
+  like any other front end, and a call still runs with every window closed.
+  The picture decodes through the browser's own H.264, the same way a clip in
+  a conversation does.
 
   A page running its **own** session has no daemon to ring in and refuses
-  every call action, incoming and outgoing alike: the microphone and the codec
-  are the same C libraries a browser has none of. `MediaRecorder` and
-  WebCodecs are the ways in, and both are API changes rather than backends.
+  every call, incoming and outgoing alike — though it does tell the caller to
+  stop ringing, since declining is signalling rather than media. The
+  microphone and the encoder are C libraries a browser has none of.
 
 ## Data
 
