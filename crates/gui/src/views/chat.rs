@@ -11,7 +11,7 @@ use gpui_component::{Icon, IconName};
 use crate::app::{Destination, MessageListCache, WhatsAppApp};
 use crate::components::{
     ChatListProps, EmptyState, InputAreaView, PluginContext, ProductIcon, StatusListProps,
-    StatusViewProps, ViewerProps, plugin_ui, render_call_card, render_chat_header,
+    StatusSelection, StatusViewProps, ViewerProps, plugin_ui, render_call_card, render_chat_header,
     render_chat_list, render_conversation_search, render_media_viewer, render_message_list,
     render_nav_rail, render_status_list, render_status_view,
 };
@@ -233,7 +233,7 @@ pub fn render_connected_view(
     });
     let status_list = status_feed.map(|feed| StatusListProps {
         feed,
-        selected: app.status_pane().author().map(str::to_string),
+        selected: StatusSelection::of(app.status_pane().author()),
         scroll: app.status_list_scroll().clone(),
     });
     let unseen_status = app.status_unseen();

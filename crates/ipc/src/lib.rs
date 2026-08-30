@@ -31,7 +31,7 @@ pub mod windows_user;
 #[cfg(target_family = "wasm")]
 pub use endpoint::web;
 #[cfg(not(target_family = "wasm"))]
-pub use endpoint::{Endpoint, Reader, Writer};
+pub use endpoint::{Endpoint, Hangup, Reader, Writer};
 pub use link::Link;
 pub use protocol::{
     AccountIdentity, CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent,

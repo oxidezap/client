@@ -202,7 +202,11 @@ impl<'a> Frames<'a> {
             // is why this side no longer has to guess what a failure was
             // about.
             DaemonMessage::Accepted { id: Some(id) } => {
-                take_pending(self.pending, id);
+                // For most requests this only releases the entry. For the few
+                // whose whole answer is that they were done, it is the answer.
+                if let Some(Awaiting::Acted(tx)) = take_pending(self.pending, id) {
+                    let _ = tx.send(());
+                }
             }
             // Accepted with no id: a request sent without one, which nobody
             // is waiting on an answer for.

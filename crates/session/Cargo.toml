@@ -66,11 +66,15 @@ web-sys = { version = "0.3", features = [
     "Event",
     "Headers",
     "MessageEvent",
+    "Navigator",
     "Request",
     "RequestInit",
     "Response",
+    "StorageEstimate",
+    "StorageManager",
     "WebSocket",
     "Window",
+    "WorkerGlobalScope",
 ] }
 # SQLite's own answer to "what is a file", which is the only answer a browser
 # can give: there is no path, there is a VFS. `sqlite-wasm-rs` is what diesel

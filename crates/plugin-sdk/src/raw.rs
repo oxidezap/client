@@ -142,14 +142,14 @@ mod off_target {
     pub unsafe fn field_str(ev: i32, field: i32, ptr: super::Ptr, cap: i32) -> i32 {
         unsafe { write_out(testing::field_str(ev, field), ptr, cap) }
     }
-    pub fn field_i64(_ev: i32, field: i32) -> i64 {
-        testing::field_i64(field)
+    pub fn field_i64(ev: i32, field: i32) -> i64 {
+        testing::field_i64(ev, field)
     }
-    pub fn field_len(_ev: i32, field: i32) -> i32 {
-        testing::field_len(field)
+    pub fn field_len(ev: i32, field: i32) -> i32 {
+        testing::field_len(ev, field)
     }
-    pub fn field_at(_ev: i32, field: i32, index: i32) -> i32 {
-        testing::field_at(field, index)
+    pub fn field_at(ev: i32, field: i32, index: i32) -> i32 {
+        testing::field_at(ev, field, index)
     }
     pub unsafe fn send_text(jid: super::Ptr, jid_len: i32, text: super::Ptr, text_len: i32) -> i32 {
         testing::command(testing::Command::Send {
@@ -304,4 +304,5 @@ pub mod level {
     pub const WARN: i32 = abi::log::WARN;
     pub const INFO: i32 = abi::log::INFO;
     pub const DEBUG: i32 = abi::log::DEBUG;
+    pub const TRACE: i32 = abi::log::TRACE;
 }

@@ -90,9 +90,11 @@ action then writes over the user's own. An empty value passed to `oxi_kv_set`
 deletes the key. `oxi_ui_set` replaces the
 plugin's whole published tree.
 
-`oxi_now_ms` is the only clock — Unix milliseconds, deliberately coarse. A
-finer one is a side channel, and nothing a plugin legitimately does needs
-better.
+`oxi_now_ms` is the only clock: Unix milliseconds, which is the resolution a
+plugin needs to stamp a message or space its own timers. Read it as the
+resolution and not as a mitigation. The host neither quantises nor jitters it,
+and a millisecond is enough to time host work a plugin can repeat inside one
+call's fuel, so nothing here is a promise about timing side channels.
 
 ### Outcomes
 

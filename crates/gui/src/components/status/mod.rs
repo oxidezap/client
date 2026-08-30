@@ -4,7 +4,7 @@ mod list;
 mod ring;
 mod view;
 
-pub use list::{StatusListProps, render_status_list};
+pub use list::{StatusListProps, StatusSelection, render_status_list};
 pub use view::{StatusViewProps, render_status_view};
 
 pub(crate) use ring::status_ring;

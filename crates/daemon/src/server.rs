@@ -91,10 +91,17 @@ pub fn client_slots() -> ClientSlots {
 
 /// How many frames may queue for one connection's own answers.
 ///
-/// Only downloads land here, and a front end asks for as many as it has
-/// visible media. Past this the answer is dropped rather than parking the
-/// download task, and the client retries — which costs nothing, because the
-/// bytes are already in the cache.
+/// Only answers to requests land here, and a front end asks for as many as it
+/// has visible media. Past this the frame is *not* dropped: see
+/// `session_bridge::answer_now`, which hands a full outbox to a task that
+/// waits on the connection's own writer, because a dropped answer leaves the
+/// view that asked waiting forever and it never asks again.
+///
+/// The price is that answers past this point are delivered by request id and
+/// not in order: a frame parked on a full outbox can be overtaken by the next
+/// one, if that one fits. Every answer names the `RequestId` it belongs to, so
+/// nothing is lost, but two pages of one paged `LoadMessages` can arrive the
+/// wrong way round.
 const OUTBOX_CAPACITY: usize = 64;
 
 #[cfg(not(target_family = "wasm"))]
@@ -564,6 +571,16 @@ where
             // Normally drain published state before reading more requests, so
             // a client that floods the socket cannot starve its own event
             // stream. After a lag that inverts, because recovery comes first.
+            //
+            // The reverse starvation is bounded rather than prevented: a
+            // request is read only once every branch above it is `Pending`,
+            // so a call with video or a hydration burst delays one. It cannot
+            // accumulate, because every producer above is slower than a local
+            // socket write is: a camera leaves tens of milliseconds between
+            // frames and a burst is finite, so the loop empties them and
+            // reaches the read. The delay is a frame interval, not a
+            // conversation, and a `Hangup` waiting that long is waiting
+            // less than the stanza it turns into.
             biased;
 
             update = updates.recv(), if !awaiting_resync => match update {
@@ -1124,8 +1141,20 @@ async fn handle_request(
             // than spawned loose, so the acknowledgement still means the
             // answer is recorded.
             let plugins = Arc::clone(plugins);
-            let _ = tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved)).await;
-            acted(Ok(()))
+            // The answer is read, not dropped. `approve` takes a mutex and
+            // writes and renames a file; a panic in there left the client
+            // acknowledged for a permission the disk never received, with
+            // Settings drawing a state nothing had recorded and no line in
+            // the log.
+            match tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved)).await {
+                Ok(()) => acted(Ok(())),
+                Err(e) => {
+                    log::error!("recording a plugin approval failed: {e}");
+                    acted(Err(ProtocolError::Refused {
+                        detail: "the approval could not be recorded".to_string(),
+                    }))
+                }
+            }
         }
         // The acknowledgement goes out first; see the caller.
         ClientRequest::Shutdown => Answer {

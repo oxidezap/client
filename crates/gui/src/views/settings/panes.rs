@@ -351,7 +351,13 @@ fn privacy(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElemen
                     div().flex().child(
                         // Outline, not filled: destructive and deliberate, but
                         // not the emphasis of the screen.
-                        Button::new("pair-again")
+                        // Prefixed by the screen it is on, like every other
+                        // control here. The logged-out screen has a button
+                        // with this action too, and gpui keys interaction
+                        // state (hover, press, focus) by element id: two
+                        // surfaces drawn in one frame would share it, for the
+                        // one action in the app that erases the account.
+                        Button::new("settings-pair-again")
                             .label("Clear data and pair again")
                             .danger()
                             .outline()

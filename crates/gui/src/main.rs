@@ -1,6 +1,15 @@
-//! WhatsApp UI - A GPUI-based WhatsApp client
+//! The window: a GPUI front end for the account the daemon holds.
 //!
-//! This is the main entry point for the WhatsApp UI application.
+//! It owns no session. `oxidezap` reaches `oxidezapd` and starts one if
+//! nobody answers, because there is exactly one WhatsApp session per user and
+//! it lives in that process. So what this crate has is the protocol, the
+//! drawing, and video decode, which writes straight into `gpui::RenderImage`
+//! and is not reusable off GPUI.
+//!
+//! The same crate builds for `wasm32-unknown-unknown`, where this `main`
+//! becomes the module's start function and the daemon is one the page starts
+//! in its own address space. Everything that differs there lives in
+//! `platform/`, so no component above it learns that browsers exist.
 
 mod app;
 mod assets;
@@ -30,6 +39,9 @@ fn main() {
     crate::platform::logging();
     // Before anything reads it: the first read is what settles the default.
     crate::platform::clocks();
+    // Before the session exists, so the ask cannot be missed: `shutdown` keeps
+    // a permit for one that arrives early.
+    crate::platform::watch_for_departure();
     open_the_window();
 }
 

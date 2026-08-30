@@ -63,11 +63,12 @@ struct AcceptGuard {
 
 impl Drop for AcceptGuard {
     fn drop(&mut self) {
-        let calls = self.calls.clone();
-        let call_id = std::mem::take(&mut self.call_id);
-        tokio::spawn(async move {
-            calls.abandon_accept(&call_id);
-        });
+        // Cleared here rather than from a spawned task. `abandon_accept` is
+        // synchronous, and deferring it left the accept marked in flight
+        // after it had ended, so a decline landing there was answered
+        // `Declined::Accepting` by an acceptance already gone and the caller
+        // went on ringing.
+        self.calls.abandon_accept(&self.call_id);
     }
 }
 
@@ -1577,9 +1578,20 @@ impl WhatsAppClient {
             // Taken out rather than held: `set_muted` waits on the call's
             // answer-transition lane, and holding the registry across that
             // would stall every other call's bookkeeping behind one peer.
-            let Some(handle) = calls.live_and_sweep(&call_id) else {
-                debug!("set_call_muted: no live handle for {}", call_id);
-                return;
+            let handle = match calls.live_and_sweep(&call_id) {
+                Some(handle) => handle,
+                None => {
+                    debug!("set_call_muted: no live handle for {}", call_id);
+                    // Answered rather than dropped, which is the video twin's
+                    // rule and holds for the same reason: the window draws
+                    // the microphone as muted the moment it is asked, so a
+                    // request landing between the state saying a call is live
+                    // and this side registering its handle would leave that
+                    // drawn over a device nothing here holds. There is no
+                    // handle, so nothing is muted, and that is what is said.
+                    Self::settle_mute(&ui_sender, &call_id, seq, &lane, false).await;
+                    return;
+                }
             };
 
             let _serialized = lane.lane.lock().await;
@@ -1598,13 +1610,6 @@ impl WhatsAppClient {
                     e
                 );
             }
-            // Superseded while announcing: the request behind us is about to
-            // set the state anyway, and a word from here would describe a
-            // device that is already on its way somewhere else. It speaks
-            // after it has arrived, which is what makes it the last word.
-            if lane.intent.lock().expect("mute intent poisoned").seq != seq {
-                return;
-            }
             // Said whether or not it is news, and this is why. A correction
             // sent only on disagreement is unversioned, and the daemon writes
             // a request's optimistic state before that request is even
@@ -1615,14 +1620,29 @@ impl WhatsAppClient {
             // the success's device. Speaking unconditionally makes the newest
             // request the one that closes the exchange, and costs nothing:
             // the daemon publishes no frame for a state that did not change.
-            let settled = handle.is_muted();
-            if let Some(tx) = ui_sender.lock().await.as_ref() {
-                let _ = tx.send(UiEvent::CallMuteChanged {
-                    call_id,
-                    muted: settled,
-                });
-            }
+            Self::settle_mute(&ui_sender, &call_id, seq, &lane, handle.is_muted()).await;
         });
+    }
+
+    /// Publish what the microphone *is*, once the newest request has reached
+    /// it. The mute half of [`Self::settle_video`], down to being silent when
+    /// a newer request has arrived meanwhile.
+    async fn settle_mute(
+        ui_sender: &UiEventSender,
+        call_id: &str,
+        seq: u64,
+        lane: &MuteLane,
+        settled: bool,
+    ) {
+        if lane.intent.lock().expect("mute intent poisoned").seq != seq {
+            return;
+        }
+        if let Some(tx) = ui_sender.lock().await.as_ref() {
+            let _ = tx.send(UiEvent::CallMuteChanged {
+                call_id: call_id.to_string(),
+                muted: settled,
+            });
+        }
     }
 
     /// Follow a live call: its own event stream while it runs, and its
@@ -1876,6 +1896,28 @@ mod tests {
         );
     }
 
+    /// A request that finds no handle used to return without a word, so the
+    /// window went on drawing the microphone it had drawn optimistically.
+    /// The video twin answers with what the registry holds; this one answers
+    /// with the only thing true of a call with no handle.
+    #[tokio::test]
+    async fn a_mute_request_with_no_handle_still_says_what_the_microphone_is() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ui_sender: UiEventSender = Arc::new(Mutex::new(Some(tx)));
+        let lane = MuteLane::default();
+        let seq = request(&lane, true);
+
+        WhatsAppClient::settle_mute(&ui_sender, "call-1", seq, &lane, false).await;
+
+        match rx.try_recv().expect("the request is answered") {
+            UiEvent::CallMuteChanged { call_id, muted } => {
+                assert_eq!(call_id, "call-1");
+                assert!(!muted, "nothing holds the device, so nothing is muted");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
     /// The window between an offer leaving `pending` and a handle reaching
     /// `active` is a real one — opening the audio devices and connecting the
     /// relay both take time — and a `<terminate>` landing inside it used to
@@ -1968,6 +2010,25 @@ mod tests {
             !calls.abandon_accept("call-1"),
             "an ending before the acceptance began is not this acceptance's"
         );
+    }
+
+    /// The guard clears the mark as it drops, so a decline arriving after
+    /// the acceptance ended has an offer to reject rather than being told an
+    /// acceptance will do it.
+    #[test]
+    fn a_decline_after_the_acceptance_ended_is_not_left_to_the_acceptance() {
+        let calls = CallRegistry::default();
+        calls.mark_accepting("call-1");
+        drop(AcceptGuard {
+            calls: calls.clone(),
+            call_id: "call-1".to_string(),
+        });
+
+        assert!(
+            matches!(calls.decline("call-1"), Declined::Nothing),
+            "the acceptance is over, so nothing is going to send the rejection"
+        );
+        assert_eq!(calls.ending_for("call-1"), None, "and nothing is left over");
     }
 
     /// A cancel for a call that is still connecting has to survive until the

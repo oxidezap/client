@@ -121,13 +121,24 @@ impl WhatsAppApp {
                     AppState::WaitingForPairing { pair_code, .. } => pair_code.clone(),
                     _ => None,
                 };
-                let cached_qr = generate_qr_png(&code).map(|png_bytes| CachedQrCode {
-                    data: code,
-                    png_bytes: Arc::new(png_bytes),
-                });
+                // The one that could not be drawn keeps the one before it.
+                // A rotation arrives every few seconds and the previous code
+                // is still scannable for a moment; replacing it with nothing
+                // left "Waiting for a code…" on screen under a life bar
+                // counting down over nothing at all.
+                let previous = match &self.app_state {
+                    AppState::WaitingForPairing { qr_code, .. } => qr_code.clone(),
+                    _ => None,
+                };
+                let cached_qr = generate_qr_png(&code)
+                    .map(|png_bytes| CachedQrCode {
+                        data: code,
+                        png_bytes: Arc::new(png_bytes),
+                    })
+                    .map(|qr| Issued::new(qr, timeout_secs, wacore::time::now_utc()))
+                    .or(previous);
                 self.app_state = AppState::WaitingForPairing {
-                    qr_code: cached_qr
-                        .map(|qr| Issued::new(qr, timeout_secs, wacore::time::now_utc())),
+                    qr_code: cached_qr,
                     pair_code,
                 };
                 // The countdown on that screen is read off the clock during

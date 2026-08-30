@@ -18,7 +18,7 @@
 //! the border and its gap are added on the outside.
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::{App, Hsla, IntoElement, ParentElement, Pixels, Styled, div};
+use gpui::{App, Hsla, IntoElement, ParentElement, Pixels, Styled, div, px};
 use gpui_component::ActiveTheme as _;
 
 use crate::components::Avatar;
@@ -29,6 +29,18 @@ use crate::theme::ActiveProductTheme as _;
 /// Past this the difference stops being legible, so more of them says the same
 /// thing — which is honest, because "several" is all a ring can carry.
 const FULL_AT: usize = 8;
+
+/// How wide the avatar inside a ring of this footprint is.
+///
+/// Its own function so the tests can exercise it rather than restate it. They
+/// used to recopy the arithmetic, which meant nothing tied them to the
+/// component: moving `thickness` or `gap` to a metrics token would have left
+/// both of them green over a layout 10px out per row, which is the regression
+/// the note above records.
+fn inner_avatar(size: Pixels, thickness: Pixels, gap: Pixels) -> Pixels {
+    // The avatar gives way to the ring rather than the other way round.
+    (size - (thickness + gap) * 2.0).max(px(1.0))
+}
 
 /// An avatar ringed to show whether `unseen` of `count` updates are unwatched.
 ///
@@ -48,8 +60,7 @@ pub fn status_ring(
     let metrics = cx.product().metrics;
     let thickness = metrics.ring_thickness();
     let gap = metrics.ring_gap();
-    // The avatar gives way to the ring rather than the other way round.
-    let inner = (size - (thickness + gap) * 2.0).max(metrics.hairline());
+    let inner = inner_avatar(size, thickness, gap);
 
     // Loudest for a single update, easing off as they pile up: one is a thing
     // to go and see, and a run of eight is the same invitation.
@@ -77,6 +88,7 @@ pub fn status_ring(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::theme::Metrics;
     use gpui::px;
 
@@ -87,9 +99,7 @@ mod tests {
     fn the_ring_fits_inside_the_size_it_was_given() {
         let metrics = Metrics::default();
         let size = px(44.0);
-        let thickness = metrics.ring_thickness();
-        let gap = metrics.ring_gap();
-        let inner = (size - (thickness + gap) * 2.0).max(metrics.hairline());
+        let inner = inner_avatar(size, metrics.ring_thickness(), metrics.ring_gap());
 
         assert_eq!(inner, px(34.0));
         assert!(inner < size, "the avatar has to give way to the ring");
@@ -99,9 +109,9 @@ mod tests {
     #[test]
     fn an_impossibly_small_ring_still_holds_something() {
         let metrics = Metrics::default();
-        let size = px(4.0);
-        let inner =
-            (size - (metrics.ring_thickness() + metrics.ring_gap()) * 2.0).max(metrics.hairline());
-        assert_eq!(inner, metrics.hairline());
+        assert_eq!(
+            inner_avatar(px(4.0), metrics.ring_thickness(), metrics.ring_gap()),
+            px(1.0)
+        );
     }
 }

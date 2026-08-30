@@ -68,15 +68,24 @@ impl LatestFrames {
     /// Hold this picture for the window, dropping whatever that direction was
     /// holding: it is a frame the window never drew and never will.
     pub fn put(&self, frame: CallFrame) {
-        let mut slots = self.slots.lock().expect("call frame slots poisoned");
+        let mut slots = self.lock();
         let slot = slot_of(frame.stream);
         slots[slot] = Some(frame);
     }
 
     /// Everything waiting, in one pass, leaving the slots empty.
     pub fn take(&self) -> SmallVec<[CallFrame; 2]> {
-        let mut slots = self.slots.lock().expect("call frame slots poisoned");
-        slots.iter_mut().filter_map(Option::take).collect()
+        self.lock().iter_mut().filter_map(Option::take).collect()
+    }
+
+    /// Poisoned or not. `put` runs on a decode thread and `take` on the
+    /// window's, so panicking here turns a panic in one decoder into a panic
+    /// in the UI on its next read: the call and the window go down together.
+    /// What is behind the lock is two `Option`s with no invariant to break.
+    fn lock(&self) -> std::sync::MutexGuard<'_, [Option<CallFrame>; 2]> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -325,5 +334,28 @@ impl Scratch {
             Frame::new(image),
             1,
         ))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `put` runs on a decode thread and `take` on the window's. Panicking on
+    /// a poisoned lock turned a panic in one decoder into a panic in the UI
+    /// on its next read, so the call and the window went down together.
+    /// over two `Option`s with no invariant to break.
+    #[test]
+    fn a_panicked_decoder_does_not_take_the_window_with_it() {
+        let frames = LatestFrames::default();
+        let poisoner = frames.clone();
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.lock();
+            panic!("a decoder gave up mid-frame");
+        })
+        .join();
+        assert!(panicked.is_err(), "the lock is poisoned now");
+
+        assert!(frames.take().is_empty(), "and the window can still read it");
     }
 }

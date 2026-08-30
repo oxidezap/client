@@ -195,6 +195,9 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
     })
 }
 
+/// The largest an ADTS frame may say it is: the length field is 13 bits.
+const MAX_ADTS_FRAME: usize = (1 << 13) - 1;
+
 /// One AAC frame, headered, appended to the ADTS stream being built.
 fn push_adts_frame(adts: &mut Vec<u8>, frame: &[u8], sample_rate: u32, channels: u8) {
     // Map sample rate to ADTS frequency index using lookup table
@@ -206,8 +209,24 @@ fn push_adts_frame(adts: &mut Vec<u8>, frame: &[u8], sample_rate: u32, channels:
 
     // ADTS profile field stores Audio Object Type minus one; AAC-LC AOT = 2
     let profile = 2u8; // AAC-LC
-    let frame_len = frame.len() + 7; // ADTS header is 7 bytes
 
+    // The channel configuration is three bits and 0 means "read it from an
+    // inline config", which there is none of here. A track answering
+    // something outside 1..=7 is clamped rather than spread across the two
+    // fields it is masked into, where it would silently name another layout.
+    let channels = channels.clamp(1, 7);
+
+    let frame_len = frame.len() + 7; // ADTS header is 7 bytes
+    // The length field is 13 bits, and the masks below simply drop what does
+    // not fit: the header would then claim a shorter frame, the parser would
+    // resynchronise somewhere inside it, and the rest of the track would be
+    // discarded with nothing said. Skipped and named instead.
+    if frame_len > MAX_ADTS_FRAME {
+        log::warn!("skipping a {frame_len} byte AAC frame, past what ADTS can describe");
+        return;
+    }
+
+    // Build 7-byte ADTS header
     let header: [u8; 7] = [
         0xFF,
         0xF1, // Syncword + MPEG-4 + no CRC
@@ -219,4 +238,64 @@ fn push_adts_frame(adts: &mut Vec<u8>, frame: &[u8], sample_rate: u32, channels:
     ];
     adts.extend_from_slice(&header);
     adts.extend_from_slice(frame);
+}
+
+/// The same, over a whole track already in hand.
+///
+/// The extraction above streams straight into its buffer rather than
+/// collecting the frames first; this exists for the tests, which are about
+/// what one frame's header says.
+#[cfg(test)]
+fn wrap_aac_as_adts(frames: &[Vec<u8>], sample_rate: u32, channels: u8) -> Vec<u8> {
+    let mut adts = Vec::new();
+    for frame in frames {
+        push_adts_frame(&mut adts, frame, sample_rate, channels);
+    }
+    adts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_ADTS_FRAME, wrap_aac_as_adts};
+
+    /// The `aac_frame_length` field is 13 bits and the masks that build it
+    /// drop what does not fit, so an oversized frame produced a header
+    /// claiming a shorter one: symphonia resynchronises somewhere inside the
+    /// frame and the rest of the track is discarded, leaving a video with
+    /// part of its audio and nothing in the log about it.
+    #[test]
+    fn a_frame_too_large_for_adts_is_skipped_rather_than_mislabelled() {
+        let big = vec![0u8; MAX_ADTS_FRAME];
+        let small = vec![0u8; 16];
+        let wrapped = wrap_aac_as_adts(&[big, small.clone()], 44100, 2);
+
+        assert_eq!(
+            wrapped.len(),
+            small.len() + 7,
+            "only the frame that fits is described"
+        );
+        let claimed = usize::from(wrapped[3] & 0x03) << 11
+            | usize::from(wrapped[4]) << 3
+            | usize::from(wrapped[5] >> 5);
+        assert_eq!(claimed, small.len() + 7, "and it is described honestly");
+    }
+
+    /// The channel configuration is three bits, spread across two fields. A
+    /// track answering something outside 1..=7 wrote into the bits beside
+    /// them, naming a different layout and a different frame length.
+    #[test]
+    fn an_impossible_channel_count_does_not_reach_the_header() {
+        for channels in [0u8, 8, 255] {
+            let wrapped = wrap_aac_as_adts(&[vec![0u8; 8]], 44100, channels);
+            let config = (wrapped[2] & 0x01) << 2 | wrapped[3] >> 6;
+            assert!(
+                (1..=7).contains(&config),
+                "{channels} channels became {config}"
+            );
+            let claimed = usize::from(wrapped[3] & 0x03) << 11
+                | usize::from(wrapped[4]) << 3
+                | usize::from(wrapped[5] >> 5);
+            assert_eq!(claimed, 8 + 7, "and the length beside it is untouched");
+        }
+    }
 }

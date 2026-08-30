@@ -50,6 +50,15 @@ fn user_chat(chat: &str) -> Option<Jid> {
         .then(|| jid.into_non_ad())
 }
 
+/// The key rows are actually filed under, for anything else left alone.
+///
+/// [`user_chat`]'s normalization applied to a string: the one shape every
+/// entry point here has to agree on, since a device-suffixed address reaches
+/// this module from receipts.
+fn chat_key(chat: &str) -> String {
+    user_chat(chat).map_or_else(|| chat.to_string(), |jid| jid.to_string())
+}
+
 /// The peer's other identity for a wire key, or `None` when the key is not a
 /// 1:1 user chat.
 pub(crate) fn counterpart_chat_key(
@@ -273,6 +282,13 @@ pub(crate) fn merge_split_chat(
     b: &str,
     cs: &mut ChangeSet,
 ) -> QueryResult<String> {
+    // Normalized here rather than trusted from the caller, the same way
+    // `route_chat_key` does it. A device-suffixed key (`user:48@lid`, the
+    // form receipts carry) names nothing in the store, so the early return
+    // below fired and the reconciliation that was asked for silently did not
+    // happen.
+    let (a, b) = (chat_key(a), chat_key(b));
+    let (a, b) = (a.as_str(), b.as_str());
     if a == b {
         return Ok(a.to_string());
     }
@@ -383,11 +399,27 @@ pub(crate) fn merge_split_chat(
     // Satellites: the newest reaction per (msg, sender) and the highest
     // receipt per (msg, user) win across the pair, matching their live-path
     // monotonic rules — drop the losing destination rows, then move.
+    //
+    // Reaction timestamps are whole seconds, so adding and removing inside
+    // one second ties, and a strict comparison kept the emoji and threw the
+    // tombstone away: the removal came back undone. A tie goes to the
+    // tombstone instead.
+    //
+    // A heuristic, not a proof, and worth saying so. The live path settles a
+    // tie by arrival (`ts_ms <= ts_ms`), and across a split pair there is no
+    // arrival order to consult: a row is updated in place, so its rowid is
+    // when the row was created rather than when its value was applied. The
+    // case this gets wrong is a same-second add, remove and re-add split
+    // across the two identities, where the re-add is dropped. That needs
+    // three actions inside one second landing on both sides; the case it
+    // fixes needs two. Settling it properly means recording when a value was
+    // applied, which is a column this schema does not have.
     diesel::sql_query(
         "DELETE FROM reactions WHERE device_id = ?1 AND chat_jid = ?3 AND EXISTS \
          (SELECT 1 FROM reactions s WHERE s.device_id = ?1 AND s.chat_jid = ?2 \
           AND s.msg_id = reactions.msg_id AND s.sender_jid = reactions.sender_jid \
-          AND s.ts_ms > reactions.ts_ms)",
+          AND (s.ts_ms > reactions.ts_ms \
+               OR (s.ts_ms = reactions.ts_ms AND s.emoji = '' AND reactions.emoji <> '')))",
     )
     .bind::<Integer, _>(device_id)
     .bind::<Text, _>(src)

@@ -74,3 +74,53 @@ fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightSty
         ..Default::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// A stopwatch rather than an assertion: what a conversation pays per
+    /// frame to re-derive text nothing changed.
+    ///
+    /// `render_rich_text` parses on every render of every visible bubble, and
+    /// the header parses its JID once. `cargo test -p oxidezap-gui --
+    /// --ignored --nocapture per_frame_text_costs`
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn per_frame_text_costs() {
+        const BUBBLES: usize = 40;
+        const FRAMES: usize = 100;
+
+        let plain = "thanks, that works for me";
+        let marked = "*thanks*, that _works_ for me, see `run.sh`";
+
+        for (what, source) in [("plain", plain), ("marked", marked)] {
+            let started = wacore::time::Instant::now();
+            let mut runs = 0;
+            for _ in 0..FRAMES {
+                for _ in 0..BUBBLES {
+                    runs += oxidezap_core::parse_rich_text(source).runs().len();
+                }
+            }
+            let elapsed = started.elapsed();
+            println!(
+                "{what}: {BUBBLES} bubbles x {FRAMES} frames: {elapsed:?} ({:?} per frame, \
+                 {runs} runs)",
+                elapsed / FRAMES as u32
+            );
+        }
+
+        let started = wacore::time::Instant::now();
+        let mut callable = 0;
+        for _ in 0..FRAMES {
+            callable += usize::from(
+                "5521999999999@s.whatsapp.net"
+                    .parse::<wacore_binary::jid::Jid>()
+                    .is_ok(),
+            );
+        }
+        println!(
+            "header JID: {FRAMES} frames: {:?} ({:?} per frame, {callable} parsed)",
+            started.elapsed(),
+            started.elapsed() / FRAMES as u32
+        );
+    }
+}

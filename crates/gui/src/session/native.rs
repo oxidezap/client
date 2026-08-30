@@ -19,7 +19,17 @@ use oxidezap_ipc::{ClientRequest, Endpoint, Link, MAX_FRAME_BYTES, PROTOCOL_VERS
 use super::frames::Frames;
 use super::media::Directory;
 use super::sink::{self, EventSink, Events};
-use super::{Pending, Session};
+use super::{Pending, Session, Teardown};
+
+/// How long to give the reader to notice it has been hung up on.
+///
+/// It normally leaves at once — the connection is shut down before this
+/// waits, so its read returns end of file. The bound is for the one case that
+/// is not instant: the reader parked publishing into a queue that only the UI
+/// drains, which is the thread standing here. Waiting for it forever would
+/// deadlock the reconnect; waiting a moment and moving on costs a thread that
+/// is already on its way out.
+const READER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Connect to the daemon, starting one if nothing is listening.
 ///
@@ -28,9 +38,12 @@ use super::{Pending, Session};
 /// for separately.
 pub(super) fn connect() -> std::io::Result<(Session, Events)> {
     let (reader, writer) = connect_or_start()?.split()?;
+    // Taken before the reader is handed to its thread, because after that
+    // there is nothing left to ask.
+    let hangup = reader.hangup()?;
     let (events, rx) = sink::channel();
 
-    let session = Session::new(
+    let mut session = Session::new(
         Link::over_stream(writer),
         events.clone(),
         Arc::new(Directory),
@@ -49,9 +62,21 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
 
     let pending = Arc::clone(&session.pending);
     let pictures = session.call_frames().clone();
+    // Dropped when the thread ends, whichever way it ends, so the wait below
+    // is over the thread's whole life rather than over a message it might
+    // not reach.
+    let (alive, until_gone) = std::sync::mpsc::channel::<()>();
     std::thread::Builder::new()
         .name("oxidezap-ipc".to_string())
-        .spawn(move || read_frames(reader, &events, &pending, &pictures))?;
+        .spawn(move || {
+            let _alive = alive;
+            read_frames(reader, &events, &pending, &pictures);
+        })?;
+
+    session.ends_with(Teardown::new(move || {
+        hangup.hang_up();
+        let _ = until_gone.recv_timeout(READER_PATIENCE);
+    }));
 
     Ok((session, rx))
 }

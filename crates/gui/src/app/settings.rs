@@ -177,11 +177,26 @@ impl WhatsAppApp {
     }
 
     /// Delete the cached media and re-measure.
+    ///
+    /// In that order. The daemon wipes before it acknowledges, so measuring
+    /// alongside the request read a size the files still had and the Storage
+    /// pane went on showing the old total, which reads as a clear that did
+    /// not work.
     pub fn clear_media_cache(&mut self, cx: &mut Context<Self>) {
-        if let Some(client) = &self.client {
-            client.clear_media_cache();
-        }
-        self.refresh_storage_usage(cx);
+        let Some(client) = &self.client else {
+            return;
+        };
+        let cleared = client.clear_media_cache();
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            // A refusal drops the sender, and the size on screen is then the
+            // last honest one there was.
+            if cleared.await.is_err() {
+                return;
+            }
+            let _ = entity.update(cx, |app, cx| app.refresh_storage_usage(cx));
+        })
+        .detach();
     }
 }
 
