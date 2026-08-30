@@ -1139,6 +1139,15 @@ browser API here); recording is refused where it starts rather than where it
 would fail; calls stay in the daemon, which is where the microphone already
 was, and so do plugins, for the same kind of reason.
 
+A call's video decodes the same way, through the same module, and obeys the
+same stream rules the desktop path does — a decoder born mid-stream waits for
+a keyframe, a gap makes it wait again, the peer's parameter set is read before
+the decoder is allowed to allocate from it, and their orientation is *undone*
+rather than repeated. What it does not have is the thread per direction, and
+does not need one: `VideoDecoder` is already asynchronous, so the work the
+thread was there to move off the caller happens off it anyway. It is only
+reachable attached to an `oxidezapd`, which is where calls happen at all.
+
 The video decoder is worth reading as the shape it is rather than as a
 backend swap. openh264 is *pulled* — hand it an access unit, get a picture on
 the same line — and `VideoDecoder` is pushed, with the pixel read out of a

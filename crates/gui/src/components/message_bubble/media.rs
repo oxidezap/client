@@ -670,30 +670,6 @@ fn render_video_player(
                             },
                         ))
                         .into_any_element()
-                } else if !crate::video::CAN_DECODE {
-                    // Not an error, and not offered as one. On this build the
-                    // answer was fixed when the binary was: the decoder is C
-                    // and there is none here. A red Retry would send every tap
-                    // back through `toggle_video` to set the same error again
-                    // — a control that looks like it might work, forever.
-                    //
-                    // Asked here rather than handled as a player state, the
-                    // way the composer asks `CAN_RECORD`: it is a property of
-                    // the build, not of this clip.
-                    div()
-                        .w(px(48.))
-                        .h(px(48.))
-                        .rounded_full()
-                        .bg(scrim.opacity(0.55))
-                        .flex()
-                        .justify_center()
-                        .items_center()
-                        .child(
-                            Icon::new(IconName::Eye)
-                                .text_color(on_scrim.opacity(0.6))
-                                .size(px(20.)),
-                        )
-                        .into_any_element()
                 } else if is_error {
                     // toggle_video's Error arm restarts the download; without
                     // a handler a transient failure left the video stuck.

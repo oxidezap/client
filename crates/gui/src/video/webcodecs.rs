@@ -26,7 +26,7 @@
 //! A browser without WebCodecs, a codec it will not configure, a picture past
 //! the budget — all of them land there, which is why none of them is fatal.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -74,8 +74,16 @@ pub struct Picture {
 pub struct Decoder {
     inner: web_sys::VideoDecoder,
     slot: Rc<RefCell<Slot>>,
-    /// The rotation applied to every picture on the way out.
-    rotation: Rotation,
+    /// The rotation applied to pictures on the way out.
+    ///
+    /// A cell because a call's is per frame: a peer's orientation describes
+    /// their device, and they may turn it mid-call. Pictures arrive after the
+    /// unit that produced them, so a turn is applied one picture late and
+    /// corrects itself on the next — which is the cost of a push decoder and
+    /// is invisible beside the turn itself.
+    rotation: Rc<Cell<Rotation>>,
+    /// How many pixels a picture may be before it is refused.
+    max_pixels: usize,
     /// Kept alive for as long as the decoder is: a `Closure` that has been
     /// dropped while the browser still holds a reference to it is a call into
     /// freed memory, which on this target is a panic that takes the tab.
@@ -97,22 +105,45 @@ impl Decoder {
     /// No `VideoDecoder` in this browser, a parameter set this build will not
     /// read, or a picture past the budget.
     pub fn new(sps_pps: &[u8], rotation: Rotation) -> Result<Self, String> {
+        Self::with_budget(sps_pps, rotation, MAX_VIDEO_PIXELS, None)
+    }
+
+    /// The same, under a caller's own pixel budget and picture sink.
+    ///
+    /// A call is tighter than an attachment — 4K is already far past what a
+    /// call offers — and it wants each picture as it lands rather than the
+    /// newest when it next draws, because the window's own frame slot is
+    /// where a call's pictures are held.
+    pub fn with_budget(
+        sps_pps: &[u8],
+        rotation: Rotation,
+        max_pixels: usize,
+        sink: Option<Rc<dyn Fn(Picture)>>,
+    ) -> Result<Self, String> {
         // Before anything is configured, for the reason the native decoder
         // asks before it allocates: the numbers come from a file somebody
         // sent, and a budget applied after the decoder has sized its own
         // buffers is applied after the allocation it exists to prevent.
-        if let Some((width, height)) = declares_more_than(sps_pps, MAX_VIDEO_PIXELS) {
+        if let Some((width, height)) = declares_more_than(sps_pps, max_pixels) {
             return Err(format!("refusing a {width}x{height} video stream"));
         }
         let codec = codec_string(sps_pps)
             .ok_or_else(|| "no readable parameter set in this stream".to_string())?;
 
         let slot = Rc::new(RefCell::new(Slot::default()));
+        let rotation = Rc::new(Cell::new(rotation));
 
         let on_frame = {
             let slot = Rc::clone(&slot);
+            let rotation = Rc::clone(&rotation);
             Closure::<dyn FnMut(web_sys::VideoFrame)>::new(move |frame: web_sys::VideoFrame| {
-                read_frame(frame, rotation, Rc::clone(&slot));
+                read_frame(
+                    frame,
+                    rotation.get(),
+                    max_pixels,
+                    Rc::clone(&slot),
+                    sink.clone(),
+                );
             })
         };
         let on_error = {
@@ -143,6 +174,7 @@ impl Decoder {
             inner,
             slot,
             rotation,
+            max_pixels,
             _on_frame: on_frame,
             _on_error: on_error,
         })
@@ -160,7 +192,7 @@ impl Decoder {
         // Refused per unit rather than once at configuration: a stream may
         // carry a new parameter set at any point, and the browser would size
         // its buffers from whichever it saw last.
-        if let Some((width, height)) = declares_more_than(access_unit, MAX_VIDEO_PIXELS) {
+        if let Some((width, height)) = declares_more_than(access_unit, self.max_pixels) {
             self.slot.borrow_mut().failed =
                 Some(format!("refusing a {width}x{height} video stream"));
             return;
@@ -214,9 +246,12 @@ impl Decoder {
         slot.produced = 0;
     }
 
-    /// The rotation this decoder applies, for a caller sizing a picture.
-    pub fn rotation(&self) -> Rotation {
-        self.rotation
+    /// Turn the next pictures a different way.
+    ///
+    /// A call's orientation travels on each frame, so this is set before the
+    /// unit that carries it is fed.
+    pub fn set_rotation(&self, rotation: Rotation) {
+        self.rotation.set(rotation);
     }
 }
 
@@ -235,7 +270,13 @@ impl Drop for Decoder {
 /// Asynchronous, because `copy_to` is: the frame is closed as soon as the
 /// copy resolves, since an unclosed `VideoFrame` pins a decoder buffer and a
 /// decoder that runs out of them stops producing.
-fn read_frame(frame: web_sys::VideoFrame, rotation: Rotation, slot: Rc<RefCell<Slot>>) {
+fn read_frame(
+    frame: web_sys::VideoFrame,
+    rotation: Rotation,
+    max_pixels: usize,
+    slot: Rc<RefCell<Slot>>,
+    sink: Option<Rc<dyn Fn(Picture)>>,
+) {
     let width = frame.coded_width() as usize;
     let height = frame.coded_height() as usize;
     let timestamp_micros = frame.timestamp() as i64;
@@ -243,7 +284,9 @@ fn read_frame(frame: web_sys::VideoFrame, rotation: Rotation, slot: Rc<RefCell<S
     // The decoder's own geometry, never the container's. See
     // [`super::geometry::frame_byte_len`] for why that distinction is the one
     // that matters.
-    let Some(byte_len) = frame_byte_len(width, height) else {
+    let Some(byte_len) =
+        frame_byte_len(width, height).filter(|_| width.saturating_mul(height) <= max_pixels)
+    else {
         frame.close();
         let mut slot = slot.borrow_mut();
         if slot.failed.is_none() {
@@ -295,12 +338,20 @@ fn read_frame(frame: web_sys::VideoFrame, rotation: Rotation, slot: Rc<RefCell<S
         };
         let image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
 
-        let mut slot = slot.borrow_mut();
-        slot.newest = Some(Picture {
+        let picture = Picture {
             image,
             timestamp_micros,
-        });
-        slot.produced += 1;
+        };
+        {
+            let mut slot = slot.borrow_mut();
+            slot.newest = Some(picture.clone());
+            slot.produced += 1;
+        }
+        // After the borrow is released: a sink is the caller's code, and one
+        // that asked this decoder anything would find it already borrowed.
+        if let Some(sink) = sink {
+            sink(picture);
+        }
     });
 }
 

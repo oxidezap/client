@@ -735,19 +735,6 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
-        // Before the download, not after the decode. Fetching a clip this
-        // build cannot decode spends the whole WhatsApp download and the
-        // loopback transfer to reach an answer that was fixed when the binary
-        // was built.
-        if !crate::video::CAN_DECODE {
-            self.video_players
-                .entry(message_id)
-                .or_default()
-                .set_error("Video cannot be played in the browser".to_string());
-            cx.notify();
-            return;
-        }
-
         let Some(client) = &self.client else {
             warn!("Cannot download video: client is unavailable");
             return;

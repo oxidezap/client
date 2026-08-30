@@ -38,16 +38,6 @@ use unsupported as streaming;
 // Memory-efficient streaming decoder (on-demand decoding, ~3MB vs ~48MB)
 pub use streaming::StreamingVideoDecoder;
 
-/// Whether this build can decode a video at all.
-///
-/// True on both now: the desktop links openh264 and a page uses the browser's
-/// own decoder through WebCodecs. It stays as a constant rather than being
-/// deleted because it answers *before the bytes are fetched* — a build with
-/// no decoder should not make the daemon download a film to refuse it — and
-/// because a browser that turns out to have no `VideoDecoder` still refuses
-/// at construction, which is a per-file answer this cannot give.
-pub const CAN_DECODE: bool = true;
-
 // A live call's two directions, decoded off the IPC thread.
 pub use call::{CallFrame, CallVideo, FrameSink, LatestFrames};
 
