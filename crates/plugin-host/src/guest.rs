@@ -980,6 +980,24 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if line > MAX_LOG_BYTES as usize {
                 return;
             }
+            // Against the raw length before anything is copied, because the
+            // escape below is host work a refusal should not pay for: with
+            // the allowance spent, a plugin calling this in a loop was
+            // copying and expanding two kilobytes of control bytes into
+            // twelve on every refused call, none of it priced.
+            //
+            // A floor rather than the whole check: what is charged is the
+            // escaped length, which is only known after the escape, so this
+            // refuses what could not fit even unexpanded and the check below
+            // refuses the rest.
+            let per_call = if c.data().phase == Phase::Init {
+                MAX_LOG_BYTES_FOR_INIT
+            } else {
+                MAX_LOG_BYTES_PER_CALL
+            };
+            if line > per_call.saturating_sub(c.data().logged_bytes) {
+                return;
+            }
             let Ok(line) = read_str(&mut c, ptr, len) else {
                 return;
             };
@@ -1004,12 +1022,6 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // a threshold, not a limit, and lets the line that crosses it
             // through in full. Silently, past it: a line saying "you have
             // logged too much" is another line.
-            // A smaller allowance until the loader has accepted the module.
-            let per_call = if c.data().phase == Phase::Init {
-                MAX_LOG_BYTES_FOR_INIT
-            } else {
-                MAX_LOG_BYTES_PER_CALL
-            };
             let spent = &mut c.data_mut().logged_bytes;
             if written > per_call.saturating_sub(*spent) {
                 return;
