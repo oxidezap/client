@@ -218,14 +218,35 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
-        // Past any plausible backlog, and held open so none of them drain.
-        let mut held = Vec::new();
-        for _ in 0..600 {
-            match std::os::unix::net::UnixStream::connect(&path) {
-                Ok(stream) => held.push(stream),
-                Err(_) => break,
+        // The saturation runs on a thread of its own, and the test waits for
+        // the *state* rather than for the loop to end. A `connect` into a full
+        // backlog does not fail here: it waits in the kernel for an accept
+        // that is never coming — which is precisely the condition being set
+        // up, so joining the loop would hang the test on exactly the machines
+        // where the setup succeeds. The thread holds the connections and
+        // parks, because a dropped one drains a slot again.
+        let (tick, ticks) = std::sync::mpsc::channel();
+        let saturating = path.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..600 {
+                match std::os::unix::net::UnixStream::connect(&saturating) {
+                    Ok(stream) => held.push(stream),
+                    Err(_) => break,
+                }
+                if tick.send(()).is_err() {
+                    return;
+                }
             }
-        }
+            let _ = tick.send(());
+            std::thread::park();
+        });
+        // Connections stopped arriving: either they are being refused or one
+        // is parked in the kernel, and for this test those are one state.
+        while ticks
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok()
+        {}
 
         let started = wacore::time::Instant::now();
         assert!(
@@ -237,7 +258,6 @@ mod tests {
             "the probe answers rather than waiting on the kernel"
         );
 
-        drop(held);
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
     }
