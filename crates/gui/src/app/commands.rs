@@ -255,6 +255,10 @@ impl WhatsAppApp {
             // directory reads in another process, and a pane that starts on
             // "measuring…" every time is worse than one that is already right.
             self.refresh_storage_usage(cx);
+            // And the plugin folder, for the same reason and on the same
+            // terms: it is a directory read, and where this front end has no
+            // folder of its own the call returns without doing anything.
+            self.refresh_installed_plugins(cx);
             cx.notify();
         }
     }
@@ -268,6 +272,9 @@ impl WhatsAppApp {
                 // Re-measured on arrival: a download since the pane was last
                 // open has changed the number it is about to show.
                 self.refresh_storage_usage(cx);
+            }
+            if section == SettingsSection::Plugins {
+                self.refresh_installed_plugins(cx);
             }
             cx.notify();
         }

@@ -77,10 +77,20 @@ js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+    # The origin's private filesystem, which is where a page keeps the
+    # plugins it has been given. See `plugins/web.rs`.
+    "DomException",
+    "File",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemWritableFileStream",
     "Lock",
     "LockManager",
     "LockOptions",
     "Navigator",
+    "StorageManager",
     "Window",
 ] }
 

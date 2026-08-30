@@ -10,7 +10,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon, IconName};
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 
 use crate::app::{SettingsSection, WhatsAppApp};
 use crate::components::ProductIcon;
@@ -63,33 +63,74 @@ pub fn group(
 /// The loaded plugins, each with what it may do and whatever it drew for
 /// itself.
 ///
-/// A list of what is running rather than a place to install anything: a
-/// plugin is a file in a folder, and a screen that pretended otherwise would
-/// be describing a mechanism this daemon does not have.
+/// A list of what is running, and — where this front end has a folder of its
+/// own — the two things that change what is in it. A page holding its own
+/// session is the only front end with one: everywhere else a plugin is a file
+/// in another process's directory, and a screen offering to install one there
+/// would be describing a mechanism this window does not have.
 fn plugins(
     app: &WhatsAppApp,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     cx: &App,
 ) -> AnyElement {
-    let ctx = crate::components::PluginContext { entity, metrics };
+    let ctx = crate::components::PluginContext {
+        entity: entity.clone(),
+        metrics,
+    };
+    let home = crate::platform::plugins::home();
+    let installer = home
+        .can_install()
+        .then(|| add_a_plugin(entity.clone(), metrics));
+
+    // Everything in the folder that published nothing. A module that fails
+    // to parse, answers the wrong ABI version or traps in `oxi_init` has no
+    // surface at all, so a screen drawn from the surfaces alone leaves the
+    // one file somebody most needs to remove with no control anywhere — and
+    // it goes on spending the folder's budget at every load.
+    let silent: Vec<String> = app
+        .installed_plugins()
+        .unwrap_or_default()
+        .iter()
+        .filter(|id| !app.plugins().iter().any(|surface| &surface.id == *id))
+        .cloned()
+        .collect();
+    let broken = (!silent.is_empty()).then(|| {
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_md())
+            .child(card(
+                silent
+                    .iter()
+                    .map(|id| (id.clone(), "Installed, but it did not load".to_string()))
+                    .collect(),
+                metrics,
+                cx,
+            ))
+            .children(
+                silent
+                    .iter()
+                    .map(|id| remove_a_plugin(id, entity.clone(), metrics)),
+            )
+    });
+
     if app.plugins().is_empty() {
         // Two different empty lists, and only one of them is waiting for a
-        // file. Where the daemon cannot run plugins at all, advice about a
-        // folder is advice nobody can take — see
-        // [`crate::platform::plugins_unavailable`].
-        let (heading, detail) = crate::platform::plugins_unavailable().map_or_else(
-            || {
-                (
-                    "None loaded",
-                    "Drop a .wasm file in the plugins folder and restart".to_string(),
-                )
-            },
-            |why| ("Not available here", why.to_string()),
-        );
+        // file somebody else has to put there.
         return group(
             label("PLUGINS", metrics, cx),
-            card(vec![(heading.to_string(), detail)], metrics, cx),
+            div()
+                .flex()
+                .flex_col()
+                .gap(metrics.space_lg())
+                .child(card(
+                    vec![("None loaded".to_string(), home.nothing_loaded().to_string())],
+                    metrics,
+                    cx,
+                ))
+                .children(broken)
+                .children(installer),
             metrics,
         )
         .into_any_element();
@@ -97,14 +138,95 @@ fn plugins(
 
     group(
         label("PLUGINS", metrics, cx),
-        div().flex().flex_col().gap(metrics.space_lg()).children(
-            app.plugins().iter().map(|surface| {
-                crate::components::plugin_ui::settings_entry(surface, app, &ctx, cx)
-            }),
-        ),
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_lg())
+            .children(app.plugins().iter().map(|surface| {
+                let entry = crate::components::plugin_ui::settings_entry(surface, app, &ctx, cx);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(metrics.space_md())
+                    .child(entry)
+                    .children(home.can_install().then(|| {
+                        // A removed plugin keeps running until the next load,
+                        // so its surface is still here while its file is not
+                        // — and a Remove button over a file that has gone is
+                        // one whose second press answers "not found". What it
+                        // says instead is the true thing: it is out of the
+                        // folder and it stops at the next load.
+                        // Absent from a folder that has been *read*. A
+                        // listing nobody has answered yet is not the folder
+                        // saying no — the read is a task, so the first frame
+                        // after Settings opens has none of it, and taking
+                        // that for absence would tell somebody every plugin
+                        // they are running had been removed.
+                        let gone = app
+                            .installed_plugins()
+                            .is_some_and(|ids| !ids.contains(&surface.id));
+                        if gone {
+                            removed_already(metrics, cx).into_any_element()
+                        } else {
+                            remove_a_plugin(&surface.id, entity.clone(), metrics).into_any_element()
+                        }
+                    }))
+            }))
+            .children(broken)
+            .children(installer),
         metrics,
     )
     .into_any_element()
+}
+
+/// The control that puts a `.wasm` in this front end's own folder.
+fn add_a_plugin(entity: Entity<WhatsAppApp>, metrics: Metrics) -> impl IntoElement + use<> {
+    div().flex().justify_end().px(metrics.space_xs()).child(
+        Button::new("install-plugin")
+            .label("Add a plugin…")
+            .outline()
+            .on_click(move |_, _window, cx| {
+                entity.update(cx, |app, cx| app.install_plugin(cx));
+            }),
+    )
+}
+
+/// What stands where the Remove button was, once the file has gone.
+///
+/// Drawn rather than left blank: a control that vanishes tells nobody
+/// anything, which is the same reason a stopped plugin's widgets stay on
+/// screen beside their reason.
+fn removed_already(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .justify_end()
+        .px(metrics.space_xs())
+        .text_size(metrics.text_meta())
+        .text_color(cx.theme().muted_foreground)
+        .child("Removed. It stops at the next reload.")
+}
+
+/// The control that takes one back out again.
+///
+/// Beside each plugin rather than inside its own tree: a plugin draws its
+/// widgets and this is not one of them — a module that could publish its own
+/// uninstall button could also publish something else under that id.
+fn remove_a_plugin(
+    id: &str,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+) -> impl IntoElement + use<> {
+    let id = id.to_owned();
+    div().flex().justify_end().px(metrics.space_xs()).child(
+        Button::new(gpui::SharedString::from(format!("remove-plugin-{id}")))
+            .label("Remove")
+            .ghost()
+            .small()
+            .on_click(move |_, _window, cx| {
+                let id = id.clone();
+                entity.update(cx, |app, cx| app.remove_plugin(id, cx));
+            }),
+    )
 }
 
 /// A short all-caps section label.

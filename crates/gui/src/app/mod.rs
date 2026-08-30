@@ -871,6 +871,16 @@ pub struct WhatsAppApp {
     settings: Option<SettingsState>,
     /// What this account occupies on disk, as the daemon last measured it.
     storage_usage: Option<crate::session::StorageUsage>,
+    /// Every plugin id in this front end's own folder, whether or not it
+    /// loaded.
+    ///
+    /// Not the same list as `plugins`, and the difference is the whole reason
+    /// it exists: a module that fails to parse, answers the wrong ABI version
+    /// or traps in `oxi_init` publishes no surface, so a screen drawn from
+    /// the surfaces alone has nowhere to put a Remove button for the one file
+    /// somebody most needs to remove. `None` is "not asked yet", which is
+    /// what a front end with no folder of its own stays at forever.
+    installed_plugins: Option<Vec<String>>,
     /// Which of the sidebar's destinations is on screen.
     destination: Destination,
     /// Whose status updates are open, and which one of them.
@@ -1060,6 +1070,7 @@ impl WhatsAppApp {
             chat_list_cache: RefCell::new(None),
             chat_cache_version: std::cell::Cell::new(0),
             storage_usage: None,
+            installed_plugins: None,
             destination: Destination::default(),
             status_pane: StatusPane::default(),
             status_feed_cache: RefCell::new(None),

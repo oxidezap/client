@@ -6196,6 +6196,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "env_logger",
+ "futures-channel",
  "futures-lite",
  "getrandom 0.4.3",
  "gpui",
@@ -6269,15 +6270,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures-channel",
+ "futures-lite",
+ "js-sys",
  "log",
  "oxidezap-core",
  "oxidezap-plugin-abi",
  "portable-atomic",
  "rustix 1.1.4",
  "serde_json",
+ "tokio",
  "wacore",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasmi",
  "wat",
+ "web-sys",
 ]
 
 [[package]]
