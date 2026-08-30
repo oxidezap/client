@@ -1250,14 +1250,13 @@ by definition.
   here. Attached to an `oxidezapd` the question does not arise, because the
   daemon holds the ureq client and does the upload.
 
-- **Video is not decoded on the web**, in a message or in a call, **and voice
-  notes are not recorded there.** All three are the same cause — the decoder
-  and the encoder are C — and each has a browser-native answer that is a Rust
-  binding: `web_sys::VideoDecoder` and `MediaRecorder`. Each is an API change
-  rather than a backend swap, because one is asynchronous where
-  `StreamingVideoDecoder` is pulled by index, and the other hands back encoded
-  bytes where `RecordedAudio` is samples. `video/call_unsupported.rs` is what
-  a page has meanwhile: the names, and frames dropped where they arrive.
+- **Voice notes are not recorded on the web.** The encoder is libopus, which
+  is C. `MediaRecorder` is the browser-native answer and a Rust binding like
+  every other here, but it is an API change rather than a backend swap: it
+  hands back *encoded bytes* where `RecordedAudio` is samples, and the
+  waveform is derived from those samples — so it needs a ready-bytes path
+  beside `encode_to_opus_ogg` and another source for the envelope, for which
+  an `AnalyserNode` during the recording is the cheap one.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
