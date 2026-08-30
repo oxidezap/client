@@ -22,7 +22,7 @@ use std::time::Duration;
 #[cfg_attr(not(target_family = "wasm"), path = "sched/native.rs")]
 mod platform;
 
-pub use platform::{Receiver, Sender, Task, channel, sleep, spawn};
+pub use platform::{Receiver, Sender, Task, breathe, channel, sleep, spawn};
 
 /// [`Send`], where the platform's executor asks for it.
 ///

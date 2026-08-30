@@ -305,7 +305,12 @@ impl Plugins {
                 })
             })
             .collect();
-        Self::start(modules, state, commands, sink)
+        // Driven here rather than propagated: a desktop's loader owns the
+        // thread it runs on — `plugins::start` puts it on `spawn_blocking` —
+        // so there is nothing for it to yield to and `breathe` is a no-op.
+        // What the `async` shape buys is the page, where the same loop has to
+        // hand the browser a turn between modules.
+        futures_lite::future::block_on(Self::start(modules, state, commands, sink))
     }
 
     /// Run a set of modules somebody else found.
@@ -314,8 +319,17 @@ impl Plugins {
     /// a browser has no directory to scan and no file to read, so it hands
     /// over the modules it holds and the storage its origin keeps, and
     /// everything below this line is the same host the socket has.
+    ///
+    /// `async` for one reason, and it is not I/O: a module's bytes are
+    /// already in hand and `Runtime::load` is synchronous wasm either way.
+    /// It is that a page runs this on the agent it draws with, so
+    /// `MAX_LOAD_TIME` would otherwise be the length of the worst freeze
+    /// rather than a bound on the loading — [`sched::breathe`] between
+    /// modules is what keeps the two from being the same number. What it
+    /// cannot break up is one module's own `oxi_init`, which is a synchronous
+    /// call with a fuel budget and nothing to yield at.
     #[must_use]
-    pub fn start(
+    pub async fn start(
         modules: Vec<Module>,
         state: Arc<dyn Backing>,
         commands: Arc<dyn Commands>,
@@ -348,6 +362,10 @@ impl Plugins {
                 );
                 break;
             }
+            // Before the module is opened, so the turn falls between two
+            // modules rather than between a read and the instantiation it
+            // feeds.
+            sched::breathe().await;
             let Module { id, open } = module;
             // Asked of every id, however the caller arrived at one. A
             // desktop's comes from a file name and a page's from whoever

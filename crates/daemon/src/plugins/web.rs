@@ -50,18 +50,19 @@ const DIR: &str = "plugins";
 /// in a browser is a promise and the host's loader is not async.
 pub const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
-thread_local! {
-    /// Held across one installation's weigh-and-write. See [`install`].
-    ///
-    /// Per agent, because that is the scope the folder is shared in: a page
-    /// has one, and a worker that ever ran this would have its own handle to
-    /// the same directory and its own reason to serialize. An async lock and
-    /// not a flag, because the section spans awaits and the second caller
-    /// should be made to wait rather than told to try again — a person who
-    /// pressed Add twice wants both files.
-    static INSTALLING: std::rc::Rc<tokio::sync::Mutex<()>> =
-        std::rc::Rc::new(tokio::sync::Mutex::new(()));
-}
+/// The name one installation is serialized under.
+///
+/// A Web Lock and not a lock in this agent, because the folder is the
+/// *origin's* and so is everyone who can write it: two tabs of the same
+/// origin share this directory, and a per-agent mutex would leave each of
+/// them weighing a folder the other is about to grow. The same API the
+/// account's own claim is taken with, and the reason it is the right one
+/// twice — a browser lock is the only kind that spans tabs.
+///
+/// Without `if_available`, deliberately: the second installation should
+/// *wait* rather than be told to try again. Somebody who pressed Add twice
+/// wants both files.
+const INSTALL_LOCK: &str = "oxidezap-plugins-install";
 
 /// Everything installed, ready to hand to the host.
 ///
@@ -142,25 +143,29 @@ pub async fn installed() -> Vec<Module> {
 /// installation notice for a plugin that never runs. Refused at the moment
 /// somebody can still do something about it.
 ///
-/// Weighing the folder and writing into it are one step, and the lock below
-/// is what makes them one. Two installations overlap easily — a second Add
-/// while the first file is still being read or written is a person pressing a
-/// button twice — and each would finish `occupied` against the same total
-/// before either write landed, so two modules that do not fit together would
-/// both be accepted. The page has one agent and every await here is a browser
-/// promise, so the lock is never contended for long and never deadlocks: it is
-/// held across the read and the write and nothing else.
+/// Weighing the folder and writing into it are one step, and
+/// [`INSTALL_LOCK`] is what makes them one. Two installations overlap easily
+/// — a second Add while the first file is still being written, or a second
+/// tab of the same origin — and each would finish `occupied` against the same
+/// total before either write landed, so two modules that do not fit together
+/// would both be accepted and the second would never run.
 ///
 /// # Errors
 ///
 /// The name is not one a plugin may have, the folder has no room for it, or
 /// the browser refused the write — a quota, or a mode with no storage.
-pub async fn install(file_name: &str, bytes: &[u8]) -> Result<String, String> {
+pub async fn install(file_name: &str, bytes: Vec<u8>) -> Result<String, String> {
     let id = plugin_id(file_name)
         .ok_or_else(|| format!("`{file_name}` is not a name a plugin can have"))?;
     let name = format!("{id}.wasm");
-    let installing = INSTALLING.with(std::rc::Rc::clone);
-    let _one_at_a_time = installing.lock().await;
+    // Both halves, and neither swallowed: the outer answers whether the lock
+    // ran the work at all, the inner what the work made of it.
+    exclusively(INSTALL_LOCK, async move { place(name, bytes).await }).await??;
+    Ok(id)
+}
+
+/// Weigh the folder and write into it. Runs under [`INSTALL_LOCK`].
+async fn place(name: String, bytes: Vec<u8>) -> Result<(), String> {
     let dir = folder(true)
         .await
         .map_err(described)?
@@ -176,8 +181,61 @@ pub async fn install(file_name: &str, bytes: &[u8]) -> Result<String, String> {
              {MAX_TOTAL_BYTES} this page loads. Remove one first."
         ));
     }
-    write(&dir, &name, bytes).await.map_err(described)?;
-    Ok(id)
+    write(&dir, &name, &bytes).await.map_err(described)
+}
+
+/// Run `work` while holding the origin-wide lock called `name`.
+///
+/// The browser holds a lock for exactly as long as the promise the callback
+/// returns stays pending, so the work goes *inside* the callback and its
+/// answer comes back out on a channel.
+///
+/// The closure is owned by a detached task rather than by this future, which
+/// is the same rule the account's claim keeps and for the same reason: a
+/// `Closure` freed while the lock manager still holds a reference is a panic
+/// rather than a missed call, and the caller here is a UI task somebody can
+/// navigate away from. It also means a write already under way finishes even
+/// if nobody is left waiting for the answer, which is the right end for a
+/// half-written module.
+async fn exclusively<T: 'static>(
+    name: &str,
+    work: impl std::future::Future<Output = T> + 'static,
+) -> Result<T, String> {
+    let Some(locks) = web_sys::window().map(|window| window.navigator().locks()) else {
+        // No lock manager at all — a context with no `navigator`, or a
+        // browser older than the API. Nothing to serialize with, so the work
+        // runs unguarded: the alternative is refusing to install anything on
+        // a browser that can still hold the file perfectly well.
+        log::warn!("this browser has no Web Locks; installing without serializing");
+        return Ok(work.await);
+    };
+
+    let (tell, told) = futures_channel::oneshot::channel::<T>();
+    let carried = std::cell::RefCell::new(Some((work, tell)));
+    let callback = wasm_bindgen::prelude::Closure::<dyn FnMut(JsValue) -> js_sys::Promise>::new(
+        move |_lock: JsValue| {
+            let taken = carried.borrow_mut().take();
+            wasm_bindgen_futures::future_to_promise(async move {
+                if let Some((work, tell)) = taken {
+                    let _ = tell.send(work.await);
+                }
+                Ok(JsValue::UNDEFINED)
+            })
+        },
+    );
+    let request = locks.request(name, callback.as_ref().unchecked_ref());
+    let name = name.to_owned();
+    wasm_bindgen_futures::spawn_local(async move {
+        // The closure lives here, and nowhere the caller can drop it. The
+        // request's promise settles when the callback's does, which is after
+        // the work has finished and answered.
+        let _held = callback;
+        if let Err(e) = JsFuture::from(request).await {
+            log::warn!("the {name} lock was not granted: {}", described(e));
+        }
+    });
+    told.await
+        .map_err(|_| "the browser did not run that installation".to_owned())
 }
 
 /// What the folder already holds, in bytes, ignoring `replacing`.

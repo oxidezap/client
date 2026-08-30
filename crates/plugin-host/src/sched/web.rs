@@ -119,6 +119,15 @@ impl Timers {
     }
 }
 
+/// Give the page's loop a turn.
+///
+/// A zero-length `setTimeout` rather than a bare yield, because what has to
+/// run in the gap is the browser's own work — a frame, an input event — and
+/// not merely another Rust task on the same tick.
+pub async fn breathe() {
+    sleep(Duration::ZERO).await;
+}
+
 /// `setTimeout`, as a future.
 ///
 /// Parks forever where no timer can be armed, which is the same answer the

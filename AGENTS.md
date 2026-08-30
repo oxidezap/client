@@ -1442,7 +1442,11 @@ by definition.
   spends its whole fuel budget costs a core nobody was using; here it costs
   the frame the page was about to draw. Fuel bounds one call and `MAX_DUTY`
   bounds the sum of them, so the ceiling is a known one, and it is still a
-  plugin the user can feel. The answer is the one the store is already
+  plugin the user can feel. Loading is the same fact at its worst: `start` is
+  `async` and yields to the page between modules (`sched::breathe`), so
+  `MAX_LOAD_TIME` bounds the loading rather than the length of a freeze — but
+  one module's own `oxi_init` is a synchronous call with a fuel budget and
+  nothing to yield at. The answer is the one the store is already
   waiting on: a dedicated worker per plugin, its queue a `postMessage` port
   instead of a channel on this loop. That is a second scheduler rather than a
   second backend, which is why it is not done here.
@@ -1451,9 +1455,9 @@ by definition.
   desktop opens them one at a time, but nothing in a browser can open a file
   lazily from a synchronous loader, so `MAX_TOTAL_BYTES` bounds the folder
   where the desktop bounds the file, and installing checks what the folder
-  *would become* rather than what the new module weighs — under a lock, since
-  two overlapping installs would otherwise weigh the same folder and both fit
-  in it. A second plugin that fits alone and not beside the first would
+  *would become* rather than what the new module weighs — under a Web Lock,
+  since the folder is the origin's and two tabs of it would otherwise each
+  weigh a folder the other is about to grow. A second plugin that fits alone and not beside the first would
   otherwise be written, reported as installed, and skipped at every load
   after.
 - **A page with its own session cannot send media, and the reason is upstream.**

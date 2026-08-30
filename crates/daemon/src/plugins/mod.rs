@@ -42,12 +42,15 @@ pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugin
     #[cfg(target_family = "wasm")]
     {
         let modules = web::installed().await;
-        Arc::new(Plugins::start(
-            modules,
-            Arc::new(oxidezap_plugin_host::Origin::storage()),
-            Arc::new(Bridge { commands }),
-            sink,
-        ))
+        Arc::new(
+            Plugins::start(
+                modules,
+                Arc::new(oxidezap_plugin_host::Origin::storage()),
+                Arc::new(Bridge { commands }),
+                sink,
+            )
+            .await,
+        )
     }
 
     #[cfg(not(target_family = "wasm"))]

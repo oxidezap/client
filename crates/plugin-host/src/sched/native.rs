@@ -65,6 +65,9 @@ impl<T> Receiver<T> {
     }
 }
 
+/// Nothing to yield to: the loader owns this thread.
+pub async fn breathe() {}
+
 /// Hold this thread. See the module note: there is nothing else on it.
 pub async fn sleep(duration: Duration) {
     std::thread::sleep(duration);

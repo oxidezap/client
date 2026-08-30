@@ -168,7 +168,7 @@ mod imp {
             .await
             .map_err(|e| format!("that file could not be read ({e:?})"))?;
         let bytes = Uint8Array::new(&buffer).to_vec();
-        oxidezap_daemon::plugins::web::install(&name, &bytes)
+        oxidezap_daemon::plugins::web::install(&name, bytes)
             .await
             .map(Some)
     }

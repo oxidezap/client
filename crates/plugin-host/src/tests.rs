@@ -502,7 +502,7 @@ fn modules_handed_over_as_bytes_run_like_files_in_a_folder() {
     let module = wat::parse_str(pong().as_str()).expect("the fixture assembles");
     let commands = Recorder::new(Outcome::Accepted);
     let published = Published::default();
-    let plugins = Plugins::start(
+    let plugins = futures_lite::future::block_on(Plugins::start(
         vec![crate::Module {
             id: "autoreply".to_owned(),
             open: Box::new(move || Ok(module)),
@@ -510,7 +510,7 @@ fn modules_handed_over_as_bytes_run_like_files_in_a_folder() {
         Arc::new(crate::store::Nowhere),
         Arc::new(Arc::clone(&commands)) as Arc<dyn Commands>,
         published.sink(),
-    );
+    ));
     assert_eq!(plugins.ids(), vec!["autoreply"]);
     plugins.approve("autoreply", true);
 
@@ -534,7 +534,7 @@ fn a_module_whose_id_is_not_usable_is_not_opened() {
     let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watched = Arc::clone(&opened);
     let published = Published::default();
-    let plugins = Plugins::start(
+    let plugins = futures_lite::future::block_on(Plugins::start(
         vec![crate::Module {
             id: "../approvals".to_owned(),
             open: Box::new(move || {
@@ -545,7 +545,7 @@ fn a_module_whose_id_is_not_usable_is_not_opened() {
         Arc::new(crate::store::Nowhere),
         Arc::new(Recorder::new(Outcome::Accepted)) as Arc<dyn Commands>,
         published.sink(),
-    );
+    ));
     assert!(plugins.is_empty(), "nothing with that name runs");
     assert!(
         !opened.load(std::sync::atomic::Ordering::SeqCst),
@@ -561,7 +561,7 @@ fn two_modules_cannot_claim_one_id() {
     let first = wat::parse_str(pong().as_str()).expect("the fixture assembles");
     let second = first.clone();
     let published = Published::default();
-    let plugins = Plugins::start(
+    let plugins = futures_lite::future::block_on(Plugins::start(
         vec![
             crate::Module {
                 id: "autoreply".to_owned(),
@@ -575,7 +575,7 @@ fn two_modules_cannot_claim_one_id() {
         Arc::new(crate::store::Nowhere),
         Arc::new(Recorder::new(Outcome::Accepted)) as Arc<dyn Commands>,
         published.sink(),
-    );
+    ));
     assert_eq!(plugins.ids(), vec!["autoreply"]);
 }
 
