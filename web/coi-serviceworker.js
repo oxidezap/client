@@ -12,6 +12,13 @@
 // load registers this and reloads once, and every navigation after that is
 // served through here and is already isolated.
 //
+// *Once* is load-bearing rather than descriptive. A reload is the only way
+// this takes effect and it is also the only thing here that can run away: a
+// page that reloads whenever a worker takes control reloads on every update,
+// and a worker that skips waiting and claims makes every update a takeover.
+// The page half below bounds it — once per document, once per tab — and says
+// what it knows instead of navigating again.
+//
 // *Navigations*, and worker scripts: those are the two responses the headers
 // mean anything on, and answering the rest of them costs the page a second
 // download of everything it preloaded. See the fetch handler below.
@@ -100,46 +107,116 @@ if (typeof window === "undefined") {
     });
 } else {
     // ---- Running on the page --------------------------------------------
-    // Already isolated: either the worker is serving us, or the host set the
-    // headers itself. Nothing to do.
-    if (!window.crossOriginIsolated) {
-        if (!window.isSecureContext) {
-            // Service workers need HTTPS (or localhost). Say so rather than
-            // failing later with "SharedArrayBuffer is not defined".
-            console.error(
-                "coi-serviceworker: this page is not a secure context, so it " +
-                    "cannot be cross-origin isolated. Serve it over HTTPS or " +
-                    "from localhost.",
-            );
-        } else if (!navigator.serviceWorker) {
-            console.error(
-                "coi-serviceworker: this browser has no service workers, so " +
-                    "the window cannot start its background executor.",
-            );
-        } else {
-            // Reload when the worker is actually *controlling* the page, not
-            // when it starts installing. `updatefound` fires at the start of
-            // an install, and a reload then lands on another uncontrolled
-            // navigation which sees the same installing registration, gets no
-            // new event, and sits there without a SharedArrayBuffer until
-            // somebody reloads by hand. `controllerchange` is the event that
-            // means "from now on, responses come through the worker".
-            navigator.serviceWorker.addEventListener("controllerchange", () =>
-                window.location.reload(),
-            );
-            navigator.serviceWorker
-                .register(window.document.currentScript.src)
-                .then((registration) => {
-                    // Already active but not yet controlling this page — the
-                    // navigation that registered it is never controlled by
-                    // it, and no `controllerchange` is coming for us.
-                    if (registration.active && !navigator.serviceWorker.controller) {
-                        window.location.reload();
-                    }
-                })
-                .catch((error) =>
-                    console.error("coi-serviceworker: registration failed:", error),
-                );
+    // A reload is the only way this takes effect, and it is also the only way
+    // it can fail catastrophically: a page that reloads to become isolated and
+    // is not isolated when it comes back will reload again, and there is
+    // nothing in the second attempt that was not in the first. So the reload
+    // is bounded twice over — once per document, and once per tab — and what
+    // is past the bound is a console error rather than another navigation.
+    const RELOADED = "coi-serviceworker:reloaded";
+
+    // `sessionStorage` is per tab and survives a reload, which is exactly the
+    // scope the bound wants. A browser may refuse it (a privacy mode, a
+    // blocked storage context), and a refusal must not be read as "not yet
+    // reloaded" — that is the reading that loops — so it counts as spent.
+    const alreadyReloaded = () => {
+        try {
+            return window.sessionStorage.getItem(RELOADED) !== null;
+        } catch (error) {
+            console.warn("coi-serviceworker: no session storage:", error);
+            return true;
         }
+    };
+
+    if (window.crossOriginIsolated) {
+        // Isolated: either this worker is serving us or the host set the
+        // headers itself. Spend the mark, so that a later load which is
+        // somehow not isolated — the registration removed by hand, a browser
+        // that dropped it — still gets its one attempt.
+        try {
+            window.sessionStorage.removeItem(RELOADED);
+        } catch {
+            // Nothing was stored, so there is nothing to clear.
+        }
+    } else if (!window.isSecureContext) {
+        // Service workers need HTTPS (or localhost). Say so rather than
+        // failing later with "SharedArrayBuffer is not defined".
+        console.error(
+            "coi-serviceworker: this page is not a secure context, so it " +
+                "cannot be cross-origin isolated. Serve it over HTTPS or " +
+                "from localhost.",
+        );
+    } else if (!navigator.serviceWorker) {
+        console.error(
+            "coi-serviceworker: this browser has no service workers, so " +
+                "the window cannot start its background executor.",
+        );
+    } else if (alreadyReloaded()) {
+        // We have been here already in this tab, and came back without the
+        // headers. Reloading again would only ask the same question, so the
+        // loop stops here and says what it knows: everything below needs a
+        // `SharedArrayBuffer`, and there will not be one.
+        console.error(
+            "coi-serviceworker: this page reloaded to pick up cross-origin " +
+                "isolation and is still not isolated. The window will not " +
+                "start. Check that the service worker is controlling this " +
+                "page (Application → Service Workers) and that nothing " +
+                "is stripping COOP/COEP from its responses.",
+        );
+    } else {
+        // One reload, whichever of the two paths below asks for it first. A
+        // `location.reload()` does not stop this script — the document is
+        // torn down at the browser's convenience — so an unguarded call is a
+        // call that can be made twice, and the second one cancels the
+        // navigation the first one started. That is the shape the request
+        // log showed: dozens of cancelled documents, tens of milliseconds
+        // apart, none of them ever finishing.
+        let reloading = false;
+        const reloadOnce = () => {
+            if (reloading) {
+                return;
+            }
+            reloading = true;
+            try {
+                window.sessionStorage.setItem(RELOADED, "1");
+            } catch (error) {
+                // Then the bound above is gone and this is the only reload
+                // there is. Which is the safe direction: it has been taken.
+                console.warn("coi-serviceworker: no session storage:", error);
+            }
+            window.location.reload();
+        };
+
+        // Reload when the worker is actually *controlling* the page, not when
+        // it starts installing. `updatefound` fires at the start of an
+        // install, and a reload then lands on another uncontrolled navigation
+        // which sees the same installing registration, gets no new event, and
+        // sits there without a SharedArrayBuffer until somebody reloads by
+        // hand. `controllerchange` is the event that means "from now on,
+        // responses come through the worker".
+        //
+        // It fires for a *replacement* too, though, and that is the other
+        // half of the loop: every navigation that finds a new script installs
+        // a new worker, which skips waiting, activates and claims — so a page
+        // that reloads on every `controllerchange` reloads on every update,
+        // and DevTools' "Update on reload" makes every navigation an update.
+        // The version counter climbing into the thousands is what that looks
+        // like from the Application panel. This listener is registered only
+        // on a page that is *not* isolated, so a replacement under a working
+        // page is what it always should have been: nothing.
+        navigator.serviceWorker.addEventListener("controllerchange", reloadOnce);
+        navigator.serviceWorker
+            .register(window.document.currentScript.src)
+            .then((registration) => {
+                // Already active but not yet controlling this page — the
+                // navigation that registered it is never controlled by it,
+                // and no `controllerchange` is coming for us.
+                if (registration.active && !navigator.serviceWorker.controller) {
+                    reloadOnce();
+                }
+            })
+            .catch((error) =>
+                console.error("coi-serviceworker: registration failed:", error),
+            );
     }
 }
