@@ -330,7 +330,9 @@ mod tests {
 
         let orphan = dir.join(format!("{IN_PROGRESS_PREFIX}12345"));
         std::fs::write(&orphan, b"half a photo").unwrap();
-        let long_ago = std::time::SystemTime::now() - super::super::IN_PROGRESS_GRACE * 2;
+        let long_ago = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(wacore::time::now_millis() as u64)
+            - super::super::IN_PROGRESS_GRACE * 2;
         std::fs::File::options()
             .write(true)
             .open(&orphan)
