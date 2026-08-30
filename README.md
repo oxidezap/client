@@ -142,15 +142,21 @@ WebSocket is not subject to the same-origin policy, so any page in your browser
 can try to reach `ws://127.0.0.1` — and this one carries your message history
 and can send. Hence the token, which is what a loopback port lacks and a Unix
 socket has in its peer uid. It also refuses to bind anywhere but loopback, and
-refuses every browser origin except `localhost` and the ones you name:
+refuses every browser origin except the loopback ones — `localhost`,
+`127.0.0.1`, `[::1]`, on any port, which is `trunk serve` on your own machine —
+and the ones you name:
 
 ```bash
 # Serve a page published somewhere else — a Pages deployment, say.
 oxidezapd --web --web-allow https://oxidezap.github.io
 ```
 
-Reaching it from another machine is a tunnel's job (`ssh -L
-9527:127.0.0.1:9527`, or a TLS-terminating proxy that authenticates).
+The page checks the other direction too: a `#daemon=` URL is honoured only for
+loopback or for the page's own origin — the whole origin, scheme and port
+included. So reaching the bridge from another machine is a tunnel's job (`ssh
+-L 9527:127.0.0.1:9527`, which lands it back on loopback), and a reverse proxy
+only works if it serves the page and the bridge at the same origin: a page on
+GitHub Pages pointed at `wss://home.example/ws` is refused before it connects.
 
 **Known gap: the daemon is not authenticated to the page.** The token proves
 the page to the daemon and nothing proves the daemon to the page. Another
@@ -171,12 +177,15 @@ do not trust. See `endpoint_url` in `crates/ipc/src/endpoint/web.rs`.
   conservative because WebGPU can pass its own probe and then fail building a
   pipeline, which reaches wgpu as a panic and leaves a window that never draws
   — observed on an ordinary Intel/Mesa laptop.
-* **Calls need a modern browser.** A page's own session carries a call over an
-  `RTCPeerConnection`, with the microphone and speaker through WebAudio, the
-  camera through `getUserMedia` and the picture through WebCodecs; an agent
-  missing any of those is told so before the control is drawn instead of after.
-  Attached to an `oxidezapd`, the call rings in the daemon, so it keeps running
-  with every window closed.
+* **A call in a page needs `RTCPeerConnection`.** That is what carries the
+  media where the page holds its own session, so it is the one thing asked
+  before the call control is drawn at all; the microphone and speaker are
+  WebAudio and the camera is `getUserMedia`. A browser with no `VideoEncoder`
+  is not refused — a camera that will not open downgrades a call to voice
+  rather than failing it — and a browser with no `VideoDecoder` cannot draw the
+  peer's picture, which is asked separately and is also why videos in a
+  conversation are not offered there. Attached to an `oxidezapd`, the call
+  rings in the daemon, so it keeps running with every window closed.
 
 ## Data
 
