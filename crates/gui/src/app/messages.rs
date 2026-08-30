@@ -16,6 +16,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use gpui::SharedString;
 
+use crate::components::BubbleText;
 use crate::utils::crosses_day;
 use oxidezap_core::{ChatMessage, TypingSummary};
 
@@ -85,6 +86,16 @@ pub struct MessageListCache {
     /// formatting them at the row is formatting them sixty times a second for
     /// text that has not changed since the conversation was opened.
     pub ids: Arc<[BubbleIds]>,
+    /// Each message's text with its markup already resolved.
+    ///
+    /// Parallel to [`Self::messages`] and here for the ids' reason carried
+    /// one step further. A bubble used to clone `content` into a
+    /// `SharedString` and then parse it — a scan of the peer's text, a
+    /// partition of its spans and two more allocations — for every visible
+    /// row of every frame, for text that cannot change without this cache
+    /// being rebuilt. Both are now the rebuild's cost, and a frame's is a
+    /// refcount.
+    pub text: Arc<[BubbleText]>,
 }
 
 /// The element ids for one message's row, formatted once.
@@ -190,6 +201,10 @@ impl MessageListCache {
             items: build_items(messages, typing.clone()).into(),
             typing,
             ids: messages.iter().map(BubbleIds::of).collect(),
+            text: messages
+                .iter()
+                .map(|message| BubbleText::of(&message.content))
+                .collect(),
             messages: messages.iter().cloned().map(Arc::new).collect(),
         }
     }

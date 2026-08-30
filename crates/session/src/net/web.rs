@@ -17,8 +17,10 @@
 //! callers hold a queue into it, which is the same arrangement `ipc::Link`
 //! describes and for the same reason.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -92,6 +94,29 @@ impl Runtime for BrowserRuntime {
     }
 }
 
+thread_local! {
+    /// The page's window, resolved once.
+    ///
+    /// `web_sys::window()` is an `instanceof` across the wasm/JS boundary and
+    /// this is the library's own clock: it is asked for on every retry, every
+    /// poll and — through `yield_now`, which is this function at zero
+    /// milliseconds with `yield_frequency` of one — once per item the library
+    /// processes. Twice, before this, since the guard asked again to disarm.
+    static WINDOW: Option<web_sys::Window> = web_sys::window();
+}
+
+/// Do something with the page's window, if this agent has one.
+///
+/// `try_with` rather than `with`: the guard below is dropped from a task that
+/// can be torn down while thread locals are being destroyed, and a panic
+/// there is a panic in a destructor.
+fn with_window<T>(f: impl FnOnce(&web_sys::Window) -> T) -> Option<T> {
+    WINDOW
+        .try_with(|window| window.as_ref().map(f))
+        .ok()
+        .flatten()
+}
+
 /// `setTimeout`, as a future.
 ///
 /// Resolves immediately where no timer can be armed — a worker torn down
@@ -107,6 +132,11 @@ async fn sleep(duration: Duration) {
     /// cancels anything in a loop would strand one timer per iteration.
     struct Timer {
         handle: i32,
+        /// Raised by the callback. A timer that has already fired has nothing
+        /// to cancel, and the ordinary end of a wait is exactly that — so
+        /// cancelling unconditionally spent a `clearTimeout`, and the
+        /// `instanceof Window` in front of it, on every one of these.
+        fired: Rc<Cell<bool>>,
         _fire: Closure<dyn FnMut()>,
     }
 
@@ -117,26 +147,30 @@ async fn sleep(duration: Duration) {
         /// struct, and a browser calling a freed `Closure` is a wasm-bindgen
         /// panic rather than a missed wakeup.
         fn drop(&mut self) {
-            if let Some(window) = web_sys::window() {
-                window.clear_timeout_with_handle(self.handle);
+            if self.fired.get() {
+                return;
             }
+            with_window(|window| window.clear_timeout_with_handle(self.handle));
         }
     }
 
     let (tx, rx) = futures_channel::oneshot::channel::<()>();
-    let Some(window) = web_sys::window() else {
-        return;
-    };
     let mut tx = Some(tx);
+    let fired = Rc::new(Cell::new(false));
+    let raise = Rc::clone(&fired);
     let fire = Closure::<dyn FnMut()>::new(move || {
+        raise.set(true);
         if let Some(tx) = tx.take() {
             let _ = tx.send(());
         }
     });
-    let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-        fire.as_ref().unchecked_ref(),
-        i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
-    ) else {
+    let armed = with_window(|window| {
+        window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            fire.as_ref().unchecked_ref(),
+            i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
+        )
+    });
+    let Some(Ok(handle)) = armed else {
         return;
     };
     // Held until it has fired *or this future is dropped*. `Closure::forget`
@@ -144,6 +178,7 @@ async fn sleep(duration: Duration) {
     // called once per retry, per poll and per yield.
     let _timer = Timer {
         handle,
+        fired,
         _fire: fire,
     };
     let _ = rx.await;

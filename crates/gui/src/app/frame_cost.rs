@@ -163,4 +163,35 @@ mod tests {
             "a `SharedString` clone is a refcount; formatting one is not"
         );
     }
+
+    /// The same sentence about the text. A bubble used to clone `content` and
+    /// then parse it, per visible row per frame, for text that cannot change
+    /// without the rows being rebuilt — so the markup is resolved where the
+    /// ids are formatted and a frame pays a refcount for it.
+    ///
+    /// Marked text as well as plain, because the marked path is the one with
+    /// a partition behind it: the runs are shared, not rebuilt.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn bubble_text_is_parsed_once() {
+        let mut chat = conversation(500);
+        for (n, message) in chat.messages.iter_mut().enumerate() {
+            if n % 2 == 0 {
+                message.content = "*obrigado*, isso _funciona_, veja `run.sh`".to_string();
+            }
+        }
+        let cache = MessageListCache::new(&chat.messages, false, None);
+
+        let handing_out = allocations(|| {
+            // Twenty rows is a viewport; this is what the list does per frame.
+            for row in cache.text.iter().take(20) {
+                std::hint::black_box(row.clone());
+            }
+        });
+        println!("20 visible rows: {handing_out} allocations for their parsed text");
+        assert_eq!(
+            handing_out, 0,
+            "the markup is resolved when the rows are built; a frame clones two refcounts"
+        );
+    }
 }
