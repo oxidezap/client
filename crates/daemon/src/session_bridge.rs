@@ -1780,6 +1780,18 @@ struct ChatReads {
 }
 
 impl ChatReads {
+    /// Drop what this chat remembers about `ids`, so a fresh answer about
+    /// them can be folded in.
+    ///
+    /// Both queues, because `seen` is what makes `observe` skip a message it
+    /// recognises: left behind, a message the store still reports unread
+    /// would never be queued for its receipt again.
+    fn forget<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        let ids: std::collections::HashSet<&str> = ids.into_iter().collect();
+        self.unread.retain(|(id, _)| !ids.contains(id.as_str()));
+        self.seen.retain(|id| !ids.contains(id.as_str()));
+    }
+
     /// Fold one message in, answering whether it is an incoming message this
     /// chat had not seen before.
     ///
@@ -1871,10 +1883,6 @@ impl ReadTracker {
             UiEvent::HistoryLoaded { chats, .. } => {
                 for chat in chats {
                     let reads = self.chats.entry(chat.jid.clone()).or_default();
-                    // The receipts are the store's answer either way: a
-                    // message it now reports as read must stop being one we
-                    // owe a receipt for.
-                    reads.unread.clear();
                     // The boundary is only the store's answer when the load
                     // reaches it. The same rule `observe` holds one message at
                     // a time: a page older than what this side holds says
@@ -1892,6 +1900,13 @@ impl ReadTracker {
                         .max();
                     if newest.is_none_or(|newest| newest >= reads.newest_secs) {
                         *reads = ChatReads::default();
+                    } else {
+                        // An older page answers for the rows in it and for
+                        // nothing else. Clearing the whole queue here dropped
+                        // the receipt owed for a live message the page does
+                        // not carry: the boundary still admitted a read
+                        // naming it, and no receipt went out for it.
+                        reads.forget(chat.messages.iter().map(|message| message.id.as_str()));
                     }
                     for message in &chat.messages {
                         reads.observe(message);
@@ -3041,6 +3056,33 @@ mod tests {
         assert_eq!(
             ids.iter().map(|(id, ..)| id.as_str()).collect::<Vec<_>>(),
             ["newest"]
+        );
+    }
+
+    /// An older page answers for the rows in it. Clearing the whole queue on
+    /// one dropped the receipt owed for a live message the page does not
+    /// carry: the boundary correctly stayed where it was, so a read naming
+    /// that message was accepted, and no receipt ever went out for it.
+    #[test]
+    fn an_older_page_leaves_a_newer_messages_receipt_owed() {
+        let mut bridge = bridge();
+        bridge.observe(received(
+            "1@s.whatsapp.net",
+            message("newest", "1@s.whatsapp.net", 200, false, false),
+            None,
+        ));
+
+        bridge.observe(loaded(vec![stored_chat(
+            "1@s.whatsapp.net",
+            1,
+            vec![message("older", "1@s.whatsapp.net", 100, false, true)],
+        )]));
+
+        let owed = bridge.reads().take_receipts("1@s.whatsapp.net");
+        assert_eq!(
+            owed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["newest"],
+            "the page said nothing about the message it does not carry"
         );
     }
 
