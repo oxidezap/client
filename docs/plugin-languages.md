@@ -141,6 +141,42 @@ and `Event::which`, and TypeScript's type system can express every one of
 those. That is an `oxidezap-plugin-as` package, and it is a day of work rather
 than a research question.
 
+## A plugin in AssemblyScript, end to end
+
+`examples/autoreply-as` is the Rust `examples/autoreply` rewritten against the
+same ABI: the same three settings, the same widget tree, the same refusal to
+answer its own messages or a group. It is here because the survey above is
+about compilers and the decision is about plugins.
+
+Verified by running the module under wasmi with this daemon's fuel budget and
+a host answering the ten imports — declaring, publishing, reading fields,
+storing settings, sending:
+
+| | |
+|---|---|
+| module | **8,915 bytes**, ten imports, all `oxidezap` |
+| `oxi_init` | 39,445 fuel; the widget tree it publishes is 214 bytes and decodes clean |
+| a message carrying the keyword | **14,407 fuel — 0.029 % of a call's budget**, and the reply comes out quoting the right id |
+| a message without it | 3,214 fuel |
+| a UI action turning the plugin off | 18,602 fuel, and the store holds `enabled = "0"` |
+| 1,000 messages in a row | linear memory flat at one 64 KiB page |
+
+Against the QuickJS route measured above — 2,765,416 fuel and 1,408 KiB for
+comparable work — that is 190× the fuel and 22× the memory saved, and it is
+the whole argument for a compiled subset stated in numbers rather than in
+principle.
+
+Two things the example had to get right, and both are host rules rather than
+language ones. `--use abort=` removes `env.abort`, which no host function
+answers. And nothing may run at the top level but constants: `asc` puts
+anything else in a start section, which the loader runs **with every import
+refusing**, so a plugin that initializes there comes up silently half-built.
+
+What it costs to read is visible in one function: `containsIgnoringCase` walks
+indices because `for…of` does not exist, and the JID it sends to is checked
+for `null` because a truncated read is somebody else rather than a shorter
+string. Neither is idiomatic TypeScript. Both are the price of 8,915 bytes.
+
 ## AssemblyScript is not TypeScript
 
 The section above is about what the *compiler* produces. This one is about
@@ -392,26 +428,32 @@ smaller project than writing a compiler by three orders of magnitude.
 
 ## What a decision needs
 
-The two goals are in tension and one of them has to be picked first.
+The two goals are in tension and the tension is not resolvable by picking a
+better toolchain — it is the same trade in every row of this document. A
+compiled plugin is a subset language; real TypeScript is an engine.
 
-- **"A plugin should be tiny and the sandbox absolute"** → AssemblyScript,
-  today, with an `oxidezap-plugin-as` SDK and an `examples/` plugin built
-  with it. 9 KiB, zero non-`oxidezap` imports, no WASI, no SIMD, no engine —
-  and authors write AssemblyScript, which they have to be told plainly rather
-  than sold as TypeScript.
-- **"People write normal TypeScript"** → a QuickJS plugin of our own, on
-  `javy-plugin-api` or `rquickjs`, keeping a context alive across calls and
-  exposing the `oxi_*` imports as JS globals. ~1.5 KiB per plugin against one
-  provider module, 5.5 % of a call's fuel, 1.4 MiB of the 4 MiB — at the cost
-  of nine answered WASI imports, wasmi's SIMD feature, and an engine inside
-  the sandbox.
+**If minimal and compiled is the requirement**, the work is:
 
-Both are real. What is not real is getting both from one toolchain, and the
-measurements above are the record of why.
+- an `oxidezap-plugin-as` package, which is `examples/autoreply-as/assembly/oxidezap.ts`
+  moved out of the example and given the guarantees the Rust SDK has — masks
+  that cannot be passed where the other is wanted, an event narrowed to the
+  fields its kind carries, a declaration that cannot be made twice;
+- a line in `docs/plugin-abi.md` about the start section, which is the first
+  thing a non-Rust author hits and which nothing currently states: the loader
+  runs it with every import refusing;
+- and saying plainly, wherever plugins are documented, that this is
+  AssemblyScript rather than TypeScript. The subset is defensible; a plugin
+  author discovering it one `tsc`-shaped error code at a time is not.
 
-Whichever is picked, one line belongs in `docs/plugin-abi.md` either way:
-the loader runs a module's start section with every import refusing, which is
-the first thing a non-Rust author hits — AssemblyScript emits one for
-something as ordinary as a string constant.
+`json-as` compiles and works if a plugin needs JSON (15,299 bytes for parse
+and stringify of one class); `assemblyscript-regex` does not compile against
+`asc` 0.28 at all, so a plugin wanting a regex has to write the matcher it
+needs. Neither changes the answer, and both are worth knowing before somebody
+promises a user a regex.
+
+**If real TypeScript is the requirement**, it is a QuickJS plugin of our own
+and the four costs in *What real TypeScript costs* — an engine inside the
+sandbox, nine answered WASI imports, wasmi's SIMD feature, and 190× the fuel
+of the compiled route for identical work.
 
 Nothing further on Porffor until wasmi has exception handling.

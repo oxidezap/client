@@ -1,0 +1,12 @@
+{
+  "name": "oxidezap-autoreply-as",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "asc assembly/index.ts -o autoreply-as.wasm --runtime incremental --use abort= --optimize --shrinkLevel 2 --noAssert",
+    "build:debug": "asc assembly/index.ts -o autoreply-as.wasm --runtime incremental --use abort= --debug"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.28.20"
+  }
+}
