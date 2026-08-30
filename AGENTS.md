@@ -1302,12 +1302,24 @@ impossibility it describes before believing it.
 
 **A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
 is there because cross-origin isolation needs two response headers GitHub Pages
-will not set, and the price is that it also caches the bundle: an ordinary
-reload of a published page serves the *old* `.js`, so a build that fixed
-something looks exactly like one that did not. Unregister it (Application →
-Service Workers) and hard-reload, or check the hash in the bundle's filename
+will not set, and the price is that the *document* comes back through it: an
+ordinary reload of a published page can be answered out of the browser's cache
+with the old `index.html`, which names the old hashed bundle — so a build that
+fixed something looks exactly like one that did not. Unregister it (Application
+→ Service Workers) and hard-reload, or check the hash in the bundle's filename
 before believing a test of the deployed page. `trunk serve` has no service
 worker, which is the other reason to reproduce there first.
+
+What it answers is *navigations and worker scripts*, and nothing else, because
+those are the only two responses COOP and COEP are read off: a subresource is
+governed by `Cross-Origin-Resource-Policy`, which same-origin bytes pass
+without a header. Answering the rest was not merely useless — a request a
+service worker answers is a different "world" from the one `<link
+rel="preload">` fetched in, so the browser matched neither and the page
+downloaded the ~30 MB module twice, saying so in the console each time
+("cross-world service worker resource mismatch"). Passing a request through —
+returning from the fetch handler without `respondWith` — leaves it in the
+page's own world, where the preload is waiting for it.
 
 Every browser API in the tree is bound through `web-sys`/`js-sys` from Rust:
 the WebSocket, `fetch`, `setTimeout`, WebAudio, `localStorage`, the download
