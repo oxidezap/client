@@ -148,6 +148,19 @@ impl Rolling {
         }
     }
 
+    /// What may still be spent, given how long the window has been open.
+    ///
+    /// Read before a cost is *built* rather than after: the log path escapes
+    /// a plugin's line, and the escaped length is what it is charged, so
+    /// without a ceiling on the escape a refused line costs the host six
+    /// times the bytes it will decline to write.
+    pub(crate) fn remaining(&self, elapsed: std::time::Duration) -> usize {
+        if elapsed >= ROLLING_WINDOW {
+            return self.allowance;
+        }
+        self.allowance.saturating_sub(self.spent)
+    }
+
     /// Whether `amount` may be spent, given how long the window has been
     /// open, and charge it if so.
     ///
@@ -980,22 +993,31 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             if line > MAX_LOG_BYTES as usize {
                 return;
             }
-            // Against the raw length before anything is copied, because the
-            // escape below is host work a refusal should not pay for: with
-            // the allowance spent, a plugin calling this in a loop was
-            // copying and expanding two kilobytes of control bytes into
-            // twelve on every refused call, none of it priced.
+            // What is left to spend, asked *before* anything is copied. A
+            // refused call is host work a plugin does not pay for — the copy
+            // out of guest memory and the escape below — so without a ceiling
+            // taken from here, a plugin whose allowance is spent, or nearly,
+            // could expand two kilobytes of control bytes into twelve on
+            // every refused call, as often as it liked.
             //
-            // A floor rather than the whole check: what is charged is the
-            // escaped length, which is only known after the escape, so this
-            // refuses what could not fit even unexpanded and the check below
-            // refuses the rest.
+            // Both budgets, because either can be the one that refuses: the
+            // per-call allowance and the rolling one across calls.
             let per_call = if c.data().phase == Phase::Init {
                 MAX_LOG_BYTES_FOR_INIT
             } else {
                 MAX_LOG_BYTES_PER_CALL
             };
-            if line > per_call.saturating_sub(c.data().logged_bytes) {
+            let room = {
+                let guest = c.data();
+                let elapsed = guest.log_budget.window_began.elapsed();
+                per_call
+                    .saturating_sub(guest.logged_bytes)
+                    .min(guest.log_budget.remaining(elapsed))
+            };
+            // The raw length first: escaping only ever expands, so a line
+            // that does not fit unexpanded fits nothing, and this refusal
+            // costs not even the read.
+            if line > room {
                 return;
             }
             let Ok(line) = read_str(&mut c, ptr, len) else {
@@ -1010,7 +1032,12 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // control character goes, not only the line breaks, since an
             // ANSI escape rewrites a terminal's idea of what it is showing
             // just as well as a newline does.
-            let line = escape_controls(&line);
+            //
+            // Under the ceiling read above, so what a refused line costs the
+            // host is never more than the allowance it was asking against.
+            let Some(line) = escape_controls_within(&line, room) else {
+                return;
+            };
             // Charged for what is written, which is what the budget is a
             // bound on: every control byte becomes five or six characters, so
             // billing the length the guest passed let two kilobytes of `0x01`
@@ -1152,9 +1179,22 @@ fn read_bytes(caller: &mut Caller<'_, Guest>, ptr: i32, len: usize) -> Result<Ve
 /// Control characters become their escapes, so what a plugin wrote stays
 /// readable and stays on the one line the host prefixed. Borrowed back
 /// unchanged in the ordinary case, which is every honest line.
-fn escape_controls(line: &str) -> std::borrow::Cow<'_, str> {
+/// Escape `line`, refusing as soon as the result would pass `budget`.
+///
+/// The ceiling is the point rather than a detail. What a line is charged is
+/// its *escaped* length, which is only known once it is escaped — so a line
+/// that will be refused was, without this, expanded in full first: two
+/// kilobytes of control bytes becoming twelve, for a call that writes
+/// nothing and is charged nothing, as often as a plugin cares to ask. Bounded
+/// here, a refused attempt costs the host no more than the allowance it is
+/// asking against, and the caller's arithmetic is unchanged because the
+/// answer is still the whole escaped line or nothing.
+fn escape_controls_within(line: &str, budget: usize) -> Option<std::borrow::Cow<'_, str>> {
+    if line.len() > budget {
+        return None;
+    }
     if !line.contains(char::is_control) {
-        return std::borrow::Cow::Borrowed(line);
+        return Some(std::borrow::Cow::Borrowed(line));
     }
     let mut out = String::with_capacity(line.len() + 8);
     for c in line.chars() {
@@ -1165,8 +1205,11 @@ fn escape_controls(line: &str) -> std::borrow::Cow<'_, str> {
             c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
             c => out.push(c),
         }
+        if out.len() > budget {
+            return None;
+        }
     }
-    std::borrow::Cow::Owned(out)
+    Some(std::borrow::Cow::Owned(out))
 }
 
 fn read_str(caller: &mut Caller<'_, Guest>, ptr: i32, len: i32) -> Result<String, i32> {
@@ -1324,8 +1367,30 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
 #[cfg(test)]
 mod tests {
     use super::{
-        HOST_LINE_COST, MAX_LOG_BYTES_PER_WINDOW, Rolling, abi, escape_controls, may_report,
+        HOST_LINE_COST, MAX_LOG_BYTES_PER_WINDOW, Rolling, abi, escape_controls_within, may_report,
     };
+
+    /// The escape with no ceiling on it, which is what these assertions are
+    /// about: the budget's half is `a_refused_line_is_not_expanded_first`.
+    fn escaped(line: &str) -> std::borrow::Cow<'_, str> {
+        escape_controls_within(line, usize::MAX).expect("no ceiling")
+    }
+
+    /// A line that will be refused is not expanded on the way to being
+    /// refused. What is charged is the escaped length, so the escape has to
+    /// run before the charge is known — and a plugin with a little allowance
+    /// left could otherwise spend the host six times its own line, per call,
+    /// for as long as its fuel held out.
+    #[test]
+    fn a_refused_line_is_not_expanded_first() {
+        // Two kilobytes of control bytes: six characters each once escaped.
+        let control = "\u{1}".repeat(2048);
+        assert!(escape_controls_within(&control, 2048).is_none());
+        assert!(
+            escape_controls_within(&control, control.len() * 6).is_some(),
+            "and it is the whole line or nothing, not a truncation"
+        );
+    }
 
     /// A refusal the *host* writes costs the journal what a plugin's own line
     /// costs, and a plugin can ask for one as often as it likes: an invalid
@@ -1421,18 +1486,18 @@ mod tests {
     /// prefix never reaches, and so one that reads as the daemon's own.
     #[test]
     fn a_log_line_cannot_forge_another() {
-        let forged = escape_controls("done\nERROR wiping local state");
+        let forged = escaped("done\nERROR wiping local state");
         assert_eq!(forged, "done\\nERROR wiping local state");
         assert!(!forged.contains('\n'));
 
         // Every control character, not only the line breaks: an ANSI escape
         // rewrites a terminal's idea of what it is showing just as well.
-        assert_eq!(escape_controls("a\u{1b}[2Jb"), "a\\u{1b}[2Jb");
-        assert_eq!(escape_controls("a\rb\tc"), "a\\rb\\tc");
+        assert_eq!(escaped("a\u{1b}[2Jb"), "a\\u{1b}[2Jb");
+        assert_eq!(escaped("a\rb\tc"), "a\\rb\\tc");
 
         // And an ordinary line is handed back untouched, borrowed.
         assert!(matches!(
-            escape_controls("answered 3 messages"),
+            escaped("answered 3 messages"),
             std::borrow::Cow::Borrowed(_)
         ));
     }
@@ -1445,7 +1510,7 @@ mod tests {
     fn a_log_line_costs_what_it_writes() {
         let control = "\u{1}".repeat(2048);
         assert_eq!(control.len(), 2048);
-        let written = escape_controls(&control);
+        let written = escaped(&control);
         assert!(
             written.len() >= control.len() * 5,
             "{} escaped to {}",
