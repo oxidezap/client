@@ -112,7 +112,11 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
     // Windows this is a pipe name rather than anything on disk.
     let path = oxidezap_ipc::endpoint_path()
         .ok_or_else(|| std::io::Error::other("no per-user directory to look for the daemon in"))?;
-    let program = daemon_program();
+    let program = daemon_program().ok_or_else(|| {
+        std::io::Error::other(
+            "no daemon beside this binary to start; the two ship in one directory",
+        )
+    })?;
     let deadline = wacore::time::Instant::now() + START_TIMEOUT;
 
     loop {
@@ -147,10 +151,15 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
 
 /// Where to find the daemon.
 ///
-/// Beside this binary first: the two ship together and a release directory is
-/// not on anybody's `PATH`. A bare name otherwise, so a development build run
-/// from `cargo` finds the one on the path.
-fn daemon_program() -> std::path::PathBuf {
+/// Beside this binary, and nowhere else: the two ship together and a release
+/// directory is not on anybody's `PATH`.
+///
+/// `None` rather than a bare name, which `PATH` would resolve — the same
+/// reason the daemon's `front_end_program` gives for the other direction: a
+/// window started from an arranged environment would start whatever that
+/// environment calls `oxidezapd`, and there is no session more sensitive
+/// than the one that holds the account.
+fn daemon_program() -> Option<std::path::PathBuf> {
     const NAME: &str = if cfg!(windows) {
         "oxidezapd.exe"
     } else {
@@ -160,5 +169,4 @@ fn daemon_program() -> std::path::PathBuf {
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
         .filter(|path| path.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from(NAME))
 }
