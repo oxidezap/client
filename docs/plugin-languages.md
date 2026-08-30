@@ -43,10 +43,11 @@ Nothing rules out an *approach* on taste. What rules things out is that list.
 | | What it is | Verdict here |
 |---|---|---|
 | [AssemblyScript](https://www.assemblyscript.org/) | Strict TypeScript subset → core wasm, via Binaryen | **Works today.** Measured below: 541 bytes, imports only from `oxidezap`. |
-| [Porffor](https://github.com/CanadaHonk/porffor) | AOT JS/TS engine: JS → IR → C → native or wasm | Watch. The wasm path now goes through a C compiler, so the question is a freestanding libc-less build nobody has done here. |
+| [Porffor](https://github.com/CanadaHonk/porffor) | AOT JS/TS engine: JS → IR → C → native or wasm | **Measured, and no.** 328 KiB for a ten-line handler, eight WASI imports, `_start` as its only export, and `setjmp` under every `throw`. |
 | [jz](https://github.com/dy/jz) | "Good parts" JS subset → wasm, no runtime, no GC | Right shape, wrong domain: numeric/DSP code, not strings and objects. |
 | [Javy](https://github.com/bytecodealliance/javy) / [Extism js-pdk](https://github.com/extism/js-pdk) | QuickJS in wasm, snapshotted with Wizer | Real JavaScript, at the cost of WASI imports, the memory budget and double interpretation. |
 | [Jawsm](https://github.com/drogus/jawsm) | JS → wasm, no interpreter, Rust | Blocked: built on wasm-GC, exception handling and tail calls. Two of the three are what wasmi lacks. |
+| [Wasmnizer-ts](https://github.com/intel/Wasmnizer-ts) | Intel's TypeScript → WasmGC toolchain | Blocked, and by three at once: WasmGC, exception handling and stringref. |
 | [ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS) / StarlingMonkey | SpiderMonkey embedding → wasm component | Blocked twice: the component model is the trade this ABI is built around, and the embedding is ~8 MB. |
 | [Static Hermes](https://github.com/facebook/hermes) | Meta's AOT JS compiler; can target wasm | Targets wasm through a C/WASI toolchain, same shape of problem as Porffor with a much larger runtime. |
 | [MoonBit](https://www.moonbitlang.com/) | TS-flavoured language, wasm-first, linear-memory backend | Not JS, but the closest thing to "TypeScript that produces a 30 KiB module". Worth a line in the ABI doc if anyone tries it. |
@@ -97,6 +98,25 @@ Three flags carry that and each answers a real default:
 - Nothing imports `env.memory`: AssemblyScript exports its memory by default,
   which is what the loader needs to hand a plugin anything at all.
 
+**What real code costs.** The 541-byte figure is a handler working out of a
+static buffer, which is the shape the ABI's pull-based reads encourage. The
+same ten lines measured against Porffor below — `toLowerCase`, `trim`,
+`startsWith`, `includes`, a loop over an array of strings, string
+concatenation — with AssemblyScript's real `String` and `Array` behind them:
+
+| runtime | with `env.abort` | with `--use abort=` |
+|---|---|---|
+| `stub` (bump allocator, never frees) | 9,660 B | **9,225 B, zero imports** |
+| `minimal` (GC called externally) | 11,210 B | — |
+| `incremental` (default GC) | 12,508 B | 11,954 B, zero imports |
+
+Under ten kilobytes for the whole thing, against 328 KiB from Porffor for the
+same source. `stub` is the honest default for a plugin: a call is fuel-bounded
+and every event handle dies when it returns, so a handler that leaks its
+per-call garbage into a 4 MiB linear memory is a plugin that eventually traps
+rather than one that misbehaves — and the SDK can say so and offer
+`incremental` to anyone who wants the two kilobytes spent.
+
 **The one trap is the start section.** Add a top-level dynamic initializer —
 `let table = new StaticArray<i32>(4)` — and `asc` emits `(start $0)`, which
 this host permits and runs with *every import refusing*
@@ -106,7 +126,11 @@ moves it to an ordinary export, and nothing calls it: so an AssemblyScript SDK
 would export the start under a name of its own and call it as the first line
 of `oxi_init`, and a plugin without an SDK should keep top-level state to
 `memory.data` and constants. Verified both ways — 541 bytes with no start
-section, 296 bytes with one.
+section, 296 bytes with one — and note that string constants alone are enough
+to produce one: the handler above emits `(start $9)` to lay its strings out in
+memory. That start is harmless, because it calls no import; the rule the SDK
+has to hold is not *no start section*, it is *nothing in it may talk to the
+host*.
 
 What is missing is not capability, it is the SDK: the Rust one's value is the
 two mask types, the `Setup` whose methods vanish once used, the field sizes
@@ -114,31 +138,81 @@ and `Event::which`, and TypeScript's type system can express every one of
 those. That is an `oxidezap-plugin-as` package, and it is a day of work rather
 than a research question.
 
-## Porffor, in fairness to the question
+## Porffor, measured
 
-Porffor is the project worth asking about, and the answer moved. It is an AOT
-JS/TS engine — no interpreter in the output, which is exactly the property
-that makes a 6 KiB plugin conceivable in a language with objects — and the
-pipeline as of August 2026 is JS/TS → Porffor IR → **C** → a native binary or
-wasm. The tree at `a415d19` contains no wasm backend at all; the wasm target
-is reached by compiling the emitted C.
+Porffor is the project worth asking about, and it is now the one with numbers
+against it. Built at `a415d19` (29 Aug 2026), compiled with wasi-sdk 27
+(clang 20) — the toolchain its own C output is written for, since the file
+carries `#ifdef __wasi__` branches.
 
-That relocates the question rather than answering it. What decides it here is
-what that C needs: a freestanding `wasm32-unknown-unknown` build against no
-libc emits no WASI imports and could satisfy this ABI, while an ordinary
-wasi-sdk build emits `fd_write` and friends and cannot. Nobody in this tree
-has built it either way, and the honest next step is one afternoon: compile
-`console.log('hi')` for wasm, read the import section, and measure the module.
-Its own claim is that modules "come out drastically smaller" than the
-interpreter-embedding route, which is the right comparison and not the one
-that matters here — the comparison that matters is against 541 bytes of
-AssemblyScript.
+There is no wasm target in the CLI. `porf` takes `c` and `native`; wasm is
+reached by taking the emitted C and compiling it yourself, and the C does not
+compile for wasm as it stands: it includes `sys/mman.h`, `signal.h` and
+`setjmp.h`, and wasi-libc refuses all three by `#error` until you ask for the
+emulations. The build that works is
 
-Two further notes for whoever does that. Porffor is pre-1.0 with releases cut
-per push, so a plugin ecosystem pinned to it inherits that cadence. And its
-TypeScript support is real but is the engine's own annotated dialect
-(`.porf.ts`), not `tsc` semantics — which puts it nearer AssemblyScript on the
-"is this really TypeScript" axis than the framing suggests.
+```sh
+porf c plugin.js -o plugin.c
+clang --target=wasm32-wasip1 -O2 \
+  -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -mllvm -wasm-enable-sjlj \
+  -o plugin.wasm plugin.c -lwasi-emulated-signal -lwasi-emulated-mman
+```
+
+and what comes out of it:
+
+| Source | C | wasm |
+|---|---|---|
+| empty file | 93 KiB | **88.5 KiB** |
+| `console.log('hello world!')` | 94 KiB | **145 KiB** |
+| a 10-line handler: `toLowerCase`, `startsWith`, `includes`, a `for…of` | 237 KiB | **328 KiB** (306 KiB after `wasm-opt -Oz`) |
+
+The 88.5 KiB floor is the runtime — an arena the C reserves with `mmap` and
+commits with `mprotect`, plus the GC metadata beside it. The `hello world`
+module runs: under Node's WASI it prints `hello world!`, so this is a real
+pipeline and not a toolchain accident.
+
+Four things stop it being a plugin toolchain here, and they are structural
+rather than a matter of flags.
+
+**It asks for WASI.** Eight `wasi_snapshot_preview1` imports — `fd_write`,
+`fd_seek`, `fd_close`, `fd_pread`, `fd_fdstat_get`, `args_get`,
+`args_sizes_get`, `proc_exit` — because the runtime writes `console.log`
+through stdio. There is no WASI here.
+
+**`throw` is `setjmp`.** `compiler/render.js` renders every JS `try` as
+`_setjmp(porf_try_stack[…])`, so exceptions are C longjmps. On wasm that is
+the exception-handling proposal, which wasmi does not implement; with
+`-mllvm -wasm-enable-sjlj` clang instead emits three imports —
+`env.__wasm_setjmp`, `env.__wasm_setjmp_test`, `env.__wasm_longjmp` — for
+glue the embedder is expected to supply. The handler module fails to
+instantiate even under a full WASI host for exactly that reason: *Import #0
+module="env": module is not an object or function*. `hello world` escapes only
+because it never reaches a try frame; the ten-line handler does, without a
+single `try` in its source, because `for…of` has one.
+
+**It exports `_start` and nothing else.** The ABI needs `oxi_abi_version`,
+`oxi_init` and `oxi_on_event` as exports. Porffor compiles a *program*, not a
+reactor: there is no `export_name` on anything it emits and no
+`-mexec-model=reactor` path through its C.
+
+**Its FFI is `Porffor.dlopen`.** A native shared library by name — which is
+the right design for the thing Porffor is, and is not a route to an
+`oxidezap` import. Reaching the host would mean hand-written C shims with
+`__attribute__((import_module("oxidezap")))` linked beside the generated
+file, i.e. maintaining a C layer per ABI function.
+
+None of that is a criticism of Porffor: it compiles JS to a 33 KiB *native*
+binary and runs on things with no operating system, which is a genuinely
+remarkable achievement. Its wasm claim is against the interpreter-embedding
+route — 328 KiB against Javy's 869 KiB, and that comparison is honestly won.
+The comparison this daemon cares about is against 9 KiB of AssemblyScript
+doing the same ten lines, and it loses that one by thirty-five times before
+the four blockers above are even reached.
+
+Worth revisiting if two things change: wasmi ships exception handling (it is
+under development, and it would also unblock Jawsm), and Porffor grows a
+reactor-shaped wasm output with importable host functions. Neither is ours to
+do, and neither is far-fetched.
 
 ## Javy, and what running real JavaScript would cost
 
@@ -164,11 +238,67 @@ Four costs, in the order they would bite:
 It is a coherent thing to want and it is a different product decision from
 "which compiler" — closer in kind to `oxi_http_fetch` than to a build flag.
 
+## Writing our own, in Rust
+
+The honest version of "let's build a minimal TS/JS → wasm compiler in Rust,
+maybe on [oxc](https://oxc.rs/)": the front end is the part that is free, and
+it is not the part that decides the project.
+
+oxc gives a `.ts`/`.tsx` parser that passes Test262 and 99 % of the
+TypeScript suite, plus semantic analysis, scopes and symbol resolution — and
+[`wasm-encoder`](https://crates.io/crates/wasm-encoder) or
+[`walrus`](https://github.com/wasm-bindgen/walrus) gives the binary at the
+other end. A week gets `export function add(a: i32, b: i32): i32` down to a
+valid module. What oxc does not give is a *type checker*: it parses TypeScript
+types, it does not infer or check them. Everything after the parse — a
+checker, a layout for objects and strings, an allocator, `String`, `Array`,
+`Map`, `JSON`, the numeric tower, and an optimizer to stand in for Binaryen —
+is the compiler.
+
+That is AssemblyScript's entire body of work, and rewriting it to get what
+AssemblyScript already produces is not a plan. So the question worth asking is
+narrower: **is there a compiler that is not a general one?**
+
+There is a real argument that there is, and it comes from this host rather
+than from language design. Every plugin call is bounded — 50 M fuel, event
+handles invalid the moment `oxi_on_event` returns, nothing survives a call but
+the key-value store. A compiler that only ever has to serve *that* shape can
+reset an arena at the end of each call and have no GC at all, no finalizers,
+no cycle collector, no shadow stack: the three hardest parts of AssemblyScript
+are things a plugin dialect does not need. Give it strings, arrays, plain
+objects, closures that do not escape a call, and the ABI's imports as
+first-class functions, and the compiler is a few thousand lines rather than a
+few hundred thousand — with modules plausibly under 2 KiB, since nothing but
+the plugin's own code is in them.
+
+What that buys, honestly: no Node in the plugin toolchain (`asc` is npm), the
+ABI known to the compiler rather than declared by hand, and sizes we set. What
+it costs is the long tail — the first person to write `array.reduce(…)`, or a
+regex, or `async`, files a bug, and the answer is either "not in this dialect"
+forever or an unbounded queue of standard-library work. jz is the honest
+precedent: it took the same bet on a JS subset and the subset it kept is
+numeric, because that is what stays small.
+
+So: worth designing on paper, not worth starting instead of an
+`oxidezap-plugin-as` package. The one thing that would change that is wanting
+plugins written in something we control end to end — a decision about the
+product, not about compilers.
+
+Two cheaper bets to make first, in order: watch wasmi's exception-handling
+issue, because shipping it makes Porffor-via-C and Jawsm live options and
+costs us a version bump; and if npm in a plugin author's path is the real
+objection, note that `asc` is itself a wasm bundle — vendoring it is a
+smaller project than writing a compiler by three orders of magnitude.
+
 ## What a decision needs
 
 - An `oxidezap-plugin-as` SDK and an `examples/` plugin built with it, which
-  is what turns "AssemblyScript works" into something somebody can copy.
-- One afternoon on Porffor's wasm output: import section and size.
+  is what turns "AssemblyScript works" into something somebody can copy. The
+  Rust SDK's value is the two mask types, the `Setup` whose methods vanish
+  once used, the per-field sizes and `Event::which`; TypeScript's type system
+  expresses every one of those.
 - A line in `docs/plugin-abi.md` naming the start-section trap, since it is
   the first thing an AssemblyScript author hits and nothing in the ABI says
   the loader will run that code with every import refusing.
+- Nothing further on Porffor until wasmi has exception handling. The
+  measurements above are the record of why.
