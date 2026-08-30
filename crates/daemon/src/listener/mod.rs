@@ -171,9 +171,14 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250)
 /// Off this thread and bounded, because the comment this replaces was no
 /// longer true: it said the probe runs before the runtime has any work, and
 /// by now `server::run` has the tray, the plugins and the session bridge
-/// started. A connect that does not come back — Linux answers a full backlog
-/// with `EAGAIN`, other unices make the caller wait — would stop the daemon
-/// here with not even a "listening" line to say where.
+/// started. A connect that does not come back would stop the daemon here
+/// with not even a "listening" line to say where.
+///
+/// What a full backlog answers is the platform's own business: Linux makes
+/// the caller wait, macOS refuses outright. The refusal is indistinguishable
+/// from nobody listening, so there the probe can be wrong about a daemon
+/// under load — which is why the startup lock, not this, is what keeps two
+/// daemons off one account.
 #[cfg(unix)]
 fn socket_is_live(path: &std::path::Path) -> bool {
     let (answer, asked) = std::sync::mpsc::channel();
@@ -199,6 +204,12 @@ mod tests {
     /// accepting from it. The probe has to answer either way, and it must
     /// answer "live" — refusing to start is recoverable, taking a running
     /// daemon's socket is not.
+    ///
+    /// Linux only, because that is where the state can be constructed: a
+    /// full backlog makes the caller wait there and is refused outright on
+    /// macOS, where a saturated listener is therefore indistinguishable from
+    /// nobody listening. See [`socket_is_live`].
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_socket_nobody_accepts_from_does_not_stop_the_probe() {
         let dir = std::env::temp_dir().join(format!("oxidezap-probe-test-{}", std::process::id()));
