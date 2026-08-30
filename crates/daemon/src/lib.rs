@@ -33,6 +33,17 @@ pub mod state;
 /// The ways in, which are a platform each.
 #[cfg(not(target_family = "wasm"))]
 pub mod listener;
+/// The one transport in that directory a page can serve.
+///
+/// A socket and a named pipe need an operating system, so none of the rest of
+/// `listener/` compiles here — but the tab that holds the account does serve
+/// front ends, and where it serves them from is the same directory as every
+/// other server-side transport. See /AGENTS.md on why there are exactly two
+/// places for this.
+#[cfg(target_family = "wasm")]
+pub mod listener {
+    pub mod tab;
+}
 #[cfg(not(target_family = "wasm"))]
 mod private_dir;
 /// Being asked to stop, which is a notification rather than a signal — so it

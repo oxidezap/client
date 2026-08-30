@@ -9,8 +9,12 @@
 //
 // GitHub Pages serves static files and offers no way to add them. A service
 // worker can, because it answers requests for its own scope — so the first
-// load registers this and reloads once, and every load after that is served
-// through here and is already isolated.
+// load registers this and reloads once, and every navigation after that is
+// served through here and is already isolated.
+//
+// *Navigations*, and worker scripts: those are the two responses the headers
+// mean anything on, and answering the rest of them costs the page a second
+// download of everything it preloaded. See the fetch handler below.
 //
 // This is the only hand-written JavaScript in the build; everything else on
 // the page is Rust through `wasm-bindgen`. It is here because the alternative
@@ -26,12 +30,48 @@ if (typeof window === "undefined") {
         event.waitUntil(self.clients.claim()),
     );
 
+    // What the two headers are *for* is a context, not a byte stream:
+    // COOP and COEP describe a document or a worker, and a page's ordinary
+    // subresources are governed by `Cross-Origin-Resource-Policy` instead —
+    // which same-origin bytes pass with no header at all. So rewriting the
+    // headers of the module, the glue and the icons changed nothing about
+    // isolation, and it was not free: a request a service worker answers is
+    // a different "world" from the one `<link rel="preload">` fetched in,
+    // so the browser refuses to match the two and fetches the ~30 MB module
+    // a second time —
+    //
+    //     A preload for '…_bg.wasm' is found, but is not used because it is
+    //     a cross-world service worker resource mismatch.
+    //
+    // Passing a request through (returning without `respondWith`) leaves it
+    // in the page's own world, where the preload is waiting for it.
+    const ISOLATED = new Set([
+        // A worker script's own response carries the policy the worker is
+        // created under, so this one is not optional: a dedicated worker
+        // fetched over http(s) into a `require-corp` page needs the header
+        // or it is refused. (`gpui_web`'s executor threads start from a
+        // `blob:` URL, which inherits the page's policy and never reaches
+        // here — but a URL-loaded worker is one dependency away.)
+        "worker",
+        "sharedworker",
+        // And a nested document, which is a context of its own.
+        "iframe",
+        "frame",
+        "document",
+    ]);
+
     self.addEventListener("fetch", (event) => {
         const request = event.request;
         // A navigation preload response cannot have headers rewritten, and a
         // range request must be passed through untouched or media seeking
         // breaks.
         if (request.cache === "only-if-cached" && request.mode !== "same-origin") {
+            return;
+        }
+
+        // Everything else is a subresource: the page's own world serves it,
+        // out of the preload if one is pending.
+        if (request.mode !== "navigate" && !ISOLATED.has(request.destination)) {
             return;
         }
 

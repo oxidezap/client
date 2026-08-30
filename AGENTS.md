@@ -58,8 +58,13 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   codec. No dependencies and `no_std`, because it is compiled into the daemon
   *and* into every plugin, including ones with no allocator.
 - **oxidezap-plugin-host**: runs `.wasm` plugins inside the daemon. Discovery,
-  the sandbox, and the host half of the ABI. One OS thread, one wasmi `Store`
-  and one bounded queue per plugin.
+  the sandbox, and the host half of the ABI. One wasmi `Store` and one
+  bounded queue per plugin, on an OS thread where there is one and on the
+  page's own loop where there is not — `sched/` is that split and it is two
+  files, because a wasm call is synchronous either way and the loop above it
+  is written once. Where a plugin's approvals and its own settings are kept
+  is the other split (`store/`): files in a private directory, or the
+  origin's `localStorage`.
 - **oxidezap-plugin**: the Rust SDK a plugin is written against. Not a
   dependency of anything here; it exists to be built for wasm32. What it adds
   over the raw imports is what the compiler can check: two mask types so a
@@ -99,6 +104,13 @@ exception to it — a page has no process to reach one in, so it starts one in
 its own address space through `daemon::embedded`. The session is still the
 daemon's, the window still owns none of it, and the protocol between them is
 the protocol a socket carries everywhere else.
+
+Which is also what makes a second tab ordinary rather than a conflict. One tab
+per origin holds the account — the claim decides which — and every other tab is
+a front end onto it over `ipc::tab`, holding no session, no store and no media,
+exactly as a desktop window holds none. Nothing in the interface knows the
+difference, and the rule it looks like it breaks is the rule it is an instance
+of.
 
 `examples/` holds plugins, and is excluded from the workspace: they build for
 `wasm32-unknown-unknown` and link imports only the daemon provides, so a
@@ -219,9 +231,12 @@ profile here repeats it deliberately.
   refuses to start and the client talks to whoever got there. The kernel knows
   who is on the other end either way — a peer uid on the socket, the serving
   process's token SID on the pipe.
-  A third transport joined them rather than becoming a third place:
+  Two more transports joined them rather than becoming new places:
   `endpoint/web.rs` and `listener/web.rs` are a WebSocket, because a page can
-  open neither of the others. What every transport shares on the way out is
+  open neither of the others, and `endpoint/tab.rs` and `listener/tab.rs` are
+  a `BroadcastChannel` between two tabs of one origin — the tab holding the
+  account serving the tabs that do not, which is the same daemon-and-front-end
+  split a socket carries, in a browser that has no socket to carry it. What every transport shares on the way out is
   `ipc::Link`, one `Send + Sync` handle with the platform's own object behind
   it — load-bearing on the web, where a `web_sys::WebSocket` is neither and so
   cannot be held beside a front end's state at all; it holds a queue into the
@@ -1165,13 +1180,71 @@ to.** Attached to an `oxidezapd`, all of it: the web bridge hands
 `serve_client` the same `Plugins` the socket does, so a plugin's interface
 arrives in the snapshot, its buttons act through `PluginAction`, and its
 permission prompt is answered through `PluginApproval` — not one line of that
-is a second implementation, because the protocol already carried it. Holding
-its own session, none, for the reason in the table below, and the front end
-says which of the two it is rather than drawing an empty list: one place
-decides (`platform::plugins_unavailable`) and it is the mirror of the daemon's
-own (`daemon::plugins::start`). Two halves of one fact, so they are written to
-be read together — a page that drew "drop a .wasm in the plugins folder" is
-giving instructions about a folder it does not have.
+is a second implementation, because the protocol already carried it.
+
+Holding its own session, its own — and that is the same sentence rather than
+an exception to it. A page's daemon runs the same host, over the same
+sandbox, with the same bounds and the same protocol underneath; what differs
+is where three things come from, and each is a platform split inside the host
+rather than a second host. A plugin gets a task on the page's loop instead of
+a thread (`plugin-host/sched/`), which is what the `async` shape of the worker
+loop is for — on a desktop every call in there blocks, because the future is
+driven by a `block_on` on a thread with nothing else on it. Its module comes
+out of OPFS instead of a folder (`daemon::plugins::web`), which is a real
+directory whose listing *is* the registry, exactly as it is on a desktop: the
+file's name is the plugin's id. And its approval and its settings come out of
+`localStorage` instead of a private directory (`plugin_host::Origin`), because
+both are read and written from inside a synchronous wasm call and an
+asynchronous store would have to be mirrored in memory and written behind the
+caller's back.
+
+What replaces `only_this_user_can_write` there is the origin itself: an
+origin's private filesystem is reachable by that origin and by nothing else,
+which is a stronger sentence than a `0700` directory makes and one the browser
+enforces rather than this code. What it does not answer is the same thing a
+folder does not answer — that the module is the one the user meant — which is
+what the approval prompt is for, unchanged.
+
+The one thing a page cannot order by waiting is a plugin's *last* write. A
+desktop joins every plugin's thread before it replaces the host, so the
+settings write has already happened; a page cannot join a task on its own
+loop, and a worker not polled since the shutdown flag went up still has that
+write in front of it. Two things it would land on: after a wipe it recreates
+the departed account's data under whoever pairs next, and after an ordinary
+reconnection — no wipe at all — it puts the old host's in-memory settings over
+what the new host has already written. So a store is stamped when it is taken
+and an older handle's write is refused, `Origin::storage` and `forget_all`
+both moving the stamp on. *Superseded* rather than a latch, because a page
+rebuilds its whole service in the same agent: a latch would leave the new host
+unable to write for the rest of the tab's life — grants rolled back, settings
+lost — while the tasks it was aimed at were the old host's.
+
+Retiring is where a page fails closed rather than tidily. A browser that
+refuses `localStorage` outright is not the same fact as an origin that never
+held an approval, and nothing here can tell the two apart — so `forget_all`
+answers `false` and the wipe is refused, because a storage context that is
+shut can be opened again and the approvals it still holds would then be read
+back for whoever paired in the meantime.
+
+What a page draws about that folder is two lists rather than one. A module
+that fails to parse, answers the wrong ABI version or traps in `oxi_init`
+publishes no surface at all, so Settings drawn from the surfaces alone leaves
+the one file somebody most needs to remove with no control anywhere — and it
+goes on spending the folder's budget at every load.
+`daemon::plugins::web::names` is that second list, asked when Settings opens
+and again after an install or a removal, the same shape and on the same terms
+as the storage total beside it.
+
+The front end says which of the two it is looking at rather than guessing:
+`platform::plugins::home` is the mirror of `daemon::plugins::start`, and the
+two halves are written to be read together — a page that drew "drop a .wasm in
+the plugins folder" would be giving instructions about a folder it does not
+have. It is also what decides whether the install and remove controls are
+drawn at all: only a page holding its own session has a folder it can write,
+and a window talking to an `oxidezapd` is looking at another process's
+directory. Installing does not start anything — loading happens once, before
+the session — so the sentence the notice uses is the true one: it runs at the
+next load, which for a page is a reload of the tab.
 
 **Media crosses the bridge in both directions.** The daemon's web endpoint
 served media and nothing else, so a page attached to an `oxidezapd` could read
@@ -1208,19 +1281,84 @@ typed behind a voice note reaches the daemon after the window has already
 drawn it as failed. A frame carrying no id is fire-and-forget and writing it
 late costs nothing.
 
-**Which tab holds the account is claimed, not assumed.** `daemon/claim/` is a
-lock file on the desktop and a Web Lock in a browser, taken with `ifAvailable`
-so a second tab is told *now* rather than queued — a queued tab looks like one
-that is starting, and would silently take the account the moment the first
-closed. What it costs is that the refusal has to survive the trip up: it
-reaches the window as `ErrorKind::AlreadyExists`, `Session::is_settled` names
-it, and it lands in `AppState::Refused` rather than `Error`. That distinction
-is the whole point — the error screen is for an outage, and it promises to
-keep trying, offers *Work offline*, and arms a countdown. All three are false
-for a refusal: nothing was unreachable, nothing is still trying, and *Work
-offline* reads a database this window is precisely the one that could not
-open. A retrying tab also reintroduces, one layer above the lock, the exact
-behaviour `ifAvailable` was chosen to prevent.
+**Which tab holds the account is claimed, and the tabs that lose it are front
+ends.** `daemon/claim/` is a lock file on the desktop and a Web Lock in a
+browser, taken with `ifAvailable` so a tab is told *now* whether it has the
+account — the answer decides what it becomes, so it cannot be waited for. What
+it becomes if the answer is no is not an error screen. The tab that won is
+running `daemon::embedded`, which is a daemon by every definition here — one
+session, one store, one writer — and a daemon is something more than one front
+end can talk to. So a second tab attaches to the first over a fourth transport
+and draws the same account, live, with no handover and nothing disconnected.
+That is the whole feature: WhatsApp Web ends one tab's session when another
+opens, because there the session lives in the page.
+
+The transport is `ipc/endpoint/tab.rs` and `daemon/listener/tab.rs`, which is
+the same two places every other transport lives in, and above them not one line
+of protocol is written twice — `serve_client` was already generic over
+`AsyncRead + AsyncWrite`, so a connection is one end of a `tokio::io::duplex`
+with its lines moved across. What carries them is a `BroadcastChannel` named
+after the connection rather than a `MessagePort`, and that is a limitation
+rather than a preference: a port is delivered by *transferring* it, and
+`BroadcastChannel.postMessage` takes no transfer list. A name only the two
+parties use is what stands in — not private, because nothing same-origin is,
+but enough that one connection's frames are not delivered to every tab in the
+origin. Deriving the channel name from the ask is what removes the race rather
+than narrowing it: the asking tab opens the channel *before* the ask goes out,
+so there is no window in which the answering tab writes to a channel nobody has
+opened.
+
+Media does not travel as a frame there either. A follower has no media map and
+no HTTP endpoint, so the sideband is three more messages on the same channel,
+with the bytes crossing as a `Uint8Array` — one structured clone, where JSON
+would be a base64 round trip through a string twice the size.
+
+**Queuing for the lock is now the right thing, and the reasoning that ruled it
+out has not been dropped so much as spent.** It said a queued tab looks like
+one that is starting and would silently take an account nobody was looking at.
+Both halves were about a tab that had been *refused*: it was idle, and it was
+showing nothing. A follower is neither — it is drawing the account, through the
+tab that holds it — so `claim::promotion` queues behind the leader, and the
+browser grants it at the moment that tab goes, whatever took it away. That
+grant is also the only thing watching: a `BroadcastChannel` has no close event
+and a killed tab says no goodbye. The follower ends its connection, the front
+end's own retry calls `embedded::start` again, and it finds the claim already
+held — by itself. One connection per follower is watched the same way, with
+`tabs::liveness_lock_for` held by the front end and waited on by the leader, so
+a tab that vanishes is noticed at the moment it vanishes and nothing anywhere
+polls.
+
+Being handed the lock is not the *only* way a follower learns its leader has
+gone, and it cannot be: with three tabs open, one follower is granted the
+account and the others stay queued behind a lock that tab now holds for its
+lifetime, over a channel to a tab that will never post again. So a follower
+listens to the rendezvous for the whole life of its connection, and a
+`Leading` from anywhere ends it — a leader announces exactly once, on the way
+up, and a `BroadcastChannel` does not deliver to the object that posted, so
+hearing one always means a *new* leader and a connection worth remaking.
+The same announcement is why an ask is answered idempotently: a follower
+re-asks when it hears `Leading`, and an ask that landed just before that
+announcement is one the leader has already served — serving it twice puts two
+`serve_client` instances on one channel, where a press sends one message
+twice. The nonce is the connection's name, so the name is what is remembered.
+
+A payload's ceiling travels *with* the request, and is enforced by the tab
+that has the bytes. It has to be: what crosses is a `Uint8Array` the serving
+tab builds and the browser clones, so a ceiling applied on arrival is applied
+after the copy it exists to prevent.
+
+`AppState::Refused` survives, for the one case that is still settled: something
+holds the account and will not answer for it — a tab left open across a deploy,
+speaking a rendezvous version this build does not. It is reached only after
+`ATTEMPTS` rounds of ask-then-try, because the ordinary race is two tabs opened
+in the same moment: one takes the lock and then spends seconds opening the
+store and starting a session before it can serve anybody, and a single ask
+would draw "another tab is running this account" over a tab that was four
+seconds from answering. Where it *is* reached the distinction is still the
+whole point — the error screen is for an outage, and it promises to keep
+trying, offers *Work offline*, and arms a countdown. All three are false for a
+refusal: nothing was unreachable, nothing is still trying, and *Work offline*
+reads a database this window is precisely the one that could not open.
 
 **The store round-trips, and that was measured rather than assumed.** A page
 that had never been visited opens the VFS holding 0 files; one that comes back
@@ -1255,30 +1393,30 @@ nothing above them names a clock. The same fact reaches chrono, whose
 one of chrono's defaults and this workspace turns defaults off, so it is named
 at the root.
 
-`std::thread::spawn` is the row that decides the plugins, and it is worth
-separating from the one above it: `wasmi` compiles here quite happily — a
-wasm interpreter inside a wasm module is nothing unusual — so the reason a
-page runs no plugins is not the interpreter. It is that the host gives each
-plugin an OS thread and a bounded queue it blocks on, and a page has neither
-to give; the same fact r2d2 ran into — twice, since the pool's *management*
-threads are a second spawn behind the connection ones, and
-`scheduled-thread-pool` unwraps that one. Both are the library's to answer and
-it does, in `storages/sqlite-storage/src/pool.rs`: on the web a "pool" is one
-connection behind a lock, keeping r2d2's own spelling so the store above it is
-written once. `Builder::spawn` answering an error is
-already handled — the entry is published and then stopped, with the reason
-beside it — so a page that tried would draw a list of plugins that all failed
-identically. It does not try: `daemon::plugins::start` returns
-`Plugins::none` with that written down, rather than arriving there by way of
-a browser having no `HOME`.
+`std::thread::spawn` is the row that used to decide the plugins, and it is
+worth separating from the one above it: `wasmi` compiles here quite happily —
+a wasm interpreter inside a wasm module is nothing unusual — so the
+interpreter was never the obstacle. What was, was that the host gave each
+plugin an OS thread and a bounded queue it *blocked* on; the same fact r2d2
+ran into — twice, since the pool's *management* threads are a second spawn
+behind the connection ones, and `scheduled-thread-pool` unwraps that one.
+Both are the library's to answer and it does, in
+`storages/sqlite-storage/src/pool.rs`: on the web a "pool" is one connection
+behind a lock, keeping r2d2's own spelling so the store above it is written
+once. The host's answer is the same shape and is in `plugin-host/sched/`: a
+task on the page's loop, an async queue, and `setTimeout` where a thread
+slept. What a page still does not have is a thread *per plugin*, so a call
+that spends its whole fuel budget is a call the page is not drawing during —
+bounded by that budget and by `MAX_DUTY` between calls, which is what the
+throttle already measured, and the reason both matter more here than on a
+desktop.
 
 So voice notes play and record, a video in a conversation decodes through the
 browser's own H.264 (`web_sys::VideoDecoder`, bound from Rust like every other
-browser API here), and calls are placed and answered — the microphone and
-speaker through WebAudio, the camera through `getUserMedia`, the picture
-encoded by `VideoEncoder` and the media carried to the relay by an
-`RTCPeerConnection`. Plugins stay in the daemon, for the reason in the table
-above: the interpreter builds here, and the thread-per-plugin scheduler cannot.
+browser API here), plugins run, and calls are placed and answered — the
+microphone and speaker through WebAudio, the camera through `getUserMedia`,
+the picture encoded by `VideoEncoder` and the media carried to the relay by an
+`RTCPeerConnection`.
 
 The relay is the part worth stating precisely, because it reads like a second
 protocol and is not. The native transport dials UDP and runs DTLS, SCTP and a
@@ -1338,12 +1476,24 @@ impossibility it describes before believing it.
 
 **A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
 is there because cross-origin isolation needs two response headers GitHub Pages
-will not set, and the price is that it also caches the bundle: an ordinary
-reload of a published page serves the *old* `.js`, so a build that fixed
-something looks exactly like one that did not. Unregister it (Application →
-Service Workers) and hard-reload, or check the hash in the bundle's filename
+will not set, and the price is that the *document* comes back through it: an
+ordinary reload of a published page can be answered out of the browser's cache
+with the old `index.html`, which names the old hashed bundle — so a build that
+fixed something looks exactly like one that did not. Unregister it (Application
+→ Service Workers) and hard-reload, or check the hash in the bundle's filename
 before believing a test of the deployed page. `trunk serve` has no service
 worker, which is the other reason to reproduce there first.
+
+What it answers is *navigations and worker scripts*, and nothing else, because
+those are the only two responses COOP and COEP are read off: a subresource is
+governed by `Cross-Origin-Resource-Policy`, which same-origin bytes pass
+without a header. Answering the rest was not merely useless — a request a
+service worker answers is a different "world" from the one `<link
+rel="preload">` fetched in, so the browser matched neither and the page
+downloaded the ~30 MB module twice, saying so in the console each time
+("cross-world service worker resource mismatch"). Passing a request through —
+returning from the fetch handler without `respondWith` — leaves it in the
+page's own world, where the preload is waiting for it.
 
 Every browser API in the tree is bound through `web-sys`/`js-sys` from Rust:
 the WebSocket, `fetch`, `setTimeout`, WebAudio, `localStorage`, the download
@@ -1408,16 +1558,55 @@ by definition.
   a worker a change of where this runs rather than a change to what it does —
   the backend decides the `synchronous` pragma and how a wipe deletes, and
   nothing above `session/store/` learns which one answered.
-- **A page holds no plugins, and the way in is a worker rather than a
-  backend.** The interpreter is not the obstacle — `wasmi` builds for this
-  target — the thread-per-plugin scheduler is, along with there being no
-  directory to discover a module from and no file to keep an approval in. All
-  three have the same answer and it is the one the store is already waiting
-  on: a dedicated worker per plugin, its queue a `postMessage` port instead of
-  a `sync_channel`, its module and its approvals in OPFS. That is a second
-  scheduler rather than a second backend, which is why it is not done here and
-  why the front end says so instead. What a page *can* do meanwhile it already
-  does: attach to an `oxidezapd` and get that daemon's plugins whole.
+- **Every tab is served its own copy of every frame.** The tab holding the
+  account writes a history load once per connection, and the browser
+  structured-clones each of them: two tabs is two copies of the same hundred
+  chats, and the frames go to whoever asked rather than being shared. That is
+  the right trade at the number of tabs a person opens and the wrong one at
+  ten, and the shape that fixes it is the same one everything else here is
+  waiting on — a `SharedWorker` holding the session, handing every tab a
+  `MessagePort`, with one copy of a frame going out to a fan-out the browser
+  does rather than one this side writes. It is also what would let a tab's
+  media come from a `MessagePort` transfer rather than a clone. The obstacle
+  is not the transport: it is that the session, the store and the bridge all
+  change address space at once, which is the item below.
+- **A tab that takes over restarts the session it inherits.** A follower
+  promoted when the leader closes does not receive the leader's session — it
+  starts one of its own: dials, hydrates from the store, and draws the account
+  again a second or two later, with the window showing its reconnect while it
+  does. Nothing is lost, because everything was committed to the store by the
+  tab that had it, and nothing is corrupted, because the lock is what serialises
+  the two. But it is a reconnection where a handover would be seamless, and a
+  handover is not something two agents can do with a session in one of them.
+  The `SharedWorker` above is the answer to this one too: there the session
+  outlives every tab, so the last tab closing is the only thing that ends it.
+- **A page's plugins share its one agent, and a worker is what would end
+  that.** They run now — a task each on the page's loop, their modules in
+  OPFS, their approvals in `localStorage` — and what is left is isolation
+  rather than capability. A desktop plugin owns a thread, so a handler that
+  spends its whole fuel budget costs a core nobody was using; here it costs
+  the frame the page was about to draw. Fuel bounds one call and `MAX_DUTY`
+  bounds the sum of them, so the ceiling is a known one, and it is still a
+  plugin the user can feel. Loading is the same fact at its worst: `start` is
+  `async` and yields to the page between modules (`sched::breathe`), so
+  `MAX_LOAD_TIME` bounds the loading rather than the length of a freeze — but
+  one module's own `oxi_init` is a synchronous call with a fuel budget and
+  nothing to yield at. The answer is the one the store is already
+  waiting on: a dedicated worker per plugin, its queue a `postMessage` port
+  instead of a channel on this loop. That is a second scheduler rather than a
+  second backend, which is why it is not done here.
+  Two smaller things go with it. A page reads every installed module before
+  it starts any of them — `Plugins::start` takes a closure per module and the
+  desktop opens them one at a time, but nothing in a browser can open a file
+  lazily from a synchronous loader, so `MAX_TOTAL_BYTES` bounds the folder
+  where the desktop bounds the file, and installing checks what the folder
+  *would become* rather than what the new module weighs — under a Web Lock,
+  since the folder is the origin's and two tabs of it would otherwise each
+  weigh a folder the other is about to grow. `MAX_PLUGINS` is asked at the
+  listing rather than at the workers, for the reason the desktop's discovery
+  truncates before it opens anything. A second plugin that fits alone and not beside the first would
+  otherwise be written, reported as installed, and skipped at every load
+  after.
 - **A page with its own session cannot send media, and the reason is upstream.**
   `BrowserHttpClient` implements `execute` and nothing else, which the trait
   allows: the streaming paths default to refusing. But the library's upload

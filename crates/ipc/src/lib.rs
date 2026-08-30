@@ -27,10 +27,17 @@ mod endpoint;
 pub mod framing;
 mod link;
 mod protocol;
+/// How a tab with no session finds the tab that has one.
+pub mod tabs;
 mod transport;
+/// The browser's own answer to "is that other agent still there".
+#[cfg(target_family = "wasm")]
+pub mod web_locks;
 #[cfg(windows)]
 pub mod windows_user;
 
+#[cfg(target_family = "wasm")]
+pub use endpoint::tab;
 #[cfg(target_family = "wasm")]
 pub use endpoint::web;
 #[cfg(not(target_family = "wasm"))]

@@ -35,6 +35,34 @@ use wasm_bindgen_futures::JsFuture;
 const LOCK: &str = "oxidezap-session";
 
 thread_local! {
+    /// The lock this tab was handed after waiting for it.
+    ///
+    /// A tab that lost the account does not stop wanting it: it attaches to
+    /// the tab that won as a front end, and it queues for the lock behind
+    /// that tab. When the leader closes, the browser grants this — and what
+    /// it means is that this tab is now the one that holds the account.
+    ///
+    /// Queuing was ruled out when losing meant being *refused*, and the
+    /// reasoning was right for that world: a tab sitting in a queue looked
+    /// like one that was starting, and would silently take an account nobody
+    /// was looking at the moment the other tab closed. Neither half holds any
+    /// more. A tab waiting here is showing the account — live, through the
+    /// tab that has it — so it is not idle, and taking over is what keeps it
+    /// showing rather than a surprise. The first ask is still `ifAvailable`,
+    /// because whether this tab is the leader has to be answered *now*.
+    static PROMOTED: RefCell<Option<Rc<oxidezap_ipc::web_locks::Hold>>> =
+        const { RefCell::new(None) };
+
+    /// Everyone waiting to be promoted, and whether anyone is asking yet.
+    ///
+    /// One wait per tab, however many callers there are, for the same reason
+    /// [`ASK`] is one ask: a caller is a connection, and a follower makes a
+    /// new one every time the tab it was watching goes. A request per
+    /// connection would leave a queue of them behind this tab's own grant,
+    /// each waiting on a lock this tab holds for its lifetime — every one of
+    /// them permanently unresolved, holding whatever its waiter closed over.
+    static PROMOTION: RefCell<Option<Rc<RefCell<Vec<Waiter>>>>> = const { RefCell::new(None) };
+
     /// This page's ask, and what came of it.
     ///
     /// One per page, because the lock is one per page. Present while an ask
@@ -62,7 +90,7 @@ struct Ask {
 /// promise the callback returned is pending, and dropping this settles it.
 /// Which is why nothing here drops it — the browser releases the lock when
 /// the agent goes, and that is the only release this page has.
-struct Hold {
+pub(crate) struct Hold {
     _release: futures_channel::oneshot::Sender<()>,
 }
 
@@ -71,7 +99,17 @@ struct Hold {
 /// A token on the page's hold rather than the hold itself: letting go of one
 /// is letting go of a caller, not of the account. See the module docs for why
 /// those had to stop being the same thing.
-pub(crate) struct Claim(#[expect(dead_code, reason = "a token; the Rc is the point")] Rc<Hold>);
+pub(crate) enum Claim {
+    /// Granted when this tab asked, which is the ordinary first tab.
+    Asked(#[expect(dead_code, reason = "a token; the Rc is the point")] Rc<Hold>),
+    /// Granted after waiting, which is a tab that was a front end onto
+    /// another one until that tab closed. The lock is the same lock; only the
+    /// way it was come by differs, and nothing above this cares which.
+    Promoted(
+        #[expect(dead_code, reason = "a token; the Rc is the point")]
+        Rc<oxidezap_ipc::web_locks::Hold>,
+    ),
+}
 
 /// Take the claim, or say who has it.
 ///
@@ -84,6 +122,14 @@ pub(crate) struct Claim(#[expect(dead_code, reason = "a token; the Rc is the poi
 /// Another tab holds it, or the browser has no lock manager to ask — a very
 /// old one, or a context without a `navigator`.
 pub(crate) async fn take() -> Result<Claim, String> {
+    // Already promoted: this tab waited its turn and the browser gave it the
+    // account. Answered before the ask below, because asking again would find
+    // the lock held — by this tab — and `ifAvailable` cannot tell that apart
+    // from another tab holding it.
+    if let Some(held) = PROMOTED.with(|cell| cell.borrow().clone()) {
+        return Ok(Claim::Promoted(held));
+    }
+
     // Already asked: either the answer is here, or it is on its way and this
     // caller joins the others waiting for it. Registered while the slot is
     // borrowed, so a grant cannot land between reading it and joining.
@@ -99,10 +145,10 @@ pub(crate) async fn take() -> Result<Claim, String> {
         Some(Waiting::Told(told))
     });
     match waiting {
-        Some(Waiting::Held(held)) => return Ok(Claim(held)),
+        Some(Waiting::Held(held)) => return Ok(Claim::Asked(held)),
         Some(Waiting::Told(told)) => {
             return match told.await {
-                Ok(answer) => answer.map(Claim),
+                Ok(answer) => answer.map(Claim::Asked),
                 Err(_) => Err("The browser did not answer the claim for this account.".to_string()),
             };
         }
@@ -203,10 +249,14 @@ pub(crate) async fn take() -> Result<Claim, String> {
             )),
             Ok(Answer::Refused) => Err(
                 // A sentence, because it is drawn as one: this is the whole
-                // body text of the screen a second tab shows, not a fragment
-                // appended after a colon.
-                "Another tab is already running this account. Use that one, or \
-                 close it and try again."
+                // body text of a screen, not a fragment appended after a
+                // colon. It is rarely drawn now — a tab that loses the claim
+                // attaches to the tab that won it and shows the account —
+                // which is why it says *did not answer* rather than merely
+                // "is running": by the time somebody reads this, asking that
+                // tab for a connection has already been tried and failed.
+                "Another tab is holding this account and did not answer this \
+                 one. Use that tab, or close it and try again."
                     .to_string(),
             ),
             Err(_) => Err("The browser did not answer the claim for this account.".to_string()),
@@ -230,9 +280,123 @@ pub(crate) async fn take() -> Result<Claim, String> {
     });
 
     match told.await {
-        Ok(answer) => answer.map(Claim),
+        Ok(answer) => answer.map(Claim::Asked),
         Err(_) => Err("The browser did not answer the claim for this account.".to_string()),
     }
+}
+
+/// Wait until this tab is the one holding the account.
+///
+/// Returns when the lock is this tab's — at once if it already is, and
+/// otherwise when whichever tab has it lets go. What the caller does with
+/// that is reconnect: the account is here now, so the connection to the other
+/// tab is over and [`take`] will answer this tab's own session.
+///
+/// It is the *only* thing watching for a leader that has gone. A
+/// `BroadcastChannel` has no close event and a tab that is killed says
+/// nothing, so a follower learns its daemon has closed by being handed the
+/// lock that daemon was holding.
+///
+/// # Errors
+///
+/// No lock manager to ask. A follower that cannot wait has no way to notice
+/// its leader leaving, which is worth saying rather than retrying forever.
+pub(crate) async fn promotion() -> Result<Promotion, String> {
+    if PROMOTED.with(|cell| cell.borrow().is_some())
+        || ASK.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .is_some_and(|ask| ask.borrow().held.is_some())
+        })
+    {
+        return Ok(Promotion::Granted);
+    }
+
+    let (tell, told) = futures_channel::oneshot::channel();
+    let asking = PROMOTION.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        match slot.as_ref() {
+            // Somebody is already waiting on the browser. This caller joins
+            // them rather than queuing a second request behind the first —
+            // and *replaces* them, because there is only ever one caller with
+            // anything to do with the answer.
+            //
+            // A follower reconnects for reasons that have nothing to do with
+            // the leader leaving: an overflow, a resync, a hello refused. Each
+            // reconnection asks again, and a waiter kept from the connection
+            // before it is a task parked until the account changes hands,
+            // holding a `Hangup` onto a connection that is already over.
+            // Coalescing the browser's lock request without coalescing the
+            // callers left the request count right and the task count
+            // growing.
+            Some(waiting) => {
+                let superseded = std::mem::replace(&mut *waiting.borrow_mut(), vec![tell]);
+                for stale in superseded {
+                    let _ = stale.send(Ok(Promotion::Superseded));
+                }
+                None
+            }
+            None => {
+                let waiting = Rc::new(RefCell::new(vec![tell]));
+                *slot = Some(Rc::clone(&waiting));
+                Some(waiting)
+            }
+        }
+    });
+
+    if let Some(waiting) = asking {
+        // Settled here rather than in the caller, for the reason the ask is:
+        // a caller can be dropped — a follower's connection is replaced every
+        // time it reconnects — and a grant that arrives after its asker has
+        // gone is still this tab's grant.
+        wasm_bindgen_futures::spawn_local(async move {
+            let answer = match oxidezap_ipc::web_locks::hold(LOCK).await {
+                // Kept for the life of the tab, exactly as a first-tab grant
+                // is: the account did not stop being this tab's when the
+                // session that opened it ended. Releasing it between two of
+                // this tab's own sessions is the window `embedded::running`
+                // documents at length.
+                Ok(held) => {
+                    PROMOTED.with(|cell| *cell.borrow_mut() = Some(Rc::new(held)));
+                    Ok(Promotion::Granted)
+                }
+                Err(e) => Err(e),
+            };
+            // Cleared either way. On a grant the early return above answers
+            // every later caller; on a failure the next one is entitled to
+            // ask the browser again rather than inherit an answer that has
+            // expired.
+            PROMOTION.with(|cell| *cell.borrow_mut() = None);
+            for tell in std::mem::take(&mut *waiting.borrow_mut()) {
+                let _ = tell.send(answer.clone());
+            }
+        });
+    }
+
+    match told.await {
+        Ok(answer) => answer,
+        Err(_) => Err("The browser did not answer the wait for this account.".to_string()),
+    }
+}
+
+/// One caller waiting to be told this tab now holds the account.
+type Waiter = futures_channel::oneshot::Sender<Result<Promotion, String>>;
+
+/// What became of a wait for the account.
+///
+/// Two outcomes and not one, because a caller that has been replaced must be
+/// able to stop *quietly*: it is a connection that has already been remade,
+/// not a failure worth a line in anybody's console.
+///
+/// `pub` rather than `pub(crate)` because it leaves the crate: the front end
+/// is what waits, through `embedded::promotion`, and it is the side that has
+/// to tell the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Promotion {
+    /// This tab holds the account now.
+    Granted,
+    /// A later connection is waiting instead; this caller has nothing to do.
+    Superseded,
 }
 
 /// How a caller that did not do the asking gets its answer.

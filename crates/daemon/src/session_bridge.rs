@@ -315,8 +315,14 @@ pub async fn run(
     // that was meant to join threads would instead panic here — before the
     // publisher is joined and before the store is deleted, which is the
     // whole of what this teardown exists to order. `unblock` is a hand-off
-    // on a desktop and a plain call in a page, which is right on both: what
-    // it runs there is `Plugins::none`, with no thread to join.
+    // on a desktop and a plain call in a page, which is right on both: a
+    // page's plugins are tasks on this very loop, so there is nothing to
+    // join and nothing that could be running while this runs. What their
+    // *last* write cannot be ordered against is the retirement below, which
+    // is why the origin's storage stamps the account a store was opened for
+    // and refuses a write from an older one — see `plugin_host::Origin`. A
+    // page can pair again without reloading, so what is refused has to be the
+    // departed account's handles rather than every handle from here on.
     {
         let plugins = Arc::clone(&bridge.plugins);
         if oxidezap_session::unblock(move || plugins.shutdown())
@@ -340,15 +346,27 @@ pub async fn run(
     /// `true` when there was nothing to remove, which is the ordinary case: an
     /// account with no plugins has no permissions to retire.
     fn approvals_retired() -> bool {
-        let Some(dir) = oxidezap_plugin_host::default_state_dir() else {
-            return true;
-        };
-        match oxidezap_plugin_host::forget_approvals(&dir) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(e) => {
-                log::error!("cannot remove the plugins' recorded permissions: {e}");
-                false
+        // A page keeps them in its origin's storage rather than in a
+        // directory, and clears the plugins' settings in the same sweep:
+        // there is no directory below to remove afterwards, so the two halves
+        // that are separate on a desktop are one call here. What survives is
+        // what survives there — the modules themselves.
+        #[cfg(target_family = "wasm")]
+        {
+            oxidezap_plugin_host::Origin::forget_all()
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let Some(dir) = oxidezap_plugin_host::default_state_dir() else {
+                return true;
+            };
+            match oxidezap_plugin_host::forget_approvals(&dir) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(e) => {
+                    log::error!("cannot remove the plugins' recorded permissions: {e}");
+                    false
+                }
             }
         }
     }
@@ -393,6 +411,7 @@ pub async fn run(
         // and they sit in their own directory beside the plugins rather than
         // inside the store. Nothing is writing them any more: the threads
         // were joined above.
+        #[cfg(not(target_family = "wasm"))]
         if let Some(dir) = oxidezap_plugin_host::default_state_dir()
             && let Err(e) = std::fs::remove_dir_all(&dir)
             && e.kind() != std::io::ErrorKind::NotFound

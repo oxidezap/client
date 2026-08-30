@@ -871,6 +871,16 @@ pub struct WhatsAppApp {
     settings: Option<SettingsState>,
     /// What this account occupies on disk, as the daemon last measured it.
     storage_usage: Option<crate::session::StorageUsage>,
+    /// Every plugin id in this front end's own folder, whether or not it
+    /// loaded.
+    ///
+    /// Not the same list as `plugins`, and the difference is the whole reason
+    /// it exists: a module that fails to parse, answers the wrong ABI version
+    /// or traps in `oxi_init` publishes no surface, so a screen drawn from
+    /// the surfaces alone has nowhere to put a Remove button for the one file
+    /// somebody most needs to remove. `None` is "not asked yet", which is
+    /// what a front end with no folder of its own stays at forever.
+    installed_plugins: Option<Vec<String>>,
     /// Which of the sidebar's destinations is on screen.
     destination: Destination,
     /// Whose status updates are open, and which one of them.
@@ -1060,6 +1070,7 @@ impl WhatsAppApp {
             chat_list_cache: RefCell::new(None),
             chat_cache_version: std::cell::Cell::new(0),
             storage_usage: None,
+            installed_plugins: None,
             destination: Destination::default(),
             status_pane: StatusPane::default(),
             status_feed_cache: RefCell::new(None),
@@ -2322,14 +2333,17 @@ impl WhatsAppApp {
                         app.client = Some(client);
                     }
                     Err(e) if Session::is_settled(&e) => {
-                        // A refusal, not a failure to reach anything: another
-                        // tab holds this account, or this preview has not been
-                        // told it may keep one. Said in its own words — a
-                        // "Failed to reach the daemon" in front of it would be
-                        // the one sentence that is not true — and with no
-                        // timer behind it, because the next attempt would get
-                        // the same answer and the one after that would take an
-                        // account the moment somebody else's tab closed.
+                        // A refusal, not a failure to reach anything: this
+                        // preview has not been told it may keep an account, or
+                        // a tab is holding one and would not answer for it —
+                        // which is now the narrow case it sounds like, since a
+                        // tab that loses the claim ordinarily attaches to the
+                        // tab that won and draws the account through it. Said
+                        // in its own words — a "Failed to reach the daemon" in
+                        // front of it would be the one sentence that is not
+                        // true — and with no timer behind it, because the
+                        // attempt that reached here had already asked the
+                        // holder for a connection and been left waiting.
                         app.app_state = AppState::Refused {
                             reason: e.to_string(),
                         };
