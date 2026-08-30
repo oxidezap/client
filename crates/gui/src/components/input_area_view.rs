@@ -450,7 +450,7 @@ impl InputAreaView {
                 // does nothing is the worse answer: the browser has no Opus
                 // encoder, and that is knowable before the microphone is ever
                 // asked for.
-                let can_record = oxidezap_audio::CAN_RECORD;
+                let can_record = oxidezap_audio::can_record();
                 Button::new("ptt")
                     .icon(ProductIcon::Mic)
                     .ghost()

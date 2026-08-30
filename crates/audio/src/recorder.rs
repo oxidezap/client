@@ -16,6 +16,36 @@ pub struct RecordedAudio {
     pub duration_secs: u32,
 }
 
+/// A voice note that is already encoded, and everything drawn from it.
+///
+/// The waveform travels with the bytes rather than being derived from them:
+/// it is measured from the samples while they are still samples, and once a
+/// platform has handed back an encoded note there is nothing left to measure.
+pub struct EncodedNote {
+    pub bytes: Vec<u8>,
+    pub waveform: Vec<u8>,
+    pub duration_secs: u32,
+}
+
+/// What stopping a recording produced.
+///
+/// Two shapes because the platforms answer at different times. A desktop hands
+/// back samples and the encode is ordinary work on a background thread; a
+/// browser encodes *as it captures*, through an encoder whose last packets
+/// arrive after the microphone has closed, so the answer is a channel rather
+/// than a value.
+///
+/// The caller awaits one and encodes the other, which is the whole difference
+/// and is why this is an enum rather than a future on both: making the desktop
+/// asynchronous to match would move a real encode off the background pool for
+/// nothing.
+pub enum Recording {
+    /// Samples this build encodes itself.
+    Samples(RecordedAudio),
+    /// A note the platform is still flushing.
+    Pending(futures_channel::oneshot::Receiver<Result<EncodedNote, RecorderError>>),
+}
+
 impl RecordedAudio {
     pub fn resample_to_16khz(&self) -> Vec<f32> {
         if self.sample_rate == TARGET_SAMPLE_RATE {
@@ -107,7 +137,7 @@ mod capture {
     use log::{error, info, warn};
     use wacore::time::Instant;
 
-    use super::{CAPTURE_SAMPLE_RATE, RecordedAudio, RecorderError};
+    use super::{CAPTURE_SAMPLE_RATE, RecordedAudio, RecorderError, Recording};
 
     /// How much of the tail the meter averages: 150ms.
     /// Short enough to follow speech, long enough not to flicker.
@@ -292,7 +322,9 @@ mod capture {
             rms(&samples[from..])
         }
 
-        pub fn stop(&mut self) -> Result<RecordedAudio, RecorderError> {
+        /// Samples, always: this build has an encoder of its own, so there is
+        /// nothing to wait for. See [`Recording`].
+        pub fn stop(&mut self) -> Result<Recording, RecorderError> {
             if !self.is_recording {
                 return Err(RecorderError::NotRecording);
             }
@@ -309,11 +341,11 @@ mod capture {
                 duration.as_secs_f32()
             );
 
-            Ok(RecordedAudio {
+            Ok(Recording::Samples(RecordedAudio {
                 samples,
                 sample_rate: self.sample_rate,
                 duration_secs: duration.as_secs() as u32,
-            })
+            }))
         }
 
         pub fn cancel(&mut self) {

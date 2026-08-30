@@ -7,9 +7,13 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 - **oxidezap-core**: domain types (chats, messages, calls, UI events). No UI, no I/O.
 - **oxidezap-audio**: capture, playback, Opus encoding, waveforms. cpal; no UI.
   On the web the sound card and the codec are the browser's: playback is real
-  (`decodeAudioData` takes exactly the bytes the daemon sends) and recording is
-  refused up front, because libopus is C and capturing samples nothing could
-  encode is a recording UI that always fails at the end.
+  (`decodeAudioData` takes exactly the bytes the daemon sends) and so is
+  recording, through WebAudio for the capture and `AudioEncoder` for the
+  codec. `ogg_opus` is the container both platforms write, because only the
+  codec was ever missing — which is also why `MediaRecorder` is *not* the
+  route in: it produces a container the browser picks (WebM on Chrome, MP4 on
+  Safari) where a voice note is Opus in OGG, so it would have meant a demuxer
+  to undo it.
 - **oxidezap-chat-store**: materializes the library's event stream into chats,
   messages, receipts and an FTS5 search index. Owns its schema and migrations;
   consumes only the library's public event surface. Extracted from
@@ -1133,11 +1137,16 @@ identically. It does not try: `daemon::plugins::start` returns
 `Plugins::none` with that written down, rather than arriving there by way of
 a browser having no `HOME`.
 
-So voice notes play and a video in a conversation decodes through the
-browser's own H.264 (`web_sys::VideoDecoder`, bound from Rust like every other
-browser API here); recording is refused where it starts rather than where it
-would fail; calls stay in the daemon, which is where the microphone already
-was, and so do plugins, for the same kind of reason.
+So voice notes play and record, and a video in a conversation decodes through
+the browser's own H.264 (`web_sys::VideoDecoder`, bound from Rust like every
+other browser API here); calls stay in the daemon, which is where the
+microphone already was, and so do plugins, for the same kind of reason.
+
+Whether a page can record is a question about the *browser* rather than about
+the build, which is why `can_record()` is a function where `CAN_RECORD` was a
+constant: the encoder is `AudioEncoder`, and an older browser may not have it.
+Asked before the microphone is offered either way, because a control that is
+drawn and then always fails is worse than one that is not drawn.
 
 A call's video decodes the same way, through the same module, and obeys the
 same stream rules the desktop path does — a decoder born mid-stream waits for
@@ -1250,13 +1259,10 @@ by definition.
   here. Attached to an `oxidezapd` the question does not arise, because the
   daemon holds the ureq client and does the upload.
 
-- **Voice notes are not recorded on the web.** The encoder is libopus, which
-  is C. `MediaRecorder` is the browser-native answer and a Rust binding like
-  every other here, but it is an API change rather than a backend swap: it
-  hands back *encoded bytes* where `RecordedAudio` is samples, and the
-  waveform is derived from those samples — so it needs a ready-bytes path
-  beside `encode_to_opus_ogg` and another source for the envelope, for which
-  an `AnalyserNode` during the recording is the cheap one.
+- **A page's own session cannot send the media it can now record.** See the
+  upload note above: the recording, the staging and the container are all in
+  place, and `execute_upload` upstream is what a voice note from an
+  own-session page still runs into. Attached to an `oxidezapd` it goes.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.

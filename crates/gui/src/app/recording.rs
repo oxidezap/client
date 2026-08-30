@@ -73,7 +73,7 @@ impl WhatsAppApp {
         // Refused where nothing can come of it. The composer already draws
         // the microphone disabled there, so this is the keyboard route and
         // anything else that reaches the action directly.
-        if !oxidezap_audio::CAN_RECORD {
+        if !oxidezap_audio::can_record() {
             warn!("this build cannot record a voice note");
             return;
         }
@@ -128,8 +128,8 @@ impl WhatsAppApp {
         cx.notify();
 
         // Stop recording and get audio data
-        let recorded = match self.audio_recorder.stop() {
-            Ok(audio) => audio,
+        let recording = match self.audio_recorder.stop() {
+            Ok(recording) => recording,
             Err(e) => {
                 error!("Failed to stop recording: {}", e);
                 self.recording_state = RecordingState::Idle;
@@ -140,21 +140,6 @@ impl WhatsAppApp {
                 return;
             }
         };
-
-        // Check minimum duration (1 second)
-        if recorded.duration_secs < 1 {
-            warn!("Recording too short, discarding");
-            self.recording_state = RecordingState::Idle;
-            self.update_input_recording(cx);
-            cx.notify();
-            return;
-        }
-
-        info!(
-            "Recording stopped: {} samples, {}s",
-            recorded.samples.len(),
-            recorded.duration_secs
-        );
 
         if self.client.is_none() {
             warn!("Cannot send audio: not connected to the daemon");
@@ -169,17 +154,7 @@ impl WhatsAppApp {
         // was started for is still the current one.
         let epoch = self.recording_epoch;
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            // GPUI's own background pool. This used to borrow the session's
-            // tokio runtime, which was only ever within reach because the
-            // session lived in this process.
-            let encoded = cx
-                .background_spawn(async move {
-                    let waveform = generate_waveform(&recorded.samples);
-                    encode_to_opus_ogg(&recorded)
-                        .map(|ogg| (ogg, waveform, recorded.duration_secs))
-                        .map_err(|error| error.to_string())
-                })
-                .await;
+            let encoded = Self::finish(cx, recording).await;
             let _ = entity.update(cx, |app, cx| {
                 // A disconnect, a logout or a plain cancel while the encoder
                 // ran makes this note something nobody is waiting for. Sending
@@ -195,6 +170,48 @@ impl WhatsAppApp {
         })
         .detach();
     }
+    /// Turn a stopped recording into the note that gets sent.
+    ///
+    /// The two arms are the two platforms, and the difference is *when* the
+    /// encode happens rather than what it produces. A desktop hands back samples
+    /// and this encodes them on the background pool, which is real work and
+    /// belongs off the UI thread. A browser encoded as it captured, so there is
+    /// nothing to do but wait for the last packets to flush.
+    ///
+    /// The minimum-duration guard lives here rather than before the stop, because
+    /// only one of the two knows how long the recording was without waiting for
+    /// it.
+    async fn finish(
+        cx: &mut gpui::AsyncApp,
+        recording: oxidezap_audio::Recording,
+    ) -> Result<(Vec<u8>, Vec<u8>, u32), String> {
+        use gpui::AppContext as _;
+
+        let (bytes, waveform, duration_secs) = match recording {
+            oxidezap_audio::Recording::Samples(recorded) => {
+                cx.background_spawn(async move {
+                    let waveform = generate_waveform(&recorded.samples);
+                    encode_to_opus_ogg(&recorded)
+                        .map(|ogg| (ogg, waveform, recorded.duration_secs))
+                        .map_err(|error| error.to_string())
+                })
+                .await?
+            }
+            oxidezap_audio::Recording::Pending(pending) => {
+                let note = pending
+                    .await
+                    .map_err(|_| "the recording ended before it was encoded".to_string())?
+                    .map_err(|e| e.to_string())?;
+                (note.bytes, note.waveform, note.duration_secs)
+            }
+        };
+
+        if duration_secs < 1 {
+            return Err("that recording was too short to send".to_string());
+        }
+        Ok((bytes, waveform, duration_secs))
+    }
+
     fn finish_recording_send(
         &mut self,
         jid: String,
@@ -206,6 +223,11 @@ impl WhatsAppApp {
             Ok(encoded) => encoded,
             Err(error) => {
                 error!("Failed to encode audio: {error}");
+                // The person watched themselves record this, so its
+                // disappearance needs a sentence. Every message reaching here
+                // is written for a reader: a refused microphone, a recording
+                // too short to send, an encoder that stopped.
+                self.notify_user(error, crate::app::notices::Tone::Problem, cx);
                 self.recording_state = RecordingState::Idle;
                 self.update_input_recording(cx);
                 cx.notify();
