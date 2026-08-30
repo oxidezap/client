@@ -4,7 +4,7 @@
 //! retry now, wait for the automatic retry, or stop waiting and read what is
 //! already on this device.
 
-use oxidezap_core::Fault;
+use oxidezap_core::{Fault, Recovery};
 
 use super::*;
 
@@ -32,10 +32,16 @@ impl WhatsAppApp {
     /// keep.
     pub(super) fn connection_ended(&mut self, fault: Fault, cx: &mut Context<Self>) {
         self.leave_connected_view(cx);
-        let retry = fault.retry;
+        let recovery = fault.recovery;
         self.app_state = AppState::Error(fault);
-        if retry {
-            self.schedule_retry(cx);
+        match recovery {
+            // Now, because the screen says so. A window that fell behind is
+            // one the daemon is right there for, and arming the outage's
+            // countdown left it sitting under a body that claimed it was
+            // already attaching.
+            Recovery::Now => self.retry_connection(cx),
+            Recovery::AfterAWait => self.schedule_retry(cx),
+            Recovery::Nothing => {}
         }
         cx.notify();
     }

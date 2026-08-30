@@ -702,15 +702,20 @@ mod tests {
     #[test]
     fn a_diagnosed_ending_is_not_drawn_as_an_outage() {
         let outage = Fault::unreachable("the socket went");
-        assert!(outage.retry);
+        assert_eq!(outage.recovery, oxidezap_core::Recovery::AfterAWait);
 
         let behind = Fault::fell_behind("lost part of the stream");
-        assert!(behind.retry, "attaching again is exactly the way out");
+        assert_eq!(
+            behind.recovery,
+            oxidezap_core::Recovery::Now,
+            "the body says it is attaching again, so it has to be"
+        );
         assert_ne!(behind.headline, outage.headline);
 
         let mismatch = Fault::mismatched("protocol 3 against 4");
-        assert!(
-            !mismatch.retry,
+        assert_eq!(
+            mismatch.recovery,
+            oxidezap_core::Recovery::Nothing,
             "reconnecting fails the same way forever, so nothing may promise it"
         );
         assert!(

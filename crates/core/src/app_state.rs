@@ -91,8 +91,24 @@ pub struct Fault {
     pub body: &'static str,
     /// The raw reason, for the fold.
     pub detail: String,
-    /// Whether reconnecting is the way out of this one.
-    pub retry: bool,
+    /// What the way out of this one is.
+    pub recovery: Recovery,
+}
+
+/// How a connection comes back, if it does.
+///
+/// Three answers rather than a flag, because the screen says which and a
+/// countdown is a promise: a window that fell behind attaches again at once
+/// and has nothing to count, an outage is waited out, and a version mismatch
+/// is neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// Attach again now. Nothing was unreachable.
+    Now,
+    /// Wait out the countdown and try again.
+    AfterAWait,
+    /// Nothing here to try.
+    Nothing,
 }
 
 impl Fault {
@@ -102,7 +118,7 @@ impl Fault {
             headline: "Can't reach WhatsApp",
             body: "Your messages are safe on this device. We'll keep trying to reconnect.",
             detail: detail.into(),
-            retry: true,
+            recovery: Recovery::AfterAWait,
         }
     }
 
@@ -112,7 +128,7 @@ impl Fault {
             headline: "Reconnecting to the background service",
             body: "This window fell behind and is attaching again. Nothing has been lost.",
             detail: detail.into(),
-            retry: true,
+            recovery: Recovery::Now,
         }
     }
 
@@ -123,7 +139,7 @@ impl Fault {
             body: "They are different versions. Quit oxidezap completely and start it \
                    again; reconnecting will not help.",
             detail: detail.into(),
-            retry: false,
+            recovery: Recovery::Nothing,
         }
     }
 }

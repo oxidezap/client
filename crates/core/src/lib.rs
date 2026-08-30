@@ -28,7 +28,7 @@ mod status;
 mod system_notice;
 mod video;
 
-pub use app_state::{AppState, CachedQrCode, Fault, Issued, Lifetime};
+pub use app_state::{AppState, CachedQrCode, Fault, Issued, Lifetime, Recovery};
 pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
 pub use calls::{ActiveCall, Admission, CallState, Ending, Stage, WaitingCall};
 pub use chat::STATUS_BROADCAST_JID;
