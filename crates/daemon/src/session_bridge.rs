@@ -775,6 +775,12 @@ impl Bridge {
                     limit.map_or(WhatsAppClient::MESSAGE_PAGE, i64::from),
                 );
                 let reads = Arc::clone(&self.reads);
+                // The cache epoch as it is *now*, not as it will be when the
+                // page lands. A `ForgetSession` in between retires this one,
+                // and `put_since` then refuses the write rather than putting
+                // the departed account's thumbnails back into a directory the
+                // wipe has already emptied.
+                let epoch = crate::media::epoch();
                 // Which account asked. A page of the old one's history
                 // landing after it left would be folded into a tracker that
                 // had just forgotten it, and the next account would carry the
@@ -787,7 +793,7 @@ impl Bridge {
                             // The bytes travel the way they do everywhere
                             // else: written to the media directory, named by
                             // a key.
-                            externalize_messages(crate::media::epoch(), &mut page.items);
+                            externalize_messages(epoch, &mut page.items);
                             // What this side served, it now knows. A read is
                             // bounded by the messages the daemon has observed,
                             // and the page a front end asked for is the
@@ -845,13 +851,15 @@ impl Bridge {
                 );
                 let reads = Arc::clone(&self.reads);
                 let hub = Arc::clone(&self.hub);
+                // As above: taken now, so a wipe between the ask and the
+                // answer refuses the write rather than repopulating the cache.
+                let epoch = crate::media::epoch();
                 // As above: a page of the departed account's chats must not
                 // be put back into a hub that has just been emptied of it.
                 let asked_as = hub.account_generation();
                 oxidezap_session::spawn(async move {
                     let answer = match page.await {
                         Ok(Ok(mut page)) => {
-                            let epoch = crate::media::epoch();
                             // The same rule. A chat past the attach window is
                             // in no snapshot, and a read for one is refused
                             // with "no such chat" until this side has been
