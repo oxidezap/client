@@ -723,6 +723,11 @@ impl Bridge {
     /// a local query. What the fold needs is shared rather than borrowed, so
     /// what the daemon learns from a page it serves is learned wherever the
     /// page lands.
+    ///
+    /// A page read takes a permit like every other slow action: the command
+    /// channel has no bound of its own, and a front end that reads its
+    /// acknowledgements would otherwise keep queueing SQLite reads, each
+    /// holding its page and that page's externalized media until it answers.
     fn begin_slow(
         &mut self,
         client: &WhatsAppClient,
@@ -762,6 +767,10 @@ impl Bridge {
                     before.map(|cursor| cursor.as_str().to_string()),
                     limit.map_or(WhatsAppClient::MESSAGE_PAGE, i64::from),
                 );
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
                 let reads = Arc::clone(&self.reads);
                 // Which account asked. A page of the old one's history
                 // landing after it left would be folded into a tracker that
@@ -802,6 +811,7 @@ impl Bridge {
                     };
                     answer_now(&answer_to, answered(id, answer));
                     let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
                 });
                 None
             }
@@ -815,6 +825,10 @@ impl Bridge {
                     after.map(|cursor| cursor.as_str().to_string()),
                     limit.map_or(WhatsAppClient::CHAT_PAGE, i64::from),
                 );
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
                 let reads = Arc::clone(&self.reads);
                 let hub = Arc::clone(&self.hub);
                 // As above: a page of the departed account's chats must not
@@ -858,6 +872,7 @@ impl Bridge {
                     };
                     answer_now(&answer_to, answered(id, answer));
                     let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
                 });
                 None
             }
