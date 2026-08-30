@@ -311,6 +311,14 @@ async fn occupied(
 
 /// Take one out of the folder.
 ///
+/// By the name the folder actually holds, and not by one rebuilt from the id.
+/// `plugin_id` accepts an uppercase extension — a file picker hands back
+/// whatever the operating system called it — so a module written as
+/// `autoreply.WASM` is listed, loaded and drawn as `autoreply`, and removing
+/// `autoreply.wasm` would name an entry that is not there. OPFS is
+/// case-sensitive, so every Remove on such a module answered `NotFoundError`
+/// while the plugin went on running.
+///
 /// # Errors
 ///
 /// The browser refused, which for a removal is either no storage or a handle
@@ -319,7 +327,18 @@ pub async fn uninstall(id: &str) -> Result<(), String> {
     let Some(dir) = folder(false).await.map_err(described)? else {
         return Ok(());
     };
-    JsFuture::from(dir.remove_entry(&format!("{id}.wasm")))
+    let held = entries(&dir)
+        .await
+        .map_err(described)?
+        .into_iter()
+        .find(|name| plugin_id(name).as_deref() == Some(id));
+    // Nothing under that id is nothing to remove, which is the answer a
+    // second press deserves rather than an error about a file the first press
+    // took away.
+    let Some(held) = held else {
+        return Ok(());
+    };
+    JsFuture::from(dir.remove_entry(&held))
         .await
         .map(|_| ())
         .map_err(described)
