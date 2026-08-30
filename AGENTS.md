@@ -1372,6 +1372,32 @@ by definition.
   upload note above: the recording, the staging and the container are all in
   place, and `execute_upload` upstream is what a voice note from an
   own-session page still runs into. Attached to an `oxidezapd` it goes.
+- **A page prepares a recording on the window's own thread.** `app/recording.rs`
+  hands the desktop's waveform and encode to `cx.background_spawn`, which is
+  where work measured in hundreds of millions of operations belongs. The web
+  path does not: `stop` spawns a local task that runs the 63-tap resampler and
+  the waveform generator to completion before its first await, so a long note
+  holds the window while it does. gpui's background executor runs on real
+  workers here, so the destination exists; what does not is a seam, because
+  the pure-Rust half and the `AudioEncoder` half are one task inside the audio
+  crate and only the first of them may leave the window. Splitting the
+  resampler instead is the wrong half to reach for: a 63-tap filter carries
+  state across any boundary it is cut at, so chunking it changes the audio.
+  Bounded meanwhile by the ten-minute ceiling, which is what makes it a stall
+  rather than a hang.
+- **A video with B-frames is stamped in the wrong order.** `stamp_of` labels
+  each access unit with its decode-order index, and `collect` reads that label
+  back as the picture's position. The two agree exactly while decode order is
+  presentation order, which is every baseline stream and so every video
+  WhatsApp itself sends. They stop agreeing the moment an attachment carries
+  B-frames: WebCodecs answers in presentation order, so the labels come back
+  out of sequence and the timeline reads a picture as a position it does not
+  hold. What it needs is the composition offset the container already carries
+  (`Mp4Sample::rendering_offset`) as the stamp, kept apart from the decode
+  cursor the feed loop walks, which makes a seek a search for the decode
+  samples a presentation position depends on rather than a range. That is the
+  timeline's indexing model rather than a patch to it, and verifying it wants
+  a B-frame fixture this tree has none of.
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
