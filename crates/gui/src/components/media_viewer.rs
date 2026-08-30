@@ -19,6 +19,14 @@ use crate::app::{MediaViewer, VIEWER_CONTEXT, ViewerNext, ViewerPrev, WhatsAppAp
 use crate::components::ProductIcon;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use crate::utils::format_list_time;
+
+/// How much of a caption the viewer shows before it scrolls, in multiples of
+/// its own type size.
+///
+/// A caption is the sender's text and has no length limit, so this is what
+/// keeps the picture from being pushed off its own screen. Roughly six lines
+/// at the usual line height, which is most captions whole.
+pub(crate) const CAPTION_LINES: f32 = 9.0;
 use oxidezap_core::{ChatMessage, MediaType};
 
 /// What the viewer needs that only the app can resolve.
@@ -173,8 +181,16 @@ pub fn render_media_viewer(
                 )),
         )
         .children(caption.map(|caption| {
+            // Bounded, and scrolled past that. A caption is the sender's text
+            // with no length limit, and a band that refuses to shrink pushes
+            // the picture's own `flex_1 min_h_0` pane to zero: the photo
+            // vanishes, the caption fills the screen, and what does not fit
+            // is cut off the bottom with no way to reach it.
             div()
+                .id("viewer-caption")
                 .flex_shrink_0()
+                .max_h(metrics.text_secondary() * CAPTION_LINES)
+                .overflow_y_scroll()
                 .px(metrics.space_xxxl())
                 .py(metrics.space_xl())
                 .flex()
