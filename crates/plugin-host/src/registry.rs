@@ -251,7 +251,7 @@ mod tests {
             }),
             // Nowhere to write: these tests are about what the registry
             // publishes, not about what survives a restart.
-            Approvals::open(None),
+            Approvals::open(Arc::new(crate::store::Nowhere)),
         );
         (registry, log)
     }

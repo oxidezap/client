@@ -1,22 +1,24 @@
-//! One plugin, from a file on disk to a thread that answers events.
+//! One plugin, from a module's bytes to something that answers events.
 //!
 //! Everything here is per plugin and nothing is shared: its own wasmi
-//! `Store`, its own instance, its own thread, its own queue. That is not
+//! `Store`, its own instance, its own worker, its own queue. That is not
 //! defensive tidiness — a `Store` is not shareable and a wasm call is a
 //! blocking synchronous call, so putting one on a runtime worker would stall
-//! the accept loop for as long as the plugin ran.
+//! the accept loop for as long as the plugin ran. Where the worker runs is
+//! `sched`'s business: a thread on a desktop, a task on the page's loop in a
+//! browser.
 
 use portable_atomic::AtomicI64;
-use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use oxidezap_plugin_abi as abi;
 use wasmi::{Config, Engine, Instance, Linker, Module, Store, StoreLimitsBuilder, TypedFunc};
 
 use crate::event::Event;
 use crate::guest::{Guest, Phase};
 use crate::kv::Kv;
+use crate::store::Backing;
 use crate::{Commands, MAX_MODULE_BYTES, MAX_TABLE_ELEMENTS, MAX_TABLES, MEMORY_LIMIT};
 use wacore::time::Instant;
 
@@ -66,9 +68,9 @@ impl Runtime {
     /// means calling one — and that is bounded by the same fuel budget, so a
     /// module whose setup misbehaves is caught there.
     pub fn load(
-        path: &Path,
+        bytes: &[u8],
         id: &str,
-        state_dir: Option<&Path>,
+        state: &Arc<dyn Backing>,
         commands: Arc<dyn Commands>,
         // The raw mask the user has already agreed to for this plugin, read
         // before it runs a single instruction — so whatever it declares
@@ -76,42 +78,28 @@ impl Runtime {
         // answer.
         approved: Arc<AtomicI64>,
     ) -> Result<Self> {
-        // Asked of the *file*, before a byte is read. Everything from here to
+        // Asked of the bytes, which is where a caller that read them from
+        // somewhere unbounded is answered. Discovery asks the same question
+        // of the *file* before it opens one, because everything from there to
         // `store.limiter` — the bytes themselves, and whatever wasmi
         // allocates parsing and validating them — happens before the limiter
-        // exists, so the sandbox's memory bound does not cover any of it. One
-        // downloaded file with an enormous section would otherwise exhaust
-        // the daemon during startup and take the account down with it.
-        let too_big =
-            |size: u64| anyhow!("it is {size} bytes, past the {MAX_MODULE_BYTES} a plugin may be");
-        let size = std::fs::metadata(path)
-            .with_context(|| format!("reading {}", path.display()))?
-            .len();
-        if size > MAX_MODULE_BYTES as u64 {
-            return Err(too_big(size));
-        }
-        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        // And of the bytes, because the answer above was about the file as it
-        // was a moment ago. The race is narrow and the directory is provably
-        // not writable by another account, so whoever won it is already the
-        // owner. The cap is what the sentence above promises, and asking
-        // twice is what makes it true rather than nearly true.
+        // exists, so the sandbox's memory bound covers none of it. Asked
+        // twice is what makes that promise true rather than nearly true.
         if bytes.len() > MAX_MODULE_BYTES {
-            return Err(too_big(bytes.len() as u64));
+            return Err(anyhow!(
+                "it is {} bytes, past the {MAX_MODULE_BYTES} a plugin may be",
+                bytes.len()
+            ));
         }
 
         let mut config = Config::default();
         // The whole reason this is defensible in-process.
         config.consume_fuel(true);
         let engine = Engine::new(&config);
-        let module = Module::new(&engine, &bytes[..]).map_err(|e| {
-            anyhow!(
-                "{} is not a wasm module this host can load: {e}",
-                path.display()
-            )
-        })?;
+        let module = Module::new(&engine, bytes)
+            .map_err(|e| anyhow!("{id} is not a wasm module this host can load: {e}"))?;
 
-        let kv = state_dir.map_or_else(Kv::in_memory, |dir| Kv::open(dir, id));
+        let kv = Kv::open(Arc::clone(state), id);
         let mut store = Store::new(
             &engine,
             Guest {

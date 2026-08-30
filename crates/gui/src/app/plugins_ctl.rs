@@ -205,6 +205,122 @@ impl WhatsAppApp {
         &self.plugins
     }
 
+    /// Every plugin id in this front end's own folder, or `None` where the
+    /// folder has not been read yet — and where there is none to read.
+    ///
+    /// The two are worth telling apart by whoever draws them: "the folder
+    /// does not hold this plugin" is a fact about the folder, and an answer
+    /// nobody has asked for yet is not that fact. The read is a task, so the
+    /// first frame after Settings opens has none of it.
+    #[must_use]
+    pub fn installed_plugins(&self) -> Option<&[String]> {
+        self.installed_plugins.as_deref()
+    }
+
+    /// Read the folder, so Settings can offer to remove what is in it.
+    ///
+    /// The list of *surfaces* is not that list. A module that fails to parse,
+    /// answers the wrong ABI version or traps in `oxi_init` publishes nothing
+    /// at all, so a screen drawn from the surfaces alone leaves the one file
+    /// somebody most needs to remove with no control anywhere — and it goes
+    /// on spending the folder's budget at every load.
+    ///
+    /// Asked when Settings opens and again after an install or a removal,
+    /// which is the same shape the storage total is asked in: a pane that
+    /// starts on "reading…" every time is worse than one that is already
+    /// right.
+    pub fn refresh_installed_plugins(&mut self, cx: &mut Context<Self>) {
+        if !crate::platform::plugins::home().can_install() {
+            return;
+        }
+        cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
+            let found = crate::platform::plugins::installed().await;
+            let _ = entity.update(cx, |app, cx| {
+                match found {
+                    Ok(ids) => app.installed_plugins = Some(ids),
+                    // Left as it was rather than emptied: a read that failed
+                    // is not a folder that is empty, and drawing it as one
+                    // would take away the Remove button somebody was about
+                    // to press.
+                    Err(e) => log::warn!("cannot read this page's plugin folder: {e}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Put a `.wasm` somebody chose into this front end's own plugin folder.
+    ///
+    /// Only a page holding its own session has one; every other front end
+    /// talks to a daemon whose folder is somebody else's, which is why the
+    /// control that calls this is drawn only where
+    /// [`crate::platform::PluginHome::can_install`] says so.
+    ///
+    /// It does not start the plugin. Loading happens once, before the session
+    /// does, and a plugin reloaded under itself mid-conversation is a
+    /// separate problem the daemon does not have an answer to either — so the
+    /// honest thing to say is that the next load runs it, which for a page is
+    /// a reload of the tab.
+    pub fn install_plugin(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
+            let outcome = crate::platform::plugins::install().await;
+            let _ = entity.update(cx, |app, cx| match outcome {
+                // Nobody chose anything. Not a failure, and not worth a line.
+                Ok(None) => {}
+                Ok(Some(id)) => {
+                    app.refresh_installed_plugins(cx);
+                    app.notify_user(
+                        format!("{id} installed. Reload this page to run it."),
+                        super::notices::Tone::Info,
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    log::warn!("cannot install a plugin: {e}");
+                    app.notify_user(
+                        format!("That plugin could not be installed: {e}"),
+                        super::notices::Tone::Problem,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Take one out of this front end's own plugin folder.
+    ///
+    /// The running plugin is not stopped, for the reason above: what this
+    /// changes is what the next load finds. Its recorded permission stays
+    /// until it is withdrawn, which is deliberate — an id reinstalled later
+    /// is the same id, and the answer was given against the id and its mask
+    /// rather than against the bytes.
+    pub fn remove_plugin(&mut self, id: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
+            let outcome = crate::platform::plugins::uninstall(&id).await;
+            let _ = entity.update(cx, |app, cx| match outcome {
+                Ok(()) => {
+                    app.refresh_installed_plugins(cx);
+                    app.notify_user(
+                        format!("{id} removed. It stops at the next reload."),
+                        super::notices::Tone::Info,
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    log::warn!("cannot remove the plugin {id}: {e}");
+                    app.notify_user(
+                        format!("{id} could not be removed: {e}"),
+                        super::notices::Tone::Problem,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Allow, or stop allowing, what a plugin asked to be able to do.
     pub fn approve_plugin(&mut self, plugin: &str, approved: bool, cx: &mut Context<Self>) {
         if let Some(client) = self.client.as_ref() {
