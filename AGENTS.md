@@ -7,9 +7,11 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 - **oxidezap-core**: domain types (chats, messages, calls, UI events). No UI, no I/O.
 - **oxidezap-audio**: capture, playback, Opus encoding, waveforms. cpal; no UI.
   On the web the sound card and the codec are the browser's: playback is real
-  (`decodeAudioData` takes exactly the bytes the daemon sends) and so is
+  (`decodeAudioData` takes exactly the bytes the daemon sends), so is
   recording, through WebAudio for the capture and `AudioEncoder` for the
-  codec. `ogg_opus` is the container both platforms write, because only the
+  codec, and so is a call's mic and speaker — one `AudioContext` for both
+  directions, because the browser's echo canceller only subtracts what it
+  played itself. `ogg_opus` is the container both platforms write, because only the
   codec was ever missing — which is also why `MediaRecorder` is *not* the
   route in: it produces a container the browser picks (WebM on Chrome, MP4 on
   Safari) where a voice note is Opus in OGG, so it would have meant a demuxer
@@ -19,9 +21,12 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   consumes only the library's public event surface. Extracted from
   whatsapp-rust, where it was application logic living in a protocol repo.
 - **oxidezap-video**: camera capture and H.264 encoding for calls. cpal's
-  opposite number: a capture backend per platform behind one crate, and the
-  encoder the GUI already decodes with. No UI, and no decode — decoding
-  belongs to whoever draws.
+  opposite number, and now in both senses: a capture backend per platform
+  behind one crate — nokhwa and OpenH264 on a desktop, `getUserMedia` and
+  `VideoEncoder` in a browser — and the encoder the GUI already decodes with.
+  The browser encoder is configured `avc: { format: "annexb" }`, so what comes
+  out is what the library's video source already wants rather than AVCC to be
+  converted. No UI, and no decode — decoding belongs to whoever draws.
 - **oxidezap-session**: the WhatsApp connection: events, sends, store hydration.
   Knows nothing about how anything is drawn, and nothing about IPC either —
   the daemon translates requests onto its methods. Three of its modules are
@@ -345,10 +350,18 @@ profile here repeats it deliberately.
   has to know is also the one thing worth overriding, so `OXIDEZAP_FRONT_END`
   names another — a TUI, a second GUI — and the shipped pair is only the
   default.
-- **Calls ring in the daemon.** `oxidezap-session` is what opens the mic and
-  speaker, so the process that owns the session owns the audio device. That
-  follows from the split rather than being chosen, and it is why a call still
-  works with the window closed.
+- **A call is held by whoever holds the session.** `oxidezap-session` is what
+  opens the mic, the speaker and the camera, so the process that owns the
+  session owns the devices. That follows from the split rather than being
+  chosen, and it is why a call still works with the window closed.
+  On a desktop that process is the daemon. On a page holding its own session
+  it is the page, which is the same sentence and not an exception to it — the
+  devices are WebAudio and `getUserMedia` there, and the media reaches the
+  relay through an `RTCPeerConnection` rather than a UDP socket (`session/
+  relay/`). What used to be written here is that a browser had no audio codec;
+  it was wrong about which thing was missing. MLow is pure Rust and is what
+  WhatsApp's own clients negotiate. What a page has no such thing as is a
+  socket.
 - **A plugin is a front end that does not draw, and it runs in the daemon.**
   It sees the account's events and acts through the same command channel a
   window's requests go onto, so it has no privileged path to the session. It
@@ -1435,8 +1448,33 @@ desktop.
 
 So voice notes play and record, a video in a conversation decodes through the
 browser's own H.264 (`web_sys::VideoDecoder`, bound from Rust like every other
-browser API here), and plugins run; calls stay in the daemon, which is where
-the microphone already was.
+browser API here), plugins run, and calls are placed and answered — the
+microphone and speaker through WebAudio, the camera through `getUserMedia`,
+the picture encoded by `VideoEncoder` and the media carried to the relay by an
+`RTCPeerConnection`.
+
+The relay is the part worth stating precisely, because it reads like a second
+protocol and is not. The native transport dials UDP and runs DTLS, SCTP and a
+pre-negotiated `id=0` DataChannel over it — and its own comment calls that "the
+synthetic-SDP / wrtc dance" reduced to one layer. A browser does the dance
+instead: `session/relay/` writes the SDP answer describing the relay and hands
+it to a peer connection, which is the same stack with the browser assembling
+it. The library takes it through `Client::set_relay_transport_provider`, a seam
+that exists upstream for exactly this and answers with a factory per relay
+endpoint, since the server names the relay per call.
+
+One fact on that path is a captured constant rather than something the
+protocol carries. An SDP answer must name the certificate the far end presents
+and a browser enforces the match (RFC 8122); the native transport does not care
+and says the fingerprint "is fixed and cosmetic at this layer". *Fixed* is the
+operative word, and it is a claim that was checked rather than taken: read out
+of `chrome://webrtc-internals` during calls placed on WhatsApp Web itself, the
+remote certificate was the same across separate calls that reached *different*
+relay addresses, while each tab's own certificate differed. One value, two
+endpoints — that is what makes `RELAY_DTLS_FINGERPRINT` a constant and not a
+per-call secret. It is not in the `<relay>` block and there is nowhere else to
+get it, so a build that lost it would fail every handshake, which is what
+`the_fingerprint_is_thirty_two_hex_pairs` is there to notice early.
 
 Whether a page can record is a question about the *browser* rather than about
 the build, which is why `can_record()` is a function where `CAN_RECORD` was a
@@ -1680,6 +1718,21 @@ by definition.
   samples a presentation position depends on rather than a range. That is the
   timeline's indexing model rather than a patch to it, and verifying it wants
   a B-frame fixture this tree has none of.
+- **A dropped access unit is a frame of RTP time that goes unspent.** The
+  library's `VideoSource` advertises one `rtp_timestamp_stride` and advances
+  by exactly that per unit delivered, and `EncodedFrame` carries no timestamp
+  — so the stream's clock counts *units*, not elapsed time. Everything on this
+  path drops on purpose (the encoder's own queue, the plane's, and the web
+  timer's backpressure skip), and each drop is therefore a frame's worth of
+  time the video clock never advances through: under sustained loss the
+  picture's timestamps fall behind the audio's, by the length of what was
+  dropped. Predates the browser backend and is identical on the desktop —
+  `camera.rs`'s `try_send` and `plane.rs`'s both drop into the same
+  fixed-stride source. Closing it means a timestamp on `EncodedFrame` and a
+  `VideoSource` that reads one, which is a change to `whatsapp-rust` rather
+  than to anything here; the alternative — not dropping — is the one thing
+  this path exists to do.
+
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.

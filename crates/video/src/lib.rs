@@ -11,13 +11,60 @@
 //! whoever draws, which on this side is the GPUI front end writing straight
 //! into a `RenderImage`.
 
+//! # Two backends
+//!
+//! nokhwa is three operating systems and OpenH264 is C, so neither reaches
+//! `wasm32-unknown-unknown`. A browser has both anyway — `getUserMedia` is
+//! the device and `VideoEncoder` is the codec — so the split is the same one
+//! `oxidezap-audio` makes: one set of names, two implementations behind it,
+//! and the same Annex-B access units out of either. See [`web`].
+
+#[cfg(not(target_family = "wasm"))]
 mod camera;
+#[cfg(not(target_family = "wasm"))]
 mod convert;
+#[cfg(not(target_family = "wasm"))]
 mod encoder;
+#[cfg(target_family = "wasm")]
+mod web;
 
+#[cfg(not(target_family = "wasm"))]
 pub use camera::{CameraControl, CameraStream, is_available, open};
-pub use encoder::EncodedFrame;
+#[cfg(target_family = "wasm")]
+pub use web::{CameraControl, CameraStream, is_available, open_camera};
 
+/// Open the camera, off the caller's thread.
+///
+/// The shape the browser backend has to have -- `getUserMedia` is a
+/// permission prompt and answers no other way -- so the session's video plane
+/// is written once. Here it is nokhwa's blocking open, moved somewhere
+/// blocking is allowed.
+///
+/// # Errors
+///
+/// If no camera can be opened at `quality`.
+#[cfg(not(target_family = "wasm"))]
+pub async fn open_camera(quality: VideoQuality) -> anyhow::Result<CameraStream> {
+    tokio::task::spawn_blocking(move || open(quality))
+        .await
+        .map_err(|e| anyhow::anyhow!("camera task failed: {e}"))?
+}
+
+/// One encoded access unit.
+///
+/// Here rather than beside an encoder, because there are two encoders and one
+/// of them is the browser's: a type that lived with OpenH264 could not be
+/// named on the target that has no OpenH264, and the session names it on
+/// both.
+pub struct EncodedFrame {
+    /// Annex-B, start codes included, exactly as the library's video source
+    /// wants it.
+    pub data: Vec<u8>,
+    /// Carries an IDR: a decoder may start here.
+    pub keyframe: bool,
+}
+
+#[cfg(not(target_family = "wasm"))]
 use nokhwa::utils::FrameFormat;
 
 /// What the camera is asked for and what the encoder aims at.
@@ -152,6 +199,7 @@ fn env_pair(name: &str) -> Option<(u32, u32)> {
 
 /// A capture format's name, for a log line. The backend's own type has no
 /// stable `Display` we want to depend on in messages.
+#[cfg(not(target_family = "wasm"))]
 fn format_name(format: FrameFormat) -> &'static str {
     match format {
         FrameFormat::MJPEG => "MJPEG",

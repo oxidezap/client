@@ -12,6 +12,14 @@ repository.workspace = true
 anyhow = { workspace = true }
 async-channel = "2"
 log = { workspace = true }
+portable-atomic = { workspace = true }
+# `wacore::time::Instant` rather than std's, which /clippy.toml disallows: the
+# same portable clock the rest of the tree stamps against.
+wacore = { workspace = true }
+
+# The device and the codec, which are a platform each. See `src/web/` for the
+# other one, where both are the browser's.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 # The camera, on every platform that has one: V4L2 on Linux, AVFoundation on
 # macOS, Media Foundation on Windows. `input-native` is the only feature
 # taken; the defaults would add an MJPEG decoder we reach through the same
@@ -23,10 +31,43 @@ nokhwa = { version = "0.10.11", default-features = false, features = [
 # The same encoder the GUI already decodes with: one copy of OpenH264 in the
 # tree, and a video call adds no codec the binary did not already carry.
 openh264 = "0.9"
-portable-atomic = { workspace = true }
-# `wacore::time::Instant` rather than std's, which /clippy.toml disallows: the
-# same portable clock the rest of the tree stamps against.
-wacore = { workspace = true }
+# Only to get the blocking open and the blocking close off a runtime thread.
+tokio = { workspace = true, features = ["rt"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# Not called from here; see the same note in `oxidezap-audio`.
+getrandom = { workspace = true }
+# Racing the camera permission prompt against a ceiling; see `after`.
+futures-lite = "2"
+getrandom_02 = { workspace = true }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "CodecState",
+    "Document",
+    "Element",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkType",
+    "HtmlMediaElement",
+    "HtmlVideoElement",
+    "LatencyMode",
+    "MediaDevices",
+    "MediaStream",
+    "MediaStreamConstraints",
+    "Event",
+    "MediaStreamTrack",
+    "Navigator",
+    "Performance",
+    "VideoEncoder",
+    "VideoEncoderConfig",
+    "VideoEncoderEncodeOptions",
+    "VideoEncoderInit",
+    "VideoEncoderSupport",
+    "VideoFrame",
+    "VideoFrameInit",
+    "Window",
+] }
 
 [lints]
 workspace = true

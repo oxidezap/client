@@ -105,6 +105,13 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 # and no two crates can drift onto incompatible revisions. The exact commit is
 # pinned in the committed Cargo.lock.
 #
+# `main` carries the VoIP split this front end needs as of
+# oxidezap/whatsapp-rust#1364: the library's portable VoIP runtime is separate
+# from its native UDP relay dialler, and `Client::set_relay_transport_provider`
+# is the seam a page reaches a call through. Every entry moves together, which
+# is the rule this block exists for -- a per-crate `rev` is what produces
+# "expected `Jid`, found `Jid`".
+#
 # `whatsapp-rust` re-exports wacore, wacore-binary and waproto wholesale, so
 # anything already depending on it reaches them through that and does not
 # declare them here. The satellites below stay because `oxidezap-core`,
