@@ -534,11 +534,21 @@ fn tick(
             }
         };
         let options = web_sys::VideoEncoderEncodeOptions::new();
-        options.set_key_frame(control.0.keyframe.replace(false));
-        if let Err(e) = encoder.encode_with_options(&frame, &options)
-            && !std::mem::replace(&mut complained.borrow_mut(), true)
-        {
-            warn!("a camera frame could not be encoded: {}", describe(&e));
+        let wanted_key = control.0.keyframe.replace(false);
+        options.set_key_frame(wanted_key);
+        if let Err(e) = encoder.encode_with_options(&frame, &options) {
+            // The ask outlives the frame it was made of. This encoder is
+            // configured with no periodic IDR — every keyframe here is one
+            // somebody asked for, whether that was the stream opening, a
+            // queue that dropped a unit or the peer's PLI — so consuming the
+            // request on a frame that was never submitted leaves a decoder
+            // waiting on a keyframe nothing will now produce.
+            if wanted_key {
+                control.0.keyframe.set(true);
+            }
+            if !std::mem::replace(&mut complained.borrow_mut(), true) {
+                warn!("a camera frame could not be encoded: {}", describe(&e));
+            }
         }
         // Closed explicitly: a `VideoFrame` holds a decoder-side buffer that
         // garbage collection does not release in time, and a page that leaks

@@ -159,6 +159,37 @@ impl Drop for Opening {
     }
 }
 
+/// Detaches nodes that were wired before `wire` failed.
+///
+/// A `ScriptProcessorNode` with a handler attached is a node the browser will
+/// call, and `Opening`'s close is asynchronous — so a `wire` that returns
+/// early drops its `Closure`s while the nodes still reference them, and the
+/// next audio callback is a call into freed memory rather than a missed
+/// frame. Every node gets detached here before the closures go, which is the
+/// same ordering `Graph::drop` uses for the same reason.
+struct Wiring(Vec<web_sys::ScriptProcessorNode>);
+
+impl Wiring {
+    /// This node now has a handler on it, so it is one to detach.
+    fn armed(&mut self, node: &web_sys::ScriptProcessorNode) {
+        self.0.push(node.clone());
+    }
+
+    /// `Graph` owns them from here.
+    fn release(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for Wiring {
+    fn drop(&mut self) {
+        for node in self.0.drain(..) {
+            node.set_onaudioprocess(None);
+            let _ = node.disconnect();
+        }
+    }
+}
+
 /// Open the microphone and the speaker for one call.
 ///
 /// Async where the desktop's is blocking, and it has to be: `getUserMedia` is
@@ -280,6 +311,8 @@ fn wire(
     // Taken before the capture callback moves the sender in; see the tracks'
     // `ended` handlers at the end of this function.
     let ended_mic = mic.clone();
+    // Every node that gets a handler is registered here; see `Wiring`.
+    let mut wiring = Wiring(Vec::new());
     let source = context
         .create_media_stream_source(stream)
         .map_err(|e| anyhow!("the microphone could not be attached: {}", describe(&e)))?;
@@ -323,6 +356,7 @@ fn wire(
         )
     };
     capture.set_onaudioprocess(Some(on_capture.as_ref().unchecked_ref()));
+    wiring.armed(&capture);
 
     let playout_node = context
         .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(CHUNK, 0, 1)
@@ -351,6 +385,7 @@ fn wire(
         )
     };
     playout_node.set_onaudioprocess(Some(on_playout.as_ref().unchecked_ref()));
+    wiring.armed(&playout_node);
 
     source
         .connect_with_audio_node(&capture)
@@ -386,6 +421,9 @@ fn wire(
             ended
         })
         .collect();
+
+    // Past every `?`: `Graph` detaches these from here.
+    wiring.release();
 
     Ok(Graph {
         context: context.clone(),

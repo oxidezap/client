@@ -98,6 +98,15 @@ const INBOUND_DEPTH: usize = 256;
 /// reachable and whose DTLS wedges parks the caller forever.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
+/// How much unsent media the DataChannel may be holding before this side
+/// starts dropping rather than adding to it.
+///
+/// 64 KiB, which at a call's bitrate is a fraction of a second: past that the
+/// packets in the buffer are older than anything worth sending, and the whole
+/// path from the encoder down is built to drop rather than to queue. Small
+/// enough to be a ceiling and not a second jitter buffer.
+const OUTBOUND_CEILING: u32 = 64 * 1024;
+
 /// The platform's answer to "how does media reach the relay".
 pub struct BrowserRelay;
 
@@ -199,6 +208,32 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// Takes the handlers off a channel that setup never handed to
+/// [`BrowserRelayChannel`].
+///
+/// The peer connection's own guard closes the connection, and `close()` is not
+/// synchronous: the channel's `close` and `error` events can still fire, and
+/// by then the `Closure` locals in `connect_peer_connection` have been
+/// dropped — which is a call into freed memory rather than a missed event.
+/// Declared *after* those closures so it drops before them, which is the
+/// whole of the ordering this exists for.
+struct ChannelGuard(Option<web_sys::RtcDataChannel>);
+
+impl ChannelGuard {
+    /// Setup succeeded; the channel keeps its handlers and its wiring.
+    fn release(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for ChannelGuard {
+    fn drop(&mut self) {
+        if let Some(channel) = self.0.take() {
+            detach(&channel);
+        }
+    }
+}
+
 /// The open media channel, as the call driver sees it.
 struct BrowserRelayChannel {
     connection: web_sys::RtcPeerConnection,
@@ -208,6 +243,11 @@ struct BrowserRelayChannel {
     /// So a second `disconnect` — the driver's polite close and then the drop
     /// — does not close a connection twice and log twice.
     closed: std::cell::Cell<bool>,
+    /// Whether the last send found the channel over [`OUTBOUND_CEILING`], so
+    /// congestion is one line and one line again when it clears.
+    congested: std::cell::Cell<bool>,
+    /// Counted for that second line: how much media the ceiling has dropped.
+    outbound_dropped: std::cell::Cell<u32>,
 }
 
 /// Where an inbound packet goes, and what happens when there is no room.
@@ -261,8 +301,40 @@ impl Inbound {
 #[async_trait(?Send)]
 impl RelayTransport for BrowserRelayChannel {
     async fn send(&self, data: Bytes) -> Result<()> {
-        // `send_with_u8_array` copies into the channel's own buffer, so the
-        // slice does not have to outlive the call.
+        // `send_with_u8_array` copies into the channel's own buffer and
+        // returns: it is not backpressure, and a channel configured
+        // `maxRetransmits: 0` still queues locally when SCTP cannot get the
+        // bytes out. So a congested path accumulates seconds of RTP that is
+        // obsolete by the time it leaves — the exact thing the rest of this
+        // path drops for — until the browser's own implementation-defined
+        // limit rejects a send and the transport reads as broken.
+        //
+        // The ceiling is ours instead, and what it drops is media. STUN is
+        // not media: it is what keeps the binding alive, it is a handful of
+        // bytes, and losing it while the queue is deep is how a congested
+        // call becomes a dead one.
+        if self.channel.buffered_amount() > OUTBOUND_CEILING
+            && classify_relay_packet(&data) != RelayPacketKind::Stun
+        {
+            self.outbound_dropped
+                .set(self.outbound_dropped.get().saturating_add(1));
+            // Said once per run of congestion rather than per packet: at a
+            // call's frame rate this is otherwise a line per 20ms.
+            if !self.congested.replace(true) {
+                warn!(
+                    "the relay channel is {} bytes behind; dropping outbound media until it \
+                     drains",
+                    self.channel.buffered_amount()
+                );
+            }
+            return Ok(());
+        }
+        if self.congested.replace(false) {
+            debug!(
+                "the relay channel drained; {} outbound packets were dropped while it was behind",
+                self.outbound_dropped.replace(0)
+            );
+        }
         self.channel
             .send_with_u8_array(&data)
             .map_err(|e| anyhow!("relay channel send failed: {}", describe(&e)))
@@ -418,6 +490,10 @@ async fn connect_peer_connection(
         }) as Box<dyn FnMut(web_sys::Event)>)
     };
     channel.set_onopen(Some(on_state.as_ref().unchecked_ref()));
+    // Declared here rather than beside the channel, and that is deliberate:
+    // locals drop in reverse, so a guard declared after the four closures is
+    // one that detaches them before they go. See `ChannelGuard`.
+    let wired = ChannelGuard(Some(channel.clone()));
 
     let offer = js_sys::Reflect::get(
         &wasm_bindgen_futures::JsFuture::from(connection.get().create_offer())
@@ -450,6 +526,8 @@ async fn connect_peer_connection(
         .map_err(|_| anyhow!("the relay channel was torn down before it opened"))?;
 
     debug!("voip: the relay media channel to {} is open", params.addr);
+    // Past every `?`: the channel keeps its handlers from here.
+    wired.release();
     Ok((
         std::sync::Arc::new(BrowserRelayChannel {
             connection: connection.release(),
@@ -461,6 +539,8 @@ async fn connect_peer_connection(
                 _on_state: on_state,
             },
             closed: std::cell::Cell::new(false),
+            congested: std::cell::Cell::new(false),
+            outbound_dropped: std::cell::Cell::new(0),
         }),
         events_rx,
     ))

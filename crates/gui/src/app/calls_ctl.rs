@@ -92,6 +92,19 @@ impl WhatsAppApp {
             warn!("Cannot accept call: client is unavailable");
             return;
         };
+        // The same question the outgoing path asks, and it has to be asked
+        // here too: an offer arrives whatever this browser can carry, so a
+        // page that cannot hold the media would otherwise open the
+        // microphone, accept, and end the call at relay setup. Declined
+        // rather than ignored — the caller is ringing, and the honest answer
+        // is no rather than silence until their own timeout.
+        if let Some(reason) = crate::platform::calls_unavailable() {
+            warn!("Cannot accept call: {reason}");
+            self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
+            self.decline_call(cx);
+            return;
+        }
+
         let Some(call) = self.call_state.take_incoming() else {
             return;
         };
