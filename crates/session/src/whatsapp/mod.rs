@@ -661,6 +661,23 @@ impl WhatsAppClient {
             let names = names.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
+                // The dispatch loop's own handle. The one below is moved into
+                // the per-event closure, and what this asks the client is the
+                // PN/LID pairing that decides the lane.
+                let dispatch_client = client.clone();
+                let mut lanes = EventLanes::new(
+                    move |event| {
+                        let client = client.clone();
+                        let ui_tx = ui_tx.clone();
+                        let calls = calls.clone();
+                        let ui_sender = ui_sender.clone();
+                        let names = names.clone();
+                        async move {
+                            Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
+                        }
+                    },
+                    stopping.clone(),
+                );
                 loop {
                     let event = tokio::select! {
                         event = incoming.recv() => match event {
@@ -680,14 +697,7 @@ impl WhatsAppClient {
                     // nothing to say — the arms below speak only for the
                     // variants they handle.
                     debug!("client event: {:?}", event.kind());
-                    let client = client.clone();
-                    let ui_tx = ui_tx.clone();
-                    let calls = calls.clone();
-                    let ui_sender = ui_sender.clone();
-                    let names = names.clone();
-                    crate::exec::spawn_owned(async move {
-                        Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
-                    });
+                    lanes.dispatch(&dispatch_client, event).await;
                 }
             });
         }
@@ -862,6 +872,15 @@ impl WhatsAppClient {
                 let _ = ui_tx.send(UiEvent::CallEndedElsewhere(ended.call_id.clone()));
             }
             Event::Messages(batch) => {
+                // A drain is a backlog, not an arrival: fetching every
+                // picture in it before the first bubble reaches the window
+                // spends the whole reconnection on work the store has
+                // already materialized and hydration would redo from the
+                // thumbnail anyway.
+                let eager = matches!(
+                    batch.origin,
+                    whatsapp_rust::wacore::types::events::BatchOrigin::Live
+                );
                 for inbound in batch.iter() {
                     Self::handle_inbound_message(
                         &inbound.message,
@@ -869,6 +888,7 @@ impl WhatsAppClient {
                         &client,
                         &ui_tx,
                         &names,
+                        eager,
                     )
                     .await;
                 }
@@ -1025,6 +1045,7 @@ impl WhatsAppClient {
         client: &Arc<Client>,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
         names: &NameBook,
+        eager: bool,
     ) {
         // Use MessageExt to unwrap ephemeral/device_sent/view_once wrappers
         let base_msg = msg.get_base_message();
@@ -1075,8 +1096,18 @@ impl WhatsAppClient {
             return;
         }
 
+        // The same question the store asks, so a live conversation and a
+        // reloaded one agree. A poll update, an encrypted reaction or comment,
+        // a pin or a keep-in-chat carries nothing to draw: published live it
+        // is a `[Media]` bubble with an unread badge, and the store writes no
+        // row for it, so it vanishes at the next hydration having already
+        // raised a count nothing sent a receipt for.
+        if oxidezap_chat_store::is_control_only(msg) {
+            return;
+        }
+
         // Try to extract media content
-        let media_result = Self::try_extract_media(base_msg, client).await;
+        let media_result = Self::try_extract_media(base_msg, client, eager).await;
 
         // Extract text content
         let content = msg
@@ -1116,6 +1147,9 @@ impl WhatsAppClient {
         if let Some(media) = media_result {
             chat_message.media = Some(media);
         }
+
+        Self::canonicalize_quoted_authors(client, names, std::slice::from_mut(&mut chat_message))
+            .await;
 
         // Normalize chat JID to LID if mapping exists, so the same user doesn't
         // appear as two chats when messages come from PN vs LID.
@@ -1160,6 +1194,20 @@ impl WhatsAppClient {
         });
     }
 
+    /// The eager fetch, or nothing when this is not the moment for one.
+    async fn fetch_now<T: whatsapp_rust::wacore::download::Downloadable>(
+        client: &Arc<Client>,
+        media: &T,
+        media_name: &str,
+        eager: bool,
+        file_length: Option<u64>,
+    ) -> Option<Vec<u8>> {
+        if !Self::worth_fetching_now(eager, file_length) {
+            return None;
+        }
+        Self::download_media(client, media, media_name).await
+    }
+
     /// Helper to download media with logging
     async fn download_media<T: whatsapp_rust::wacore::download::Downloadable>(
         client: &Arc<Client>,
@@ -1183,8 +1231,31 @@ impl WhatsAppClient {
         }
     }
 
-    /// Try to extract and download media from a message
-    async fn try_extract_media(msg: &wa::Message, _client: &Arc<Client>) -> Option<MediaContent> {
+    /// Most bytes a picture may be worth fetching before anybody has asked
+    /// for it.
+    ///
+    /// A photo sent through WhatsApp is a fraction of this; past it the
+    /// message keeps its thumbnail and its download metadata, which is what
+    /// the renderer already draws for a video, and the full bytes arrive when
+    /// somebody opens it.
+    const EAGER_MEDIA_BYTES: u64 = 4 * 1024 * 1024;
+
+    /// Whether media of this size is worth fetching before anybody asked.
+    fn worth_fetching_now(eager: bool, file_length: Option<u64>) -> bool {
+        eager && file_length.is_none_or(|len| len <= Self::EAGER_MEDIA_BYTES)
+    }
+
+    /// Try to extract media from a message, fetching the bytes when they are
+    /// worth having before anybody has asked for them.
+    ///
+    /// Not fetching them is the same shape as failing to: the thumbnail is
+    /// what shows and the download metadata is what makes the full bytes
+    /// retryable.
+    async fn try_extract_media(
+        msg: &wa::Message,
+        _client: &Arc<Client>,
+        eager: bool,
+    ) -> Option<MediaContent> {
         // Check for sticker message
         if let Some(sticker) = effective_sticker(msg) {
             let mime = sticker
@@ -1204,21 +1275,36 @@ impl WhatsAppClient {
             // Same rule as the image path below: a failed eager download
             // degrades to the thumbnail (and stays retryable through the
             // download metadata) instead of the message losing its media.
-            let (data, mime_type, is_animated, data_is_preview) =
-                match Self::download_media(_client, sticker, "sticker").await {
-                    Some(data) => (data, mime, sticker.is_animated.unwrap_or(false), false),
-                    None => (
-                        sticker
-                            .png_thumbnail
-                            .as_ref()
-                            .filter(|t| !t.is_empty())
-                            .cloned()
-                            .unwrap_or_default(),
-                        "image/png".to_string(),
-                        false,
-                        true,
-                    ),
-                };
+            let (data, mime_type, is_animated, data_is_preview) = match Self::fetch_now(
+                _client,
+                sticker,
+                "sticker",
+                eager,
+                sticker.file_length,
+            )
+            .await
+            {
+                Some(data) => (data, mime, sticker.is_animated.unwrap_or(false), false),
+                None => (
+                    sticker
+                        .png_thumbnail
+                        .as_ref()
+                        .filter(|t| !t.is_empty())
+                        .cloned()
+                        .unwrap_or_default(),
+                    "image/png".to_string(),
+                    // What the sticker *is*, not what the thumbnail is. The
+                    // still is a PNG either way, and this flag travels with
+                    // the row past the fetch: `adopt_full_bytes` restores the
+                    // mime type from the download metadata and cannot restore
+                    // this, so a `false` written here is an animated sticker
+                    // that never animates. It used to be reached only by a
+                    // download that failed; it is now the ordinary path for
+                    // anything not fetched eagerly.
+                    sticker.is_animated.unwrap_or(false),
+                    true,
+                ),
+            };
             if data.is_empty() && downloadable.is_none() {
                 return None;
             }
@@ -1262,7 +1348,7 @@ impl WhatsAppClient {
             // now and the full image stays retryable, instead of the message
             // degrading to a plain text row for the whole session.
             let (data, mime_type, data_is_preview) =
-                match Self::download_media(_client, image, "image").await {
+                match Self::fetch_now(_client, image, "image", eager, image.file_length).await {
                     Some(data) => (
                         data,
                         image
@@ -1829,39 +1915,59 @@ impl WhatsAppClient {
             let Some(names) = names.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let chat: Jid = jid.parse().map_err(|_| "not a chat address".to_string())?;
-            let before = before
-                .map(|cursor| parse_message_cursor(&cursor).ok_or("unreadable cursor".to_string()))
-                .transpose()?;
+            Self::message_page(&store, &client, &names, jid, before, limit).await
+        })
+    }
 
-            let limit = limit.clamp(1, Self::MESSAGE_PAGE);
-            let mut page = store
-                .messages(&chat, before, limit)
-                .await
-                .map_err(|e| e.to_string())?;
-            // A page shorter than it asked for is the start of the
-            // conversation: there is nothing older to name a cursor with.
-            let next = ((page.len() as i64) == limit)
-                .then(|| page.last().map(message_cursor))
-                .flatten();
-            page.reverse(); // the store returns newest-first; a timeline is drawn the other way
-            let mut messages: Vec<ChatMessage> =
-                page.into_iter().map(stored_to_chat_message).collect();
-            Self::hydrate_reactions(&store, &client, &names, &chat, &mut messages).await;
-            if chat.is_group() || chat.is_status_broadcast() {
-                Self::hydrate_sender_names(
-                    &store,
-                    &client,
-                    &mut messages,
-                    &names,
-                    chat.is_status_broadcast(),
-                )
-                .await;
-            }
-            Ok(Page {
-                items: messages,
-                next,
-            })
+    async fn message_page(
+        store: &Arc<ChatStore>,
+        client: &Arc<Client>,
+        names: &NameBook,
+        jid: String,
+        before: Option<String>,
+        limit: i64,
+    ) -> Result<Page<ChatMessage>, String> {
+        let chat: Jid = jid.parse().map_err(|_| "not a chat address".to_string())?;
+        let before = before
+            .map(|cursor| parse_message_cursor(&cursor).ok_or("unreadable cursor".to_string()))
+            .transpose()?;
+
+        let limit = limit.clamp(1, Self::MESSAGE_PAGE);
+        // The page and how much of the unread tail it owes, out of one
+        // snapshot: asked separately, a message committed between the two
+        // raises the counter without appearing in the page, and the tail then
+        // reaches a row further back than the page justifies — one already
+        // read, advertised as owing a receipt.
+        let (mut page, unread) = store
+            .page_with_unread(&chat, before, limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        // A page shorter than it asked for is the start of the
+        // conversation: there is nothing older to name a cursor with.
+        let next = ((page.len() as i64) == limit)
+            .then(|| page.last().map(message_cursor))
+            .flatten();
+        page.reverse(); // the store returns newest-first; a timeline is drawn the other way
+        let mut messages: Vec<ChatMessage> = page.into_iter().map(stored_to_chat_message).collect();
+        Self::hydrate_reactions(store, client, names, &chat, &mut messages).await;
+        Self::canonicalize_quoted_authors(client, names, &mut messages).await;
+        if chat.is_group() || chat.is_status_broadcast() {
+            Self::hydrate_sender_names(
+                store,
+                client,
+                &mut messages,
+                names,
+                chat.is_status_broadcast(),
+            )
+            .await;
+        }
+        // Exactly what the attach load does to its rows, which is what the
+        // paragraph above promises: a page hydrated any other way is one whose
+        // unread tail nobody ever sends a receipt for.
+        mark_unread_tail(&mut messages, unread.clamp(0, u32::MAX as i64) as u32);
+        Ok(Page {
+            items: messages,
+            next,
         })
     }
 
@@ -2408,6 +2514,7 @@ impl WhatsAppClient {
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
                 Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut msgs).await;
+                Self::canonicalize_quoted_authors(client, names, &mut msgs).await;
                 // Groups *and* the status broadcast: both carry rows written
                 // by many people, and a hydrated row has no push name on it.
                 if existing.is_group || existing.is_status {
@@ -2422,16 +2529,7 @@ impl WhatsAppClient {
                 }
                 // Each alias still needs its unread tail marked for receipts,
                 // but PN/LID counters describe the same logical chat.
-                let mut remaining = entry.unread_count.max(0) as u32;
-                for msg in msgs.iter_mut().rev() {
-                    if remaining == 0 {
-                        break;
-                    }
-                    if !msg.is_from_me {
-                        msg.is_read = false;
-                        remaining -= 1;
-                    }
-                }
+                mark_unread_tail(&mut msgs, entry.unread_count.max(0) as u32);
                 merge_alias_history_messages(existing, msgs, entry.unread_count.max(0) as u32);
                 // A page is assigned rather than added a row at a time, so
                 // the naming `add_message` does per row has to be run over it.
@@ -2457,6 +2555,7 @@ impl WhatsAppClient {
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut chat.messages)
                 .await;
+            Self::canonicalize_quoted_authors(client, names, &mut chat.messages).await;
             if chat.is_group || chat.is_status {
                 let is_status = chat.is_status;
                 Self::hydrate_sender_names(
@@ -2468,19 +2567,7 @@ impl WhatsAppClient {
                 )
                 .await;
             }
-            // The newest `unread_count` incoming messages are the unread ones;
-            // select_chat only sends read receipts for !is_read, so hydrated
-            // unread must not come up pre-read.
-            let mut remaining = chat.unread_count;
-            for msg in chat.messages.iter_mut().rev() {
-                if remaining == 0 {
-                    break;
-                }
-                if !msg.is_from_me {
-                    msg.is_read = false;
-                    remaining -= 1;
-                }
-            }
+            mark_unread_tail(&mut chat.messages, chat.unread_count);
             // After the sender names, because the best answer for "who wrote
             // the message this is replying to" is usually the reply's own
             // neighbour, and it has only just been named.
@@ -2657,6 +2744,34 @@ impl WhatsAppClient {
     /// A group page names the same handful of people over and over and the
     /// book memoizes per JID, so a page costs one lookup per unique sender
     /// rather than one per row.
+    /// File a quote's author under the identity their own bubbles are filed
+    /// under.
+    ///
+    /// Every other sender field on a message goes through
+    /// `identity.canonical_jid`; the one on a quote came straight off the
+    /// envelope, which is a phone number where the chat is keyed by a LID and
+    /// carries the sending device's suffix besides. `Chat::quoted_author`
+    /// looks a participant up by exact string, so the bar above a reply read
+    /// "Unknown contact" — or a bare number — over bubbles from the same
+    /// person, named from the address book, an inch above it.
+    async fn canonicalize_quoted_authors(
+        client: &Arc<Client>,
+        names: &NameBook,
+        msgs: &mut [ChatMessage],
+    ) {
+        for msg in msgs.iter_mut() {
+            let Some(quoted) = msg.quoted.as_mut() else {
+                continue;
+            };
+            let Ok(jid) = quoted.sender.parse::<Jid>() else {
+                continue;
+            };
+            quoted
+                .sender
+                .clone_from(&names.identity(client, &jid).await.canonical_jid);
+        }
+    }
+
     async fn hydrate_sender_names(
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
@@ -2923,6 +3038,215 @@ fn effective_sticker(msg: &wa::Message) -> Option<&wa::message::StickerMessage> 
             .and_then(|w| w.message.as_option())
             .and_then(|m| m.sticker_message.as_option())
     })
+}
+
+/// How many lanes events about a subject are spread across.
+///
+/// Fixed rather than one per subject: a lane is a task and a queue, and a
+/// lane per chat is one of each for every conversation an account has ever
+/// had. Subjects share a lane by hash, so two busy chats can queue behind
+/// each other — which costs latency, where the alternative costs order.
+const EVENT_LANES: usize = 8;
+
+/// Events about one subject, handled in the order they arrived.
+///
+/// The event stream reaches this side already ordered, and handling each
+/// event on its own task threw that away: a `CallEndedElsewhere` could run
+/// before the `IncomingCall` it ends, leaving a card ringing for a call that
+/// is over, and a receipt could run before the message it answers. Ordering
+/// only matters between events about the same thing, so events are keyed by
+/// their call or their chat and a key always reaches the same lane. Anything
+/// naming neither is session-wide and gets a lane of its own, so a pairing
+/// code never waits behind a conversation.
+struct EventLanes {
+    lanes: Vec<mpsc::UnboundedSender<Arc<Event>>>,
+}
+
+impl EventLanes {
+    fn new<F, Fut>(handle: F, stopping: tokio::sync::watch::Receiver<()>) -> Self
+    where
+        F: Fn(Arc<Event>) -> Fut + Clone + crate::exec::MaybeSend + 'static,
+        Fut: Future<Output = ()> + crate::exec::MaybeSend + 'static,
+    {
+        let lanes = (0..=EVENT_LANES)
+            .map(|_| {
+                let (tx, mut rx) = mpsc::unbounded_channel::<Arc<Event>>();
+                let handle = handle.clone();
+                let mut stopping = stopping.clone();
+                crate::exec::spawn_owned(async move {
+                    loop {
+                        let event = tokio::select! {
+                            event = rx.recv() => match event {
+                                Some(event) => event,
+                                None => return,
+                            },
+                            // Dropping the senders is not enough on its own:
+                            // a receiver hands out everything already queued
+                            // before it answers `None`, so a lane would work
+                            // through a backlog belonging to an account this
+                            // session no longer speaks for. On a page that
+                            // matters twice over, where nothing cancels a
+                            // spawned task and the backlog keeps the old
+                            // client and its store alive.
+                            _ = stopping.changed() => return,
+                        };
+                        handle(event).await;
+                    }
+                });
+                tx
+            })
+            .collect();
+        Self { lanes }
+    }
+
+    async fn dispatch(&mut self, client: &Client, event: Arc<Event>) {
+        // A batch may span chats, and a lane is one chat's order: sent whole
+        // on the first message's lane, a receipt for a later chat in it runs
+        // on that chat's own lane and can overtake the message it answers.
+        // Split, each chat's messages keep their order against everything
+        // else about that chat, and two chats in one batch were never ordered
+        // against each other.
+        for event in split_by_subject(&event) {
+            let lane = lane_for(client, &event).await;
+            let _ = self.lanes[lane].send(event);
+        }
+    }
+}
+
+/// One event per subject it is about, which for everything but a batch of
+/// messages is the event itself.
+fn split_by_subject(event: &Arc<Event>) -> Vec<Arc<Event>> {
+    let Event::Messages(batch) = &**event else {
+        return vec![Arc::clone(event)];
+    };
+    let mut chats: Vec<String> = Vec::new();
+    for inbound in batch.iter() {
+        let chat = inbound.info.source.chat.to_string();
+        if !chats.contains(&chat) {
+            chats.push(chat);
+        }
+    }
+    if chats.len() <= 1 {
+        return vec![Arc::clone(event)];
+    }
+    chats
+        .into_iter()
+        .map(|chat| {
+            let messages: Arc<[whatsapp_rust::wacore::types::events::InboundMessage]> = batch
+                .iter()
+                .filter(|inbound| inbound.info.source.chat.to_string() == chat)
+                .cloned()
+                .collect();
+            // The origin travels with every part: it says how the batch was
+            // delivered, which is as true of one chat's share of it as of the
+            // whole, and it is what decides whether media is fetched eagerly.
+            Arc::new(Event::Messages(
+                whatsapp_rust::wacore::types::events::MessageBatch::builder()
+                    .messages(messages)
+                    .origin(batch.origin)
+                    .build(),
+            ))
+        })
+        .collect()
+}
+
+/// Which lane an event is handled on. Same subject, same lane.
+///
+/// The address is canonicalized first, which is the whole reason this is not
+/// a pure function of the event. The wire names one peer two ways and the two
+/// hash to different lanes, so a message under a phone number and its receipt
+/// under the LID were handled concurrently: the receipt could overtake the
+/// message it answers -- most easily while that message waits on an eager
+/// media fetch -- and a front end drops a receipt naming a row it has not
+/// been given yet. The library keeps the pairing in memory in front of its
+/// store, so this is a map read for a peer already seen and not asked at all
+/// of a LID.
+async fn lane_for(client: &Client, event: &Event) -> usize {
+    let subject = match event_subject(event) {
+        Some(Subject::Call(id)) => Some(id),
+        Some(Subject::Chat(jid)) => Some(normalize_chat_jid(client, &jid.to_string()).await),
+        None => None,
+    };
+    lane_of(subject.as_deref())
+}
+
+/// The lane a subject hashes to, or the session-wide one for no subject.
+fn lane_of(subject: Option<&str>) -> usize {
+    match subject {
+        Some(subject) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&subject, &mut hasher);
+            (std::hash::Hasher::finish(&hasher) as usize) % EVENT_LANES
+        }
+        None => EVENT_LANES,
+    }
+}
+
+/// What an event is about, for the lane that keeps its order.
+///
+/// A call or a chat. `None` is a session-wide event, which is about the
+/// account rather than about anything in it.
+enum Subject {
+    Call(String),
+    Chat(Jid),
+}
+
+fn event_subject(event: &Event) -> Option<Subject> {
+    match event {
+        Event::IncomingCall(call) => Some(Subject::Call(call.action.call_id().to_string())),
+        Event::MissedCall(missed) => Some(Subject::Call(missed.call_id.clone())),
+        Event::CallEndedElsewhere(ended) => Some(Subject::Call(ended.call_id.clone())),
+        Event::Messages(batch) => batch
+            .iter()
+            .next()
+            .map(|inbound| Subject::Chat(inbound.info.source.chat.clone())),
+        Event::Receipt(receipt) => Some(Subject::Chat(receipt.source.chat.clone())),
+        Event::ChatPresence(update) => Some(Subject::Chat(update.source.chat.clone())),
+        // Both name somebody, and both handlers go to the store for a name or
+        // an identity. On the session-wide lane a burst of either delayed
+        // `Connected`, `PairingQrCode` and `LoggedOut` behind it, which are
+        // the events a window is waiting on to draw anything at all.
+        Event::Presence(update) => Some(Subject::Chat(update.from.clone())),
+        Event::GroupUpdate(update) => Some(Subject::Chat(update.group_jid.clone())),
+        _ => None,
+    }
+}
+
+impl Subject {
+    /// The address, before canonicalization. For tests and for logging: a
+    /// lane is chosen from the canonical form, which needs the client.
+    #[cfg(test)]
+    fn as_written(&self) -> String {
+        match self {
+            Self::Call(id) => id.clone(),
+            Self::Chat(jid) => jid.to_string(),
+        }
+    }
+}
+
+/// Un-read the newest `unread` incoming rows of a hydrated page.
+///
+/// [`stored_to_chat_message`] reads an incoming row back as read, because the
+/// store keeps read state on the chat's counter and not on the row — so every
+/// caller that hydrates stored rows owes this correction. Skipping it hands a
+/// front end a page in which nothing is unread: the read it then asks for
+/// names messages the daemon was told were already seen, no receipt goes out,
+/// and the badge comes back on the next hydration.
+///
+/// Returns whatever budget the page did not spend, for a caller walking a
+/// PN/LID pair a page at a time.
+fn mark_unread_tail(messages: &mut [ChatMessage], unread: u32) -> u32 {
+    let mut remaining = unread;
+    for msg in messages.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        if !msg.is_from_me {
+            msg.is_read = false;
+            remaining -= 1;
+        }
+    }
+    remaining
 }
 
 fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage) -> ChatMessage {
@@ -3308,6 +3632,266 @@ mod tests {
                 .await
                 .expect("history loads");
         assert_eq!(chats[0].last_message.as_deref(), Some("bom dia"));
+    }
+
+    /// A page opened on a chat nobody has read comes back saying every row in
+    /// it has been read, so the read the front end then asks for names
+    /// messages the daemon was told were already seen and no receipt goes out.
+    #[tokio::test]
+    async fn a_page_of_an_unread_chat_comes_back_unread() {
+        let (chat_store, client) = test_session("page-unread").await;
+        for (n, id) in ["MSG-P1", "MSG-P2", "MSG-P3"].iter().enumerate() {
+            feed(
+                &chat_store,
+                incoming(wa::Message::text("oi"), id, 1_700_000_000 + n as i64),
+            )
+            .await;
+        }
+
+        let page = WhatsAppClient::message_page(
+            &chat_store,
+            &client,
+            &book(),
+            TEST_PEER.to_string(),
+            None,
+            50,
+        )
+        .await
+        .expect("page loads");
+
+        assert_eq!(page.items.len(), 3);
+        assert!(
+            page.items.iter().all(|m| !m.is_read),
+            "nothing in the chat has been read, so nothing in its page may say it was"
+        );
+    }
+
+    /// The stream reaches this side ordered and used to be handled on a task
+    /// per event, so a call's later stanza could run before the offer that
+    /// made it: the removal finds nothing, the offer's task files the call
+    /// after it, and a card rings on for a call that is over.
+    #[test]
+    fn a_calls_later_stanza_is_handled_behind_its_offer() {
+        use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall, MissedCall};
+        use whatsapp_rust::wacore::types::events::Event;
+
+        let call_id = "CALL-ORDER-1";
+        let peer: Jid = TEST_PEER.parse().expect("test JID");
+        let at = whatsapp_rust::wacore::time::from_secs(1_700_000_000).expect("test timestamp");
+        let offer = Event::IncomingCall(IncomingCall::new_for_test(
+            peer.clone(),
+            "STANZA-1".to_string(),
+            at,
+            CallAction::Offer {
+                call_id: call_id.to_string(),
+                call_creator: peer.clone(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            },
+        ));
+        let missed = Event::MissedCall(MissedCall::new(
+            peer,
+            call_id.to_string(),
+            at,
+            whatsapp_rust::wacore::types::call::MissedReason::Offline,
+        ));
+
+        assert_eq!(
+            super::lane_of(
+                super::event_subject(&offer)
+                    .map(|s| s.as_written())
+                    .as_deref()
+            ),
+            super::lane_of(
+                super::event_subject(&missed)
+                    .map(|s| s.as_written())
+                    .as_deref()
+            ),
+        );
+    }
+
+    /// A batch can span chats — the store's own fixtures build one over a
+    /// hundred of them — and a lane keeps one chat's order. Sent whole on the
+    /// first message's lane, a receipt for a later chat in the batch runs on
+    /// that chat's own lane and can overtake the message it answers.
+    #[test]
+    fn a_batch_spanning_chats_reaches_every_lane_it_is_about() {
+        use whatsapp_rust::wacore::types::events::{
+            BatchOrigin, Event, InboundMessage, MessageBatch,
+        };
+        use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+        let chats = ["1@s.whatsapp.net", "2@s.whatsapp.net", "3@s.whatsapp.net"];
+        let messages: Arc<[InboundMessage]> = chats
+            .iter()
+            .enumerate()
+            .map(|(n, chat)| {
+                let info = MessageInfo {
+                    source: MessageSource {
+                        chat: chat.parse().expect("test JID"),
+                        sender: chat.parse().expect("test JID"),
+                        ..Default::default()
+                    },
+                    id: format!("MSG-BATCH-{n}"),
+                    timestamp: whatsapp_rust::wacore::time::from_secs(1_700_000_000)
+                        .expect("test timestamp"),
+                    ..Default::default()
+                };
+                InboundMessage::builder()
+                    .message(Arc::new(wa::Message::text("oi")))
+                    .info(Arc::new(info))
+                    .build()
+            })
+            .collect();
+        let batch = Arc::new(Event::Messages(
+            MessageBatch::builder()
+                .messages(messages)
+                .origin(BatchOrigin::OfflineDrain)
+                .build(),
+        ));
+
+        let parts = super::split_by_subject(&batch);
+        assert_eq!(parts.len(), 3, "one per chat it is about");
+        let mut subjects: Vec<String> = parts
+            .iter()
+            .filter_map(|part| super::event_subject(part).map(|s| s.as_written()))
+            .collect();
+        subjects.sort();
+        assert_eq!(subjects, chats);
+        // How the batch was delivered is as true of one chat's share of it as
+        // of the whole, and it is what decides whether media is fetched.
+        for part in &parts {
+            let Event::Messages(batch) = &**part else {
+                panic!("a batch splits into batches");
+            };
+            assert!(matches!(batch.origin, BatchOrigin::OfflineDrain));
+            assert_eq!(batch.iter().count(), 1);
+        }
+
+        // And a batch about one chat is not rebuilt at all.
+        let single = incoming(wa::Message::text("oi"), "MSG-ONE", 1_700_000_000);
+        assert_eq!(super::split_by_subject(&Arc::new(single)).len(), 1);
+    }
+
+    /// Two chats are not each other's business, so they do not queue behind
+    /// one another; an event about the account is about neither.
+    #[test]
+    fn events_are_keyed_by_what_they_are_about() {
+        assert_eq!(
+            super::event_subject(&incoming(
+                wa::Message::text("oi"),
+                "MSG-LANE",
+                1_700_000_000
+            ))
+            .map(|s| s.as_written())
+            .as_deref(),
+            Some(TEST_PEER)
+        );
+        assert_eq!(
+            super::event_subject(&incoming_in(
+                "120363000000000001@g.us",
+                wa::Message::text("oi"),
+                "MSG-LANE-2",
+                1_700_000_000,
+            ))
+            .map(|s| s.as_written())
+            .as_deref(),
+            Some("120363000000000001@g.us")
+        );
+
+        // Presence is about a person and a group update about a group, and
+        // both handlers go to the store. On the session-wide lane a burst of
+        // either queued in front of `Connected`, `PairingQrCode` and
+        // `LoggedOut` -- the events a window waits on to draw anything.
+        let presence = whatsapp_rust::wacore::types::events::Event::Presence(
+            whatsapp_rust::wacore::types::events::PresenceUpdate::builder()
+                .from(TEST_PEER.parse().unwrap())
+                .unavailable(false)
+                .build(),
+        );
+        assert_eq!(
+            super::event_subject(&presence)
+                .map(|s| s.as_written())
+                .as_deref(),
+            Some(TEST_PEER)
+        );
+        assert_ne!(
+            super::lane_of(
+                super::event_subject(&presence)
+                    .map(|s| s.as_written())
+                    .as_deref()
+            ),
+            super::lane_of(None),
+            "and so is not on the account's own lane"
+        );
+    }
+
+    /// Reconnecting after a while offline hands over a batch of hundreds, and
+    /// fetching a picture per message before the first bubble reaches the
+    /// window spends the whole reconnection on it. The same question decides
+    /// a picture nobody is going to look at soon enough to be worth the
+    /// bytes.
+    #[test]
+    fn a_backlog_is_not_a_reason_to_fetch_every_picture() {
+        // Live and small: the one case worth the round trip.
+        assert!(WhatsAppClient::worth_fetching_now(true, Some(64 * 1024)));
+        assert!(WhatsAppClient::worth_fetching_now(true, None));
+
+        assert!(!WhatsAppClient::worth_fetching_now(false, Some(64 * 1024)));
+        assert!(!WhatsAppClient::worth_fetching_now(false, None));
+        assert!(
+            !WhatsAppClient::worth_fetching_now(true, Some(WhatsAppClient::EAGER_MEDIA_BYTES + 1)),
+            "past the ceiling the thumbnail shows and the bytes stay retryable"
+        );
+    }
+
+    /// The quote bar above a reply named an unknown contact while the bubbles
+    /// from the same person, an inch above it, carried their name: the
+    /// participant went onto the row exactly as the envelope spelled it,
+    /// device suffix and all, and `Chat::quoted_author` looks a participant
+    /// up by exact string.
+    #[tokio::test]
+    async fn a_quoted_author_is_filed_where_their_bubbles_are() {
+        use whatsapp_rust::waproto::buffa;
+        use whatsapp_rust::waproto::whatsapp::message;
+
+        let (chat_store, client) = test_session("quoted-author").await;
+        let reply = wa::Message {
+            extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
+                text: Some("e o áudio?".to_string()),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    stanza_id: Some("ORIGINAL".to_string()),
+                    // As a sending device spells itself.
+                    participant: Some(TEST_PEER.replace('@', ":12@")),
+                    quoted_message: buffa::MessageField::some(wa::Message {
+                        conversation: Some("ping".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        feed(&chat_store, incoming(reply, "MSG-QUOTE", 1_700_000_000)).await;
+
+        let page = WhatsAppClient::message_page(
+            &chat_store,
+            &client,
+            &book(),
+            TEST_PEER.to_string(),
+            None,
+            50,
+        )
+        .await
+        .expect("page loads");
+        let quoted = page.items[0].quoted.as_ref().expect("this is a reply");
+        assert_eq!(quoted.sender, TEST_PEER);
     }
 
     const TEST_PEER: &str = "559900000001@s.whatsapp.net";

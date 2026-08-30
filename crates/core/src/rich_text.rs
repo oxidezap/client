@@ -39,14 +39,19 @@ impl Emphasis {
         self == Self::default()
     }
 
-    /// Everything either one asks for. Nesting accumulates rather than
-    /// replaces: the inner run of `*_both_*` is both.
-    fn union(self, other: Self) -> Self {
+    /// The four attributes in a fixed order, so the sweep in `runs` can keep
+    /// a count of each: nesting accumulates rather than replaces, and the
+    /// inner run of `*_both_*` is both.
+    fn attributes(self) -> [bool; 4] {
+        [self.bold, self.italic, self.strikethrough, self.code]
+    }
+
+    fn from_attributes([bold, italic, strikethrough, code]: [bool; 4]) -> Self {
         Self {
-            bold: self.bold || other.bold,
-            italic: self.italic || other.italic,
-            strikethrough: self.strikethrough || other.strikethrough,
-            code: self.code || other.code,
+            bold,
+            italic,
+            strikethrough,
+            code,
         }
     }
 
@@ -108,23 +113,40 @@ impl RichText {
             return Vec::new();
         }
         // Every span edge is a point where the appearance can change; between
-        // two adjacent edges it cannot, so each gap is one run.
-        let mut edges = Vec::with_capacity(self.spans.len() * 2);
+        // two adjacent edges it cannot, so each gap is one run. Which
+        // emphasis is in force is carried across the sweep rather than looked
+        // up: asking every span about every gap is quadratic, and the text is
+        // the peer's, unbounded, and re-run on every repaint of every visible
+        // bubble.
+        let mut events: Vec<(usize, bool, Emphasis)> = Vec::with_capacity(self.spans.len() * 2);
         for span in &self.spans {
-            edges.push(span.range.start);
-            edges.push(span.range.end);
+            events.push((span.range.start, false, span.emphasis));
+            events.push((span.range.end, true, span.emphasis));
         }
-        edges.sort_unstable();
-        edges.dedup();
+        // Closings first at a shared point, so a span that ends where the next
+        // begins is not counted through it.
+        events.sort_unstable_by_key(|(at, closing, _)| (*at, std::cmp::Reverse(*closing)));
 
-        let mut runs: Vec<(Range<usize>, Emphasis)> = Vec::with_capacity(edges.len());
-        for pair in edges.windows(2) {
-            let (from, to) = (pair[0], pair[1]);
-            let emphasis = self
-                .spans
-                .iter()
-                .filter(|span| span.range.start <= from && to <= span.range.end)
-                .fold(Emphasis::default(), |acc, span| acc.union(span.emphasis));
+        // A count per attribute rather than a set of spans: the same
+        // attribute can be in force from several of them at once.
+        let mut depth = [0usize; 4];
+        let mut runs: Vec<(Range<usize>, Emphasis)> = Vec::with_capacity(events.len());
+        let mut at = 0;
+        while at < events.len() {
+            let from = events[at].0;
+            while at < events.len() && events[at].0 == from {
+                let (_, closing, emphasis) = events[at];
+                for (count, on) in depth.iter_mut().zip(emphasis.attributes()) {
+                    if on {
+                        *count = if closing { *count - 1 } else { *count + 1 };
+                    }
+                }
+                at += 1;
+            }
+            let Some(&(to, ..)) = events.get(at) else {
+                break;
+            };
+            let emphasis = Emphasis::from_attributes(depth.map(|count| count > 0));
             if emphasis.is_plain() {
                 continue;
             }
@@ -692,6 +714,32 @@ mod tests {
                 rich.text.is_char_boundary(span.range.start)
                     && rich.text.is_char_boundary(span.range.end),
                 "span {span:?} splits a character"
+            );
+        }
+    }
+
+    /// What one received message can cost the window.
+    ///
+    /// A stopwatch rather than an assertion, so it is ignored by default. The
+    /// old `runs` asked every span about every gap between edges, and
+    /// `render_rich_text` calls it on every repaint of every visible bubble:
+    /// a message the peer can simply send made repainting the conversation
+    /// take longer than a frame, by a lot.
+    ///
+    /// `cargo test -p oxidezap-core -- --ignored runs_cost`
+    #[test]
+    #[ignore = "a stopwatch, not a test"]
+    fn runs_cost() {
+        for spans in [500, 1_000, 2_000, 4_000, 8_000, 16_000] {
+            let text = "*a* ".repeat(spans);
+            let rich = parse(&text);
+            assert_eq!(rich.spans.len(), spans);
+            let started = wacore::time::Instant::now();
+            let runs = rich.runs();
+            println!(
+                "{spans} spans -> {} runs in {:?}",
+                runs.len(),
+                started.elapsed()
             );
         }
     }

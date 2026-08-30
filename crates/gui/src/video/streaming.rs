@@ -33,7 +33,8 @@ use smallvec::SmallVec;
 use super::audio::VideoAudio;
 use super::demux::{H264Sample, avcc_to_annexb, build_sps_pps_annexb, is_keyframe};
 use super::geometry::{
-    MAX_VIDEO_PIXELS, Rotation, declares_more_than, frame_byte_len, write_bgra_rotated,
+    MAX_VIDEO_PIXELS, Rotation, declares_more_than, declares_unreadably, frame_byte_len,
+    write_bgra_rotated,
 };
 
 /// A decoded video frame, BGRA8-encoded and ready to hand to `gpui::img`.
@@ -281,6 +282,9 @@ impl StreamingVideoDecoder {
                 coded_height
             ));
         }
+        if declares_unreadably(&sps_pps) {
+            return Err(anyhow!("Coded video dimensions could not be read"));
+        }
 
         // Create decoder
         let decoder = Decoder::new().context("Failed to create H.264 decoder")?;
@@ -493,6 +497,11 @@ impl StreamingVideoDecoder {
             declares_more_than(&self.samples[index].data, MAX_VIDEO_PIXELS)
         {
             log::warn!("refusing a {coded_width}x{coded_height} video stream");
+            self.last_decoded_index = index as i32;
+            return;
+        }
+        if declares_unreadably(&self.samples[index].data) {
+            log::warn!("refusing a video stream whose parameter set cannot be read");
             self.last_decoded_index = index as i32;
             return;
         }
@@ -772,5 +781,21 @@ mod tests {
         );
         // A unit that declares nothing is decoded against the set before it.
         assert_eq!(declares_more_than(b"nothing here", MAX_VIDEO_PIXELS), None);
+        assert!(!declares_unreadably(b"nothing here"));
+    }
+
+    /// The way past the budget is a parameter set shaped so the parser gives
+    /// up: it declares geometry, so it is not the "decoded against the set
+    /// before it" case, and nothing here can check what the decoder is about
+    /// to allocate from it.
+    #[test]
+    fn a_parameter_set_that_cannot_be_read_is_refused() {
+        let truncated = [0, 0, 0, 1, 0x67, 0x42];
+        assert!(declares_unreadably(&truncated));
+        assert_eq!(
+            declares_more_than(&truncated, MAX_VIDEO_PIXELS),
+            None,
+            "and it is not a size, which is why it needs its own answer"
+        );
     }
 }

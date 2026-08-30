@@ -9,13 +9,15 @@ use std::sync::Arc;
 
 use gpui::StyledImage as _;
 use gpui::{
-    App, Entity, Image, ImageSource, IntoElement, ParentElement, SharedString, Styled, div, img,
+    App, Entity, Image, ImageSource, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement as _, Styled, div, img,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 
 use crate::app::WhatsAppApp;
+use crate::components::media_viewer::CAPTION_LINES;
 use crate::components::{Avatar, EmptyState, ProductIcon};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
@@ -243,7 +245,13 @@ fn render_update(props: &StatusViewProps, metrics: Metrics, cx: &App) -> impl In
             // A text status, or media whose bytes are not here yet. Both are
             // the caption drawn large rather than an empty frame.
             (None, None) => div()
+                .id("status-text")
                 .max_w(metrics.reading_width())
+                // A text update is its caption, which the sender wrote and
+                // nothing bounds: past this it scrolls rather than filling
+                // the pane and being cut off at the bottom.
+                .max_h(metrics.text_heading() * CAPTION_LINES)
+                .overflow_y_scroll()
                 .px(metrics.space_xxl())
                 .py(metrics.space_xxxl())
                 .rounded(metrics.radius_lg())
@@ -267,7 +275,11 @@ fn render_update(props: &StatusViewProps, metrics: Metrics, cx: &App) -> impl In
                 .flatten()
                 .map(|caption| {
                     div()
+                        .id("status-caption")
                         .max_w(metrics.reading_width())
+                        .flex_shrink_0()
+                        .max_h(metrics.text_secondary() * CAPTION_LINES)
+                        .overflow_y_scroll()
                         .text_size(metrics.text_secondary())
                         .text_color(cx.theme().foreground)
                         .child(caption)

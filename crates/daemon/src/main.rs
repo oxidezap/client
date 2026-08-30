@@ -79,7 +79,7 @@ async fn run() -> Result<()> {
     // After the command channel, because a plugin acts through it, and before
     // the session, because a plugin subscribed to messages must not miss the
     // ones that arrive while it is still loading.
-    let plugins = plugins::start(&hub, commands.clone());
+    let plugins = plugins::start(&hub, commands.clone()).await;
 
     let mut session = {
         let hub = Arc::clone(&hub);

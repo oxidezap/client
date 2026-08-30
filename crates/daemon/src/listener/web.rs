@@ -385,8 +385,8 @@ async fn upgrade(
     // will accept before the server got to refuse it — the allocation is the
     // cost, and it happens here.
     let config = WebSocketConfig::default()
-        .max_message_size(Some(server::MAX_REQUEST_BYTES))
-        .max_frame_size(Some(server::MAX_REQUEST_BYTES));
+        .max_message_size(Some(oxidezap_ipc::MAX_REQUEST_BYTES))
+        .max_frame_size(Some(oxidezap_ipc::MAX_REQUEST_BYTES));
     Ok(WebSocketStream::from_raw_socket(stream.into_inner(), Role::Server, Some(config)).await)
 }
 

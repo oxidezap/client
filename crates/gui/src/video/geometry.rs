@@ -147,8 +147,25 @@ pub(super) fn frame_byte_len(width: usize, height: usize) -> Option<usize> {
 /// The bound is an argument so a test can name one it can afford to encode
 /// against; every caller passes [`MAX_VIDEO_PIXELS`].
 pub(super) fn declares_more_than(access_unit: &[u8], max_pixels: usize) -> Option<(u32, u32)> {
-    let (width, height) = super::sps::coded_size(access_unit)?;
+    let super::sps::Geometry::Size(width, height) = super::sps::coded_size(access_unit) else {
+        return None;
+    };
     ((width as usize).saturating_mul(height as usize) > max_pixels).then_some((width, height))
+}
+
+/// Whether the unit declares a picture nothing here can check.
+///
+/// The other half of [`declares_more_than`], and separate because it is a
+/// different sentence: that one says the declared picture is too big, this
+/// says a parameter set is being declared and could not be read. A budget
+/// nothing can apply is not a budget, and the way past it would otherwise be
+/// a parameter set shaped so the parser gives up — which whoever produced the
+/// file chooses.
+pub(super) fn declares_unreadably(access_unit: &[u8]) -> bool {
+    matches!(
+        super::sps::coded_size(access_unit),
+        super::sps::Geometry::Unreadable
+    )
 }
 
 #[cfg(test)]

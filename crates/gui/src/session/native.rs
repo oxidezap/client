@@ -10,7 +10,7 @@
 //! cannot spawn a process, which is why the two front ends differ about what
 //! "no daemon" means. Here it means "start one"; there it means "say so".
 
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::sync::Arc;
 
 use log::info;
@@ -82,6 +82,13 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
 }
 
 /// Read frames until the daemon goes away.
+///
+/// Whatever ends the loop, the reporting has to run: draining `pending` and
+/// failing every request in it, and telling the window the connection is
+/// gone. That block used to sit at the end of the loop and be reached only by
+/// a `break`, so a panic anywhere inside unwound straight past it — leaving a
+/// window that still reads as connected, with no events arriving, every send
+/// spinning on an answer nothing will produce, and no reconnect scheduled.
 fn read_frames(
     stream: oxidezap_ipc::Reader,
     events: &EventSink,
@@ -90,18 +97,45 @@ fn read_frames(
 ) {
     let cache = Directory;
     let mut frames = Frames::new(events, pending, &cache, pictures);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_loop(stream, &mut frames);
+    }))
+    .is_err();
+    if panicked {
+        log::error!("the thread reading the daemon connection panicked");
+    }
+    frames.finish();
+}
+
+fn read_loop(stream: oxidezap_ipc::Reader, frames: &mut Frames<'_>) {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+    // Bounded, through the same framing the daemon's own reader is bounded
+    // by: reading a frame into a `String` with nothing stopping it means a
+    // peer that never sends a newline grows this thread until the window is
+    // killed.
+    let mut buf = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
+        let frame =
+            oxidezap_ipc::read_frame(&mut reader, &mut buf, oxidezap_ipc::MAX_DAEMON_FRAME_BYTES);
+        let line = match frame {
+            Ok(Some(oxidezap_ipc::FrameRead::Line(line))) => line,
+            Ok(Some(oxidezap_ipc::FrameRead::NotUtf8)) => {
+                log::warn!("the daemon sent a frame that is not text; ignoring it");
+                continue;
+            }
+            Ok(Some(oxidezap_ipc::FrameRead::TooLong)) => {
+                log::error!(
+                    "the daemon sent a frame past {} bytes with no end to it",
+                    oxidezap_ipc::MAX_DAEMON_FRAME_BYTES
+                );
+                break;
+            }
+            Ok(None) => break,
             Err(e) => {
                 log::error!("lost the daemon connection: {e}");
                 break;
             }
-        }
+        };
 
         if let Some(message) = super::frames::parse(&line)
             && frames.apply(message).is_break()
@@ -109,7 +143,6 @@ fn read_frames(
             break;
         }
     }
-    frames.finish();
 }
 
 /// How long to keep trying before giving the user an error instead.
@@ -139,11 +172,22 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
         .ok_or_else(|| std::io::Error::other("no per-user directory to look for the daemon in"))?;
     let program = daemon_program();
     let deadline = wacore::time::Instant::now() + START_TIMEOUT;
+    // The daemon this call started, kept so it can be asked whether it is
+    // still running rather than left to become a zombie.
+    let mut started: Option<std::process::Child> = None;
 
     loop {
         match Endpoint::connect() {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                reap(started.take());
+                return Ok(stream);
+            }
             Err(e) if wacore::time::Instant::now() >= deadline => {
+                // The last one this call started, on the way out. Dropping a
+                // `Child` waits for nothing: on unix the process stays a
+                // zombie until this window exits, and the error screen retries
+                // startup, so repeated failures accumulate them.
+                reap(started.take());
                 return Err(std::io::Error::other(format!(
                     "no daemon listening on {} after {START_TIMEOUT:?}: {e}",
                     path.display()
@@ -152,10 +196,34 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
             Err(_) => {}
         }
 
-        info!("no daemon on {}; starting one", path.display());
-        std::process::Command::new(&program).spawn().map_err(|e| {
-            std::io::Error::other(format!("could not start {}: {e}", program.display()))
-        })?;
+        // Only if the last one is not still coming up. The connect above can
+        // fail for reasons that are not "nobody is listening" — a socket this
+        // user may not open, a peer that is not us — and each turn of the
+        // loop launching another daemon meant five of them per attempt, all
+        // but one losing the per-user lock and exiting. Held rather than
+        // dropped, and reaped: a `Child` nobody waits on is a zombie for as
+        // long as this window lives, and the error screen retries every
+        // fifteen seconds for as long as the user leaves it up.
+        match started.as_mut().map(std::process::Child::try_wait) {
+            Some(Ok(None)) => {}
+            _ => {
+                info!("no daemon on {}; starting one", path.display());
+                started = Some(
+                    std::process::Command::new(&program)
+                        // The daemon's own log belongs in the daemon's, not
+                        // interleaved into this window's.
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .map_err(|e| {
+                            std::io::Error::other(format!(
+                                "could not start {}: {e}",
+                                program.display()
+                            ))
+                        })?,
+                );
+            }
+        }
 
         // Polled rather than waited on: the daemon binds after it has taken
         // its lock and prepared its directory, and there is no signal for that
@@ -163,11 +231,30 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
         let attempt = wacore::time::Instant::now() + START_ATTEMPT;
         while wacore::time::Instant::now() < attempt {
             if let Ok(stream) = Endpoint::connect() {
+                reap(started.take());
                 return Ok(stream);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
+}
+
+/// Wait for a daemon this process started, in a thread of its own.
+///
+/// The connection succeeding is not the end of the child: on Unix a process
+/// nobody waits on is a zombie from the moment it exits until its parent
+/// does, and the daemon outliving the window is the ordinary case — so the
+/// wait belongs somewhere that can outlive the connect loop. One parked
+/// thread per daemon this process started, which is at most one.
+fn reap(child: Option<std::process::Child>) {
+    let Some(mut child) = child else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("oxidezap-daemon-wait".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 /// Where to find the daemon.

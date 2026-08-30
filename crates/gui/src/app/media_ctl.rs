@@ -566,22 +566,34 @@ impl WhatsAppApp {
     /// animation state per `Arc<Image>`, so a fresh one restarts an animated
     /// sticker on every frame; and building one copies the encoded bytes and
     /// makes GPUI decode them again. `update_message_media_data` evicts the
-    /// entry when the real bytes replace a preview, so a stale thumbnail cannot
-    /// outlive its download.
+    /// entry when the real bytes replace a preview — see [`Cached`] — so a
+    /// stale thumbnail cannot outlive its download.
     /// Uses interior mutability (RefCell) so it can be called during immutable render.
     ///
     /// `None` where `data` is not a still picture — a video's bytes are its
     /// own file once it has been fetched, and nothing decodes those as one.
     /// Answered before the cache is touched, so an MP4 cannot take a slot
     /// from the pictures the cache exists for.
-    pub fn get_decoded_image(
-        &self,
-        message_id: &str,
-        data: &[u8],
-        mime_type: &str,
-    ) -> Option<Arc<Image>> {
-        let format = mime_to_image_format(mime_type)?;
+    pub fn get_decoded_image(&self, message_id: &str, media: &MediaContent) -> Option<Arc<Image>> {
+        let (data, format) = (&media.data, mime_to_image_format(&media.mime_type)?);
 
+        // Keyed by the id *and* what the bytes are, because a message's bytes
+        // are not fixed: a preview is replaced by the real picture, and there
+        // are two paths that do it — `update_message_media_data`, which
+        // evicts, and `fill` on the way in from the daemon, which never
+        // reaches this side at all. An entry keyed by the id alone therefore
+        // outlived its own download, and `is_viewable` then let the stale
+        // thumbnail be opened full screen, until the cache had pushed it out.
+        let cached = Cached {
+            bytes: data.len(),
+            format,
+            // The flag the two paths that replace a preview both set. Length
+            // and format alone are a signature two different pictures can
+            // share, and this is the one difference the replacement always
+            // has: `adopt_full_bytes` clears it, on the app's path and on the
+            // one that never reaches the app.
+            preview: media.data_is_preview,
+        };
         // A hit moves the entry to the back, which is what makes the order
         // below least-recently-used rather than insertion order. By
         // insertion, the entry evicted first was as likely as not the one
@@ -593,9 +605,19 @@ impl WhatsAppApp {
         {
             let mut cache = self.decoded_images.borrow_mut();
             if let Some(at) = cache.get_index_of(message_id) {
-                let last = cache.len() - 1;
-                cache.move_index(at, last);
-                return cache.get_index(last).map(|(_, image)| Arc::clone(image));
+                // Unless the bytes behind it have been replaced, in which
+                // case the entry describes a picture that is gone and the
+                // insert below overwrites it.
+                if cache
+                    .get_index(at)
+                    .is_some_and(|(_, (seen, _))| *seen == cached)
+                {
+                    let last = cache.len() - 1;
+                    cache.move_index(at, last);
+                    return cache
+                        .get_index(last)
+                        .map(|(_, (_, image))| Arc::clone(image));
+                }
             }
         }
 
@@ -613,7 +635,7 @@ impl WhatsAppApp {
         // this one fits — see `DECODED_IMAGE_BUDGET` for why there are two
         // bounds and `MIN_DECODED_IMAGES` for why the byte one gives way.
         let cost = image.bytes.len();
-        let mut held: usize = cache.values().map(|image| image.bytes.len()).sum();
+        let mut held: usize = cache.values().map(|(seen, _)| seen.bytes).sum();
         while super::over_budget(held + cost, cache.len()) {
             let Some(at) = cache
                 .keys()
@@ -627,11 +649,17 @@ impl WhatsAppApp {
                 break;
             };
             if let Some((_, evicted)) = cache.shift_remove_index(at) {
-                held = held.saturating_sub(evicted.bytes.len());
+                held = held.saturating_sub(evicted.0.bytes);
             }
         }
 
-        cache.insert(message_id.to_string(), image.clone());
+        // Removed before it is inserted, not replaced in place: `insert`
+        // keeps an existing key where it is, so a picture decoded now would
+        // take the position of the one it replaced and be evicted before
+        // entries older than itself — a rebuild, which is the thing this
+        // whole path exists to avoid.
+        cache.shift_remove(message_id);
+        cache.insert(message_id.to_string(), (cached, Arc::clone(&image)));
         Some(image)
     }
     /// Toggle video playback for a message

@@ -463,7 +463,7 @@ fn range_bound(
 ) -> Option<RangeBound> {
     let range = range.as_option()?;
     let ts_secs = range.last_message_timestamp.filter(|&ts| ts > 0)?;
-    let second_start_ms = ts_secs.saturating_mul(1000);
+    let second_start_ms = crate::types::secs_to_ms(ts_secs);
     let keys: Vec<String> = range
         .messages
         .iter()
@@ -961,7 +961,14 @@ fn apply_writer_msg(
             Ok(())
         }
         WriterMsg::SendFailed { chat, msg_id } => {
-            let chat_str = chat.to_string();
+            // The routing every other write that targets a row goes through.
+            // The caller names the chat the send named, so a row written
+            // under a peer's LID was looked for under their phone number:
+            // nothing matched, nothing was invalidated, and the message sat
+            // PENDING for the rest of the session — a spinner with no error
+            // state and no retry.
+            let wire = chat.to_string();
+            let chat_str = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
             // Same guard as the nack path: a row past PENDING already got its
             // positive answer, so a late local failure must not regress it.
             let updated =
@@ -975,6 +982,9 @@ fn apply_writer_msg(
             // A no-op update (row already acked, or unknown id) must not
             // broadcast an invalidation and re-hydrate the UI for nothing.
             if updated > 0 {
+                if chat_str != wire {
+                    cs.message_chats.insert(wire);
+                }
                 cs.message_chats.insert(chat_str);
             }
             Ok(())
@@ -2486,7 +2496,7 @@ fn apply_history_conversation(
     let chat = &crate::lid::route_chat_key(conn, device_id, conv.id.as_str(), cs)?;
     let last_ts_ms = conv
         .conversation_timestamp
-        .map(|s| (s as i64).saturating_mul(1000))
+        .map(crate::types::wire_secs_to_ms)
         .unwrap_or(0);
 
     {
@@ -2512,11 +2522,11 @@ fn apply_history_conversation(
                 // app-state paths) are milliseconds.
                 dsl::pinned_at.eq(conv
                     .pinned
-                    .map(|p| (p as i64).saturating_mul(1000))
+                    .map(|p| crate::types::secs_to_ms(i64::from(p)))
                     .filter(|&p| p > 0)),
                 dsl::muted_until.eq(conv
                     .mute_end_time
-                    .map(|m| (m as i64).saturating_mul(1000))
+                    .map(crate::types::wire_secs_to_ms)
                     .filter(|&m| m > 0)),
                 dsl::archived.eq(conv.archived.unwrap_or(false)),
                 dsl::ephemeral_expiration.eq(conv.ephemeral_expiration.map(|e| e as i32)),
@@ -2569,7 +2579,7 @@ fn apply_history_message(
         .unwrap_or(if from_me { "" } else { chat });
     let ts_ms = wmi
         .message_timestamp
-        .map(|s| (s as i64).saturating_mul(1000))
+        .map(crate::types::wire_secs_to_ms)
         .unwrap_or(0);
 
     if let Some(name) = wmi.push_name.as_deref()

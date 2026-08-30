@@ -37,7 +37,8 @@ use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 
 use super::geometry::{
-    MAX_VIDEO_PIXELS, Rotation, declares_more_than, frame_byte_len, write_bgra_rotated,
+    MAX_VIDEO_PIXELS, Rotation, declares_more_than, declares_unreadably, frame_byte_len,
+    write_bgra_rotated,
 };
 
 /// The newest decoded picture, and what has gone wrong.
@@ -127,6 +128,13 @@ impl Decoder {
         if let Some((width, height)) = declares_more_than(sps_pps, max_pixels) {
             return Err(format!("refusing a {width}x{height} video stream"));
         }
+        // A budget nothing can apply is not a budget: a parameter set the
+        // parser gives up on is a picture the decoder is about to allocate
+        // from, unchecked, and its shape is whoever produced the file's to
+        // choose.
+        if declares_unreadably(sps_pps) {
+            return Err("refusing a video stream whose geometry cannot be read".to_string());
+        }
         let codec = codec_string(sps_pps)
             .ok_or_else(|| "no readable parameter set in this stream".to_string())?;
 
@@ -195,6 +203,11 @@ impl Decoder {
         if let Some((width, height)) = declares_more_than(access_unit, self.max_pixels) {
             self.slot.borrow_mut().failed =
                 Some(format!("refusing a {width}x{height} video stream"));
+            return;
+        }
+        if declares_unreadably(access_unit) {
+            self.slot.borrow_mut().failed =
+                Some("refusing a video stream whose geometry cannot be read".to_string());
             return;
         }
         let data = js_sys::Uint8Array::from(access_unit);

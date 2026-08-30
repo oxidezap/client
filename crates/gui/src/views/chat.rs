@@ -104,32 +104,24 @@ pub fn render_connected_view(
         app.want_more_chats();
     }
 
-    // Everything the conversation pane needs, read before the borrow of `app`
-    // ends — the render helpers keep nothing borrowed.
-    let selected_chat = app.selected_chat_data().cloned();
-    let typing = selected_chat
+    // The conversation is named rather than held, so nothing here borrows
+    // `app` across the calls below that need it mutably. It used to be cloned
+    // for exactly that, which meant copying every message in the conversation
+    // once per frame for readers that only look at the timeline cache.
+    let open_chat = selected_jid.clone().filter(|jid| app.has_chat(jid));
+    let typing = open_chat.as_ref().and_then(|jid| app.typing_in(jid));
+    let availability = open_chat
         .as_ref()
-        .and_then(|chat| app.typing_in(&chat.jid));
-    let availability = selected_chat
-        .as_ref()
-        .and_then(|chat| app.availability_of(&chat.jid))
+        .and_then(|jid| app.availability_of(jid))
         .cloned();
-    let message_cache = selected_chat.as_ref().map(|chat| {
-        app.get_message_list_cache(
-            &chat.jid,
-            &chat.messages,
-            chat.is_group,
-            typing.clone(),
-            layout,
-        )
-    });
+    let message_cache = open_chat
+        .as_ref()
+        .map(|jid| app.get_message_list_cache(jid, typing.clone(), layout));
     // A call in a chat other than the one on screen is what the return banner
     // is for; a call in *this* chat is already obvious from the card.
-    let return_banner = app.active_call().filter(|call| {
-        selected_chat
-            .as_ref()
-            .is_none_or(|chat| chat.jid != call.peer_jid)
-    });
+    let return_banner = app
+        .active_call()
+        .filter(|call| open_chat.as_deref().is_none_or(|jid| jid != call.peer_jid));
     let banner = return_banner.map(|call| (call.peer_name.clone(), call.elapsed_label()));
     // Rendered as an element here rather than passed down as state: the
     // search belongs to the conversation pane, and only this level has both
@@ -150,21 +142,13 @@ pub fn render_connected_view(
         let message = app.media_viewer_message()?.clone();
         let media = message.media.as_ref()?;
         let image = (!media.data.is_empty())
-            .then(|| app.get_decoded_image(&message.id, &media.data, &media.mime_type))
+            .then(|| app.get_decoded_image(&message.id, media))
             .flatten();
         let frame = app.video_current_frame(&message.id);
         let author = if message.is_from_me {
             SharedString::from("You")
         } else {
-            selected_chat
-                .as_ref()
-                .and_then(|chat| {
-                    chat.author_name(&message)
-                        .map(str::to_owned)
-                        .or_else(|| Some(chat.name.clone()))
-                })
-                .unwrap_or_else(|| "Unknown contact".to_string())
-                .into()
+            SharedString::from(app.author_label(open_chat.as_deref(), &message))
         };
         Some(
             render_media_viewer(
@@ -208,7 +192,7 @@ pub fn render_connected_view(
             .media
             .as_ref()
             .filter(|media| !media.data.is_empty())
-            .and_then(|media| app.get_decoded_image(&message.id, &media.data, &media.mime_type));
+            .and_then(|media| app.get_decoded_image(&message.id, media));
         let frame = app.video_current_frame(&message.id);
         // A video says it is loading in its *player*, not in the download
         // table: `start_video_download` records progress there and nowhere
@@ -242,9 +226,9 @@ pub fn render_connected_view(
     // the way out, not the field.
     let is_offline = app.is_offline();
     // "(You)" on the conversation with your own number, as on its list row.
-    let is_own_number = selected_chat
-        .as_ref()
-        .is_some_and(|chat| app.is_own_number(&chat.jid));
+    let is_own_number = open_chat
+        .as_deref()
+        .is_some_and(|jid| app.is_own_number(jid));
     let can_send = app.can_send();
 
     // Which surfaces this frame gives the keyboard somewhere to land. Only
@@ -255,7 +239,7 @@ pub fn render_connected_view(
         chat_list: destination == Destination::Chats && layout.show_sidebar(),
         composer: destination == Destination::Chats
             && layout.show_chat_area()
-            && selected_chat.is_some()
+            && open_chat.is_some()
             && !is_offline,
         viewer: viewer.is_some(),
         // The card floats above this view rather than inside it, so the root
@@ -272,6 +256,10 @@ pub fn render_connected_view(
         cx,
     );
 
+    // Borrowed last, once nothing else needs `app` mutably: the header and
+    // the empty state are the only readers of the chat itself, and everything
+    // the timeline draws has already been gathered.
+    let selected_chat = open_chat.as_deref().and_then(|jid| app.chat_named(jid));
     // The two panes, whichever destination they belong to.
     let panes = div()
         .flex()
@@ -296,7 +284,7 @@ pub fn render_connected_view(
             } else {
                 el.child(render_chat_area(
                     ChatAreaProps {
-                        selected_chat: selected_chat.as_deref(),
+                        selected_chat,
                         message_cache,
                         banner,
                         typing: typing.as_ref(),

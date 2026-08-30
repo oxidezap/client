@@ -25,7 +25,7 @@ use crate::types::{
 const BIND_CHUNK: usize = 400;
 
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
-    DateTime::<Utc>::from_timestamp_millis(ms)
+    DateTime::<Utc>::from_timestamp_millis(crate::types::clamp_ms(ms))
 }
 
 /// A wall-clock instant as the first whole millisecond at or after it.
@@ -388,6 +388,82 @@ impl ChatStore {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// One page of a chat's messages and how much of the unread tail it still
+    /// owes, out of one snapshot.
+    ///
+    /// Read state is per chat rather than per row, so whoever turns stored
+    /// rows into messages has to place the unread tail itself: it is the
+    /// newest incoming rows, and the count is how many of them this page
+    /// still owes. On the newest page that is just the chat's counter; on an
+    /// older one it is the counter less the incoming rows in front of it.
+    ///
+    /// Both out of one read, and not only to save a permit and a transaction.
+    /// Asked separately, a message committed between the two raises the
+    /// counter without appearing in the page, and the tail then reaches one
+    /// row further back than the page's own rows justify — a message already
+    /// read, advertised as owing a receipt. Counted over every key the chat
+    /// is filed under, the same set the page is read over, or half a split
+    /// PN/LID pair answers for the whole thread.
+    pub async fn page_with_unread(
+        &self,
+        chat: &Jid,
+        before: Option<MessageCursor>,
+        limit: i64,
+    ) -> Result<(Vec<StoredMessage>, i64)> {
+        use schema::messages::dsl;
+        let limit = limit.max(0);
+        let device_id = self.device_id();
+        let chat = chat.to_string();
+        let (rows, unread): (Vec<MessageRow>, i64) = self
+            .db()
+            .read(move |conn| {
+                use schema::chats::dsl as chats;
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
+                let rows: Vec<MessageRow> = page_query(device_id, &keys, before.as_ref())
+                    .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+                    .limit(limit)
+                    .load(conn)
+                    .map_err(db_err)?;
+
+                let counts: Vec<i32> = chats::chats
+                    .filter(
+                        chats::device_id
+                            .eq(device_id)
+                            .and(chats::jid.eq_any(keys.clone())),
+                    )
+                    .select(chats::unread_count)
+                    .load(conn)
+                    .map_err(db_err)?;
+                // -1 is "manually marked unread", which is a badge and not a
+                // tail of rows: it owes no receipts.
+                let unread: i64 = counts.iter().map(|c| (*c).max(0) as i64).sum();
+                let Some(cursor) = before else {
+                    return Ok((rows, unread));
+                };
+                let ahead: i64 = dsl::messages
+                    .filter(
+                        dsl::device_id
+                            .eq(device_id)
+                            .and(dsl::chat_jid.eq_any(keys))
+                            .and(dsl::from_me.eq(false))
+                            .and(
+                                dsl::timestamp_ms
+                                    .gt(cursor.timestamp_ms)
+                                    .or(dsl::timestamp_ms
+                                        .eq(cursor.timestamp_ms)
+                                        .and(dsl::rowid.ge(cursor.seq))),
+                            ),
+                    )
+                    .count()
+                    .get_result(conn)
+                    .map_err(db_err)?;
+                Ok((rows, (unread - ahead).max(0)))
+            })
+            .await?;
+        Ok((rows.into_iter().map(Into::into).collect(), unread))
+    }
+
     /// One page of a chat's messages, newest first. Pass the cursor of the
     /// oldest message you already have to get the page before it.
     ///
@@ -408,21 +484,7 @@ impl ChatStore {
             .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                let mut query = dsl::messages
-                    .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
-                    .into_boxed();
-                if let Some(cursor) = &before {
-                    // Mirrors the sort exactly; anything looser skips or
-                    // repeats rows at a page boundary inside a same-second run.
-                    query = query.filter(
-                        dsl::timestamp_ms
-                            .lt(cursor.timestamp_ms)
-                            .or(dsl::timestamp_ms
-                                .eq(cursor.timestamp_ms)
-                                .and(dsl::rowid.lt(cursor.seq))),
-                    );
-                }
-                query
+                page_query(device_id, &keys, before.as_ref())
                     .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
                     .limit(limit)
                     .load(conn)
@@ -431,7 +493,41 @@ impl ChatStore {
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
+}
 
+/// The rows of one page, before they are ordered and limited.
+///
+/// Written once because two readers ask for it — the page on its own, and the
+/// page beside its unread tail — and a page boundary that differed between
+/// them would be two different pages.
+fn page_query<'a>(
+    device_id: i32,
+    keys: &[String],
+    before: Option<&MessageCursor>,
+) -> schema::messages::BoxedQuery<'a, diesel::sqlite::Sqlite> {
+    use schema::messages::dsl;
+    let mut query = dsl::messages
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq_any(keys.to_vec())),
+        )
+        .into_boxed();
+    if let Some(cursor) = before {
+        // Mirrors the sort exactly; anything looser skips or repeats rows at
+        // a page boundary inside a same-second run.
+        query = query.filter(
+            dsl::timestamp_ms
+                .lt(cursor.timestamp_ms)
+                .or(dsl::timestamp_ms
+                    .eq(cursor.timestamp_ms)
+                    .and(dsl::rowid.lt(cursor.seq))),
+        );
+    }
+    query
+}
+
+impl ChatStore {
     /// The newest page of each of several chats, in one read.
     ///
     /// The same statement [`messages`](Self::messages) runs, once per chat,

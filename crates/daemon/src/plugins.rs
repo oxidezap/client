@@ -24,7 +24,7 @@ use crate::state::StateHub;
 /// Failing to find a plugin directory is not a failure: the ordinary account
 /// has no plugins, and a daemon that would not start without a folder is a
 /// daemon that would not start.
-pub fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
+pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
     let sink = publishing_to(hub);
 
     // A page runs no plugins, and this is where that is decided rather than
@@ -52,8 +52,25 @@ pub fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
 
     #[cfg(not(target_family = "wasm"))]
     {
-        start_here(sink, commands)
+        // Off the runtime's thread. Loading reads up to `MAX_MODULE_BYTES` a
+        // module off the disk, validates it and runs its `oxi_init`, all of
+        // it synchronous — done here it parks a runtime worker for as long as
+        // the folder takes, before the daemon has bound anything. Awaited
+        // rather than detached, because the session must not start until the
+        // plugins subscribed to messages are there to receive them.
+        tokio::task::spawn_blocking(move || start_here(sink, commands))
+            .await
+            .unwrap_or_else(|e| {
+                log::error!("the plugin loader did not finish: {e}");
+                Arc::new(Plugins::none(publishing_to_nothing()))
+            })
     }
+}
+
+/// A sink for a set of plugins that will never publish anything.
+#[cfg(not(target_family = "wasm"))]
+fn publishing_to_nothing() -> Sink {
+    Arc::new(|_| {})
 }
 
 /// The half that needs a filesystem.

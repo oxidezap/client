@@ -202,9 +202,14 @@ profile here repeats it deliberately.
   does not, which is why reclaiming a stale endpoint exists on one and not the
   other — and why the Windows listener builds a security descriptor by hand,
   since a named pipe's default grants read access to `Everyone` while a Unix
-  socket inherits a `0700` directory. A client checks who answered, too: the
-  socket sits at a predictable path, and under the `/tmp` fallback another
-  user can get there first.
+  socket inherits a `0700` directory. A client checks who answered on both,
+  and for one reason: the name is predictable and not reserved, so somebody
+  else can be there first — the socket under the `/tmp` fallback, the pipe at
+  `\\.\pipe\oxidezap-<SID>`. `first_pipe_instance` on the listener guards the
+  daemon once it exists, which is the wrong half of it: the daemon then
+  refuses to start and the client talks to whoever got there. The kernel knows
+  who is on the other end either way — a peer uid on the socket, the serving
+  process's token SID on the pipe.
   A third transport joined them rather than becoming a third place:
   `endpoint/web.rs` and `listener/web.rs` are a WebSocket, because a page can
   open neither of the others. What every transport shares on the way out is
@@ -570,10 +575,14 @@ profile here repeats it deliberately.
   out of *every* parameter set in it, answering the largest, because one unit
   may carry several and the slice picks which one it is coded against: a
   thumbnail-sized set in front of the one the picture really uses is a budget
-  walked straight past. It answers `None` for a unit with no parameter set
-  (nothing new is being declared) and for ones it cannot follow, which is
-  deliberate: refusing on a reading nobody has checked would break a
-  legitimate call over a parser bug.
+  walked straight past. It answers three things and not two, because the
+  sender picks which one it sends: no parameter set is nothing new being
+  declared and is left alone, a size is bounded, and a set it cannot follow is
+  refused. Folding the last two together made the way past the budget a
+  parameter set shaped so the parser gives up — which the peer chooses — and
+  the shapes that actually reach it are the hostile ones: a truncated set, a
+  `ue(v)` of more than 31 zeros, a frame cycle longer than the bytes carrying
+  it. Baseline and main, which is all a call has ever carried, parse.
 - **A decoded picture is a slot, not a place in a queue.** The window's event
   channel is hundreds of messages deep because the messages that may not be
   lost need it to be, and a decoded 720p frame is 3.5 MiB — so frames put

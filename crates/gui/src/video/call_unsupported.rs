@@ -34,7 +34,7 @@ use gpui::RenderImage;
 use oxidezap_core::{CallVideoFrame, VideoStream};
 use smallvec::SmallVec;
 
-use super::geometry::Rotation;
+use super::geometry::{Rotation, declares_unreadably};
 use super::webcodecs;
 
 /// Where a decoded picture goes.
@@ -176,7 +176,7 @@ impl Stream {
         // its reference and output buffers from the parameter set — from
         // numbers the *peer* chose. A unit carrying no parameter set declares
         // no new geometry and is left alone.
-        if let Some((width, height)) = super::sps::coded_size(&frame.data)
+        if let super::sps::Geometry::Size(width, height) = super::sps::coded_size(&frame.data)
             && (width as usize).saturating_mul(height as usize) > MAX_PIXELS
         {
             log::warn!(
@@ -186,6 +186,17 @@ impl Stream {
             // Not a gap to recover from: every unit that follows references
             // this picture, so the stream stays refused until the peer sends
             // a parameter set describing one that fits.
+            self.started.set(false);
+            return;
+        }
+        // The same rule as the budget above and a different sentence: a set
+        // the parser gave up on is a picture the decoder allocates from with
+        // nothing having checked it.
+        if declares_unreadably(&frame.data) {
+            log::warn!(
+                "refusing a video stream on call {} whose geometry cannot be read",
+                self.call_id
+            );
             self.started.set(false);
             return;
         }
