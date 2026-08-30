@@ -278,13 +278,28 @@ impl Inbound {
             Ok(()) => {}
             Err(async_channel::TrySendError::Full(event)) => {
                 // The driver is behind. Media is what a call can afford to
-                // lose and STUN is not, but neither can be waited for from
-                // inside a JS callback without stopping the page — so the
-                // loss is counted and carried out on the next delivery.
+                // lose and STUN is not: it is what keeps the relay binding
+                // alive, so a stall that drops it ends the call rather than
+                // degrading it. Neither can be *waited* for from inside a JS
+                // callback without stopping the page — but the queue can be
+                // made room in, which is the same trade the outbound ceiling
+                // makes and the opposite answer to the same question.
                 if let RelayTransportEvent::PacketReceived(packet) = &event
                     && classify_relay_packet(packet) == RelayPacketKind::Stun
                 {
-                    warn!("the relay channel dropped a STUN packet: the call driver is behind");
+                    // `force_send` evicts the oldest, which here is the
+                    // stalest media in the queue — worth less than the
+                    // connectivity check displacing it. Counted, because a
+                    // packet the driver never saw is a packet it is owed an
+                    // account of either way.
+                    warn!("the relay channel is behind; evicting media to deliver a STUN packet");
+                    if self.events.force_send(event).is_ok() {
+                        self.dropped.set(self.dropped.get().saturating_add(1));
+                        return;
+                    }
+                    // Only a closed channel gets here, and it is the ending
+                    // the other arm treats as nothing to report.
+                    return;
                 }
                 // `self.dropped.get()` and not `pending`: the report above
                 // may have just succeeded and zeroed the cell, and adding to

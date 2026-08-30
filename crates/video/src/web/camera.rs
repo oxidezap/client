@@ -25,8 +25,50 @@ const FRAME_DEPTH: usize = 2;
 /// The microsecond clock `VideoFrame` timestamps count in.
 const MICROS_PER_SECOND: f64 = 1_000_000.0;
 
-/// The millisecond clock `setInterval` and `Date::now` count in.
+/// The millisecond clock `setInterval` and the deadline count in.
 const MILLIS_PER_SECOND: f64 = 1000.0;
+
+/// Whether this browser will really encode what [`encoder_config`] describes.
+///
+/// `isConfigSupported` is a promise and a static, so it costs one await and
+/// no device. A browser without it — the method is newer than `VideoEncoder`
+/// itself — answers `true` rather than being refused: the check exists to
+/// turn a late failure into an early one, and a browser that cannot be asked
+/// is no worse off than before it was.
+async fn encoder_supports(config: &web_sys::VideoEncoderConfig) -> bool {
+    let asked = web_sys::VideoEncoder::is_config_supported(config);
+    match wasm_bindgen_futures::JsFuture::from(asked).await {
+        Ok(answer) => js_sys::Reflect::get(&answer, &wasm_bindgen::JsValue::from_str("supported"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            // Present and false is a refusal; absent is a browser answering
+            // in a shape this does not know, which is not a refusal.
+            .unwrap_or(true),
+        Err(e) => {
+            // A throw here is the method not being there, or not liking the
+            // config's shape. Neither is an answer about the codec.
+            debug!(
+                "this browser would not answer isConfigSupported: {}",
+                describe(&e)
+            );
+            true
+        }
+    }
+}
+
+/// Milliseconds on a clock that only goes forward.
+///
+/// `Date::now` is the wall clock, and the deadline above measures *elapsed*
+/// time: an NTP correction backwards would leave `now` under a deadline
+/// already met for as long as the adjustment lasted, and every tick would
+/// return with the timer and the encoder both healthy. `performance.now` is
+/// monotonic by specification. Falls back to the wall clock where there is no
+/// `Performance` — a clock that can jump is still better than no frames.
+fn monotonic_now() -> f64 {
+    web_sys::window()
+        .and_then(|window| window.performance())
+        .map_or_else(js_sys::Date::now, |performance| performance.now())
+}
 
 /// Whether this browser has a camera and an H.264 encoder at all.
 ///
@@ -212,6 +254,22 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
         bail!("this browser has no VideoEncoder, so it cannot send a picture");
     }
     let window = web_sys::window().ok_or_else(|| anyhow!("no window to open a camera from"))?;
+
+    // Asked before the device is, which is the ordering this whole module is
+    // built on: a browser that will not encode Constrained Baseline should
+    // downgrade the call to voice without ever raising a camera prompt.
+    //
+    // And asked at all because `configure` is not the answer. It is
+    // synchronous and validates the *shape* of the config; an implementation
+    // that cannot actually encode these numbers is entitled to say so later,
+    // through the error callback — by which time `open_camera` has returned,
+    // the offer has gone out as video, and the recovery is a call that
+    // downgrades itself after signalling rather than before.
+    let config = encoder_config(quality)?;
+    if !encoder_supports(&config).await {
+        bail!("this browser's VideoEncoder will not encode {CODEC} at these settings");
+    }
+
     // Armed before anything else can fail: from here to `Held` the camera is
     // open, and every `?` below would otherwise leave it that way.
     let guard = CameraGuard(Some(open_device(&window, quality).await?));
@@ -278,7 +336,9 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
     );
     let encoder = web_sys::VideoEncoder::new(&init)
         .map_err(|e| anyhow!("no video encoder: {}", describe(&e)))?;
-    encoder.configure(&encoder_config(quality)?).map_err(|e| {
+    // The same config the support check asked about, not a second one built
+    // to the same recipe: they cannot drift if there is only one.
+    encoder.configure(&config).map_err(|e| {
         anyhow!(
             "the encoder refused {CODEC} at these settings: {}",
             describe(&e)
@@ -516,7 +576,7 @@ fn tick(
         if encoder.state() != web_sys::CodecState::Configured {
             return;
         }
-        let now = js_sys::Date::now();
+        let now = monotonic_now();
         if now < due.get() {
             return;
         }
