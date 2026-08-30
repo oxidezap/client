@@ -53,6 +53,16 @@ thread_local! {
     static PROMOTED: RefCell<Option<Rc<oxidezap_ipc::web_locks::Hold>>> =
         const { RefCell::new(None) };
 
+    /// Everyone waiting to be promoted, and whether anyone is asking yet.
+    ///
+    /// One wait per tab, however many callers there are, for the same reason
+    /// [`ASK`] is one ask: a caller is a connection, and a follower makes a
+    /// new one every time the tab it was watching goes. A request per
+    /// connection would leave a queue of them behind this tab's own grant,
+    /// each waiting on a lock this tab holds for its lifetime — every one of
+    /// them permanently unresolved, holding whatever its waiter closed over.
+    static PROMOTION: RefCell<Option<Rc<RefCell<Vec<Waiter>>>>> = const { RefCell::new(None) };
+
     /// This page's ask, and what came of it.
     ///
     /// One per page, because the lock is one per page. Present while an ask
@@ -302,14 +312,61 @@ pub(crate) async fn promotion() -> Result<(), String> {
         return Ok(());
     }
 
-    let held = oxidezap_ipc::web_locks::hold(LOCK).await?;
-    // Kept for the life of the tab, exactly as a first-tab grant is: the
-    // account did not stop being this tab's when the session that opened it
-    // ended. Releasing it between two of this tab's own sessions is the
-    // window `embedded::running` documents at length.
-    PROMOTED.with(|cell| *cell.borrow_mut() = Some(Rc::new(held)));
-    Ok(())
+    let (tell, told) = futures_channel::oneshot::channel();
+    let asking = PROMOTION.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        match slot.as_ref() {
+            // Somebody is already waiting on the browser. This caller joins
+            // them rather than queuing a second request behind the first.
+            Some(waiting) => {
+                waiting.borrow_mut().push(tell);
+                None
+            }
+            None => {
+                let waiting = Rc::new(RefCell::new(vec![tell]));
+                *slot = Some(Rc::clone(&waiting));
+                Some(waiting)
+            }
+        }
+    });
+
+    if let Some(waiting) = asking {
+        // Settled here rather than in the caller, for the reason the ask is:
+        // a caller can be dropped — a follower's connection is replaced every
+        // time it reconnects — and a grant that arrives after its asker has
+        // gone is still this tab's grant.
+        wasm_bindgen_futures::spawn_local(async move {
+            let answer = match oxidezap_ipc::web_locks::hold(LOCK).await {
+                // Kept for the life of the tab, exactly as a first-tab grant
+                // is: the account did not stop being this tab's when the
+                // session that opened it ended. Releasing it between two of
+                // this tab's own sessions is the window `embedded::running`
+                // documents at length.
+                Ok(held) => {
+                    PROMOTED.with(|cell| *cell.borrow_mut() = Some(Rc::new(held)));
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            // Cleared either way. On a grant the early return above answers
+            // every later caller; on a failure the next one is entitled to
+            // ask the browser again rather than inherit an answer that has
+            // expired.
+            PROMOTION.with(|cell| *cell.borrow_mut() = None);
+            for tell in std::mem::take(&mut *waiting.borrow_mut()) {
+                let _ = tell.send(answer.clone());
+            }
+        });
+    }
+
+    match told.await {
+        Ok(answer) => answer,
+        Err(_) => Err("The browser did not answer the wait for this account.".to_string()),
+    }
 }
+
+/// One caller waiting to be told this tab now holds the account.
+type Waiter = futures_channel::oneshot::Sender<Result<(), String>>;
 
 /// How a caller that did not do the asking gets its answer.
 enum Waiting {

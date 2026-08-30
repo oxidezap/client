@@ -1252,6 +1252,25 @@ held — by itself. One connection per follower is watched the same way, with
 a tab that vanishes is noticed at the moment it vanishes and nothing anywhere
 polls.
 
+Being handed the lock is not the *only* way a follower learns its leader has
+gone, and it cannot be: with three tabs open, one follower is granted the
+account and the others stay queued behind a lock that tab now holds for its
+lifetime, over a channel to a tab that will never post again. So a follower
+listens to the rendezvous for the whole life of its connection, and a
+`Leading` from anywhere ends it — a leader announces exactly once, on the way
+up, and a `BroadcastChannel` does not deliver to the object that posted, so
+hearing one always means a *new* leader and a connection worth remaking.
+The same announcement is why an ask is answered idempotently: a follower
+re-asks when it hears `Leading`, and an ask that landed just before that
+announcement is one the leader has already served — serving it twice puts two
+`serve_client` instances on one channel, where a press sends one message
+twice. The nonce is the connection's name, so the name is what is remembered.
+
+A payload's ceiling travels *with* the request, and is enforced by the tab
+that has the bytes. It has to be: what crosses is a `Uint8Array` the serving
+tab builds and the browser clones, so a ceiling applied on arrival is applied
+after the copy it exists to prevent.
+
 `AppState::Refused` survives, for the one case that is still settled: something
 holds the account and will not answer for it — a tab left open across a deploy,
 speaking a rendezvous version this build does not. It is reached only after

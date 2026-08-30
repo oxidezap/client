@@ -32,6 +32,7 @@
 //! [`oxidezap_ipc::tabs::liveness_lock_for`].
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -108,6 +109,20 @@ pub(crate) fn serve(
     // other transport draws on rather than a second one beside it.
     let served = Rc::new(std::cell::Cell::new(0_usize));
 
+    // The asks already being served, so that a repeat is not a second
+    // connection.
+    //
+    // A follower re-sends its ask when it hears a tab announce that it holds
+    // the account, because the ordinary race is an ask that arrived while
+    // there was nobody listening. But the *other* order happens too — the ask
+    // lands just after this handler is installed and just before the
+    // announcement goes out — and then the same nonce is asked twice. Serving
+    // it twice puts two `serve_client` instances on one channel: both read
+    // every request, so one press sends one message twice, and their frames
+    // interleave into a front end that has no way to tell them apart. An ask
+    // is a connection's name, so the name is what is remembered.
+    let serving: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+
     let hub = Arc::clone(hub);
     let plugins = Arc::clone(plugins);
     let commands = commands.clone();
@@ -123,6 +138,14 @@ pub(crate) fn serve(
             log::warn!("refusing a tab: already serving {MAX_CLIENTS} front ends");
             return;
         }
+        // Answered again rather than ignored: the repeat exists because the
+        // asking tab is not sure its first ask was heard, and the connection
+        // it is waiting on is the one already open under this name.
+        if !serving.borrow_mut().insert(ask.clone()) {
+            log::debug!("a tab asked twice; answering the connection it already has");
+            answer(&rendezvous, &ask);
+            return;
+        }
         served.set(served.get() + 1);
         accept(
             &rendezvous,
@@ -131,6 +154,7 @@ pub(crate) fn serve(
             Arc::clone(&plugins),
             commands.clone(),
             Rc::clone(&served),
+            Rc::clone(&serving),
         );
     });
     channel.set_onmessage(Some(answering.as_ref().unchecked_ref()));
@@ -159,6 +183,7 @@ fn accept(
     plugins: Arc<oxidezap_plugin_host::Plugins>,
     commands: Commands,
     served: Rc<std::cell::Cell<usize>>,
+    serving: Rc<RefCell<HashSet<String>>>,
 ) {
     let name = tabs::channel_for(ask);
     let frames = match BroadcastChannel::new(&name) {
@@ -166,6 +191,7 @@ fn accept(
         Err(e) => {
             log::error!("this browser would not open a channel for a tab: {e:?}");
             served.set(served.get().saturating_sub(1));
+            serving.borrow_mut().remove(ask);
             return;
         }
     };
@@ -229,6 +255,7 @@ fn accept(
     // it has gone — closed, crashed, or navigated away — and there is nothing
     // to say to it.
     let live = tabs::liveness_lock_for(ask);
+    let live_name = ask.to_string();
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(e) = oxidezap_ipc::web_locks::wait_for(&live).await {
             // Nothing to fall back on, and better said than silently leaked:
@@ -238,17 +265,28 @@ fn accept(
         }
         open.borrow_mut().take();
         served.set(served.get().saturating_sub(1));
+        // Forgotten with the connection, which is what keeps the set the size
+        // of the tabs being served rather than of every tab ever served. The
+        // repeat this guards against belongs to a connection that is opening;
+        // once one has ended, its name is nobody's.
+        serving.borrow_mut().remove(&live_name);
         log::debug!("a tab stopped listening");
     });
 
-    // On the channel this tab is already listening on, rather than a second
-    // object opened to say one thing: a `BroadcastChannel` does not deliver to
-    // the object that posted, so answering here is also what keeps this tab
-    // from hearing its own answer and treating it as traffic.
+    answer(rendezvous, ask);
+}
+
+/// Tell a tab which channel its connection is on.
+///
+/// On the channel this tab is already listening on, rather than a second
+/// object opened to say one thing: a `BroadcastChannel` does not deliver to
+/// the object that posted, so answering here is also what keeps this tab from
+/// hearing its own answer and treating it as traffic.
+fn answer(rendezvous: &BroadcastChannel, ask: &str) {
     if let Some(line) = (Rendezvous::Serve {
         v: tabs::VERSION,
         ask: ask.to_string(),
-        on: name,
+        on: tabs::channel_for(ask),
     })
     .encode()
         && let Err(e) = rendezvous.post_message(&wasm_bindgen::JsValue::from_str(&line))
@@ -307,7 +345,22 @@ fn handler(
                 } else {
                     crate::media::read(&key)
                 };
+                // The ceiling is checked here, before the copy, because here
+                // is the only place it can be: what crosses is a
+                // `Uint8Array` this tab builds and the browser then clones
+                // into the asking tab, so a payload larger than that tab's
+                // whole allowance is already spent by the time it could
+                // refuse it. `most` absent means no ceiling — the answer to a
+                // download somebody asked for is not rationed, and neither is
+                // an older tab that does not know to send one.
+                let most = number_field(&data, "most").unwrap_or(u64::MAX);
                 let _ = match bytes {
+                    Some(bytes) if bytes.len() as u64 > most => post_failure(
+                        &frames,
+                        "media",
+                        id,
+                        &format!("media {key} is larger than the asking tab's budget"),
+                    ),
                     Some(bytes) => post_media(&frames, id, &bytes),
                     None => post_failure(&frames, "media", id, &format!("media {key} is not here")),
                 };

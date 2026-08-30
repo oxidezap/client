@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use oxidezap_ipc::tab::{self, FromTab, Media};
+use oxidezap_ipc::tab::{self, FromTab, Incoming, Media};
 use oxidezap_ipc::{ClientRequest, DaemonMessage, PROTOCOL_VERSION};
 use wasm_bindgen_futures::spawn_local;
 
@@ -39,6 +39,17 @@ use super::sink::{self, Events};
 /// of them in one browser. What is left out is not lost — the renderer draws
 /// media it does not have as an offer to download.
 use oxidezap_core::WEB_MEDIA_BUDGET_BYTES as FRAME_MEDIA_CEILING;
+
+/// How long one frame's whole media sideband may take.
+///
+/// Per frame rather than per key, and it is the same bound the socket path
+/// applies for a reason that is sharper here: posting to a
+/// `BroadcastChannel` nobody is listening on *succeeds*, so a tab that has
+/// gone does not refuse a request, it simply never answers one. Without this,
+/// a history frame naming a hundred cached photos spends a hundred sequential
+/// deadlines discovering that, one after another — and the takeover queued
+/// behind that frame waits out every one of them.
+const FRAME_MEDIA_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Attach to the tab holding the account.
 ///
@@ -60,7 +71,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     })?;
     let tab::Connection {
         link,
-        mut incoming,
+        incoming,
         media,
         hangup,
     } = connection;
@@ -107,6 +118,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     let pending = Arc::clone(&session.pending);
     let pictures = session.call_frames().clone();
     spawn_local(async move {
+        let mut incoming: Incoming = incoming;
         let mut frames = Frames::new(&events, &pending, held.as_ref(), &pictures);
         while let Some(message) = incoming.recv().await {
             match message {
@@ -121,7 +133,14 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
                     // Before the frame and not inside it: applying one is
                     // synchronous, so what it will ask for has to be here.
                     held.clear();
-                    gather(&message, &media, held.as_ref(), &pending).await;
+                    gather(
+                        &message,
+                        &media,
+                        held.as_ref(),
+                        &pending,
+                        incoming.connection_ended(),
+                    )
+                    .await;
                     if frames.apply(message).is_break() {
                         break;
                     }
@@ -136,40 +155,69 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
 
 /// Pull every payload this frame names out of the tab that has them.
 ///
-/// Sequentially, and under a ceiling rather than a clock. The socket path
-/// budgets time because its errand crosses a network; this one does not — the
-/// bytes are a structured clone away, and the one way it can hang is the tab
-/// on the other end vanishing, which every request already bounds for itself.
-/// What is worth bounding here is memory: two tabs, each holding a frame's
-/// media, in one browser.
-async fn gather(message: &DaemonMessage, media: &Media, into: &Fetched, pending: &super::Pending) {
+/// Sequentially, under a ceiling and under a clock — both, and neither is the
+/// other's substitute. The ceiling is memory: two tabs, each holding a frame's
+/// media, in one browser. The clock is the tab on the other end vanishing,
+/// which a per-request deadline bounds one request at a time and therefore
+/// does not bound at all across a frame naming a hundred keys.
+///
+/// `after_close` skips the optional half outright, exactly as the socket path
+/// does: once the other tab has gone, the frames still queued are worth
+/// applying and the media they name is not worth waiting for — the renderer
+/// draws what is missing as an offer to download. It does not skip a
+/// `Downloaded`, which *is* somebody's answer.
+async fn gather(
+    message: &DaemonMessage,
+    media: &Media,
+    into: &Fetched,
+    pending: &super::Pending,
+    after_close: bool,
+) {
     // A download somebody asked for is not rationed and is one key; a frame's
     // own media is both. The same division the socket path makes, made for
     // the same reason: a `Downloaded` frame *is* somebody's answer, and
     // skipping it would report a fetch that succeeded as one that failed.
     let answering_a_request = matches!(message, DaemonMessage::Downloaded { .. });
+    if after_close && !answering_a_request {
+        return;
+    }
     let ceiling = if answering_a_request {
         u64::MAX
     } else {
         FRAME_MEDIA_CEILING
     };
 
-    let mut held: u64 = 0;
-    for key in frames::media_keys(message, pending) {
-        if ceiling.saturating_sub(held) == 0 {
-            log::debug!("this frame's media passed its size budget; the rest is on demand");
-            break;
-        }
-        // `once` on the frame that answers a request, which is what releases
-        // the other tab's claim on those bytes — the same two answers that
-        // tab gives itself, asked from one connection away.
-        match media.read(&key, answering_a_request).await {
-            Ok(bytes) => {
-                held = held.saturating_add(bytes.len() as u64);
-                into.put(key, bytes);
+    let all = async {
+        let mut held: u64 = 0;
+        for key in frames::media_keys(message, pending) {
+            let Some(left) = ceiling.checked_sub(held).filter(|left| *left > 0) else {
+                log::debug!("this frame's media passed its size budget; the rest is on demand");
+                break;
+            };
+            // What is left rather than the whole ceiling, and sent *with* the
+            // request rather than checked on the answer: the other tab is the
+            // one that builds the array and the browser clones it from there,
+            // so a payload larger than the whole allowance is spent before
+            // anything here sees its length. A total consulted only between
+            // requests is one an oversized payload walks straight past.
+            //
+            // `once` on the frame that answers a request, which is what
+            // releases the other tab's claim on those bytes — the same two
+            // answers that tab gives itself, asked from one connection away.
+            match media.read(&key, answering_a_request, left).await {
+                Ok(bytes) => {
+                    held = held.saturating_add(bytes.len() as u64);
+                    into.put(key, bytes);
+                }
+                Err(e) => log::debug!("media {key} is not available: {e}"),
             }
-            Err(e) => log::debug!("media {key} is not available: {e}"),
         }
+    };
+    if crate::platform::with_timeout(all, FRAME_MEDIA_BUDGET)
+        .await
+        .is_none()
+    {
+        log::debug!("this frame's media did not arrive within its budget");
     }
 }
 

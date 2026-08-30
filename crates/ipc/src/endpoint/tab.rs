@@ -32,6 +32,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel, unbounded_channel};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
@@ -67,11 +68,39 @@ pub struct Connection {
     /// Where requests go.
     pub link: Link,
     /// Where frames arrive.
-    pub incoming: Receiver<FromTab>,
+    pub incoming: Incoming,
     /// The media sideband.
     pub media: Media,
     /// How this side ends it.
     pub hangup: Hangup,
+}
+
+/// The frames from the other tab, and whether it is still there.
+pub struct Incoming {
+    queued: Receiver<FromTab>,
+    ended: Rc<std::cell::Cell<bool>>,
+}
+
+impl Incoming {
+    /// Whether the connection has already gone, ahead of the queue saying so.
+    ///
+    /// The twin of the WebSocket's `connection_ended`, and it answers the same
+    /// question for the same reason: the frames still queued are worth
+    /// applying, and the *media* they name is not worth waiting for once the
+    /// tab that would serve it has gone. Here that matters more rather than
+    /// less — posting to a `BroadcastChannel` nobody is listening on succeeds,
+    /// so an unasked question is not refused, it is simply never answered, and
+    /// a frame naming a hundred keys would otherwise spend a hundred deadlines
+    /// in a row learning that.
+    #[must_use]
+    pub fn connection_ended(&self) -> bool {
+        self.ended.get()
+    }
+
+    /// The next thing that happened, oldest first.
+    pub async fn recv(&mut self) -> Option<FromTab> {
+        self.queued.recv().await
+    }
 }
 
 /// Ending the connection from this side.
@@ -81,14 +110,43 @@ pub struct Connection {
 /// its own address space, and what was a connection to another tab becomes a
 /// connection to `daemon::embedded`.
 #[derive(Clone)]
-pub struct Hangup(Sender<FromTab>);
+pub struct Hangup {
+    inbound: Sender<FromTab>,
+    ended: Rc<std::cell::Cell<bool>>,
+}
 
 impl Hangup {
     /// End the connection, saying why.
     ///
-    /// Best effort: a connection that has already ended has nothing to tell.
+    /// The flag is raised before the frame is queued, and that ordering is the
+    /// whole value: what is behind this call is a tab that has gone, so the
+    /// backlog still in the queue has to drain *without* asking it for
+    /// anything. Announcing the ending behind a hundred frames that each spend
+    /// a media deadline first is a takeover measured in hours.
     pub fn close(&self, reason: String) {
-        let _ = self.0.try_send(FromTab::Closed(reason));
+        self.ended.set(true);
+        deliver(&self.inbound, FromTab::Closed(reason));
+    }
+}
+
+/// Put one event on the queue, waiting for room only where waiting is right.
+///
+/// Lifted from the WebSocket transport, which learned it the same way: a
+/// `Closed` is one event and says what happened to the connection, so losing
+/// it to a full queue leaves the reader waiting on a connection that has
+/// already gone. A `Line` does not come through here — a task per overflowing
+/// frame is the unbounded queue wearing the scheduler's clothes — except the
+/// single frame that *triggers* the overflow, which is spent knowing that
+/// nothing is queued after it.
+fn deliver(inbound: &Sender<FromTab>, event: FromTab) {
+    match inbound.try_send(event) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(event)) => {
+            let inbound = inbound.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = inbound.send(event).await;
+            });
+        }
     }
 }
 
@@ -123,15 +181,25 @@ impl Media {
     /// cache: the sideband is a different shape here, not a different
     /// contract.
     ///
+    /// `most` is the largest payload worth having, and it is enforced by the
+    /// tab that *has* the bytes rather than by the tab that asked. That is the
+    /// only place it can be: a ceiling applied on arrival is applied after the
+    /// copy it exists to prevent — the sending tab has already built a
+    /// `Uint8Array` and the browser has already cloned it into this heap — so
+    /// a single payload larger than the whole allowance is spent before
+    /// anything here could refuse it.
+    ///
     /// # Errors
     ///
-    /// The connection has gone, or the other tab does not have the bytes.
-    pub async fn read(&self, key: &str, once: bool) -> Result<Vec<u8>, String> {
+    /// The connection has gone, the other tab does not have the bytes, or they
+    /// are larger than `most`.
+    pub async fn read(&self, key: &str, once: bool, most: u64) -> Result<Vec<u8>, String> {
         let (tell, told) = futures_channel::oneshot::channel();
         self.asks
             .send(Outgoing::Read {
                 key: key.to_string(),
                 once,
+                most,
                 answer: tell,
             })
             .map_err(|_| "the tab holding this account has gone".to_string())?;
@@ -179,6 +247,7 @@ enum Outgoing {
     Read {
         key: String,
         once: bool,
+        most: u64,
         answer: futures_channel::oneshot::Sender<Result<Vec<u8>, String>>,
     },
     Stage {
@@ -225,8 +294,9 @@ pub async fn connect() -> Result<Connection, String> {
     let live = crate::web_locks::hold(&tabs::liveness_lock_for(&ask)).await?;
 
     let (incoming, from_leader) = channel(MAX_QUEUED_FRAMES);
+    let ended = Rc::new(std::cell::Cell::new(false));
     let answers: Rc<RefCell<HashMap<u64, Answer>>> = Rc::new(RefCell::new(HashMap::new()));
-    let on_frame = frame_handler(&incoming, &answers);
+    let on_frame = frame_handler(&incoming, &answers, &ended);
     frames.set_onmessage(Some(on_frame.as_ref().unchecked_ref()));
 
     if let Err(e) = announce(&ask).await {
@@ -239,6 +309,24 @@ pub async fn connect() -> Result<Connection, String> {
         drop(live);
         return Err(e);
     }
+
+    let hangup = Hangup {
+        inbound: incoming,
+        ended: Rc::clone(&ended),
+    };
+    // Kept open for the life of the connection, not only for the ask.
+    //
+    // This is the *other* way a leader is replaced, and without it a third tab
+    // is left frozen. When a leader goes, every follower queues for the
+    // account and exactly one of them is granted it — that one hangs up and
+    // reconnects to itself. The others are still queued behind a lock the new
+    // leader now holds for its lifetime, and their channel to the tab that
+    // died will never say a word: nothing closes a `BroadcastChannel` and
+    // nobody is left to post on it. What reaches them is the new leader's own
+    // announcement, which is exactly the sentence they need — there is a
+    // daemon in this origin again — so hearing it ends the dead connection and
+    // the front end's ordinary retry attaches to whoever is now serving.
+    let watching = watch_for_a_new_leader(&hangup)?;
 
     let (asks, mut to_send) = unbounded_channel::<Outgoing>();
     let (lines, mut written) = unbounded_channel::<String>();
@@ -265,15 +353,21 @@ pub async fn connect() -> Result<Connection, String> {
         // the front end has let go of the connection.
         let _live = live;
         let _on_frame = on_frame;
+        let _watching = watching;
         let mut next: u64 = 0;
         while let Some(outgoing) = to_send.recv().await {
             let posted = match outgoing {
                 Outgoing::Line(line) => post_line(&frames, &line),
-                Outgoing::Read { key, once, answer } => {
+                Outgoing::Read {
+                    key,
+                    once,
+                    most,
+                    answer,
+                } => {
                     let id = next;
                     next += 1;
                     answers.borrow_mut().insert(id, Answer::Read(answer));
-                    post_read(&frames, id, &key, once)
+                    post_read(&frames, id, &key, once, most)
                 }
                 Outgoing::Stage { key, bytes, answer } => {
                     let id = next;
@@ -293,9 +387,56 @@ pub async fn connect() -> Result<Connection, String> {
 
     Ok(Connection {
         link: Link::over_socket(lines),
-        incoming: from_leader,
+        incoming: Incoming {
+            queued: from_leader,
+            ended,
+        },
         media: Media { asks },
-        hangup: Hangup(incoming),
+        hangup,
+    })
+}
+
+/// The rendezvous, listened to for as long as the connection lasts.
+///
+/// Held by the caller: closing the channel is what stops the watch, and a
+/// `Closure` dropped while the browser still holds a reference is a panic
+/// rather than a missed call.
+struct Watching {
+    channel: BroadcastChannel,
+    _heard: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        self.channel.set_onmessage(None);
+        self.channel.close();
+    }
+}
+
+/// End this connection when some other tab announces that it holds the
+/// account.
+fn watch_for_a_new_leader(hangup: &Hangup) -> Result<Watching, String> {
+    let channel = BroadcastChannel::new(tabs::RENDEZVOUS)
+        .map_err(|e| format!("this browser would not open a channel between tabs: {e:?}"))?;
+    let hangup = hangup.clone();
+    let heard = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+        let Some(line) = event.data().as_string() else {
+            return;
+        };
+        if matches!(Rendezvous::decode(&line), Some(Rendezvous::Leading { .. })) {
+            // Whoever posted it is not the tab this connection is to: a
+            // `BroadcastChannel` does not deliver to the object that posted,
+            // and a leader announces exactly once, on the way up. So this is
+            // always a *new* leader, and this connection is always to a tab
+            // that has gone.
+            log::info!("another tab has taken the account; reconnecting to it");
+            hangup.close("another tab has taken the account".to_string());
+        }
+    });
+    channel.set_onmessage(Some(heard.as_ref().unchecked_ref()));
+    Ok(Watching {
+        channel,
+        _heard: heard,
     })
 }
 
@@ -367,9 +508,11 @@ async fn announce(ask: &str) -> Result<(), String> {
 fn frame_handler(
     incoming: &Sender<FromTab>,
     answers: &Rc<RefCell<HashMap<u64, Answer>>>,
+    ended: &Rc<std::cell::Cell<bool>>,
 ) -> Closure<dyn FnMut(MessageEvent)> {
     let incoming = incoming.clone();
     let answers = Rc::clone(answers);
+    let ended = Rc::clone(ended);
     Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         let data = event.data();
         let Some(kind) = string_field(&data, "k") else {
@@ -383,11 +526,41 @@ fn frame_handler(
                 // Refused rather than queued past the bound, and the
                 // connection ends with it: the front end tracks requests
                 // against these frames, and failing them all at once lets the
-                // views that asked ask again. See the WebSocket's own note.
-                if incoming.try_send(FromTab::Line(line)).is_err() {
-                    let _ = incoming.try_send(FromTab::Closed(
-                        "this tab fell too far behind the one holding the account".to_string(),
-                    ));
+                // views that asked ask again.
+                //
+                // The ending cannot be queued *here*, though, and that was the
+                // bug: a `try_send` that failed for want of room proves there
+                // is no room for the next one either, so the frame and the
+                // close were both dropped on the floor, the handler went on
+                // accepting, and the front end sat on a connection it had no
+                // reason to think was broken. Both go out from one task that
+                // may wait — one task rather than two, because two race and
+                // the ending winning that race is the retained frame lost
+                // after all — with the flag raised first so the backlog drains
+                // without paying for its media on the way.
+                if let Err(TrySendError::Full(FromTab::Line(line))) =
+                    incoming.try_send(FromTab::Line(line))
+                {
+                    if ended.replace(true) {
+                        // Already ending: the frame is past the bound and the
+                        // close is already on its way.
+                        return;
+                    }
+                    log::error!(
+                        "the tab holding this account is sending frames faster than this one \
+                         can apply them; ending the connection"
+                    );
+                    let incoming = incoming.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if incoming.send(FromTab::Line(line)).await.is_ok() {
+                            let _ = incoming
+                                .send(FromTab::Closed(
+                                    "this tab fell too far behind the one holding the account"
+                                        .to_string(),
+                                ))
+                                .await;
+                        }
+                    });
                 }
             }
             "media" | "staged" => {
@@ -434,12 +607,17 @@ fn post_read(
     id: u64,
     key: &str,
     once: bool,
+    most: u64,
 ) -> Result<(), wasm_bindgen::JsValue> {
     let message = js_sys::Object::new();
     set(&message, "k", &"read".into())?;
     set(&message, "id", &(id as f64).into())?;
     set(&message, "key", &key.into())?;
     set(&message, "once", &once.into())?;
+    // A `f64` carries every byte count a browser can hold exactly — the
+    // integers are exact to 2^53, and a payload is bounded by a linear memory
+    // a thousand times smaller than that.
+    set(&message, "most", &(most.min(1 << 53) as f64).into())?;
     frames.post_message(&message)
 }
 
