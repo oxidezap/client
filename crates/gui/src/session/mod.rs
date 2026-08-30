@@ -46,9 +46,17 @@ mod web;
 /// until something says otherwise: a window that has not attached to anything
 /// yet holds no account, which is the answer that withholds rather than the
 /// one that promises.
+///
+/// Web-only, and so are the two functions below, because the question is:
+/// a desktop front end reaches a daemon in another *process* and never holds
+/// a session whatever happens, so there is nothing here for it to ask. Left
+/// ungated, all three are dead code on that target — which `-D warnings`
+/// rightly refuses, and which a check of the wasm target alone cannot see.
+#[cfg(target_family = "wasm")]
 static HOLDS_THE_ACCOUNT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether this tab is the one running the session.
+#[cfg(target_family = "wasm")]
 #[must_use]
 pub fn this_tab_holds_the_account() -> bool {
     HOLDS_THE_ACCOUNT.load(std::sync::atomic::Ordering::Relaxed)
@@ -58,6 +66,7 @@ pub fn this_tab_holds_the_account() -> bool {
 ///
 /// Called by each of the ways a connection is made, at the moment it is made
 /// — not before, because a tab that is still asking has not settled anything.
+#[cfg(target_family = "wasm")]
 pub(crate) fn note_account_is_here(here: bool) {
     HOLDS_THE_ACCOUNT.store(here, std::sync::atomic::Ordering::Relaxed);
 }
