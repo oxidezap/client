@@ -105,23 +105,41 @@ fn revision() {
 
 /// The checkout's own answer, and what to watch so it stays current.
 ///
-/// `rerun-if-changed` on `.git/HEAD` and on the file it names: without them
-/// the revision is baked in at the first build and every later one reports
-/// the commit that happened to be checked out that day. `git rev-parse
-/// --git-path` rather than joining paths onto `.git`, because a worktree's
-/// `.git` is a file and its HEAD is somewhere else entirely.
+/// Without a `rerun-if-changed` the revision is baked in at the first build
+/// and every later one reports the commit that happened to be checked out
+/// that day. What to watch is four files rather than one, because there is
+/// no single file a commit is guaranteed to touch:
+///
+///   `HEAD`             changes when the checkout does.
+///   the ref it names   changes when a commit lands on this branch — but
+///                      only exists while the ref is loose.
+///   `packed-refs`      is where that ref goes after a `git gc`, and where
+///                      it moves back out of.
+///   `logs/HEAD`        is appended on every commit and every checkout, and
+///                      is the one that covers the gap: with the branch
+///                      packed, a commit writes a *new* loose ref that no
+///                      earlier build could have named, and neither `HEAD`
+///                      nor `packed-refs` moves.
+///
+/// Only the ones that are there. Cargo reads a missing `rerun-if-changed`
+/// path as changed, so naming a file that does not exist yet — the loose ref
+/// of a packed branch, a reflog somebody turned off — would recompile this
+/// crate on every build for the rest of the checkout's life. Which leaves
+/// one gap by construction: a repository with no reflog *and* a packed
+/// branch can report the previous commit until some other input moves. That
+/// is a stale line in a footer, and the alternative is a permanent rebuild
+/// of the largest crate here.
+///
+/// `git rev-parse --git-path` rather than joining paths onto `.git`, because
+/// a worktree's `.git` is a file and its HEAD is somewhere else entirely.
 fn git_revision() -> Option<String> {
     let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
 
-    // HEAD moves when the checkout does; the ref it names moves when a
-    // commit lands on the branch already checked out. A detached HEAD has no
-    // second file, and holds the revision itself.
-    //
-    // Only files that are *there*: cargo reads a missing `rerun-if-changed`
-    // path as changed, so naming a ref that lives in `packed-refs` rather
-    // than in a file of its own would recompile this crate on every build
-    // for the rest of the checkout's life.
-    let mut watch = vec!["HEAD".to_owned()];
+    let mut watch = vec![
+        "HEAD".to_owned(),
+        "packed-refs".to_owned(),
+        "logs/HEAD".to_owned(),
+    ];
     watch.extend(git(&dir, &["symbolic-ref", "--quiet", "HEAD"]));
     for path in watch {
         if let Some(resolved) = git(&dir, &["rev-parse", "--git-path", &path]) {

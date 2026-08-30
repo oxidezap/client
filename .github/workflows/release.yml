@@ -21,12 +21,18 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       version: ${{ inputs.tag || github.ref_name }}
+      # The tag itself, not the ref this run was launched from. A tag push
+      # is already sitting on it; a `workflow_dispatch` naming an existing
+      # tag is launched from a branch, and without this the archives would
+      # be that branch's code uploaded over the tagged release's assets.
+      ref: ${{ inputs.tag || github.ref_name }}
 
   # The client as a page, packaged so it can be hosted without being built.
   web:
     uses: ./.github/workflows/web-bundle.yml
     with:
       version: ${{ inputs.tag || github.ref_name }}
+      ref: ${{ inputs.tag || github.ref_name }}
 
   publish:
     needs: [build, web]

@@ -20,6 +20,15 @@ on:
         description: Version string embedded in the archive name
         required: true
         type: string
+      ref:
+        description: >
+          Revision to build. Empty means the one the run was started from.
+          A manual release names an existing tag while being launched from a
+          branch, and a bundle built from that branch would be published as
+          the tag's.
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -36,6 +45,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Empty is the ref the run was started from, which is what a push
+          # to `main` wants.
+          ref: ${{ inputs.ref }}
 
       # Nightly, and not by preference — the same three reasons `pages.yml`
       # gives: `-Z build-std` is nightly-only, the standard library has to be
