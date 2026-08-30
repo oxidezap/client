@@ -290,6 +290,12 @@ fn acquire_startup_lock(_path: &Path) -> Result<StartupLock> {
 /// controls the account somewhere another user can reach is a worse one.
 #[cfg(unix)]
 fn prepare_state_dir(dir: &Path) -> Result<()> {
+    prepare_state_dir_with_media(dir, oxidezap_ipc::media_dir().as_deref())
+}
+
+/// The same, told where the media cache is, so a test can name one.
+#[cfg(unix)]
+fn prepare_state_dir_with_media(dir: &Path, media: Option<&Path>) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -334,7 +340,7 @@ fn prepare_state_dir(dir: &Path) -> Result<()> {
         log::warn!("tightening {} from {mode:o} to 700", dir.display());
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("restricting {}", dir.display()))?;
-        if let Some(media) = oxidezap_ipc::media_dir()
+        if let Some(media) = media
             && media.exists()
         {
             log::warn!(
@@ -342,9 +348,13 @@ fn prepare_state_dir(dir: &Path) -> Result<()> {
                  have put media in",
                 media.display()
             );
-            if let Err(e) = std::fs::remove_dir_all(&media) {
-                log::warn!("{} could not be cleared ({e})", media.display());
-            }
+            // Refused rather than logged: a cache this daemon could not
+            // clear is one another account may have planted a file in under
+            // a key we would then serve as this account's own photo, and
+            // starting anyway is trusting exactly what the `chmod` above
+            // could not vouch for.
+            std::fs::remove_dir_all(media)
+                .with_context(|| format!("clearing {}", media.display()))?;
         }
     }
     Ok(())
@@ -2091,6 +2101,40 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The cache in a directory others could write is deleted, and a delete
+    /// that fails refuses the directory.
+    ///
+    /// Tightening the mode closes the door on whatever is already inside, so
+    /// a cache this daemon could not clear is one another account may have
+    /// planted a file in under a key we would then serve as this account's
+    /// own photo. Logged and carried on, that is trusting exactly what the
+    /// `chmod` could not vouch for.
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_that_cannot_be_cleared_refuses_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("oxidezap-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        // A file where the cache directory belongs: `remove_dir_all` refuses
+        // it, which is the failure without needing a second account to make
+        // one.
+        let media = dir.join("media");
+        std::fs::write(&media, b"planted").unwrap();
+
+        let err = prepare_state_dir_with_media(&dir, Some(&media))
+            .expect_err("a cache that will not clear is not a cache to keep");
+        assert!(
+            err.to_string().contains("clearing"),
+            "unexpected reason: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A directory we already own is reused, and tightened if it is loose.
