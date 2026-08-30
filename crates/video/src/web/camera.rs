@@ -358,20 +358,25 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
                     return;
                 }
                 let keyframe = chunk.type_() == web_sys::EncodedVideoChunkType::Key;
-                // Dropped rather than queued: this is the same trade the
-                // desktop's plane makes one step further along. A unit the
-                // session has not taken by the time the next is encoded is
-                // one the peer is better off not waiting for.
+                // Something is dropped when this queue is full, and *which*
+                // is the whole question. `try_send` refuses the unit just
+                // encoded and keeps the two before it, which is this queue's
+                // stated policy exactly backwards: after a scheduling or
+                // encoder burst the session is handed a stale picture, then
+                // another, before it ever reaches the current scene. The
+                // newest frame is the only one worth having — that is what
+                // the depth of two is for — so the oldest is evicted instead.
+                // The microphone's queue makes the same call one crate over.
                 //
-                // The keyframe is asked for *here*, though, and not left to
-                // the session: a unit dropped at this queue never reaches the
+                // The keyframe is asked for *here*, and not left to the
+                // session: a unit dropped at this queue never reaches the
                 // session at all, so its own "my send failed" path cannot see
                 // the gap, and every P-frame after this one references a
-                // picture the peer will never hold. Only on `Full` — a closed
-                // channel means the call is over and nothing wants a picture.
-                if let Err(async_channel::TrySendError::Full(_)) =
-                    tx.try_send(EncodedFrame { data, keyframe })
-                {
+                // picture the peer will never hold. Asked whenever something
+                // was evicted, which `force_send` reports as `Ok(Some(_))`; a
+                // closed channel means the call is over and nothing wants a
+                // picture.
+                if let Ok(Some(_)) = tx.force_send(EncodedFrame { data, keyframe }) {
                     control.request_keyframe();
                 }
             },

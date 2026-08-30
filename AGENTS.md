@@ -1718,6 +1718,21 @@ by definition.
   samples a presentation position depends on rather than a range. That is the
   timeline's indexing model rather than a patch to it, and verifying it wants
   a B-frame fixture this tree has none of.
+- **A follower tab cannot place a call, and the reason is which document owns
+  the devices.** A tab that lost the claim holds no session, so its Place or
+  Accept is executed by the tab that does — and `getUserMedia` and
+  `AudioContext::resume` then run in *that* document. The microphone, the
+  speakers and the permission prompt would all be the leader's, in a tab the
+  person pressing the button is not looking at and has not gestured in, so
+  the call would be held by a tab that did not ask for it and heard there
+  too. `calls_unavailable` refuses it and says which tab to use. It is the
+  one place a follower differs from a desktop window talking to an
+  `oxidezapd`, and the contrast is what makes it right: there the devices are
+  the daemon's by design and nobody expects the window to hold them, while
+  here both tabs are windows and the wrong one would. Fixing it properly
+  means the follower opening the devices and handing them across, which is a
+  change to the tab protocol rather than a check.
+
 - **A dropped access unit is a frame of RTP time that goes unspent.** The
   library's `VideoSource` advertises one `rtp_timestamp_stride` and advances
   by exactly that per unit delivered, and `EncodedFrame` carries no timestamp

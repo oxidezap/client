@@ -88,10 +88,10 @@ impl WhatsAppApp {
     /// than waiting for an answer event that never arrives for an inbound
     /// call. That gap is what used to leave the audio running with no UI.
     pub fn accept_call(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = &self.client else {
+        if self.client.is_none() {
             warn!("Cannot accept call: client is unavailable");
             return;
-        };
+        }
         // The same question the outgoing path asks, and it has to be asked
         // here too: an offer arrives whatever this browser can carry, so a
         // page that cannot hold the media would otherwise open the
@@ -108,11 +108,39 @@ impl WhatsAppApp {
         let Some(call) = self.call_state.take_incoming() else {
             return;
         };
+        // A video offer this window cannot decode is still a call worth
+        // taking: the audio works, and the only thing missing is the picture.
+        //
+        // Said rather than acted on, because the two obvious actions are both
+        // worse and one of them is not ours to take. Declining throws away a
+        // conversation over a pane. Answering it as voice is the daemon's
+        // decision and deliberately not a front end's — it reads `is_video`
+        // off the ringing offer rather than taking our word, since the
+        // library refuses `.video()` on an audio offer — so there is no way
+        // from here to accept a video call as anything else. What is left,
+        // and what the person actually needs, is knowing why the picture
+        // never arrives instead of watching two panes wait forever.
+        if call.is_video
+            && let Some(reason) = crate::platform::video_decode_unavailable()
+        {
+            warn!("Accepting a video call this window cannot draw: {reason}");
+            self.notify_user(
+                "This browser cannot show video, so you will hear this call but not see it.",
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
+        }
         info!(
             "Accepting call {} from {}",
             call.call_id,
             observe_str(&call.caller_jid)
         );
+        let Some(client) = &self.client else {
+            // Checked at the top; re-read here because the notice above needs
+            // `self`, and a borrow held across it would outlive it.
+            warn!("Cannot accept call: client is unavailable");
+            return;
+        };
         client.accept_call(call.call_id.as_str());
         self.call_state.connect_accepted(&call);
         self.ensure_tick(cx);

@@ -171,6 +171,30 @@ mod calls {
     pub fn calls_unavailable() -> Option<&'static str> {
         match oxidezap_ipc::web::named_daemon() {
             oxidezap_ipc::web::NamedDaemon::Named(_) => None,
+            // A follower tab holds no session, so its Place or Accept is
+            // executed by the tab that does — and that tab is where
+            // `getUserMedia` and `AudioContext::resume` would run. The
+            // devices would be the *leader's*: its microphone, its speakers,
+            // its permission prompt, in a document the person pressing the
+            // button is not looking at and has not gestured in. So the call
+            // would be held by a tab that did not ask for it, and heard there
+            // too.
+            //
+            // Refused rather than relayed, because the fix is not a capability
+            // this window is missing: it is which document owns the media, and
+            // moving that needs the follower to open the devices and hand them
+            // across — a change to the tab protocol rather than a check.
+            //
+            // This is the one place a follower differs from a desktop window
+            // talking to an `oxidezapd`, and the reason is the same one that
+            // makes the daemon arrangement fine: there the devices are the
+            // daemon's *by design*, and nobody expects the window to hold
+            // them. Here both tabs are windows, and the wrong one would.
+            _ if !crate::session::this_tab_holds_the_account() => Some(
+                "This tab is showing an account another tab is running, so a \
+                 call would open that tab's microphone instead. Place it from \
+                 that tab.",
+            ),
             // `Rejected` answered like `Nobody`, as above: the window is on
             // the refusal screen and drawing no call control either way.
             _ if has_peer_connection() => None,
