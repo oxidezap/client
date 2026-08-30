@@ -284,6 +284,21 @@ opt-level = "z"
 [profile.web.package.buffa]
 opt-level = "z"
 
+# The same bundle with its symbols, which `WEB_PROFILE=debug ./web/build.sh`
+# selects. It inherits `web` rather than `release` deliberately: a build you
+# are diagnosing should be the build that misbehaved, so the only difference
+# is that the names survive.
+#
+# `strip` and not `debug`: what a wasm flame graph and a panic trace read is
+# the *name section*, which rustc emits unless it is stripped — and which
+# `strip = true` removes before wasm-opt ever sees the module, which is why
+# there are no Rust symbols in a profile of the published page and never were.
+# Full DWARF would add source lines and tens of megabytes; the names are what
+# was promised.
+[profile.web-debug]
+inherits = "web"
+strip = "none"
+
 # z = persistence and the one-shot subsystems, mirroring the sweep above for
 # the members of it that actually reach this target.
 [profile.web.package.diesel]

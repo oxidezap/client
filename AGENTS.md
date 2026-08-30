@@ -153,10 +153,11 @@ TRUNK_ACTION=serve ./web/build.sh
 # query reaches whoever served the page, a fragment never leaves the browser.
 cargo run --bin oxidezapd -- --web
 
-# The bundle with its diagnostics intact, for when a page misbehaves. The
-# published one is built to `[profile.web]`, whose whole subject is bytes;
-# this is the ordinary release profile with the standard library at its
-# defaults.
+# The same bundle with its symbols, for when a profile or a panic trace has
+# to name something. `[profile.web-debug]` inherits `[profile.web]` and turns
+# `strip` off, so it is the build that misbehaved rather than a different one
+# — and `-g` in `data-wasm-opt-params` is what stops wasm-opt throwing the
+# name section away again.
 WEB_PROFILE=debug ./web/build.sh
 ```
 

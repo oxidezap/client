@@ -35,13 +35,20 @@
          wasm-bindgen output, trunk's release default produced 29,825,238
          bytes and `-Oz` produced 29,419,240.
 
-         Nothing here strips anything, because there is nothing left to strip:
-         `strip = true` in the release profile removes the name section before
-         wasm-opt ever sees the module, and `wasm-objdump -h` on the shipped
+         Nothing here strips anything, because in the shipped build there is
+         nothing left to strip: `strip = true` removes the name section before
+         wasm-opt ever sees the module, and `wasm-objdump -h` on the published
          artifact lists exactly one custom section, `producers`, at 72 bytes.
-         Which is also the warning worth leaving: a DevTools flame graph of
-         this page has no Rust symbols in it and never had. Build with
-         `WEB_PROFILE=debug ./web/build.sh` when you need them. -->
+         Which is the warning worth leaving — a DevTools flame graph of this
+         page has no Rust symbols in it and never had.
+         `WEB_PROFILE=debug ./web/build.sh` is the build that does: it selects
+         `[profile.web-debug]`, which is the same profile with `strip` off.
+
+         `-g` is what carries that through to here. wasm-opt drops the name
+         section unless asked to keep it, so without this the debug profile
+         would produce a module whose symbols rustc emitted and this step
+         threw away — and it costs the shipped build nothing, because there
+         the section it preserves does not exist. -->
     <link
       data-trunk
       rel="rust"
@@ -49,7 +56,7 @@
       data-bin="oxidezap"
       data-bindgen-target="web"
       data-wasm-opt="z"
-      data-wasm-opt-params="--enable-bulk-memory --enable-threads --enable-mutable-globals --enable-nontrapping-float-to-int --enable-sign-ext"
+      data-wasm-opt-params="-g --enable-bulk-memory --enable-threads --enable-mutable-globals --enable-nontrapping-float-to-int --enable-sign-ext"
     />
 
     <!-- Cross-origin isolation, which GitHub Pages cannot give us.

@@ -374,17 +374,26 @@ const MAX_VIDEO_PLAYERS: usize = 10;
 
 /// How many bytes of decoded images to keep cached.
 ///
-/// Bytes rather than entries, which is what this was. Fifty is a number about
-/// a list; what the cache actually costs is the photographs in it, and fifty
-/// pictures off a phone are two hundred megabytes of encoded bytes before
-/// `gpui` has decoded any of them — in a linear memory with a one-gigabyte
-/// ceiling that never shrinks. The count bounded the wrong thing in both
-/// directions: fifty stickers are a rounding error, and fifty photos are the
-/// tab.
+/// Bytes *and* [`MAX_DECODED_IMAGES`], because neither bounds this on its own.
+/// Fifty is a number about a list, and fifty pictures off a phone are two
+/// hundred megabytes of encoded bytes before `gpui` has decoded any of them —
+/// in a linear memory with a one-gigabyte ceiling that never shrinks.
 ///
 /// [`oxidezap_core::DECODED_IMAGE_BUDGET_BYTES`] is where the share comes
 /// from, because the page's budgets are ceilings on one heap.
 const DECODED_IMAGE_BUDGET: usize = oxidezap_core::DECODED_IMAGE_BUDGET_BYTES as usize;
+
+/// How many decoded images to keep cached, whatever they weigh.
+///
+/// The second half of [`DECODED_IMAGE_BUDGET`], and not redundant with it:
+/// what this cache measures is the *encoded* payload, and what it keeps alive
+/// is the decoded one. `gpui` holds the `RenderImage` against the `Arc<Image>`
+/// this map is what retains, and nothing here can see how large that is
+/// without decoding the picture to find out. A sticker, a screenshot or a
+/// flat-colour PNG is a few kilobytes encoded and megabytes of RGBA, so a byte
+/// budget alone admits hundreds of them — which is the bound the count was
+/// quietly providing before it was removed.
+const MAX_DECODED_IMAGES: usize = 50;
 
 /// Download timeout in seconds (for audio/video downloads)
 /// How long a download somebody asked for is allowed to take.

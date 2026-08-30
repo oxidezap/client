@@ -582,14 +582,16 @@ impl WhatsAppApp {
 
         let mut cache = self.decoded_images.borrow_mut();
 
-        // Oldest first, until this one fits. Measured in bytes rather than
-        // entries: see `DECODED_IMAGE_BUDGET`. An image larger than the whole
-        // budget still goes in and is then alone in the cache — refusing it
-        // would mean a picture the reader opened and the renderer decoded on
-        // every frame.
+        // Oldest first, until this one fits under both ceilings — see
+        // `DECODED_IMAGE_BUDGET` for why there are two. An image larger than
+        // the whole budget still goes in and is then alone in the cache;
+        // refusing it would mean a picture the reader opened being decoded
+        // again on every frame.
         let cost = image.bytes.len();
         let mut held: usize = cache.values().map(|image| image.bytes.len()).sum();
-        while held + cost > DECODED_IMAGE_BUDGET && !cache.is_empty() {
+        while (held + cost > DECODED_IMAGE_BUDGET || cache.len() >= MAX_DECODED_IMAGES)
+            && !cache.is_empty()
+        {
             if let Some((_, evicted)) = cache.shift_remove_index(0) {
                 held = held.saturating_sub(evicted.bytes.len());
             }
