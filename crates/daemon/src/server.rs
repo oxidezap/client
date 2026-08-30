@@ -1046,8 +1046,12 @@ async fn handle_request(
         ClientRequest::SetLogLevel { level } => {
             oxidezap_logging::apply(level);
             log::info!("logging at {level}, asked for by a front end");
-            let recorded =
-                oxidezap_session::unblock(move || oxidezap_logging::remember(level)).await;
+            // `remember` writes the level in force rather than this
+            // request's, and serializes the writes: two front ends can ask in
+            // the same moment and each is written on a thread of its own, so
+            // a write carrying its own level could land after a later one and
+            // leave the next start at the earlier answer.
+            let recorded = oxidezap_session::unblock(oxidezap_logging::remember).await;
             match recorded {
                 Ok(Ok(())) => acted(Ok(())),
                 // The level *did* change; only the memory of it failed. Said

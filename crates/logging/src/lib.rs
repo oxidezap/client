@@ -21,6 +21,7 @@
 //! a person changing the level in Settings is asking about now.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 pub use oxidezap_core::LogLevel;
 
@@ -64,8 +65,20 @@ pub fn install(quiet: &'static [&'static str]) {
 ///
 /// `RUST_LOG` (or `?log=`), then the stored choice, then `info`.
 pub fn activate() -> LogLevel {
-    let level = forced().unwrap_or_else(|| stored().unwrap_or_default());
+    // Read before anything is applied and reported after, in that order and
+    // for one reason: `log`'s runtime maximum is `Off` until the first
+    // `set_max_level`, so a line written about the file here would be
+    // discarded by the macro before any logger saw it — and a stored level
+    // that failed to parse would then be ignored in total silence, which is
+    // the one thing worth saying about it.
+    let stored = store::read();
+    let level = forced()
+        .or_else(|| stored.as_ref().ok().copied().flatten())
+        .unwrap_or_default();
     apply(level);
+    if let Err(e) = &stored {
+        log::warn!("the stored log level was not used ({e}); logging at {level}");
+    }
     level
 }
 
@@ -94,17 +107,10 @@ pub const fn forced_by() -> &'static str {
 /// product default is a perfectly good answer.
 #[must_use]
 pub fn stored() -> Option<LogLevel> {
-    match store::read() {
-        Ok(level) => level,
-        Err(e) => {
-            // At `install` time there is no logger yet, and this is called
-            // again from Settings where there is. A line either way is better
-            // than a silent fallback to `info` that reads as the file being
-            // ignored.
-            log::debug!("could not read the stored log level: {e}");
-            None
-        }
-    }
+    // Silent, and deliberately: the one caller that runs before a logger
+    // exists is [`activate`], which reads the store itself so it can say
+    // what happened *after* it has established a level to say it at.
+    store::read().ok().flatten()
 }
 
 /// Log at this level from now on, without writing it down.
@@ -126,14 +132,29 @@ pub fn apply(level: LogLevel) {
     log::set_max_level(level.filter().max(imp::named_ceiling()));
 }
 
-/// Write the choice down, so the next start makes it again.
+/// Write the level in force down, so the next start makes it again.
+///
+/// What is written is [`current`] rather than a level passed in, and the
+/// writes are serialized. Both halves answer the same thing: two front ends
+/// can change the level in the same moment, and the daemon writes for each
+/// of them on a thread of its own. Ordered by nothing, two writes carrying
+/// their own levels can land in either order and leave the file disagreeing
+/// with the process — the earlier request restored on the next start. A
+/// write that asks what the level *is* converges instead: whichever runs
+/// last writes the last level applied.
 ///
 /// # Errors
 ///
 /// There is nowhere to keep it — no config directory, a browser with site
 /// data switched off — or keeping it failed.
-pub fn remember(level: LogLevel) -> Result<(), String> {
-    store::write(level)
+pub fn remember() -> Result<(), String> {
+    static WRITING: Mutex<()> = Mutex::new(());
+    // Recovered rather than panicked on: this guards one file write with no
+    // invariant spanning anything, so a holder that died mid-write left
+    // nothing torn — the write is a temporary and a rename — and a second
+    // panic here would hide the first.
+    let _serialized = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
+    store::write(current())
 }
 
 /// Change the level and remember it: what a front end's own process does.
@@ -145,7 +166,7 @@ pub fn remember(level: LogLevel) -> Result<(), String> {
 /// change. A caller that cannot persist has still been heard.
 pub fn set(level: LogLevel) -> Result<(), String> {
     apply(level);
-    remember(level)
+    remember()
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -164,47 +185,86 @@ mod imp {
             .filter(|v| !v.trim().is_empty())
     }
 
-    /// The bare level in `RUST_LOG`, if it names one.
+    /// One directive out of a filter: a level, and the target it is about.
     ///
-    /// `env_filter`'s own grammar, which is what `env_logger` parses: a
-    /// comma-separated list of directives, each either `target=level` or a
-    /// level on its own. The one on its own is the global answer, and the
-    /// last one wins.
+    /// `None` for the target is the level with nothing attached — the one
+    /// that says how loud the process is.
+    type Directive = (Option<String>, log::LevelFilter);
+
+    /// Read a filter the way `env_filter` reads it.
+    ///
+    /// Its grammar and not a subset of it, because every form it accepts is
+    /// one somebody may have in a shell profile, and one this crate fails to
+    /// recognise is a directive the dynamic gate then refuses. Three of them
+    /// are easy to miss and all three are real:
+    ///
+    /// - `RUST_LOG=oxidezap_session` — a bare word that is not a level names
+    ///   a *target*, at `trace`.
+    /// - `RUST_LOG=oxidezap_session=` — an empty level does the same.
+    /// - `RUST_LOG=debug/stanza` — the `/` and everything after it is a
+    ///   regular expression over the message, applied by the logger. It is
+    ///   not part of the last directive's level, and reading it as one loses
+    ///   the level in front of it.
+    ///
+    /// An unreadable level is skipped, which is what `env_filter` does with
+    /// it too.
+    fn parse_filter(spec: &str) -> Vec<Directive> {
+        // The regex is one suffix over the whole filter rather than
+        // something a directive carries, so it comes off first.
+        let directives = spec.split('/').next().unwrap_or_default();
+        directives
+            .split(',')
+            .map(str::trim)
+            .filter(|directive| !directive.is_empty())
+            .filter_map(|directive| match directive.split_once('=') {
+                Some((target, level)) => {
+                    let (target, level) = (target.trim(), level.trim());
+                    // `target=` names a target at its loudest, exactly as a
+                    // bare `target` does.
+                    let level = if level.is_empty() {
+                        log::LevelFilter::Trace
+                    } else {
+                        level.parse().ok()?
+                    };
+                    (!target.is_empty()).then(|| (Some(target.to_string()), level))
+                }
+                // A bare word is a level if it reads as one, and a target at
+                // its loudest otherwise.
+                None => Some(match directive.parse() {
+                    Ok(level) => (None, level),
+                    Err(_) => (Some(directive.to_string()), log::LevelFilter::Trace),
+                }),
+            })
+            .collect()
+    }
+
+    /// The bare level in `RUST_LOG`, if it names one.
     pub(super) fn forced() -> Option<LogLevel> {
         global_level(&directives()?)
     }
 
-    /// The last module-less directive in a filter string.
-    fn global_level(directives: &str) -> Option<LogLevel> {
-        directives
-            .split(',')
-            .filter(|directive| !directive.contains('='))
-            .filter_map(|directive| directive.trim().parse::<LogLevel>().ok())
-            .next_back()
+    /// The last directive in a filter that names no target.
+    ///
+    /// The last, because that is `env_filter`'s rule for two answers to one
+    /// question.
+    fn global_level(spec: &str) -> Option<LogLevel> {
+        parse_filter(spec)
+            .into_iter()
+            .rev()
+            .find(|(target, _)| target.is_none())
+            .map(|(_, level)| LogLevel::from_filter(level))
     }
 
-    /// A `target=level` directive out of `RUST_LOG`, as this module needs to
-    /// read them itself.
+    /// The targets a filter names, and how loud each was asked to be.
     ///
     /// `env_filter` parses these too and answers with them, and that answer
-    /// is still what runs — this second reading exists only to know *that* a
-    /// target was named, which is a question its `Filter` does not expose.
-    /// See [`Dynamic::named`] for why the difference matters.
-    fn named_targets(directives: &str) -> Vec<(String, log::LevelFilter)> {
-        directives
-            .split(',')
-            // The regex half of a filter (`directives/regex`) is the inner
-            // logger's business and never a target's name.
-            .filter_map(|directive| directive.split('/').next())
-            .filter_map(|directive| directive.split_once('='))
-            .filter_map(|(target, level)| {
-                let target = target.trim();
-                // A bare `=level` names nothing, and neither does a level
-                // this crate cannot read.
-                (!target.is_empty())
-                    .then(|| Some((target.to_string(), level.trim().parse().ok()?)))
-                    .flatten()
-            })
+    /// is still what runs — this reading exists only to know *that* a target
+    /// was named, which is a question its `Filter` does not expose. See
+    /// [`Dynamic::named`] for why the difference matters.
+    fn named_targets(spec: &str) -> Vec<(String, log::LevelFilter)> {
+        parse_filter(spec)
+            .into_iter()
+            .filter_map(|(target, level)| Some((target?, level)))
             .collect()
     }
 
@@ -363,6 +423,37 @@ mod imp {
             // A bare level names nothing, and neither does an unreadable one.
             assert!(named_targets("debug").is_empty());
             assert!(named_targets("gpui=verbose").is_empty());
+        }
+
+        /// `env_filter`'s shorthands, which are the forms most likely to be
+        /// sitting in somebody's shell profile: a bare target is that target
+        /// at its loudest, an empty level says the same thing, and a filter
+        /// this crate failed to recognise is a directive the gate then
+        /// refuses.
+        #[test]
+        fn a_target_named_without_a_level_is_named_at_its_loudest() {
+            assert_eq!(
+                named_targets("oxidezap_session"),
+                vec![("oxidezap_session".to_string(), log::LevelFilter::Trace)]
+            );
+            assert_eq!(
+                named_targets("oxidezap_session="),
+                vec![("oxidezap_session".to_string(), log::LevelFilter::Trace)]
+            );
+            // And it is a statement about that target, not about the process.
+            assert_eq!(global_level("oxidezap_session"), None);
+        }
+
+        /// The `/` and what follows it is a regular expression over the
+        /// message, applied by the logger. Read as part of the level in front
+        /// of it, it loses that level entirely.
+        #[test]
+        fn a_message_regex_is_not_part_of_the_level() {
+            assert_eq!(global_level("debug/stanza"), Some(LogLevel::Debug));
+            assert_eq!(
+                global_level("info,oxidezap_session=debug/pair-device"),
+                Some(LogLevel::Info)
+            );
         }
 
         /// A filter that only names targets says nothing about how loud the

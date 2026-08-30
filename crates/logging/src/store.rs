@@ -54,6 +54,7 @@ pub fn write(level: LogLevel) -> Result<(), String> {
 #[cfg(not(target_family = "wasm"))]
 mod imp {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Where this platform keeps a per-user configuration file.
     ///
@@ -111,9 +112,18 @@ mod imp {
         // window and the daemon both write this one, so a file written in
         // place could be read by one process halfway through the other's
         // write. A rename is what makes the two orderings the only two.
-        // The temporary carries the process id so those two cannot collide
-        // over it either.
-        let temp = path.with_extension(format!("tmp{}", std::process::id()));
+        //
+        // The temporary carries the process id *and* a counter, because two
+        // writers in one process are as ordinary as two processes here: a
+        // daemon serving two windows writes for each of them on a thread of
+        // its own, and a shared name is one write truncating another's file
+        // and renaming the result.
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let temp = path.with_extension(format!(
+            "tmp{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         write_and_sync(&temp, word).map_err(|e| {
             let _ = std::fs::remove_file(&temp);
             format!("could not write {}: {e}", temp.display())
