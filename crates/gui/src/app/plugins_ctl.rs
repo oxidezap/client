@@ -57,14 +57,33 @@ const MAX_FIELD_BYTES: usize = 64 * 1024;
 /// field the moment somebody clicked another conversation — swept away and
 /// rebuilt from the plugin's last published value, with what had been typed
 /// gone for a context it never had.
-fn key(plugin: &str, slot: PluginSlot, chat: Option<&str>, id: &str) -> String {
+fn key(plugin: &str, slot: PluginSlot, chat: Option<&str>, id: &str) -> FieldKey {
     let chat = match slot {
         PluginSlot::ChatHeader => chat,
         PluginSlot::Settings => None,
     };
-    // A separator no plugin id may hold: ids are alphanumeric plus `-` and
-    // `_`, checked by the host when it reads the file's name.
-    format!("{plugin}/{slot:?}/{}/{id}", chat.unwrap_or(""))
+    FieldKey {
+        plugin: plugin.to_string(),
+        slot,
+        chat: chat.map(str::to_string),
+        id: id.to_string(),
+    }
+}
+
+/// Which field, as the four things that name it.
+///
+/// A tuple and not a formatted string. The separator a string needs has to
+/// be a character none of the four can hold, and only the plugin id is
+/// checked for that: a *widget* id is decoded by `ui::ident`, which asks for
+/// valid non-empty UTF-8 and nothing else, and the chat JID goes in raw. Two
+/// different `(chat, id)` pairs formatting to one key is two boxes sharing
+/// one `InputState`, so what is typed in one commits in the other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FieldKey {
+    plugin: String,
+    slot: PluginSlot,
+    chat: Option<String>,
+    id: String,
 }
 
 impl WhatsAppApp {
@@ -89,7 +108,7 @@ impl WhatsAppApp {
         // Gone means gone: a plugin that stopped drawing a field has taken it
         // back, and holding the entity would keep a subscription alive that
         // fires into a widget nobody can see.
-        let live: std::collections::HashSet<String> = wanted
+        let live: std::collections::HashSet<FieldKey> = wanted
             .iter()
             .map(|f| key(&f.plugin, f.slot, chat.as_deref(), &f.id))
             .collect();
@@ -254,7 +273,7 @@ fn collect_fields(plugin: &str, slot: PluginSlot, node: &PluginNode, out: &mut V
 }
 
 /// The map the app holds.
-pub type PluginFields = HashMap<String, PluginField>;
+pub type PluginFields = HashMap<FieldKey, PluginField>;
 
 #[cfg(test)]
 mod tests {
@@ -281,6 +300,21 @@ mod tests {
             header(Some("a@s.whatsapp.net")),
             settings(Some("a@s.whatsapp.net")),
             "and the same id in two slots is still two fields"
+        );
+    }
+
+    /// The key used to be a formatted string with `/` between its parts. A
+    /// plugin id cannot hold one, which is what the comment there said, but a
+    /// *widget* id can, since `ui::ident` asks for valid non-empty UTF-8 and
+    /// nothing more, and so can a chat JID. Two different fields formatting
+    /// to one key is two boxes sharing an `InputState`: what is typed over
+    /// one conversation commits in the other.
+    #[test]
+    fn two_header_fields_do_not_collide_through_their_separator() {
+        let header = |chat, id| key("autoreply", PluginSlot::ChatHeader, Some(chat), id);
+        assert_ne!(
+            header("a@s.whatsapp.net", "b@s.whatsapp.net/note"),
+            header("a@s.whatsapp.net/b@s.whatsapp.net", "note"),
         );
     }
 }

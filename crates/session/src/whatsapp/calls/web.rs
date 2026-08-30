@@ -1,31 +1,26 @@
-//! Calls in a browser: heard, recorded, and not answered.
+//! Calls in a browser: heard, declined, and not answered.
 //!
-//! Every one of the actions goes through `client.voip()`, and that is the
-//! module a page does not have. So they are refused, and refused *here*, at
-//! the method the front end calls, rather than deeper in where the failure
-//! would arrive as a call that silently never connects.
+//! Answering, placing, muting and turning a camera on all go through the
+//! library's `voip` runtime, whose codec is C and does not build for
+//! `wasm32-unknown-unknown`. So they are refused, and refused *here*, at the
+//! method the front end calls, rather than deeper in where the failure would
+//! arrive as a call that silently never connects.
 //!
-//! # Declining does not reach the caller, and cannot from here
+//! # Signalling is free of the feature; media is not
 //!
-//! It should. A `<reject>` needs no audio codec — it is a stanza on the
-//! socket that is already open — and `AGENTS.md` is explicit that ending a
-//! call is *something you say*, since a local teardown alone leaves the far
-//! end ringing until its transport gives up. That is exactly what a decline
-//! does here, and it is a wart rather than a design.
+//! `client.voip()` carries no `cfg`, and neither does `reject`: their stanza
+//! builders live in `wacore`, so declining is a node on the socket that is
+//! already open. What the `voip` feature gates is the media stack — accept,
+//! call, mute, the relay and the engine — which is what pulls `tokio`'s `net`
+//! and therefore mio's `compile_error!` on this target.
 //!
-//! What stands in the way is not the codec. `voip()` lives behind the
-//! library's `voip` feature, and enabling it for `wasm32-unknown-unknown`
-//! pulls `tokio`'s `net` and therefore mio, which answers with a
-//! `compile_error!`: "This wasm target is unsupported by mio." Measured, by
-//! turning the feature on and reading what came back — the whole VoIP stack
-//! arrives together, and the reject stanza cannot be taken out of it from
-//! this side.
+//! This module used to conclude the opposite, from a real measurement of the
+//! wrong thing: turning the feature on does fail exactly as described, but
+//! `reject` never needed it. A decline reaches the caller from a page.
 //!
-//! The fix belongs upstream: a way to decline a ringing offer that does not
-//! depend on the transport layer for a call nobody is going to place. Until
-//! then a decline clears the card here, which is what the person asked for,
-//! and the caller rings on — and nothing tells them, because this app has no
-//! transient surface to say it in.
+//! `terminate` is ungated for the same reason and is unreachable here anyway:
+//! a page never answers, so the registry holds ringing offers and nothing
+//! that could be hung up.
 //!
 //! What is kept is the ringing. A page learns about an incoming call like it
 //! learns about anything else, so the offer is recorded and forgotten on the
@@ -60,6 +55,17 @@ impl CallRegistry {
             .lock()
             .expect("call registry poisoned")
             .remove(call_id);
+    }
+
+    /// Take a ringing offer out to decline it.
+    ///
+    /// Removing and answering in one step, because the offer carries the
+    /// identifiers `reject` needs and a second decline has nothing to send.
+    pub(in crate::whatsapp) fn decline(&self, call_id: &str) -> Option<Arc<WaIncomingCall>> {
+        self.pending
+            .lock()
+            .expect("call registry poisoned")
+            .remove(call_id)
     }
 
     /// A call that ended without us, which here is only ever a ringing offer
@@ -102,14 +108,37 @@ impl WhatsAppClient {
         });
     }
 
-    /// Refused for the same reason as accepting.
+    /// Declined, and the caller is told so.
     ///
-    /// A decline is not just a local dismissal — it tells the caller to stop
-    /// ringing, and that goes through `client.voip().reject`. Doing nothing
-    /// but clearing it here would leave the other side ringing until their
-    /// own timeout, which is worse than saying the window cannot do it.
+    /// The one call action a page performs rather than refuses: `reject` is a
+    /// stanza builder in `wacore` behind no feature, so it needs none of the
+    /// media stack that is missing here. The card is cleared whatever the
+    /// send did, because the person has already answered the question the
+    /// card was asking; the send is what stops the far end ringing.
     pub fn decline_call(&self, call_id: &str) {
-        self.refuse_call(call_id, "declined");
+        let client_handle = self.client_handle.clone();
+        let calls = self.calls.clone();
+        let ui_sender = self.ui_sender.clone();
+        let call_id = call_id.to_string();
+
+        self.exec.spawn(async move {
+            let offer = calls.decline(&call_id);
+            if let Some(tx) = ui_sender.lock().await.as_ref() {
+                let _ = tx.send(UiEvent::CallEnded(call_id.clone()));
+            }
+            let Some(offer) = offer else {
+                warn!("No pending offer for call {}", call_id);
+                return;
+            };
+            let Some(client) = client_handle.lock().await.clone() else {
+                error!("Client not available for declining call");
+                return;
+            };
+            match client.voip().reject(&offer).await {
+                Ok(()) => info!("Call {} declined", call_id),
+                Err(e) => error!("Failed to decline call {}: {}", call_id, e),
+            }
+        });
     }
 
     /// Refused: placing a call needs the microphone and the codec.

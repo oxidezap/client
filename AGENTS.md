@@ -1149,6 +1149,16 @@ microphone already was, and so do plugins, for the same kind of reason. WebCodec
 bindings rather than JavaScript — they are API changes rather than backends,
 which is why neither is done here.
 
+Declining is the exception, and the exception is instructive. A page cannot
+answer a call, but it *does* tell the caller to stop ringing: `client.voip()`
+and `reject` carry no `cfg` — their stanza builders live in `wacore` — so
+what the `voip` feature gates is the media stack and never the signalling.
+This module concluded the opposite for a long time, from a real measurement
+of the wrong question: enabling the feature for wasm does pull mio and fail
+exactly as its comment described, which says nothing about a function that
+never needed it. When a comment says something is impossible, reproduce the
+impossibility it describes before believing it.
+
 **A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
 is there because cross-origin isolation needs two response headers GitHub Pages
 will not set, and the price is that it also caches the bundle: an ordinary
@@ -1208,6 +1218,21 @@ by definition.
   scheduler rather than a second backend, which is why it is not done here and
   why the front end says so instead. What a page *can* do meanwhile it already
   does: attach to an `oxidezapd` and get that daemon's plugins whole.
+- **A page with its own session cannot send media, and the reason is upstream.**
+  `BrowserHttpClient` implements `execute` and nothing else, which the trait
+  allows: the streaming paths default to refusing. But the library's upload
+  never asks. `upload_media_with_retry` sends the body through a closure that
+  calls `execute_upload` unconditionally, and nothing anywhere reads
+  `supports_upload_streaming` except the ureq client that sets it. So a photo
+  or a voice note sent from a page's own session fails with "Upload streaming
+  not supported by this HTTP client", whatever this side does about staging.
+  A browser cannot answer `execute_upload` either: it is synchronous, must be
+  called from a blocking context, and `fetch` is neither. The fix is a
+  buffered fallback in the library, taken when the client declares no upload
+  streaming, and it is a change to `whatsapp-rust` rather than to anything
+  here. Attached to an `oxidezapd` the question does not arise, because the
+  daemon holds the ureq client and does the upload.
+
 - **Video is not decoded on the web**, in a message or in a call, **and voice
   notes are not recorded there.** All three are the same cause — the decoder
   and the encoder are C — and each has a browser-native answer that is a Rust

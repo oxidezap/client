@@ -14,9 +14,12 @@
 //! writes: which field it reads, what it decides, and what it asks for.
 //!
 //! ```ignore
+//! use oxidezap_plugin::testing::{Event as In, Host};
+//!
 //! let mut host = Host::new();
+//! host.init(setup);
 //! host.store("enabled", "1");
-//! host.deliver(Message::from("5511999@s.whatsapp.net", "ping"));
+//! host.deliver(In::message("5511999@s.whatsapp.net", "ping"), handle);
 //! assert_eq!(host.sent(), [("5511999@s.whatsapp.net".into(), "pong".into())]);
 //! ```
 
@@ -295,7 +298,15 @@ pub(crate) fn field_str(handle: i32, field: i32) -> Option<String> {
     })
 }
 
-pub(crate) fn field_i64(field: i32) -> i64 {
+/// The three below all take the handle and answer the default for anything
+/// but the root, which is what a list element carries today: its only field
+/// is `SELF`, and that is a string. Ignoring the handle read the *parent's*
+/// field instead, so the day an element holds a structure a test about a
+/// child would have passed by reading the message it came from.
+pub(crate) fn field_i64(handle: i32, field: i32) -> i64 {
+    if handle != 0 {
+        return 0;
+    }
     HOST.with(|h| {
         h.borrow()
             .event
@@ -305,7 +316,10 @@ pub(crate) fn field_i64(field: i32) -> i64 {
     })
 }
 
-pub(crate) fn field_len(field: i32) -> i32 {
+pub(crate) fn field_len(handle: i32, field: i32) -> i32 {
+    if handle != 0 {
+        return abi::ABSENT;
+    }
     HOST.with(|h| {
         h.borrow()
             .event
@@ -320,7 +334,10 @@ pub(crate) fn field_len(field: i32) -> i32 {
     })
 }
 
-pub(crate) fn field_at(field: i32, index: i32) -> i32 {
+pub(crate) fn field_at(handle: i32, field: i32, index: i32) -> i32 {
+    if handle != 0 {
+        return abi::ABSENT;
+    }
     HOST.with(|h| {
         let mut state = h.borrow_mut();
         let Some(value) = state
@@ -351,4 +368,40 @@ pub(crate) fn kv_set(key: &str, value: &str) -> i32 {
         }
     });
     abi::outcome::ACCEPTED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three accessors that took no handle read the root whatever they
+    /// were asked about, so a test that walked into a list element got the
+    /// parent's field back and passed by accident. Today an element holds
+    /// only `SELF`, a string; the day it holds a structure, that accident is
+    /// a green test over a handler reading the wrong thing.
+    #[test]
+    fn a_child_handle_does_not_read_the_event_it_came_from() {
+        let mut host = Host::new();
+        host.deliver(
+            Event::message("5511999@s.whatsapp.net", "hi")
+                .int(abi::fields::TIMESTAMP_MS, 1_700_000_000_000)
+                .list(abi::fields::MESSAGE_IDS, &["3EB0A"]),
+            |_| {},
+        );
+
+        let child = field_at(0, abi::fields::MESSAGE_IDS, 0);
+        assert!(child > 0, "the root hands out a handle");
+        assert_eq!(
+            field_str(child, abi::fields::SELF).as_deref(),
+            Some("3EB0A")
+        );
+
+        assert_eq!(
+            field_i64(child, abi::fields::TIMESTAMP_MS),
+            0,
+            "an element carries no timestamp of its own"
+        );
+        assert_eq!(field_len(child, abi::fields::MESSAGE_IDS), abi::ABSENT);
+        assert_eq!(field_at(child, abi::fields::MESSAGE_IDS, 0), abi::ABSENT);
+    }
 }

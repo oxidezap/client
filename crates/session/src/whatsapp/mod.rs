@@ -209,9 +209,15 @@ fn chat_cursor(entry: &ChatEntry) -> String {
 
 fn parse_chat_cursor(token: &str) -> Option<oxidezap_chat_store::ChatCursor> {
     let mut parts = token.strip_prefix("c1:")?.splitn(3, ':');
-    let pinned = parts.next()?;
+    // An unreadable pin is an unreadable cursor, not an unpinned chat: read as
+    // `None` it is a valid position in the wrong half of the order, and the
+    // next page silently skips or repeats conversations.
+    let pinned_at_ms = match parts.next()? {
+        "-" => None,
+        pinned => Some(pinned.parse().ok()?),
+    };
     Some(oxidezap_chat_store::ChatCursor {
-        pinned_at_ms: (pinned != "-").then(|| pinned.parse().ok()).flatten(),
+        pinned_at_ms,
         last_message_ts: parts.next()?.parse().ok()?,
         jid: parts.next()?.to_string(),
     })
@@ -4131,5 +4137,11 @@ mod tests {
             .expect("reads back");
         assert_eq!(plain.pinned_at_ms, None);
         assert_eq!(plain.jid, "5599000000001@s.whatsapp.net");
+    }
+
+    #[test]
+    fn an_unreadable_pin_does_not_read_back_as_unpinned() {
+        assert!(parse_chat_cursor("c1:xx:1700000000123:5599000000001@s.whatsapp.net").is_none());
+        assert!(parse_chat_cursor("c1::1700000000123:5599000000001@s.whatsapp.net").is_none());
     }
 }

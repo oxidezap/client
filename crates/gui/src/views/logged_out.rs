@@ -74,7 +74,7 @@ pub fn render_logged_out_view(
             div().flex().items_center().gap(metrics.space_lg()).child(
                 // Outline, not filled: this is irreversible, and a filled
                 // primary would make it the obvious thing to click.
-                Button::new("pair-again")
+                Button::new("logged-out-pair-again")
                     .label("Clear data and pair again")
                     .danger()
                     .outline()

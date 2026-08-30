@@ -112,9 +112,19 @@ mod capture {
 
     use super::{CAPTURE_SAMPLE_RATE, RecordedAudio, RecorderError};
 
-    /// How much of the tail the meter averages: ~150ms at the capture rate.
+    /// How much of the tail the meter averages: 150ms.
     /// Short enough to follow speech, long enough not to flicker.
-    const LEVEL_WINDOW: usize = (CAPTURE_SAMPLE_RATE as usize * 150) / 1000;
+    const LEVEL_WINDOW_MS: usize = 150;
+
+    /// That window in samples, at the rate the device actually opened at.
+    ///
+    /// Not at `CAPTURE_SAMPLE_RATE`: a device that cannot do 48 kHz is opened
+    /// at its own best rate instead (`with_max_sample_rate`), so a fixed
+    /// count is 450ms of tail on a 16 kHz microphone. The meter then lags the
+    /// voice with no symptom beyond looking dead.
+    fn level_window(sample_rate: u32) -> usize {
+        (sample_rate as usize * LEVEL_WINDOW_MS) / 1000
+    }
 
     /// Root-mean-square of a slice, scaled so ordinary speech lands mid-meter.
     ///
@@ -287,6 +297,11 @@ mod capture {
                 consumer,
                 self.samples.clone(),
                 self.level.clone(),
+                // The device's own rate, not the one asked for: a microphone
+                // that will not do 48 kHz is opened at its best rate instead,
+                // and a window in samples is a window in milliseconds only
+                // against the rate it is actually capturing at.
+                level_window(self.sample_rate),
             ));
 
             stream
@@ -379,6 +394,7 @@ mod capture {
         mut consumer: impl ringbuf::traits::Consumer<Item = f32> + Send + 'static,
         capture: Arc<Mutex<Vec<f32>>>,
         level: Arc<std::sync::atomic::AtomicU32>,
+        window: usize,
     ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let stop = Arc::new(AtomicBool::new(false));
         let ending = stop.clone();
@@ -389,7 +405,7 @@ mod capture {
                 // The meter's window, kept here so reading it never touches
                 // the capture's lock.
                 let mut tail: std::collections::VecDeque<f32> =
-                    std::collections::VecDeque::with_capacity(LEVEL_WINDOW);
+                    std::collections::VecDeque::with_capacity(window);
                 let mut full = false;
                 loop {
                     let ending_now = ending.load(Ordering::Relaxed);
@@ -397,7 +413,7 @@ mod capture {
                     if taken > 0 {
                         let taken = &block[..taken];
                         for &sample in taken {
-                            if tail.len() == LEVEL_WINDOW {
+                            if tail.len() == window {
                                 tail.pop_front();
                             }
                             tail.push_back(sample);
@@ -492,7 +508,12 @@ mod capture {
             let (mut producer, consumer) = HeapRb::<f32>::new(RING_SAMPLES).split();
             let capture = Arc::new(Mutex::new(Vec::new()));
             let level = Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let (stop, handle) = spawn_drain(consumer, capture.clone(), level.clone());
+            let (stop, handle) = spawn_drain(
+                consumer,
+                capture.clone(),
+                level.clone(),
+                level_window(CAPTURE_SAMPLE_RATE),
+            );
 
             use ringbuf::traits::Producer as _;
             let block = vec![0.25f32; 4096];
@@ -519,7 +540,12 @@ mod capture {
             let capture = Arc::new(Mutex::new(vec![0.0f32; MAX_RECORDING_SAMPLES - 8]));
             let (mut producer, consumer) = HeapRb::<f32>::new(RING_SAMPLES).split();
             let level = Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let (stop, handle) = spawn_drain(consumer, capture.clone(), level);
+            let (stop, handle) = spawn_drain(
+                consumer,
+                capture.clone(),
+                level,
+                level_window(CAPTURE_SAMPLE_RATE),
+            );
 
             use ringbuf::traits::Producer as _;
             let block = vec![0.5f32; 64];
@@ -537,7 +563,19 @@ mod capture {
 
     #[cfg(test)]
     mod tests {
-        use super::rms;
+        use super::{level_window, rms};
+
+        /// The window is 150ms of whatever the device opened at. A count
+        /// fixed to 48 kHz is 450ms of tail on a 16 kHz microphone, and the
+        /// meter then lags the voice with nothing to show for it.
+        #[test]
+        fn the_meter_window_follows_the_rate_the_device_opened_at() {
+            for rate in [48_000, 44_100, 16_000, 8_000] {
+                let window = level_window(rate);
+                let ms = window * 1000 / rate as usize;
+                assert_eq!(ms, 150, "at {rate} Hz the window is {window} samples");
+            }
+        }
 
         #[test]
         fn silence_reads_as_nothing() {

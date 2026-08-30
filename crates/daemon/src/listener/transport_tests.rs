@@ -207,3 +207,111 @@ fn a_frame_larger_than_a_buffer_arrives_whole() {
 
     assert_eq!(line.trim_end().len(), payload.len());
 }
+
+/// A front end reconnects by dropping its connection and opening another, and
+/// the read half is a thread parked in the kernel that nothing wakes: the
+/// daemon went on counting a connection with nobody behind it. Thirty-two
+/// network blips filled `MAX_CLIENTS` and the window never connected again.
+///
+/// Counted on the *server's* side, because that is the count that ran out.
+#[test]
+fn reconnecting_does_not_leak_a_client() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Enough that a leak shows as a count above one rather than as luck.
+    const RECONNECTS: usize = 8;
+
+    let path = scratch_endpoint("reconnect-leak");
+    let (runtime, mut listener) = bound(&path);
+
+    let live = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&live);
+    // Said by the server rather than waited out: a sleep long enough for a
+    // loaded runner is a sleep this test spends eight times, and one that is
+    // not is a failure that says nothing about connections.
+    let (accepted, was_accepted) = mpsc::channel::<()>();
+    let (closed, was_closed) = mpsc::channel::<()>();
+    // A tokio channel rather than a `std` one: this runtime is
+    // single-threaded, and a blocking wait inside it would starve the reads
+    // spawned below — the count would then never come down and the test
+    // would be measuring the wait rather than the connections.
+    let (all_done, mut until_done) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let served = std::thread::spawn(move || {
+        runtime.block_on(async move {
+            for _ in 0..RECONNECTS {
+                let mut stream = listener.accept().await.expect("accept");
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = accepted.send(());
+                let held = Arc::clone(&counted);
+                let closed = closed.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt as _;
+                    // Says nothing, so only the client hanging up ends this.
+                    let mut sink = Vec::new();
+                    let _ = stream.read_to_end(&mut sink).await;
+                    held.fetch_sub(1, Ordering::SeqCst);
+                    let _ = closed.send(());
+                });
+            }
+            let _ = until_done.recv().await;
+        });
+    });
+
+    let mut highest = 0;
+    for _ in 0..RECONNECTS {
+        let (reader, writer) = Endpoint::connect_at(&path)
+            .expect("connect")
+            .split()
+            .expect("split");
+        let hangup = reader.hangup().expect("a way to end the read");
+        let (alive, until_gone) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _alive = alive;
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            // Parked exactly as the front end's reader is: the daemon has
+            // nothing to say, so nothing completes this but the hangup.
+            let _ = reader.read_line(&mut line);
+        });
+        was_accepted
+            .recv_timeout(PATIENCE)
+            .expect("the server accepted the connection");
+        highest = highest.max(live.load(Ordering::SeqCst));
+
+        // The order a `Session` goes in: the write half first, then the
+        // hangup that ends the read. It is load-bearing on a named pipe,
+        // where cancelling the read does not disconnect anything — the pipe
+        // breaks when the last handle to it closes, and the reader's is the
+        // last only once this one has gone. A socket is shut down instead,
+        // so there the order does not show.
+        drop(writer);
+        hangup.hang_up();
+        assert!(
+            matches!(
+                until_gone.recv_timeout(PATIENCE),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the reader did not leave after the connection was hung up on"
+        );
+        // The server learns of the same close on its own runtime, and the
+        // next connection may not be opened until it has: two at once is
+        // exactly what this test reports.
+        was_closed
+            .recv_timeout(PATIENCE)
+            .expect("the server saw the connection close");
+    }
+
+    drop(all_done);
+    served.join().expect("the server thread");
+
+    assert_eq!(
+        highest, 1,
+        "a reconnect left the last connection open: the daemon saw {highest} at once"
+    );
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        0,
+        "connections outlived the front ends that opened them"
+    );
+}

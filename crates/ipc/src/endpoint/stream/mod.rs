@@ -35,6 +35,45 @@ pub struct Reader(Inner);
 /// The half everything else writes through, behind a lock.
 pub struct Writer(Inner);
 
+/// What ends a [`Reader`] parked in a blocking read.
+///
+/// A front end reconnects by dropping its connection and opening another, and
+/// dropping the writer does not reach the reader: the read half is owned by a
+/// thread sitting in the kernel, and nothing wakes it while the daemon has
+/// nothing to say. The connection stays open, the daemon keeps counting it,
+/// and a handful of network blips fills its admission count for good.
+///
+/// The two platforms end that wait differently and this is where the
+/// difference lives — see /AGENTS.md. A Unix socket is shut down, which is a
+/// thing said about the socket and is seen through every descriptor naming
+/// it. A named pipe has no equivalent, so the read is made to wait on the
+/// pipe *and* on an event, and this signals the event.
+pub struct Hangup(HangupInner);
+
+#[cfg(unix)]
+type HangupInner = Inner;
+
+#[cfg(windows)]
+type HangupInner = overlapped::Stop;
+
+#[cfg(not(any(unix, windows)))]
+type HangupInner = ();
+
+impl Hangup {
+    /// End the read. Idempotent, and safe to call after the connection has
+    /// already gone.
+    pub fn hang_up(&self) {
+        #[cfg(unix)]
+        {
+            let _ = rustix::net::shutdown(&self.0, rustix::net::Shutdown::Both);
+        }
+        #[cfg(windows)]
+        {
+            self.0.signal();
+        }
+    }
+}
+
 #[cfg(unix)]
 type Inner = std::os::unix::net::UnixStream;
 
@@ -128,6 +167,31 @@ impl Endpoint {
         #[cfg(unix)]
         writer.set_write_timeout(Some(WRITE_TIMEOUT))?;
         Ok((Reader(self.0), Writer(writer)))
+    }
+}
+
+impl Reader {
+    /// A handle that ends this reader's wait.
+    ///
+    /// Taken before the reader is handed to its thread, because after that
+    /// there is nothing left to ask.
+    ///
+    /// # Errors
+    ///
+    /// The platform would not give out a second reference to the connection.
+    pub fn hangup(&self) -> std::io::Result<Hangup> {
+        #[cfg(unix)]
+        {
+            self.0.try_clone().map(Hangup)
+        }
+        #[cfg(windows)]
+        {
+            Ok(Hangup(self.0.stop()))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(Hangup(()))
+        }
     }
 }
 

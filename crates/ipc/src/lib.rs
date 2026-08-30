@@ -34,7 +34,7 @@ pub mod windows_user;
 #[cfg(target_family = "wasm")]
 pub use endpoint::web;
 #[cfg(not(target_family = "wasm"))]
-pub use endpoint::{Endpoint, Reader, Writer};
+pub use endpoint::{Endpoint, Hangup, Reader, Writer};
 pub use framing::{FrameRead, MAX_DAEMON_FRAME_BYTES, MAX_REQUEST_BYTES, read_frame};
 pub use link::Link;
 pub use protocol::{

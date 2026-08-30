@@ -68,15 +68,24 @@ impl LatestFrames {
     /// Hold this picture for the window, dropping whatever that direction was
     /// holding: it is a frame the window never drew and never will.
     pub fn put(&self, frame: CallFrame) {
-        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots = self.lock();
         let slot = slot_of(frame.stream);
         slots[slot] = Some(frame);
     }
 
     /// Everything waiting, in one pass, leaving the slots empty.
     pub fn take(&self) -> SmallVec<[CallFrame; 2]> {
-        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        slots.iter_mut().filter_map(Option::take).collect()
+        self.lock().iter_mut().filter_map(Option::take).collect()
+    }
+
+    /// Poisoned or not. `put` runs on a decode thread and `take` on the
+    /// window's, so panicking here turns a panic in one decoder into a panic
+    /// in the UI on its next read: the call and the window go down together.
+    /// What is behind the lock is two `Option`s with no invariant to break.
+    fn lock(&self) -> std::sync::MutexGuard<'_, [Option<CallFrame>; 2]> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -333,21 +342,21 @@ impl Scratch {
 mod tests {
     use super::*;
 
-    /// A panic while a frame slot is held used to poison the lock, and the
-    /// next `expect` took the IPC thread with it: no events reached the
-    /// window, every request waited on an answer nothing would send, and the
-    /// app still read as connected. Every other lock in this path recovers
-    /// for exactly that reason.
+    /// `put` runs on a decode thread and `take` on the window's. Panicking on
+    /// a poisoned lock turned a panic in one decoder into a panic in the UI
+    /// on its next read, so the call and the window went down together.
+    /// over two `Option`s with no invariant to break.
     #[test]
-    fn a_poisoned_frame_slot_does_not_take_the_connection_down() {
-        let frames = std::sync::Arc::new(LatestFrames::default());
-        let poisoner = std::sync::Arc::clone(&frames);
-        let _ = std::thread::spawn(move || {
-            let _held = poisoner.slots.lock().expect("first lock");
-            panic!("something in the window went wrong");
+    fn a_panicked_decoder_does_not_take_the_window_with_it() {
+        let frames = LatestFrames::default();
+        let poisoner = frames.clone();
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.lock();
+            panic!("a decoder gave up mid-frame");
         })
         .join();
+        assert!(panicked.is_err(), "the lock is poisoned now");
 
-        assert!(frames.take().is_empty());
+        assert!(frames.take().is_empty(), "and the window can still read it");
     }
 }
