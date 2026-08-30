@@ -416,6 +416,8 @@ struct Watching {
 }
 
 impl Drop for Watching {
+    /// The handler comes off before it is dropped: a browser holding a
+    /// reference to a freed callback is a crash rather than a missed event.
     fn drop(&mut self) {
         self.channel.set_onmessage(None);
         self.channel.close();
@@ -469,6 +471,8 @@ struct Meeting {
 }
 
 impl Drop for Meeting {
+    /// The handler comes off before it is dropped: a browser holding a
+    /// reference to a freed callback is a crash rather than a missed event.
     fn drop(&mut self) {
         self.channel.set_onmessage(None);
         self.channel.close();
@@ -510,6 +514,7 @@ impl Meeting {
                     // the object that posted — so this is never our own
                     // leader, and never a repeat.
                     if answered.borrow().is_some() {
+                        log::info!("a tab has taken the account; asking it again");
                         let _ = post_ask(&asking, &want);
                     } else {
                         log::info!("another tab has taken the account; reconnecting to it");
@@ -539,10 +544,17 @@ impl Meeting {
         let Some(answered) = self.answered.take() else {
             return Err("this tab has already asked for the account".to_string());
         };
+        // The nonce is logged on both sides, which is what makes two consoles
+        // readable as one conversation: it is a connection's name and not a
+        // secret — see [`nonce`].
+        log::info!("asking for the account as {}", self.ask);
         post_ask(&self.channel, &self.ask)
             .map_err(|e| format!("this tab could not ask for the account: {e:?}"))?;
         match deadline(answered, tabs::ANSWER_TIMEOUT_MS).await {
-            Some(Ok(())) => Ok(()),
+            Some(Ok(())) => {
+                log::info!("a tab answered for the account");
+                Ok(())
+            }
             // Not an error worth a screen. The tab that would have answered
             // has gone, and the caller's next move is to take the account
             // itself.
@@ -551,6 +563,11 @@ impl Meeting {
     }
 }
 
+/// Say what this tab is looking for.
+///
+/// Sent more than once on purpose — see the `Leading` arm of the handler
+/// above — which is why the leader answers a repeat with the connection it
+/// already opened rather than a second one.
 fn post_ask(channel: &BroadcastChannel, ask: &str) -> Result<(), wasm_bindgen::JsValue> {
     let Some(line) = (Rendezvous::Ask {
         v: tabs::VERSION,
@@ -665,6 +682,11 @@ fn frame_handler(
     })
 }
 
+/// One request, on its way to the tab holding the account.
+///
+/// Without a terminator: a channel frames its own messages, where the pipe on
+/// the other end of the connection needs the newline this does not carry. The
+/// serving side adds it back.
 fn post_line(frames: &BroadcastChannel, line: &str) -> Result<(), wasm_bindgen::JsValue> {
     let message = js_sys::Object::new();
     set(&message, "k", &"line".into())?;
@@ -672,6 +694,7 @@ fn post_line(frames: &BroadcastChannel, line: &str) -> Result<(), wasm_bindgen::
     frames.post_message(&message)
 }
 
+/// Ask for a payload, on the terms this frame allows.
 fn post_read(
     frames: &BroadcastChannel,
     id: u64,
@@ -691,6 +714,10 @@ fn post_read(
     frames.post_message(&message)
 }
 
+/// Hand a payload to the tab that will send it.
+///
+/// The one direction bytes travel *out* of a follower: a voice note is
+/// recorded here and sent by the tab holding the account.
 fn post_stage(
     frames: &BroadcastChannel,
     id: u64,
@@ -708,6 +735,12 @@ fn post_stage(
     frames.post_message(&message)
 }
 
+/// Drop a staged payload whose request is never going to run.
+///
+/// Unanswered, and safe to be: a channel delivers in order, so a discard
+/// posted after a stage is handled after it. The HTTP path needs a record of
+/// what is in flight because a `DELETE` and a `PUT` are two requests that can
+/// land the wrong way round.
 fn post_discard(frames: &BroadcastChannel, key: &str) -> Result<(), wasm_bindgen::JsValue> {
     let message = js_sys::Object::new();
     set(&message, "k", &"discard".into())?;

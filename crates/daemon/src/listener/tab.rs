@@ -74,6 +74,9 @@ pub(crate) struct Serving {
 }
 
 impl Drop for Serving {
+    /// Stops answering, and takes the handler off before dropping it: a
+    /// browser holding a reference to a freed callback is a crash rather than
+    /// a missed event.
     fn drop(&mut self) {
         self.channel.set_onmessage(None);
         self.channel.close();
@@ -142,10 +145,11 @@ pub(crate) fn serve(
         // asking tab is not sure its first ask was heard, and the connection
         // it is waiting on is the one already open under this name.
         if !serving.borrow_mut().insert(ask.clone()) {
-            log::debug!("a tab asked twice; answering the connection it already has");
+            log::info!("tab {ask} asked twice; answering the connection it already has");
             answer(&rendezvous, &ask);
             return;
         }
+        log::info!("serving tab {ask}");
         served.set(served.get() + 1);
         accept(
             &rendezvous,
@@ -302,6 +306,9 @@ struct Connection {
 }
 
 impl Drop for Connection {
+    /// Closes this connection's channel, which is what "the front end has
+    /// gone" amounts to on this side. The handler comes off first, for the
+    /// reason above.
     fn drop(&mut self) {
         self.channel.set_onmessage(None);
         self.channel.close();
@@ -389,6 +396,10 @@ fn handler(
     })
 }
 
+/// One frame, on its way to the tab this connection serves.
+///
+/// Stripped of the terminator the pipe carries: a channel frames its own
+/// messages, so a newline here would arrive inside the message.
 fn post_line(frames: &BroadcastChannel, line: &str) -> Result<(), wasm_bindgen::JsValue> {
     let message = js_sys::Object::new();
     set(&message, "k", &"line".into())?;
@@ -396,6 +407,11 @@ fn post_line(frames: &BroadcastChannel, line: &str) -> Result<(), wasm_bindgen::
     frames.post_message(&message)
 }
 
+/// Say that this connection is over.
+///
+/// Said rather than merely stopped: the other tab is watching a channel that
+/// would otherwise just go quiet, and a front end that never learns its
+/// connection ended never retries.
 fn post_bye(frames: &BroadcastChannel, why: &str) -> Result<(), wasm_bindgen::JsValue> {
     let message = js_sys::Object::new();
     set(&message, "k", &"bye".into())?;
@@ -403,6 +419,7 @@ fn post_bye(frames: &BroadcastChannel, why: &str) -> Result<(), wasm_bindgen::Js
     frames.post_message(&message)
 }
 
+/// Hand over a payload, as bytes the browser clones rather than text.
 fn post_media(
     frames: &BroadcastChannel,
     id: u64,
@@ -415,6 +432,11 @@ fn post_media(
     frames.post_message(&message)
 }
 
+/// Confirm that a payload has landed in this tab's cache.
+///
+/// What the asking tab waits for before sending the request that names the
+/// key: a frame that overtakes its own upload names a payload that is not
+/// there.
 fn post_staged(frames: &BroadcastChannel, id: u64) -> Result<(), wasm_bindgen::JsValue> {
     let message = js_sys::Object::new();
     set(&message, "k", &"staged".into())?;
@@ -422,6 +444,11 @@ fn post_staged(frames: &BroadcastChannel, id: u64) -> Result<(), wasm_bindgen::J
     frames.post_message(&message)
 }
 
+/// Answer a sideband request with why it could not be met.
+///
+/// Answered rather than left silent, because the asking side is waiting on a
+/// deadline: an unanswered read costs it the whole allowance to learn what
+/// one message could have told it at once.
 fn post_failure(
     frames: &BroadcastChannel,
     kind: &str,

@@ -75,6 +75,11 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         media,
         hangup,
     } = connection;
+    // Said out loud, because until now a successful attach was the one path
+    // through here that logged nothing at all — which made a tab that had
+    // attached and a tab that was stuck looking identical from a console, and
+    // that is exactly the report this is meant to answer.
+    log::info!("attached to the tab holding this account");
 
     let (events, rx) = sink::channel();
     let held = Arc::new(Fetched::new(media.clone()));
@@ -265,6 +270,7 @@ struct Fetched {
 }
 
 impl Fetched {
+    /// Empty, and holding the sideband it will fill itself from.
     fn new(media: Media) -> Self {
         Self {
             bytes: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -287,6 +293,13 @@ impl Fetched {
 }
 
 impl MediaCache for Fetched {
+    /// Read without consuming.
+    ///
+    /// One frame can name the same key on more than one message — media is
+    /// content-addressed, so a photo forwarded twice is one payload — and
+    /// taking it would leave every message after the first drawing a download
+    /// offer for bytes that are already here. `clear` is what bounds the map,
+    /// once per frame.
     fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
         self.bytes
             .lock()
@@ -320,6 +333,12 @@ impl MediaCache for Fetched {
         )
     }
 
+    /// Hand the payload to the other tab, and only then continue.
+    ///
+    /// The continuation belongs here rather than to the caller for the reason
+    /// the trait gives: the request naming this key may not go out before the
+    /// bytes have landed, and crossing to another tab is not something a
+    /// caller can await inside a frame.
     fn stage_then(&self, key: &str, bytes: Vec<u8>, then: StageThen) {
         let key = key.to_string();
         let media = self.media.clone();
