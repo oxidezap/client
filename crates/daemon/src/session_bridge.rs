@@ -762,15 +762,18 @@ impl Bridge {
                 limit,
                 answer_to,
             } => {
+                // Before the call, not after it: `load_messages` spawns the
+                // query as it returns, so taking the permit afterwards refused
+                // the request and ran it anyway.
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
                 let page = client.load_messages(
                     jid.clone(),
                     before.map(|cursor| cursor.as_str().to_string()),
                     limit.map_or(WhatsAppClient::MESSAGE_PAGE, i64::from),
                 );
-                let Some(permit) = self.permit() else {
-                    let _ = reply.send(too_busy());
-                    return None;
-                };
                 let reads = Arc::clone(&self.reads);
                 // Which account asked. A page of the old one's history
                 // landing after it left would be folded into a tracker that
@@ -792,11 +795,20 @@ impl Bridge {
                             // window naming a message from a page nobody told
                             // the daemon about is refused, and the badge comes
                             // back on the next hydration.
-                            if hub.account_generation() == asked_as {
+                            //
+                            // Asked with the tracker's own lock held, which
+                            // is what makes the answer good enough: a logout
+                            // clears the tracker *after* it bumps the
+                            // generation, so either this reads the bump and
+                            // folds nothing, or it folds and the clear that
+                            // follows takes it.
+                            {
                                 let mut reads =
                                     reads.lock().unwrap_or_else(|held| held.into_inner());
-                                for message in &page.items {
-                                    reads.observe_message(&jid, message);
+                                if hub.account_generation() == asked_as {
+                                    for message in &page.items {
+                                        reads.observe_message(&jid, message);
+                                    }
                                 }
                             }
                             Ok(DaemonMessage::Messages {
@@ -821,14 +833,16 @@ impl Bridge {
                 limit,
                 answer_to,
             } => {
-                let page = client.load_chats(
-                    after.map(|cursor| cursor.as_str().to_string()),
-                    limit.map_or(WhatsAppClient::CHAT_PAGE, i64::from),
-                );
+                // As above: the permit is what decides whether the query
+                // runs, so it is taken before the call that starts one.
                 let Some(permit) = self.permit() else {
                     let _ = reply.send(too_busy());
                     return None;
                 };
+                let page = client.load_chats(
+                    after.map(|cursor| cursor.as_str().to_string()),
+                    limit.map_or(WhatsAppClient::CHAT_PAGE, i64::from),
+                );
                 let reads = Arc::clone(&self.reads);
                 let hub = Arc::clone(&self.hub);
                 // As above: a page of the departed account's chats must not
@@ -838,7 +852,6 @@ impl Bridge {
                     let answer = match page.await {
                         Ok(Ok(mut page)) => {
                             let epoch = crate::media::epoch();
-                            let still_ours = hub.account_generation() == asked_as;
                             // The same rule. A chat past the attach window is
                             // in no snapshot, and a read for one is refused
                             // with "no such chat" until this side has been
@@ -851,15 +864,21 @@ impl Bridge {
                             // back on the next hydration.
                             for chat in &mut page.items {
                                 externalize_messages(epoch, &mut chat.messages);
-                                if !still_ours {
-                                    continue;
-                                }
                                 let mut reads =
                                     reads.lock().unwrap_or_else(|held| held.into_inner());
                                 for message in &chat.messages {
                                     reads.observe_message(&chat.jid, message);
                                 }
-                                hub.apply(chat_updated(chat, &mut reads));
+                                // Asked and written under one lock, so a
+                                // logout cannot land between the question and
+                                // the answer. What it refuses is folded back
+                                // out of the tracker: an entry for a departed
+                                // account's chat is a boundary the next one
+                                // would inherit.
+                                let summary = chat_updated(chat, &mut reads);
+                                if !hub.apply_for(asked_as, summary) {
+                                    reads.forget(&chat.jid);
+                                }
                             }
                             Ok(DaemonMessage::Chats {
                                 id,
