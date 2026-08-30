@@ -113,6 +113,14 @@ impl Wipe {
     }
 }
 
+/// How long a write may sit unfinished before it is an orphan.
+///
+/// A live one holds its name for one write and one rename, so anything this
+/// old is a file whose writer is gone: a crash between the two leaves a `w-`
+/// that no wipe claims and the sweep skips, which is a leak the `.partN`
+/// name it replaced did not have.
+pub(super) const IN_PROGRESS_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// A payload a front end staged for a send that has not run yet.
 ///
 /// The one thing under this roof that is not a cache: there is no other copy,

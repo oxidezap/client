@@ -277,7 +277,21 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         // A write in progress is nobody's to reclaim either: the bytes are
         // not there yet, and whoever asked for them is waiting.
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_staged_upload(&name) || is_in_progress(&name) {
+        if is_staged_upload(&name) {
+            continue;
+        }
+        if is_in_progress(&name) {
+            // Not this sweep's to count or to drop for space — the bytes are
+            // not there yet and whoever asked for them is waiting — but one
+            // old enough is a write whose process is gone, and nothing else
+            // would ever take it.
+            let orphan = meta.modified().is_ok_and(|at| {
+                at.elapsed()
+                    .is_ok_and(|since| since > super::IN_PROGRESS_GRACE)
+            });
+            if orphan {
+                let _ = std::fs::remove_file(entry.path());
+            }
             continue;
         }
         let age = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -298,4 +312,40 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `w-` name is nobody's to reclaim while its writer is holding it, and
+    /// nobody's at all once that writer is gone: no wipe claims one and the
+    /// sweep skipped them outright, so a crash between the write and the
+    /// rename left a file that nothing on this machine would ever delete.
+    #[test]
+    fn a_write_whose_process_is_gone_is_reclaimed() {
+        let dir = std::env::temp_dir().join(format!("oxidezap-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let orphan = dir.join(format!("{IN_PROGRESS_PREFIX}12345"));
+        std::fs::write(&orphan, b"half a photo").unwrap();
+        let long_ago = std::time::SystemTime::now() - super::super::IN_PROGRESS_GRACE * 2;
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(long_ago))
+            .unwrap();
+
+        let live = dir.join(format!("{IN_PROGRESS_PREFIX}67890"));
+        std::fs::write(&live, b"a photo being written now").unwrap();
+
+        sweep(&dir).unwrap();
+
+        assert!(!orphan.exists(), "a write nobody is holding stays for ever");
+        assert!(live.exists(), "and one still being written is not taken");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
