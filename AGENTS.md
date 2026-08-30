@@ -226,8 +226,9 @@ profile here repeats it deliberately.
   without an early return, so the matching prefix is not something a caller
   can time; and answered with a `404` rather than a `403`, because an endpoint
   the caller may not open has no reason to confirm it is there. A request with
-  no `Origin` is not a browser — a page cannot suppress the header — so it is
-  served on a loopback bind, and still only with the token. A non-loopback
+  no `Origin` carries nothing to check — an `<img>`, a `<script>` and a form
+  GET are browser requests that send none — so it is served on a loopback
+  bind, and still only with the token, which is the whole admission check. A non-loopback
   bind is an error rather than a warning: there the header is a string the
   client picks and the traffic is cleartext, so remote access is a tunnel's
   job. Both endpoints draw on one admission
@@ -1195,7 +1196,13 @@ by definition.
   Durability is the other half. The window's VFS is relaxed-IndexedDB, which
   writes changed blocks after the commit rather than during it, so a tab killed
   in that window loses the commit — a message that comes back on the next
-  hydration, or a ratchet that has to re-establish. The durable answer is OPFS
+  hydration, or a ratchet that has to re-establish. Nor is an ordinary commit
+  *observable*: the VFS answers for an import, a deletion and a clear, and
+  hands back nothing for the writes a session makes — so a quota the browser
+  refuses has nowhere to be reported, and the account behaves perfectly all
+  session and is gone on the next load. What the store does about that is say
+  the headroom out loud when it opens, which is a warning rather than a fix.
+  The durable answer is OPFS
   through a synchronous access handle, which exists in a dedicated worker and
   nowhere else, so it arrives with the worker. It changes nothing above
   `session/store/`, which is why that interface is three functions.

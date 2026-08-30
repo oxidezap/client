@@ -58,6 +58,9 @@ mod web {
     pub fn save(file_name: &str, data: &[u8]) -> Result<String, String> {
         let window = web_sys::window().ok_or("no window to save from")?;
         let document = window.document().ok_or("no document to save from")?;
+        // Before the blob, because a failure after one is a blob the browser
+        // holds with nobody left to revoke it.
+        let body = document.body().ok_or("no document body to save from")?;
 
         // Copied into a JS array first: `Blob` takes a JS value, and handing
         // it a view over wasm memory would let a later allocation move the
@@ -82,7 +85,6 @@ mod web {
         // laid out, and a save should not reflow the page it was asked from.
         let _ = anchor.set_attribute("style", "display:none");
 
-        let body = document.body().ok_or("no document body to save from")?;
         let _ = body.append_child(&anchor);
         anchor.click();
         let _ = body.remove_child(&anchor);

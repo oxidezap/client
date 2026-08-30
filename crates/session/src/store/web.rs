@@ -15,9 +15,16 @@
 //! database is held in memory and changed blocks are written to IndexedDB
 //! after the fact, so a tab killed between a commit and its flush loses that
 //! commit — which for chat history is a message that comes back on the next
-//! hydration, and for Signal state is a ratchet that has to re-establish. The
-//! flush is observable (`WaitCommit`), so this is a window that can be closed
-//! rather than a guarantee that is gone.
+//! hydration, and for Signal state is a ratchet that has to re-establish.
+//!
+//! An ordinary commit is also not *observable*: the VFS hands back a
+//! `WaitCommit` for an import, a deletion and a clear, and nothing at all for
+//! the writes a session actually makes. So a quota the browser refuses to go
+//! past has nowhere to be reported — the database keeps behaving perfectly
+//! all session and the account is gone on the next load. What this module can
+//! do about that is say the headroom out loud before it runs out; see
+//! [`report_headroom`]. Closing it properly means either a VFS that answers
+//! for a commit or the move to OPFS, where the write is the call.
 //!
 //! Moving the session into a worker and this to OPFS is the hardening, and it
 //! changes nothing above [`super`] — which is the whole reason that interface
@@ -72,6 +79,12 @@ pub async fn prepare() -> Result<(), String> {
         "opened the browser store, holding {} file(s)",
         store.count()
     );
+    // Bounded, and nothing waits on the answer beyond that. This is one log
+    // line: `navigator.storage.estimate()` is a promise the browser is under
+    // no obligation to settle, and an account that will not open because a
+    // quota-reporting API went quiet is a far worse failure than the one the
+    // line is warning about.
+    let _ = crate::exec::with_timeout(report_headroom(), HEADROOM_ASK).await;
     // Kept for [`wipe`], and only the first one needs keeping: `install`
     // registers the VFS under `vfs_name` once and every later call finds it
     // registered and hands back another `RelaxedIdbUtil` over the *same*
@@ -84,6 +97,71 @@ pub async fn prepare() -> Result<(), String> {
         let _ = cell.set(store);
     });
     Ok(())
+}
+
+/// How long the headroom question may take before it is abandoned.
+///
+/// Generous, because the answer is worth having and the browser is usually
+/// instant; bounded, because it is a diagnostic on the path that opens the
+/// account.
+const HEADROOM_ASK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How little room may be left before it is worth saying so.
+///
+/// An account's database is tens of megabytes and grows with its history, so
+/// this is a floor under "there is room for what is coming", not under one
+/// write.
+const HEADROOM_FLOOR: f64 = 64.0 * 1024.0 * 1024.0;
+
+/// Say how much of this origin's storage is spent.
+///
+/// The only warning available. A write that the browser refuses for quota is
+/// dropped inside the VFS with nobody to hand it to, and the page carries on
+/// against a database it is holding in memory — so the account is intact all
+/// session and absent on the next load. Asking beforehand does not stop that;
+/// it puts a line in front of it that says what happened.
+async fn report_headroom() {
+    let Some(estimate) = storage_estimate().await else {
+        return;
+    };
+    let (usage, quota) = estimate;
+    let left = quota - usage;
+    if left < HEADROOM_FLOOR {
+        log::warn!(
+            "this origin has {:.0} MiB of storage left of {:.0} MiB; \
+             writes the browser refuses are not reported, so an account kept \
+             here may not survive a reload",
+            left / (1024.0 * 1024.0),
+            quota / (1024.0 * 1024.0)
+        );
+    } else {
+        info!(
+            "this origin is using {:.0} MiB of {:.0} MiB",
+            usage / (1024.0 * 1024.0),
+            quota / (1024.0 * 1024.0)
+        );
+    }
+}
+
+/// `navigator.storage.estimate()`, as bytes used and bytes allowed.
+///
+/// `None` wherever the browser will not say, which is not a problem: this is
+/// a warning, and one that cannot be produced is one nothing depends on.
+async fn storage_estimate() -> Option<(f64, f64)> {
+    let manager = web_sys::window()?.navigator().storage();
+    let estimate = wasm_bindgen_futures::JsFuture::from(manager.estimate().ok()?)
+        .await
+        .ok()?;
+    // Read by name: `StorageEstimate` is a dictionary in web-sys, so it has
+    // the setters a caller building one needs and no getters at all. Both
+    // fields are optional in the specification too, which is the same answer
+    // this function already gives for a browser that will not say.
+    let field = |name: &str| {
+        js_sys::Reflect::get(&estimate, &wasm_bindgen::JsValue::from_str(name))
+            .ok()
+            .and_then(|value| value.as_f64())
+    };
+    Some((field("usage")?, field("quota")?))
 }
 
 /// Delete the local session.
