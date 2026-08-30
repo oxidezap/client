@@ -57,7 +57,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libxkbcommon-dev \
+          # `--no-install-recommends`: what these headers recommend is
+          # documentation and tooling nothing links against, and it is a
+          # download and an unpack on every run of every job that needs them.
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libwayland-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig1-dev libfreetype6-dev
@@ -66,9 +70,29 @@ jobs:
         with:
           tool: protoc
 
+      # The registry and the git checkouts, and deliberately not `target/`.
+      #
+      # A repository gets 10 GB of Actions cache in total and GitHub evicts the
+      # least recently used entry to stay under it. Every push to `main` writes
+      # nine entries between them — five from `ci.yml`, one from `pages.yml`
+      # and three from here — and this job's three are by some way the largest,
+      # because a release target directory is fat LTO with `codegen-units = 1`
+      # for three platforms. They were pushing `ci.yml`'s out: across the runs
+      # sampled while writing this, the macOS and Windows `Check` jobs restored
+      # nothing on every pull request, which is what turned a 3m49 Windows job
+      # on `main` into 12m26 on the pull request twenty minutes later.
+      #
+      # So this job keeps the half of the cache that is cheap — the crates.io
+      # registry and the `whatsapp-rust` git checkout — and gives up the half
+      # that is expensive. What it loses is the dependency compile of a release
+      # build, on a job that is nobody's critical path and whose wall clock is
+      # mostly a fat LTO link that was never cached anyway. What every pull
+      # request gains is a warm cache on the two platforms where a cold one
+      # costs eight minutes.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
+          cache-targets: "false"
 
       # Both binaries, because they are one product now: the front end owns no
       # WhatsApp session and starts `oxidezapd` beside itself when none is
