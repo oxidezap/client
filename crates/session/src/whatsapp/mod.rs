@@ -2737,8 +2737,13 @@ impl WhatsAppClient {
                     None => latest.push((who.canonical_jid.clone(), entry.emoji)),
                 }
             }
+            // Through `add_reaction` rather than into the map, because the
+            // bounds on a message's reactions live there: writing the rows
+            // straight in restored every stored reactor, so a message the
+            // live path had capped came back over the cap after a reload —
+            // and drew a different set from the copy beside it.
             for (sender, emoji) in latest {
-                msg.reactions.entry(emoji).or_default().push(sender);
+                msg.add_reaction(emoji, sender);
             }
         }
     }
