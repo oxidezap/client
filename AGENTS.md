@@ -1372,6 +1372,19 @@ by definition.
   upload note above: the recording, the staging and the container are all in
   place, and `execute_upload` upstream is what a voice note from an
   own-session page still runs into. Attached to an `oxidezapd` it goes.
+  Which is why the microphone is not offered there. `platform::capabilities`
+  is the twin of `platform::plugins` and answers the same shape of question:
+  each is `None` or the sentence to draw instead, and each is about the
+  platform and the session rather than about a file or a moment, which is what
+  makes it safe to ask *before* the control is offered. Asking early is the
+  whole value. A composer that drew the microphone on an own-session page let
+  somebody record a whole voice note and lose it at the send, which is the
+  worse of the two ways to learn this, and the file already said so about the
+  browsers with no Opus encoder. The same module answers for video, and there
+  the ordering is the point: a decoder is built from the parameter sets, so a
+  browser with no `VideoDecoder` was otherwise found out only after the whole
+  attachment had been fetched and demuxed, and the bubble draws that as Retry
+ , every press paying the download again to reach the same permanent answer.
 - **A page prepares a recording on the window's own thread.** `app/recording.rs`
   hands the desktop's waveform and encode to `cx.background_spawn`, which is
   where work measured in hundreds of millions of operations belongs. The web

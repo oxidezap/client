@@ -802,6 +802,16 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
+        // Asked before the fetch, not after it. The decoder is built from the
+        // parameter sets, so a browser with no `VideoDecoder` is otherwise
+        // discovered once the whole attachment has been downloaded and
+        // demuxed, and the bubble draws that as Retry: every press pays the
+        // download again to reach the same permanent answer.
+        if let Some(reason) = crate::platform::video_decode_unavailable() {
+            warn!("not downloading a video: {reason}");
+            self.notify_user(reason.to_string(), crate::app::notices::Tone::Problem, cx);
+            return;
+        }
         let Some(client) = &self.client else {
             warn!("Cannot download video: client is unavailable");
             return;
