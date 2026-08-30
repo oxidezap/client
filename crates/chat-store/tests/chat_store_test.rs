@@ -7264,6 +7264,49 @@ async fn a_collapsed_duplicate_does_not_shorten_the_page() {
     );
 }
 
+/// The same rule for the batch an attach load asks for. This one is worse
+/// than a short page: the attach limit is sized to cover the unread tail, so
+/// a message dropped out of it never reaches `ReadTracker` and its receipt is
+/// never sent — the badge comes back on the next hydration, for a message the
+/// person has read.
+#[tokio::test]
+async fn a_collapsed_duplicate_does_not_shorten_a_batched_page() {
+    let (store, chat_store) = test_store().await;
+    let mut events = Vec::new();
+    for (n, id) in ["BATCH-A", "BATCH-B"].iter().enumerate() {
+        let at = 1_700_000_000 + n as i64;
+        events.push(message_event(
+            wa::Message::text("under the number"),
+            incoming_info(PEER, PEER, id, at),
+        ));
+        events.push(message_event(
+            wa::Message::text("under the lid"),
+            incoming_info(PEER_LID, PEER_LID, id, at),
+        ));
+    }
+    events.push(message_event(
+        wa::Message::text("older, and only under the number"),
+        incoming_info(PEER, PEER, "BATCH-OLDER", 1_699_999_000),
+    ));
+    feed(&chat_store, events).await;
+
+    add_lid_mapping(&store).await;
+    let pages = chat_store.pages(vec![(jid(PEER), 3)]).await.unwrap();
+    let page = pages
+        .values()
+        .next()
+        .expect("the chat has rows under one of its two keys");
+    assert_eq!(
+        page.len(),
+        3,
+        "the batch fills to its limit in unique messages, as one chat's page does"
+    );
+    assert!(
+        page.iter().any(|m| m.id == "BATCH-OLDER"),
+        "and it is the row behind the duplicates that fills the slot"
+    );
+}
+
 /// The write has to look where the reads do. A thread living under the LID
 /// key, named here by the phone number, used to be updated under a key it has
 /// no rows beneath: the view was recorded nowhere and the ring stayed up.

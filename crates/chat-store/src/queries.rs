@@ -134,20 +134,6 @@ pub(crate) struct MessageRow {
     pub(crate) rowid: i64,
 }
 
-/// One row per message id, keeping the first of a duplicate.
-///
-/// A read covers both halves of a PN/LID pair, and the message table's key
-/// includes the chat, so until a split is merged the same message can exist
-/// under both. Returned twice it fills two slots of a page's limit and moves
-/// the cursor past rows nobody was shown; the merge path already treats such
-/// a pair as one message.
-fn dedup_by_id(rows: Vec<MessageRow>) -> Vec<MessageRow> {
-    let mut seen = std::collections::HashSet::with_capacity(rows.len());
-    rows.into_iter()
-        .filter(|row| seen.insert(row.msg_id.clone()))
-        .collect()
-}
-
 impl From<MessageRow> for StoredMessage {
     fn from(row: MessageRow) -> Self {
         let message = row.proto.as_deref().and_then(|bytes| {
@@ -489,7 +475,6 @@ impl ChatStore {
         before: Option<MessageCursor>,
         limit: i64,
     ) -> Result<Vec<StoredMessage>> {
-        use schema::messages::dsl;
         let limit = limit.max(0);
         let device_id = self.device_id();
         let chat = chat.to_string();
@@ -498,41 +483,59 @@ impl ChatStore {
             .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                // Filled to `limit` *unique* rows, not to `limit` raw ones: a
-                // caller reads a short page as the start of the conversation
-                // and stops asking, so a duplicate collapsed inside the page
-                // would end the history at the split rather than at its
-                // beginning. Each pass costs a query only when the last one
-                // collapsed something, which a merged pair never does.
-                let mut kept: Vec<MessageRow> = Vec::new();
-                let mut ids = std::collections::HashSet::new();
-                let mut before = before;
-                while (kept.len() as i64) < limit {
-                    let wanted = limit - kept.len() as i64;
-                    let rows: Vec<MessageRow> = page_query(device_id, &keys, before.as_ref())
-                        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
-                        .limit(wanted)
-                        .load(conn)
-                        .map_err(db_err)?;
-                    let exhausted = (rows.len() as i64) < wanted;
-                    before = rows.last().map(|row| MessageCursor {
-                        timestamp_ms: row.timestamp_ms,
-                        seq: row.rowid,
-                    });
-                    for row in rows {
-                        if ids.insert(row.msg_id.clone()) {
-                            kept.push(row);
-                        }
-                    }
-                    if exhausted {
-                        break;
-                    }
-                }
-                Ok(kept)
+                fill_unique(conn, device_id, &keys, before, limit)
             })
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
+}
+
+/// One page of `limit` *unique* rows, not `limit` raw ones.
+///
+/// A caller reads a short page as the start of the conversation and stops
+/// asking, so a duplicate collapsed inside the page would end the history at
+/// the split rather than at its beginning — and a page that serves the unread
+/// tail would leave the messages it dropped out of `ReadTracker`, where their
+/// receipts are owed. Each pass costs a query only when the last one collapsed
+/// something, which a merged pair never does.
+///
+/// Both readers go through it: the single chat's page and the batch an attach
+/// load asks for. The batch is where this was missing, which is the shape of
+/// every other defect in this batch — the rule written once and not repeated on
+/// its twin.
+fn fill_unique(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    keys: &[String],
+    before: Option<MessageCursor>,
+    limit: i64,
+) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
+    use schema::messages::dsl;
+    let mut kept: Vec<MessageRow> = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    let mut before = before;
+    while (kept.len() as i64) < limit {
+        let wanted = limit - kept.len() as i64;
+        let rows: Vec<MessageRow> = page_query(device_id, keys, before.as_ref())
+            .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+            .limit(wanted)
+            .load(conn)
+            .map_err(db_err)?;
+        let exhausted = (rows.len() as i64) < wanted;
+        before = rows.last().map(|row| MessageCursor {
+            timestamp_ms: row.timestamp_ms,
+            seq: row.rowid,
+        });
+        for row in rows {
+            if ids.insert(row.msg_id.clone()) {
+                kept.push(row);
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+    Ok(kept)
 }
 
 /// The rows of one page, before they are ordered and limited.
@@ -589,7 +592,6 @@ impl ChatStore {
         &self,
         wanted: Vec<(Jid, i64)>,
     ) -> Result<HashMap<String, Vec<StoredMessage>>> {
-        use schema::messages::dsl;
         let device_id = self.device_id();
         let wanted: Vec<(String, i64)> = wanted
             .iter()
@@ -610,14 +612,9 @@ impl ChatStore {
                         .get(&chat)
                         .cloned()
                         .unwrap_or_else(|| vec![chat.clone()]);
-                    let rows: Vec<MessageRow> = dsl::messages
-                        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
-                        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
-                        .limit(limit)
-                        .load(conn)
-                        .map_err(db_err)?;
+                    let rows = fill_unique(conn, device_id, &keys, None, limit)?;
                     if !rows.is_empty() {
-                        pages.insert(chat, dedup_by_id(rows));
+                        pages.insert(chat, rows);
                     }
                 }
                 Ok(pages)
