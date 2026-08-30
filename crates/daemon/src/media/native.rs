@@ -12,13 +12,10 @@
 //! bookkeeping, just files whose names say what is in them.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 
-use super::{CACHE_EPOCH, WIPE_LOCK, Wipe, is_staged_upload};
-#[cfg(test)]
-use super::{download_key, message_key};
+use super::{Wipe, is_staged_upload};
 
 /// How much media the cache may hold before the oldest is dropped.
 ///
@@ -260,14 +257,9 @@ pub fn cache_usage() -> (u64, u64) {
 }
 
 /// Best-effort per entry: one unreadable file must not abandon the rest.
-pub fn wipe(scope: Wipe) -> Result<()> {
-    // For the whole wipe, so an epoch-checked write is either wholly before
-    // it — and deleted by it — or wholly after, and kept.
-    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Before the deletions, not after: a writer that reads the epoch between
-    // the two would otherwise believe its file survived the wipe that is
-    // about to remove it.
-    CACHE_EPOCH.fetch_add(1, Ordering::SeqCst);
+///
+/// The lock and the epoch belong to [`super::wipe`], which is the only caller.
+pub(super) fn delete(scope: Wipe) -> Result<()> {
     let Some(dir) = oxidezap_ipc::media_dir() else {
         return Ok(());
     };
@@ -337,85 +329,4 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A "clear cached media" that takes a staged upload with it turns an
-    /// unrelated cleanup into a voice note that fails with "no audio cached".
-    #[test]
-    fn clearing_the_cache_spares_a_staged_upload() {
-        assert!(Wipe::Cache.takes("f-3EB0ABC"));
-        assert!(Wipe::Cache.takes("d-9f86d081884c7d65"));
-        assert!(
-            !Wipe::Cache.takes("u-local_audio-7"),
-            "somebody is still waiting for that to be sent"
-        );
-    }
-
-    /// The budget sweep reclaims more than a "clear cached media" does: the
-    /// orphans of an older build have nothing else to remove them, and they
-    /// are billed to the user by `cache_usage` either way.
-    #[test]
-    fn the_budget_sweep_spares_only_a_staged_upload() {
-        assert!(is_staged_upload("u-local_audio-7"));
-        assert!(!is_staged_upload("f-3EB0ABC"));
-        assert!(!is_staged_upload("d-9f86d081884c7d65"));
-        assert!(
-            !is_staged_upload("m-3EB0ABC"),
-            "an orphan of the build that wrote thumbnails under the message key"
-        );
-    }
-
-    /// The account is going, and so is anything that was going to be sent
-    /// under it.
-    #[test]
-    fn forgetting_an_account_takes_everything() {
-        assert!(Wipe::Everything.takes("f-3EB0ABC"));
-        assert!(Wipe::Everything.takes("d-9f86d081884c7d65"));
-        assert!(Wipe::Everything.takes("u-local_audio-7"));
-    }
-
-    /// A message id comes off the network. One carrying a separator would name
-    /// a file outside the cache, which the daemon writes to as the user who
-    /// owns the session.
-    #[test]
-    fn a_key_built_from_a_message_id_cannot_escape_the_cache() {
-        for id in ["../../etc/passwd", "a/b", "..", "with space", "\0"] {
-            let key = message_key(id);
-            assert!(
-                oxidezap_ipc::media_path(&key).is_some(),
-                "{id} produced an unusable key: {key}"
-            );
-            assert!(!key.contains('/'), "{key}");
-        }
-    }
-
-    /// The same media shared into two chats is one file, so the second
-    /// download never happens.
-    #[test]
-    fn the_same_content_is_the_same_key() {
-        let sha = [0xab_u8; 32];
-        assert_eq!(download_key(&sha), download_key(&sha));
-        assert_ne!(download_key(&sha), download_key(&[0xcd; 32]));
-        assert!(
-            download_key(&sha).len() < 40,
-            "a key is a file name a person may have to read"
-        );
-    }
-
-    /// Message keys and download keys share a directory and must not collide:
-    /// one is addressed by message, the other by content. The message prefix
-    /// is `f-` because it also promises *full* media — see [`message_key`].
-    #[test]
-    fn the_two_key_spaces_stay_apart() {
-        assert!(message_key("abc").starts_with("f-"));
-        assert!(download_key(&[1; 32]).starts_with("d-"));
-        assert!(
-            !message_key("abc").starts_with("m-"),
-            "the old prefix cached thumbnails under it and must stay orphaned"
-        );
-    }
 }

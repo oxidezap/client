@@ -146,7 +146,7 @@ impl WhatsAppApp {
             match index.get(&chat.jid).copied() {
                 Some(at) => {
                     let jid = chat.jid.clone();
-                    self.chats[at].merge_history(chat);
+                    Arc::make_mut(&mut self.chats[at]).merge_history(chat);
                     // The chat *on screen* was read locally the moment the
                     // message arrived; the store row commits with the unread
                     // bump before our receipt lands, so the hydrated counter
@@ -156,7 +156,7 @@ impl WhatsAppApp {
                     // would otherwise clear the badge of a conversation nobody
                     // was looking at.
                     if self.visible_chat.as_deref() == Some(jid.as_str()) {
-                        self.chats[at].mark_as_read();
+                        Arc::make_mut(&mut self.chats[at]).mark_as_read();
                     }
                     // The read a row without messages could not bound. Spent
                     // here because this is what gave it a message to name; see
@@ -180,7 +180,7 @@ impl WhatsAppApp {
                     // would be pushed twice: the scan this replaces found the
                     // first of them.
                     index.insert(chat.jid.clone(), self.chats.len());
-                    self.chats.push(chat);
+                    self.chats.push(Arc::new(chat));
                 }
             }
         }

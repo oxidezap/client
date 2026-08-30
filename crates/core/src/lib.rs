@@ -18,6 +18,7 @@ mod call;
 mod calls;
 mod chat;
 mod events;
+mod media_budget;
 mod message_status;
 mod plugin;
 mod presence;
@@ -34,6 +35,7 @@ pub use chat::STATUS_BROADCAST_JID;
 pub use chat::fallback_chat_name;
 pub use chat::{Chat, ChatMessage, DownloadableMedia, MediaContent, MediaType, Resend};
 pub use events::{ReceiptType, UiEvent};
+pub use media_budget::{DECODED_IMAGE_BUDGET_BYTES, WEB_MEDIA_BUDGET_BYTES};
 pub use message_status::MessageStatus;
 pub use plugin::{PluginAction, PluginNode, PluginRoot, PluginSlot, PluginSurface, PluginWidget};
 pub use presence::{

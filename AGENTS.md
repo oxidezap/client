@@ -152,6 +152,13 @@ TRUNK_ACTION=serve ./web/build.sh
 # what people paste into issues. The token goes after a `#`, never a `?`: a
 # query reaches whoever served the page, a fragment never leaves the browser.
 cargo run --bin oxidezapd -- --web
+
+# The same bundle with its symbols, for when a profile or a panic trace has
+# to name something. `[profile.web-debug]` inherits `[profile.web]` and turns
+# `strip` off, so it is the build that misbehaved rather than a different one
+# — and `-g` in `data-wasm-opt-params` is what stops wasm-opt throwing the
+# name section away again.
+WEB_PROFILE=debug ./web/build.sh
 ```
 
 Type-checking the web build without the whole bundle:
@@ -231,8 +238,9 @@ profile here repeats it deliberately.
   without an early return, so the matching prefix is not something a caller
   can time; and answered with a `404` rather than a `403`, because an endpoint
   the caller may not open has no reason to confirm it is there. A request with
-  no `Origin` is not a browser — a page cannot suppress the header — so it is
-  served on a loopback bind, and still only with the token. A non-loopback
+  no `Origin` carries nothing to check — an `<img>`, a `<script>` and a form
+  GET are browser requests that send none — so it is served on a loopback
+  bind, and still only with the token, which is the whole admission check. A non-loopback
   bind is an error rather than a warning: there the header is a string the
   client picks and the traffic is cleartext, so remote access is a tunnel's
   job. Both endpoints draw on one admission
@@ -674,6 +682,47 @@ profile here repeats it deliberately.
   call that has ended would put the last person's face on this one, and a
   frame for a direction just turned off would light a pane nothing will come
   to clear again.
+- **The web build is a profile, not a `cfg`.** `[profile.release]` is
+  calibrated for the binary, where an optimization is paid for once and
+  collected at every frame after; the web artifact is one module a visitor
+  waits on before the first pixel and a browser then compiles, and its code
+  section is 84% of it. Cargo has no per-target profiles, so `[profile.web]`
+  is the answer and `web/build.sh` selects it through trunk's
+  `--cargo-profile`. `opt-level = "s"` there was measured at 31% of the module
+  — by a wide margin the largest single thing in it, larger than every crate
+  gate put together. `gpui` is the one exception at 3: it draws every frame
+  and is the largest crate here. Package overrides do *not* inherit through
+  `inherits`, so the ones that reach this graph are repeated rather than
+  borrowed from the desktop sweep — which names `ureq`, `zbus`, `wayland-*`
+  and `libsqlite3-sys`, almost none of which are compiled for wasm at all.
+  Two ways in that look like they should work and do not:
+  `CARGO_PROFILE_RELEASE_PACKAGE_<NAME>_OPT_LEVEL` is silently ignored, and
+  `--config`, which is not, is not something trunk can forward.
+- **The page has a third heap, and it is the size of the account.** The
+  relaxed-idb VFS holds `HashMap<usize, Uint8Array>` — the whole database,
+  resident in the *JavaScript* heap, one 8 KiB page per entry, kept alive
+  through wasm-bindgen's object table. A snapshot of a logged-in session
+  showed 1,528 of them: 12 MiB of database beside 7.6 MiB of linear memory,
+  under 32 MiB of V8-compiled module. So "the wasm heap" is not where the
+  store's memory is, the budgets in `media/web.rs` and `session/web.rs` do not
+  bound it, and it grows with history rather than with what is on screen.
+  Another argument for OPFS in a worker, and a larger one than durability.
+- **A frame may not cost what the conversation costs.** The conversation pane
+  reads the selected chat and then needs the app mutably to build the
+  timeline, so what it takes has to survive that — and a `Chat` taken by value
+  is its messages, each of them four `String`s, a reaction map, a quote and a
+  media handle. `chats` holds `Arc<Chat>` for that reason and every write goes
+  through `Arc::make_mut`, which costs nothing while the only other holder is
+  a frame about to end. The same rule reaches the rows: `BubbleProps` carries
+  an `Arc<ChatMessage>`, and the four to seven element ids a bubble draws
+  under are formatted into `MessageListCache` when the rows are built rather
+  than per row per frame — that cache is already rebuilt exactly when the
+  messages change, which is exactly when an id could differ. `app::frame_cost`
+  is what holds it: a counting allocator, ignored by default, asserting that
+  the per-frame path does not scale with the conversation behind it. It counts
+  allocations rather than milliseconds deliberately — the machine with the
+  problem is a browser running `dlmalloc`, and a count is the same count on
+  both.
 - **Decoded images are cached by message id**, because GPUI tracks animation
   state per `Arc<Image>` and rebuilding one re-decodes the bytes. Whoever
   replaces a preview with real bytes must evict the entry.
@@ -1204,7 +1253,13 @@ by definition.
   Durability is the other half. The window's VFS is relaxed-IndexedDB, which
   writes changed blocks after the commit rather than during it, so a tab killed
   in that window loses the commit — a message that comes back on the next
-  hydration, or a ratchet that has to re-establish. The durable answer is OPFS
+  hydration, or a ratchet that has to re-establish. Nor is an ordinary commit
+  *observable*: the VFS answers for an import, a deletion and a clear, and
+  hands back nothing for the writes a session makes — so a quota the browser
+  refuses has nowhere to be reported, and the account behaves perfectly all
+  session and is gone on the next load. What the store does about that is say
+  the headroom out loud when it opens, which is a warning rather than a fix.
+  The durable answer is OPFS
   through a synchronous access handle, which exists in a dedicated worker and
   nowhere else, so it arrives with the worker. It changes nothing above
   `session/store/`, which is why that interface is three functions.
@@ -1265,6 +1320,32 @@ by definition.
   the native cache keeping claims the way the page's does, which is the index
   that module opens by saying it does not have — worth it only if somebody
   meets it.
+- **The page's parsed markup is rebuilt on every frame.** `render_rich_text`
+  reparses a bubble's text per frame and allocates a `String` and two `Vec`s
+  doing it, and the plain path allocates a copy too. It belongs in
+  `MessageListCache` beside the element ids — except that a `StyledText` is
+  built against `cx.theme()`, so what is cached and what a theme change
+  invalidates is a decision rather than a move. The complexity of `runs()` is
+  not the thing to chase: `spans` is small, and the cost is the allocation.
+- **What the module weighs is nobody's job to notice.** The Pages workflow
+  prints it now, and the numbers to compare against are: 29,825,238 bytes at
+  `17e6d4f`, of which the code section is 84.5% and the data section 15.1%,
+  with no name section at all (`strip = true` removes it before wasm-opt
+  sees the module — which is also why a DevTools flame graph of this page has
+  never had Rust symbols in it). By group, that code is 29% gpui and its
+  renderer, 21% the Rust standard library, 17% the WhatsApp protocol and
+  crypto, and 5% gpui-component. `wasmi`, `symphonia`, `mp4`, `opus`,
+  `openh264`, `tree_sitter`, `notify` and `tracing` are all absent: LTO
+  removes them, and the gates that exist for them are discipline rather than
+  bytes.
+- **The page's media budgets are one number and three ceilings.**
+  `WEB_MEDIA_BUDGET_BYTES` is what the daemon's cache and a frame's fetch each
+  allow, and `DECODED_IMAGE_BUDGET_BYTES` is a quarter of it again on top — so
+  the worst case a page holds is their sum rather than the figure any of them
+  names. Naming them in one place makes them move together and makes the
+  arithmetic possible; nobody has done the arithmetic. Coordinating one
+  allowance across three caches in two crates wants a measurement of what a
+  page actually holds, which is the same measurement the item below needs.
 - **Nothing evicts the media a conversation is holding.** A message keeps its
   full bytes in `MediaContent::data` for as long as the row is loaded, and
   `Chat::add_message` has no ceiling — so the two media budgets that do exist

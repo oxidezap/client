@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use gpui::SharedString;
 
 use crate::utils::crosses_day;
 use oxidezap_core::{ChatMessage, TypingSummary};
@@ -69,7 +70,56 @@ pub struct MessageListCache {
     /// The rows, dividers and typing indicator included.
     pub items: Arc<[TimelineItem]>,
     /// The messages the rows index into.
-    pub messages: Arc<[ChatMessage]>,
+    ///
+    /// One `Arc` per message rather than one over the slice, because a bubble
+    /// is handed its message and the list builds one per visible row per
+    /// frame: from a slice that hand-off is a `ChatMessage` clone — four
+    /// `String`s, a reaction map, a quote and a media handle — and from this
+    /// it is a refcount. The extra allocation is paid once per rebuild, which
+    /// happens when the conversation changes rather than when it is drawn.
+    pub messages: Arc<[Arc<ChatMessage>]>,
+    /// The element ids each message's row is drawn under.
+    ///
+    /// Parallel to [`Self::messages`], and here for the same reason: a bubble
+    /// needs four of them, `gpui` wants each as a `SharedString`, and
+    /// formatting them at the row is formatting them sixty times a second for
+    /// text that has not changed since the conversation was opened.
+    pub ids: Arc<[BubbleIds]>,
+}
+
+/// The element ids for one message's row, formatted once.
+#[derive(Clone)]
+pub struct BubbleIds {
+    /// The row that holds the bubble and its action bar.
+    pub row: SharedString,
+    /// The hover group the action bar reveals itself from. Named three times
+    /// in one row, which is the whole reason this is a field.
+    pub group: SharedString,
+    /// The bubble itself.
+    pub bubble: SharedString,
+    /// The three controls in the action bar beside it, which is built on
+    /// every frame whether or not the pointer is over the row: it is
+    /// `invisible()` until a hover reveals it, not absent.
+    pub react: SharedString,
+    pub reply: SharedString,
+    pub copy: SharedString,
+    /// The button a failed send grows.
+    pub retry: SharedString,
+}
+
+impl BubbleIds {
+    fn of(message: &ChatMessage) -> Self {
+        let id = &message.id;
+        Self {
+            row: format!("row-{id}").into(),
+            group: format!("bubble-{id}").into(),
+            bubble: format!("msg-{id}").into(),
+            react: format!("react-{id}").into(),
+            reply: format!("reply-{id}").into(),
+            copy: format!("copy-{id}").into(),
+            retry: format!("retry-{id}").into(),
+        }
+    }
 }
 
 impl MessageListCache {
@@ -139,7 +189,8 @@ impl MessageListCache {
             is_group,
             items: build_items(messages, typing.clone()).into(),
             typing,
-            messages: Arc::from(messages),
+            ids: messages.iter().map(BubbleIds::of).collect(),
+            messages: messages.iter().cloned().map(Arc::new).collect(),
         }
     }
 
