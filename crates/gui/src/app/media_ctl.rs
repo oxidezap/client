@@ -600,14 +600,12 @@ impl WhatsAppApp {
         ];
         let mut cache = self.decoded_images.borrow_mut();
 
-        // Oldest first, never one that is being drawn, until this one fits
-        // under both ceilings — see `DECODED_IMAGE_BUDGET` for why there are
-        // two. An image larger than the whole budget still goes in and is then
-        // alone in the cache; refusing it would mean a picture the reader
-        // opened being decoded again on every frame.
+        // Least recently used first, never one that is being drawn, until
+        // this one fits — see `DECODED_IMAGE_BUDGET` for why there are two
+        // bounds and `MIN_DECODED_IMAGES` for why the byte one gives way.
         let cost = image.bytes.len();
         let mut held: usize = cache.values().map(|image| image.bytes.len()).sum();
-        while held + cost > DECODED_IMAGE_BUDGET || cache.len() >= MAX_DECODED_IMAGES {
+        while super::over_budget(held + cost, cache.len()) {
             let Some(at) = cache
                 .keys()
                 .position(|key| !pinned.contains(&Some(key.as_str())))

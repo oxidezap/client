@@ -1322,6 +1322,14 @@ by definition.
   `openh264`, `tree_sitter`, `notify` and `tracing` are all absent: LTO
   removes them, and the gates that exist for them are discipline rather than
   bytes.
+- **The page's media budgets are one number and three ceilings.**
+  `WEB_MEDIA_BUDGET_BYTES` is what the daemon's cache and a frame's fetch each
+  allow, and `DECODED_IMAGE_BUDGET_BYTES` is a quarter of it again on top — so
+  the worst case a page holds is their sum rather than the figure any of them
+  names. Naming them in one place makes them move together and makes the
+  arithmetic possible; nobody has done the arithmetic. Coordinating one
+  allowance across three caches in two crates wants a measurement of what a
+  page actually holds, which is the same measurement the item below needs.
 - **Nothing evicts the media a conversation is holding.** A message keeps its
   full bytes in `MediaContent::data` for as long as the row is loaded, and
   `Chat::add_message` has no ceiling — so the two media budgets that do exist

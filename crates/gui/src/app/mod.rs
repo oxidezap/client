@@ -383,6 +383,31 @@ const MAX_VIDEO_PLAYERS: usize = 10;
 /// from, because the page's budgets are ceilings on one heap.
 const DECODED_IMAGE_BUDGET: usize = oxidezap_core::DECODED_IMAGE_BUDGET_BYTES as usize;
 
+/// The fewest decoded images the byte budget may leave in the cache.
+///
+/// A floor under [`DECODED_IMAGE_BUDGET`], and the thing that keeps a byte
+/// budget from being worse than the entry count it joined. Eviction is
+/// least-recently-used, so a *working set* larger than the budget does not
+/// degrade — it thrashes: every row on screen misses, evicts the row drawn
+/// before it, and pays `Image::from_bytes` to copy its encoded bytes again,
+/// on every frame. The entry ceiling could only reach that at fifty visible
+/// pictures; twelve megabytes is four of them if they are large.
+///
+/// So the bytes give way. A viewport that will not fit is kept anyway and the
+/// budget is exceeded, because the alternative spends the same memory
+/// transiently *and* the decode, sixty times a second, forever. Above the
+/// floor the budget binds normally, which is where the long tail is.
+///
+/// Sized as a viewport rather than a guess: a conversation draws on the order
+/// of twenty rows, and images are a minority of them even in an album.
+const MIN_DECODED_IMAGES: usize = 16;
+
+/// The floor is a floor, not a second cap: it has to leave room under the
+/// entry ceiling for the byte budget to bind on anything at all. Asserted at
+/// compile time rather than in a test, because it is a property of the two
+/// literals and a test of it can only ever restate them.
+const _: () = assert!(MIN_DECODED_IMAGES < MAX_DECODED_IMAGES);
+
 /// How many decoded images to keep cached, whatever they weigh.
 ///
 /// The second half of [`DECODED_IMAGE_BUDGET`], and not redundant with it:
@@ -3076,6 +3101,15 @@ impl Render for WhatsAppApp {
 ///
 /// `None` is older than any timestamp, so an empty conversation lands at the
 /// end — the same place `Reverse(last_message_time)` puts it.
+/// Whether the decoded-image cache should give up an entry.
+///
+/// Two bounds and a floor, in one place because they only make sense
+/// together: entries are capped absolutely, bytes are capped only while
+/// there is more than a viewport left to cap. See [`MIN_DECODED_IMAGES`].
+fn over_budget(held: usize, entries: usize) -> bool {
+    entries >= MAX_DECODED_IMAGES || (held > DECODED_IMAGE_BUDGET && entries > MIN_DECODED_IMAGES)
+}
+
 fn slot_newest_first(rest: &[Arc<Chat>], at: Option<chrono::DateTime<chrono::Utc>>) -> usize {
     rest.iter()
         .position(|other| other.last_message_time < at)
@@ -3378,5 +3412,43 @@ mod tests {
     fn an_equal_head_keeps_the_incumbent_above_it() {
         let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(10)))];
         assert_eq!(slot_newest_first(&rest, at(30)), 1);
+    }
+}
+
+#[cfg(test)]
+mod decoded_image_budget {
+    use super::{DECODED_IMAGE_BUDGET, MAX_DECODED_IMAGES, MIN_DECODED_IMAGES, over_budget};
+
+    #[test]
+    fn entries_are_capped_whatever_they_weigh() {
+        assert!(over_budget(1, MAX_DECODED_IMAGES));
+        assert!(!over_budget(1, MAX_DECODED_IMAGES - 1));
+    }
+
+    #[test]
+    fn bytes_are_capped_above_the_floor() {
+        assert!(over_budget(
+            DECODED_IMAGE_BUDGET + 1,
+            MIN_DECODED_IMAGES + 1
+        ));
+        assert!(!over_budget(DECODED_IMAGE_BUDGET, MIN_DECODED_IMAGES + 1));
+    }
+
+    /// The property the floor exists for: a viewport whose pictures do not fit
+    /// is kept, rather than evicted one row at a time by the next row.
+    ///
+    /// Without it the loop empties the cache down to the one image that
+    /// triggered it, every row misses, and each miss copies its encoded bytes
+    /// and decodes them again — on every frame, for as long as the reader
+    /// looks at that part of the conversation.
+    #[test]
+    fn a_viewport_that_does_not_fit_is_kept_rather_than_thrashed() {
+        let far_over = DECODED_IMAGE_BUDGET * 100;
+        assert!(
+            !over_budget(far_over, MIN_DECODED_IMAGES),
+            "the byte budget must not evict a viewport's worth of images"
+        );
+        // And it still binds on the entry above the floor.
+        assert!(over_budget(far_over, MIN_DECODED_IMAGES + 1));
     }
 }
