@@ -14,30 +14,8 @@ use super::super::*;
 // Named here rather than through the star above, because the camera is this
 // file's business alone: the session's own module has no use for one.
 use crate::video::LocalVideo;
-use oxidezap_audio::{spawn_mic, spawn_speaker};
+use oxidezap_audio::open_call_audio;
 use whatsapp_rust::voip::{CallEvent, CallHandle, CallTermination, VideoState, VideoUpgradeToken};
-
-/// The two ends of a call's audio: what the microphone produces, and what the
-/// speaker consumes.
-type CallAudio = (
-    async_channel::Receiver<Vec<i16>>,
-    async_channel::Sender<Vec<i16>>,
-);
-
-/// Open the devices, off the async thread.
-///
-/// cpal's setup is blocking and can take a noticeable moment on a cold audio
-/// stack, which is a moment the session would otherwise spend not answering
-/// anything else.
-async fn open_call_audio() -> Result<CallAudio, String> {
-    tokio::task::spawn_blocking(|| {
-        let mic = spawn_mic().map_err(|e| e.to_string())?;
-        let speaker = spawn_speaker().map_err(|e| e.to_string())?;
-        Ok((mic, speaker))
-    })
-    .await
-    .map_err(|e| format!("audio setup task failed: {e}"))?
-}
 
 /// Whether an offer asked for video.
 ///
@@ -354,7 +332,13 @@ impl CallRegistry {
         let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.pending.remove(call_id);
         if let Some(handle) = calls.active.remove(call_id) {
-            tokio::spawn(async move { handle.hangup_local().await });
+            // The session's executor rather than tokio's: a page has no runtime
+            // to reach for. Dropped rather than kept, which detaches on both --
+            // a tokio `JoinHandle` and the page's oneshot receiver each leave
+            // their task running -- and this is a hangup nobody waits on.
+            drop(crate::exec::spawn(
+                async move { handle.hangup_local().await },
+            ));
             return;
         }
         if calls.in_flight.contains(call_id) {

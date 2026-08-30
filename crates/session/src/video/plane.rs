@@ -140,7 +140,17 @@ fn publish(publisher: &VideoPublisher, frame: impl FnOnce() -> CallVideoFrame) -
 /// spawned, so a user who turns video off and on again in that window would
 /// otherwise have the *replacement* torn down by the failure of the one
 /// before it.
+///
+/// The bound is the platform's, and it is the same difference [`crate::exec`]
+/// names once: what this closure captures is the call registry, and on a page
+/// that holds the library's own `CallHandle`, which is not `Send` there and
+/// does not need to be. A cfg on the alias rather than a `MaybeSendSync`
+/// bound, because only auto traits may be added to a trait object.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) type CameraLost = Arc<dyn Fn(String, CameraId) + Send + Sync>;
+/// See the desktop half: on a page the bound is empty.
+#[cfg(target_family = "wasm")]
+pub(crate) type CameraLost = Arc<dyn Fn(String, CameraId)>;
 
 /// One opened camera, told apart from the next one on the same call.
 ///

@@ -107,3 +107,55 @@ mod video {
         }
     }
 }
+
+/// # Placing a call
+///
+/// Why this front end cannot carry a call's media, or `None` if it can.
+///
+/// A call's media rides a pre-negotiated WebRTC DataChannel, which on a
+/// desktop the daemon builds over a UDP socket and in a page is an
+/// `RTCPeerConnection`. A browser old enough to lack one cannot carry a call
+/// at all, and that is worth knowing before somebody presses Call and grants
+/// microphone permission to something that was never going to connect --
+/// which is the same sentence this module makes about the microphone and
+/// about `VideoDecoder`.
+///
+/// Not asked about video separately, and deliberately: a camera that will not
+/// open downgrades a call to voice rather than failing it, on both platforms,
+/// so a browser with `RTCPeerConnection` and no `VideoEncoder` places an
+/// ordinary voice call. There is nothing to withhold.
+///
+/// What this cannot see is whether the *build* can complete the handshake:
+/// that is `oxidezap-session`'s `relay::web::RELAY_DTLS_FINGERPRINT`, and a
+/// front end has no route to it -- the GUI depends on ipc, core and audio,
+/// never on the session. A build missing it fails at setup with its own
+/// reason instead, which is the weaker of the two places to learn it.
+#[must_use]
+pub fn calls_unavailable() -> Option<&'static str> {
+    calls::calls_unavailable()
+}
+
+#[cfg(not(target_family = "wasm"))]
+mod calls {
+    /// The daemon holds the session, and with it the UDP socket.
+    pub fn calls_unavailable() -> Option<&'static str> {
+        None
+    }
+}
+
+#[cfg(target_family = "wasm")]
+mod calls {
+    /// Asked of the global rather than by constructing one, for the reason
+    /// `video_decode_unavailable` is: building an `RTCPeerConnection` to find
+    /// out is work, and this is a question with a constant answer.
+    pub fn calls_unavailable() -> Option<&'static str> {
+        let global = js_sys::global();
+        match js_sys::Reflect::get(
+            &global,
+            &wasm_bindgen::JsValue::from_str("RTCPeerConnection"),
+        ) {
+            Ok(found) if !found.is_undefined() && !found.is_null() => None,
+            _ => Some("Calls need a browser with WebRTC, and this one has none."),
+        }
+    }
+}

@@ -412,6 +412,18 @@ impl WhatsAppApp {
             return;
         }
 
+        // Asked before the call is drawn rather than after it fails: a browser
+        // with no WebRTC cannot carry the media whatever the account does, and
+        // the alternative is somebody granting the microphone to a call that
+        // was never going to connect. Said out loud, because unlike the
+        // microphone there is no control to draw disabled -- the call button
+        // is worth keeping for the desktop this same view runs on.
+        if let Some(reason) = crate::platform::calls_unavailable() {
+            warn!("Cannot start call: {reason}");
+            self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
+            return;
+        }
+
         let recipient_name = self
             .find_chat(&recipient_jid)
             .map(|chat| chat.name.clone())
