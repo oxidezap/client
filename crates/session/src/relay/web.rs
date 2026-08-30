@@ -448,7 +448,16 @@ async fn connect_peer_connection(
 
     let on_close = {
         let events = events_tx.clone();
+        let opened = opened.clone();
         Closure::wrap(Box::new(move |_: web_sys::Event| {
+            // Setup's waiter, if it is still waiting. A channel that closes
+            // before it ever opens — the relay refusing the answer, ICE or
+            // DTLS failing outright — otherwise leaves `open_rx` parked on a
+            // sender this callback holds, so an attempt that is already over
+            // spends the whole connect ceiling before another relay is tried.
+            // Dropped rather than sent: the receiver reads a dropped sender
+            // as the teardown it is.
+            opened.borrow_mut().take();
             // `force_send` rather than `try_send`: this is the one event the
             // driver cannot do without. A packet queue that is full is
             // exactly the state a dying relay leaves behind, so a `try_send`
@@ -466,7 +475,10 @@ async fn connect_peer_connection(
 
     let on_error = {
         let events = events_tx.clone();
+        let opened = opened.clone();
         Closure::wrap(Box::new(move |event: web_sys::Event| {
+            // Terminal before `open`, exactly as in `on_close` above.
+            opened.borrow_mut().take();
             // `RTCErrorEvent` carries a reason; a bare `Event` does not, and
             // an empty string in a disconnect reason is worse than a name.
             let reason = event

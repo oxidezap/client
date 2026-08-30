@@ -280,15 +280,90 @@ async fn open_microphone() -> Result<web_sys::MediaStream> {
     let constraints = web_sys::MediaStreamConstraints::new();
     constraints.set_audio(&audio);
 
-    wasm_bindgen_futures::JsFuture::from(
-        devices
-            .get_user_media_with_constraints(&constraints)
-            .map_err(|e| anyhow!("the microphone could not be opened: {}", describe(&e)))?,
-    )
+    let asked = devices
+        .get_user_media_with_constraints(&constraints)
+        .map_err(|e| anyhow!("the microphone could not be opened: {}", describe(&e)))?;
+
+    // Bounded, because the thing this waits on is a person. `getUserMedia`
+    // settles when the permission prompt is answered and not before, and this
+    // is awaited *inside* placing or accepting a call — an accept has already
+    // consumed the offer by the time it gets here, so a hangup while the
+    // prompt sits there can only be recorded as deferred while the caller
+    // goes on ringing until their own timeout. The camera's prompt is bounded
+    // the same way and for the same half of this reason.
+    let abandoned = std::rc::Rc::new(std::cell::Cell::new(false));
+    // A prompt answered after we gave up still opens the device, and the
+    // stream it resolves with is one nothing here is holding — so its tracks
+    // would run, with the tab's indicator on, until the page went away. The
+    // same promise is awaited twice, which is what promises are for.
+    {
+        let abandoned = std::rc::Rc::clone(&abandoned);
+        let late = asked.clone();
+        crate::web::spawn(async move {
+            let Ok(value) = wasm_bindgen_futures::JsFuture::from(late).await else {
+                return;
+            };
+            if !abandoned.get() {
+                return;
+            }
+            if let Ok(stream) = value.dyn_into::<web_sys::MediaStream>() {
+                warn!("the microphone opened after the call gave up waiting for it; closing it");
+                for track in stream.get_tracks().iter() {
+                    if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
+                        track.stop();
+                    }
+                }
+            }
+        });
+    }
+
+    let opened = wasm_bindgen_futures::JsFuture::from(asked);
+    let Some(opened) = futures_lite::future::or(async move { Some(opened.await) }, async {
+        after(PERMISSION_CEILING_MS).await;
+        None
+    })
     .await
-    .map_err(|e| anyhow!("the microphone was refused: {}", describe(&e)))?
-    .dyn_into::<web_sys::MediaStream>()
-    .map_err(|_| anyhow!("the browser opened something that is not a stream"))
+    else {
+        abandoned.set(true);
+        bail!("the microphone permission prompt went unanswered");
+    };
+
+    opened
+        .map_err(|e| anyhow!("the microphone was refused: {}", describe(&e)))?
+        .dyn_into::<web_sys::MediaStream>()
+        .map_err(|_| anyhow!("the browser opened something that is not a stream"))
+}
+
+/// How long a microphone permission prompt is waited on.
+///
+/// Generous, because it is a person reading a dialog: a call that gives up
+/// while somebody was reaching for the mouse is the worse failure. Short
+/// enough that a prompt left on screen does not hold a call open with nothing
+/// happening at either end.
+const PERMISSION_CEILING_MS: i32 = 30_000;
+
+/// Resolve after `ms`, through the only clock this target has.
+///
+/// `tokio::time` links here and traps on the first await; the session says
+/// the same thing in `exec::sleep`, which this crate has no route to.
+async fn after(ms: i32) {
+    let (tx, rx) = async_channel::bounded::<()>(1);
+    let fire = Closure::once_into_js(move || {
+        let _ = tx.try_send(());
+    });
+    let armed = web_sys::window().and_then(|window| {
+        window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(fire.unchecked_ref(), ms)
+            .ok()
+    });
+    if armed.is_none() {
+        // No timer to arm means no ceiling to enforce; waiting forever on a
+        // channel nothing will send to leaves the other side of the race the
+        // only one that can finish, which is how this behaved before the
+        // ceiling existed.
+        warn!("no timer to bound the microphone permission prompt with");
+    }
+    let _ = rx.recv().await;
 }
 
 /// The page's `navigator.mediaDevices`, from a window or a worker.
@@ -346,11 +421,17 @@ fn wire(
                 pending.extend_from_slice(&scratch);
                 while pending.len() >= CALL_FRAME_SAMPLES {
                     let frame: Vec<i16> = pending.drain(..CALL_FRAME_SAMPLES).collect();
-                    // Dropped rather than waited for: this is the audio
-                    // thread, and the newest frame is the only one worth
-                    // having. A closed channel is the call ending, which the
-                    // owning task notices for itself.
-                    let _ = mic.try_send(frame);
+                    // `force_send` rather than `try_send`: this is the audio
+                    // thread and it cannot wait, and what a full queue holds
+                    // is the *oldest* speech — up to four frames of it. A
+                    // `try_send` drops the frame just captured and keeps
+                    // those, which is the policy backwards: on recovery the
+                    // peer hears stale audio, either as a burst or as latency
+                    // that never comes back down if both ends then run at the
+                    // same rate. Evicting the oldest is what the rest of this
+                    // path does. A closed channel is the call ending, which
+                    // the owning task notices for itself.
+                    let _ = mic.force_send(frame);
                 }
             },
         )
