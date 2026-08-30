@@ -312,7 +312,21 @@ pub async fn connect() -> Result<Connection, String> {
     let on_frame = frame_handler(&incoming, &answers, &ended);
     frames.set_onmessage(Some(on_frame.as_ref().unchecked_ref()));
 
-    if let Err(e) = announce(&ask).await {
+    let hangup = Hangup {
+        inbound: incoming,
+        ended: Rc::clone(&ended),
+    };
+
+    // One listener on the rendezvous, opened before the ask and kept for the
+    // life of the connection. Two would have been the obvious shape — one to
+    // wait for the answer, one to watch for a new leader — and it leaves a
+    // gap between them: a leader that dies in that moment is replaced by a
+    // tab whose `Leading` this one is not listening for, and a broadcast is
+    // never replayed. What is missed there is missed permanently, which is
+    // the failure this watch exists to prevent, so the watch may not have a
+    // beginning that comes after the ask.
+    let mut meeting = Meeting::open(&ask, hangup.clone())?;
+    if let Err(e) = meeting.ask_and_wait().await {
         // Closed by hand rather than left to the collector: a channel with a
         // handler on it is reachable from the browser, and this ask is one of
         // several a tab makes while the leader is still starting up.
@@ -322,24 +336,6 @@ pub async fn connect() -> Result<Connection, String> {
         drop(live);
         return Err(e);
     }
-
-    let hangup = Hangup {
-        inbound: incoming,
-        ended: Rc::clone(&ended),
-    };
-    // Kept open for the life of the connection, not only for the ask.
-    //
-    // This is the *other* way a leader is replaced, and without it a third tab
-    // is left frozen. When a leader goes, every follower queues for the
-    // account and exactly one of them is granted it — that one hangs up and
-    // reconnects to itself. The others are still queued behind a lock the new
-    // leader now holds for its lifetime, and their channel to the tab that
-    // died will never say a word: nothing closes a `BroadcastChannel` and
-    // nobody is left to post on it. What reaches them is the new leader's own
-    // announcement, which is exactly the sentence they need — there is a
-    // daemon in this origin again — so hearing it ends the dead connection and
-    // the front end's ordinary retry attaches to whoever is now serving.
-    let watching = watch_for_a_new_leader(&hangup)?;
 
     let (asks, mut to_send) = unbounded_channel::<Outgoing>();
     let (lines, mut written) = unbounded_channel::<String>();
@@ -366,7 +362,7 @@ pub async fn connect() -> Result<Connection, String> {
         // the front end has let go of the connection.
         let _live = live;
         let _on_frame = on_frame;
-        let _watching = watching;
+        let _meeting = meeting;
         let mut next: u64 = 0;
         while let Some(outgoing) = to_send.recv().await {
             let posted = match outgoing {
@@ -453,67 +449,119 @@ fn watch_for_a_new_leader(hangup: &Hangup) -> Result<Watching, String> {
     })
 }
 
-/// Say what this tab is looking for, and wait for the tab that has it.
-async fn announce(ask: &str) -> Result<(), String> {
-    let rendezvous = BroadcastChannel::new(tabs::RENDEZVOUS)
-        .map_err(|e| format!("this browser would not open a channel between tabs: {e:?}"))?;
-    let (answered, was_answered) = futures_channel::oneshot::channel::<()>();
-    let answered = Rc::new(RefCell::new(Some(answered)));
+/// This tab's place on the rendezvous, for as long as it has a connection.
+///
+/// It answers two questions with one listener, because they are two halves of
+/// one fact — where is the tab holding the account — and because splitting
+/// them leaves a moment when neither is being asked. Before the connection
+/// exists it is waiting for a `Serve` naming this tab's ask; afterwards it is
+/// waiting for a `Leading` from a tab that has taken the account, which means
+/// the connection it is holding is to a tab that has gone.
+struct Meeting {
+    channel: BroadcastChannel,
+    ask: String,
+    /// Where the answer to this tab's ask lands, until it is waited on.
+    answered: Option<futures_channel::oneshot::Receiver<()>>,
+    /// Held so the browser does not collect it, and taken off the channel
+    /// before it is dropped: a `Closure` freed while the browser still holds a
+    /// reference is a panic rather than a missed call.
+    _heard: Closure<dyn FnMut(MessageEvent)>,
+}
 
-    let want = ask.to_string();
-    let asking = rendezvous.clone();
-    let asked = want.clone();
-    let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-        let Some(line) = event.data().as_string() else {
-            return;
+impl Drop for Meeting {
+    fn drop(&mut self) {
+        self.channel.set_onmessage(None);
+        self.channel.close();
+    }
+}
+
+impl Meeting {
+    /// Start listening. Nothing is said yet.
+    fn open(ask: &str, hangup: Hangup) -> Result<Self, String> {
+        let channel = BroadcastChannel::new(tabs::RENDEZVOUS)
+            .map_err(|e| format!("this browser would not open a channel between tabs: {e:?}"))?;
+        let (answered, was_answered) = futures_channel::oneshot::channel::<()>();
+        let answered = RefCell::new(Some(answered));
+
+        let want = ask.to_string();
+        let asking = channel.clone();
+        let heard = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            let Some(line) = event.data().as_string() else {
+                return;
+            };
+            match Rendezvous::decode(&line) {
+                Some(Rendezvous::Serve { ask, .. }) if ask == want => {
+                    if let Some(tell) = answered.borrow_mut().take() {
+                        let _ = tell.send(());
+                    }
+                }
+                Some(Rendezvous::Leading { .. }) => {
+                    // Before this tab is connected, a new leader is one that
+                    // was not there to hear the ask a moment ago: asked again
+                    // rather than waited out, since the alternative is sitting
+                    // through the whole timeout and then trying for a lock the
+                    // new leader holds.
+                    //
+                    // After it is connected, the same message means the
+                    // opposite and is the more important of the two: some
+                    // *other* tab has taken the account, so the tab this
+                    // connection is to has gone. A leader announces once, on
+                    // the way up, and a `BroadcastChannel` does not deliver to
+                    // the object that posted — so this is never our own
+                    // leader, and never a repeat.
+                    if answered.borrow().is_some() {
+                        let _ = post_ask(&asking, &want);
+                    } else {
+                        log::info!("another tab has taken the account; reconnecting to it");
+                        hangup.close("another tab has taken the account".to_string());
+                    }
+                }
+                _ => {}
+            }
+        });
+        channel.set_onmessage(Some(heard.as_ref().unchecked_ref()));
+
+        Ok(Self {
+            channel,
+            ask: ask.to_string(),
+            answered: Some(was_answered),
+            _heard: heard,
+        })
+    }
+
+    /// Say what this tab is looking for, and wait for the tab that has it.
+    ///
+    /// Waited on once, which is what taking the receiver says. The listener
+    /// stays behind either way — after this returns it is watching for the
+    /// *next* leader, which is the whole reason it was opened before the ask
+    /// rather than after the answer.
+    async fn ask_and_wait(&mut self) -> Result<(), String> {
+        let Some(answered) = self.answered.take() else {
+            return Err("this tab has already asked for the account".to_string());
         };
-        match Rendezvous::decode(&line) {
-            Some(Rendezvous::Serve { ask, .. }) if ask == want => {
-                if let Some(tell) = answered.borrow_mut().take() {
-                    let _ = tell.send(());
-                }
-            }
-            // A tab has just taken the account, which means it was not there
-            // to hear the ask that went out a moment ago. Asked again rather
-            // than waited out: the alternative is this tab sitting through
-            // the whole timeout and then trying for a lock the new leader
-            // holds, which is a refusal and a retry where this is a
-            // reconnection.
-            Some(Rendezvous::Leading { .. }) => {
-                if let Some(line) = (Rendezvous::Ask {
-                    v: tabs::VERSION,
-                    ask: asked.clone(),
-                })
-                .encode()
-                {
-                    let _ = asking.post_message(&wasm_bindgen::JsValue::from_str(&line));
-                }
-            }
-            _ => {}
+        post_ask(&self.channel, &self.ask)
+            .map_err(|e| format!("this tab could not ask for the account: {e:?}"))?;
+        match deadline(answered, tabs::ANSWER_TIMEOUT_MS).await {
+            Some(Ok(())) => Ok(()),
+            // Not an error worth a screen. The tab that would have answered
+            // has gone, and the caller's next move is to take the account
+            // itself.
+            _ => Err("no other tab is holding this account".to_string()),
         }
-    });
-    rendezvous.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    }
+}
 
-    let line = Rendezvous::Ask {
+fn post_ask(channel: &BroadcastChannel, ask: &str) -> Result<(), wasm_bindgen::JsValue> {
+    let Some(line) = (Rendezvous::Ask {
         v: tabs::VERSION,
         ask: ask.to_string(),
-    }
-    .encode()
-    .ok_or_else(|| "this ask could not be written".to_string())?;
-    rendezvous
-        .post_message(&wasm_bindgen::JsValue::from_str(&line))
-        .map_err(|e| format!("this tab could not ask for the account: {e:?}"))?;
-
-    let answered = deadline(was_answered, tabs::ANSWER_TIMEOUT_MS).await;
-    rendezvous.set_onmessage(None);
-    rendezvous.close();
-    drop(on_message);
-    match answered {
-        Some(Ok(())) => Ok(()),
-        // Not an error worth a screen. The tab that would have answered has
-        // gone, and the caller's next move is to take the account itself.
-        _ => Err("no other tab is holding this account".to_string()),
-    }
+    })
+    .encode() else {
+        return Err(wasm_bindgen::JsValue::from_str(
+            "this ask could not be written",
+        ));
+    };
+    channel.post_message(&wasm_bindgen::JsValue::from_str(&line))
 }
 
 /// The handler that turns a message from the other tab into a frame or an
