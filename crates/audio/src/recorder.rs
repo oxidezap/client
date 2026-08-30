@@ -147,12 +147,24 @@ mod capture {
     /// samples here is losing part of what somebody said.
     const RING_SAMPLES: usize = CAPTURE_SAMPLE_RATE as usize * 2;
 
-    /// Longest voice note this will hold, in samples.
+    /// Longest voice note this will hold.
     ///
     /// Ten minutes, past which the capture stops growing rather than growing
-    /// until the process is killed. At the capture rate this is already 115
+    /// until the process is killed. At the capture rate that is already 115
     /// MB of `f32`, which is far more than anybody records by mistake.
-    const MAX_RECORDING_SAMPLES: usize = CAPTURE_SAMPLE_RATE as usize * 600;
+    const MAX_RECORDING_SECS: usize = 600;
+
+    /// That ceiling in samples, at the rate the device is actually running.
+    ///
+    /// Derived rather than fixed for the reason [`level_window`] is: a
+    /// microphone that will not do 48 kHz is opened at its best rate, and a
+    /// count of samples is a length of time only against the rate producing
+    /// them. Fixed at 48 kHz, a 96 kHz device stopped capturing after five
+    /// minutes while `stop` went on reporting the wall clock — a voice note
+    /// truncated in silence, claiming a duration longer than its audio.
+    fn max_recording_samples(sample_rate: u32) -> usize {
+        sample_rate as usize * MAX_RECORDING_SECS
+    }
 
     /// How often the drain empties the ring. Short against `RING_SAMPLES`, so
     /// a scheduling hiccup on this side costs nothing.
@@ -293,6 +305,19 @@ mod capture {
                     "unsupported input sample format {other:?}"
                 ))),
             }?;
+            // After the device is running, not before: a `play` that fails —
+            // the microphone unplugged between opening it and starting it —
+            // returns from here, and a drain started above it would be a
+            // thread nobody ever asks to stop, holding its ring, with the
+            // next attempt overwriting the handle that could have joined it.
+            stream
+                .play()
+                .inspect_err(|_| {
+                    self.device = None;
+                    self.config = None;
+                })
+                .map_err(|e| RecorderError::StreamError(e.to_string()))?;
+
             self.draining = Some(spawn_drain(
                 consumer,
                 self.samples.clone(),
@@ -302,15 +327,9 @@ mod capture {
                 // and a window in samples is a window in milliseconds only
                 // against the rate it is actually capturing at.
                 level_window(self.sample_rate),
+                // And the ceiling in samples, for the same reason.
+                max_recording_samples(self.sample_rate),
             ));
-
-            stream
-                .play()
-                .inspect_err(|_| {
-                    self.device = None;
-                    self.config = None;
-                })
-                .map_err(|e| RecorderError::StreamError(e.to_string()))?;
 
             self.stream = Some(stream);
             self.is_recording = true;
@@ -395,6 +414,7 @@ mod capture {
         capture: Arc<Mutex<Vec<f32>>>,
         level: Arc<std::sync::atomic::AtomicU32>,
         window: usize,
+        ceiling: usize,
     ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let stop = Arc::new(AtomicBool::new(false));
         let ending = stop.clone();
@@ -420,7 +440,7 @@ mod capture {
                         }
                         level.store(rms_of(&mut tail).to_bits(), Ordering::Relaxed);
                         if let Ok(mut samples) = capture.lock() {
-                            let room = MAX_RECORDING_SAMPLES.saturating_sub(samples.len());
+                            let room = ceiling.saturating_sub(samples.len());
                             if room < taken.len() && !full {
                                 full = true;
                                 warn!("recording reached its ceiling; capturing no more");
@@ -513,6 +533,7 @@ mod capture {
                 capture.clone(),
                 level.clone(),
                 level_window(CAPTURE_SAMPLE_RATE),
+                max_recording_samples(CAPTURE_SAMPLE_RATE),
             );
 
             use ringbuf::traits::Producer as _;
@@ -532,12 +553,28 @@ mod capture {
             );
         }
 
+        /// A device that will not do 48 kHz is opened at its best rate, and
+        /// a count of samples is a length of time only against the rate
+        /// producing them. Fixed at 48 kHz, a 96 kHz microphone stopped
+        /// capturing after five minutes while `stop` went on reporting the
+        /// wall clock: a note truncated in silence, claiming a duration
+        /// longer than its audio.
+        #[test]
+        fn the_ceiling_is_a_length_of_time_at_any_rate() {
+            assert_eq!(
+                max_recording_samples(48_000) / 48_000,
+                max_recording_samples(96_000) / 96_000
+            );
+            assert_eq!(max_recording_samples(48_000) / 48_000, MAX_RECORDING_SECS);
+        }
+
         /// A capture with nothing stopping it grows until the process is
         /// killed. The ceiling stops it growing; it does not stop the note
         /// that was already recorded from being sent.
         #[test]
         fn a_capture_stops_growing_at_its_ceiling() {
-            let capture = Arc::new(Mutex::new(vec![0.0f32; MAX_RECORDING_SAMPLES - 8]));
+            let ceiling = max_recording_samples(CAPTURE_SAMPLE_RATE);
+            let capture = Arc::new(Mutex::new(vec![0.0f32; ceiling - 8]));
             let (mut producer, consumer) = HeapRb::<f32>::new(RING_SAMPLES).split();
             let level = Arc::new(std::sync::atomic::AtomicU32::new(0));
             let (stop, handle) = spawn_drain(
@@ -545,6 +582,7 @@ mod capture {
                 capture.clone(),
                 level,
                 level_window(CAPTURE_SAMPLE_RATE),
+                ceiling,
             );
 
             use ringbuf::traits::Producer as _;
@@ -557,7 +595,7 @@ mod capture {
             stop.store(true, Ordering::Relaxed);
             handle.join().expect("the drain finishes");
 
-            assert_eq!(capture.lock().unwrap().len(), MAX_RECORDING_SAMPLES);
+            assert_eq!(capture.lock().unwrap().len(), ceiling);
         }
     }
 

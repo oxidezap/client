@@ -565,13 +565,8 @@ impl WhatsAppApp {
     /// own file once it has been fetched, and nothing decodes those as one.
     /// Answered before the cache is touched, so an MP4 cannot take a slot
     /// from the pictures the cache exists for.
-    pub fn get_decoded_image(
-        &self,
-        message_id: &str,
-        data: &[u8],
-        mime_type: &str,
-    ) -> Option<Arc<Image>> {
-        let format = mime_to_image_format(mime_type)?;
+    pub fn get_decoded_image(&self, message_id: &str, media: &MediaContent) -> Option<Arc<Image>> {
+        let (data, format) = (&media.data, mime_to_image_format(&media.mime_type)?);
 
         // Keyed by the id *and* what the bytes are, because a message's bytes
         // are not fixed: a preview is replaced by the real picture, and there
@@ -583,6 +578,12 @@ impl WhatsAppApp {
         let cached = Cached {
             bytes: data.len(),
             format,
+            // The flag the two paths that replace a preview both set. Length
+            // and format alone are a signature two different pictures can
+            // share, and this is the one difference the replacement always
+            // has: `adopt_full_bytes` clears it, on the app's path and on the
+            // one that never reaches the app.
+            preview: media.data_is_preview,
         };
         // A hit moves the entry to the back, which is what makes the order
         // below least-recently-used rather than insertion order. By

@@ -142,7 +142,7 @@ pub fn render_connected_view(
         let message = app.media_viewer_message()?.clone();
         let media = message.media.as_ref()?;
         let image = (!media.data.is_empty())
-            .then(|| app.get_decoded_image(&message.id, &media.data, &media.mime_type))
+            .then(|| app.get_decoded_image(&message.id, media))
             .flatten();
         let frame = app.video_current_frame(&message.id);
         let author = if message.is_from_me {
@@ -192,7 +192,7 @@ pub fn render_connected_view(
             .media
             .as_ref()
             .filter(|media| !media.data.is_empty())
-            .and_then(|media| app.get_decoded_image(&message.id, &media.data, &media.mime_type));
+            .and_then(|media| app.get_decoded_image(&message.id, media));
         let frame = app.video_current_frame(&message.id);
         // A video says it is loading in its *player*, not in the download
         // table: `start_video_download` records progress there and nowhere

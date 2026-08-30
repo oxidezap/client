@@ -3095,14 +3095,18 @@ fn slot_newest_first(rest: &[Chat], at: Option<chrono::DateTime<chrono::Utc>>) -
 /// enough to notice, rather than trusting whoever swapped the bytes to have
 /// evicted the entry.
 ///
-/// The length and the format, not a hash: the point is to spot a picture
-/// being replaced, hashing every byte is what the cache exists to avoid, and
-/// a replacement that matches both is the same picture as far as anything
-/// here can tell.
+/// The length, the format and whether it was a preview — not a hash: the
+/// point is to spot a picture being replaced, and hashing every byte is
+/// exactly what this cache exists to avoid. The preview flag is what makes
+/// the answer exact for the case that matters rather than merely unlikely:
+/// a thumbnail and the picture that replaces it can in principle encode to
+/// the same length in the same format, and `adopt_full_bytes` always clears
+/// that flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cached {
     bytes: usize,
     format: gpui::ImageFormat,
+    preview: bool,
 }
 
 /// Whether the timeline this frame is building may ask for the page before
@@ -3255,10 +3259,12 @@ mod tests {
         let preview = Cached {
             bytes: 4_096,
             format: gpui::ImageFormat::Jpeg,
+            preview: true,
         };
         let full = Cached {
             bytes: 812_344,
             format: gpui::ImageFormat::Jpeg,
+            preview: false,
         };
         assert_ne!(preview, full);
 
@@ -3268,6 +3274,18 @@ mod tests {
             Cached {
                 bytes: 4_096,
                 format: gpui::ImageFormat::Png,
+                preview: true,
+            },
+            preview
+        );
+
+        // The length is a signature two pictures can share; the flag the
+        // replacement always clears is what makes this exact rather than
+        // merely unlikely.
+        assert_ne!(
+            Cached {
+                preview: false,
+                ..preview
             },
             preview
         );

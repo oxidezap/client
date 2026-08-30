@@ -195,7 +195,7 @@ fn render_row(
                     _ => false,
                 };
                 (cacheable && !m.data.is_empty())
-                    .then(|| app.get_decoded_image(message_id, &m.data, &m.mime_type))
+                    .then(|| app.get_decoded_image(message_id, m))
                     .flatten()
             });
             // Progress belongs to the one clip that is loaded; a second voice

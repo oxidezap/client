@@ -661,16 +661,19 @@ impl WhatsAppClient {
             let names = names.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
-                let mut lanes = EventLanes::new(move |event| {
-                    let client = client.clone();
-                    let ui_tx = ui_tx.clone();
-                    let calls = calls.clone();
-                    let ui_sender = ui_sender.clone();
-                    let names = names.clone();
-                    async move {
-                        Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
-                    }
-                });
+                let mut lanes = EventLanes::new(
+                    move |event| {
+                        let client = client.clone();
+                        let ui_tx = ui_tx.clone();
+                        let calls = calls.clone();
+                        let ui_sender = ui_sender.clone();
+                        let names = names.clone();
+                        async move {
+                            Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
+                        }
+                    },
+                    stopping.clone(),
+                );
                 loop {
                     let event = tokio::select! {
                         event = incoming.recv() => match event {
@@ -3037,7 +3040,7 @@ struct EventLanes {
 }
 
 impl EventLanes {
-    fn new<F, Fut>(handle: F) -> Self
+    fn new<F, Fut>(handle: F, stopping: tokio::sync::watch::Receiver<()>) -> Self
     where
         F: Fn(Arc<Event>) -> Fut + Clone + crate::exec::MaybeSend + 'static,
         Fut: Future<Output = ()> + crate::exec::MaybeSend + 'static,
@@ -3046,10 +3049,24 @@ impl EventLanes {
             .map(|_| {
                 let (tx, mut rx) = mpsc::unbounded_channel::<Arc<Event>>();
                 let handle = handle.clone();
-                // Dropping the senders is what ends these: the loop above owns
-                // them and returns when the session does.
+                let mut stopping = stopping.clone();
                 crate::exec::spawn_owned(async move {
-                    while let Some(event) = rx.recv().await {
+                    loop {
+                        let event = tokio::select! {
+                            event = rx.recv() => match event {
+                                Some(event) => event,
+                                None => return,
+                            },
+                            // Dropping the senders is not enough on its own:
+                            // a receiver hands out everything already queued
+                            // before it answers `None`, so a lane would work
+                            // through a backlog belonging to an account this
+                            // session no longer speaks for. On a page that
+                            // matters twice over, where nothing cancels a
+                            // spawned task and the backlog keeps the old
+                            // client and its store alive.
+                            _ = stopping.changed() => return,
+                        };
                         handle(event).await;
                     }
                 });
@@ -3060,8 +3077,53 @@ impl EventLanes {
     }
 
     fn dispatch(&mut self, event: Arc<Event>) {
-        let _ = self.lanes[lane_for(&event)].send(event);
+        // A batch may span chats, and a lane is one chat's order: sent whole
+        // on the first message's lane, a receipt for a later chat in it runs
+        // on that chat's own lane and can overtake the message it answers.
+        // Split, each chat's messages keep their order against everything
+        // else about that chat, and two chats in one batch were never ordered
+        // against each other.
+        for event in split_by_subject(&event) {
+            let _ = self.lanes[lane_for(&event)].send(event);
+        }
     }
+}
+
+/// One event per subject it is about, which for everything but a batch of
+/// messages is the event itself.
+fn split_by_subject(event: &Arc<Event>) -> Vec<Arc<Event>> {
+    let Event::Messages(batch) = &**event else {
+        return vec![Arc::clone(event)];
+    };
+    let mut chats: Vec<String> = Vec::new();
+    for inbound in batch.iter() {
+        let chat = inbound.info.source.chat.to_string();
+        if !chats.contains(&chat) {
+            chats.push(chat);
+        }
+    }
+    if chats.len() <= 1 {
+        return vec![Arc::clone(event)];
+    }
+    chats
+        .into_iter()
+        .map(|chat| {
+            let messages: Arc<[whatsapp_rust::wacore::types::events::InboundMessage]> = batch
+                .iter()
+                .filter(|inbound| inbound.info.source.chat.to_string() == chat)
+                .cloned()
+                .collect();
+            // The origin travels with every part: it says how the batch was
+            // delivered, which is as true of one chat's share of it as of the
+            // whole, and it is what decides whether media is fetched eagerly.
+            Arc::new(Event::Messages(
+                whatsapp_rust::wacore::types::events::MessageBatch::builder()
+                    .messages(messages)
+                    .origin(batch.origin)
+                    .build(),
+            ))
+        })
+        .collect()
 }
 
 /// Which lane an event is handled on. Same subject, same lane.
@@ -3573,6 +3635,69 @@ mod tests {
         ));
 
         assert_eq!(super::lane_for(&offer), super::lane_for(&missed));
+    }
+
+    /// A batch can span chats — the store's own fixtures build one over a
+    /// hundred of them — and a lane keeps one chat's order. Sent whole on the
+    /// first message's lane, a receipt for a later chat in the batch runs on
+    /// that chat's own lane and can overtake the message it answers.
+    #[test]
+    fn a_batch_spanning_chats_reaches_every_lane_it_is_about() {
+        use whatsapp_rust::wacore::types::events::{
+            BatchOrigin, Event, InboundMessage, MessageBatch,
+        };
+        use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+        let chats = ["1@s.whatsapp.net", "2@s.whatsapp.net", "3@s.whatsapp.net"];
+        let messages: Arc<[InboundMessage]> = chats
+            .iter()
+            .enumerate()
+            .map(|(n, chat)| {
+                let info = MessageInfo {
+                    source: MessageSource {
+                        chat: chat.parse().expect("test JID"),
+                        sender: chat.parse().expect("test JID"),
+                        ..Default::default()
+                    },
+                    id: format!("MSG-BATCH-{n}"),
+                    timestamp: whatsapp_rust::wacore::time::from_secs(1_700_000_000)
+                        .expect("test timestamp"),
+                    ..Default::default()
+                };
+                InboundMessage::builder()
+                    .message(Arc::new(wa::Message::text("oi")))
+                    .info(Arc::new(info))
+                    .build()
+            })
+            .collect();
+        let batch = Arc::new(Event::Messages(
+            MessageBatch::builder()
+                .messages(messages)
+                .origin(BatchOrigin::OfflineDrain)
+                .build(),
+        ));
+
+        let parts = super::split_by_subject(&batch);
+        assert_eq!(parts.len(), 3, "one per chat it is about");
+        let mut subjects: Vec<String> = parts
+            .iter()
+            .filter_map(|part| super::event_subject(part))
+            .collect();
+        subjects.sort();
+        assert_eq!(subjects, chats);
+        // How the batch was delivered is as true of one chat's share of it as
+        // of the whole, and it is what decides whether media is fetched.
+        for part in &parts {
+            let Event::Messages(batch) = &**part else {
+                panic!("a batch splits into batches");
+            };
+            assert!(matches!(batch.origin, BatchOrigin::OfflineDrain));
+            assert_eq!(batch.iter().count(), 1);
+        }
+
+        // And a batch about one chat is not rebuilt at all.
+        let single = incoming(wa::Message::text("oi"), "MSG-ONE", 1_700_000_000);
+        assert_eq!(super::split_by_subject(&Arc::new(single)).len(), 1);
     }
 
     /// Two chats are not each other's business, so they do not queue behind
