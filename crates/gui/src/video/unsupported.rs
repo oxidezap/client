@@ -63,6 +63,14 @@ pub struct StreamingVideoDecoder {
     /// The furthest sample handed to the decoder, so a forward seek continues
     /// rather than replaying.
     last_fed_index: i32,
+    /// Whether the next unit fed has to carry the parameter sets.
+    ///
+    /// A flag rather than a condition on the index: a decoder configured
+    /// without a `description` learns its geometry from the stream, and what
+    /// decides whether it still knows it is a *reset*, not where in the
+    /// samples the next feed happens to start. Derived from the index, an
+    /// ordinary forward step re-sent the sets on every frame.
+    needs_parameter_sets: bool,
     /// What index the picture in the decoder's slot is for.
     ///
     /// Tracked here rather than read back, because a decoded frame carries
@@ -155,6 +163,7 @@ impl StreamingVideoDecoder {
             duration,
             decoder,
             last_fed_index: -1,
+            needs_parameter_sets: true,
             awaiting_index: None,
             current_frame: None,
             audio,
@@ -231,6 +240,7 @@ impl StreamingVideoDecoder {
             // target and replayed to it.
             self.decoder.reset();
             self.last_fed_index = -1;
+            self.needs_parameter_sets = true;
             self.awaiting_index = None;
             keyframe_at_or_before(&self.samples, target_index)
         };
@@ -239,10 +249,9 @@ impl StreamingVideoDecoder {
             let Some(sample) = self.samples.get(index) else {
                 break;
             };
-            // The parameter sets ride with the first unit after a reset: a
-            // decoder configured without a description takes its geometry
-            // from the stream, and a reset leaves it with none.
-            let unit = if index == start && start > 0 || (index == 0 && self.last_fed_index < 0) {
+            // The parameter sets ride with the first unit after a reset.
+            let unit = if self.needs_parameter_sets {
+                self.needs_parameter_sets = false;
                 let mut with_sets = self.sps_pps.clone();
                 with_sets.extend_from_slice(&sample.data);
                 with_sets
@@ -289,6 +298,7 @@ impl StreamingVideoDecoder {
     pub fn reset(&mut self) {
         self.decoder.reset();
         self.last_fed_index = -1;
+        self.needs_parameter_sets = true;
         self.awaiting_index = None;
         self.current_frame = None;
     }
