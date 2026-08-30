@@ -28,6 +28,24 @@ const MICROS_PER_SECOND: f64 = 1_000_000.0;
 /// The millisecond clock `setInterval` and the deadline count in.
 const MILLIS_PER_SECOND: f64 = 1000.0;
 
+/// Whether `VideoEncoder.isConfigSupported` is there to be called.
+///
+/// Read off the constructor rather than assumed from `VideoEncoder` existing:
+/// the static is newer than the interface, and browsers shipped the two apart.
+fn has_config_check() -> bool {
+    let global = js_sys::global();
+    js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("VideoEncoder"))
+        .ok()
+        .and_then(|encoder| {
+            js_sys::Reflect::get(
+                &encoder,
+                &wasm_bindgen::JsValue::from_str("isConfigSupported"),
+            )
+            .ok()
+        })
+        .is_some_and(|method| method.is_function())
+}
+
 /// Whether this browser will really encode what [`encoder_config`] describes.
 ///
 /// `isConfigSupported` is a promise and a static, so it costs one await and
@@ -36,6 +54,15 @@ const MILLIS_PER_SECOND: f64 = 1000.0;
 /// turn a late failure into an early one, and a browser that cannot be asked
 /// is no worse off than before it was.
 async fn encoder_supports(config: &web_sys::VideoEncoderConfig) -> bool {
+    // Asked for before it is called, because calling an absent static is a
+    // synchronous `TypeError` — and web-sys does not bind this one `catch`,
+    // so it would take the tab rather than falling through to the `Err` arm
+    // below. The one case this helper exists to be lenient about is exactly
+    // the one that would have trapped.
+    if !has_config_check() {
+        debug!("this browser's VideoEncoder has no isConfigSupported; assuming {CODEC} encodes");
+        return true;
+    }
     let asked = web_sys::VideoEncoder::is_config_supported(config);
     match wasm_bindgen_futures::JsFuture::from(asked).await {
         Ok(answer) => js_sys::Reflect::get(&answer, &wasm_bindgen::JsValue::from_str("supported"))
@@ -292,7 +319,13 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
                 // parse; dropped instead, and the gap is what asks for the
                 // next keyframe further down the line.
                 if chunk.copy_to_with_u8_slice(&mut data).is_err() {
-                    warn!("an encoded video chunk could not be read");
+                    // The encoder produced this unit and counted it: whatever
+                    // it emits next references a picture that is about to go
+                    // nowhere. The same answer the full-queue branch gives,
+                    // for the same reason — a drop is a drop wherever on this
+                    // path it happens.
+                    warn!("an encoded video chunk could not be read; asking for a keyframe");
+                    control.0.keyframe.set(true);
                     return;
                 }
                 let keyframe = chunk.type_() == web_sys::EncodedVideoChunkType::Key;

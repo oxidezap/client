@@ -1668,6 +1668,21 @@ by definition.
   samples a presentation position depends on rather than a range. That is the
   timeline's indexing model rather than a patch to it, and verifying it wants
   a B-frame fixture this tree has none of.
+- **A dropped access unit is a frame of RTP time that goes unspent.** The
+  library's `VideoSource` advertises one `rtp_timestamp_stride` and advances
+  by exactly that per unit delivered, and `EncodedFrame` carries no timestamp
+  — so the stream's clock counts *units*, not elapsed time. Everything on this
+  path drops on purpose (the encoder's own queue, the plane's, and the web
+  timer's backpressure skip), and each drop is therefore a frame's worth of
+  time the video clock never advances through: under sustained loss the
+  picture's timestamps fall behind the audio's, by the length of what was
+  dropped. Predates the browser backend and is identical on the desktop —
+  `camera.rs`'s `try_send` and `plane.rs`'s both drop into the same
+  fixed-stride source. Closing it means a timestamp on `EncodedFrame` and a
+  `VideoSource` that reads one, which is a change to `whatsapp-rust` rather
+  than to anything here; the alternative — not dropping — is the one thing
+  this path exists to do.
+
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
