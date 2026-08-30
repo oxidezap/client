@@ -422,28 +422,59 @@ impl ChatStore {
             .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                let mut query = dsl::messages
-                    .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
-                    .into_boxed();
-                if let Some(cursor) = &before {
-                    // Mirrors the sort exactly; anything looser skips or
-                    // repeats rows at a page boundary inside a same-second run.
-                    query = query.filter(
-                        dsl::timestamp_ms
-                            .lt(cursor.timestamp_ms)
-                            .or(dsl::timestamp_ms
-                                .eq(cursor.timestamp_ms)
-                                .and(dsl::rowid.lt(cursor.seq))),
-                    );
+                // Filled to `limit` *unique* rows, not to `limit` raw ones: a
+                // caller reads a short page as the start of the conversation
+                // and stops asking, so a duplicate collapsed inside the page
+                // would end the history at the split rather than at its
+                // beginning. Each pass costs a query only when the last one
+                // collapsed something, which a merged pair never does.
+                let mut kept: Vec<MessageRow> = Vec::new();
+                let mut ids = std::collections::HashSet::new();
+                let mut before = before;
+                while (kept.len() as i64) < limit {
+                    let mut query = dsl::messages
+                        .filter(
+                            dsl::device_id
+                                .eq(device_id)
+                                .and(dsl::chat_jid.eq_any(&keys)),
+                        )
+                        .into_boxed();
+                    if let Some(cursor) = &before {
+                        // Mirrors the sort exactly; anything looser skips or
+                        // repeats rows at a page boundary inside a same-second
+                        // run.
+                        query = query.filter(
+                            dsl::timestamp_ms
+                                .lt(cursor.timestamp_ms)
+                                .or(dsl::timestamp_ms
+                                    .eq(cursor.timestamp_ms)
+                                    .and(dsl::rowid.lt(cursor.seq))),
+                        );
+                    }
+                    let wanted = limit - kept.len() as i64;
+                    let rows: Vec<MessageRow> = query
+                        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+                        .limit(wanted)
+                        .load(conn)
+                        .map_err(db_err)?;
+                    let exhausted = (rows.len() as i64) < wanted;
+                    before = rows.last().map(|row| MessageCursor {
+                        timestamp_ms: row.timestamp_ms,
+                        seq: row.rowid,
+                    });
+                    for row in rows {
+                        if ids.insert(row.msg_id.clone()) {
+                            kept.push(row);
+                        }
+                    }
+                    if exhausted {
+                        break;
+                    }
                 }
-                query
-                    .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
-                    .limit(limit)
-                    .load(conn)
-                    .map_err(db_err)
+                Ok(kept)
             })
             .await?;
-        Ok(dedup_by_id(rows).into_iter().map(Into::into).collect())
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     /// The newest page of each of several chats, in one read.

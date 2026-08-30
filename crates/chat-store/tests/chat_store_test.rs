@@ -6912,6 +6912,45 @@ async fn a_split_pair_does_not_hand_back_the_same_message_twice() {
     );
 }
 
+/// A page is `limit` messages, not `limit` rows. Collapsing a duplicate
+/// inside the page made it shorter than it asked for, and a page shorter than
+/// its limit is how the caller recognises the start of a conversation: the
+/// history ended at the split, with older messages unreachable.
+#[tokio::test]
+async fn a_collapsed_duplicate_does_not_shorten_the_page() {
+    let (store, chat_store) = test_store().await;
+    // No mapping yet, so the two identities file their own copy of the pair.
+    let mut events = Vec::new();
+    for (n, id) in ["DUP-A", "DUP-B"].iter().enumerate() {
+        let at = 1_700_000_000 + n as i64;
+        events.push(message_event(
+            wa::Message::text("under the number"),
+            incoming_info(PEER, PEER, id, at),
+        ));
+        events.push(message_event(
+            wa::Message::text("under the lid"),
+            incoming_info(PEER_LID, PEER_LID, id, at),
+        ));
+    }
+    events.push(message_event(
+        wa::Message::text("older, and only under the number"),
+        incoming_info(PEER, PEER, "OLDER", 1_699_999_000),
+    ));
+    feed(&chat_store, events).await;
+
+    add_lid_mapping(&store).await;
+    let page = chat_store.messages(&jid(PEER), None, 3).await.unwrap();
+    assert_eq!(
+        page.len(),
+        3,
+        "a duplicate collapsed inside the page is topped up from behind it"
+    );
+    assert!(
+        page.iter().any(|m| m.id == "OLDER"),
+        "and the row behind the duplicates is what fills the slot"
+    );
+}
+
 /// The write has to look where the reads do. A thread living under the LID
 /// key, named here by the phone number, used to be updated under a key it has
 /// no rows beneath: the view was recorded nowhere and the ring stayed up.
