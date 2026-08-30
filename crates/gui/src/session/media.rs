@@ -234,13 +234,20 @@ impl MediaCache for Fetched {
                 .remove(&key)
                 .unwrap_or(false);
             if abandoned {
-                // The send was given up on while this was crossing. The
-                // payload is now really there, so this is the removal the
+                // Answered before the cleanup, not after it. `then` is what
+                // releases this send's place in the outbox, and the discard
+                // below carries a deadline: a daemon that stops answering the
+                // `DELETE` would otherwise hold every frame queued behind an
+                // abandoned voice note for the whole of it. Nothing in the
+                // cleanup changes the answer.
+                then(Err("that send was abandoned".to_string()));
+                // The payload is really there now, so this is the removal the
                 // discard could not safely make at the time.
                 if staged.is_ok() {
-                    oxidezap_ipc::web::discard_media(&base, &key).await;
+                    wasm_bindgen_futures::spawn_local(async move {
+                        oxidezap_ipc::web::discard_media(&base, &key).await;
+                    });
                 }
-                then(Err("that send was abandoned".to_string()));
                 return;
             }
             then(staged);
@@ -258,7 +265,7 @@ impl MediaCache for Fetched {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key);
-        if !key.starts_with("u-") {
+        if !oxidezap_ipc::is_staged_key(key) {
             return;
         }
         {

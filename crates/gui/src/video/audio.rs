@@ -94,6 +94,13 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
     );
 
     // Extract raw AAC frames from MP4 (reusing the same reader)
+    //
+    // The count is the container's and the container is a file somebody sent,
+    // so it is bounded against the file's own length first: a sample is at
+    // least a byte, and `stsz` can otherwise declare four billion of them in
+    // a header that costs nothing to write. Without this the loop below is
+    // the denial of service rather than the allocation.
+    let sample_count = sample_count.min(u32::try_from(mp4_data.len()).unwrap_or(u32::MAX));
     let mut aac_frames: Vec<Vec<u8>> = Vec::new();
     for sample_idx in 1..=sample_count {
         if let Ok(Some(sample)) = mp4.read_sample(track_id, sample_idx) {

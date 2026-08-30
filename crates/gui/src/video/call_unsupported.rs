@@ -263,6 +263,13 @@ impl Stream {
                 "dropping a {:?} call frame: the browser's decoder is behind",
                 self.stream
             );
+            // Reset rather than only stopping the feed: the units already
+            // taken are still the browser's to decode, and their pictures
+            // would be drawn over the pane while this side waits for the
+            // keyframe that is supposed to replace them. The reset empties
+            // that queue and moves the generation on, so the copies still in
+            // flight are recognised as belonging to the stream being left.
+            decoder.reset();
             self.started.set(false);
             return;
         }

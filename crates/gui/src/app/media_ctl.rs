@@ -388,6 +388,10 @@ impl WhatsAppApp {
                 }
                 Err(e) => {
                     error!("Failed to download audio: {}", e);
+                    // Said, not only logged: the control goes back to idle
+                    // either way, so without this a tap that fetched nothing
+                    // is indistinguishable from one that was never noticed.
+                    say(&entity, cx, format!("Could not download that audio: {e}"));
                     let _ = entity.update(cx, |app, cx| {
                         app.finish_download(&msg_id);
                         cx.notify();
@@ -428,6 +432,9 @@ impl WhatsAppApp {
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let result = download_with_timeout(download_rx).await;
+            // Carried out of the update rather than said inside it, because
+            // `say` needs the same handle this closure is borrowing.
+            let mut failed = None;
             let _ = entity.update(cx, |app, cx| {
                 app.finish_download(&message_id);
                 match result {
@@ -435,10 +442,16 @@ impl WhatsAppApp {
                         info!("Image downloaded: {} bytes", data.len());
                         app.update_message_media_data(&message_id, data);
                     }
-                    Err(e) => error!("Failed to download image: {}", e),
+                    Err(e) => {
+                        error!("Failed to download image: {}", e);
+                        failed = Some(format!("Could not download that image: {e}"));
+                    }
                 }
                 cx.notify();
             });
+            if let Some(reason) = failed {
+                say(&entity, cx, reason);
+            }
         })
         .detach();
     }

@@ -142,8 +142,27 @@ impl StreamingVideoDecoder {
         let cursor = Cursor::new(mp4_data);
         let mut mp4 = Mp4Reader::read_header(cursor, mp4_data.len() as u64)?;
 
-        let mut samples = Vec::with_capacity(sample_count as usize);
-        for index in 1..=sample_count {
+        // The count is the container's, and the container is a file somebody
+        // sent: `stsz` can declare a fixed sample size and a count of four
+        // billion in a few hundred bytes, which reserves tens of gigabytes
+        // before a single sample is read. On this target that is an abort
+        // rather than an error, so it is bounded against the only thing that
+        // cannot be forged, which is how many bytes the file actually has: a
+        // sample carries a length prefix and at least one byte after it.
+        let ceiling = mp4_data.len() / (nal_length_size + 1);
+        let sample_count = (sample_count as usize).min(ceiling);
+        if sample_count == 0 {
+            return Err(anyhow!("No video samples could be extracted"));
+        }
+
+        // Fallibly, as the second half of the same guard: the bound above is
+        // arithmetic on a length, and a very large file would still be asking
+        // for a very large reservation.
+        let mut samples: Vec<H264Sample> = Vec::new();
+        samples
+            .try_reserve(sample_count)
+            .map_err(|e| anyhow!("no room for {sample_count} video samples: {e}"))?;
+        for index in 1..=sample_count as u32 {
             match mp4.read_sample(track_id, index) {
                 Ok(Some(sample)) => {
                     let data = avcc_to_annexb(&sample.bytes, nal_length_size);

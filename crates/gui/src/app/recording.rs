@@ -145,6 +145,11 @@ impl WhatsAppApp {
             Ok(recording) => recording,
             Err(e) => {
                 error!("Failed to stop recording: {}", e);
+                self.notify_user(
+                    "The recording could not be stopped.".to_string(),
+                    crate::app::notices::Tone::Problem,
+                    cx,
+                );
                 self.recording_state = RecordingState::Idle;
                 // Every abort path must reset the input area too, or it keeps
                 // rendering the recording UI forever.
@@ -156,6 +161,11 @@ impl WhatsAppApp {
 
         if self.client.is_none() {
             warn!("Cannot send audio: not connected to the daemon");
+            self.notify_user(
+                "That recording could not be sent: not connected.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             self.recording_state = RecordingState::Idle;
             self.update_input_recording(cx);
             cx.notify();
@@ -250,6 +260,11 @@ impl WhatsAppApp {
 
         let Some(client) = &self.client else {
             warn!("Cannot send audio: client is unavailable");
+            self.notify_user(
+                "That recording could not be sent: not connected.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             self.recording_state = RecordingState::Idle;
             self.update_input_recording(cx);
             cx.notify();

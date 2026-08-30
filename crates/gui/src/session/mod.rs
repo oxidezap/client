@@ -612,7 +612,7 @@ impl Session {
         // Through the media cache: a voice note is the one thing this side
         // sends that does not belong in a frame. The key is the local id,
         // which is already unique per recording.
-        let upload = format!("u-{}", sanitize(&local_id));
+        let upload = oxidezap_ipc::staged_key(&sanitize(&local_id));
         let request = ClientRequest::SendAudio {
             jid: jid.to_string(),
             upload: upload.clone(),
@@ -925,41 +925,62 @@ fn write_or_queue(
     id: Option<RequestId>,
     frame: Vec<u8>,
 ) -> std::io::Result<()> {
-    {
+    let ready = {
         let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
-        if !outbox.slots.is_empty() {
-            outbox.slots.push_back(Slot::Ready(id, frame));
-            return flush(link, &mut outbox, pending);
+        if outbox.slots.is_empty() {
+            // Nothing is holding the wire, so this goes straight out. The
+            // lock is released before the write for the reason below.
+            None
+        } else {
+            outbox.slots.push_back(Slot::Ready(id, frame.clone()));
+            Some(outbox.drain_ready())
         }
+    };
+    match ready {
+        Some(ready) => write_ready(link, ready, pending),
+        None => link.send_line(&frame),
     }
-    link.send_line(&frame)
 }
 
-/// Write everything at the head of the outbox that is ready to go.
+/// Write frames already taken out of the outbox.
+///
+/// Taken out under the lock and written here, without it: a write can block
+/// and that lock is on the path of every other send, which is the rule
+/// [`Outbox::drain_ready`] states and this is the half that keeps it.
 ///
 /// A write that fails takes the rest with it, because they were waiting on a
-/// connection that has gone.
-///
-/// A frame whose reservation has gone is dropped rather than written. That is
-/// the same connection ending seen from the other side: `Frames::finish`
-/// drains every reservation and answers each one, but it knows nothing about
-/// what is queued here, and the `Link` it holds is a clone that does not
-/// necessarily refuse the write. Without this a line typed behind a voice
-/// note could reach the daemon after the window had already drawn it as
-/// failed.
-fn flush(link: &Link, outbox: &mut Outbox, pending: &Pending) -> std::io::Result<()> {
-    for (id, frame) in outbox.drain_ready() {
-        if let Some(id) = id
-            && !pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains_key(&id)
-        {
+/// connection that has gone. A frame whose reservation has gone is dropped
+/// rather than written, which is that same ending seen from the other side:
+/// `Frames::finish` answers every reservation and knows nothing about what is
+/// queued here, while the `Link` it holds is a clone that does not
+/// necessarily refuse the write. Without that check a line typed behind a
+/// voice note could reach the daemon after the window had drawn it as failed.
+fn write_ready(
+    link: &Link,
+    ready: Vec<(Option<RequestId>, Vec<u8>)>,
+    pending: &Pending,
+) -> std::io::Result<()> {
+    for (id, frame) in ready {
+        if !worth_writing(id, pending) {
             continue;
         }
         link.send_line(&frame)?;
     }
     Ok(())
+}
+
+/// Whether a queued frame is still worth writing.
+///
+/// A frame with no id is fire-and-forget and nothing is waiting on it. One
+/// naming a reservation that has gone is a send the window has already drawn
+/// as failed, and writing it would have the daemon act on it anyway.
+fn worth_writing(id: Option<RequestId>, pending: &Pending) -> bool {
+    id.is_none_or(|id| {
+        pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&id)
+    })
 }
 
 /// Fill a staged send's place in the outbox, and write what that unblocks.
@@ -974,9 +995,12 @@ fn release(
     ticket: u64,
     frame: Option<(RequestId, Vec<u8>)>,
 ) -> std::io::Result<()> {
-    let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
-    outbox.fill(ticket, frame);
-    flush(link, &mut outbox, pending)
+    let ready = {
+        let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
+        outbox.fill(ticket, frame);
+        outbox.drain_ready()
+    };
+    write_ready(link, ready, pending)
 }
 
 /// Whether this frame is the one the outbox is holding for.
@@ -1262,9 +1286,7 @@ mod tests {
         let kept: Vec<Vec<u8>> = outbox
             .drain_ready()
             .into_iter()
-            .filter(|(id, _)| {
-                id.is_none_or(|id| pending.lock().expect("fresh lock").contains_key(&id))
-            })
+            .filter(|(id, _)| worth_writing(*id, &pending))
             .map(|(_, frame)| frame)
             .collect();
         assert_eq!(
@@ -1279,7 +1301,7 @@ mod tests {
     #[test]
     fn a_staged_recording_cannot_escape_the_cache() {
         for id in ["../../etc/passwd", "local/1", "local 1"] {
-            let key = format!("u-{}", sanitize(id));
+            let key = oxidezap_ipc::staged_key(&sanitize(id));
             assert!(
                 oxidezap_ipc::media_path(&key).is_some(),
                 "{id} produced {key}"

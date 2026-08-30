@@ -753,7 +753,7 @@ async fn discard_media(stream: &mut TcpStream, key: &str, origin: Option<&str>) 
 static STAGING_SEQUENCE: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 fn is_staged(key: &str) -> bool {
-    key.starts_with("u-")
+    oxidezap_ipc::is_staged_key(key)
 }
 
 fn staging_refusal(key: &str, length: Option<u64>) -> Option<(u16, &'static str)> {

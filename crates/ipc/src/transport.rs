@@ -250,6 +250,34 @@ pub fn media_path(key: &str) -> Option<PathBuf> {
     sane.then(media_dir).flatten().map(|dir| dir.join(key))
 }
 
+/// The prefix a front end's staged payload is filed under.
+///
+/// The one key space a front end *writes*. `f-` and `d-` are the daemon's
+/// cache of what it fetched and can fetch again; `u-` is a payload staged for
+/// a send that has not run yet, which is its only copy, so the cache sweep
+/// spares it and the daemon's write endpoint takes nothing else.
+///
+/// Here rather than spelled at each end, because the two ends have to agree:
+/// the daemon answers 403 to any other prefix, and a front end that composed
+/// a key the daemon did not recognise would have its cleanup silently refused
+/// and leave the payload staged until the account was wiped.
+pub const STAGED_PREFIX: &str = "u-";
+
+/// Whether this key names a payload a front end staged for a send.
+#[must_use]
+pub fn is_staged_key(key: &str) -> bool {
+    key.starts_with(STAGED_PREFIX)
+}
+
+/// The key a staged payload is filed under.
+///
+/// `name` is the caller's own, and has to survive [`media_path`]: a local id
+/// is composed by a front end, so it is sanitized before it gets here.
+#[must_use]
+pub fn staged_key(name: &str) -> String {
+    format!("{STAGED_PREFIX}{name}")
+}
+
 /// The directory [`media_path`] resolves into.
 #[must_use]
 pub fn media_dir() -> Option<PathBuf> {

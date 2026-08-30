@@ -106,7 +106,7 @@ impl Wipe {
 /// a "clear cached media" is entitled to, and the budget sweep has to reclaim
 /// more than that.
 pub(super) fn is_staged_upload(name: &str) -> bool {
-    name.starts_with("u-")
+    oxidezap_ipc::is_staged_key(name)
 }
 /// Which cache the writers still in flight think they are writing into.
 ///
