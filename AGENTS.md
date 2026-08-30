@@ -1195,7 +1195,14 @@ by definition.
   Durability is the other half. The window's VFS is relaxed-IndexedDB, which
   writes changed blocks after the commit rather than during it, so a tab killed
   in that window loses the commit — a message that comes back on the next
-  hydration, or a ratchet that has to re-establish. The durable answer is OPFS
+  hydration, or a ratchet that has to re-establish. That window cannot be
+  closed from this side: `WaitCommit` is returned by `import_db`, `delete_db`
+  and `clear_all` and by nothing else, so the writes SQLite makes are queued
+  with no notifier and there is no ordinary commit to await, nor a refused
+  flush to hear about. What `prepare` does instead is ask for persistent
+  storage and read the quota, because running out is otherwise silent — the
+  database is memory, the page behaves perfectly all session, and the account
+  is gone on reload. The durable answer is OPFS
   through a synchronous access handle, which exists in a dedicated worker and
   nowhere else, so it arrives with the worker. It changes nothing above
   `session/store/`, which is why that interface is three functions.

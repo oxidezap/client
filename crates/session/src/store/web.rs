@@ -15,13 +15,21 @@
 //! database is held in memory and changed blocks are written to IndexedDB
 //! after the fact, so a tab killed between a commit and its flush loses that
 //! commit — which for chat history is a message that comes back on the next
-//! hydration, and for Signal state is a ratchet that has to re-establish. The
-//! flush is observable (`WaitCommit`), so this is a window that can be closed
-//! rather than a guarantee that is gone.
+//! hydration, and for Signal state is a ratchet that has to re-establish.
 //!
-//! Moving the session into a worker and this to OPFS is the hardening, and it
-//! changes nothing above [`super`] — which is the whole reason that interface
-//! is shaped the way it is.
+//! That window cannot be closed from here, and a note that used to say
+//! otherwise is why this paragraph is explicit. `WaitCommit` comes back from
+//! `import_db`, `delete_db` and `clear_all` and from nothing else: the writes
+//! SQLite makes are queued with no notifier at all, so there is no ordinary
+//! commit to await and no failed flush to hear about. Nothing here can turn
+//! that into a guarantee, which is why [`wipe`] is the one operation that
+//! waits — it has a management op to wait *on*.
+//!
+//! What is left is making eviction less likely and a full quota audible:
+//! [`request_durability`] asks the browser to keep this origin's storage and
+//! reports what is left. Moving the session into a worker and this to OPFS is
+//! the real hardening, and it changes nothing above [`super`] — which is the
+//! whole reason that interface is shaped the way it is.
 
 use std::cell::OnceCell;
 
@@ -61,6 +69,10 @@ pub fn database_path() -> String {
 /// The browser refused IndexedDB — a private window with storage disabled,
 /// or a quota already spent.
 pub async fn prepare() -> Result<(), String> {
+    // Before the store rather than after it: a quota already spent is the
+    // reason the next line fails, and asking afterwards would report it as a
+    // mystery.
+    request_durability().await;
     let store = install::<WasmOsCallback>(&RelaxedIdbCfg::default(), true)
         .await
         .map_err(|e| format!("the browser would not open a store: {e:?}"))?;
@@ -85,6 +97,80 @@ pub async fn prepare() -> Result<(), String> {
     });
     Ok(())
 }
+
+/// Ask the browser to keep this origin's storage, and say what is left.
+///
+/// Two different questions, asked together because both are about the same
+/// tab losing an account. `persist()` moves the origin out of the bucket a
+/// browser clears under pressure without asking; a browser that declines is
+/// not an error, it is one that decides on its own criteria, so it is said
+/// once and the session goes on.
+///
+/// The quota half is the one that matters more, because running out is
+/// silent. This VFS holds the database in memory and pushes changed blocks
+/// afterwards, so a refused write surfaces nowhere: the page behaves
+/// perfectly all session and the account is gone on reload. Knowing the
+/// headroom at open is not a fix, but it is the difference between a
+/// diagnosable report and an unreproducible one.
+///
+/// Never fatal. Every one of these APIs is absent or refused in some ordinary
+/// configuration — a private window, an older browser, a user who declined —
+/// and none of them is a reason not to run.
+async fn request_durability() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let storage = window.navigator().storage();
+
+    match wasm_bindgen_futures::JsFuture::from(
+        storage
+            .persist()
+            .unwrap_or_else(|_| js_sys::Promise::resolve(&wasm_bindgen::JsValue::FALSE)),
+    )
+    .await
+    {
+        Ok(granted) if granted.is_truthy() => {
+            info!("the browser will keep this origin's storage");
+        }
+        Ok(_) => info!("the browser may evict this origin's storage under pressure"),
+        Err(e) => info!("could not ask the browser to keep storage: {e:?}"),
+    }
+
+    let Ok(promise) = storage.estimate() else {
+        return;
+    };
+    let Ok(estimate) = wasm_bindgen_futures::JsFuture::from(promise).await else {
+        return;
+    };
+    let number = |key: &str| {
+        js_sys::Reflect::get(&estimate, &wasm_bindgen::JsValue::from_str(key))
+            .ok()
+            .and_then(|v| v.as_f64())
+    };
+    if let (Some(usage), Some(quota)) = (number("usage"), number("quota")) {
+        let left = quota - usage;
+        info!(
+            "browser storage: {:.1} MiB used of {:.1} MiB",
+            usage / 1_048_576.0,
+            quota / 1_048_576.0
+        );
+        // A database that cannot grow is the failure this whole function
+        // exists to make audible, and it arrives with no error of its own.
+        if left < LOW_STORAGE_BYTES {
+            log::warn!(
+                "browser storage is nearly full ({:.1} MiB left): writes may be refused, \
+                 and this store cannot report a refused write",
+                left / 1_048_576.0
+            );
+        }
+    }
+}
+
+/// Where "nearly full" starts, in bytes.
+///
+/// Generous because the cost of a false warning is a log line and the cost of
+/// a missed one is the account.
+const LOW_STORAGE_BYTES: f64 = 32.0 * 1_048_576.0;
 
 /// Delete the local session.
 ///
