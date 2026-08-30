@@ -136,6 +136,19 @@ mod imp {
             return Ok(None);
         };
         let name = chosen.name();
+        // Before it is read, not after. A `File` knows how long it is without
+        // anybody asking for its bytes, and reading one that cannot be kept
+        // costs the tab twice its size — the `ArrayBuffer` and the copy out
+        // of it — to arrive at a refusal the size alone already decided. The
+        // folder's own budget is still checked below, against what is
+        // already in it; this is the half that can be answered for nothing.
+        let size = chosen.size() as usize;
+        let ceiling = oxidezap_daemon::plugins::web::MAX_TOTAL_BYTES;
+        if size > ceiling {
+            return Err(format!(
+                "{name} is {size} bytes, past the {ceiling} a page holds in plugins"
+            ));
+        }
         let buffer = JsFuture::from(chosen.array_buffer())
             .await
             .map_err(|e| format!("that file could not be read ({e:?})"))?;

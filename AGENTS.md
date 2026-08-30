@@ -1182,6 +1182,19 @@ enforces rather than this code. What it does not answer is the same thing a
 folder does not answer — that the module is the one the user meant — which is
 what the approval prompt is for, unchanged.
 
+The one thing a page cannot order by waiting is a plugin's *last* write. A
+desktop joins every plugin's thread before it retires the approvals, so the
+settings write has already happened; a page cannot join a task on its own
+loop, and a worker not polled since the shutdown flag went up still has that
+write in front of it — landing after the wipe it would recreate the departed
+account's data under whoever pairs next. So a store is stamped with the
+account it was opened for and an older handle's write is refused. The account
+and not a latch, because a page can pair again without reloading: the bridge
+tears the service down and the next connection builds a fresh host in the same
+agent, and a latch would leave *that* host unable to write for the rest of the
+tab's life — grants rolled back, settings lost — while the tasks it was aimed
+at were the old host's.
+
 The front end says which of the two it is looking at rather than guessing:
 `platform::plugins::home` is the mirror of `daemon::plugins::start`, and the
 two halves are written to be read together — a page that drew "drop a .wasm in
@@ -1421,7 +1434,10 @@ by definition.
   it starts any of them — `Plugins::start` takes a closure per module and the
   desktop opens them one at a time, but nothing in a browser can open a file
   lazily from a synchronous loader, so `MAX_TOTAL_BYTES` bounds the folder
-  where the desktop bounds the file. And a module that fails to load
+  where the desktop bounds the file, and installing checks what the folder
+  *would become* rather than what the new module weighs: a second plugin that
+  fits alone and not beside the first would otherwise be written, reported as
+  installed, and skipped at every load after. And a module that fails to load
   publishes no surface, so a page has nowhere to draw a Remove button for
   it: the list of installed ids is in `daemon::plugins::web::names`, and
   nothing asks it yet.

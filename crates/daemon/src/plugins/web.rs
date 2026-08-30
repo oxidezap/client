@@ -48,7 +48,7 @@ const DIR: &str = "plugins";
 /// need it — there the bytes are opened one at a time and dropped after
 /// instantiation — but nothing here can open a file lazily, since every read
 /// in a browser is a promise and the host's loader is not async.
-const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
 /// Everything installed, ready to hand to the host.
 ///
@@ -121,27 +121,65 @@ pub async fn installed() -> Vec<Module> {
 /// one nothing will ever run, and telling somebody that at the moment they
 /// chose it is the only useful moment.
 ///
+/// The *folder's* budget is checked here too, and against what the folder
+/// would become rather than against this module alone. `installed` stops
+/// reading once the total is past [`MAX_TOTAL_BYTES`], so a second module
+/// that fits on its own but not beside the first would be written, reported
+/// as installed, and then silently skipped at every load after — an
+/// installation notice for a plugin that never runs. Refused at the moment
+/// somebody can still do something about it.
+///
 /// # Errors
 ///
-/// The name is not one a plugin may have, the module is larger than one may
-/// be, or the browser refused the write — a quota, or a mode with no storage.
+/// The name is not one a plugin may have, the folder has no room for it, or
+/// the browser refused the write — a quota, or a mode with no storage.
 pub async fn install(file_name: &str, bytes: &[u8]) -> Result<String, String> {
     let id = plugin_id(file_name)
         .ok_or_else(|| format!("`{file_name}` is not a name a plugin can have"))?;
-    if bytes.len() > MAX_TOTAL_BYTES {
-        return Err(format!(
-            "it is {} bytes, past the {MAX_TOTAL_BYTES} a plugin may be",
-            bytes.len()
-        ));
-    }
+    let name = format!("{id}.wasm");
     let dir = folder(true)
         .await
         .map_err(described)?
         .ok_or_else(|| "this page has no storage to keep a plugin in".to_owned())?;
-    write(&dir, &format!("{id}.wasm"), bytes)
-        .await
-        .map_err(described)?;
+    // Everything except what is being replaced: reinstalling a plugin over
+    // itself is not the folder growing, and counting the old copy would
+    // refuse an update that fits perfectly well.
+    let others = occupied(&dir, Some(&name)).await.map_err(described)?;
+    let after = others.saturating_add(bytes.len());
+    if after > MAX_TOTAL_BYTES {
+        return Err(format!(
+            "there is no room for it: {after} bytes of plugins, past the \
+             {MAX_TOTAL_BYTES} this page loads. Remove one first."
+        ));
+    }
+    write(&dir, &name, bytes).await.map_err(described)?;
     Ok(id)
+}
+
+/// What the folder already holds, in bytes, ignoring `replacing`.
+///
+/// A file's size without reading it: a handle answers a `File`, and a `File`
+/// knows how long it is before anybody asks for its bytes.
+async fn occupied(
+    dir: &FileSystemDirectoryHandle,
+    replacing: Option<&str>,
+) -> Result<usize, JsValue> {
+    let mut total = 0usize;
+    for name in entries(dir).await? {
+        if replacing == Some(name.as_str()) || plugin_id(&name).is_none() {
+            continue;
+        }
+        let handle: web_sys::FileSystemFileHandle = JsFuture::from(
+            dir.get_file_handle_with_options(&name, &FileSystemGetFileOptions::new()),
+        )
+        .await?
+        .dyn_into()?;
+        let file: web_sys::File = JsFuture::from(handle.get_file()).await?.dyn_into()?;
+        // `size` is a `f64` because every length in the web platform is;
+        // saturating rather than wrapping, since what this feeds is a budget.
+        total = total.saturating_add(file.size() as usize);
+    }
+    Ok(total)
 }
 
 /// Take one out of the folder.

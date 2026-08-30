@@ -199,15 +199,19 @@ pub struct Origin {
     /// Prepended to every name, so nothing here can collide with a
     /// preference the window keeps under the same origin.
     prefix: &'static str,
+    /// Which account's storage this is a handle to. See [`Origin::forget_all`].
+    account: u64,
 }
 
 #[cfg(target_family = "wasm")]
 impl Origin {
-    /// Documents under `oxidezap.plugin.`.
+    /// Documents under `oxidezap.plugin.`, for the account this page holds
+    /// now.
     #[must_use]
     pub fn storage() -> Self {
         Self {
             prefix: "oxidezap.plugin.",
+            account: ACCOUNT.load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -243,18 +247,25 @@ impl Backing for Origin {
     }
 
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
-        // Nothing more, once the account has left. This is the half a page
-        // cannot order any other way: a desktop joins every plugin's thread
-        // before it retires the approvals, so a plugin's last settings write
-        // has already happened — and a page cannot join a task on its own
-        // loop, so a plugin whose worker has not been polled since the
-        // shutdown flag went up still has that write in front of it. Landing
-        // after `forget_all` it would recreate the departed account's data
-        // under whoever pairs next. Refused for the rest of the page's life,
-        // which costs nothing: the plugins were stopped by the same shutdown
-        // and nothing restarts them without a reload.
-        if retired() {
-            return Err("this page's plugin storage has been retired".to_owned());
+        // Nothing more, once the account this handle belongs to has left.
+        // This is the half a page cannot order any other way: a desktop joins
+        // every plugin's thread before it retires the approvals, so a
+        // plugin's last settings write has already happened — and a page
+        // cannot join a task on its own loop, so a plugin whose worker has
+        // not been polled since the shutdown flag went up still has that
+        // write in front of it. Landing after `forget_all` it would recreate
+        // the departed account's data under whoever pairs next.
+        //
+        // Which account, and not merely "has any left". A page can pair again
+        // without reloading: the bridge tears the service down and the next
+        // connection builds a fresh one, plugin host and all, in the same
+        // agent. A latch would leave that new host unable to write anything
+        // for the rest of the tab's life — grants rolled back, settings lost
+        // — while the tasks it was aimed at are the *old* host's. So a store
+        // is stamped with the account it was opened for, and only handles
+        // older than the last departure are refused.
+        if self.account != ACCOUNT.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("this store belonged to an account that has been wiped".to_owned());
         }
         let held = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
         let storage = Self::local().ok_or_else(|| "this page has no storage".to_owned())?;
@@ -299,9 +310,9 @@ impl Origin {
     /// caller wipes the credentials only once this has said yes.
     #[must_use]
     pub fn forget_all() -> bool {
-        // Raised before anything is removed, so a write racing this one is
+        // Moved on before anything is removed, so a write racing this one is
         // refused rather than landing behind it. See `Backing::write`.
-        RETIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+        ACCOUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let Some(storage) = Self::local() else {
             // No storage is nothing to retire, which is the ordinary case for
             // a page that has never run a plugin.
@@ -325,16 +336,14 @@ impl Origin {
     }
 }
 
-/// Whether this origin's plugin storage has been retired with the account.
+/// How many accounts this page has been through.
 ///
-/// A process-wide latch rather than state on the store, because the store is
-/// rebuilt per host and the fact it records is about the *page*: the account
-/// that these documents belonged to has gone, and the plugins that were
-/// writing them are stopped.
+/// Not a name and not a JID — nothing here needs to know *which* account, only
+/// whether a store handed out earlier belongs to the one that is here now.
+/// Page-wide rather than state on the store, because what it records is a
+/// departure and every store opened before one is stale, whichever host holds
+/// it.
 #[cfg(target_family = "wasm")]
-static RETIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(target_family = "wasm")]
-fn retired() -> bool {
-    RETIRED.load(std::sync::atomic::Ordering::SeqCst)
-}
+/// Through `portable-atomic`, like every other 64-bit atomic here: a page is
+/// a 32-bit target, and there is no native 64-bit atomic on one.
+static ACCOUNT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);

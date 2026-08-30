@@ -319,8 +319,10 @@ pub async fn run(
     // page's plugins are tasks on this very loop, so there is nothing to
     // join and nothing that could be running while this runs. What their
     // *last* write cannot be ordered against is the retirement below, which
-    // is why the origin's storage latches shut rather than being joined —
-    // see `plugin_host::Origin`.
+    // is why the origin's storage stamps the account a store was opened for
+    // and refuses a write from an older one — see `plugin_host::Origin`. A
+    // page can pair again without reloading, so what is refused has to be the
+    // departed account's handles rather than every handle from here on.
     {
         let plugins = Arc::clone(&bridge.plugins);
         if oxidezap_session::unblock(move || plugins.shutdown())
