@@ -95,6 +95,19 @@ const MAX_HELD_FRAMES: usize = 64;
 /// does reach it ends with a reason rather than losing frames one at a time:
 /// the front end is tracking requests against them, and `Frames::finish`
 /// fails all of those at once so the views that asked can ask again.
+///
+/// What it does *not* promise is that no frame is lost, and the difference is
+/// worth stating rather than discovering. Everything queued is delivered, and
+/// so is the frame that hit the bound — but frames the browser had already
+/// dispatched behind it are dropped, because the alternative to dropping them
+/// is going on accepting from a producer this page has just proven it cannot
+/// match, which is the unbounded queue again. State survives that: it carries
+/// a version and the reconnect's snapshot brings it back. News does not, so a
+/// `SendFailed` landing in the window between the bound being hit and the
+/// socket closing is genuinely gone. Closing it is not on this side of the
+/// wire — a page cannot exert back pressure over a WebSocket — and belongs
+/// with the daemon coalescing pending state frames rather than with a second
+/// bounded queue here, which would only ask the same question one level down.
 const MAX_QUEUED_FRAMES: usize = 256;
 
 /// What the socket says, in the order it says it.
