@@ -181,6 +181,21 @@ cargo run --bin oxidezapd -- --web
 WEB_PROFILE=debug ./web/build.sh
 ```
 
+The web half of the daemon — the OPFS folder a page installs plugins into —
+is `cfg`-gated to wasm, so `cargo test --workspace` compiles none of it. It
+has tests that run in a real browser instead, and CI runs them:
+
+```bash
+# The driver must match the browser's major version. `RUSTFLAGS` here
+# *replaces* the root's wasm flags, which is deliberate: those are the web
+# front end's, and a shared memory would need headers this runner does not
+# serve. The Web Locks cfg is the one that has to stay.
+CHROMEDRIVER=$(which chromedriver) \
+RUSTFLAGS='--cfg web_sys_unstable_apis' \
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo test -p oxidezap-daemon --lib --target wasm32-unknown-unknown
+```
+
 Type-checking the web build without the whole bundle:
 
 ```bash
@@ -1459,6 +1474,21 @@ downloaded the ~30 MB module twice, saying so in the console each time
 ("cross-world service worker resource mismatch"). Passing a request through —
 returning from the fetch handler without `respondWith` — leaves it in the
 page's own world, where the preload is waiting for it.
+
+**A cast to a type no engine defines always fails, and fails quietly.**
+wasm-bindgen checks `dyn_into` with `instanceof <the declared type>` unless
+the binding carries an `is_type_of`, and js-sys declares a few types the
+platform has no global for — `js_sys::IteratorNext`, the `{done, value}` an
+async iterator answers with, is one. The emitted shim wraps that `instanceof`
+in a `try`/`catch`, so the `ReferenceError` for the missing global becomes a
+plain `false` and `dyn_into` answers `Err` with the value back: not an error
+anybody wrote, and identical for a perfectly good object and a wrong one.
+That is how `daemon::plugins::web::entries` shipped a folder listing that
+could not take a single step, taking installing, listing and removing with
+it, past every review and every green check. A record whose shape is the
+whole of it — an iterator step, an options bag — is read with
+`js_sys::Reflect::get`; a cast is for something a browser actually has a
+constructor for.
 
 Every browser API in the tree is bound through `web-sys`/`js-sys` from Rust:
 the WebSocket, `fetch`, `setTimeout`, WebAudio, `localStorage`, the download

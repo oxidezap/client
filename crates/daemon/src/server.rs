@@ -1195,7 +1195,12 @@ async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> Result
     Ok(())
 }
 
-#[cfg(test)]
+// Native only, and not for want of trying. These drive `serve_client` over a
+// `tokio::io::duplex` and take the startup lock, so they need `tokio::spawn`
+// — which wants a `Send` future the wasm bridge's state deliberately is not —
+// and a socket path a page has no filesystem for. The web half of this crate
+// has tests of its own that run in a browser; see `plugins/web/tests.rs`.
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     /// Every request gets exactly one answer, the ones that fail included.
     /// A frame that could not be encoded used to be no frame at all, and the

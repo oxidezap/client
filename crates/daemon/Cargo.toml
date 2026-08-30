@@ -98,6 +98,14 @@ web-sys = { version = "0.3", features = [
     "Window",
 ] }
 
+# The one harness that can run this crate's browser half. Everything in
+# `plugins/web.rs` is `web_sys` against a real OPFS, a real `LockManager` and a
+# real `localStorage`; none of it can be exercised by `cargo test` on the host,
+# which is how a total breakage of the plugin folder reached production with
+# the review rounds all green. See `plugins/web/tests.rs`.
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 [dev-dependencies]
 chrono = { workspace = true, features = ["std", "clock"] }
 # `start_paused`: the handshake deadline is ten seconds of wall clock, and a
