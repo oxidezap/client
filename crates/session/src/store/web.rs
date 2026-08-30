@@ -4,12 +4,20 @@
 //! this origin and holds nothing but our database — so a path would be a
 //! second naming scheme over a flat store that already has one.
 //!
-//! # Why this one and not OPFS
+//! # Two stores, and which one this agent got
 //!
 //! SQLite's durable VFS on the web is OPFS through a synchronous access
-//! handle, and that handle exists in a dedicated worker and nowhere else.
-//! This one works in the window, which is where the session runs today, and
-//! it is the reason it can run there at all.
+//! handle, and that handle is specified to exist in a dedicated worker and
+//! nowhere else. [`prepare`] asks for it anyway and falls back, so the
+//! question is answered by the runtime rather than assumed: where the handle
+//! is reachable the page gets a store with no durability window at all, and
+//! where it is not it gets the one below, which is what the window has today.
+//!
+//! Asking costs one refused call at startup and buys the thing that matters
+//! when the session does move into a worker — the move becomes a change of
+//! where this runs rather than a change to what it does.
+//!
+//! # What the fallback costs
 //!
 //! What it costs is *when* a write lands rather than whether it does. The
 //! database is held in memory and changed blocks are written to IndexedDB
@@ -36,8 +44,23 @@ use std::cell::OnceCell;
 use log::info;
 use sqlite_wasm_rs::WasmOsCallback;
 use sqlite_wasm_vfs::relaxed_idb::{RelaxedIdbCfg, RelaxedIdbUtil, install};
+use sqlite_wasm_vfs::sahpool::{OpfsSAHPoolCfg, OpfsSAHPoolUtil, install as install_sahpool};
 
 use super::DB_FILE;
+
+/// Which of the two stores this agent got.
+///
+/// Decided once, at [`prepare`], and asked afterwards by everything whose
+/// answer depends on it — which is the pragma the connection opens with and
+/// how a wipe deletes.
+enum Backend {
+    /// OPFS through a synchronous access handle: a commit is on the disk when
+    /// it returns, so there is no window to lose one in.
+    Durable(OpfsSAHPoolUtil),
+    /// The database in memory, with changed blocks pushed to IndexedDB after
+    /// the fact. See the durability note above.
+    Relaxed(RelaxedIdbUtil),
+}
 
 thread_local! {
     /// The installed store, kept for the deletions [`wipe`] does.
@@ -47,7 +70,7 @@ thread_local! {
     /// on one agent owning the database. SQLite is compiled here with
     /// `SQLITE_THREADSAFE=0`, so a second thread reaching for this is not a
     /// race to make unlikely; it is one to make impossible.
-    static STORE: OnceCell<RelaxedIdbUtil> = const { OnceCell::new() };
+    static STORE: OnceCell<Backend> = const { OnceCell::new() };
 }
 
 /// The database's name inside the store.
@@ -73,6 +96,26 @@ pub async fn prepare() -> Result<(), String> {
     // reason the next line fails, and asking afterwards would report it as a
     // mystery.
     request_durability().await;
+
+    // OPFS first, because it is the one with no durability window at all: a
+    // synchronous access handle writes during the commit rather than after
+    // it. It is refused wherever the handle is not reachable — the
+    // specification puts it in a dedicated worker, and this runs in the
+    // window — so the fallback below is not an error path but the ordinary
+    // one until the session moves. Trying anyway costs one refused call at
+    // startup and is what makes the move a configuration change rather than a
+    // rewrite.
+    match install_sahpool::<WasmOsCallback>(&OpfsSAHPoolCfg::default(), true).await {
+        Ok(pool) => {
+            info!("opened a durable OPFS store");
+            STORE.with(|cell| {
+                let _ = cell.set(Backend::Durable(pool));
+            });
+            return Ok(());
+        }
+        Err(e) => info!("no durable OPFS store here, falling back to IndexedDB: {e:?}"),
+    }
+
     let store = install::<WasmOsCallback>(&RelaxedIdbCfg::default(), true)
         .await
         .map_err(|e| format!("the browser would not open a store: {e:?}"))?;
@@ -93,9 +136,19 @@ pub async fn prepare() -> Result<(), String> {
     // `prepare` runs again after "clear data and pair again", and swapping
     // handles there would be swapping a thing for itself.
     STORE.with(|cell| {
-        let _ = cell.set(store);
+        let _ = cell.set(Backend::Relaxed(store));
     });
     Ok(())
+}
+
+/// Whether the store this agent opened writes during the commit.
+///
+/// Read rather than assumed by [`settings`] and [`wipe`], because the two
+/// backends differ in exactly the place durability is decided: one accepts
+/// the pragma that describes when a write has landed, and the other has no
+/// disk at the moment of the write to describe.
+fn is_durable() -> bool {
+    STORE.with(|cell| matches!(cell.get(), Some(Backend::Durable(_))))
 }
 
 /// Ask the browser to keep this origin's storage, and say what is left.
@@ -178,22 +231,26 @@ const LOW_STORAGE_BYTES: f64 = 32.0 * 1_048_576.0;
 /// pairing a new device, and a delete still sitting in memory when the tab
 /// reloads would put the dead account straight back.
 pub async fn wipe() -> std::io::Result<()> {
-    let commit = STORE.with(|cell| {
-        let Some(store) = cell.get() else {
-            // Nothing installed, so nothing was ever written.
-            return Ok(None);
-        };
-        store
+    let commit = STORE.with(|cell| match cell.get() {
+        // Nothing installed, so nothing was ever written.
+        None => Ok(None),
+        // Nothing to await: this backend's delete has already reached the
+        // disk by the time it answers, which is the whole difference.
+        Some(Backend::Durable(pool)) => pool
+            .delete_db(DB_FILE)
+            .map(|_| None)
+            .map_err(|e| std::io::Error::other(format!("could not remove {DB_FILE}: {e:?}"))),
+        Some(Backend::Relaxed(store)) => store
             .delete_db(DB_FILE)
             .map(Some)
-            .map_err(|e| std::io::Error::other(format!("could not remove {DB_FILE}: {e:?}")))
+            .map_err(|e| std::io::Error::other(format!("could not remove {DB_FILE}: {e:?}"))),
     })?;
     if let Some(commit) = commit {
         commit
             .await
             .map_err(|e| std::io::Error::other(format!("the deletion did not land: {e:?}")))?;
-        info!("Removed {DB_FILE}");
     }
+    info!("Removed {DB_FILE}");
     Ok(())
 }
 
@@ -214,6 +271,12 @@ pub async fn wipe() -> std::io::Result<()> {
 /// saying what is already true; the durability window is the module's own
 /// subject, above.
 pub fn settings() -> whatsapp_rust_sqlite_storage::SqliteStoreConfig {
+    if is_durable() {
+        // The store's own default, which is `normal`: this backend has a disk
+        // at the moment of the write, so the pragma describes something real
+        // and refusing it would be refusing the durability it exists for.
+        return whatsapp_rust_sqlite_storage::SqliteStoreConfig::default();
+    }
     whatsapp_rust_sqlite_storage::SqliteStoreConfig {
         synchronous: whatsapp_rust_sqlite_storage::Synchronous::Off,
         ..Default::default()

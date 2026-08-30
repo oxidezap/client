@@ -1230,10 +1230,15 @@ by definition.
   flush to hear about. What `prepare` does instead is ask for persistent
   storage and read the quota, because running out is otherwise silent — the
   database is memory, the page behaves perfectly all session, and the account
-  is gone on reload. The durable answer is OPFS
-  through a synchronous access handle, which exists in a dedicated worker and
-  nowhere else, so it arrives with the worker. It changes nothing above
-  `session/store/`, which is why that interface is three functions.
+  is gone on reload.
+  The durable answer is OPFS through a synchronous access handle, and
+  `prepare` asks for it *first* rather than assuming: the handle is specified
+  to exist in a dedicated worker and nowhere else, so in the window the ask is
+  normally refused and the IndexedDB store above is what a page gets. Asking
+  costs one refused call at startup and is what makes moving the session into
+  a worker a change of where this runs rather than a change to what it does —
+  the backend decides the `synchronous` pragma and how a wipe deletes, and
+  nothing above `session/store/` learns which one answered.
 - **A page holds no plugins, and the way in is a worker rather than a
   backend.** The interpreter is not the obstacle — `wasmi` builds for this
   target — the thread-per-plugin scheduler is, along with there being no
