@@ -79,6 +79,7 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     # The origin's private filesystem, which is where a page keeps the
     # plugins it has been given. See `plugins/web.rs`.
+    "DomException",
     "File",
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",

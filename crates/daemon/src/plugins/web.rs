@@ -31,7 +31,7 @@ use web_sys::{
     FileSystemWritableFileStream,
 };
 
-use oxidezap_plugin_host::Module;
+use oxidezap_plugin_host::{MAX_PLUGINS, Module};
 
 /// What the folder is called inside this origin's filesystem.
 ///
@@ -97,6 +97,14 @@ pub async fn installed() -> Vec<Module> {
         }
     };
     names.sort();
+    // Before a byte is read, which is the same place the desktop's discovery
+    // truncates and for the same reason: counting at the workers counted the
+    // *successes*, so a folder of modules that each fail — after being read,
+    // parsed and given their init fuel to refuse in — never reached the cap
+    // at all. `Plugins::start` asks again, and this is what keeps a folder of
+    // tiny files from being read whole before it does. The first
+    // `MAX_PLUGINS` by name, which is the answer discovery always gives.
+    names.truncate(MAX_PLUGINS);
 
     let mut modules = Vec::new();
     let mut total = 0usize;
@@ -170,6 +178,19 @@ async fn place(name: String, bytes: Vec<u8>) -> Result<(), String> {
         .await
         .map_err(described)?
         .ok_or_else(|| "this page has no storage to keep a plugin in".to_owned())?;
+    // How many, before how large. `installed` loads the first `MAX_PLUGINS`
+    // by name and no more, so a folder already at the cap would take this
+    // module, report it installed, and then never run one of them — which
+    // one depending on where the new name sorts. Refused at the moment
+    // somebody can still do something about it, exactly as the byte budget
+    // is.
+    let held = present(&dir, Some(&name)).await.map_err(described)?;
+    if held >= MAX_PLUGINS {
+        return Err(format!(
+            "there is no room for it: {held} plugins already installed, which is the \
+             {MAX_PLUGINS} this page loads. Remove one first."
+        ));
+    }
     // Everything except what is being replaced: reinstalling a plugin over
     // itself is not the folder growing, and counting the old copy would
     // refuse an update that fits perfectly well.
@@ -236,6 +257,18 @@ async fn exclusively<T: 'static>(
     });
     told.await
         .map_err(|_| "the browser did not run that installation".to_owned())
+}
+
+/// How many plugins the folder already holds, ignoring `replacing`.
+async fn present(
+    dir: &FileSystemDirectoryHandle,
+    replacing: Option<&str>,
+) -> Result<usize, JsValue> {
+    Ok(entries(dir)
+        .await?
+        .iter()
+        .filter(|name| replacing != Some(name.as_str()) && plugin_id(name).is_some())
+        .count())
 }
 
 /// What the folder already holds, in bytes, ignoring `replacing`.
@@ -336,9 +369,26 @@ async fn folder(create: bool) -> Result<Option<FileSystemDirectoryHandle>, JsVal
         Ok(handle) => Ok(Some(handle.dyn_into()?)),
         // A folder nobody has made yet, which the browser reports as a
         // `NotFoundError` rather than as an empty directory.
-        Err(_) if !create => Ok(None),
+        //
+        // *That* exception and not any of them. Answering absence to every
+        // failure made a transient one — a permission the browser withheld, a
+        // file sitting where the directory goes — read as "no plugins are
+        // installed": `names` would then hide every one of them and
+        // `uninstall` would report success without removing anything, leaving
+        // the module to run again at the next reload.
+        Err(e) if !create && is_missing(&e) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Whether a browser's refusal was "there is nothing there".
+///
+/// By the exception's `name`, which is what the File System Access API is
+/// specified to set, rather than by its message, which is the engine's to
+/// word.
+fn is_missing(e: &JsValue) -> bool {
+    e.dyn_ref::<web_sys::DomException>()
+        .is_some_and(|e| e.name() == "NotFoundError")
 }
 
 /// Every file name in `dir`.

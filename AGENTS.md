@@ -1183,17 +1183,18 @@ folder does not answer — that the module is the one the user meant — which i
 what the approval prompt is for, unchanged.
 
 The one thing a page cannot order by waiting is a plugin's *last* write. A
-desktop joins every plugin's thread before it retires the approvals, so the
+desktop joins every plugin's thread before it replaces the host, so the
 settings write has already happened; a page cannot join a task on its own
 loop, and a worker not polled since the shutdown flag went up still has that
-write in front of it — landing after the wipe it would recreate the departed
-account's data under whoever pairs next. So a store is stamped with the
-account it was opened for and an older handle's write is refused. The account
-and not a latch, because a page can pair again without reloading: the bridge
-tears the service down and the next connection builds a fresh host in the same
-agent, and a latch would leave *that* host unable to write for the rest of the
-tab's life — grants rolled back, settings lost — while the tasks it was aimed
-at were the old host's.
+write in front of it. Two things it would land on: after a wipe it recreates
+the departed account's data under whoever pairs next, and after an ordinary
+reconnection — no wipe at all — it puts the old host's in-memory settings over
+what the new host has already written. So a store is stamped when it is taken
+and an older handle's write is refused, `Origin::storage` and `forget_all`
+both moving the stamp on. *Superseded* rather than a latch, because a page
+rebuilds its whole service in the same agent: a latch would leave the new host
+unable to write for the rest of the tab's life — grants rolled back, settings
+lost — while the tasks it was aimed at were the old host's.
 
 Retiring is where a page fails closed rather than tidily. A browser that
 refuses `localStorage` outright is not the same fact as an origin that never
@@ -1457,7 +1458,9 @@ by definition.
   where the desktop bounds the file, and installing checks what the folder
   *would become* rather than what the new module weighs — under a Web Lock,
   since the folder is the origin's and two tabs of it would otherwise each
-  weigh a folder the other is about to grow. A second plugin that fits alone and not beside the first would
+  weigh a folder the other is about to grow. `MAX_PLUGINS` is asked at the
+  listing rather than at the workers, for the reason the desktop's discovery
+  truncates before it opens anything. A second plugin that fits alone and not beside the first would
   otherwise be written, reported as installed, and skipped at every load
   after.
 - **A page with its own session cannot send media, and the reason is upstream.**

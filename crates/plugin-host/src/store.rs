@@ -43,7 +43,15 @@ pub trait Backing: Send + Sync + 'static {
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String>;
 
     /// Remove `name`, durably. Missing is success.
-    fn remove(&self, name: &str);
+    ///
+    /// # Errors
+    ///
+    /// Whatever the platform said. Fallible because of the one caller that
+    /// acts on it: a withdrawal whose write failed removes the document
+    /// instead, and a removal that silently failed would leave the old grant
+    /// to be read back on the next start while Settings had already drawn the
+    /// plugin as revoked.
+    fn remove(&self, name: &str) -> Result<(), String>;
 
     /// What to call `name` in a log line: a path, or an origin's storage.
     fn describe(&self, name: &str) -> String;
@@ -66,7 +74,9 @@ impl Backing for Nowhere {
         Ok(())
     }
 
-    fn remove(&self, _name: &str) {}
+    fn remove(&self, _name: &str) -> Result<(), String> {
+        Ok(())
+    }
 
     fn describe(&self, name: &str) -> String {
         format!("{name} (kept in memory only)")
@@ -154,25 +164,20 @@ impl Backing for Files {
         }
     }
 
-    fn remove(&self, name: &str) {
+    fn remove(&self, name: &str) -> Result<(), String> {
         let path = self.path(name);
         match std::fs::remove_file(&path) {
             // The unlink is a directory entry like a rename, and just as
             // unpersisted until the directory is flushed: a document removed
-            // to withhold a grant is one that can come back.
-            Ok(()) => {
-                if let Some(dir) = path.parent()
-                    && let Err(e) = crate::sync_dir(dir)
-                {
-                    log::error!(
-                        "{} was removed but the removal is not on disk yet ({e}); a \
-                         withdrawn permission could come back",
-                        path.display()
-                    );
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => log::error!("cannot remove {} ({e})", path.display()),
+            // to withhold a grant is one that can come back. Counted as part
+            // of the removal rather than logged beside it, for the reason the
+            // rename's sync is.
+            Ok(()) => match path.parent() {
+                Some(dir) => crate::sync_dir(dir).map_err(|e| e.to_string()),
+                None => Ok(()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -196,27 +201,29 @@ impl Backing for Files {
 /// OPFS. What is here is a permission answer and a settings map.
 #[cfg(target_family = "wasm")]
 pub struct Origin {
-    /// Prepended to every name, so nothing here can collide with a
-    /// preference the window keeps under the same origin.
-    prefix: &'static str,
-    /// Which account's storage this is a handle to. See [`Origin::forget_all`].
-    account: u64,
+    /// Which handle this is. See [`LIVE`].
+    stamp: u64,
 }
 
 #[cfg(target_family = "wasm")]
 impl Origin {
-    /// Documents under `oxidezap.plugin.`, for the account this page holds
-    /// now.
+    /// Documents under [`PREFIX`], for the host being built now.
+    ///
+    /// Taking one retires every handle given out before it. See [`LIVE`].
     #[must_use]
     pub fn storage() -> Self {
         Self {
-            prefix: "oxidezap.plugin.",
-            account: ACCOUNT.load(std::sync::atomic::Ordering::SeqCst),
+            stamp: LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
         }
     }
 
-    fn key(&self, name: &str) -> String {
-        format!("{}{name}", self.prefix)
+    fn key(name: &str) -> String {
+        format!("{PREFIX}{name}")
+    }
+
+    /// Whether this handle is the one the page is using now.
+    fn live(&self) -> bool {
+        self.stamp == LIVE.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The origin's store, or `None` where the browser refuses it — a
@@ -229,7 +236,7 @@ impl Origin {
 #[cfg(target_family = "wasm")]
 impl Backing for Origin {
     fn read(&self, name: &str, max: usize) -> Option<Vec<u8>> {
-        let held = Self::local()?.get_item(&self.key(name)).ok().flatten()?;
+        let held = Self::local()?.get_item(&Self::key(name)).ok().flatten()?;
         // Asked of what came back rather than before it, which is the honest
         // difference from a file: `getItem` has already allocated the string
         // by the time anything here can look at it. The bound still does its
@@ -239,7 +246,7 @@ impl Backing for Origin {
         if held.len() > max {
             log::warn!(
                 "{} is larger than it may be; starting empty",
-                self.key(name)
+                Self::key(name)
             );
             return None;
         }
@@ -247,25 +254,26 @@ impl Backing for Origin {
     }
 
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
-        // Nothing more, once the account this handle belongs to has left.
-        // This is the half a page cannot order any other way: a desktop joins
-        // every plugin's thread before it retires the approvals, so a
-        // plugin's last settings write has already happened — and a page
-        // cannot join a task on its own loop, so a plugin whose worker has
-        // not been polled since the shutdown flag went up still has that
-        // write in front of it. Landing after `forget_all` it would recreate
-        // the departed account's data under whoever pairs next.
+        // Nothing more, once this handle has been superseded. This is the
+        // half a page cannot order any other way: a desktop joins every
+        // plugin's thread before it replaces the host, so a plugin's last
+        // settings write has already happened — and a page cannot join a task
+        // on its own loop, so a plugin whose worker has not been polled since
+        // the shutdown flag went up still has that write in front of it.
         //
-        // Which account, and not merely "has any left". A page can pair again
-        // without reloading: the bridge tears the service down and the next
-        // connection builds a fresh one, plugin host and all, in the same
-        // agent. A latch would leave that new host unable to write anything
-        // for the rest of the tab's life — grants rolled back, settings lost
-        // — while the tasks it was aimed at are the *old* host's. So a store
-        // is stamped with the account it was opened for, and only handles
-        // older than the last departure are refused.
-        if self.account != ACCOUNT.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err("this store belonged to an account that has been wiped".to_owned());
+        // Two things it would land on, and the stamp answers both with one
+        // rule. After a wipe it would recreate the departed account's data
+        // under whoever pairs next. After an ordinary reconnection — no wipe
+        // at all — it would put the old host's in-memory settings over what
+        // the new host has already written, since a page rebuilds the whole
+        // service in the same agent.
+        //
+        // *Superseded*, and not "any host has ever gone": a latch would leave
+        // the new host unable to write anything for the rest of the tab's
+        // life — grants rolled back, settings lost — while the tasks it was
+        // aimed at are the old host's. See [`LIVE`].
+        if !self.live() {
+            return Err("this store belongs to a host that has been replaced".to_owned());
         }
         let held = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
         let storage = Self::local().ok_or_else(|| "this page has no storage".to_owned())?;
@@ -274,18 +282,19 @@ impl Backing for Origin {
         // and no temporary name to clean up. The quota is the failure to
         // expect, and it arrives here rather than being discovered later.
         storage
-            .set_item(&self.key(name), held)
+            .set_item(&Self::key(name), held)
             .map_err(|e| format!("{e:?}"))
     }
 
-    fn remove(&self, name: &str) {
-        if let Some(storage) = Self::local() {
-            let _ = storage.remove_item(&self.key(name));
-        }
+    fn remove(&self, name: &str) -> Result<(), String> {
+        let storage = Self::local().ok_or_else(|| "this page has no storage".to_owned())?;
+        storage
+            .remove_item(&Self::key(name))
+            .map_err(|e| format!("{e:?}"))
     }
 
     fn describe(&self, name: &str) -> String {
-        format!("{} in this browser's storage", self.key(name))
+        format!("{} in this browser's storage", Self::key(name))
     }
 }
 
@@ -312,7 +321,7 @@ impl Origin {
     pub fn forget_all() -> bool {
         // Moved on before anything is removed, so a write racing this one is
         // refused rather than landing behind it. See `Backing::write`.
-        ACCOUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let Some(storage) = Self::local() else {
             // Not "there was nothing to retire". This browser refused the
             // store *now*, and refusing it is not the same fact as its being
@@ -331,7 +340,6 @@ impl Origin {
             );
             return false;
         };
-        let prefix = Self::storage().prefix;
         // Collected before anything is removed: `key(i)` is an index into a
         // list this loop is about to change under itself.
         let Ok(count) = storage.length() else {
@@ -339,8 +347,25 @@ impl Origin {
         };
         let mut ours = Vec::new();
         for i in 0..count {
-            if let Ok(Some(key)) = storage.key(i)
-                && key.starts_with(prefix)
+            // An index that throws is not an index that holds nothing. A
+            // browser failing part-way through its own enumeration would
+            // otherwise have this skip the entry and answer success, and the
+            // entry it skipped can be `approvals.json` — the one document
+            // whose survival lets a plugin act on the next account under
+            // consent given for this one. Refused whole, like every other
+            // half-answer here.
+            let Ok(key) = storage.key(i) else {
+                log::error!(
+                    "this page's storage failed while being listed; the plugins' permissions \
+                     cannot be shown to be retired, so the wipe cannot go ahead"
+                );
+                return false;
+            };
+            // A `None` is the list having shrunk under this loop, which is
+            // not a failure: nothing removes from this storage but the lines
+            // below, and they have not run yet.
+            if let Some(key) = key
+                && key.starts_with(PREFIX)
             {
                 ours.push(key);
             }
@@ -349,14 +374,22 @@ impl Origin {
     }
 }
 
-/// How many accounts this page has been through.
-///
-/// Not a name and not a JID — nothing here needs to know *which* account, only
-/// whether a store handed out earlier belongs to the one that is here now.
-/// Page-wide rather than state on the store, because what it records is a
-/// departure and every store opened before one is stale, whichever host holds
-/// it.
+/// What every document this host keeps is named under.
 #[cfg(target_family = "wasm")]
+const PREFIX: &str = "oxidezap.plugin.";
+
+/// Which handle the page is writing through now.
+///
+/// Bumped by [`Origin::storage`], so taking a handle retires every one given
+/// out before it, and by [`Origin::forget_all`], so a departure retires the
+/// handle that was live when it happened. One counter for both, because they
+/// are one question: is this store still the page's?
+///
+/// Page-wide rather than state on the store, because what it records is about
+/// the page — a host has been replaced — and every handle from before it is
+/// stale whoever is holding it.
+///
 /// Through `portable-atomic`, like every other 64-bit atomic here: a page is
 /// a 32-bit target, and there is no native 64-bit atomic on one.
-static ACCOUNT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+#[cfg(target_family = "wasm")]
+static LIVE: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);

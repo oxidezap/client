@@ -167,7 +167,19 @@ impl Approvals {
             "cannot write {}: {e}. Every plugin permission will be asked for again.",
             self.store.describe(FILE_NAME)
         );
-        self.store.remove(FILE_NAME);
+        // And say so when even that does not land. It is the whole of what
+        // this branch is for: the caller keeps a withdrawal's in-memory
+        // effect whatever the store did, so a removal that failed silently
+        // would leave the plugin drawn as revoked here and granted again on
+        // the next start. Nothing can undo the revocation — that would be the
+        // worse answer — so what is left is saying it out loud.
+        if let Err(e) = self.store.remove(FILE_NAME) {
+            log::error!(
+                "and {} could not be removed either ({e}); a permission withdrawn now may be \
+                 granted again on the next start",
+                self.store.describe(FILE_NAME)
+            );
+        }
         false
     }
 

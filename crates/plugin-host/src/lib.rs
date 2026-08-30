@@ -121,7 +121,7 @@ const DUTY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 /// its socket. The count is the bound on the sum, as `MAX_DUTY` is for time.
 /// Far past what anybody runs: the point of a limit here is that the number
 /// is finite, not that it is small.
-const MAX_PLUGINS: usize = 32;
+pub const MAX_PLUGINS: usize = 32;
 
 /// The most a widget's use may carry into a plugin's queue, across every
 /// string the event clones.
