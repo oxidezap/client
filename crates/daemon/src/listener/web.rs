@@ -29,10 +29,10 @@
 //! It is therefore opt-in (`--web`), bound to loopback unless told otherwise,
 //! and refuses any browser origin that was not named (`--web-allow`) —
 //! excepting `localhost` and `127.0.0.1`, which are the developer's own
-//! `trunk serve`. A request with no `Origin` at all is not a browser and is
-//! left to the same rule, because a page cannot suppress the header and a
-//! hand-written client that omits it should not be privileged over one that
-//! sends it.
+//! `trunk serve`. The token is the admission check; the origin only narrows
+//! who can probe. A request carrying no `Origin` is not necessarily something
+//! other than a browser — an `<img>`, a `<script>` or a form GET sends none —
+//! so it is served on a loopback bind and still only with the token.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -687,12 +687,26 @@ async fn preflight(
     origin: Option<&str>,
     private_network: bool,
 ) -> Result<()> {
+    stream
+        .write_all(preflight_head(origin, private_network).as_bytes())
+        .await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// The preflight's headers, so what a browser is told can be asserted.
+fn preflight_head(origin: Option<&str>, private_network: bool) -> String {
     let mut head = String::from(
         "HTTP/1.1 204 No Content\r\n\
          Content-Length: 0\r\n\
          Connection: close\r\n",
     );
     if let Some(origin) = origin {
+        // Without a lifetime a browser picks its own, and Chrome's is five
+        // seconds — which is one preflight per photo, and a preflight is a
+        // whole connection and round trip before the one that fetches. A
+        // history load naming a hundred photos paid for two hundred.
+        head.push_str("Access-Control-Max-Age: 600\r\n");
         head.push_str(&format!(
             "Access-Control-Allow-Origin: {origin}\r\n\
              Access-Control-Allow-Methods: GET, PUT, OPTIONS\r\n\
@@ -704,9 +718,7 @@ async fn preflight(
         head.push_str("Access-Control-Allow-Private-Network: true\r\n");
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).await?;
-    stream.flush().await?;
-    Ok(())
+    head
 }
 
 async fn respond(
@@ -847,9 +859,12 @@ impl Request {
     /// what stops one from being probed for.
     fn origin_allowed(&self, config: &Config) -> bool {
         let Some(origin) = &self.origin else {
-            // Not a browser: a page cannot suppress `Origin`. So this is
-            // something else on this machine — `run` refuses to bind anywhere
-            // else — and it still has to know the token.
+            // A missing `Origin` says nothing about who is asking: an
+            // `<img src>`, a `<script src>` and a form GET are all browser
+            // requests that carry none. So this branch is not "not a
+            // browser", it is "nothing to check" — which is why the token
+            // is what admits it, and why this is served only on a loopback
+            // bind, where `run` already refuses to be anywhere else.
             return config.addr.ip().is_loopback();
         };
         if is_loopback_origin(origin) {
@@ -1082,8 +1097,23 @@ mod tests {
         }
     }
 
-    /// A client that sends no `Origin` is not a page — a page cannot suppress
-    /// it — so it is served only where the reach is the machine itself.
+    /// A preflight with no lifetime on it is one the browser repeats, and
+    /// Chrome repeats it after five seconds — so a history load naming a
+    /// hundred photos spends a hundred extra round trips before the fetches
+    /// that carry the pictures, and the ones that miss the frame's budget are
+    /// drawn as media that is not there.
+    #[test]
+    fn a_preflight_says_how_long_it_is_good_for() {
+        let head = preflight_head(Some("https://oxidezap.github.io"), true);
+        assert!(
+            head.contains("Access-Control-Max-Age: 600\r\n"),
+            "the browser was told nothing, so it asks again per photo: {head}"
+        );
+    }
+
+    /// A client that sends no `Origin` carries nothing to check, so it is
+    /// served only where the reach is the machine itself — and still only
+    /// with the token.
     #[test]
     fn a_client_with_no_origin_is_served_only_on_loopback() {
         assert!(request(None).origin_allowed(&config(&[])));

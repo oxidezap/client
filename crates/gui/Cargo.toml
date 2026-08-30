@@ -17,6 +17,18 @@ name = "oxidezap"
 path = "src/main.rs"
 
 [dependencies]
+# The video's own audio track: `mp4` demuxes the container and `symphonia`
+# decodes the AAC out of it. Both were desktop-only while the only caller was
+# `video/streaming.rs`, which needs openh264 and so was a desktop path from
+# end to end. That is the day the note beside them predicted: a page demuxes
+# for `web_sys::VideoDecoder` now, and the container was never the problem
+# there — the codec was. So they are shared, and they are real bytes in the
+# bundle rather than something LTO removes, which is the cost of the feature.
+# Voice notes are Opus and live in `oxidezap-audio`, so only the AAC codec and
+# the ISO-MP4 reader are ever reachable; every other format symphonia can
+# register is dead weight in the probe tables.
+mp4 = "0.14"
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["std", "clock"] }
 
@@ -33,7 +45,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Ordered maps for deterministic cache eviction
 indexmap = "2"
 log = { workspace = true }
-mp4 = "0.14"
 
 oxidezap-audio = { workspace = true }
 oxidezap-core = { workspace = true }
@@ -55,11 +66,6 @@ smallvec = "1"
 # which is all the window ever used it for besides timers — and the only half
 # that builds for a page, since `smol`'s timer is an epoll loop.
 futures-lite = { version = "2", default-features = false, features = ["std"] }
-# Decodes the AAC track lifted out of an MP4 video. The container is demuxed by
-# the `mp4` crate and voice notes are Opus (handled in `oxidezap-audio`), so
-# only the AAC codec and the ISO-MP4 reader are reachable from here. Every
-# other format symphonia can register is dead weight in the probe tables.
-symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 # Channels only. The session runs in another process now, so nothing here
 # needs a runtime to drive it.
 tokio = { workspace = true, features = ["sync"] }
@@ -109,10 +115,14 @@ web-sys = { version = "0.3", features = [
     "BlobPropertyBag",
     "Document",
     "Element",
+    "EventTarget",
     "HtmlAnchorElement",
     "HtmlElement",
     "Location",
+    "Node",
+    "PageTransitionEvent",
     "Storage",
+    "StorageEvent",
     "Url",
     "Performance",
     "Window",

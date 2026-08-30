@@ -77,6 +77,13 @@ struct Playing {
     /// speed the person changed while it was paused. Asking this instead
     /// gives the voice note the current setting and the video its 1×.
     follows_speed: bool,
+    /// The speed control's current setting, shared with a decode in flight.
+    ///
+    /// The same number as `Player::speed`, kept here because a decode is a
+    /// promise: `play` used to capture the speed on the way in, so a note
+    /// switched to 2× while `decodeAudioData` was still working started at 1×
+    /// under a control already reading 2×.
+    chosen: f32,
     duration: f64,
     is_playing: bool,
     finished: bool,
@@ -120,6 +127,7 @@ impl Default for Playing {
             offset: 0.0,
             rate: 1.0,
             follows_speed: true,
+            chosen: 1.0,
             duration: 0.0,
             is_playing: false,
             finished: false,
@@ -187,6 +195,10 @@ impl AudioPlayer {
         }
         self.speed = speed.clamp(0.5, 3.0);
         let mut state = self.state.borrow_mut();
+        // Before the early return below: a video's soundtrack does not follow
+        // the control, but the setting it is not following is still the one a
+        // voice note decoding right now has to start at.
+        state.chosen = self.speed;
         // A video's soundtrack keeps its 1× while this is playing, the same
         // as it keeps it across a restart. The setting is still recorded, and
         // still applies to the next voice note.
@@ -380,7 +392,6 @@ impl AudioPlayer {
 
         let state = Rc::clone(&self.state);
         let context = context.clone();
-        let speed = self.speed;
         // The run this decode belongs to. `stop` above has already bumped it,
         // so anything armed before this call is superseded.
         let generation = self.state.borrow().generation;
@@ -416,6 +427,18 @@ impl AudioPlayer {
                             .map_or(0.0, |fraction| f64::from(fraction) * state.duration);
                         state.offset = offset;
                         (offset, std::mem::take(&mut state.pending_pause))
+                    };
+                    // Read here rather than captured on the way in: this is
+                    // after the decode, and the speed control may have moved
+                    // while it ran. `follows_speed` is what keeps a video's
+                    // soundtrack at 1× either way.
+                    let speed = {
+                        let state = state.borrow();
+                        if state.follows_speed {
+                            state.chosen
+                        } else {
+                            1.0
+                        }
                     };
                     start(&context, &buffer, &state, speed, offset);
                     if stay_paused {
@@ -453,9 +476,12 @@ impl AudioPlayer {
     ///
     /// No audio context, no samples, or a buffer the browser refused to
     /// allocate.
+    /// Borrowed, not owned: the samples are copied into a `WebAudio` buffer
+    /// and nothing here keeps them, so taking the caller's `Vec` was a copy
+    /// of the whole track that the page then dropped.
     pub fn play_samples(
         &mut self,
-        samples: Vec<f32>,
+        samples: &[f32],
         src_sample_rate: u32,
     ) -> Result<(), PlayerError> {
         if samples.is_empty() {
@@ -470,7 +496,7 @@ impl AudioPlayer {
             .create_buffer(1, frames, src_sample_rate as f32)
             .map_err(|e| PlayerError::DeviceError(format!("{e:?}")))?;
         buffer
-            .copy_to_channel(&samples, 0)
+            .copy_to_channel(samples, 0)
             .map_err(|e| PlayerError::DeviceError(format!("{e:?}")))?;
 
         {

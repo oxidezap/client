@@ -14,16 +14,6 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
-/// Delete the cached files this wipe is entitled to.
-///
-/// Part of "clear data and pair again", and not optional there: the store is
-/// one file, but the media beside it is a directory that can hold half a
-/// gigabyte of the *previous* account's photos, videos and documents. Leaving
-/// it in place means pairing a different account onto a cache of someone
-/// else's pictures, with no control anywhere that clears them.
-///
-pub use platform::wipe;
-
 pub use platform::{cache_usage, claim, has, put, put_owned, take};
 /// Read without removing, where the front end is this process. See `web.rs`.
 #[cfg(target_family = "wasm")]
@@ -155,4 +145,149 @@ pub fn put_since(epoch: usize, key: &str, bytes: &[u8]) -> Result<String> {
         anyhow::bail!("the media cache was cleared while this was being prepared");
     }
     platform::put_evictable(key, bytes)
+}
+
+/// Delete the cached files this wipe is entitled to.
+///
+/// Part of "clear data and pair again", and not optional there: the store is
+/// one file, but the media beside it is a directory that can hold half a
+/// gigabyte of the *previous* account's photos, videos and documents. Leaving
+/// it in place means pairing a different account onto a cache of someone
+/// else's pictures, with no control anywhere that clears them.
+///
+/// The lock and the epoch are taken here rather than by each platform, so a
+/// backend cannot forget them. One did: the page's wipe emptied its map
+/// without moving the epoch, so a publisher still draining its queue found
+/// the epoch it was handed still current and put the bytes straight back.
+///
+/// # Errors
+///
+/// Whatever the platform's deletion answers.
+pub fn wipe(scope: Wipe) -> Result<()> {
+    // For the whole wipe, so an epoch-checked write is either wholly before
+    // it — and deleted by it — or wholly after, and kept.
+    let _guard = WIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Before the deletions, not after: a writer that reads the epoch between
+    // the two would otherwise believe its file survived the wipe that is
+    // about to remove it.
+    invalidate();
+    platform::delete(scope)
+}
+
+/// Retire the epoch every writer in flight is holding.
+///
+/// Split out so the property can be asserted without deleting anybody's
+/// cache. [`wipe`] is its only caller.
+fn invalidate() {
+    CACHE_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
+
+/// What both backends have to answer the same way.
+///
+/// These live here rather than beside either implementation because that is
+/// the whole subject: the page's cache and the daemon's directory are two
+/// answers to one question, and the one place they silently disagreed was a
+/// wipe that emptied the map without retiring the epoch. Written once, so a
+/// third backend inherits them.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A publisher's queue outlives the tap that cleared the cache, so the
+    /// write it is still holding has to be refused rather than repopulating a
+    /// directory the user was just told was empty.
+    #[test]
+    fn a_write_prepared_before_a_clear_is_refused() {
+        let before = epoch();
+        invalidate();
+        assert!(
+            put_since(before, "f-3EB0ABC", b"the bytes of a photo").is_err(),
+            "the cache was cleared after this write was prepared"
+        );
+    }
+
+    /// The epoch is what a writer in flight compares against, so a clear that
+    /// leaves it standing is a clear that undoes itself.
+    #[test]
+    fn clearing_the_cache_retires_the_epoch_every_writer_is_holding() {
+        let before = epoch();
+        invalidate();
+        assert_ne!(epoch(), before);
+    }
+
+    /// A "clear cached media" that takes a staged upload with it turns an
+    /// unrelated cleanup into a voice note that fails with "no audio cached".
+    #[test]
+    fn clearing_the_cache_spares_a_staged_upload() {
+        assert!(Wipe::Cache.takes("f-3EB0ABC"));
+        assert!(Wipe::Cache.takes("d-9f86d081884c7d65"));
+        assert!(
+            !Wipe::Cache.takes("u-local_audio-7"),
+            "somebody is still waiting for that to be sent"
+        );
+    }
+
+    /// The budget sweep reclaims more than a "clear cached media" does: the
+    /// orphans of an older build have nothing else to remove them, and they
+    /// are billed to the user by `cache_usage` either way.
+    #[test]
+    fn the_budget_sweep_spares_only_a_staged_upload() {
+        assert!(is_staged_upload("u-local_audio-7"));
+        assert!(!is_staged_upload("f-3EB0ABC"));
+        assert!(!is_staged_upload("d-9f86d081884c7d65"));
+        assert!(
+            !is_staged_upload("m-3EB0ABC"),
+            "an orphan of the build that wrote thumbnails under the message key"
+        );
+    }
+
+    /// The account is going, and so is anything that was going to be sent
+    /// under it.
+    #[test]
+    fn forgetting_an_account_takes_everything() {
+        assert!(Wipe::Everything.takes("f-3EB0ABC"));
+        assert!(Wipe::Everything.takes("d-9f86d081884c7d65"));
+        assert!(Wipe::Everything.takes("u-local_audio-7"));
+    }
+
+    /// A message id comes off the network. One carrying a separator would name
+    /// a file outside the cache, which the daemon writes to as the user who
+    /// owns the session.
+    #[test]
+    fn a_key_built_from_a_message_id_cannot_escape_the_cache() {
+        for id in ["../../etc/passwd", "a/b", "..", "with space", "\0"] {
+            let key = message_key(id);
+            assert!(
+                oxidezap_ipc::media_path(&key).is_some(),
+                "{id} produced an unusable key: {key}"
+            );
+            assert!(!key.contains('/'), "{key}");
+        }
+    }
+
+    /// The same media shared into two chats is one file, so the second
+    /// download never happens.
+    #[test]
+    fn the_same_content_is_the_same_key() {
+        let sha = [0xab_u8; 32];
+        assert_eq!(download_key(&sha), download_key(&sha));
+        assert_ne!(download_key(&sha), download_key(&[0xcd; 32]));
+        assert!(
+            download_key(&sha).len() < 40,
+            "a key is a file name a person may have to read"
+        );
+    }
+
+    /// Message keys and download keys share a directory and must not collide:
+    /// one is addressed by message, the other by content. The message prefix
+    /// is `f-` because it also promises *full* media — see [`message_key`].
+    #[test]
+    fn the_two_key_spaces_stay_apart() {
+        assert!(message_key("abc").starts_with("f-"));
+        assert!(download_key(&[1; 32]).starts_with("d-"));
+        assert!(
+            !message_key("abc").starts_with("m-"),
+            "the old prefix cached thumbnails under it and must stay orphaned"
+        );
+    }
 }

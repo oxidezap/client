@@ -2,10 +2,13 @@
 //!
 //! This module provides audio extraction functionality for MP4 video files.
 //! The video decoding is handled by StreamingVideoDecoder in streaming.rs.
-
-use std::io::Cursor;
-
-use mp4::{Mp4Reader, TrackType};
+//!
+//! The extraction was desktop-only while the only caller was `streaming.rs`,
+//! which a page did not build. It builds one now — `unsupported.rs` demuxes
+//! the same container for the browser's own decoder — so a video's sound
+//! plays on both, and `symphonia` and `mp4` are in the shipped module rather
+//! than removed from it by LTO. That is a real cost, paid for a real feature:
+//! a video that played silently on the web would be the more obvious defect.
 
 /// ADTS sample rate to frequency index mapping
 const ADTS_FREQ_TABLE: [(u32, u8); 13] = [
@@ -25,16 +28,25 @@ const ADTS_FREQ_TABLE: [(u32, u8); 13] = [
 ];
 
 /// Decoded audio data from video (always mono after conversion)
+///
+/// Shared rather than owned, because the play path hands this around: the
+/// player keeps one, a resume re-feeds one, and each of those used to be a
+/// copy of the whole track. Three minutes of mono at 44.1 kHz is 31 MB in
+/// `f32`, and on the web that is linear memory that never comes back.
 #[derive(Clone)]
 pub struct VideoAudio {
     /// PCM samples (f32, mono)
-    pub samples: Vec<f32>,
+    pub samples: std::sync::Arc<[f32]>,
     /// Sample rate in Hz
     pub sample_rate: u32,
 }
 
 /// Extract audio from MP4 using mp4 crate for demuxing and symphonia for AAC decoding
 pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
+    use std::io::Cursor;
+
+    use mp4::{Mp4Reader, TrackType};
+
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::formats::FormatOptions;
@@ -185,7 +197,7 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
     );
 
     Some(VideoAudio {
-        samples: mono_samples,
+        samples: mono_samples.into(),
         sample_rate,
     })
 }

@@ -4,20 +4,12 @@
 //! this origin and holds nothing but our database — so a path would be a
 //! second naming scheme over a flat store that already has one.
 //!
-//! # Two stores, and which one this agent got
+//! # Why this one and not OPFS
 //!
 //! SQLite's durable VFS on the web is OPFS through a synchronous access
-//! handle, and that handle is specified to exist in a dedicated worker and
-//! nowhere else. [`prepare`] asks for it anyway and falls back, so the
-//! question is answered by the runtime rather than assumed: where the handle
-//! is reachable the page gets a store with no durability window at all, and
-//! where it is not it gets the one below, which is what the window has today.
-//!
-//! Asking costs one refused call at startup and buys the thing that matters
-//! when the session does move into a worker — the move becomes a change of
-//! where this runs rather than a change to what it does.
-//!
-//! # What the fallback costs
+//! handle, and that handle exists in a dedicated worker and nowhere else.
+//! This one works in the window, which is where the session runs today, and
+//! it is the reason it can run there at all.
 //!
 //! What it costs is *when* a write lands rather than whether it does. The
 //! database is held in memory and changed blocks are written to IndexedDB
@@ -25,19 +17,23 @@
 //! commit — which for chat history is a message that comes back on the next
 //! hydration, and for Signal state is a ratchet that has to re-establish.
 //!
-//! That window cannot be closed from here, and a note that used to say
-//! otherwise is why this paragraph is explicit. `WaitCommit` comes back from
-//! `import_db`, `delete_db` and `clear_all` and from nothing else: the writes
-//! SQLite makes are queued with no notifier at all, so there is no ordinary
-//! commit to await and no failed flush to hear about. Nothing here can turn
-//! that into a guarantee, which is why [`wipe`] is the one operation that
-//! waits — it has a management op to wait *on*.
+//! An ordinary commit is also not *observable*: the VFS hands back a
+//! `WaitCommit` for an import, a deletion and a clear, and nothing at all for
+//! the writes a session actually makes. So a quota the browser refuses to go
+//! past has nowhere to be reported — the database keeps behaving perfectly
+//! all session and the account is gone on the next load. What this module can
+//! do about that is say the headroom out loud before it runs out; see
+//! [`report_headroom`]. Closing it properly means either a VFS that answers
+//! for a commit or the move to OPFS, where the write is the call.
 //!
-//! What is left is making eviction less likely and a full quota audible:
-//! [`request_durability`] asks the browser to keep this origin's storage and
-//! reports what is left. Moving the session into a worker and this to OPFS is
-//! the real hardening, and it changes nothing above [`super`] — which is the
-//! whole reason that interface is shaped the way it is.
+//! Moving the session into a worker and this to OPFS is the hardening, and it
+//! changes nothing above [`super`] — which is the whole reason that interface
+//! is shaped the way it is. [`prepare`] already *asks* for OPFS before
+//! falling back here, so both backends are written and the pragma and the
+//! wipe already dispatch on which one answered: the move becomes a change of
+//! where this runs rather than a change to what it does. In the window the
+//! ask is normally refused, since the synchronous access handle is specified
+//! to live in a dedicated worker.
 
 use std::cell::OnceCell;
 
@@ -55,10 +51,11 @@ use super::DB_FILE;
 /// how a wipe deletes.
 enum Backend {
     /// OPFS through a synchronous access handle: a commit is on the disk when
-    /// it returns, so there is no window to lose one in.
+    /// it returns, so the durability window above does not exist here and
+    /// there is nothing for the headroom warning to be about.
     Durable(OpfsSAHPoolUtil),
     /// The database in memory, with changed blocks pushed to IndexedDB after
-    /// the fact. See the durability note above.
+    /// the fact.
     Relaxed(RelaxedIdbUtil),
 }
 
@@ -92,19 +89,12 @@ pub fn database_path() -> String {
 /// The browser refused IndexedDB — a private window with storage disabled,
 /// or a quota already spent.
 pub async fn prepare() -> Result<(), String> {
-    // Before the store rather than after it: a quota already spent is the
-    // reason the next line fails, and asking afterwards would report it as a
-    // mystery.
-    request_durability().await;
-
-    // OPFS first, because it is the one with no durability window at all: a
-    // synchronous access handle writes during the commit rather than after
-    // it. It is refused wherever the handle is not reachable — the
-    // specification puts it in a dedicated worker, and this runs in the
-    // window — so the fallback below is not an error path but the ordinary
-    // one until the session moves. Trying anyway costs one refused call at
-    // startup and is what makes the move a configuration change rather than a
-    // rewrite.
+    // Neither of these decides whether the store opens, so neither is allowed
+    // to stop it: `persist` is a request a browser may simply decline, and
+    // the OPFS ask is refused wherever the synchronous access handle is not
+    // reachable — which the specification says is everywhere but a dedicated
+    // worker, and this runs in the window.
+    request_persistence().await;
     match install_sahpool::<WasmOsCallback>(&OpfsSAHPoolCfg::default(), true).await {
         Ok(pool) => {
             info!("opened a durable OPFS store");
@@ -127,6 +117,12 @@ pub async fn prepare() -> Result<(), String> {
         "opened the browser store, holding {} file(s)",
         store.count()
     );
+    // Bounded, and nothing waits on the answer beyond that. This is one log
+    // line: `navigator.storage.estimate()` is a promise the browser is under
+    // no obligation to settle, and an account that will not open because a
+    // quota-reporting API went quiet is a far worse failure than the one the
+    // line is warning about.
+    let _ = crate::exec::with_timeout(report_headroom(), HEADROOM_ASK).await;
     // Kept for [`wipe`], and only the first one needs keeping: `install`
     // registers the VFS under `vfs_name` once and every later call finds it
     // registered and hands back another `RelaxedIdbUtil` over the *same*
@@ -151,79 +147,97 @@ fn is_durable() -> bool {
     STORE.with(|cell| matches!(cell.get(), Some(Backend::Durable(_))))
 }
 
-/// Ask the browser to keep this origin's storage, and say what is left.
+/// Ask the browser not to evict this origin.
 ///
-/// Two different questions, asked together because both are about the same
-/// tab losing an account. `persist()` moves the origin out of the bucket a
-/// browser clears under pressure without asking; a browser that declines is
-/// not an error, it is one that decides on its own criteria, so it is said
-/// once and the session goes on.
-///
-/// The quota half is the one that matters more, because running out is
-/// silent. This VFS holds the database in memory and pushes changed blocks
-/// afterwards, so a refused write surfaces nowhere: the page behaves
-/// perfectly all session and the account is gone on reload. Knowing the
-/// headroom at open is not a fix, but it is the difference between a
-/// diagnosable report and an unreproducible one.
-///
-/// Never fatal. Every one of these APIs is absent or refused in some ordinary
-/// configuration — a private window, an older browser, a user who declined —
-/// and none of them is a reason not to run.
-async fn request_durability() {
+/// The other half of the same worry as [`report_headroom`], and the half that
+/// can actually be acted on: persistent storage is not cleared under pressure
+/// without asking. A browser that declines is not an error — it decides on
+/// its own criteria — so it is said once and the session goes on.
+async fn request_persistence() {
     let Some(window) = web_sys::window() else {
         return;
     };
-    let storage = window.navigator().storage();
-
-    match wasm_bindgen_futures::JsFuture::from(
-        storage
-            .persist()
-            .unwrap_or_else(|_| js_sys::Promise::resolve(&wasm_bindgen::JsValue::FALSE)),
-    )
-    .await
+    let promise = window.navigator().storage().persist();
+    let Ok(promise) = promise else {
+        return;
+    };
+    match crate::exec::with_timeout(wasm_bindgen_futures::JsFuture::from(promise), HEADROOM_ASK)
+        .await
     {
-        Ok(granted) if granted.is_truthy() => {
+        Some(Ok(granted)) if granted.is_truthy() => {
             info!("the browser will keep this origin's storage");
         }
-        Ok(_) => info!("the browser may evict this origin's storage under pressure"),
-        Err(e) => info!("could not ask the browser to keep storage: {e:?}"),
-    }
-
-    let Ok(promise) = storage.estimate() else {
-        return;
-    };
-    let Ok(estimate) = wasm_bindgen_futures::JsFuture::from(promise).await else {
-        return;
-    };
-    let number = |key: &str| {
-        js_sys::Reflect::get(&estimate, &wasm_bindgen::JsValue::from_str(key))
-            .ok()
-            .and_then(|v| v.as_f64())
-    };
-    if let (Some(usage), Some(quota)) = (number("usage"), number("quota")) {
-        let left = quota - usage;
-        info!(
-            "browser storage: {:.1} MiB used of {:.1} MiB",
-            usage / 1_048_576.0,
-            quota / 1_048_576.0
-        );
-        // A database that cannot grow is the failure this whole function
-        // exists to make audible, and it arrives with no error of its own.
-        if left < LOW_STORAGE_BYTES {
-            log::warn!(
-                "browser storage is nearly full ({:.1} MiB left): writes may be refused, \
-                 and this store cannot report a refused write",
-                left / 1_048_576.0
-            );
-        }
+        Some(Ok(_)) => info!("the browser may evict this origin's storage under pressure"),
+        // A refusal and a promise that never settles are the same thing here:
+        // one log line either way, and nothing waits on it.
+        Some(Err(_)) | None => {}
     }
 }
 
-/// Where "nearly full" starts, in bytes.
+/// How long the headroom question may take before it is abandoned.
 ///
-/// Generous because the cost of a false warning is a log line and the cost of
-/// a missed one is the account.
-const LOW_STORAGE_BYTES: f64 = 32.0 * 1_048_576.0;
+/// Generous, because the answer is worth having and the browser is usually
+/// instant; bounded, because it is a diagnostic on the path that opens the
+/// account.
+const HEADROOM_ASK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How little room may be left before it is worth saying so.
+///
+/// An account's database is tens of megabytes and grows with its history, so
+/// this is a floor under "there is room for what is coming", not under one
+/// write.
+const HEADROOM_FLOOR: f64 = 64.0 * 1024.0 * 1024.0;
+
+/// Say how much of this origin's storage is spent.
+///
+/// The only warning available. A write that the browser refuses for quota is
+/// dropped inside the VFS with nobody to hand it to, and the page carries on
+/// against a database it is holding in memory — so the account is intact all
+/// session and absent on the next load. Asking beforehand does not stop that;
+/// it puts a line in front of it that says what happened.
+async fn report_headroom() {
+    let Some(estimate) = storage_estimate().await else {
+        return;
+    };
+    let (usage, quota) = estimate;
+    let left = quota - usage;
+    if left < HEADROOM_FLOOR {
+        log::warn!(
+            "this origin has {:.0} MiB of storage left of {:.0} MiB; \
+             writes the browser refuses are not reported, so an account kept \
+             here may not survive a reload",
+            left / (1024.0 * 1024.0),
+            quota / (1024.0 * 1024.0)
+        );
+    } else {
+        info!(
+            "this origin is using {:.0} MiB of {:.0} MiB",
+            usage / (1024.0 * 1024.0),
+            quota / (1024.0 * 1024.0)
+        );
+    }
+}
+
+/// `navigator.storage.estimate()`, as bytes used and bytes allowed.
+///
+/// `None` wherever the browser will not say, which is not a problem: this is
+/// a warning, and one that cannot be produced is one nothing depends on.
+async fn storage_estimate() -> Option<(f64, f64)> {
+    let manager = web_sys::window()?.navigator().storage();
+    let estimate = wasm_bindgen_futures::JsFuture::from(manager.estimate().ok()?)
+        .await
+        .ok()?;
+    // Read by name: `StorageEstimate` is a dictionary in web-sys, so it has
+    // the setters a caller building one needs and no getters at all. Both
+    // fields are optional in the specification too, which is the same answer
+    // this function already gives for a browser that will not say.
+    let field = |name: &str| {
+        js_sys::Reflect::get(&estimate, &wasm_bindgen::JsValue::from_str(name))
+            .ok()
+            .and_then(|value| value.as_f64())
+    };
+    Some((field("usage")?, field("quota")?))
+}
 
 /// Delete the local session.
 ///
@@ -234,8 +248,8 @@ pub async fn wipe() -> std::io::Result<()> {
     let commit = STORE.with(|cell| match cell.get() {
         // Nothing installed, so nothing was ever written.
         None => Ok(None),
-        // Nothing to await: this backend's delete has already reached the
-        // disk by the time it answers, which is the whole difference.
+        // Nothing to await: this backend's delete has reached the disk by the
+        // time it answers, which is the whole difference between the two.
         Some(Backend::Durable(pool)) => pool
             .delete_db(DB_FILE)
             .map(|_| None)
@@ -274,7 +288,7 @@ pub fn settings() -> whatsapp_rust_sqlite_storage::SqliteStoreConfig {
     if is_durable() {
         // The store's own default, which is `normal`: this backend has a disk
         // at the moment of the write, so the pragma describes something real
-        // and refusing it would be refusing the durability it exists for.
+        // and refusing it would refuse the durability it exists for.
         return whatsapp_rust_sqlite_storage::SqliteStoreConfig::default();
     }
     whatsapp_rust_sqlite_storage::SqliteStoreConfig {

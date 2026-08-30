@@ -247,3 +247,79 @@ opt-level = "s"
 opt-level = "s"
 
 
+
+# The same tree, built to be downloaded.
+#
+# `release` above is calibrated for the binary, where an optimization is paid
+# for once at build time and collected at every frame afterwards. The web
+# artifact is one 28 MiB module a visitor waits on before the first pixel and
+# a browser then has to compile, so the same setting is the wrong one — and
+# cargo has no per-target profiles, which is why this is a profile of its own
+# rather than a `cfg`. `web/build.sh` selects it through trunk's
+# `--cargo-profile`; nothing else uses it, and the desktop build is untouched.
+#
+# The measurements are at the rustc stage on this tree, against `release`
+# (35,828,266 bytes), each on its own:
+#
+#   opt-level = "s"                     -11,196,329   (-31.3%)
+#   waproto + buffa at "z"               -1,237,629    (-3.5%)
+#
+# The package overrides are not inherited from `release` — cargo copies the
+# base settings and not the per-package table — so the ones that matter to
+# *this* graph are repeated here. That is a much shorter list than the sweep
+# above, which names the desktop: `ureq`, `zbus`, `accesskit_*`, `wayland-*`,
+# `usvg`, `notify-rust` and `libsqlite3-sys` are not compiled for wasm at all
+# (there it is `sqlite-wasm-rs`), so the sweep's coverage of this artifact was
+# close to nil.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+
+# The exception, and the only one. `gpui` draws every frame, it is the largest
+# single crate in the shipped module at 10.6% of its code, and it is the one
+# place where "fast" is worth more than "small".
+[profile.web.package.gpui]
+opt-level = 3
+
+# z = the protocol. `waproto` is generated from a 590 KB descriptor and is the
+# second-largest crate here; `buffa` is its encoder. Both are per message
+# rather than per frame, and the manifest above deliberately keeps them at 3
+# for the desktop — which is the right answer there and not here.
+[profile.web.package.waproto]
+opt-level = "z"
+[profile.web.package.buffa]
+opt-level = "z"
+
+# The same bundle with its symbols, which `WEB_PROFILE=debug ./web/build.sh`
+# selects. It inherits `web` rather than `release` deliberately: a build you
+# are diagnosing should be the build that misbehaved, so the only difference
+# is that the names survive.
+#
+# `strip` and not `debug`: what a wasm flame graph and a panic trace read is
+# the *name section*, which rustc emits unless it is stripped — and which
+# `strip = true` removes before wasm-opt ever sees the module, which is why
+# there are no Rust symbols in a profile of the published page and never were.
+# Full DWARF would add source lines and tens of megabytes; the names are what
+# was promised.
+[profile.web-debug]
+inherits = "web"
+strip = "none"
+
+# z = persistence and the one-shot subsystems, mirroring the sweep above for
+# the members of it that actually reach this target.
+[profile.web.package.diesel]
+opt-level = "z"
+[profile.web.package.diesel_migrations]
+opt-level = "z"
+[profile.web.package.whatsapp-rust-sqlite-storage]
+opt-level = "z"
+[profile.web.package.naga]
+opt-level = "z"
+[profile.web.package.regex]
+opt-level = "z"
+[profile.web.package.regex-automata]
+opt-level = "z"
+[profile.web.package.markdown]
+opt-level = "z"
+[profile.web.package.html5ever]
+opt-level = "z"

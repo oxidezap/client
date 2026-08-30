@@ -230,6 +230,18 @@ else
         # somebody serves this somewhere else.
         sed -i'' -e 's|<head>|<head><meta name="oxidezap-build" content="preview" />|' \
             "$work/$target/index.html"
+        # `sed` exits 0 when it matches nothing, and the page reads the
+        # absence of this tag as "not a preview" — which is the direction that
+        # opens a session in the deployment's own origin storage. So the
+        # injection is checked rather than assumed: a bundler that emits
+        # `<head >`, `<HEAD>` or no literal `<head>` at all must fail the
+        # publish here, loudly, rather than ship a preview that holds an
+        # account.
+        if ! grep -q 'name="oxidezap-build" content="preview"' \
+            "$work/$target/index.html"; then
+            echo "could not mark $target as a preview: no <head> to inject into" >&2
+            exit 1
+        fi
     fi
     message="Publish $target from ${GITHUB_SHA:-a build}"
 fi
