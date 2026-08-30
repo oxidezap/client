@@ -86,7 +86,7 @@ pub async fn installed() -> Vec<Module> {
             return Vec::new();
         }
     };
-    let mut names = match entries(&dir).await {
+    let listed = match entries(&dir).await {
         Ok(names) => names,
         Err(e) => {
             log::warn!(
@@ -96,23 +96,36 @@ pub async fn installed() -> Vec<Module> {
             return Vec::new();
         }
     };
-    names.sort();
-    // Before a byte is read, which is the same place the desktop's discovery
-    // truncates and for the same reason: counting at the workers counted the
+    // Filtered, *then* truncated, which is the order the desktop's discovery
+    // keeps: a directory holds whatever anybody put in it, and a name this
+    // host cannot make a plugin id out of is not a plugin. Truncating the raw
+    // listing spent a slot on each of them, so entries sorting early — a
+    // stray file, a directory made through origin tooling — pushed real
+    // modules out of the set that runs.
+    let mut found: Vec<(String, String)> = listed
+        .into_iter()
+        .filter_map(|name| match plugin_id(&name) {
+            Some(id) => Some((name, id)),
+            None => {
+                log::warn!("skipping {name}: its name is not a usable plugin id");
+                None
+            }
+        })
+        .collect();
+    // Sorted by file name, because the order plugins load in is the order
+    // their buttons are drawn in.
+    found.sort();
+    // And bounded before a byte is read, which is where the desktop bounds it
+    // too and for the same reason: counting at the workers counted the
     // *successes*, so a folder of modules that each fail — after being read,
     // parsed and given their init fuel to refuse in — never reached the cap
-    // at all. `Plugins::start` asks again, and this is what keeps a folder of
-    // tiny files from being read whole before it does. The first
-    // `MAX_PLUGINS` by name, which is the answer discovery always gives.
-    names.truncate(MAX_PLUGINS);
+    // at all. `Plugins::start` asks again; this is what keeps a folder of
+    // tiny files from being read whole before it does.
+    found.truncate(MAX_PLUGINS);
 
     let mut modules = Vec::new();
     let mut total = 0usize;
-    for name in names {
-        let Some(id) = plugin_id(&name) else {
-            log::warn!("skipping {name}: its name is not a usable plugin id");
-            continue;
-        };
+    for (name, id) in found {
         // What is left of the folder's budget, handed down so the size is
         // checked before the bytes are read rather than after. Checking the
         // total afterwards bounded what this *keeps* and not what it
