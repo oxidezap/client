@@ -1975,7 +1975,7 @@ mod tests {
                 .collect();
 
             let frames = 60u32;
-            let started = std::time::Instant::now();
+            let started = wacore::time::Instant::now();
             for _ in 0..frames {
                 std::hint::black_box(chat.clone());
             }

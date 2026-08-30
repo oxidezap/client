@@ -130,6 +130,34 @@ pub fn format_time_local(timestamp: &DateTime<Utc>) -> String {
     local.format("%H:%M").to_string()
 }
 
+/// Longest a person's name may be where one is drawn.
+///
+/// A push name is whatever the peer typed and the wire carries it whole. It
+/// reaches the sidebar's preview line and the call card's pill, and both are
+/// laid out around it: a three-hundred-character name turns the sidebar row
+/// into nothing but the name, with the preview squeezed to zero, and pushes
+/// the call card off the left edge of the window with its drag handle. Sixty
+/// four is far past any name anybody chooses and short enough that the
+/// layout still owns the row.
+const MAX_NAME_CHARS: usize = 64;
+
+/// A name at a length a layout can hold.
+///
+/// Counted in `chars`, never in bytes: a name is somebody's, most of the
+/// world's are not ASCII, and cutting a UTF-8 sequence in half panics.
+/// Truncated here rather than only in the component, because the string is
+/// also measured, compared and put in tooltips.
+#[must_use]
+pub fn capped_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let head: String = chars.by_ref().take(MAX_NAME_CHARS).collect();
+    if chars.next().is_none() {
+        head
+    } else {
+        format!("{head}\u{2026}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// A push name is whatever the peer typed and the wire carries it whole:
@@ -220,33 +248,5 @@ mod tests {
         // 10:1 stays 10:1; the floor grow stops at max_size instead of
         // stretching only the short side (the old per-axis behavior).
         assert_close(scale_media_dimensions(200, 20, 300.0), (300.0, 30.0));
-    }
-}
-
-/// Longest a person's name may be where one is drawn.
-///
-/// A push name is whatever the peer typed and the wire carries it whole. It
-/// reaches the sidebar's preview line and the call card's pill, and both are
-/// laid out around it: a three-hundred-character name turns the sidebar row
-/// into nothing but the name, with the preview squeezed to zero, and pushes
-/// the call card off the left edge of the window with its drag handle. Sixty
-/// four is far past any name anybody chooses and short enough that the
-/// layout still owns the row.
-const MAX_NAME_CHARS: usize = 64;
-
-/// A name at a length a layout can hold.
-///
-/// Counted in `chars`, never in bytes: a name is somebody's, most of the
-/// world's are not ASCII, and cutting a UTF-8 sequence in half panics.
-/// Truncated here rather than only in the component, because the string is
-/// also measured, compared and put in tooltips.
-#[must_use]
-pub fn capped_name(name: &str) -> String {
-    let mut chars = name.chars();
-    let head: String = chars.by_ref().take(MAX_NAME_CHARS).collect();
-    if chars.next().is_none() {
-        head
-    } else {
-        format!("{head}\u{2026}")
     }
 }

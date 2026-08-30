@@ -269,6 +269,9 @@ mod tests {
     /// a send then blocks with nothing to end it — on the caller's own
     /// thread, holding the lock every other send waits on. The window used to
     /// freeze whole, with no timeout and no recovery.
+    // A stopwatch in a test, and this crate has no `wacore` to borrow one
+    // from — it deliberately depends on nothing that reaches the network.
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn a_send_nobody_is_reading_gives_up_rather_than_hanging() {
         let dir =

@@ -1253,7 +1253,6 @@ async fn a_wrapped_message_is_still_the_message_inside_it() {
     let wrapped = wa::Message {
         group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
             message: MessageField::some(wa::Message::text("bom dia")),
-            ..Default::default()
         }),
         ..Default::default()
     };

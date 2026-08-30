@@ -734,7 +734,7 @@ mod tests {
             let text = "*a* ".repeat(spans);
             let rich = parse(&text);
             assert_eq!(rich.spans.len(), spans);
-            let started = std::time::Instant::now();
+            let started = wacore::time::Instant::now();
             let runs = rich.runs();
             println!(
                 "{spans} spans -> {} runs in {:?}",

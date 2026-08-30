@@ -848,7 +848,7 @@ mod poster_cost_tests {
         for kb in [200usize, 400, 800] {
             let bytes = Arc::new(vec![0x7fu8; kb * 1024]);
             let frames = 60u32;
-            let started = std::time::Instant::now();
+            let started = wacore::time::Instant::now();
             for _ in 0..frames {
                 // Exactly the two costs: the clone the `Arc` cannot avoid,
                 // and the hash `Image::from_bytes` takes over the result.
