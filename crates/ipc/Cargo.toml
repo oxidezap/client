@@ -32,6 +32,7 @@ web-sys = { version = "0.3", features = [
     "AbortSignal",
     "CloseEvent",
     "Event",
+    "Headers",
     "Location",
     "MessageEvent",
     "Request",

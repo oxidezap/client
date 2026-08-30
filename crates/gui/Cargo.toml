@@ -17,6 +17,18 @@ name = "oxidezap"
 path = "src/main.rs"
 
 [dependencies]
+# The video's own audio track: `mp4` demuxes the container and `symphonia`
+# decodes the AAC out of it. Both were desktop-only while the only caller was
+# `video/streaming.rs`, which needs openh264 and so was a desktop path from
+# end to end. That is the day the note beside them predicted: a page demuxes
+# for `web_sys::VideoDecoder` now, and the container was never the problem
+# there — the codec was. So they are shared, and they are real bytes in the
+# bundle rather than something LTO removes, which is the cost of the feature.
+# Voice notes are Opus and live in `oxidezap-audio`, so only the AAC codec and
+# the ISO-MP4 reader are ever reachable; every other format symphonia can
+# register is dead weight in the probe tables.
+mp4 = "0.14"
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["std", "clock"] }
 
@@ -73,19 +85,6 @@ wacore-binary = { workspace = true }
 # environment variable to read a log filter out of.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 env_logger = "0.11"
-# The video's own audio track: `mp4` demuxes the container and `symphonia`
-# decodes the AAC out of it. Both are here rather than above because the only
-# caller is `video/streaming.rs`, which needs `openh264` — a C decoder — and
-# so is a desktop path from end to end. Voice notes are Opus and live in
-# `oxidezap-audio`, so only the AAC codec and the ISO-MP4 reader are ever
-# reachable; every other format symphonia can register is dead weight in the
-# probe tables.
-#
-# `mp4` comes back for every target the day a page demuxes for
-# `web_sys::VideoDecoder`: the container was never the problem there, the
-# codec was.
-mp4 = "0.14"
-symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 # Timers, on a platform that has a reactor to run them on.
 smol = "2"
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
@@ -127,6 +126,20 @@ web-sys = { version = "0.3", features = [
     "Url",
     "Performance",
     "Window",
+    # WebCodecs: the browser's own H.264 decoder, which is what stands in for
+    # openh264 where there is no C toolchain. See `video/webcodecs.rs`.
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "VideoFrame",
+    "DomRectReadOnly",
+    "VideoPixelFormat",
+    "VideoFrameCopyToOptions",
+    "PlaneLayout",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "DomException",
 ] }
 
 [lints]

@@ -3,20 +3,14 @@
 //! This module provides audio extraction functionality for MP4 video files.
 //! The video decoding is handled by StreamingVideoDecoder in streaming.rs.
 //!
-//! [`VideoAudio`] is the whole module on the web: the player and the
-//! call's stub both name it, so the *type* is every target's. What is not is
-//! the extraction — `mp4` demuxes and `symphonia` decodes the AAC, and the
-//! only thing that calls it is `streaming.rs`, which a page does not build.
-//! Gated rather than left to the optimizer, which is the discipline
-//! `openh264` already follows two lines below it in the manifest: LTO does in
-//! fact remove all of it today (measured — `symphonia` and `mp4` are absent
-//! from the shipped module), but `get_probe()` builds its registry through
-//! trait objects, which is exactly the shape dead-code elimination is least
-//! reliable about. A page that stopped being able to prove it would gain a
-//! codec it cannot reach.
+//! The extraction was desktop-only while the only caller was `streaming.rs`,
+//! which a page did not build. It builds one now — `unsupported.rs` demuxes
+//! the same container for the browser's own decoder — so a video's sound
+//! plays on both, and `symphonia` and `mp4` are in the shipped module rather
+//! than removed from it by LTO. That is a real cost, paid for a real feature:
+//! a video that played silently on the web would be the more obvious defect.
 
 /// ADTS sample rate to frequency index mapping
-#[cfg(not(target_family = "wasm"))]
 const ADTS_FREQ_TABLE: [(u32, u8); 13] = [
     (96000, 0),
     (88200, 1),
@@ -48,7 +42,6 @@ pub struct VideoAudio {
 }
 
 /// Extract audio from MP4 using mp4 crate for demuxing and symphonia for AAC decoding
-#[cfg(not(target_family = "wasm"))]
 pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
     use std::io::Cursor;
 
@@ -100,10 +93,23 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
         channels
     );
 
-    // Straight into the ADTS stream, rather than collecting every frame and
-    // copying the lot again: the two together held the whole track twice
+    // The count is the container's, and the container is a file somebody
+    // sent. Two ceilings, because neither alone is one: the file's length
+    // bounds what it can carry, since a sample is at least a byte and `stsz`
+    // can otherwise declare four billion in a header that costs nothing to
+    // write; but a fixed one-byte sample size makes that bound tens of
+    // millions on its own, and the cost there is one `Vec` of metadata each
+    // before a byte of payload is read. Without both, the loop below is the
+    // denial of service rather than the allocation.
+    let ceiling = mp4_data.len().min(super::demux::MAX_TRACK_SAMPLES);
+    let sample_count = sample_count.min(u32::try_from(ceiling).unwrap_or(u32::MAX));
+
+    // Read straight into the ADTS stream, rather than collecting every frame
+    // and copying the lot again: the two together held the whole track twice
     // over, on top of the MP4 the caller is still holding, before a sample
-    // had been decoded.
+    // had been decoded. The ceiling above still bounds it — what that bounds
+    // is how many samples are read, which is a question about the container
+    // rather than about where they are put.
     //
     // Grown rather than reserved: the audio is a small fraction of a video
     // file, and reserving the MP4's whole length asked for a second copy of
@@ -165,7 +171,13 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
             }
         };
 
-    let mut all_samples: Vec<f32> = Vec::new();
+    // Mono as it comes, rather than a whole interleaved track and then a
+    // downmix of it. The result of this function is mono, so keeping the
+    // interleaved copy meant holding both at once: a stereo track's peak was
+    // one and a half times what it ends up returning, for a buffer that
+    // exists only to be averaged. Averaging per decoded frame is the same
+    // arithmetic against a buffer the size of one frame.
+    let mut mono_samples: Vec<f32> = Vec::new();
     let mut frame: Vec<f32> = Vec::new();
 
     // Decode all audio packets
@@ -177,7 +189,31 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
         match decoder.decode(&packet) {
             Ok(decoded) => {
                 decoded.copy_to_vec_interleaved(&mut frame);
-                all_samples.extend_from_slice(&frame);
+                // The bound above is on the *packets*, and this is where the
+                // cost actually is: an AAC packet is a few hundred bytes and
+                // decodes to 1024 samples a channel, so a low-bitrate track
+                // inside every ceiling so far still expands into billions of
+                // `f32`. Truncated rather than refused, which is what this
+                // function already does with a frame it cannot describe: a
+                // video with its first hours of sound is better than a tab
+                // that aborted opening it.
+                if mono_samples.len() + frame.len() > MAX_DECODED_SAMPLES {
+                    log::warn!(
+                        "truncating a video's audio at {} samples: the track decodes to more \
+                         than this build will hold",
+                        mono_samples.len()
+                    );
+                    break;
+                }
+                if channels > 1 {
+                    mono_samples.extend(
+                        frame
+                            .chunks(channels as usize)
+                            .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32),
+                    );
+                } else {
+                    mono_samples.extend_from_slice(&frame);
+                }
             }
             Err(e) => {
                 log::debug!("Audio decode error (skipping frame): {}", e);
@@ -185,26 +221,10 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
         }
     }
 
-    if all_samples.is_empty() {
+    if mono_samples.is_empty() {
         log::info!("No audio samples decoded");
         return None;
     }
-
-    // Downmix to mono if needed (average across all channels; the API promises mono)
-    let mono_samples = if channels > 1 {
-        let mono: Vec<f32> = all_samples
-            .chunks(channels as usize)
-            .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32)
-            .collect();
-        log::info!(
-            "Converted {} interleaved samples to {} mono samples",
-            all_samples.len(),
-            mono.len()
-        );
-        mono
-    } else {
-        all_samples
-    };
 
     log::info!(
         "Decoded {} audio samples ({:.2}s)",
@@ -218,14 +238,25 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
     })
 }
 
+/// The most decoded audio a video attachment may expand into.
+///
+/// The packet ceiling is not this one, and the difference is the whole
+/// reason both exist: a packet is a few hundred bytes of metadata and
+/// decodes to 1024 samples per channel, so a track that satisfies every
+/// bound on the *compressed* side still expands by three orders of
+/// magnitude. On the web that is a linear memory with a fixed roof, where
+/// running out aborts rather than fails.
+///
+/// Counted in the mono samples this returns, which is also what it holds:
+/// the downmix happens per decoded frame, so there is no interleaved copy of
+/// the whole track to bound separately. Twenty minutes at 48 kHz, which is
+/// 230 MB of `f32` and far past any video anybody sends through a chat.
+const MAX_DECODED_SAMPLES: usize = 48_000 * 1200;
+
 /// The largest an ADTS frame may say it is: the length field is 13 bits.
-#[cfg(not(target_family = "wasm"))]
 const MAX_ADTS_FRAME: usize = (1 << 13) - 1;
 
 /// One AAC frame, headered, appended to the ADTS stream being built.
-///
-/// Beside the table it reads, which a page has no decoder to need.
-#[cfg(not(target_family = "wasm"))]
 fn push_adts_frame(adts: &mut Vec<u8>, frame: &[u8], sample_rate: u32, channels: u8) {
     // Map sample rate to ADTS frequency index using lookup table
     let freq_idx = ADTS_FREQ_TABLE
@@ -283,7 +314,37 @@ fn wrap_aac_as_adts(frames: &[Vec<u8>], sample_rate: u32, channels: u8) -> Vec<u
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::{MAX_ADTS_FRAME, wrap_aac_as_adts};
+    use super::{MAX_ADTS_FRAME, MAX_DECODED_SAMPLES, wrap_aac_as_adts};
+
+    /// The compressed ceiling is not the decoded one, and the gap between
+    /// them is why both exist.
+    ///
+    /// Bounding the packet count bounds the metadata. It says nothing about
+    /// what those packets expand into: an AAC packet is a few hundred bytes
+    /// and decodes to 1024 samples a channel, so a track satisfying every
+    /// bound on the compressed side still grows by three orders of magnitude.
+    /// Written down as a test because this is the second ceiling that turned
+    /// out to be measuring the wrong thing, and the next reader deserves the
+    /// arithmetic rather than the conclusion.
+    #[test]
+    fn the_packet_ceiling_does_not_bound_what_the_packets_decode_to() {
+        // What the packet ceiling alone would allow, at one AAC frame's worth
+        // of stereo output per packet: two billion `f32`, which is eight
+        // gigabytes and something like thirty-five times the decoded bound.
+        let unbounded = super::super::demux::MAX_TRACK_SAMPLES * 1024 * 2;
+        assert!(
+            unbounded > MAX_DECODED_SAMPLES * 10,
+            "the decoded ceiling has to be the binding one by a wide margin: \
+             {unbounded} against {MAX_DECODED_SAMPLES}"
+        );
+
+        // And it is a size somebody can hold: well under a gigabyte of `f32`.
+        let bytes = MAX_DECODED_SAMPLES * std::mem::size_of::<f32>();
+        assert!(
+            bytes < 512 * 1024 * 1024,
+            "{bytes} bytes is too much to hold"
+        );
+    }
 
     /// The `aac_frame_length` field is 13 bits and the masks that build it
     /// drop what does not fit, so an oversized frame produced a header

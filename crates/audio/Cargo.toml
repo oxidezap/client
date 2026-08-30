@@ -12,6 +12,14 @@ repository.workspace = true
 anyhow = { workspace = true }
 async-channel = "2"
 log = { workspace = true }
+# The container, which is not the codec: `ogg` is plain Rust and builds for
+# every target here, so `ogg_opus` packages packets from libopus on a desktop
+# and from the browser's own encoder in a page, into the identical stream.
+ogg = "0.9"
+# The one channel shape that is the same on both targets: `Recording::Pending`
+# is a oneshot, and tokio's own would pull a runtime a page does not have.
+futures-channel = "0.3"
+
 portable-atomic = { workspace = true }
 # Channels and timers only on the web, where there is no thread pool to build
 # a multi-threaded runtime on. The feature list below adds the rest.
@@ -24,7 +32,6 @@ wacore = { workspace = true }
 # one worth capturing. See `src/web/mod.rs`.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 cpal = "0.18"
-ogg = "0.9"
 # Kept on the same major as the library's voip-libopus dependency: two
 # semver-incompatible wrappers would each link their own copy of libopus.
 opus = "0.4"
@@ -50,6 +57,29 @@ web-sys = { version = "0.3", features = [
     "AudioNode",
     "AudioParam",
     "AudioScheduledSourceNode",
+    # Capture, and the browser's own Opus encoder standing in for libopus.
+    # ScriptProcessorNode rather than AudioWorklet: a worklet is loaded from a
+    # JavaScript module file, and the one hand-written JS file in this tree is
+    # the service worker, which exists because nothing else can set a header.
+    "AudioContextOptions",
+    "AudioData",
+    "AudioDataCopyToOptions",
+    "AudioDataInit",
+    "AudioEncoder",
+    "AudioEncoderConfig",
+    "AudioEncoderInit",
+    "AudioProcessingEvent",
+    "AudioSampleFormat",
+    "EncodedAudioChunk",
+    "MediaDevices",
+    "MediaStream",
+    "MediaStreamAudioSourceNode",
+    "MediaStreamConstraints",
+    "MediaStreamTrack",
+    "Navigator",
+    "ScriptProcessorNode",
+    "Window",
+    "DomException",
 ] }
 
 [lints]

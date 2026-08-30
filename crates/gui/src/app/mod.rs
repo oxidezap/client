@@ -17,6 +17,7 @@ mod frame_cost;
 mod media;
 mod media_ctl;
 mod messages;
+pub mod notices;
 mod paging;
 mod plugins_ctl;
 mod recording;
@@ -336,7 +337,7 @@ use crate::responsive::{MobilePanel, ResponsiveLayout};
 use crate::session::{FromDaemon, Session};
 use crate::theme::ActiveProductTheme as _;
 use crate::utils::{contains_ignore_case, mime_to_image_format};
-use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
+use crate::video::{VideoPlayer, VideoPlayerState};
 use crate::views::pairing::generate_qr_png;
 use crate::views::{
     render_call_overlay, render_connected_view, render_connecting_view, render_error_view,
@@ -770,6 +771,13 @@ pub struct WhatsAppApp {
     retry_task: Option<Task<()>>,
     /// Whether the error screen's technical detail is unfolded.
     error_detail_open: bool,
+    /// Transient lines drawn over whatever screen is up. See [`notices`].
+    notices: Vec<notices::Notice>,
+    /// Never reused, so a dismissal cannot land on a later notice.
+    next_notice_id: u64,
+    /// Expires them. Alive only while something is up.
+    #[allow(dead_code)]
+    notice_task: Option<Task<()>>,
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
@@ -1034,6 +1042,9 @@ impl WhatsAppApp {
             retry_at: None,
             retry_task: None,
             error_detail_open: false,
+            notices: Vec::new(),
+            next_notice_id: 0,
+            notice_task: None,
             downloads_in_flight: std::collections::HashSet::new(),
             call_state: CallState::new(),
             call_card: CallCard::default(),
@@ -1574,6 +1585,12 @@ impl WhatsAppApp {
         self.call_pictures = CallPictures::default();
         self.call_video_asked = None;
         self.call_muted_asked = None;
+        // And the notices, which are drawn by the root over every screen and
+        // so outlive the view they were raised in. "That recording could not
+        // be sent" is about an account that has gone, shown to whoever pairs
+        // next, and a reset is a departure rather than a clear.
+        self.notices.clear();
+        self.notice_task = None;
         // What the *old* account occupied, and the query that is still
         // measuring it. Settings survives the reset, so a completion landing
         // after it would show the previous account's database and media under
@@ -2485,9 +2502,38 @@ impl WhatsAppApp {
     // ========== Video Playback ==========
 
     /// Start the video frame update task
+    /// Give back the codec session of every player that is not playing.
+    ///
+    /// A `VideoDecoder` is hardware and a browser allows a handful, while the
+    /// window caches players so a clip replays without re-fetching. Called
+    /// where one video becomes the one playing, and again where playback
+    /// ends: `stop` is not the place, because that is where a poster frame is
+    /// asked for and so where the decoder is still needed, but once the
+    /// settling polls are done nothing is waiting on it. What cost a download
+    /// stays and only the session goes.
+    fn release_idle_decoders(&mut self) {
+        let playing = self.playing_video_id().map(|s| s.to_string());
+        for (id, player) in &mut self.video_players {
+            if Some(id) != playing.as_ref() {
+                player.release_decoder();
+            }
+        }
+    }
+
     fn start_video_update_task(&mut self, cx: &mut Context<Self>) {
         // Cancel any existing task
         self.video_update_task = None;
+
+        // One codec session at a time. A `VideoDecoder` is hardware, not a
+        // buffer, and a browser allows only a handful; the cache keeps up to
+        // `MAX_VIDEO_PLAYERS` players so a clip replays without re-fetching,
+        // which meant every attachment opened in a conversation held a
+        // session for as long as its player lived. Released here, where one
+        // video demonstrably becomes the one playing, rather than in `stop`,
+        // which is where a poster frame is asked for and so is where the
+        // decoder is still needed. What cost a download stays; only the
+        // session goes, and it is rebuilt from the samples on the next play.
+        self.release_idle_decoders();
 
         // Get completion receiver from current video player
         // Clone the message_id first to avoid borrow conflicts
@@ -2501,6 +2547,16 @@ impl WhatsAppApp {
         self.video_update_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             // Create a fused future for completion (handles None case)
             let mut completion_rx = completion_rx;
+            // How many polls a player that has left `Playing` still gets.
+            //
+            // Stopping on the same tick was right while every decode was
+            // inline: `stop` asks for the first frame and the answer was
+            // already there. Where the decoder is the browser's it is not,
+            // and a loop that ended immediately left the poster frame
+            // nowhere to arrive. A third of a second, after which the last
+            // frame is what the video is worth showing anyway.
+            const SETTLING_POLLS: u8 = 10;
+            let mut settling = 0u8;
 
             loop {
                 // Check for completion event (non-blocking)
@@ -2511,6 +2567,11 @@ impl WhatsAppApp {
                             // Video completed naturally
                             let _ = entity.update(cx, |app, cx| {
                                 app.active_media = ActiveMedia::None;
+                                // After the clear, not before it: the sweep
+                                // spares whatever is playing, and what has
+                                // just finished stops being that only once
+                                // `active_media` says so.
+                                app.release_idle_decoders();
                                 app.video_update_task = None;
                                 app.audio_player.stop();
                                 // Ownership must not survive the sink: a stale
@@ -2546,8 +2607,14 @@ impl WhatsAppApp {
                             if player.update() {
                                 cx.notify();
                             }
-                            // Continue as long as we're in Playing state
-                            return player.state() != VideoPlayerState::Playing;
+                            if player.state() == VideoPlayerState::Playing {
+                                settling = 0;
+                                return false;
+                            }
+                            // Left `Playing`, and possibly still waiting on a
+                            // picture it has already asked for.
+                            settling = settling.saturating_add(1);
+                            return settling >= SETTLING_POLLS;
                         }
                         true // Stop if no playing video
                     })
@@ -2556,6 +2623,11 @@ impl WhatsAppApp {
                 if should_stop {
                     let _ = entity.update(cx, |app, cx| {
                         app.active_media = ActiveMedia::None;
+                        // After the clear and after the settling polls: the
+                        // sweep spares whatever is playing, and a poster
+                        // frame still on its way has landed by now. A codec
+                        // session is hardware a browser allows a handful of.
+                        app.release_idle_decoders();
                         app.video_update_task = None;
                         app.audio_player.stop();
                         app.audio = AudioHolder::None;
@@ -3181,7 +3253,21 @@ impl Render for WhatsAppApp {
         // conversation need a keyboard too, and the window is what they get.
         self.sync_overlay_focus(window, cx);
 
-        root.child(body).children(call_overlay)
+        // Above the call card as well as the body: a notice raised by
+        // something the call did is about the call, and a card that covered
+        // it would leave the sentence unread.
+        let notices = (!self.notices.is_empty()).then(|| {
+            let entity = cx.entity().clone();
+            crate::components::notice::render_notices(
+                &self.notices,
+                move |id, cx| {
+                    entity.update(cx, |app, cx| app.dismiss_notice(id, cx));
+                },
+                cx,
+            )
+        });
+
+        root.child(body).children(call_overlay).children(notices)
     }
 }
 

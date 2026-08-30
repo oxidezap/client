@@ -19,6 +19,9 @@
 //! sound.
 
 mod encoder;
+/// Opus packets, in the OGG stream WhatsApp expects. The container is not the
+/// codec, and only the codec was ever the problem here.
+mod ogg_opus;
 mod player;
 mod recorder;
 mod resample;
@@ -37,16 +40,32 @@ mod call_device;
 #[cfg(target_family = "wasm")]
 mod web;
 
-/// Whether this build can record a voice note.
+/// Whether a voice note can be recorded here.
 ///
 /// Asked *before* the microphone is offered, not after it is opened: a
 /// control that is drawn and then always fails is worse than one that is not
-/// drawn. False on the web, where there is no Opus encoder — see [`web`].
-pub const CAN_RECORD: bool = cfg!(not(target_family = "wasm"));
+/// drawn.
+///
+/// A function rather than a constant, because on the web it is a question
+/// about the browser rather than about the build — the encoder is
+/// `AudioEncoder`, which an older one may not have — and the honest answer
+/// there can only be given at runtime. On a desktop it is still settled when
+/// the binary is.
+#[must_use]
+pub fn can_record() -> bool {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        true
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        web::AudioRecorder::supported()
+    }
+}
 
 pub use encoder::{EncoderError, encode_to_opus_ogg};
 pub use player::PlayerError;
-pub use recorder::{RecordedAudio, RecorderError, TARGET_SAMPLE_RATE};
+pub use recorder::{EncodedNote, RecordedAudio, RecorderError, Recording, TARGET_SAMPLE_RATE};
 pub use waveform::{WAVEFORM_SAMPLES, generate_waveform};
 
 #[cfg(not(target_family = "wasm"))]

@@ -377,6 +377,10 @@ impl WhatsAppApp {
                 }
                 Err(e) => {
                     error!("Failed to download audio: {}", e);
+                    // Said, not only logged: the control goes back to idle
+                    // either way, so without this a tap that fetched nothing
+                    // is indistinguishable from one that was never noticed.
+                    say(&entity, cx, format!("Could not download that audio: {e}"));
                     let _ = entity.update(cx, |app, cx| {
                         app.finish_download(&msg_id);
                         cx.notify();
@@ -417,6 +421,9 @@ impl WhatsAppApp {
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let result = download_with_timeout(download_rx).await;
+            // Carried out of the update rather than said inside it, because
+            // `say` needs the same handle this closure is borrowing.
+            let mut failed = None;
             let _ = entity.update(cx, |app, cx| {
                 app.finish_download(&message_id);
                 match result {
@@ -424,10 +431,16 @@ impl WhatsAppApp {
                         info!("Image downloaded: {} bytes", data.len());
                         app.update_message_media_data(&message_id, data);
                     }
-                    Err(e) => error!("Failed to download image: {}", e),
+                    Err(e) => {
+                        error!("Failed to download image: {}", e);
+                        failed = Some(format!("Could not download that image: {e}"));
+                    }
                 }
                 cx.notify();
             });
+            if let Some(reason) = failed {
+                say(&entity, cx, reason);
+            }
         })
         .detach();
     }
@@ -480,9 +493,15 @@ impl WhatsAppApp {
             match download_with_timeout(download_rx).await {
                 Ok(data) => match hand_to_user(cx, file_name, data).await {
                     Ok(where_it_went) => info!("Document {message_id} saved to {where_it_went}"),
-                    Err(e) => warn!("Failed to save document {message_id}: {e}"),
+                    Err(e) => {
+                        warn!("Failed to save document {message_id}: {e}");
+                        say(&entity, cx, e);
+                    }
                 },
-                Err(e) => error!("Failed to download document {}: {}", message_id, e),
+                Err(e) => {
+                    error!("Failed to download document {}: {}", message_id, e);
+                    say(&entity, cx, format!("Could not download that file: {e}"));
+                }
             }
             let _ = entity.update(cx, |app, cx| {
                 app.finish_download(&message_id);
@@ -519,10 +538,13 @@ impl WhatsAppApp {
         let data = Arc::clone(&media.data);
         let id = message_id.to_string();
 
-        cx.spawn(async move |_entity: WeakEntity<Self>, cx| {
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match hand_to_user(cx, file_name, data).await {
                 Ok(where_it_went) => info!("Saved {id} to {where_it_went}"),
-                Err(e) => warn!("Failed to save {id}: {e}"),
+                Err(e) => {
+                    warn!("Failed to save {id}: {e}");
+                    say(&entity, cx, e);
+                }
             }
         })
         .detach();
@@ -652,6 +674,16 @@ impl WhatsAppApp {
         // Get player state first to determine action
         let player_state = self.video_players.get(&message_id).map(|p| p.state());
 
+        // Here, in the gesture, for the reason the voice note path says it
+        // there: a browser grants an audio context permission to play only
+        // under a transient user activation, and the first play of a video
+        // downloads and demuxes the attachment before any sound starts, so
+        // the click that authorised it has long expired by the time
+        // `play_samples` calls `resume`. What that looks like is a video that
+        // plays with no sound at all. Free where a sound card needs no
+        // permission, and harmless on the paths that turn out not to need it.
+        self.audio_player.unlock();
+
         match player_state {
             Some(VideoPlayerState::Playing) => {
                 // Pause video and its audio
@@ -660,6 +692,13 @@ impl WhatsAppApp {
                 }
                 self.audio_player.pause();
                 self.active_media = ActiveMedia::None;
+                // After the clear, like the two paths that end a playback: a
+                // paused player is idle, and a codec session is hardware a
+                // browser allows a handful of. `stop` is the one clear that
+                // keeps its decoder, because that is where a poster frame is
+                // asked for; a pause already has the frame it is showing, and
+                // resuming rebuilds from the samples that stay.
+                self.release_idle_decoders();
                 self.video_update_task = None;
             }
             Some(VideoPlayerState::Paused) => {
@@ -759,19 +798,16 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
-        // Before the download, not after the decode. Fetching a clip this
-        // build cannot decode spends the whole WhatsApp download and the
-        // loopback transfer to reach an answer that was fixed when the binary
-        // was built.
-        if !crate::video::CAN_DECODE {
-            self.video_players
-                .entry(message_id)
-                .or_default()
-                .set_error("Video cannot be played in the browser".to_string());
-            cx.notify();
+        // Asked before the fetch, not after it. The decoder is built from the
+        // parameter sets, so a browser with no `VideoDecoder` is otherwise
+        // discovered once the whole attachment has been downloaded and
+        // demuxed, and the bubble draws that as Retry: every press pays the
+        // download again to reach the same permanent answer.
+        if let Some(reason) = crate::platform::video_decode_unavailable() {
+            warn!("not downloading a video: {reason}");
+            self.notify_user(reason.to_string(), crate::app::notices::Tone::Problem, cx);
             return;
         }
-
         let Some(client) = &self.client else {
             warn!("Cannot download video: client is unavailable");
             return;
@@ -832,9 +868,7 @@ impl WhatsAppApp {
                         cx.notify();
                     });
 
-                    let decode_result = cx
-                        .background_spawn(async move { StreamingVideoDecoder::new(&data) })
-                        .await;
+                    let decode_result = crate::video::build_decoder(cx, data).await;
 
                     // Update UI with decode results
                     let _ = entity.update(cx, |app, cx| {
@@ -936,6 +970,18 @@ impl WhatsAppApp {
 
         cx.notify();
     }
+}
+
+/// Put a failure in front of the person who asked for it.
+///
+/// These paths ran to `warn!` and stopped, which on a desktop is a save that
+/// quietly did not happen and in a browser is a first tap that does nothing
+/// and a second that works. The message is the one the platform wrote, which
+/// is why those are phrased for a reader rather than for a log.
+fn say(entity: &WeakEntity<WhatsAppApp>, cx: &mut gpui::AsyncApp, text: String) {
+    let _ = entity.update(cx, |app, cx| {
+        app.notify_user(text, crate::app::notices::Tone::Problem, cx);
+    });
 }
 
 /// Put a file where the user keeps things, on whichever thread can.

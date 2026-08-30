@@ -32,7 +32,7 @@ use openh264::formats::YUVSource as _;
 use oxidezap_core::{CallVideoFrame, VideoStream};
 use smallvec::SmallVec;
 
-use super::streaming::{Rotation, swap_rb_in_place, write_bgra_rotated};
+use super::geometry::{Rotation, swap_rb_in_place, write_bgra_rotated};
 
 /// Where a decoded picture goes.
 ///

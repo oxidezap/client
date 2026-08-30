@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use super::{IN_PROGRESS_PREFIX, Wipe, is_in_progress, is_staged_upload};
+use super::{IN_PROGRESS_PREFIX, Wipe, is_in_progress, is_staged_upload, is_staging_partial};
 
 /// How much media the cache may hold before the oldest is dropped.
 ///
@@ -24,6 +24,17 @@ use super::{IN_PROGRESS_PREFIX, Wipe, is_in_progress, is_staged_upload};
 /// delete these: a session that runs for months would otherwise keep every
 /// image it has ever shown.
 const CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How long a staged payload may sit unsent before it is treated as
+/// abandoned.
+///
+/// The gap this closes is the one that has no other end: a staged upload is
+/// spared the budget because it is the only copy of something somebody is
+/// waiting to send, so nothing else in the daemon will ever remove it. The
+/// send that names it arrives milliseconds after the upload, which makes any
+/// large number a safe one, and six hours is chosen to be obviously past a
+/// slow network rather than tuned to anything.
+const STALE_UPLOAD: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
 /// Bytes written since the last sweep before another one runs.
 ///
@@ -219,7 +230,59 @@ fn prepare_dir(dir: &std::path::Path) -> Result<()> {
         // it: the same sweep the plugin directory takes.
         crate::private_dir::drop_foreign_entries(dir)?;
     }
+    // Once, here, because a daemon that is restarted is the case the
+    // per-upload call cannot cover: the orphan was left by the run before
+    // this one.
+    reclaim_abandoned_writes(dir);
     Ok(())
+}
+
+/// Delete the writes nobody came back for.
+///
+/// Three kinds, and they are one rule: a staged upload, the partial of one,
+/// and a download this daemon was writing. Every one of them is spared the
+/// budget sweep — the bytes are the only copy, or are not all there yet — so
+/// every one of them needs an age rule somewhere, or being spared means never
+/// being taken at all.
+///
+/// Split out of [`sweep`] because it has to be reachable without it. The
+/// sweep runs on a *cache-write* threshold, and a staged upload is written by
+/// the front end rather than through `put`, so it never advances that
+/// counter: on an account that downloads no media, an orphan would sit past
+/// the allowance for ever with the rule that names it never running. Called
+/// where a staged payload is created, and once at startup, which between them
+/// cover both the long-running daemon and the one that was restarted.
+pub fn reclaim_abandoned_writes(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Two allowances rather than one, because the two say different
+        // things. A staged upload waits on a send somebody asked for and may
+        // sit through a reconnect; a `w-` file is a download this process was
+        // in the middle of, so one older than the grace is a write whose
+        // writer is gone — there is no second daemon to come back for it.
+        let allowance = if is_staged_upload(&name) || is_staging_partial(&name) {
+            STALE_UPLOAD
+        } else if is_in_progress(&name) {
+            super::IN_PROGRESS_GRACE
+        } else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta
+            .modified()
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age > allowance)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Drop the oldest files once enough has been written to be worth looking.
@@ -298,6 +361,7 @@ pub(super) fn delete(scope: Wipe) -> Result<()> {
 
 /// Delete oldest-first until the cache is under budget.
 fn sweep(dir: &std::path::Path) -> Result<()> {
+    reclaim_abandoned_writes(dir);
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     let mut total = 0u64;
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -315,24 +379,17 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         // waiting to have sent, and it never counted toward the budget it
         // would be dropped for: `put` is what feeds the sweep, and an upload
         // is written by the front end, not through it.
-        // A write in progress is nobody's to reclaim either: the bytes are
-        // not there yet, and whoever asked for them is waiting.
+        // Spared the budget, and reclaimed on age by
+        // `reclaim_abandoned_writes`, which this calls first so a sweep also
+        // does the sweeping somebody reading only this function would expect
+        // it to. A partial is spared on the same terms and for a sharper
+        // reason: it is being written right now, so dropping it breaks the
+        // rename it is on its way to and fails a send because the cache
+        // happened to be full. A download in progress is the third of the
+        // same kind — the bytes are not there yet and whoever asked for them
+        // is waiting — and the three differ only in who is writing.
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_staged_upload(&name) {
-            continue;
-        }
-        if is_in_progress(&name) {
-            // Not this sweep's to count or to drop for space — the bytes are
-            // not there yet and whoever asked for them is waiting — but one
-            // old enough is a write whose process is gone, and nothing else
-            // would ever take it.
-            let orphan = meta.modified().is_ok_and(|at| {
-                at.elapsed()
-                    .is_ok_and(|since| since > super::IN_PROGRESS_GRACE)
-            });
-            if orphan {
-                let _ = std::fs::remove_file(entry.path());
-            }
+        if is_staged_upload(&name) || is_staging_partial(&name) || is_in_progress(&name) {
             continue;
         }
         let age = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -358,6 +415,106 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A staged payload is spared the budget, and not spared for ever.
+    ///
+    /// Nothing else in the daemon removes one: the sweep is the only thing
+    /// that looks at the directory and it was told to look away from these.
+    /// So a send that never came, or an upload whose answer was lost while
+    /// the write landed anyway, left a file until the account was wiped.
+    #[test]
+    fn a_staged_upload_that_was_never_sent_is_reclaimed() {
+        // The same shape the tests below use: a named directory rather than
+        // a crate added for one case.
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-media-stale-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+
+        let fresh = dir.join("u-local_1");
+        let stale = dir.join("u-local_2");
+        let cached = dir.join("f-3EB0ABC");
+        for path in [&fresh, &stale, &cached] {
+            std::fs::write(path, b"payload").expect("a file");
+        }
+
+        // Older than the allowance by a wide margin. Measured back from the
+        // file's own timestamp rather than from a clock: `SystemTime::now` is
+        // disallowed in this tree, and the file was written a moment ago, so
+        // its mtime is the same answer.
+        let long_ago = std::fs::metadata(&stale)
+            .expect("the staged file")
+            .modified()
+            .expect("an mtime")
+            - super::STALE_UPLOAD
+            - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("the staged file")
+            .set_modified(long_ago)
+            .expect("an mtime");
+
+        super::sweep(&dir).expect("the sweep runs");
+
+        assert!(fresh.exists(), "a payload a send is still coming for");
+        assert!(!stale.exists(), "one no send ever came for");
+        assert!(
+            cached.exists(),
+            "and the cache is under budget, so nothing there is touched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A partial is the same payload one moment earlier, and is treated as
+    /// one: kept while it is being written, taken once nothing is coming back
+    /// for it. Sparing it without the age rule leaks an upload whose
+    /// connection died mid-`PUT`, since the budget sweep is now told to look
+    /// away from it too.
+    #[test]
+    fn a_partial_upload_is_kept_while_fresh_and_reclaimed_when_abandoned() {
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-media-partial-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+
+        let prefix = crate::media::STAGING_PARTIAL_PREFIX;
+        let writing = dir.join(format!("{prefix}1-u-local_1"));
+        let abandoned = dir.join(format!("{prefix}2-u-local_2"));
+        for path in [&writing, &abandoned] {
+            std::fs::write(path, b"payload").expect("a file");
+        }
+
+        let long_ago = std::fs::metadata(&abandoned)
+            .expect("the partial")
+            .modified()
+            .expect("an mtime")
+            - super::STALE_UPLOAD
+            - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&abandoned)
+            .expect("the partial")
+            .set_modified(long_ago)
+            .expect("an mtime");
+
+        super::reclaim_abandoned_writes(&dir);
+
+        assert!(
+            writing.exists(),
+            "a rename is still on its way to that payload"
+        );
+        assert!(!abandoned.exists(), "nothing will ever rename that one");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A `w-` name is nobody's to reclaim while its writer is holding it, and
     /// nobody's at all once that writer is gone: no wipe claims one and the
