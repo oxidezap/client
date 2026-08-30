@@ -397,6 +397,18 @@ pub(super) fn parse(line: &str) -> Option<DaemonMessage> {
 pub(super) fn media_keys(message: &DaemonMessage, pending: &Pending) -> Vec<String> {
     fn key_of(media: &Option<MediaContent>, into: &mut Vec<String>) {
         let Some(media) = media else { return };
+        // A film this build cannot play is a film not worth fetching. There
+        // used to be a skip here against `CAN_DECODE`, and retiring that
+        // constant removed it correctly: the answer had become yes on every
+        // build. What replaced it is a question about the *browser*, and
+        // `capabilities` was wired only into the play path, so a history full
+        // of cached videos spent the whole frame-media budget on files no
+        // press could ever open.
+        if media.media_type == oxidezap_core::MediaType::Video
+            && crate::platform::video_decode_unavailable().is_some()
+        {
+            return;
+        }
         let Some(key) = media.cache_key.clone() else {
             return;
         };

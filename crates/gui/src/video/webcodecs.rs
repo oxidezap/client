@@ -99,6 +99,14 @@ pub struct Decoder {
     /// How many frames have been handed to a copy, which is the order they
     /// were decoded in. See [`Slot::accepted`].
     submitted: Rc<Cell<u64>>,
+    /// How many copies have been started and not yet resolved.
+    ///
+    /// The callers bound the decoder's *input* queue, which says nothing
+    /// about frames that have already left it. Reading the pixels out of one
+    /// is asynchronous and allocates the whole picture, so a browser that
+    /// decodes faster than it copies accumulates multi-megabyte buffers for
+    /// as long as a call lasts, however few of them anybody draws.
+    in_flight: Rc<Cell<usize>>,
     /// The turn to apply to the next unit fed.
     ///
     /// A cell because a call's is per frame: a peer's orientation describes
@@ -167,6 +175,7 @@ impl Decoder {
 
         let generation = Rc::new(Cell::new(0u64));
         let submitted = Rc::new(Cell::new(0u64));
+        let in_flight = Rc::new(Cell::new(0usize));
         let turns: Rc<RefCell<TurnLog>> = Rc::new(RefCell::new(TurnLog::default()));
 
         let on_frame = {
@@ -175,7 +184,18 @@ impl Decoder {
             let turns = Rc::clone(&turns);
             let generation = Rc::clone(&generation);
             let submitted = Rc::clone(&submitted);
+            let in_flight = Rc::clone(&in_flight);
             Closure::<dyn FnMut(web_sys::VideoFrame)>::new(move |frame: web_sys::VideoFrame| {
+                // Dropped rather than queued, which is what every queue on
+                // this path does: the slot holds one picture, so a frame
+                // arriving while that many copies are still outstanding is
+                // one nobody was going to see. Closing it is not optional
+                // either, since an unclosed `VideoFrame` pins a decoder
+                // buffer and a decoder that runs out stops producing.
+                if in_flight.get() >= MAX_COPIES_IN_FLIGHT {
+                    frame.close();
+                    return;
+                }
                 let seq = submitted.get().wrapping_add(1);
                 submitted.set(seq);
                 // The turn this picture was encoded under, not whatever the
@@ -197,6 +217,7 @@ impl Decoder {
                         born: generation.get(),
                         seq,
                     },
+                    Rc::clone(&in_flight),
                 );
             })
         };
@@ -230,6 +251,7 @@ impl Decoder {
             codec,
             generation,
             submitted,
+            in_flight,
             rotation,
             turns,
             max_pixels,
@@ -377,6 +399,33 @@ impl Drop for Decoder {
     }
 }
 
+/// How many pixel copies may be outstanding at once.
+///
+/// A little more than the deepest input queue either caller allows, so an
+/// ordinary burst is never refused and a browser that has stopped resolving
+/// copies stops costing memory. The slot holds one picture, so what is
+/// dropped here is a picture nobody would have drawn.
+const MAX_COPIES_IN_FLIGHT: usize = 8;
+
+/// One outstanding pixel copy, counted while it lives.
+///
+/// A guard rather than a decrement at the end of the task, because the copy
+/// has several ways to finish and only one of them is the ordinary one.
+struct Outstanding(Rc<Cell<usize>>);
+
+impl Outstanding {
+    fn new(count: Rc<Cell<usize>>) -> Self {
+        count.set(count.get().saturating_add(1));
+        Self(count)
+    }
+}
+
+impl Drop for Outstanding {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
 /// Which decoder generation a copy belongs to, and where it sits in it.
 ///
 /// Carried into the asynchronous read so a picture can say whether it is
@@ -408,6 +457,7 @@ fn read_frame(
     slot: Rc<RefCell<Slot>>,
     sink: Option<Rc<dyn Fn(Picture)>>,
     stamp: Stamp,
+    in_flight: Rc<Cell<usize>>,
 ) {
     // The *visible* rectangle, not the coded one. `copyTo` copies the visible
     // region by default, and a coded frame is padded out to whole macroblocks
@@ -466,12 +516,18 @@ fn read_frame(
         return;
     }
     let destination = js_sys::Uint8Array::new_with_length(needed as u32);
+    // Counted from here, where the buffer is actually allocated, to wherever
+    // the copy settles below. The two early returns above allocate nothing.
+    let outstanding = Outstanding::new(in_flight);
     // Returns the promise directly rather than a `Result`: a `copyTo` that
     // cannot be started rejects rather than throwing, so there is one failure
     // path and it is the awaited one below.
     let promise = frame.copy_to_with_buffer_source_and_options(&destination, &options);
 
     wasm_bindgen_futures::spawn_local(async move {
+        // Held for the length of the copy and released however it ends, so a
+        // rejected or refused read frees the slot it took.
+        let _outstanding = outstanding;
         let read = wasm_bindgen_futures::JsFuture::from(promise).await;
         // Closed on both paths, and before the slot is touched: the buffer it
         // holds is the decoder's, not ours.

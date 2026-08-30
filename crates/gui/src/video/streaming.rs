@@ -667,6 +667,14 @@ impl StreamingVideoDecoder {
         self.current_frame.as_ref()
     }
 
+    /// Give up whatever the platform is holding while nothing plays.
+    ///
+    /// Nothing, here: openh264 is a decoder in this process's own memory,
+    /// with no session to run out of. The web twin gives back a hardware
+    /// codec session, which a browser allows only a handful of. Present on
+    /// both so the caller does not learn which build it is in.
+    pub fn release(&mut self) {}
+
     /// Reset to first frame
     pub fn reset(&mut self) {
         self.reset_decoder();

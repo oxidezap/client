@@ -69,7 +69,20 @@ pub struct StreamingVideoDecoder {
     sps_pps: Vec<u8>,
     frame_duration: Duration,
     duration: Duration,
-    decoder: webcodecs::Decoder,
+    /// The turn the decoder is built with, kept because it may have to be
+    /// built more than once. See [`Self::release`].
+    rotation: Rotation,
+    /// Absent while nothing is playing.
+    ///
+    /// A `VideoDecoder` is a hardware codec session, not a buffer, and a
+    /// browser allows only a handful at once. The window caches players so a
+    /// clip replays without re-fetching, which meant every attachment opened
+    /// in a conversation held a session for as long as its player lived: open
+    /// a few different clips and the next `Decoder::new` fails, on a page
+    /// where nothing is playing at all. What is worth caching is the demuxed
+    /// samples, which cost nothing but memory, so the session goes and they
+    /// stay.
+    decoder: Option<webcodecs::Decoder>,
     /// The furthest sample handed to the decoder, so a forward seek continues
     /// rather than replaying.
     last_fed_index: i32,
@@ -117,6 +130,9 @@ impl StreamingVideoDecoder {
     ///
     /// The browser will not decode this stream.
     pub fn attach(prepared: Prepared) -> Result<Self> {
+        // Built here rather than lazily, so a stream this browser will not
+        // take is refused while somebody is still looking at the press that
+        // asked for it.
         let decoder = webcodecs::Decoder::new(&prepared.sps_pps, prepared.rotation)
             .map_err(|e| anyhow!(e))?;
         Ok(Self {
@@ -124,13 +140,52 @@ impl StreamingVideoDecoder {
             sps_pps: prepared.sps_pps,
             frame_duration: prepared.frame_duration,
             duration: prepared.duration,
-            decoder,
+            rotation: prepared.rotation,
+            decoder: Some(decoder),
             last_fed_index: -1,
             needs_parameter_sets: true,
             shown_stamp: None,
             current_frame: None,
             audio: prepared.audio,
         })
+    }
+
+    /// The decoder, built if this player let its session go.
+    ///
+    /// `None` only when the browser refuses to build one, which for a stream
+    /// that already configured once means it has run out of sessions rather
+    /// than that the stream is bad. The caller reports it like any other
+    /// decode failure.
+    fn decoder(&mut self) -> Option<&webcodecs::Decoder> {
+        if self.decoder.is_none() {
+            match webcodecs::Decoder::new(&self.sps_pps, self.rotation) {
+                Ok(built) => {
+                    // A new session knows nothing, so the next unit fed has
+                    // to carry the parameter sets and the walk starts again.
+                    self.last_fed_index = -1;
+                    self.needs_parameter_sets = true;
+                    self.shown_stamp = None;
+                    self.decoder = Some(built);
+                }
+                Err(e) => {
+                    log::warn!("could not open a decoder for this video again: {e}");
+                    return None;
+                }
+            }
+        }
+        self.decoder.as_ref()
+    }
+
+    /// Give up the codec session, keeping everything that cost a download.
+    ///
+    /// Called when playback stops. The samples, the parameter sets and the
+    /// audio stay, so replaying is a decode rather than a fetch; the session
+    /// goes, so a conversation full of clips does not hold one each.
+    pub fn release(&mut self) {
+        self.decoder = None;
+        self.last_fed_index = -1;
+        self.needs_parameter_sets = true;
+        self.shown_stamp = None;
     }
 
     /// Every sample of the video track, rewritten as Annex B.
@@ -327,6 +382,14 @@ impl StreamingVideoDecoder {
         // its own schedule, so "asked for and not arrived" is the ordinary
         // state a moment after a seek. Resetting here threw away the very
         // work that was about to answer, and then replayed the whole group of
+        // The session may have been given up when playback last stopped, in
+        // which case this rebuilds it and resets the walk, so the equality
+        // check below is against a fresh `last_fed_index` rather than a
+        // remembered one.
+        if self.decoder().is_none() {
+            return;
+        }
+
         // pictures to ask for it again.
         if i64::try_from(target_index).unwrap_or(i64::MAX) == i64::from(self.last_fed_index) {
             self.collect();
@@ -339,7 +402,9 @@ impl StreamingVideoDecoder {
             // Backwards: the decoder's reference chain only runs forwards, so
             // the stream is re-entered at the keyframe at or before the
             // target and replayed to it.
-            self.decoder.reset();
+            if let Some(decoder) = self.decoder.as_ref() {
+                decoder.reset();
+            }
             self.last_fed_index = -1;
             self.needs_parameter_sets = true;
             self.shown_stamp = None;
@@ -355,7 +420,11 @@ impl StreamingVideoDecoder {
             // are obsolete before they are drawn. Stopping is safe because
             // `last_fed_index` records where it stopped and the player asks
             // again on its next tick, which resumes forwards from here.
-            if self.decoder.queued() >= MAX_QUEUED_UNITS {
+            if self
+                .decoder
+                .as_ref()
+                .is_none_or(|decoder| decoder.queued() >= MAX_QUEUED_UNITS)
+            {
                 break;
             }
             let Some(sample) = self.samples.get(index) else {
@@ -370,8 +439,9 @@ impl StreamingVideoDecoder {
             } else {
                 sample.data.clone()
             };
-            self.decoder
-                .decode(&unit, stamp_of(index), sample.is_keyframe);
+            if let Some(decoder) = self.decoder.as_ref() {
+                decoder.decode(&unit, stamp_of(index), sample.is_keyframe);
+            }
             self.last_fed_index = index as i32;
         }
         self.collect();
@@ -384,7 +454,7 @@ impl StreamingVideoDecoder {
     /// order and a seek feeds several, so "what was asked for" is the wrong
     /// label for the first of them.
     fn collect(&mut self) {
-        let Some(picture) = self.decoder.newest() else {
+        let Some(picture) = self.decoder.as_ref().and_then(webcodecs::Decoder::newest) else {
             return;
         };
         let stamp = i32::try_from(picture.timestamp_micros).unwrap_or(i32::MAX);
@@ -411,7 +481,7 @@ impl StreamingVideoDecoder {
     /// that would not complete — otherwise leaves it playing with no picture
     /// and nothing to say.
     pub fn failure(&self) -> Option<String> {
-        self.decoder.failure()
+        self.decoder.as_ref().and_then(webcodecs::Decoder::failure)
     }
 
     /// The newest decoded frame, if one has arrived yet.
@@ -427,7 +497,9 @@ impl StreamingVideoDecoder {
     /// slot cleared with nothing requested leaves a finished video showing
     /// its last frame for ever.
     pub fn reset(&mut self) {
-        self.decoder.reset();
+        if let Some(decoder) = self.decoder.as_ref() {
+            decoder.reset();
+        }
         self.last_fed_index = -1;
         self.needs_parameter_sets = true;
         self.shown_stamp = None;

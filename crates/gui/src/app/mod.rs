@@ -2477,6 +2477,22 @@ impl WhatsAppApp {
         // Cancel any existing task
         self.video_update_task = None;
 
+        // One codec session at a time. A `VideoDecoder` is hardware, not a
+        // buffer, and a browser allows only a handful; the cache keeps up to
+        // `MAX_VIDEO_PLAYERS` players so a clip replays without re-fetching,
+        // which meant every attachment opened in a conversation held a
+        // session for as long as its player lived. Released here, where one
+        // video demonstrably becomes the one playing, rather than in `stop`,
+        // which is where a poster frame is asked for and so is where the
+        // decoder is still needed. What cost a download stays; only the
+        // session goes, and it is rebuilt from the samples on the next play.
+        let playing = self.playing_video_id().map(|s| s.to_string());
+        for (id, player) in &mut self.video_players {
+            if Some(id) != playing.as_ref() {
+                player.release_decoder();
+            }
+        }
+
         // Get completion receiver from current video player
         // Clone the message_id first to avoid borrow conflicts
         let msg_id = self.playing_video_id().map(|s| s.to_string());

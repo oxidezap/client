@@ -164,6 +164,18 @@ impl VideoPlayer {
         self.completion_tx = None;
     }
 
+    /// Give up the codec session while this player is not the one playing.
+    ///
+    /// Separate from `stop`, which is where a poster frame is asked for and
+    /// so is exactly where the decoder is still needed. This is for a player
+    /// the cache is keeping around: what cost a download stays, and the
+    /// session a browser allows only a few of goes back.
+    pub fn release_decoder(&mut self) {
+        if let Some(decoder) = &mut self.decoder {
+            decoder.release();
+        }
+    }
+
     pub fn current_time(&self) -> Duration {
         self.playback_start
             .map(|start| start.elapsed())
