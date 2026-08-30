@@ -1220,7 +1220,20 @@ fn usable_state_dir(dir: Option<&Path>) -> Option<&Path> {
 /// account, which is not what "per-user state" means anywhere else in this
 /// daemon. Repaired as well as created, because a directory from an earlier
 /// version is one somebody already has.
+///
+/// A link is refused before anything is written rather than after: both calls
+/// below follow one, so a link planted where this directory goes had the
+/// daemon set the mode of whatever it named, chosen by whoever planted it,
+/// and only then find out. Asking first means the refusal costs nothing; the
+/// check that the directory is this user's still runs afterwards, because
+/// nothing here can close the gap between a question and a `chmod`.
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "it is a symlink",
+        ));
+    }
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {

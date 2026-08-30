@@ -1754,6 +1754,35 @@ fn a_state_directory_behind_a_symlink_is_not_used() {
     );
 }
 
+/// And refused *before* anything is written. Both calls that prepare the
+/// directory follow a link, so asking afterwards left the daemon having set
+/// the mode of whatever the link named — a directory chosen by whoever
+/// planted it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_state_directory_is_refused_before_its_target_is_touched() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new("state-link-mode");
+    let elsewhere = dir.0.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("writable");
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let linked = dir.0.join("state");
+    std::os::unix::fs::symlink(&elsewhere, &linked).expect("link");
+
+    assert_eq!(crate::usable_state_dir(Some(&linked)), None);
+
+    let mode = std::fs::metadata(&elsewhere)
+        .expect("still there")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o755,
+        "the target's mode is not this daemon's to change"
+    );
+}
+
 /// A module the loader refuses — this one declares its capabilities twice,
 /// which is refused by design and refused again at every launch — used to
 /// write its settings file first: a serialize, a private write and two syncs
