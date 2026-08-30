@@ -794,9 +794,7 @@ impl WhatsAppApp {
                         cx.notify();
                     });
 
-                    let decode_result = cx
-                        .background_spawn(async move { StreamingVideoDecoder::new(&data) })
-                        .await;
+                    let decode_result = crate::video::build_decoder(cx, data).await;
 
                     // Update UI with decode results
                     let _ = entity.update(cx, |app, cx| {

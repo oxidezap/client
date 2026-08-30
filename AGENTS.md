@@ -1133,12 +1133,22 @@ identically. It does not try: `daemon::plugins::start` returns
 `Plugins::none` with that written down, rather than arriving there by way of
 a browser having no `HOME`.
 
-So voice notes play and video does not; recording is refused where it starts
-rather than where it would fail; calls stay in the daemon, which is where the
-microphone already was, and so do plugins, for the same kind of reason. WebCodecs (`web_sys::VideoDecoder`) and
-`MediaRecorder` are the ways back in for the last two, and both are Rust
-bindings rather than JavaScript — they are API changes rather than backends,
-which is why neither is done here.
+So voice notes play and a video in a conversation decodes through the
+browser's own H.264 (`web_sys::VideoDecoder`, bound from Rust like every other
+browser API here); recording is refused where it starts rather than where it
+would fail; calls stay in the daemon, which is where the microphone already
+was, and so do plugins, for the same kind of reason.
+
+The video decoder is worth reading as the shape it is rather than as a
+backend swap. openh264 is *pulled* — hand it an access unit, get a picture on
+the same line — and `VideoDecoder` is pushed, with the pixel read out of a
+frame asynchronous on top of that. What makes the player above survive
+unchanged is that playback is already a timer asking for the frame it is
+about to paint: a seek feeds the decoder and returns, and the picture lands on
+a later ask. `video/geometry.rs` and `video/demux.rs` are what the two
+decoders share, which is everything except the decode — the pixel budget, the
+rotation, the channel order, the container walk — because a second copy of
+those is a second set of answers to drift apart.
 
 Declining is the exception, and the exception is instructive. A page cannot
 answer a call, but it *does* tell the caller to stop ringing: `client.voip()`

@@ -335,7 +335,7 @@ use crate::responsive::{MobilePanel, ResponsiveLayout};
 use crate::session::{FromDaemon, Session};
 use crate::theme::ActiveProductTheme as _;
 use crate::utils::mime_to_image_format;
-use crate::video::{StreamingVideoDecoder, VideoPlayer, VideoPlayerState};
+use crate::video::{VideoPlayer, VideoPlayerState};
 use crate::views::pairing::generate_qr_png;
 use crate::views::{
     render_call_overlay, render_connected_view, render_connecting_view, render_error_view,

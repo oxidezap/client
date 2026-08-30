@@ -116,6 +116,19 @@ web-sys = { version = "0.3", features = [
     "Url",
     "Performance",
     "Window",
+    # WebCodecs: the browser's own H.264 decoder, which is what stands in for
+    # openh264 where there is no C toolchain. See `video/webcodecs.rs`.
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "VideoFrame",
+    "VideoPixelFormat",
+    "VideoFrameCopyToOptions",
+    "PlaneLayout",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "DomException",
 ] }
 
 [lints]

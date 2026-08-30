@@ -1,0 +1,203 @@
+//! Getting H.264 out of an MP4, for whichever decoder is going to read it.
+//!
+//! The container work is the same on both targets — `mp4` builds for
+//! `wasm32-unknown-unknown` and the byte shuffling below is plain Rust — so
+//! it is the *decoder* that differs, not the demux. Keeping these here is
+//! what lets the browser path be a decoder swap rather than a second reader.
+//!
+//! Everything is Annex B on the way out. AVCC is what the container stores
+//! and neither decoder wants it: openh264 takes start codes, and a WebCodecs
+//! configuration with no `description` is Annex B by specification.
+
+/// NAL unit start code for Annex B format.
+pub(super) const NAL_START_CODE: &[u8] = &[0x00, 0x00, 0x00, 0x01];
+
+/// One access unit, and whether the stream can be entered at it.
+pub(super) struct H264Sample {
+    pub data: Vec<u8>,
+    pub is_keyframe: bool,
+}
+
+/// Rewrite AVCC length-prefixed units as Annex B start-code units.
+///
+/// `nal_length_size` is the container's, and it is 1, 2 or 4: assuming 4
+/// misparses any valid file that uses a narrower prefix.
+pub(super) fn avcc_to_annexb(avcc_data: &[u8], nal_length_size: usize) -> Vec<u8> {
+    let mut annexb = Vec::with_capacity(avcc_data.len() + 16);
+    let mut pos = 0;
+
+    while pos + nal_length_size <= avcc_data.len() {
+        let mut nal_len = 0usize;
+        for i in 0..nal_length_size {
+            nal_len = (nal_len << 8) | avcc_data[pos + i] as usize;
+        }
+        pos += nal_length_size;
+
+        // A length that runs past the buffer is a truncated or malformed
+        // sample; what has been read so far is still decodable.
+        if nal_len == 0 || pos + nal_len > avcc_data.len() {
+            break;
+        }
+
+        annexb.extend_from_slice(NAL_START_CODE);
+        annexb.extend_from_slice(&avcc_data[pos..pos + nal_len]);
+        pos += nal_len;
+    }
+
+    annexb
+}
+
+/// The parameter sets, as the Annex B preamble a decoder is configured with.
+pub(super) fn build_sps_pps_annexb(sps: Option<&[u8]>, pps: Option<&[u8]>) -> Vec<u8> {
+    let mut annexb = Vec::new();
+
+    if let Some(sps_data) = sps
+        && !sps_data.is_empty()
+    {
+        annexb.extend_from_slice(NAL_START_CODE);
+        annexb.extend_from_slice(sps_data);
+    }
+
+    if let Some(pps_data) = pps
+        && !pps_data.is_empty()
+    {
+        annexb.extend_from_slice(NAL_START_CODE);
+        annexb.extend_from_slice(pps_data);
+    }
+
+    annexb
+}
+
+/// Whether this access unit carries an IDR, which is where a decode may start.
+pub(super) fn is_keyframe(annexb_data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < annexb_data.len() {
+        if annexb_data[i..i + 4] == [0, 0, 0, 1] {
+            let nal_type = annexb_data.get(i + 4).map(|b| b & 0x1F).unwrap_or(0);
+            if nal_type == 5 {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The first sample at or before `index` a decode may be entered at.
+///
+/// A decoder's reference chain only runs forwards, so a backward seek has to
+/// re-enter the stream at a keyframe and replay to the target. A stream whose
+/// first sample is not an IDR still has to start somewhere, and the start is
+/// the only honest answer.
+pub(super) fn keyframe_at_or_before(samples: &[H264Sample], index: usize) -> usize {
+    (0..=index)
+        .rev()
+        .find(|&i| samples.get(i).is_some_and(|s| s.is_keyframe))
+        .unwrap_or(0)
+}
+
+/// The microsecond stamp a sample is fed under.
+///
+/// Derived from the index so a decoder's output can be mapped back to one.
+/// Saturating because the WebCodecs binding takes an `i32`, which runs out at
+/// about half an hour: past that the stamp stops being unique, and the newest
+/// picture is whatever came last, which is what the slot would have answered
+/// anyway.
+pub(super) fn stamp_micros(index: usize, frame_duration: std::time::Duration) -> i32 {
+    let micros = index as f64 * frame_duration.as_secs_f64() * 1_000_000.0;
+    if micros >= f64::from(i32::MAX) {
+        i32::MAX
+    } else {
+        micros as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The prefix width is the container's, and a narrower one is not an
+    /// unusual file: reading every sample as 4-byte-prefixed turns a valid
+    /// clip into noise.
+    #[test]
+    fn a_narrow_length_prefix_is_read_as_written() {
+        // Two units of two bytes each, with one-byte lengths.
+        let avcc = [0x02, 0x65, 0xAA, 0x02, 0x68, 0xBB];
+        assert_eq!(
+            avcc_to_annexb(&avcc, 1),
+            [0, 0, 0, 1, 0x65, 0xAA, 0, 0, 0, 1, 0x68, 0xBB]
+        );
+    }
+
+    /// A length running past the buffer is a truncated sample, and what came
+    /// before it still decodes.
+    #[test]
+    fn a_truncated_sample_keeps_what_it_had() {
+        let avcc = [0x00, 0x00, 0x00, 0x02, 0x65, 0xAA, 0x00, 0x00, 0x00, 0x40];
+        assert_eq!(avcc_to_annexb(&avcc, 4), [0, 0, 0, 1, 0x65, 0xAA]);
+    }
+
+    /// An IDR is what a decode may be entered at, so recognising one is what
+    /// decides where a seek restarts.
+    #[test]
+    fn an_idr_is_what_makes_a_sample_a_keyframe() {
+        assert!(is_keyframe(&[0, 0, 0, 1, 0x65, 0x88, 0x00]));
+        // Type 1 is a non-IDR slice.
+        assert!(!is_keyframe(&[0, 0, 0, 1, 0x41, 0x9A, 0x00]));
+    }
+
+    /// Either set may be absent, and the preamble is still whatever there was.
+    #[test]
+    fn a_preamble_carries_only_the_sets_that_exist() {
+        assert_eq!(
+            build_sps_pps_annexb(Some(&[0x67, 0x42]), Some(&[0x68, 0xEE])),
+            [0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xEE]
+        );
+        assert_eq!(build_sps_pps_annexb(None, None), Vec::<u8>::new());
+    }
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn samples(keyframes: &[bool]) -> Vec<H264Sample> {
+        keyframes
+            .iter()
+            .map(|&is_keyframe| H264Sample {
+                data: Vec::new(),
+                is_keyframe,
+            })
+            .collect()
+    }
+
+    /// A backward seek re-enters at a keyframe, because entering anywhere
+    /// else produces nothing until the next IDR.
+    #[test]
+    fn a_backward_seek_re_enters_at_a_keyframe() {
+        let samples = samples(&[true, false, false, true, false, false]);
+        assert_eq!(keyframe_at_or_before(&samples, 5), 3);
+        assert_eq!(keyframe_at_or_before(&samples, 3), 3);
+        assert_eq!(keyframe_at_or_before(&samples, 2), 0);
+    }
+
+    /// A stream with no keyframe at all still has to start somewhere.
+    #[test]
+    fn a_stream_with_no_keyframe_starts_at_the_beginning() {
+        assert_eq!(
+            keyframe_at_or_before(&samples(&[false, false, false]), 2),
+            0
+        );
+    }
+
+    /// The stamp maps a decoded picture back to a sample and must not wrap:
+    /// an i32 of microseconds runs out at about half an hour.
+    #[test]
+    fn a_long_video_saturates_rather_than_wrapping() {
+        let frame = Duration::from_secs_f64(1.0 / 30.0);
+        assert_eq!(stamp_micros(0, frame), 0);
+        assert!(stamp_micros(30, frame) > 0);
+        assert_eq!(stamp_micros(usize::MAX, frame), i32::MAX);
+    }
+}
