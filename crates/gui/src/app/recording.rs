@@ -134,6 +134,15 @@ impl WhatsAppApp {
         // Check if connected before attempting to send
         if !self.is_connected() {
             warn!("Cannot send audio: not connected");
+            // Said before it is thrown away. This is the path where somebody
+            // has already spoken into the microphone, so a recording that
+            // vanishes with the reason only in a log is the worst of the
+            // three ways this can end.
+            self.notify_user(
+                "That recording could not be sent: not connected.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             self.cancel_recording(cx);
             return;
         }

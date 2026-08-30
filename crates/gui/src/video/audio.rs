@@ -160,7 +160,13 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
             }
         };
 
-    let mut all_samples: Vec<f32> = Vec::new();
+    // Mono as it comes, rather than a whole interleaved track and then a
+    // downmix of it. The result of this function is mono, so keeping the
+    // interleaved copy meant holding both at once: a stereo track's peak was
+    // one and a half times what it ends up returning, for a buffer that
+    // exists only to be averaged. Averaging per decoded frame is the same
+    // arithmetic against a buffer the size of one frame.
+    let mut mono_samples: Vec<f32> = Vec::new();
     let mut frame: Vec<f32> = Vec::new();
 
     // Decode all audio packets
@@ -180,15 +186,23 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
                 // function already does with a frame it cannot describe: a
                 // video with its first hours of sound is better than a tab
                 // that aborted opening it.
-                if all_samples.len() + frame.len() > MAX_DECODED_SAMPLES {
+                if mono_samples.len() + frame.len() > MAX_DECODED_SAMPLES {
                     log::warn!(
                         "truncating a video's audio at {} samples: the track decodes to more \
                          than this build will hold",
-                        all_samples.len()
+                        mono_samples.len()
                     );
                     break;
                 }
-                all_samples.extend_from_slice(&frame);
+                if channels > 1 {
+                    mono_samples.extend(
+                        frame
+                            .chunks(channels as usize)
+                            .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32),
+                    );
+                } else {
+                    mono_samples.extend_from_slice(&frame);
+                }
             }
             Err(e) => {
                 log::debug!("Audio decode error (skipping frame): {}", e);
@@ -196,26 +210,10 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
         }
     }
 
-    if all_samples.is_empty() {
+    if mono_samples.is_empty() {
         log::info!("No audio samples decoded");
         return None;
     }
-
-    // Downmix to mono if needed (average across all channels; the API promises mono)
-    let mono_samples = if channels > 1 {
-        let mono: Vec<f32> = all_samples
-            .chunks(channels as usize)
-            .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32)
-            .collect();
-        log::info!(
-            "Converted {} interleaved samples to {} mono samples",
-            all_samples.len(),
-            mono.len()
-        );
-        mono
-    } else {
-        all_samples
-    };
 
     log::info!(
         "Decoded {} audio samples ({:.2}s)",
@@ -238,10 +236,11 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
 /// magnitude. On the web that is a linear memory with a fixed roof, where
 /// running out aborts rather than fails.
 ///
-/// Ten minutes of stereo at 48 kHz, interleaved, which is 230 MB of `f32`
-/// and far past any video anybody sends through a chat. The retained copy
-/// is mono and so half of it.
-const MAX_DECODED_SAMPLES: usize = 48_000 * 2 * 600;
+/// Counted in the mono samples this returns, which is also what it holds:
+/// the downmix happens per decoded frame, so there is no interleaved copy of
+/// the whole track to bound separately. Twenty minutes at 48 kHz, which is
+/// 230 MB of `f32` and far past any video anybody sends through a chat.
+const MAX_DECODED_SAMPLES: usize = 48_000 * 1200;
 
 /// The largest an ADTS frame may say it is: the length field is 13 bits.
 const MAX_ADTS_FRAME: usize = (1 << 13) - 1;

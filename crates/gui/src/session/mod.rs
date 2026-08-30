@@ -530,7 +530,11 @@ impl Session {
 
     fn send_frame(&self, request: &Request) -> std::io::Result<()> {
         let frame = serde_json::to_vec(request).map_err(std::io::Error::other)?;
+        // The unreserved callers want an io error, not the reservation list:
+        // nothing on this path is waiting on an id, so the reason is all
+        // there is to report.
         write_or_queue(&self.link, &self.outbox, &self.pending, request.id, frame)
+            .map_err(|Unwritten { reason, .. }| reason)
     }
 
     /// Send and log rather than propagate.
@@ -924,7 +928,7 @@ fn write_or_queue(
     pending: &Pending,
     id: Option<RequestId>,
     frame: Vec<u8>,
-) -> std::io::Result<()> {
+) -> Result<(), Unwritten> {
     let ready = {
         let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
         if outbox.slots.is_empty() {
@@ -938,7 +942,10 @@ fn write_or_queue(
     };
     match ready {
         Some(ready) => write_ready(link, ready, pending),
-        None => link.send_line(&frame),
+        None => link.send_line(&frame).map_err(|e| Unwritten {
+            lost: id.into_iter().collect(),
+            reason: e,
+        }),
     }
 }
 
@@ -959,14 +966,33 @@ fn write_ready(
     link: &Link,
     ready: Vec<(Option<RequestId>, Vec<u8>)>,
     pending: &Pending,
-) -> std::io::Result<()> {
-    for (id, frame) in ready {
+) -> Result<(), Unwritten> {
+    let mut ready = ready.into_iter();
+    while let Some((id, frame)) = ready.next() {
         if !worth_writing(id, pending) {
             continue;
         }
-        link.send_line(&frame)?;
+        if let Err(e) = link.send_line(&frame) {
+            // Which reservations did not go, rather than which call started
+            // the batch. A staged send releases everything queued behind it,
+            // so a failure part way through leaves frames *before* the break
+            // already written and accepted, and frames after it never sent
+            // with their askers still waiting. Failing the caller's own id
+            // would report a send that landed and say nothing about the ones
+            // that did not.
+            let mut lost: Vec<RequestId> = id.into_iter().collect();
+            lost.extend(ready.filter_map(|(id, _)| id));
+            return Err(Unwritten { lost, reason: e });
+        }
     }
     Ok(())
+}
+
+/// What a broken write left unsent, and why.
+struct Unwritten {
+    /// The reservations whose frames never went, oldest first.
+    lost: Vec<RequestId>,
+    reason: std::io::Error,
 }
 
 /// Whether a queued frame is still worth writing.
@@ -994,7 +1020,7 @@ fn release(
     pending: &Pending,
     ticket: u64,
     frame: Option<(RequestId, Vec<u8>)>,
-) -> std::io::Result<()> {
+) -> Result<(), Unwritten> {
     let ready = {
         let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
         outbox.fill(ticket, frame);
@@ -1064,15 +1090,17 @@ fn deliver(
         Delivery::Staged(ticket) => release(link, outbox, pending, ticket, Some((id, frame))),
         Delivery::Ordinary => write_or_queue(link, outbox, pending, Some(id), frame),
     };
-    if let Err(e) = written {
-        error!("could not reach the daemon: {e}");
-        fail_reserved(
-            pending,
-            events,
-            media,
-            id,
-            format!("could not reach the daemon: {e}"),
-        );
+    if let Err(Unwritten { lost, reason }) = written {
+        error!("could not reach the daemon: {reason}");
+        for id in lost {
+            fail_reserved(
+                pending,
+                events,
+                media,
+                id,
+                format!("could not reach the daemon: {reason}"),
+            );
+        }
     }
 }
 

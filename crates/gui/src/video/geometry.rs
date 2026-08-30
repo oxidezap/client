@@ -336,17 +336,20 @@ impl TurnLog {
 
     /// The turn a unit went in under, taken out when its picture comes back.
     ///
-    /// Everything stamped in front of it goes too: pictures come out in the
-    /// order the decoder produces them, so a stamp still ahead of the one
-    /// being answered belongs to a unit that produced nothing.
+    /// Only the entry that matches. Dropping everything queued in front of it
+    /// looks right while decode order is presentation order, and is exactly
+    /// wrong where it is not: a decoder answering out of order still owes
+    /// pictures for the stamps ahead, and discarding their turns would draw
+    /// those sideways. Nothing accumulates from being careful, because the
+    /// log is bounded and a unit that truly produced nothing is evicted by
+    /// the ones after it.
     ///
     /// `None` for a stamp that was never recorded, which is the attachment
     /// path, where the turn does not change and the caller has a current one
     /// that is always right.
     pub(super) fn take(&mut self, stamp: i32) -> Option<Rotation> {
         let at = self.held.iter().position(|(held, _)| *held == stamp)?;
-        self.held.drain(..at);
-        self.held.pop_front().map(|(_, turn)| turn)
+        self.held.remove(at).map(|(_, turn)| turn)
     }
 
     /// Forget everything, because the decoder has.
@@ -378,15 +381,25 @@ mod turn_log_tests {
         assert_eq!(turns.take(3), None, "and nothing is left over");
     }
 
-    /// A unit that produced no picture does not strand the ones behind it.
+    /// A picture answered out of order does not take the turns of the
+    /// stamps still waiting.
+    ///
+    /// A decoder may answer later than it was asked and not in the order it
+    /// was asked, so a stamp ahead of the one coming out is a unit still
+    /// owed rather than one that produced nothing. Draining up to the match
+    /// discarded exactly those.
     #[test]
-    fn a_stamp_that_never_arrives_is_dropped_with_the_one_that_does() {
+    fn answering_out_of_order_leaves_the_turns_still_owed() {
         let mut turns = TurnLog::default();
         turns.record(0, Rotation::None);
         turns.record(1, Rotation::Cw180);
 
         assert_eq!(turns.take(1), Some(Rotation::Cw180));
-        assert_eq!(turns.take(0), None, "the stamp in front of it went with it");
+        assert_eq!(
+            turns.take(0),
+            Some(Rotation::None),
+            "the stamp in front of it is still owed a picture"
+        );
     }
 
     /// The log is bounded, so a stream of units whose pictures never arrive

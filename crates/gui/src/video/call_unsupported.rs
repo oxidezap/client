@@ -165,12 +165,28 @@ impl Stream {
     /// Something upstream lost units, so what the decoder holds no longer
     /// matches what the sender encoded against.
     fn interrupted(&self) {
+        self.abandon();
+    }
+
+    /// Give up the reference chain, and everything the decoder is still
+    /// holding on its behalf.
+    ///
+    /// Clearing `started` stops this side feeding; it does nothing about the
+    /// units the browser has already taken. Their pictures still arrive, and
+    /// each is a frame from before the break drawn over the pane while this
+    /// side waits for the keyframe meant to replace them. The reset empties
+    /// that queue and moves the generation on, so the copies in flight are
+    /// recognised as belonging to the stream being left.
+    fn abandon(&self) {
+        if let Some(decoder) = self.decoder.borrow().as_ref() {
+            decoder.reset();
+        }
         self.started.set(false);
     }
 
     fn accept(&self, frame: CallVideoFrame) {
         if frame.gap {
-            self.started.set(false);
+            self.abandon();
         }
         if !self.started.get() {
             if !frame.keyframe {
@@ -263,12 +279,10 @@ impl Stream {
                 "dropping a {:?} call frame: the browser's decoder is behind",
                 self.stream
             );
-            // Reset rather than only stopping the feed: the units already
-            // taken are still the browser's to decode, and their pictures
-            // would be drawn over the pane while this side waits for the
-            // keyframe that is supposed to replace them. The reset empties
-            // that queue and moves the generation on, so the copies still in
-            // flight are recognised as belonging to the stream being left.
+            // The same act a gap is: what the browser already holds is worth
+            // nothing now, and drawing it would put stale pictures on the
+            // pane. See `abandon`, which this cannot call because the
+            // decoder is borrowed here.
             decoder.reset();
             self.started.set(false);
             return;
