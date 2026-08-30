@@ -212,9 +212,16 @@ fn render_preview(
         } => line()
             .text_color(cx.theme().muted_foreground)
             .children(status.map(|status| status_ticks(status, metrics.icon_small(), cx)))
+            // Not `flex_shrink_0`: the prefix is a person's name and comes
+            // from the peer, so a row that refuses to shrink it is a row
+            // where the preview is squeezed to nothing and the message
+            // disappears from the list.
             .children(prefix.as_ref().map(|prefix| {
                 div()
-                    .flex_shrink_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
                     .text_color(product.hsla(product.palette.subtle_foreground))
                     .child(format!("{prefix}:"))
             }))

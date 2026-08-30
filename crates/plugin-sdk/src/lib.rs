@@ -1668,6 +1668,21 @@ mod view_tests {
         SEEN.with(|seen| seen.borrow().clone())
     }
 
+    /// The absence rule is `0`, and the test host answered `-1`.
+    ///
+    /// A plugin reading `raw::field_len` itself — or testing `if n < 0`
+    /// against a list it expects to be missing — passed here and behaved
+    /// differently in the daemon, which is the reverse of what a test host is
+    /// for. `Event::count` normalizes, which is what kept it hidden.
+    #[test]
+    fn a_missing_list_is_empty_here_as_it_is_in_the_daemon() {
+        let mut host = Host::new();
+        host.deliver(In::message("5511999@s.whatsapp.net", "oi"), |_| {
+            // A message carries no id list, so this is the absent case.
+            assert_eq!(crate::raw::field_len(0, abi::fields::MESSAGE_IDS), 0);
+        });
+    }
+
     /// Every view, read through the fields its own kind carries.
     fn handler(ev: &Event) {
         match ev.which() {

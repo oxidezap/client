@@ -871,15 +871,22 @@ impl Bridge {
                         // out. A window that wants to answer with the camera
                         // off turns it off once the call is up, which is what
                         // a phone does too.
-                        let with_video = self
-                            .hub
-                            .call_state()
-                            .incoming()
-                            .filter(|call| call.call_id == call_id)
-                            .is_some_and(|call| call.is_video);
+                        //
+                        // One question and not two: read separately, a front
+                        // end whose frame is older than this state accepted a
+                        // call the stage no longer holds, so nothing here
+                        // changed, no window was told anything, and the audio
+                        // came up anyway — as voice, since the kind was read
+                        // off a stage that had moved on.
+                        let mut with_video = None;
                         self.hub.calls(|calls| {
-                            calls.connect(&call_id);
+                            with_video = calls.accept(&call_id);
                         });
+                        let Some(with_video) = with_video else {
+                            return CommandOutcome::Refused(format!(
+                                "no call is ringing under {call_id}"
+                            ));
+                        };
                         client.accept_call(&call_id, with_video);
                     }
                     // A decline is the one ending only the declining side
@@ -1676,6 +1683,18 @@ impl ReadRecord {
         secs < self.secs || (secs == self.secs && self.ids.contains(&message.id))
     }
 
+    /// Whether `message` is a reason to stop trusting this read.
+    ///
+    /// Only an incoming message nobody has read: a receipt is owed for those
+    /// and for nothing else. Our own message echoed back is the one most
+    /// likely to land inside the very window this override covers — the user
+    /// opens the chat, the read goes out, they answer — and taking it as
+    /// proof the read is stale ends the override with the reload it was
+    /// waiting for still in flight, so the badge comes straight back.
+    fn undermined_by(&self, message: &ChatMessage) -> bool {
+        !message.is_from_me && !message.is_read && !self.covers(message)
+    }
+
     fn expired(&self) -> bool {
         wacore::time::now_millis() > self.expires_at_ms
     }
@@ -1798,7 +1817,7 @@ impl ReadTracker {
                 if self
                     .read_through
                     .get(chat_jid)
-                    .is_some_and(|read| !read.covers(message))
+                    .is_some_and(|read| read.undermined_by(message))
                 {
                     self.read_through.remove(chat_jid);
                 }
@@ -1875,16 +1894,23 @@ impl ReadTracker {
             return false;
         };
 
-        let newest_secs = chat
-            .last_message_time
-            .map_or(NOTHING_BEHIND_IT, |t| t.timestamp());
+        // The newest message a receipt could be owed for. `last_message_time`
+        // is whatever arrived last, ours included, and answers only where the
+        // reload carried counts without rows to look at.
+        let newest_secs = if chat.messages.is_empty() {
+            chat.last_message_time
+                .map_or(NOTHING_BEHIND_IT, |t| t.timestamp())
+        } else {
+            chat.messages
+                .iter()
+                .rev()
+                .find(|m| !m.is_from_me)
+                .map_or(NOTHING_BEHIND_IT, |m| m.timestamp.timestamp())
+        };
         let spent = store_agrees
             || read.expired()
             || newest_secs > read.secs
-            || chat
-                .messages
-                .iter()
-                .any(|m| !m.is_from_me && !m.is_read && !read.covers(m));
+            || chat.messages.iter().any(|m| read.undermined_by(m));
 
         if spent {
             self.read_through.remove(&chat.jid);
@@ -2724,6 +2750,35 @@ mod tests {
             1,
             vec![incoming],
         )]));
+        assert_eq!(
+            bridge.hub.chat("1@s.whatsapp.net").unwrap().unread,
+            0,
+            "the badge stays down"
+        );
+    }
+
+    /// Answering is the likeliest thing to happen inside the window the
+    /// override covers — open the chat, the read goes out, type a reply — and
+    /// the echo of that reply used to end the override: the reload still in
+    /// flight then republished the old count and the badge came straight
+    /// back, in the exact race the mechanism exists for.
+    #[test]
+    fn answering_does_not_bring_the_badge_back() {
+        let mut bridge = bridge();
+        let incoming = message("m1", "1@s.whatsapp.net", 10, false, false);
+        bridge.observe(received("1@s.whatsapp.net", incoming.clone(), None));
+        bridge
+            .reads
+            .record_read("1@s.whatsapp.net", read_through(10, &["m1"]));
+
+        let reply = message("m2", "me@s.whatsapp.net", 20, true, false);
+        bridge.observe(received("1@s.whatsapp.net", reply.clone(), None));
+        bridge.observe(loaded(vec![stored_chat(
+            "1@s.whatsapp.net",
+            1,
+            vec![incoming, reply],
+        )]));
+
         assert_eq!(
             bridge.hub.chat("1@s.whatsapp.net").unwrap().unread,
             0,

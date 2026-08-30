@@ -99,12 +99,15 @@ impl RecordedAudio {
 /// answers in exactly the same vocabulary.
 #[cfg(not(target_family = "wasm"))]
 mod capture {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{Device, FromSample, Sample as _, SampleFormat, SizedSample, Stream, StreamConfig};
     use log::{error, info, warn};
+    use ringbuf::HeapRb;
+    use ringbuf::traits::Split as _;
     use wacore::time::Instant;
 
     use super::{CAPTURE_SAMPLE_RATE, RecordedAudio, RecorderError};
@@ -138,9 +141,47 @@ mod capture {
     /// Chosen so a normal speaking voice fills roughly half the meter.
     const LEVEL_GAIN: f32 = 4.0;
 
+    /// How much captured audio the ring holds before the drain has to have
+    /// taken it: two seconds, which is two hundred callbacks at the usual
+    /// block size. Bounded because a ring is, and generous because losing
+    /// samples here is losing part of what somebody said.
+    const RING_SAMPLES: usize = CAPTURE_SAMPLE_RATE as usize * 2;
+
+    /// Longest voice note this will hold.
+    ///
+    /// Ten minutes, past which the capture stops growing rather than growing
+    /// until the process is killed. At the capture rate that is already 115
+    /// MB of `f32`, which is far more than anybody records by mistake.
+    const MAX_RECORDING_SECS: usize = 600;
+
+    /// That ceiling in samples, at the rate the device is actually running.
+    ///
+    /// Derived rather than fixed for the reason [`level_window`] is: a
+    /// microphone that will not do 48 kHz is opened at its best rate, and a
+    /// count of samples is a length of time only against the rate producing
+    /// them. Fixed at 48 kHz, a 96 kHz device stopped capturing after five
+    /// minutes while `stop` went on reporting the wall clock — a voice note
+    /// truncated in silence, claiming a duration longer than its audio.
+    fn max_recording_samples(sample_rate: u32) -> usize {
+        sample_rate as usize * MAX_RECORDING_SECS
+    }
+
+    /// How often the drain empties the ring. Short against `RING_SAMPLES`, so
+    /// a scheduling hiccup on this side costs nothing.
+    const DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
     pub struct AudioRecorder {
         stream: Option<Stream>,
         samples: Arc<Mutex<Vec<f32>>>,
+        /// The meter's value, written by the drain and read by the interface.
+        /// Bits of an `f32`, because the meter is one number and a lock for it
+        /// would be the UI thread and the drain taking turns.
+        level: Arc<std::sync::atomic::AtomicU32>,
+        /// What ends the drain thread, and the handle to wait on.
+        draining: Option<(
+            Arc<std::sync::atomic::AtomicBool>,
+            std::thread::JoinHandle<()>,
+        )>,
         is_recording: bool,
         start_time: Option<Instant>,
         device: Option<Device>,
@@ -160,6 +201,8 @@ mod capture {
             Self {
                 stream: None,
                 samples: Arc::new(Mutex::new(Vec::new())),
+                level: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                draining: None,
                 is_recording: false,
                 start_time: None,
                 device: None,
@@ -247,18 +290,26 @@ mod capture {
             if let Ok(mut samples) = self.samples.lock() {
                 samples.clear();
             }
+            self.level.store(0, Ordering::Relaxed);
 
-            let samples = self.samples.clone();
+            // The callback writes into a lock-free ring and nothing else; a
+            // thread on this side is what turns that into the capture. See
+            // `spawn_drain`.
+            let (producer, consumer) = HeapRb::<f32>::new(RING_SAMPLES).split();
 
             let stream = match self.sample_format {
-                SampleFormat::F32 => build_input_stream::<f32>(device, config, samples),
-                SampleFormat::I16 => build_input_stream::<i16>(device, config, samples),
-                SampleFormat::U16 => build_input_stream::<u16>(device, config, samples),
+                SampleFormat::F32 => build_input_stream::<f32, _>(device, config, producer),
+                SampleFormat::I16 => build_input_stream::<i16, _>(device, config, producer),
+                SampleFormat::U16 => build_input_stream::<u16, _>(device, config, producer),
                 other => Err(RecorderError::StreamError(format!(
                     "unsupported input sample format {other:?}"
                 ))),
             }?;
-
+            // After the device is running, not before: a `play` that fails —
+            // the microphone unplugged between opening it and starting it —
+            // returns from here, and a drain started above it would be a
+            // thread nobody ever asks to stop, holding its ring, with the
+            // next attempt overwriting the handle that could have joined it.
             stream
                 .play()
                 .inspect_err(|_| {
@@ -266,6 +317,19 @@ mod capture {
                     self.config = None;
                 })
                 .map_err(|e| RecorderError::StreamError(e.to_string()))?;
+
+            self.draining = Some(spawn_drain(
+                consumer,
+                self.samples.clone(),
+                self.level.clone(),
+                // The device's own rate, not the one asked for: a microphone
+                // that will not do 48 kHz is opened at its best rate instead,
+                // and a window in samples is a window in milliseconds only
+                // against the rate it is actually capturing at.
+                level_window(self.sample_rate),
+                // And the ceiling in samples, for the same reason.
+                max_recording_samples(self.sample_rate),
+            ));
 
             self.stream = Some(stream);
             self.is_recording = true;
@@ -277,19 +341,17 @@ mod capture {
 
         /// The input level right now, 0..=1, for a meter.
         ///
-        /// Read off the tail of what has been captured rather than from a second
-        /// tap on the device: the callback is already writing every sample here,
-        /// and a meter that opened its own stream would be a second consumer of a
-        /// microphone the user only agreed to share once.
+        /// Read off what has been captured rather than from a second tap on
+        /// the device: a meter that opened its own stream would be a second
+        /// consumer of a microphone the user only agreed to share once. One
+        /// atomic, because this is called from the interface on every tick
+        /// and taking the capture's lock for it put the UI thread in front of
+        /// the audio thread.
         ///
         /// RMS, not peak: a peak meter is pinned by a single click and says
         /// nothing about whether a voice is being picked up.
         pub fn level(&self) -> f32 {
-            let Ok(samples) = self.samples.lock() else {
-                return 0.0;
-            };
-            let from = samples.len().saturating_sub(level_window(self.sample_rate));
-            rms(&samples[from..])
+            f32::from_bits(self.level.load(Ordering::Relaxed))
         }
 
         pub fn stop(&mut self) -> Result<RecordedAudio, RecorderError> {
@@ -297,11 +359,21 @@ mod capture {
                 return Err(RecorderError::NotRecording);
             }
 
+            // The device first, so nothing more is captured, then the drain,
+            // which is what puts the last of the ring into the capture: read
+            // before it has finished is a note missing its final moments.
             self.stream.take();
+            self.stop_draining();
             self.is_recording = false;
 
-            let duration = self.start_time.map_or(Duration::ZERO, |t| t.elapsed());
             let samples = self.samples.lock().map(|b| b.clone()).unwrap_or_default();
+            // From the samples that were kept, never from the wall clock. The
+            // drain stops appending at `max_recording_samples`, so a note left
+            // running past that would otherwise advertise a length its audio
+            // does not have: ten minutes of sound claiming twenty, with the
+            // player's scrubber over silence that is not there.
+            let duration =
+                Duration::from_secs_f64(samples.len() as f64 / f64::from(self.sample_rate.max(1)));
 
             info!(
                 "Recording stopped: {} samples, {:.1}s",
@@ -318,6 +390,7 @@ mod capture {
 
         pub fn cancel(&mut self) {
             self.stream.take();
+            self.stop_draining();
             self.is_recording = false;
             self.start_time = None;
             if let Ok(mut samples) = self.samples.lock() {
@@ -325,36 +398,139 @@ mod capture {
             }
             warn!("Recording cancelled");
         }
+
+        /// Ask the drain to finish what is in the ring and wait for it.
+        fn stop_draining(&mut self) {
+            let Some((stop, handle)) = self.draining.take() else {
+                return;
+            };
+            stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+        }
+    }
+
+    impl Drop for AudioRecorder {
+        /// A recorder that is simply let go still has a thread in it.
+        ///
+        /// The drain leaves only on its stop flag: dropping the stream drops
+        /// the ring's producer, which the loop does not watch, so it goes on
+        /// waking every 20 ms for ever, holding the ring and the capture. The
+        /// two ways out of a recording -- `stop` and `cancel` -- both raise
+        /// the flag, and this is the third: a window closed mid-recording, or
+        /// a `RecorderError` on a path that returns the recorder rather than
+        /// cancelling it.
+        fn drop(&mut self) {
+            // Before the drain, for the reason `stop` does it in this order:
+            // nothing more is captured, and what is in the ring is drained
+            // rather than abandoned.
+            self.stream.take();
+            self.stop_draining();
+        }
+    }
+
+    /// Turn what the callback pushed into the capture, off the audio thread.
+    ///
+    /// This is where everything the realtime callback must not do happens: the
+    /// lock the interface also takes, a `Vec` that grows, and the meter's
+    /// arithmetic. The callback's whole job is a downmix and a lock-free
+    /// push, which is what the call device next door has always done.
+    fn spawn_drain(
+        mut consumer: impl ringbuf::traits::Consumer<Item = f32> + Send + 'static,
+        capture: Arc<Mutex<Vec<f32>>>,
+        level: Arc<std::sync::atomic::AtomicU32>,
+        window: usize,
+        ceiling: usize,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let ending = stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("oxidezap-recorder-drain".to_string())
+            .spawn(move || {
+                let mut block = vec![0.0f32; RING_SAMPLES];
+                // The meter's window, kept here so reading it never touches
+                // the capture's lock.
+                let mut tail: std::collections::VecDeque<f32> =
+                    std::collections::VecDeque::with_capacity(window);
+                let mut full = false;
+                loop {
+                    let ending_now = ending.load(Ordering::Relaxed);
+                    let taken = consumer.pop_slice(&mut block);
+                    if taken > 0 {
+                        let taken = &block[..taken];
+                        for &sample in taken {
+                            if tail.len() == window {
+                                tail.pop_front();
+                            }
+                            tail.push_back(sample);
+                        }
+                        level.store(rms_of(&mut tail).to_bits(), Ordering::Relaxed);
+                        if let Ok(mut samples) = capture.lock() {
+                            let room = ceiling.saturating_sub(samples.len());
+                            if room < taken.len() && !full {
+                                full = true;
+                                warn!("recording reached its ceiling; capturing no more");
+                            }
+                            samples.extend_from_slice(&taken[..room.min(taken.len())]);
+                        }
+                    }
+                    // Asked *before* the pop above, so the last block pushed
+                    // before the stream was taken is still drained: reading
+                    // the flag after would leave whatever arrived in between.
+                    if ending_now && taken == 0 {
+                        return;
+                    }
+                    if taken == 0 {
+                        std::thread::sleep(DRAIN_INTERVAL);
+                    }
+                }
+            })
+            .expect("a thread for the recorder's drain");
+        (stop, handle)
+    }
+
+    /// [`rms`] over the meter's window, which is a ring rather than a slice.
+    fn rms_of(tail: &mut std::collections::VecDeque<f32>) -> f32 {
+        rms(tail.make_contiguous())
     }
 
     /// Build the input stream for the device's sample format, converting to f32
     /// in the callback (same dispatch as the player's output path).
-    fn build_input_stream<T: SizedSample>(
+    ///
+    /// The callback does a downmix into a scratch it reuses and one lock-free
+    /// push. It used to take the mutex the interface's meter also takes and
+    /// `extend` a `Vec` with no capacity and no ceiling: at a minute of
+    /// push-to-talk that buffer is around 11 MB, and the `extend` that
+    /// crosses its capacity copies all of it inside the realtime callback —
+    /// an audible xrun and a lost stretch of what somebody was saying.
+    fn build_input_stream<T: SizedSample, P>(
         device: &Device,
         config: StreamConfig,
-        samples: Arc<Mutex<Vec<f32>>>,
+        mut producer: P,
     ) -> Result<Stream, RecorderError>
     where
         f32: FromSample<T>,
+        P: ringbuf::traits::Producer<Item = f32> + Send + 'static,
     {
         let channels = config.channels as usize;
+        // Reused across callbacks; reallocates only past the warmup size.
+        let mut mono: Vec<f32> = Vec::with_capacity(2048);
         device
             .build_input_stream(
                 config,
                 move |data: &[T], _: &cpal::InputCallbackInfo| {
-                    let Ok(mut buffer) = samples.lock() else {
-                        return;
-                    };
+                    mono.clear();
                     if channels == 1 {
-                        buffer.extend(data.iter().map(|&s| f32::from_sample(s)));
+                        mono.extend(data.iter().map(|&s| f32::from_sample(s)));
                     } else {
-                        // Downmix to mono
                         for chunk in data.chunks(channels) {
-                            let mono: f32 = chunk.iter().map(|&s| f32::from_sample(s)).sum::<f32>()
-                                / channels as f32;
-                            buffer.push(mono);
+                            let sum: f32 = chunk.iter().map(|&s| f32::from_sample(s)).sum();
+                            mono.push(sum / channels as f32);
                         }
                     }
+                    // Dropping is the only thing a realtime callback may do
+                    // with a full ring, and a full ring means the drain has
+                    // been off the CPU for two whole seconds.
+                    let _ = producer.push_slice(&mono);
                 },
                 move |err| {
                     error!("Audio input stream error: {}", err);
@@ -362,6 +538,90 @@ mod capture {
                 None,
             )
             .map_err(|e| RecorderError::StreamError(e.to_string()))
+    }
+
+    #[cfg(test)]
+    mod drain_tests {
+        use super::*;
+
+        /// The realtime callback used to take the mutex the interface's meter
+        /// also takes and `extend` a `Vec` with no capacity and no ceiling,
+        /// so a long note reallocated megabytes inside it. Everything that
+        /// grows, locks or averages belongs on this side of the ring.
+        #[test]
+        fn what_the_callback_pushed_becomes_the_capture() {
+            let (mut producer, consumer) = HeapRb::<f32>::new(RING_SAMPLES).split();
+            let capture = Arc::new(Mutex::new(Vec::new()));
+            let level = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let (stop, handle) = spawn_drain(
+                consumer,
+                capture.clone(),
+                level.clone(),
+                level_window(CAPTURE_SAMPLE_RATE),
+                max_recording_samples(CAPTURE_SAMPLE_RATE),
+            );
+
+            use ringbuf::traits::Producer as _;
+            let block = vec![0.25f32; 4096];
+            let mut pushed = 0usize;
+            while pushed < 4096 {
+                pushed += producer.push_slice(&block[pushed..]);
+            }
+            drop(producer);
+            stop.store(true, Ordering::Relaxed);
+            handle.join().expect("the drain finishes");
+
+            assert_eq!(capture.lock().unwrap().len(), 4096);
+            assert!(
+                f32::from_bits(level.load(Ordering::Relaxed)) > 0.0,
+                "the meter is fed by the drain, not by the audio thread"
+            );
+        }
+
+        /// A device that will not do 48 kHz is opened at its best rate, and
+        /// a count of samples is a length of time only against the rate
+        /// producing them. Fixed at 48 kHz, a 96 kHz microphone stopped
+        /// capturing after five minutes while `stop` went on reporting the
+        /// wall clock: a note truncated in silence, claiming a duration
+        /// longer than its audio.
+        #[test]
+        fn the_ceiling_is_a_length_of_time_at_any_rate() {
+            assert_eq!(
+                max_recording_samples(48_000) / 48_000,
+                max_recording_samples(96_000) / 96_000
+            );
+            assert_eq!(max_recording_samples(48_000) / 48_000, MAX_RECORDING_SECS);
+        }
+
+        /// A capture with nothing stopping it grows until the process is
+        /// killed. The ceiling stops it growing; it does not stop the note
+        /// that was already recorded from being sent.
+        #[test]
+        fn a_capture_stops_growing_at_its_ceiling() {
+            let ceiling = max_recording_samples(CAPTURE_SAMPLE_RATE);
+            let capture = Arc::new(Mutex::new(vec![0.0f32; ceiling - 8]));
+            let (mut producer, consumer) = HeapRb::<f32>::new(RING_SAMPLES).split();
+            let level = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let (stop, handle) = spawn_drain(
+                consumer,
+                capture.clone(),
+                level,
+                level_window(CAPTURE_SAMPLE_RATE),
+                ceiling,
+            );
+
+            use ringbuf::traits::Producer as _;
+            let block = vec![0.5f32; 64];
+            let mut pushed = 0usize;
+            while pushed < block.len() {
+                pushed += producer.push_slice(&block[pushed..]);
+            }
+            drop(producer);
+            stop.store(true, Ordering::Relaxed);
+            handle.join().expect("the drain finishes");
+
+            assert_eq!(capture.lock().unwrap().len(), ceiling);
+        }
     }
 
     #[cfg(test)]

@@ -40,6 +40,7 @@ mod store;
 pub mod types;
 
 pub use error::{ChatStoreError, Result};
+pub use materialize::is_control_only;
 pub use store::ChatStore;
 pub use types::{
     ArrivalCursor, ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind,

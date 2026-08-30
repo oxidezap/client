@@ -62,7 +62,12 @@ pub fn render_message_list(
 ) -> impl IntoElement {
     let metrics = *layout.metrics();
 
-    if cache.messages.is_empty() {
+    // What the list holds, not what the chat holds. In a conversation with no
+    // history the other side may still be typing, and that row is the only
+    // thing on screen with anything to say — drawn as an empty state instead,
+    // the window said "No messages yet" over a live indicator, and the list
+    // had already been synchronized to one row.
+    if cache.items.is_empty() {
         return div()
             .flex_1()
             .min_h_0()
@@ -183,11 +188,22 @@ fn render_row(
             let app = entity.read(cx);
             // Decoded once and reused: stickers additionally need the stable
             // Arc for animation state.
-            let sticker_image = msg.media.as_ref().and_then(|m| {
-                (matches!(m.media_type, MediaType::Sticker | MediaType::Image)
-                    && !m.data.is_empty())
-                .then(|| app.get_decoded_image(message_id, &m.data, &m.mime_type))
-                .flatten()
+            //
+            // A video's poster too, and it was the one that went without: the
+            // fallback path clones the whole buffer — the `Arc` always has a
+            // second holder, so it is never the cheap branch — and then hashes
+            // every byte of it to name the image, on every repaint of every
+            // visible bubble. Only while `data` really is the poster: once the
+            // file arrives those bytes are the MP4, which has no still in it.
+            let decoded_image = msg.media.as_ref().and_then(|m| {
+                let cacheable = match m.media_type {
+                    MediaType::Sticker | MediaType::Image => true,
+                    MediaType::Video => m.data_is_preview,
+                    _ => false,
+                };
+                (cacheable && !m.data.is_empty())
+                    .then(|| app.get_decoded_image(message_id, m))
+                    .flatten()
             });
             // Progress belongs to the one clip that is loaded; a second voice
             // note in the same conversation must not borrow its position.
@@ -204,7 +220,7 @@ fn render_row(
                 starts_run: *starts_run,
                 video_player_state: app.video_player_state(message_id),
                 video_frame: app.video_current_frame(message_id),
-                sticker_image,
+                decoded_image,
                 audio,
                 playback_speed: app.playback_speed(),
                 is_downloading: app.is_downloading(message_id),

@@ -288,6 +288,21 @@ mod tests {
             .collect()
     }
 
+    /// A conversation with no history can still have the other side typing,
+    /// and that row is the only thing on screen with anything to say. The
+    /// pane decided by the chat's messages rather than by the list's rows, so
+    /// it drew "No messages yet" over a live indicator — with the list
+    /// already synchronized to one row.
+    #[test]
+    fn a_new_chat_with_somebody_typing_has_a_row_to_draw() {
+        let items = build_items(&[], Some(typing(&["Ana"])));
+        assert_eq!(kinds(&items), vec!["typing"]);
+        assert!(
+            !items.is_empty(),
+            "and the pane draws by this, not by the message count"
+        );
+    }
+
     /// What the timeline anchor compares: which rows the two frames have in
     /// common at either end, and therefore the stretch between them that
     /// changed. An append changes the end alone; a page of older history

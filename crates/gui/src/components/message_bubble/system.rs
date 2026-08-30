@@ -102,6 +102,10 @@ pub fn render_notice(text: String, metrics: Metrics, cx: &App) -> impl IntoEleme
         .text_size(metrics.text_small())
         .text_color(cx.theme().muted_foreground)
         .text_center()
+        // Bounded like the encryption notice below it: a group's subject is
+        // whoever renamed it typing, and a pill that lays out to its natural
+        // width runs out past its own border.
+        .max_w(metrics.call_card_width_wide())
         .child(text)
 }
 

@@ -170,13 +170,16 @@ pub(crate) struct LocalVideo {
     /// reason: nothing else here can end it, and one that outlived the pair
     /// publishes into whatever call the id slot names next.
     remote_pump: tokio::task::JoinHandle<()>,
-    /// Cleared by the pump *before* it reports the loss, so a caller still
-    /// wiring this camera up can ask whether the device is still there.
+    /// Whether this camera is still producing, cleared by the pump on every
+    /// way out of it.
     ///
-    /// The report is what a registered camera is torn down by, and it finds
-    /// nothing to tear down while the camera is still on its way into the
-    /// registry — seconds, on a path that waits for signaling. Whoever is
-    /// holding it asks here instead.
+    /// A caller still wiring the camera up asks here, because the loss report
+    /// tears down what the *registry* holds and finds nothing while the
+    /// camera is on its way into it — seconds, on a path that waits for
+    /// signaling. So the flag is about the pump and not about the report:
+    /// the plane closing is an ending nobody reports, and leaving the flag
+    /// set for it hands a caller a camera it will draw as live and never
+    /// receive another frame from.
     alive: Arc<AtomicBool>,
     id: CallIdSlot,
     camera_id: CameraId,
@@ -211,8 +214,8 @@ impl LocalVideo {
         self.camera_id
     }
 
-    /// Whether the device is still producing. False means its loss has
-    /// already been reported — to a registry this camera was not in yet.
+    /// Whether the device is still producing. False means this camera has
+    /// stopped, whether or not its loss was worth reporting.
     pub(crate) fn alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
@@ -418,12 +421,13 @@ async fn pump_local(pump: LocalPump) {
     // that one is the call ending, which has its own teardown.
     let call_id = read(&call_id);
     debug!("local video for {call_id} ended");
+    // Every way out, including the `break` above: the flag says this pump
+    // produces no more, and a caller wiring the camera up reads it before the
+    // report — which is what the registry is torn down by, and which finds
+    // nothing while the camera is not in it yet.
+    alive.store(false, Ordering::Relaxed);
     if !plane.is_closed() {
         warn!("the camera on call {call_id} stopped producing frames");
-        // Before the report, not after: the report tears down what the
-        // registry holds, and a camera still being wired into it is not
-        // there to be found. The flag is what that caller reads.
-        alive.store(false, Ordering::Relaxed);
         lost(call_id, camera_id);
     }
 }
@@ -464,6 +468,58 @@ async fn pump_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The call's media plane going away ends the pump too, and the camera it
+    /// belongs to used to go on reading as live: a caller wiring it into the
+    /// registry kept it, so the device stayed open with its light on and
+    /// every window drew a direction nothing would ever arrive on.
+    #[tokio::test]
+    async fn a_camera_whose_plane_closed_stops_reading_as_live() {
+        let (frames_tx, frames) = async_channel::bounded(1);
+        let (plane, plane_rx) = async_channel::bounded(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        let reported = Arc::new(AtomicBool::new(false));
+
+        let lost: CameraLost = {
+            let reported = reported.clone();
+            Arc::new(move |_, _| reported.store(true, Ordering::Relaxed))
+        };
+        let pump = LocalPump {
+            call_id: slot("call-1"),
+            frames,
+            camera: CameraControl::default(),
+            plane,
+            publisher: VideoPublisher {
+                sender: Arc::new(std::sync::Mutex::new(None)),
+                watched: Arc::new(AtomicBool::new(false)),
+            },
+            lost,
+            camera_id: 1,
+            drawable: Arc::new(AtomicBool::new(false)),
+            alive: alive.clone(),
+        };
+
+        // The call ends: the plane's receiver goes, and the next frame the
+        // camera produces has nowhere to be sent.
+        drop(plane_rx);
+        frames_tx
+            .send(EncodedFrame {
+                data: vec![0u8; 4],
+                keyframe: true,
+            })
+            .await
+            .expect("the pump is still reading");
+        pump_local(pump).await;
+
+        assert!(
+            !alive.load(Ordering::Relaxed),
+            "the pump has stopped, so the camera may not read as producing"
+        );
+        assert!(
+            !reported.load(Ordering::Relaxed),
+            "the call ending is not the device being lost"
+        );
+    }
 
     /// A gap is spent by the frame that carries it, and nothing else. A slot
     /// nobody was listening to used to clear one: a frame dropped, the next

@@ -800,11 +800,13 @@ pub struct WhatsAppApp {
     /// Task for video frame updates
     #[allow(dead_code)]
     video_update_task: Option<Task<()>>,
-    /// Cache of decoded images (message_id -> Arc<Image>): sticker animation
-    /// state and per-render decode cost both depend on the Arc being stable.
+    /// Cache of decoded images (message_id -> the picture and what it was
+    /// decoded from): sticker animation state and per-render decode cost both
+    /// depend on the Arc being stable, and [`Cached`] is what stops it being
+    /// stable across a *different* picture under the same id.
     /// Uses RefCell for interior mutability since we need to cache during immutable render.
     /// Uses IndexMap to maintain insertion order for deterministic FIFO eviction.
-    decoded_images: RefCell<IndexMap<String, Arc<Image>>>,
+    decoded_images: RefCell<IndexMap<String, (Cached, Arc<Image>)>>,
     /// Cache of message list data per chat to avoid expensive recomputation on every render.
     /// Key is the chat JID, value is the cached data.
     message_list_cache: RefCell<HashMap<String, MessageListCache>>,
@@ -1313,28 +1315,39 @@ impl WhatsAppApp {
     /// appearing at the same moment the rows do. Appending splices — which
     /// keeps the reader where they were — and anything else resets, which
     /// lands them at the newest message.
+    /// The chat is named rather than handed over, and that is the whole
+    /// point: this needs the app mutably, so a caller holding a `&Chat`
+    /// cannot call it — and the way round that was to clone the chat, every
+    /// frame, with every `ChatMessage` in it. Scrolling a conversation of
+    /// five thousand messages copied five thousand strings, reaction maps and
+    /// quotes per frame for a reader that only ever looks at the timeline
+    /// cache.
     pub fn get_message_list_cache(
         &mut self,
         chat_jid: &str,
-        messages: &[ChatMessage],
-        is_group: bool,
         typing: Option<TypingSummary>,
         layout: ResponsiveLayout,
     ) -> MessageListCache {
-        let cached = {
-            let cache = self.message_list_cache.borrow();
-            cache
-                .get(chat_jid)
-                .filter(|cached| cached.is_valid_for(messages.len(), is_group, typing.as_ref()))
-                .cloned()
+        let rows = {
+            let Some(chat) = self.find_chat(chat_jid) else {
+                return MessageListCache::new(&[], false, typing);
+            };
+            let (messages, is_group) = (chat.messages.as_slice(), chat.is_group);
+            let cached = {
+                let cache = self.message_list_cache.borrow();
+                cache
+                    .get(chat_jid)
+                    .filter(|cached| cached.is_valid_for(messages.len(), is_group, typing.as_ref()))
+                    .cloned()
+            };
+            cached.unwrap_or_else(|| {
+                let built = MessageListCache::new(messages, is_group, typing);
+                self.message_list_cache
+                    .borrow_mut()
+                    .insert(chat_jid.to_string(), built.clone());
+                built
+            })
         };
-        let rows = cached.unwrap_or_else(|| {
-            let built = MessageListCache::new(messages, is_group, typing);
-            self.message_list_cache
-                .borrow_mut()
-                .insert(chat_jid.to_string(), built.clone());
-            built
-        });
 
         // Asked before the rows are handed over, because the question is
         // about the frame that was drawn: a splice replaces measurements with
@@ -1342,19 +1355,13 @@ impl WhatsAppApp {
         // is missing whatever has not been laid out yet. Asked from here at
         // all because this is the frame's one pass over the timeline and it
         // already holds the list.
-        //
-        // And only of a list that is already this conversation's. There is
-        // one of them for whichever chat is on screen, so on the frame a
-        // reader opens a new one it still holds the geometry of the one they
-        // left — and a chat left near its top would have every chat opened
-        // after it ask for a page of history nobody had scrolled to, on the
-        // frame it opened. The anchor is what the list describes; until it
-        // names this chat there is nothing here to ask about.
-        if self
-            .timeline_anchor
-            .as_ref()
-            .is_some_and(|anchor| anchor.jid == chat_jid)
-            && self.timeline_nearing_start()
+        if timeline_may_page(
+            self.visible_chat.as_deref(),
+            self.timeline_anchor
+                .as_ref()
+                .map(|anchor| anchor.jid.as_str()),
+            chat_jid,
+        ) && self.timeline_nearing_start()
         {
             self.want_older_messages(chat_jid);
         }
@@ -1755,6 +1762,33 @@ impl WhatsAppApp {
     }
 
     /// Get the currently selected chat data
+    /// One chat by address, for a frame that named it rather than holding it.
+    pub fn chat_named(&self, jid: &str) -> Option<&Chat> {
+        self.find_chat(jid).map(std::convert::AsRef::as_ref)
+    }
+
+    /// Whether this window holds the chat at `jid`.
+    pub fn has_chat(&self, jid: &str) -> bool {
+        self.find_chat(jid).is_some()
+    }
+
+    /// What the conversation at `chat_jid` calls the author of `message`.
+    ///
+    /// Here rather than at the call site because the caller has the address
+    /// and not the chat: holding the chat means borrowing this across the
+    /// decoding the same frame does, which is what the whole-conversation
+    /// clone existed to avoid.
+    pub fn author_label(&self, chat_jid: Option<&str>, message: &ChatMessage) -> String {
+        chat_jid
+            .and_then(|jid| self.chat_named(jid))
+            .and_then(|chat| {
+                chat.author_name(message)
+                    .map(str::to_owned)
+                    .or_else(|| Some(chat.name.clone()))
+            })
+            .unwrap_or_else(|| "Unknown contact".to_string())
+    }
+
     pub fn selected_chat_data(&self) -> Option<&Arc<Chat>> {
         self.selected_chat
             .as_ref()
@@ -2898,13 +2932,45 @@ fn read_bound(chat: &Chat) -> ReadBound {
     }
 }
 
+/// The newest message in `chat` that the daemon has also seen.
+///
+/// Which excludes a send this window has drawn but not yet had named, as well
+/// as its own notices: until `MessageIdAssigned` lands, the id is one
+/// [`WhatsAppApp::next_local_id`] invented here and the daemon has never
+/// heard of. That matters because messages sort by `(timestamp, id)` and a
+/// local id sorts after the uppercase hex the server issues, so a reply
+/// arriving in the same second as a send still in flight left the local id as
+/// the newest — the daemon refuses a read naming a message it does not know,
+/// the badge clears here anyway, no receipt goes out, and the next hydration
+/// puts it straight back.
+///
+/// The *id*, not the send's status. A send is renamed before the network
+/// attempt, so a bubble can be `Pending` or `Failed` and still carry a real
+/// id the daemon has folded into its own tracker; excluded by status, a chat
+/// whose only row is a failed send could never be read at all — `read_bound`
+/// answers `WhenLoaded`, and no load changes the answer.
 fn newest_shared_message(chat: &Chat) -> Option<String> {
     chat.messages
         .iter()
         .rev()
-        .find(|message| message.system.is_none())
+        .find(|message| message.system.is_none() && !is_local_id(&message.id))
         .map(|message| message.id.clone())
 }
+
+/// Whether this id is one this window invented and nothing else has seen.
+///
+/// Beside [`WhatsAppApp::next_local_id`], which is its only producer, so the
+/// two cannot drift: every id it makes carries the prefix it was asked for
+/// and then an underscore, and the server's own ids are uppercase hex.
+fn is_local_id(id: &str) -> bool {
+    LOCAL_ID_PREFIXES
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+}
+
+/// Every prefix [`WhatsAppApp::next_local_id`] is called with for something
+/// that becomes a message. A call's placeholder is not one: it names a call.
+const LOCAL_ID_PREFIXES: [&str; 2] = ["local_", "local_audio_"];
 
 impl WhatsAppApp {
     /// One second, for the two things that change with no event behind them.
@@ -3116,6 +3182,45 @@ fn slot_newest_first(rest: &[Arc<Chat>], at: Option<chrono::DateTime<chrono::Utc
         .unwrap_or(rest.len())
 }
 
+/// What a decoded image was decoded from.
+///
+/// A message's bytes are not fixed: a preview is replaced by the real
+/// picture, and one of the two paths that does it — `fill`, on the way in
+/// from the daemon — never reaches the app at all. So the cache remembers
+/// enough to notice, rather than trusting whoever swapped the bytes to have
+/// evicted the entry.
+///
+/// The length, the format and whether it was a preview — not a hash: the
+/// point is to spot a picture being replaced, and hashing every byte is
+/// exactly what this cache exists to avoid. The preview flag is what makes
+/// the answer exact for the case that matters rather than merely unlikely:
+/// a thumbnail and the picture that replaces it can in principle encode to
+/// the same length in the same format, and `adopt_full_bytes` always clears
+/// that flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cached {
+    bytes: usize,
+    format: gpui::ImageFormat,
+    preview: bool,
+}
+
+/// Whether the timeline this frame is building may ask for the page before
+/// it.
+///
+/// Both halves, and they are different questions. `anchored` is about the
+/// list's geometry: there is one list for whichever chat is on screen, so on
+/// the frame a reader opens a new conversation it still holds the
+/// measurements of the one they left, and a chat left near its top would have
+/// every chat opened after it ask for history nobody had scrolled to.
+/// `visible` is about the screen: the selection outlives it — a phone's Back
+/// leaves it standing, and so do Status and the fullscreen viewer — while the
+/// measurements stay frozen where the reader left them, so a conversation
+/// nobody is drawing went on asking for a page every frame, for ever, since a
+/// list with nothing to scroll answers "at the top" permanently.
+fn timeline_may_page(visible: Option<&str>, anchored: Option<&str>, chat_jid: &str) -> bool {
+    visible == Some(chat_jid) && anchored == Some(chat_jid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3169,6 +3274,144 @@ mod tests {
             rem: 16.0,
             width: 600.0,
         }
+    }
+
+    /// The selection outlives the screen — Back on a phone, a trip to Status,
+    /// the fullscreen viewer — and the list keeps the measurements the reader
+    /// left it with. A conversation nobody draws therefore went on asking for
+    /// a page of history every frame, for ever, since a list with nothing to
+    /// scroll answers "at the top" permanently.
+    #[test]
+    fn a_conversation_nobody_draws_asks_for_nothing() {
+        assert!(timeline_may_page(
+            Some("a@s.whatsapp.net"),
+            Some("a@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        assert!(!timeline_may_page(
+            None,
+            Some("a@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        assert!(!timeline_may_page(
+            Some("b@s.whatsapp.net"),
+            Some("a@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        // And the list still has to be describing this chat's rows.
+        assert!(!timeline_may_page(
+            Some("a@s.whatsapp.net"),
+            Some("b@s.whatsapp.net"),
+            "a@s.whatsapp.net"
+        ));
+        assert!(!timeline_may_page(
+            Some("a@s.whatsapp.net"),
+            None,
+            "a@s.whatsapp.net"
+        ));
+    }
+
+    /// A read is bounded by an id the daemon knows, and a send this window
+    /// has only drawn is not one: `local_…` sorts after the server's
+    /// uppercase hex, so a reply landing in the same second as a send still
+    /// in flight left the invented id as the newest. The daemon refuses it,
+    /// the badge clears here anyway, no receipt goes out, and the next
+    /// hydration puts the badge back.
+    #[test]
+    fn a_read_is_not_bounded_by_a_message_only_this_window_has() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        let mut theirs = ChatMessage::new_incoming(
+            "3EB0ABCDEF".to_string(),
+            "a@s.whatsapp.net".to_string(),
+            "oi".to_string(),
+        );
+        theirs.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut mine = ChatMessage::new_incoming(
+            WhatsAppApp::next_local_id("local"),
+            "me@s.whatsapp.net".to_string(),
+            "já respondo".to_string(),
+        );
+        mine.is_from_me = true;
+        mine.status = MessageStatus::Pending;
+        mine.timestamp = theirs.timestamp;
+        chat.messages = vec![theirs, mine];
+
+        assert_eq!(
+            newest_shared_message(&chat).as_deref(),
+            Some("3EB0ABCDEF"),
+            "the newest message both sides hold"
+        );
+    }
+
+    /// A send is renamed before the network attempt, so a bubble can be
+    /// `Pending` or `Failed` and still carry a real id the daemon knows. Held
+    /// back by status, a chat whose only row is a failed send could never be
+    /// read: `read_bound` answers `WhenLoaded`, and loading the same page
+    /// cannot change that.
+    #[test]
+    fn a_named_send_can_bound_a_read_however_it_ended() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        let mut failed = ChatMessage::new_incoming(
+            "3EB0FAILED".to_string(),
+            "me@s.whatsapp.net".to_string(),
+            "não saiu".to_string(),
+        );
+        failed.is_from_me = true;
+        failed.status = MessageStatus::Failed;
+        chat.messages = vec![failed];
+
+        assert_eq!(
+            newest_shared_message(&chat).as_deref(),
+            Some("3EB0FAILED"),
+            "the daemon named this one, whatever became of it"
+        );
+        // And every prefix the window invents is still held back.
+        assert!(is_local_id(&WhatsAppApp::next_local_id("local")));
+        assert!(is_local_id(&WhatsAppApp::next_local_id("local_audio")));
+        assert!(!is_local_id("3EB0ABCDEF"));
+    }
+
+    /// A blurred preview used to survive the arrival of the real photo, and
+    /// `is_viewable` then let it be opened full screen: the cache is keyed by
+    /// message id, and only one of the two paths that replaces a preview with
+    /// real bytes evicts — `fill`, on the way in from the daemon, never
+    /// reaches the app at all. It came out after fifty other pictures had
+    /// pushed it through the cache, or an account reset.
+    #[test]
+    fn real_bytes_do_not_read_back_as_the_preview_they_replaced() {
+        let preview = Cached {
+            bytes: 4_096,
+            format: gpui::ImageFormat::Jpeg,
+            preview: true,
+        };
+        let full = Cached {
+            bytes: 812_344,
+            format: gpui::ImageFormat::Jpeg,
+            preview: false,
+        };
+        assert_ne!(preview, full);
+
+        // And a sticker's preview is a PNG where the real thing is a WebP,
+        // which the format half is for.
+        assert_ne!(
+            Cached {
+                bytes: 4_096,
+                format: gpui::ImageFormat::Png,
+                preview: true,
+            },
+            preview
+        );
+
+        // The length is a signature two pictures can share; the flag the
+        // replacement always clears is what makes this exact rather than
+        // merely unlikely.
+        assert_ne!(
+            Cached {
+                preview: false,
+                ..preview
+            },
+            preview
+        );
     }
 
     /// A page of older history arrives in front of every message the list

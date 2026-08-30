@@ -276,79 +276,32 @@ fn acquire_startup_lock(_path: &Path) -> Result<StartupLock> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-/// Create the socket directory, or verify an existing one is safe to use.
+/// Make the directory the socket lives in ours alone.
 ///
-/// The socket carries control of a WhatsApp session. Under `XDG_RUNTIME_DIR`
-/// that is already a private per-user directory, but the `TMPDIR` fallback
-/// sits in a world-writable place at a predictable path, where another local
-/// user can pre-create it, or replace it with a symlink pointing somewhere
-/// they can read. Creating it blindly and chmod-ing afterwards checks neither.
-///
-/// So: create it with the right mode from the start, and if it already exists,
-/// refuse unless it is a real directory, owned by us, and inaccessible to
-/// anyone else. Refusing to start is a bad outcome; putting a socket that
-/// controls the account somewhere another user can reach is a worse one.
-#[cfg(unix)]
+/// The socket carries control of a WhatsApp session, and under the `TMPDIR`
+/// fallback its directory sits at a predictable path in a world-writable
+/// place. The check itself is shared with the media cache next door; what is
+/// specific here is what a directory that *was* open means: another local
+/// account could have left something inside under a name this daemon is about
+/// to use — a `daemon.sock` in front of the bind, a `daemon.lock` held open,
+/// a `media` symlink pointing at a directory of their own. Refusing to start
+/// is a bad outcome; opening the account's photo cache through somebody
+/// else's symlink is a worse one, so what could not be ours is removed rather
+/// than inherited.
 fn prepare_state_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => return Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
-    }
-
-    // `symlink_metadata`, not `metadata`: the latter follows the link, which
-    // would report on the target and miss exactly the substitution this
-    // guards against.
-    let meta =
-        std::fs::symlink_metadata(dir).with_context(|| format!("inspecting {}", dir.display()))?;
-
-    if !meta.is_dir() {
-        anyhow::bail!(
-            "{} exists but is not a directory; refusing to place the socket there",
-            dir.display()
-        );
-    }
-    if meta.uid() != current_uid() {
-        anyhow::bail!(
-            "{} is owned by uid {}, not by us; refusing to place the socket there",
-            dir.display(),
-            meta.uid()
-        );
-    }
-
-    // Tighten rather than reject: a directory that is ours but too permissive
-    // is recoverable, and this is the common case when an earlier version
-    // created it.
-    let mode = meta.permissions().mode() & 0o777;
-    if mode != 0o700 {
-        log::warn!("tightening {} from {mode:o} to 700", dir.display());
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting {}", dir.display()))?;
+    if crate::private_dir::prepare(dir, "the socket")? == crate::private_dir::Found::WasOpen {
+        crate::private_dir::drop_foreign_entries(dir)?;
     }
     Ok(())
 }
 
-#[cfg(not(target_family = "wasm"))]
-#[cfg(unix)]
-fn current_uid() -> u32 {
-    rustix::process::getuid().as_raw()
-}
-
-#[cfg(all(not(unix), not(target_family = "wasm")))]
-fn prepare_state_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
-}
-
-/// Longest single frame a client may send.
+/// The daemon's half of [`oxidezap_ipc::read_frame`].
 ///
-/// Per frame, not per connection: a reader capped for its whole lifetime would
-/// give a long-lived front end an artificial EOF once its small, valid
-/// requests happened to add up. Requests are tiny; a megabyte is far past any
-/// legitimate one and still cheap to refuse.
-pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-
+/// Not that function: this side reads inside a runtime, from an `AsyncRead`
+/// it selects over, where a front end parks a thread in a blocking read. The
+/// bound, the outcome and the resynchronization rules come from the ipc crate
+/// so the two ends cannot disagree; only the loop is a platform each.
+///
 /// Read one newline-delimited frame, bounded independently of every other.
 ///
 /// Returns `None` at end of stream. Reads bytes rather than lines because a
@@ -369,18 +322,18 @@ pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     buf: &mut Vec<u8>,
-) -> Result<Option<FrameRead>> {
+) -> Result<Option<oxidezap_ipc::FrameRead>> {
     // What is already here is a prefix a cancelled call left behind, and it
     // counts against this frame's budget: the cap is per frame, and a frame
     // read across three cancellations is still one frame.
     let carried = buf.len();
-    if carried >= MAX_REQUEST_BYTES {
+    if carried >= oxidezap_ipc::MAX_REQUEST_BYTES {
         buf.clear();
-        return Ok(Some(FrameRead::TooLong));
+        return Ok(Some(oxidezap_ipc::FrameRead::TooLong));
     }
 
     let read = {
-        let mut limited = reader.take((MAX_REQUEST_BYTES - carried) as u64);
+        let mut limited = reader.take((oxidezap_ipc::MAX_REQUEST_BYTES - carried) as u64);
         limited.read_until(b'\n', buf).await?
     };
 
@@ -399,34 +352,20 @@ async fn read_frame<R: AsyncRead + Unpin>(
         // that went away mid-frame. Acting on the partial bytes is not an
         // option either way — the framing says where a frame ends, and this
         // one never said.
-        let hit_the_cap = buf.len() == MAX_REQUEST_BYTES;
+        let hit_the_cap = buf.len() == oxidezap_ipc::MAX_REQUEST_BYTES;
         buf.clear();
-        return Ok(hit_the_cap.then_some(FrameRead::TooLong));
+        return Ok(hit_the_cap.then_some(oxidezap_ipc::FrameRead::TooLong));
     }
 
     buf.pop();
     let frame = match std::str::from_utf8(buf) {
-        Ok(line) => FrameRead::Line(line.to_string()),
-        Err(_) => FrameRead::NotUtf8,
+        Ok(line) => oxidezap_ipc::FrameRead::Line(line.to_string()),
+        Err(_) => oxidezap_ipc::FrameRead::NotUtf8,
     };
     // Cleared here, at the end of a complete frame, rather than at the start
     // of the next call: only a cancelled read may leave anything behind.
     buf.clear();
     Ok(Some(frame))
-}
-
-/// The outcome of reading one frame.
-#[derive(Debug)]
-enum FrameRead {
-    Line(String),
-    /// Well-framed bytes that are not text. Answerable, so the connection
-    /// survives a client with an encoding bug.
-    NotUtf8,
-    /// No newline within the cap. The stream cannot be resynchronized, since
-    /// there is no way to tell where this frame was meant to end, so this
-    /// ends the connection — unlike the other two, which the client recovers
-    /// from.
-    TooLong,
 }
 
 /// One front end, from the handshake to the close.
@@ -646,7 +585,7 @@ where
             // Cancellation-safe: `read_frame` carries a partial frame in
             // `buf` across losing this race. See its documentation.
             frame = read_frame(&mut reader, &mut buf) => match frame? {
-                Some(FrameRead::Line(line)) => {
+                Some(oxidezap_ipc::FrameRead::Line(line)) => {
                     // Parsed once, here: gating update delivery and answering
                     // are two decisions about one frame, and reading it twice
                     // is how they drift apart.
@@ -686,14 +625,17 @@ where
                         return Ok(());
                     }
                 }
-                Some(FrameRead::NotUtf8) => {
+                Some(oxidezap_ipc::FrameRead::NotUtf8) => {
                     write_line(&mut writer, &not_utf8()?).await?;
                 }
-                Some(FrameRead::TooLong) => {
+                Some(oxidezap_ipc::FrameRead::TooLong) => {
                     // Unlike the other two this ends the connection: with no
                     // newline there is no way to know where the frame was meant
                     // to end, so the stream cannot be resynchronized.
-                    let frame = malformed(&format!("frame exceeded {MAX_REQUEST_BYTES} bytes"))?;
+                    let frame = malformed(&format!(
+                    "frame exceeded {} bytes",
+                    oxidezap_ipc::MAX_REQUEST_BYTES
+                ))?;
                     write_line(&mut writer, &frame).await?;
                     return Ok(());
                 }
@@ -719,7 +661,7 @@ async fn handshake<S: AsyncRead + AsyncWrite>(
 ) -> Result<Option<Attached>> {
     loop {
         match read_frame(reader, buf).await? {
-            Some(FrameRead::Line(line)) => match check_hello(&line) {
+            Some(oxidezap_ipc::FrameRead::Line(line)) => match check_hello(&line) {
                 Ok(attached) => return Ok(Some(attached)),
                 Err(rejection) => {
                     if let Some(rejection) = rejection {
@@ -728,9 +670,12 @@ async fn handshake<S: AsyncRead + AsyncWrite>(
                     return Ok(None);
                 }
             },
-            Some(FrameRead::NotUtf8) => write_line(writer, &not_utf8()?).await?,
-            Some(FrameRead::TooLong) => {
-                let frame = malformed(&format!("frame exceeded {MAX_REQUEST_BYTES} bytes"))?;
+            Some(oxidezap_ipc::FrameRead::NotUtf8) => write_line(writer, &not_utf8()?).await?,
+            Some(oxidezap_ipc::FrameRead::TooLong) => {
+                let frame = malformed(&format!(
+                    "frame exceeded {} bytes",
+                    oxidezap_ipc::MAX_REQUEST_BYTES
+                ))?;
                 write_line(writer, &frame).await?;
                 return Ok(None);
             }
@@ -1572,7 +1517,7 @@ mod tests {
 
         // More total bytes than the cap, in frames far below it.
         let frame = "x".repeat(1000);
-        let frames = (MAX_REQUEST_BYTES / 1000) + 10;
+        let frames = (oxidezap_ipc::MAX_REQUEST_BYTES / 1000) + 10;
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt as _;
             for _ in 0..frames {
@@ -1583,7 +1528,7 @@ mod tests {
 
         for i in 0..frames {
             match read_frame(&mut reader, &mut buf).await {
-                Ok(Some(FrameRead::Line(line))) => assert_eq!(line.len(), 1000),
+                Ok(Some(oxidezap_ipc::FrameRead::Line(line))) => assert_eq!(line.len(), 1000),
                 other => panic!("frame {i} of {frames} was cut short: {other:?}"),
             }
         }
@@ -1606,12 +1551,12 @@ mod tests {
 
         assert!(matches!(
             read_frame(&mut reader, &mut buf).await,
-            Ok(Some(FrameRead::NotUtf8))
+            Ok(Some(oxidezap_ipc::FrameRead::NotUtf8))
         ));
         // The stream survives it.
         assert!(matches!(
             read_frame(&mut reader, &mut buf).await,
-            Ok(Some(FrameRead::Line(_)))
+            Ok(Some(oxidezap_ipc::FrameRead::Line(_)))
         ));
     }
 
@@ -1640,7 +1585,7 @@ mod tests {
 
         client.write_all(b"shot\"}\n").await.unwrap();
         match read_frame(&mut reader, &mut buf).await {
-            Ok(Some(FrameRead::Line(line))) => {
+            Ok(Some(oxidezap_ipc::FrameRead::Line(line))) => {
                 assert!(
                     matches!(
                         serde_json::from_str::<ClientRequest>(&line),
@@ -1661,11 +1606,11 @@ mod tests {
         let (client, server) = tokio::io::duplex(1024);
         let mut reader = BufReader::new(server);
         // As if a cancelled read had already consumed a full frame's worth.
-        let mut buf = vec![b'x'; MAX_REQUEST_BYTES];
+        let mut buf = vec![b'x'; oxidezap_ipc::MAX_REQUEST_BYTES];
 
         assert!(matches!(
             read_frame(&mut reader, &mut buf).await,
-            Ok(Some(FrameRead::TooLong))
+            Ok(Some(oxidezap_ipc::FrameRead::TooLong))
         ));
         assert!(buf.is_empty(), "a refused frame leaves nothing behind");
         drop(client);

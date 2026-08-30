@@ -2619,6 +2619,69 @@ fn the_minimal_module_in_the_abi_document_loads() {
     );
 }
 
+/// The document said `oxi_subscribe` and `oxi_request_caps` answer `-5`
+/// outside `oxi_init`. They answer nothing: both are declared without a
+/// result, and an author who believed the prose declares the import with one
+/// and is refused at instantiation for a signature mismatch — before any
+/// diagnostic could reach them. This is that refusal, pinned so the prose and
+/// the surface cannot drift apart again.
+#[test]
+fn declaring_a_result_on_a_resultless_import_refuses_the_module() {
+    let dir = TempDir::new("resultful-subscribe");
+    dir.plugin(
+        "wrong",
+        &versioned(
+            r#"(module
+  (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (drop (call $subscribe (i64.const 2)))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param i32 i32) (result i32) (i32.const 0)))"#,
+        ),
+    );
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    assert!(
+        plugins.surfaces().is_empty(),
+        "a module whose import signature disagrees with the host does not load"
+    );
+}
+
+/// The document said a second call to any of the three declaring imports
+/// refuses the load. `oxi_set_name` does not: it answers `REFUSED` and the
+/// plugin runs under the first name. A plugin whose setup is split across two
+/// helpers therefore loads normally, and its author looks for a load error
+/// that never happens.
+#[test]
+fn naming_twice_is_refused_without_refusing_the_plugin() {
+    let dir = TempDir::new("named-twice");
+    dir.plugin(
+        "twice",
+        &versioned(
+            r#"(module
+  (import "oxidezap" "oxi_set_name" (func $set_name (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "First")
+  (data (i32.const 8) "Second")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (drop (call $set_name (i32.const 0) (i32.const 5)))
+    (drop (call $set_name (i32.const 8) (i32.const 6)))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param i32 i32) (result i32) (i32.const 0)))"#,
+        ),
+    );
+    let published = Published::default();
+    let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    let surfaces = plugins.surfaces();
+    assert_eq!(surfaces.len(), 1, "the plugin loads");
+    assert_eq!(surfaces[0].name, "First", "under the name it claimed first");
+}
+
 /// A plugin reading one field over and over, with a buffer big enough for it.
 ///
 /// Sends only once the host refuses, so "did the budget bite" is a command

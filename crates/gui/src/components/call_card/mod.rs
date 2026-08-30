@@ -178,7 +178,7 @@ fn waiting_strip(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let label = format!("{caller_name} is also calling");
+    let label = format!("{} is also calling", crate::utils::capped_name(caller_name));
 
     div()
         .flex()
@@ -341,7 +341,7 @@ fn minimized_pill(
 ) -> impl IntoElement + use<> {
     let expand_entity = entity.clone();
     let end_entity = entity;
-    let name = stage.peer_name().to_string();
+    let name = crate::utils::capped_name(stage.peer_name());
     let detail = stage
         .active()
         .map(|call| call.elapsed_label())
@@ -367,8 +367,16 @@ fn minimized_pill(
             div()
                 .flex()
                 .flex_col()
+                .min_w_0()
+                // The pill is positioned from the window's right edge, so a
+                // name it will not clip pushes the whole card — drag handle
+                // included — off the left of the window.
+                .max_w(metrics.text_secondary() * 12.0)
                 .child(
                     div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
                         .text_size(metrics.text_secondary())
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(cx.theme().foreground)
