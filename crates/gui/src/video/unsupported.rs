@@ -390,13 +390,30 @@ impl StreamingVideoDecoder {
             return;
         }
 
+        // A picture dropped for want of a copy slot is one this walk already
+        // counted as fed. Left alone, the equality branch below then answers
+        // "already asked for" on every later poll while the answer is never
+        // coming, so a paused scrub stops short of the frame somebody
+        // selected. Replaying is what makes it come, and by then the copies
+        // that crowded it out have drained.
+        let refused = self
+            .decoder
+            .as_ref()
+            .is_some_and(webcodecs::Decoder::take_refusal);
+
         // pictures to ask for it again.
-        if i64::try_from(target_index).unwrap_or(i64::MAX) == i64::from(self.last_fed_index) {
+        if !refused
+            && i64::try_from(target_index).unwrap_or(i64::MAX) == i64::from(self.last_fed_index)
+        {
             self.collect();
             return;
         }
 
-        let start = if target_index as i32 > self.last_fed_index {
+        // A refusal takes the replay path whatever the target is, because
+        // what has to be redone is a picture and not a position: the decoder
+        // is re-entered at the keyframe before the target and walked to it,
+        // which is exactly what a backward seek already does.
+        let start = if !refused && target_index as i32 > self.last_fed_index {
             (self.last_fed_index + 1) as usize
         } else {
             // Backwards: the decoder's reference chain only runs forwards, so

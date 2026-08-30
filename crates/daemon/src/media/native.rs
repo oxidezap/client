@@ -220,7 +220,43 @@ fn prepare_dir(dir: &std::path::Path) -> Result<()> {
         // it: the same sweep the plugin directory takes.
         crate::private_dir::drop_foreign_entries(dir)?;
     }
+    // Once, here, because a daemon that is restarted is the case the
+    // per-upload call cannot cover: the orphan was left by the run before
+    // this one.
+    reclaim_stale_uploads(dir);
     Ok(())
+}
+
+/// Delete staged uploads nobody came back for.
+///
+/// Split out of [`sweep`] because it has to be reachable without it. The
+/// sweep runs on a *cache-write* threshold, and a staged upload is written by
+/// the front end rather than through `put`, so it never advances that
+/// counter: on an account that downloads no media, an orphan would sit past
+/// the allowance for ever with the rule that names it never running. Called
+/// where a staged payload is created, and once at startup, which between them
+/// cover both the long-running daemon and the one that was restarted.
+pub fn reclaim_stale_uploads(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !is_staged_upload(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta
+            .modified()
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age > STALE_UPLOAD)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Drop the oldest files once enough has been written to be worth looking.
@@ -299,6 +335,7 @@ pub(super) fn delete(scope: Wipe) -> Result<()> {
 
 /// Delete oldest-first until the cache is under budget.
 fn sweep(dir: &std::path::Path) -> Result<()> {
+    reclaim_stale_uploads(dir);
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     let mut total = 0u64;
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -316,23 +353,10 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         // waiting to have sent, and it never counted toward the budget it
         // would be dropped for: `put` is what feeds the sweep, and an upload
         // is written by the front end, not through it.
+        // Spared the budget, and reclaimed on age by `reclaim_stale_uploads`,
+        // which this calls first so a sweep also does the sweeping somebody
+        // reading only this function would expect it to.
         if is_staged_upload(&entry.file_name().to_string_lossy()) {
-            // Spared the budget, not spared for ever. A staged payload is
-            // opened by the send that names it, which follows its upload by
-            // milliseconds, so one this old belongs to a send that never
-            // came: a front end that went away between the two, or an upload
-            // whose answer was lost while the write landed anyway, where the
-            // discard raced the rename and lost. Nothing else would ever
-            // remove it, because the sweep is the only thing that looks and
-            // it was told to look away.
-            if meta
-                .modified()
-                .ok()
-                .and_then(|at| at.elapsed().ok())
-                .is_some_and(|age| age > STALE_UPLOAD)
-            {
-                let _ = std::fs::remove_file(entry.path());
-            }
             continue;
         }
         let age = meta.modified().unwrap_or(std::time::UNIX_EPOCH);

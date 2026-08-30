@@ -14,6 +14,8 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
+#[cfg(not(target_family = "wasm"))]
+pub use platform::reclaim_stale_uploads;
 pub use platform::{cache_usage, claim, has, put, put_owned, take};
 /// Read without removing, where the front end is this process. See `web.rs`.
 #[cfg(target_family = "wasm")]

@@ -706,6 +706,13 @@ async fn receive_media(
         .await;
     }
     log::debug!("staged {} bytes under {key}", body.len());
+    // Every staging is also an occasion to notice the ones nobody came back
+    // for. The cache sweep runs on a threshold of *cache* writes, which a
+    // staged upload does not advance, so without this the age rule that
+    // reclaims an orphan is only reachable through unrelated traffic.
+    if let Some(dir) = oxidezap_ipc::media_dir() {
+        crate::media::reclaim_stale_uploads(&dir);
+    }
     respond(stream.get_mut(), 204, "text/plain", origin, b"").await
 }
 

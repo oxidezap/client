@@ -99,6 +99,16 @@ pub struct Decoder {
     /// How many frames have been handed to a copy, which is the order they
     /// were decoded in. See [`Slot::accepted`].
     submitted: Rc<Cell<u64>>,
+    /// Set when a picture was dropped because too many copies were in
+    /// flight.
+    ///
+    /// The drop is right for a call, where a frame nobody could read is a
+    /// frame worth losing. It is wrong for an attachment, where the feed has
+    /// already advanced past the target it asked for and would otherwise sit
+    /// on an older picture for ever, waiting for one that was thrown away.
+    /// So the fact is reported rather than only acted on, and the caller that
+    /// cares asks.
+    refused: Rc<Cell<bool>>,
     /// How many copies have been started and not yet resolved.
     ///
     /// The callers bound the decoder's *input* queue, which says nothing
@@ -176,6 +186,7 @@ impl Decoder {
         let generation = Rc::new(Cell::new(0u64));
         let submitted = Rc::new(Cell::new(0u64));
         let in_flight = Rc::new(Cell::new(0usize));
+        let refused = Rc::new(Cell::new(false));
         let turns: Rc<RefCell<TurnLog>> = Rc::new(RefCell::new(TurnLog::default()));
 
         let on_frame = {
@@ -185,6 +196,7 @@ impl Decoder {
             let generation = Rc::clone(&generation);
             let submitted = Rc::clone(&submitted);
             let in_flight = Rc::clone(&in_flight);
+            let refused = Rc::clone(&refused);
             Closure::<dyn FnMut(web_sys::VideoFrame)>::new(move |frame: web_sys::VideoFrame| {
                 // Dropped rather than queued, which is what every queue on
                 // this path does: the slot holds one picture, so a frame
@@ -194,6 +206,7 @@ impl Decoder {
                 // buffer and a decoder that runs out stops producing.
                 if in_flight.get() >= MAX_COPIES_IN_FLIGHT {
                     frame.close();
+                    refused.set(true);
                     return;
                 }
                 let seq = submitted.get().wrapping_add(1);
@@ -252,6 +265,7 @@ impl Decoder {
             generation,
             submitted,
             in_flight,
+            refused,
             rotation,
             turns,
             max_pixels,
@@ -322,6 +336,16 @@ impl Decoder {
         self.slot.borrow().failed.clone()
     }
 
+    /// Whether a picture was dropped for want of a copy slot since this was
+    /// last asked, and clear the fact.
+    ///
+    /// A caller that walks to a target has to know: the unit was fed, so its
+    /// index has advanced, and the picture that would have answered is gone.
+    /// Without asking, the walk waits for something that is never coming.
+    pub fn take_refusal(&self) -> bool {
+        self.refused.replace(false)
+    }
+
     /// How many pictures have come out so far.
     pub fn produced(&self) -> u64 {
         self.slot.borrow().produced
@@ -337,6 +361,7 @@ impl Decoder {
         // belonging to the stream that has just been left behind.
         self.generation.set(self.generation.get().wrapping_add(1));
         self.submitted.set(0);
+        self.refused.set(false);
 
         let _ = self.inner.reset();
         self.turns.borrow_mut().clear();
