@@ -205,11 +205,16 @@ impl WhatsAppApp {
         &self.plugins
     }
 
-    /// Every plugin id in this front end's own folder, once it has been
-    /// asked. Empty until then, and forever where there is no folder.
+    /// Every plugin id in this front end's own folder, or `None` where the
+    /// folder has not been read yet — and where there is none to read.
+    ///
+    /// The two are worth telling apart by whoever draws them: "the folder
+    /// does not hold this plugin" is a fact about the folder, and an answer
+    /// nobody has asked for yet is not that fact. The read is a task, so the
+    /// first frame after Settings opens has none of it.
     #[must_use]
-    pub fn installed_plugins(&self) -> &[String] {
-        self.installed_plugins.as_deref().unwrap_or_default()
+    pub fn installed_plugins(&self) -> Option<&[String]> {
+        self.installed_plugins.as_deref()
     }
 
     /// Read the folder, so Settings can offer to remove what is in it.

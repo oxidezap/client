@@ -113,7 +113,13 @@ pub async fn installed() -> Vec<Module> {
             log::warn!("skipping {name}: its name is not a usable plugin id");
             continue;
         };
-        let bytes = match read(&dir, &name).await {
+        // What is left of the folder's budget, handed down so the size is
+        // checked before the bytes are read rather than after. Checking the
+        // total afterwards bounded what this *keeps* and not what it
+        // allocates: one oversized file — written through origin tooling, or
+        // left by a build that got away — would be copied into the tab whole
+        // before anything refused it.
+        let bytes = match read(&dir, &name, MAX_TOTAL_BYTES - total).await {
             Ok(bytes) => bytes,
             Err(e) => {
                 log::warn!("not loading {id}: {e}");
@@ -121,13 +127,6 @@ pub async fn installed() -> Vec<Module> {
             }
         };
         total = total.saturating_add(bytes.len());
-        if total > MAX_TOTAL_BYTES {
-            log::warn!(
-                "stopping at {id}: this page's plugin folder holds more than the \
-                 {MAX_TOTAL_BYTES} bytes it may be read for"
-            );
-            break;
-        }
         modules.push(Module {
             id,
             open: Box::new(move || Ok(bytes)),
@@ -410,8 +409,16 @@ async fn entries(dir: &FileSystemDirectoryHandle) -> Result<Vec<String>, JsValue
     }
 }
 
-/// One file's bytes.
-async fn read(dir: &FileSystemDirectoryHandle, name: &str) -> Result<Vec<u8>, String> {
+/// One file's bytes, but only if `room` is left for them.
+///
+/// The size is asked of the `File` before `array_buffer` is, which is the
+/// same order the picker asks it in and for the same reason: a file too large
+/// to keep is not worth reading, and here it is worse than a wasted read —
+/// this runs before the page has drawn anything, so an oversized module in
+/// the folder would exhaust the tab at startup and take Settings, and the
+/// Remove button in it, down with it. A `File` knows how long it is before
+/// anybody asks for its bytes.
+async fn read(dir: &FileSystemDirectoryHandle, name: &str, room: usize) -> Result<Vec<u8>, String> {
     let bytes = async {
         let handle: web_sys::FileSystemFileHandle = JsFuture::from(
             dir.get_file_handle_with_options(name, &FileSystemGetFileOptions::new()),
@@ -419,11 +426,20 @@ async fn read(dir: &FileSystemDirectoryHandle, name: &str) -> Result<Vec<u8>, St
         .await?
         .dyn_into()?;
         let file: web_sys::File = JsFuture::from(handle.get_file()).await?.dyn_into()?;
+        let size = file.size() as usize;
+        if size > room {
+            return Ok::<_, JsValue>(Err(size));
+        }
         let buffer = JsFuture::from(file.array_buffer()).await?;
-        Ok::<_, JsValue>(Uint8Array::new(&buffer).to_vec())
+        Ok(Ok(Uint8Array::new(&buffer).to_vec()))
     }
     .await;
-    bytes.map_err(described)
+    match bytes.map_err(described)? {
+        Ok(bytes) => Ok(bytes),
+        Err(size) => Err(format!(
+            "it is {size} bytes and only {room} are left to read"
+        )),
+    }
 }
 
 /// Replace one file's bytes.

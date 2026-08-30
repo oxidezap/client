@@ -90,6 +90,7 @@ fn plugins(
     // it goes on spending the folder's budget at every load.
     let silent: Vec<String> = app
         .installed_plugins()
+        .unwrap_or_default()
         .iter()
         .filter(|id| !app.plugins().iter().any(|surface| &surface.id == *id))
         .cloned()
@@ -148,10 +149,28 @@ fn plugins(
                     .flex_col()
                     .gap(metrics.space_md())
                     .child(entry)
-                    .children(
-                        home.can_install()
-                            .then(|| remove_a_plugin(&surface.id, entity.clone(), metrics)),
-                    )
+                    .children(home.can_install().then(|| {
+                        // A removed plugin keeps running until the next load,
+                        // so its surface is still here while its file is not
+                        // — and a Remove button over a file that has gone is
+                        // one whose second press answers "not found". What it
+                        // says instead is the true thing: it is out of the
+                        // folder and it stops at the next load.
+                        // Absent from a folder that has been *read*. A
+                        // listing nobody has answered yet is not the folder
+                        // saying no — the read is a task, so the first frame
+                        // after Settings opens has none of it, and taking
+                        // that for absence would tell somebody every plugin
+                        // they are running had been removed.
+                        let gone = app
+                            .installed_plugins()
+                            .is_some_and(|ids| !ids.contains(&surface.id));
+                        if gone {
+                            removed_already(metrics, cx).into_any_element()
+                        } else {
+                            remove_a_plugin(&surface.id, entity.clone(), metrics).into_any_element()
+                        }
+                    }))
             }))
             .children(broken)
             .children(installer),
@@ -170,6 +189,21 @@ fn add_a_plugin(entity: Entity<WhatsAppApp>, metrics: Metrics) -> impl IntoEleme
                 entity.update(cx, |app, cx| app.install_plugin(cx));
             }),
     )
+}
+
+/// What stands where the Remove button was, once the file has gone.
+///
+/// Drawn rather than left blank: a control that vanishes tells nobody
+/// anything, which is the same reason a stopped plugin's widgets stay on
+/// screen beside their reason.
+fn removed_already(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .justify_end()
+        .px(metrics.space_xs())
+        .text_size(metrics.text_meta())
+        .text_color(cx.theme().muted_foreground)
+        .child("Removed. It stops at the next reload.")
 }
 
 /// The control that takes one back out again.
