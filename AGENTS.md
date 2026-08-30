@@ -251,6 +251,19 @@ profile here repeats it deliberately.
   `<pair-device>` from the handler that runs inline, and then sit there with
   no code on screen. `net::abort_requested` is the rule stated once: a value
   sent is an abort, a sender dropped is a detachment and waits forever.
+- **A poisoned lock is answered by what the lock protects.** Two answers, and
+  the choice is not a matter of taste: a lock over state whose invariants span
+  several fields — the daemon's `Inner`, a call registry — is *panicked* on,
+  because a holder that died mid-mutation may have left it torn and continuing
+  publishes that. A lock over one collection whose every operation is atomic
+  in itself — a memo, an ordering token, a map of lanes — is *recovered*
+  (`unwrap_or_else(PoisonError::into_inner)`), because a `HashMap` cannot be
+  left half-inserted and turning a naming question into a second panic is
+  worse than answering it. Nothing under the release profile is reachable
+  either way: `panic = "abort"` means no lock is ever poisoned there, so this
+  rule is about tests and debug builds, which is exactly where a second panic
+  hides the first.
+
 - **A directory that was open is one whose contents are suspect.** Tightening
   the mode closes the door behind whatever is already inside, so the question
   after a `chmod` is what that is. Authority is deleted — the plugin host

@@ -634,9 +634,14 @@ impl StateHub {
         }
     }
 
-    /// A poisoned lock means a previous holder panicked mid-mutation. The
-    /// state may be torn, so continuing would publish garbage; taking the
-    /// inner value and letting the panic propagate is the honest outcome.
+    /// A poisoned lock means a previous holder panicked mid-mutation.
+    ///
+    /// Panicked on rather than recovered, which is the rule in AGENTS.md
+    /// applied to what this lock covers: `Inner` holds the version, the
+    /// connection, the calls and the chats together, and a holder that died
+    /// between two of those left a state no frame should describe. The
+    /// ordering lock beside it is recovered for the same reason read the
+    /// other way round — it protects nothing but the order of two sends.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner
             .lock()
