@@ -1223,6 +1223,18 @@ by definition.
   `chat-store/store.rs` (~3.2k). The calls came out of the first one and the
   video plane never went in, so what is left is the event pump, hydration and
   the paged reads — three things rather than one file.
+- **The session still runs on the window's own thread.** Two of the three
+  things that wanted a dedicated worker are in place: `exec::sleep` arms its
+  timer on a worker global as readily as on a window, and `store/web.rs` asks
+  for the OPFS handle before falling back, so both backends are written and
+  the pragma and the wipe already dispatch on which answered. What is left is
+  the move itself — `daemon::embedded` assembled inside a worker, with the
+  front end's `Link` a `MessagePort` rather than a `tokio::io::duplex` — and
+  it is the expensive half: the session, the store and the bridge all change
+  address space at once, and the page that works today is the thing at risk
+  if it is got wrong. `wasm_thread` is already in the tree through gpui, so
+  the spawn is not the obstacle; the restructuring is.
+
 - **The session runs in the browser, and pairing is measured now.** A page
   with no daemon named starts its own, and the whole of it works against
   WhatsApp: the VFS opens, the store and its migrations run, `ChatStore` comes
