@@ -909,6 +909,17 @@ impl Session {
         });
     }
 
+    /// Ask the daemon to read its plugin folder again and run what is in it.
+    ///
+    /// Fire and forget from here, like everything else on this channel: what
+    /// came back arrives as a republished set of surfaces, which is how every
+    /// *other* window learns of it too — a reload is the daemon's, not this
+    /// window's, and one window pressing it is not a fact the others should
+    /// have to be told separately.
+    pub fn reload_plugins(&self) {
+        self.tell(ClientRequest::ReloadPlugins);
+    }
+
     /// Tell a plugin somebody used one of its widgets.
     ///
     /// Fire and forget, like typing is: the daemon hands it to the plugin and

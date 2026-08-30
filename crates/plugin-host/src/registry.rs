@@ -51,6 +51,16 @@ pub struct Registry {
     /// has to be released before the sink is called, or a sink that reads
     /// back through the registry would deadlock.
     publishing: Mutex<()>,
+    /// Whether this set of plugins has been superseded.
+    ///
+    /// A retired registry publishes nothing, and that is what makes a reload
+    /// safe. A worker's last act is very often to publish — its tree, or the
+    /// reason it stopped — and on a page there is no way to wait for it: the
+    /// task is on the same loop the reload runs on, so it may not have taken
+    /// its turn until well after the generation that replaced it has drawn.
+    /// One late `set_roots` from a plugin nobody is running would overwrite
+    /// the whole live set with the one that is gone.
+    retired: std::sync::atomic::AtomicBool,
 }
 
 impl Registry {
@@ -61,7 +71,17 @@ impl Registry {
             approvals,
             sink,
             publishing: Mutex::new(()),
+            retired: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Stop this set from publishing anything, ever again.
+    ///
+    /// Not a pause: a generation is retired exactly once, when it is
+    /// superseded or when the host shuts down, and neither has a way back.
+    pub(crate) fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record a plugin that has just been loaded, before it has drawn
@@ -195,10 +215,17 @@ impl Registry {
     }
 
     pub(crate) fn publish(&self) {
+        // Asked under the same lock the snapshot is taken under, so a worker
+        // that reads `false` here cannot then publish after a retirement that
+        // began in between: `retire` cannot be observed as false by anything
+        // that goes on to hold this lock after it was set.
         let _order = self
             .publishing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.retired.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let surfaces = self.surfaces();
         (self.sink)(surfaces);
     }

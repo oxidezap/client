@@ -70,6 +70,85 @@ pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugin
     }
 }
 
+/// Read the plugin folder again and replace what is running with what is in
+/// it now, without stopping the daemon or the session.
+///
+/// The mirror of [`start`], down to where the work happens: a desktop's scan
+/// reads files and runs each `oxi_init`, all of it synchronous, so it goes to
+/// a blocking thread; a page's modules come out of OPFS and its host runs on
+/// the page's own loop, so it is awaited here.
+///
+/// Answers how many plugins are running afterwards.
+pub async fn reload(plugins: &Arc<Plugins>) -> usize {
+    #[cfg(target_family = "wasm")]
+    {
+        // A fresh handle on the origin's storage, not the old one: the
+        // retiring generation's tasks are still on this loop with a settings
+        // write ahead of them, and taking a new stamp is what stops that
+        // write landing on top of the set that replaced it. The same reason
+        // `plugins::start` takes one.
+        let modules = web::installed().await;
+        plugins
+            .reload(modules, Arc::new(oxidezap_plugin_host::Origin::storage()))
+            .await
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let Some(dir) = oxidezap_plugin_host::default_dir() else {
+            log::debug!("no per-user data directory, so nothing to reload");
+            return 0;
+        };
+        let state_dir = oxidezap_plugin_host::default_state_dir();
+        let plugins = Arc::clone(plugins);
+        tokio::task::spawn_blocking(move || plugins.reload_from_dir(&dir, state_dir.as_deref()))
+            .await
+            .unwrap_or_else(|e| {
+                log::error!("the plugin loader did not finish: {e}");
+                0
+            })
+    }
+}
+
+/// Record what somebody answered about a plugin's permissions.
+///
+/// A platform split for one reason, and it is the reason every other one here
+/// exists: a desktop writes and renames a file, which is disk I/O that must
+/// not run on a runtime worker, and a page writes `localStorage`, which is
+/// synchronous by construction and has no blocking pool to be moved to. This
+/// was `spawn_blocking` on both, and on a page that is not a slow answer but
+/// a panic — "there is no reactor running" — so approving a plugin in the
+/// browser has never once worked.
+///
+/// # Errors
+///
+/// The thread recording it panicked, which the caller answers by refusing the
+/// request rather than acknowledging a permission the disk never received.
+pub async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> Result<(), ()> {
+    #[cfg(target_family = "wasm")]
+    {
+        // Inline, and there is nowhere else it could go. `spawn_blocking`
+        // needs a blocking pool, and a page's runtime has none — nor could
+        // it, since a browser agent is one thread. What this costs is the
+        // write itself, which is a `localStorage` set: the same call a
+        // plugin's own settings already make from inside a wasm call.
+        plugins.approve(&plugin, approved);
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let plugins = Arc::clone(plugins);
+        // The answer is read, not dropped: a panic in there left the client
+        // acknowledged for a permission the disk never received, with
+        // Settings drawing a state nothing had recorded and no line in the
+        // log.
+        tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved))
+            .await
+            .map_err(|e| log::error!("recording a plugin approval failed: {e}"))
+    }
+}
+
 /// A sink for a set of plugins that will never publish anything.
 #[cfg(not(target_family = "wasm"))]
 fn publishing_to_nothing() -> Sink {

@@ -52,10 +52,10 @@ impl Home {
     #[must_use]
     pub const fn nothing_loaded(self) -> &'static str {
         match self {
-            Self::Folder => "Drop a .wasm file in the plugins folder and restart",
-            Self::Page => "Add a .wasm file below. It runs the next time this page loads.",
+            Self::Folder => "Drop a .wasm file in the plugins folder, then press Reload plugins",
+            Self::Page => "Add a .wasm file below. It starts as soon as it is added.",
             Self::AnotherTab => {
-                "Add a .wasm file below. It runs when the tab holding this account reloads."
+                "Add a .wasm file below. It starts in the tab holding this account."
             }
         }
     }

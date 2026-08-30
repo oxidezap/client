@@ -60,6 +60,12 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   is written once. Where a plugin's approvals and its own settings are kept
   is the other split (`store/`): files in a private directory, or the
   origin's `localStorage`.
+  What is loaded is a *generation* rather than the host itself, because
+  everything in the daemon holds the host: a connection, the session bridge
+  and the tab listener each keep an `Arc<Plugins>` for their own lifetime, so
+  a reload that built a new one would leave every one of them routing presses
+  into a set nobody is running. `Live` is the generation, one lock holds it,
+  and `Plugins::reload` is the only thing that swaps it.
 - **oxidezap-plugin**: the Rust SDK a plugin is written against. Not a
   dependency of anything here; it exists to be built for wasm32. What it adds
   over the raw imports is what the compiler can check: two mask types so a
@@ -547,6 +553,28 @@ profile here repeats it deliberately.
   a loop, which would spend a CPU rediscovering that. Its widgets stay on
   screen, drawn inert beside the reason: a control that vanished tells nobody
   anything.
+- **A reload retires before it loads, and that order is the design.** The
+  obvious alternative — build the new set first, keep the gap short — creates
+  the one thing the host refuses everywhere else: two live workers under one
+  id, each with its own mask, for the length of the load, so withdrawing a
+  permission reaches one of them and leaves the other acting. So the old
+  generation is retired first and the gap is real: for as long as loading
+  takes, nothing is observing the account. That is the honest cost of somebody
+  deciding to change what is running, and it is bounded by `MAX_LOAD_TIME`
+  like every other load; what is *not* lost is anything a plugin wrote down,
+  since its settings and its approval are in storage and the next generation
+  reads them back.
+  Retiring is three things and each answers a platform. The registry is
+  retired *first*, because a worker's last act is very often to publish and a
+  page cannot wait for it — one late `set_roots` from a plugin nobody is
+  running would draw the departed set over the live one. The queues are then
+  dropped and the threads joined, which is what a desktop has. And the masks
+  are zeroed *after* the join, which is the same sentence in the other
+  direction: on a desktop the handler has already finished so it changes
+  nothing, and on a page the task is still on the loop with a call left to
+  make — one that may no longer touch the account. It is the same zero a
+  withdrawal writes, so it is one mechanism aimed at a generation rather than
+  a second one.
 - **Stopping a plugin is dropping its channel, never queueing a message.** A
   stop message has to *fit*, and the plugin that most needs stopping is the
   one whose queue is full — `try_send` there drops the request on the floor
@@ -1264,9 +1292,9 @@ the plugins folder" would be giving instructions about a folder it does not
 have. It is also what decides whether the install and remove controls are
 drawn at all: only a page holding its own session has a folder it can write,
 and a window talking to an `oxidezapd` is looking at another process's
-directory. Installing does not start anything — loading happens once, before
-the session — so the sentence the notice uses is the true one: it runs at the
-next load, which for a page is a reload of the tab.
+directory. Installing *does* start it, by asking the daemon to reload — one
+act from where somebody is standing and two here, because the folder is the
+front end's and the host is the daemon's.
 
 **Media crosses the bridge in both directions.** The daemon's web endpoint
 served media and nothing else, so a page attached to an `oxidezapd` could read
@@ -1494,6 +1522,18 @@ downloaded the ~30 MB module twice, saying so in the console each time
 ("cross-world service worker resource mismatch"). Passing a request through —
 returning from the fetch handler without `respondWith` — leaves it in the
 page's own world, where the preload is waiting for it.
+
+**`spawn_blocking` is a promise about a thread pool a page does not have.**
+The daemon's own code is shared, so a `tokio::task::spawn_blocking` written
+for the disk compiles perfectly for wasm and panics the first time it runs —
+"there is no reactor running" — taking the connection with it. That is how
+approving a plugin in the browser stayed broken through a review, a merge and
+a production test of everything around it: the desktop has a pool, and the
+approval is the one plugin request whose work is I/O. What decides is what the
+work *is*, not where the code lives: a file written and renamed must leave the
+runtime's thread, and a `localStorage` set is synchronous by construction and
+has nowhere to go. `daemon::plugins::approve` is that split, and it is the
+same shape as `plugins::start` and `plugins::reload` beside it.
 
 **A cast to a type no engine defines always fails, and fails quietly.**
 wasm-bindgen checks `dyn_into` with `instanceof <the declared type>` unless
@@ -1836,12 +1876,17 @@ by definition.
   of the threat this guards against — but it is a gap, and closing it means
   reading an ACL and deciding what "only this user" means when the answer is
   a list rather than three bits.
-- **Plugins are not reloadable, and there is no message interception.** A
-  plugin with state, reloaded under itself mid-conversation, is a separate
-  problem; restarting `oxidezapd` is the answer for now and it is cheap. And a
-  plugin that could alter or block an inbound message would sit between the
-  store and every front end, which the whole state model assumes it cannot —
-  plugins observe and act, they do not filter.
+- **A reload is the folder's, not one plugin's.** Reloading one of five
+  restarts five, because an id is what an approval and a settings document are
+  keyed on: two generations holding one id would be two plugins sharing an
+  identity, which is the thing the host refuses everywhere else. Reloading
+  just the module that changed means keeping the rest alive across the swap,
+  which is that same sentence with an exception carved into it, so it is a
+  decision of its own rather than an optimization.
+- **There is no message interception.** A plugin that could alter or block an
+  inbound message would sit between the store and every front end, which the
+  whole state model assumes it cannot — plugins observe and act, they do not
+  filter.
 
 Clickable `div`s that remain are deliberate: a chat row and a media thumbnail
 are surfaces, not commands, and have no semantic component to compose from.

@@ -473,12 +473,7 @@ fn host(dir: &TempDir, commands: Arc<Recorder>, published: &Published) -> Plugin
     // what a plugin *does* has to say so first. Written out here rather than
     // hidden in the constructor: the gate is the point, and a helper that
     // silently opened it would make every test below prove nothing.
-    for id in plugins
-        .ids()
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>()
-    {
+    for id in plugins.ids() {
         plugins.approve(&id, true);
     }
     plugins
@@ -1183,12 +1178,13 @@ fn a_plugin_stopped_for_falling_behind_is_offered_nothing_more() {
     // memory and everything still queued go. Held open, a plugin that
     // overflowed — the one holding the most of all of that — kept it until
     // the daemon shut down.
+    let live = plugins.live();
     assert!(
-        crate::lock(&plugins.workers[0].queue).is_none(),
+        crate::lock(&live.workers[0].queue).is_none(),
         "a stopped plugin's queue is closed, not left standing"
     );
     assert!(
-        plugins.workers[0]
+        live.workers[0]
             .thread
             .lock()
             .unwrap_or_else(|held| held.into_inner())
@@ -3187,4 +3183,182 @@ fn an_action_whose_chat_contradicts_its_slot_is_ignored() {
         widget: PluginWidget::Button,
     });
     until("the greeting", || commands.sent().len() == 1);
+}
+
+// ---- reloading -----------------------------------------------------------
+
+/// The plain case, and the whole point of it: the folder changed, and what is
+/// running changes with it — without the host, the daemon or the session
+/// going anywhere.
+#[test]
+fn a_reload_runs_what_is_in_the_folder_now() {
+    let dir = TempDir::new("reload-picks-up");
+    dir.plugin("first", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(plugins.ids(), vec!["first".to_owned()]);
+
+    // One added, one taken away, which is every way a folder can differ.
+    dir.plugin("second", &draws());
+    std::fs::remove_file(dir.0.join("first.wasm")).expect("removable");
+
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
+    assert_eq!(plugins.ids(), vec!["second".to_owned()]);
+    published.settles("the new set to be published", |set| {
+        set.len() == 1 && set[0].id == "second"
+    });
+}
+
+/// A reload that finds nothing still says so.
+///
+/// The one publication a generation cannot make for itself: surfaces are
+/// published per plugin as each is inserted, so a set with no plugins in it
+/// publishes nothing at all — and every window would go on drawing the set
+/// that is no longer running, with buttons that reach nobody.
+#[test]
+fn a_reload_that_finds_nothing_publishes_the_empty_set() {
+    let dir = TempDir::new("reload-to-empty");
+    dir.plugin("only", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    published.settles("something to be drawn", |set| set.len() == 1);
+
+    std::fs::remove_file(dir.0.join("only.wasm")).expect("removable");
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), 0);
+    assert!(plugins.ids().is_empty());
+    assert!(
+        published.latest().is_empty(),
+        "an empty folder is drawn as an empty folder"
+    );
+}
+
+/// What the user answered is not a property of the plugin that was running.
+///
+/// It is written down against the id and the mask, so the generation that
+/// replaces it reads the same answer back — otherwise every reload would be a
+/// permission prompt, which is the surest way to teach somebody to dismiss
+/// one.
+#[test]
+fn an_approval_survives_a_reload() {
+    let dir = TempDir::new("reload-approval");
+    let state = TempDir::new("reload-approval-state");
+    dir.plugin("keeps", &draws());
+    let published = Published::default();
+    let commands = Recorder::new(Outcome::Accepted);
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state.0),
+        Arc::new(Arc::clone(&commands)),
+        published.sink(),
+    );
+    plugins.approve("keeps", true);
+    published.settles("the grant", |set| {
+        set.iter().any(|p| p.id == "keeps" && p.approved)
+    });
+
+    assert_eq!(plugins.reload_from_dir(&dir.0, Some(&state.0)), 1);
+    let set = published.settles("the reloaded plugin", |set| {
+        set.iter().any(|p| p.id == "keeps")
+    });
+    assert!(
+        set.iter().any(|p| p.id == "keeps" && p.approved),
+        "the answer was recorded against the id, not against the worker"
+    );
+
+    // And it is not merely drawn as approved: the new worker holds the mask,
+    // so it can act. Nothing else grants it — `host` is not used here
+    // precisely so that nothing approves the second generation.
+    plugins.act(&PluginAction {
+        plugin: "keeps".into(),
+        action: "greet".into(),
+        value: None,
+        chat_jid: Some("a@s.whatsapp.net".into()),
+        slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
+    });
+    until("the reloaded plugin to act", || commands.sent().len() == 1);
+}
+
+/// A superseded generation may not publish, and the reason it must not is
+/// that on a page nothing can wait for it.
+///
+/// A desktop joins every worker, so the case is hard to reach there — which
+/// is exactly why it is asserted against the mechanism rather than against a
+/// race: `retire` is what a reload calls, and a registry it has retired is
+/// one whose publications go nowhere.
+#[test]
+fn a_retired_set_cannot_draw_over_the_one_that_replaced_it() {
+    let dir = TempDir::new("reload-stale-publish");
+    dir.plugin("stale", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    published.settles("its interface", |set| set.len() == 1);
+
+    let previous = plugins.live();
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
+    let after = published.latest();
+
+    previous.registry.set_roots("stale", Vec::new());
+    previous.registry.publish();
+    assert_eq!(
+        published.latest(),
+        after,
+        "a generation nobody is running publishes nothing"
+    );
+}
+
+/// Reloading is not a way back in after the account has gone.
+///
+/// `shutdown` is what runs before the store is wiped, and a reload arriving
+/// then would start plugins over a session that is being forgotten — the same
+/// thing an approval is refused for, and for the same reason.
+#[test]
+fn a_shut_down_host_does_not_reload() {
+    let dir = TempDir::new("reload-after-shutdown");
+    dir.plugin("gone", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    let stopped = plugins.live();
+    plugins.shutdown();
+
+    // A file appears in the folder in the window between the wipe starting
+    // and the process ending, which is the shape of the thing being refused:
+    // the reload has a folder to read and would have something to run.
+    dir.plugin("late", &draws());
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), 0);
+    assert!(
+        Arc::ptr_eq(&stopped, &plugins.live()),
+        "nothing is installed over a host that has been shut down"
+    );
+    assert!(
+        !plugins.ids().iter().any(|id| id == "late"),
+        "and the module that appeared is not running"
+    );
+}
+
+/// A plugin the reload retired cannot act, even before its thread has ended.
+///
+/// On a desktop the join covers this; a page cannot join anything, so the
+/// mask is what covers both. It is the same zero a withdrawal writes, which
+/// is why this is one mechanism rather than two.
+#[test]
+fn retiring_a_generation_takes_its_authority_away() {
+    let dir = TempDir::new("reload-authority");
+    dir.plugin("armed", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    let previous = plugins.live();
+    assert_ne!(
+        previous.workers[0].granted.load(Ordering::Relaxed),
+        0,
+        "it was approved to begin with, or this proves nothing"
+    );
+
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
+    assert_eq!(
+        previous.workers[0].granted.load(Ordering::Relaxed),
+        0,
+        "a superseded worker may no longer touch the account"
+    );
 }

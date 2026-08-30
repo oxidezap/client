@@ -60,14 +60,15 @@ pub fn group(
         .child(content)
 }
 
-/// The loaded plugins, each with what it may do and whatever it drew for
-/// itself.
+/// Every plugin this daemon knows about, and the two things that change the
+/// list.
 ///
-/// A list of what is running, and — where this front end has a folder of its
-/// own — the two things that change what is in it. A page holding its own
-/// session is the only front end with one: everywhere else a plugin is a file
-/// in another process's directory, and a screen offering to install one there
-/// would be describing a mechanism this window does not have.
+/// One list, in one shape. It used to be two — the plugins that published a
+/// surface, drawn as cards, and below them the files that did not load, drawn
+/// as a table of key/value rows with a column of identical Remove buttons
+/// underneath it and nothing tying a button to a row. A module that failed to
+/// load is still a plugin in the folder; the difference is a word in its
+/// header, not a second layout.
 fn plugins(
     app: &WhatsAppApp,
     entity: Entity<WhatsAppApp>,
@@ -79,62 +80,44 @@ fn plugins(
         metrics,
     };
     let home = crate::platform::plugins::home();
-    let installer = home
-        .can_install()
-        .then(|| add_a_plugin(entity.clone(), metrics));
 
-    // Everything in the folder that published nothing. A module that fails
-    // to parse, answers the wrong ABI version or traps in `oxi_init` has no
+    // Everything in the folder that published nothing. A module that fails to
+    // parse, answers the wrong ABI version or traps in `oxi_init` has no
     // surface at all, so a screen drawn from the surfaces alone leaves the
     // one file somebody most needs to remove with no control anywhere — and
     // it goes on spending the folder's budget at every load.
-    let silent: Vec<String> = app
+    let unloaded: Vec<String> = app
         .installed_plugins()
         .unwrap_or_default()
         .iter()
         .filter(|id| !app.plugins().iter().any(|surface| &surface.id == *id))
         .cloned()
         .collect();
-    let broken = (!silent.is_empty()).then(|| {
-        div()
-            .flex()
-            .flex_col()
-            .gap(metrics.space_md())
-            .child(card(
-                silent
-                    .iter()
-                    .map(|id| (id.clone(), "Installed, but it did not load".to_string()))
-                    .collect(),
+
+    let rows = app.plugins().len() + unloaded.len();
+    let list = div()
+        .flex()
+        .flex_col()
+        .gap(metrics.space_lg())
+        .children(app.plugins().iter().map(|surface| {
+            crate::components::plugin_ui::settings_entry(
+                surface,
+                app,
+                &ctx,
+                removal(&surface.id, home, app, entity.clone(), metrics, cx),
+                cx,
+            )
+            .into_any_element()
+        }))
+        .children(unloaded.iter().map(|id| {
+            crate::components::plugin_ui::unloaded_entry(
+                id,
+                removal(id, home, app, entity.clone(), metrics, cx),
                 metrics,
                 cx,
-            ))
-            .children(
-                silent
-                    .iter()
-                    .map(|id| remove_a_plugin(id, entity.clone(), metrics)),
             )
-    });
-
-    if app.plugins().is_empty() {
-        // Two different empty lists, and only one of them is waiting for a
-        // file somebody else has to put there.
-        return group(
-            label("PLUGINS", metrics, cx),
-            div()
-                .flex()
-                .flex_col()
-                .gap(metrics.space_lg())
-                .child(card(
-                    vec![("None loaded".to_string(), home.nothing_loaded().to_string())],
-                    metrics,
-                    cx,
-                ))
-                .children(broken)
-                .children(installer),
-            metrics,
-        )
-        .into_any_element();
-    }
+            .into_any_element()
+        }));
 
     group(
         label("PLUGINS", metrics, cx),
@@ -142,82 +125,60 @@ fn plugins(
             .flex()
             .flex_col()
             .gap(metrics.space_lg())
-            .children(app.plugins().iter().map(|surface| {
-                let entry = crate::components::plugin_ui::settings_entry(surface, app, &ctx, cx);
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(metrics.space_md())
-                    .child(entry)
-                    .children(home.can_install().then(|| {
-                        // A removed plugin keeps running until the next load,
-                        // so its surface is still here while its file is not
-                        // — and a Remove button over a file that has gone is
-                        // one whose second press answers "not found". What it
-                        // says instead is the true thing: it is out of the
-                        // folder and it stops at the next load.
-                        // Absent from a folder that has been *read*. A
-                        // listing nobody has answered yet is not the folder
-                        // saying no — the read is a task, so the first frame
-                        // after Settings opens has none of it, and taking
-                        // that for absence would tell somebody every plugin
-                        // they are running had been removed.
-                        let gone = app
-                            .installed_plugins()
-                            .is_some_and(|ids| !ids.contains(&surface.id));
-                        if gone {
-                            removed_already(metrics, cx).into_any_element()
-                        } else {
-                            remove_a_plugin(&surface.id, entity.clone(), metrics).into_any_element()
-                        }
-                    }))
-            }))
-            .children(broken)
-            .children(installer),
+            // Prose, not a key/value row: "None loaded" against a sentence
+            // read as a setting whose value happened to be an instruction.
+            .child(if rows == 0 {
+                empty(home.nothing_loaded(), metrics, cx).into_any_element()
+            } else {
+                list.into_any_element()
+            })
+            .child(plugin_controls(home, entity, metrics, cx)),
         metrics,
     )
     .into_any_element()
 }
 
-/// The control that puts a `.wasm` in this front end's own folder.
-fn add_a_plugin(entity: Entity<WhatsAppApp>, metrics: Metrics) -> impl IntoElement + use<> {
-    div().flex().justify_end().px(metrics.space_xs()).child(
-        Button::new("install-plugin")
-            .label("Add a plugin…")
-            .outline()
-            .on_click(move |_, _window, cx| {
-                entity.update(cx, |app, cx| app.install_plugin(cx));
-            }),
-    )
-}
-
-/// What stands where the Remove button was, once the file has gone.
+/// The control that takes one plugin back out of the folder, where this front
+/// end has a folder to take it out of.
 ///
-/// Drawn rather than left blank: a control that vanishes tells nobody
-/// anything, which is the same reason a stopped plugin's widgets stay on
-/// screen beside their reason.
-fn removed_already(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
-    div()
-        .flex()
-        .justify_end()
-        .px(metrics.space_xs())
-        .text_size(metrics.text_meta())
-        .text_color(cx.theme().muted_foreground)
-        .child("Removed. It stops at the next reload.")
-}
-
-/// The control that takes one back out again.
+/// Inside the plugin's own card, which is the whole of what makes it
+/// unambiguous. `None` twice over: where the folder is another process's, and
+/// where this plugin's file has already gone — a Remove button over a file
+/// that is not there is one whose second press answers "not found".
 ///
-/// Beside each plugin rather than inside its own tree: a plugin draws its
-/// widgets and this is not one of them — a module that could publish its own
-/// uninstall button could also publish something else under that id.
-fn remove_a_plugin(
+/// Absent from a folder that has been *read*. A listing nobody has answered
+/// yet is not the folder saying no — the read is a task, so the first frame
+/// after Settings opens has none of it, and taking that for absence would
+/// tell somebody every plugin they are running had been removed.
+fn removal(
     id: &str,
+    home: crate::platform::plugins::Home,
+    app: &WhatsAppApp,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
-) -> impl IntoElement + use<> {
+    cx: &App,
+) -> Option<gpui::AnyElement> {
+    if !home.can_install() {
+        return None;
+    }
+    if app
+        .installed_plugins()
+        .is_some_and(|ids| !ids.iter().any(|f| f == id))
+    {
+        // Said rather than left blank: a control that vanishes tells nobody
+        // anything, which is the same reason a stopped plugin's widgets stay
+        // on screen beside their reason.
+        return Some(
+            div()
+                .flex_shrink_0()
+                .text_size(metrics.text_meta())
+                .text_color(cx.theme().muted_foreground)
+                .child("Removed")
+                .into_any_element(),
+        );
+    }
     let id = id.to_owned();
-    div().flex().justify_end().px(metrics.space_xs()).child(
+    Some(
         Button::new(gpui::SharedString::from(format!("remove-plugin-{id}")))
             .label("Remove")
             .ghost()
@@ -225,8 +186,75 @@ fn remove_a_plugin(
             .on_click(move |_, _window, cx| {
                 let id = id.clone();
                 entity.update(cx, |app, cx| app.remove_plugin(id, cx));
-            }),
+            })
+            .flex_shrink_0()
+            .into_any_element(),
     )
+}
+
+/// What stands where the list would be.
+fn empty(what: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+    div()
+        .w_full()
+        .rounded(metrics.radius_md())
+        .border_1()
+        .border_color(cx.theme().border)
+        .px(metrics.space_lg())
+        .py(metrics.space_xl())
+        .text_size(metrics.text_small())
+        .text_color(cx.theme().muted_foreground)
+        .child(what)
+}
+
+/// The row under the list: reload, and — where this front end has a folder of
+/// its own — add.
+///
+/// Reload is drawn everywhere and Add is not, and the asymmetry is the whole
+/// of what each is about. The folder belongs to whichever daemon is running
+/// the plugins, so only a front end that *is* that daemon can put a file in
+/// it; but asking it to read the folder again is a request on the wire, which
+/// every front end can make. A desktop window's Reload is for somebody who
+/// has just dropped a `.wasm` beside `oxidezapd`; a follower tab's is for
+/// somebody who installed one into an origin whose host is another tab.
+///
+/// With a line saying what Reload does, because "reload" over a list of
+/// running things is a word somebody is right to hesitate over.
+fn plugin_controls(
+    home: crate::platform::plugins::Home,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let installer = entity.clone();
+    div()
+        .flex()
+        .items_center()
+        .gap(metrics.space_md())
+        .px(metrics.space_xs())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(metrics.text_meta())
+                .text_color(cx.theme().muted_foreground)
+                .child("Reloading stops every plugin and starts what is in the folder now."),
+        )
+        .child(
+            Button::new("reload-plugins")
+                .label("Reload plugins")
+                .ghost()
+                .on_click(move |_, _window, cx| {
+                    entity.update(cx, |app, cx| app.reload_plugins(cx));
+                }),
+        )
+        .children(home.can_install().then(|| {
+            Button::new("install-plugin")
+                .label("Add a plugin…")
+                .outline()
+                .on_click(move |_, _window, cx| {
+                    installer.update(cx, |app, cx| app.install_plugin(cx));
+                })
+        }))
 }
 
 /// A short all-caps section label.
