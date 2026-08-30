@@ -2333,14 +2333,17 @@ impl WhatsAppApp {
                         app.client = Some(client);
                     }
                     Err(e) if Session::is_settled(&e) => {
-                        // A refusal, not a failure to reach anything: another
-                        // tab holds this account, or this preview has not been
-                        // told it may keep one. Said in its own words — a
-                        // "Failed to reach the daemon" in front of it would be
-                        // the one sentence that is not true — and with no
-                        // timer behind it, because the next attempt would get
-                        // the same answer and the one after that would take an
-                        // account the moment somebody else's tab closed.
+                        // A refusal, not a failure to reach anything: this
+                        // preview has not been told it may keep an account, or
+                        // a tab is holding one and would not answer for it —
+                        // which is now the narrow case it sounds like, since a
+                        // tab that loses the claim ordinarily attaches to the
+                        // tab that won and draws the account through it. Said
+                        // in its own words — a "Failed to reach the daemon" in
+                        // front of it would be the one sentence that is not
+                        // true — and with no timer behind it, because the
+                        // attempt that reached here had already asked the
+                        // holder for a connection and been left waiting.
                         app.app_state = AppState::Refused {
                             reason: e.to_string(),
                         };

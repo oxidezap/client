@@ -28,13 +28,24 @@ pub enum Home {
     /// `cfg` in every caller that matches on it.
     #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
     Page,
+    /// This origin's storage, which this tab can write to — and a plugin host
+    /// that is running in a *different* tab.
+    ///
+    /// The folder is one per origin and the host is one per account, so a
+    /// window with no session of its own can install perfectly well and
+    /// cannot start what it installed. Saying `Page` here was not a small
+    /// inaccuracy: it told the person to reload *this* page, which reattaches
+    /// to the same holder and loads nothing, so the plugin they had just
+    /// added simply never appeared.
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    AnotherTab,
 }
 
 impl Home {
     /// Whether this front end can install and remove plugins.
     #[must_use]
     pub const fn can_install(self) -> bool {
-        matches!(self, Self::Page)
+        matches!(self, Self::Page | Self::AnotherTab)
     }
 
     /// What to tell somebody looking at an empty list.
@@ -43,6 +54,9 @@ impl Home {
         match self {
             Self::Folder => "Drop a .wasm file in the plugins folder and restart",
             Self::Page => "Add a .wasm file below. It runs the next time this page loads.",
+            Self::AnotherTab => {
+                "Add a .wasm file below. It runs when the tab holding this account reloads."
+            }
         }
     }
 }
@@ -130,6 +144,12 @@ mod imp {
     pub fn home() -> Home {
         match oxidezap_ipc::web::named_daemon() {
             oxidezap_ipc::web::NamedDaemon::Named(_) => Home::Folder,
+            // No daemon named, and no session here either: this tab is a
+            // front end onto another tab of the same origin. The folder is
+            // still this origin's — installing writes it, and the write is
+            // serialised by a lock the folder already takes — but the host
+            // that would load it belongs to the tab holding the account.
+            _ if !crate::session::this_tab_holds_the_account() => Home::AnotherTab,
             // Rejected is not "no daemon": the window is on the settled
             // refusal screen and is drawing no Settings at all. Answered as
             // `Page` rather than as a third case, because a case nothing can

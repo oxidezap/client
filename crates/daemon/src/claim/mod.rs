@@ -16,4 +16,8 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
+#[cfg(target_family = "wasm")]
+pub use platform::Promotion;
+#[cfg(target_family = "wasm")]
+pub(crate) use platform::promotion;
 pub(crate) use platform::{Claim, take};

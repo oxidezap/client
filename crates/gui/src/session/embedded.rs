@@ -28,28 +28,40 @@ use super::frames::{self, Frames};
 use super::media::MediaCache;
 use super::sink::{self, Events};
 
-/// Start a session in this page and attach to it.
+/// Start a session in this page, or attach to the tab that already has one.
+///
+/// Two tabs of one origin are not two sessions and never were: one of them
+/// holds the account, and the other is a front end onto it — which is what a
+/// desktop window has always been, and what this file's own pipe is one of.
+/// So a lost claim is not a refusal here. It is the ordinary case, and the
+/// answer to it is `super::tab`, one transport along.
+///
+/// What that buys is the thing WhatsApp Web does not do: a second tab is a
+/// second window on one account, with no handover, no disconnection of the
+/// first, and one writer to the store throughout.
 ///
 /// # Errors
 ///
-/// Another tab already holds this account — the browser's own lock says so,
-/// and the honest answer is to point the person at the tab that has it rather
-/// than open a second session over the same database.
+/// Something is holding the account that this tab can neither start beside
+/// nor reach — a tab running a build whose rendezvous this one does not speak
+/// is the realistic one — or this tab's own session is still closing.
 pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
-    log::info!("no daemon named; starting a session in this page");
+    log::info!("no daemon named; looking for a session in this origin");
 
     // The kind is the whole message to the layer above: `AlreadyExists` is
     // the refusal retrying cannot fix, and anything else is worth another
     // attempt. `Stopping` is the second kind — this page's own session is
     // closing after being told to forget the account, and asking again is
     // exactly what fixes it. See `Session::is_settled`.
-    let pipe = oxidezap_daemon::embedded::start().await.map_err(|e| {
-        let kind = match e {
-            oxidezap_daemon::embedded::StartFailed::Claimed(_) => std::io::ErrorKind::AlreadyExists,
-            oxidezap_daemon::embedded::StartFailed::Stopping => std::io::ErrorKind::Interrupted,
-        };
-        std::io::Error::new(kind, e.to_string())
-    })?;
+    let pipe = match take_or_attach().await? {
+        Held::Session(pipe) => pipe,
+        Held::AnotherTab(attached) => return Ok(attached),
+    };
+    // This tab took the account. Said here rather than inside `take_or_attach`
+    // so that it is stamped on exactly one outcome: the pipe existing *is* the
+    // session being in this tab.
+    super::note_account_is_here(true);
+
     let (reader, mut writer) = tokio::io::split(pipe);
 
     // The write half, as a queue into the task that owns it — the same
@@ -110,6 +122,70 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     });
 
     Ok((session, rx))
+}
+
+/// How many times to go round the account before giving up on it.
+///
+/// One is not enough, and the case that proves it is the ordinary one: two
+/// tabs opened at the same moment. One takes the lock and then opens the
+/// store, runs its migrations and starts a session before it is in any
+/// position to serve anybody; the other is refused within microseconds and
+/// finds nobody answering. Giving up there would draw "another tab is running
+/// this account" over a tab that is four seconds from being ready.
+///
+/// So it is a few asks rather than one long one — the timeout inside each is
+/// what makes them cheap — and what ends the loop early is either answer:
+/// this tab has the account, or another tab answered for it.
+const ATTEMPTS: usize = 5;
+
+/// What this tab ended up with.
+enum Held {
+    /// The account, and a pipe to the session it started.
+    Session(tokio::io::DuplexStream),
+    /// A connection to the tab that has it.
+    AnotherTab((Session, Events)),
+}
+
+/// Take the account, or find the tab that has it.
+async fn take_or_attach() -> std::io::Result<Held> {
+    let mut refused = String::new();
+    for attempt in 0..ATTEMPTS {
+        match oxidezap_daemon::embedded::start().await {
+            Ok(pipe) => return Ok(Held::Session(pipe)),
+            Err(oxidezap_daemon::embedded::StartFailed::Stopping) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    oxidezap_daemon::embedded::StartFailed::Stopping.to_string(),
+                ));
+            }
+            Err(oxidezap_daemon::embedded::StartFailed::Claimed(who)) => {
+                refused = who;
+                // The lock says somebody has it, so ask them for a
+                // connection. A failure is not that refusal coming back: it
+                // is either a tab that has gone in between — in which case
+                // the next turn of this loop takes the account — or one that
+                // has the lock and is not serving yet, in which case the next
+                // turn asks it again.
+                match super::tab::connect().await {
+                    Ok(attached) => return Ok(Held::AnotherTab(attached)),
+                    Err(e) if attempt + 1 < ATTEMPTS => {
+                        log::info!("no tab answered for the account yet: {e}");
+                    }
+                    Err(e) => log::warn!("no tab answered for the account: {e}"),
+                }
+            }
+        }
+    }
+
+    // Settled, and the one case where it still is: something holds the
+    // account and will not answer for it. A tab running a build whose
+    // rendezvous this one does not speak is the realistic way to get here —
+    // a page left open across a deploy — and pointing the person at it is the
+    // honest answer, exactly as it was when every second tab landed here.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        refused,
+    ))
 }
 
 /// The daemon's own media map, read from the other side of one process.

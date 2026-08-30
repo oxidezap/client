@@ -14,6 +14,10 @@
 /// The transports an operating system provides.
 #[cfg(not(target_family = "wasm"))]
 mod stream;
+/// The transport between two tabs of one origin, where one of them holds the
+/// session and the others are front ends onto it.
+#[cfg(target_family = "wasm")]
+pub mod tab;
 /// The transport a browser tab provides.
 #[cfg(target_family = "wasm")]
 pub mod web;

@@ -100,6 +100,13 @@ its own address space through `daemon::embedded`. The session is still the
 daemon's, the window still owns none of it, and the protocol between them is
 the protocol a socket carries everywhere else.
 
+Which is also what makes a second tab ordinary rather than a conflict. One tab
+per origin holds the account — the claim decides which — and every other tab is
+a front end onto it over `ipc::tab`, holding no session, no store and no media,
+exactly as a desktop window holds none. Nothing in the interface knows the
+difference, and the rule it looks like it breaks is the rule it is an instance
+of.
+
 `examples/` holds plugins, and is excluded from the workspace: they build for
 `wasm32-unknown-unknown` and link imports only the daemon provides, so a
 `cargo build` at the root would try to link them for the host. `template/` is
@@ -219,9 +226,12 @@ profile here repeats it deliberately.
   refuses to start and the client talks to whoever got there. The kernel knows
   who is on the other end either way — a peer uid on the socket, the serving
   process's token SID on the pipe.
-  A third transport joined them rather than becoming a third place:
+  Two more transports joined them rather than becoming new places:
   `endpoint/web.rs` and `listener/web.rs` are a WebSocket, because a page can
-  open neither of the others. What every transport shares on the way out is
+  open neither of the others, and `endpoint/tab.rs` and `listener/tab.rs` are
+  a `BroadcastChannel` between two tabs of one origin — the tab holding the
+  account serving the tabs that do not, which is the same daemon-and-front-end
+  split a socket carries, in a browser that has no socket to carry it. What every transport shares on the way out is
   `ipc::Link`, one `Send + Sync` handle with the platform's own object behind
   it — load-bearing on the web, where a `web_sys::WebSocket` is neither and so
   cannot be held beside a front end's state at all; it holds a queue into the
@@ -1258,19 +1268,84 @@ typed behind a voice note reaches the daemon after the window has already
 drawn it as failed. A frame carrying no id is fire-and-forget and writing it
 late costs nothing.
 
-**Which tab holds the account is claimed, not assumed.** `daemon/claim/` is a
-lock file on the desktop and a Web Lock in a browser, taken with `ifAvailable`
-so a second tab is told *now* rather than queued — a queued tab looks like one
-that is starting, and would silently take the account the moment the first
-closed. What it costs is that the refusal has to survive the trip up: it
-reaches the window as `ErrorKind::AlreadyExists`, `Session::is_settled` names
-it, and it lands in `AppState::Refused` rather than `Error`. That distinction
-is the whole point — the error screen is for an outage, and it promises to
-keep trying, offers *Work offline*, and arms a countdown. All three are false
-for a refusal: nothing was unreachable, nothing is still trying, and *Work
-offline* reads a database this window is precisely the one that could not
-open. A retrying tab also reintroduces, one layer above the lock, the exact
-behaviour `ifAvailable` was chosen to prevent.
+**Which tab holds the account is claimed, and the tabs that lose it are front
+ends.** `daemon/claim/` is a lock file on the desktop and a Web Lock in a
+browser, taken with `ifAvailable` so a tab is told *now* whether it has the
+account — the answer decides what it becomes, so it cannot be waited for. What
+it becomes if the answer is no is not an error screen. The tab that won is
+running `daemon::embedded`, which is a daemon by every definition here — one
+session, one store, one writer — and a daemon is something more than one front
+end can talk to. So a second tab attaches to the first over a fourth transport
+and draws the same account, live, with no handover and nothing disconnected.
+That is the whole feature: WhatsApp Web ends one tab's session when another
+opens, because there the session lives in the page.
+
+The transport is `ipc/endpoint/tab.rs` and `daemon/listener/tab.rs`, which is
+the same two places every other transport lives in, and above them not one line
+of protocol is written twice — `serve_client` was already generic over
+`AsyncRead + AsyncWrite`, so a connection is one end of a `tokio::io::duplex`
+with its lines moved across. What carries them is a `BroadcastChannel` named
+after the connection rather than a `MessagePort`, and that is a limitation
+rather than a preference: a port is delivered by *transferring* it, and
+`BroadcastChannel.postMessage` takes no transfer list. A name only the two
+parties use is what stands in — not private, because nothing same-origin is,
+but enough that one connection's frames are not delivered to every tab in the
+origin. Deriving the channel name from the ask is what removes the race rather
+than narrowing it: the asking tab opens the channel *before* the ask goes out,
+so there is no window in which the answering tab writes to a channel nobody has
+opened.
+
+Media does not travel as a frame there either. A follower has no media map and
+no HTTP endpoint, so the sideband is three more messages on the same channel,
+with the bytes crossing as a `Uint8Array` — one structured clone, where JSON
+would be a base64 round trip through a string twice the size.
+
+**Queuing for the lock is now the right thing, and the reasoning that ruled it
+out has not been dropped so much as spent.** It said a queued tab looks like
+one that is starting and would silently take an account nobody was looking at.
+Both halves were about a tab that had been *refused*: it was idle, and it was
+showing nothing. A follower is neither — it is drawing the account, through the
+tab that holds it — so `claim::promotion` queues behind the leader, and the
+browser grants it at the moment that tab goes, whatever took it away. That
+grant is also the only thing watching: a `BroadcastChannel` has no close event
+and a killed tab says no goodbye. The follower ends its connection, the front
+end's own retry calls `embedded::start` again, and it finds the claim already
+held — by itself. One connection per follower is watched the same way, with
+`tabs::liveness_lock_for` held by the front end and waited on by the leader, so
+a tab that vanishes is noticed at the moment it vanishes and nothing anywhere
+polls.
+
+Being handed the lock is not the *only* way a follower learns its leader has
+gone, and it cannot be: with three tabs open, one follower is granted the
+account and the others stay queued behind a lock that tab now holds for its
+lifetime, over a channel to a tab that will never post again. So a follower
+listens to the rendezvous for the whole life of its connection, and a
+`Leading` from anywhere ends it — a leader announces exactly once, on the way
+up, and a `BroadcastChannel` does not deliver to the object that posted, so
+hearing one always means a *new* leader and a connection worth remaking.
+The same announcement is why an ask is answered idempotently: a follower
+re-asks when it hears `Leading`, and an ask that landed just before that
+announcement is one the leader has already served — serving it twice puts two
+`serve_client` instances on one channel, where a press sends one message
+twice. The nonce is the connection's name, so the name is what is remembered.
+
+A payload's ceiling travels *with* the request, and is enforced by the tab
+that has the bytes. It has to be: what crosses is a `Uint8Array` the serving
+tab builds and the browser clones, so a ceiling applied on arrival is applied
+after the copy it exists to prevent.
+
+`AppState::Refused` survives, for the one case that is still settled: something
+holds the account and will not answer for it — a tab left open across a deploy,
+speaking a rendezvous version this build does not. It is reached only after
+`ATTEMPTS` rounds of ask-then-try, because the ordinary race is two tabs opened
+in the same moment: one takes the lock and then spends seconds opening the
+store and starting a session before it can serve anybody, and a single ask
+would draw "another tab is running this account" over a tab that was four
+seconds from answering. Where it *is* reached the distinction is still the
+whole point — the error screen is for an outage, and it promises to keep
+trying, offers *Work offline*, and arms a countdown. All three are false for a
+refusal: nothing was unreachable, nothing is still trying, and *Work offline*
+reads a database this window is precisely the one that could not open.
 
 **The store round-trips, and that was measured rather than assumed.** A page
 that had never been visited opens the VFS holding 0 files; one that comes back
@@ -1448,6 +1523,28 @@ by definition.
   a worker a change of where this runs rather than a change to what it does —
   the backend decides the `synchronous` pragma and how a wipe deletes, and
   nothing above `session/store/` learns which one answered.
+- **Every tab is served its own copy of every frame.** The tab holding the
+  account writes a history load once per connection, and the browser
+  structured-clones each of them: two tabs is two copies of the same hundred
+  chats, and the frames go to whoever asked rather than being shared. That is
+  the right trade at the number of tabs a person opens and the wrong one at
+  ten, and the shape that fixes it is the same one everything else here is
+  waiting on — a `SharedWorker` holding the session, handing every tab a
+  `MessagePort`, with one copy of a frame going out to a fan-out the browser
+  does rather than one this side writes. It is also what would let a tab's
+  media come from a `MessagePort` transfer rather than a clone. The obstacle
+  is not the transport: it is that the session, the store and the bridge all
+  change address space at once, which is the item below.
+- **A tab that takes over restarts the session it inherits.** A follower
+  promoted when the leader closes does not receive the leader's session — it
+  starts one of its own: dials, hydrates from the store, and draws the account
+  again a second or two later, with the window showing its reconnect while it
+  does. Nothing is lost, because everything was committed to the store by the
+  tab that had it, and nothing is corrupted, because the lock is what serialises
+  the two. But it is a reconnection where a handover would be seamless, and a
+  handover is not something two agents can do with a session in one of them.
+  The `SharedWorker` above is the answer to this one too: there the session
+  outlives every tab, so the last tab closing is the only thing that ends it.
 - **A page's plugins share its one agent, and a worker is what would end
   that.** They run now — a task each on the page's loop, their modules in
   OPFS, their approvals in `localStorage` — and what is left is isolation

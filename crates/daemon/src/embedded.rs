@@ -111,6 +111,16 @@ struct Service {
     /// a real host is the same answer a desktop daemon with an empty folder
     /// gives. See [`crate::plugins::start`] for why it is empty here.
     plugins: Arc<oxidezap_plugin_host::Plugins>,
+    /// The other tabs of this origin, served.
+    ///
+    /// This tab won the account's lock, which makes it the daemon; the tabs
+    /// that lost it are front ends with no session, which is what a desktop
+    /// window has always been. Held here rather than detached because it has
+    /// to stop exactly when this service does — a tab whose session has been
+    /// torn down has nothing to serve, and going on answering asks would hand
+    /// the next tab a hub nothing will update again.
+    #[cfg(target_family = "wasm")]
+    _tabs: Option<crate::listener::tab::Serving>,
 }
 
 /// Start this page's session if it is not already running, and hand back what
@@ -179,12 +189,30 @@ async fn service() -> Result<
         }
     });
 
+    // After the session, and only in the tab that has one. What this
+    // announces is exactly what has just become true — there is a daemon in
+    // this origin — and announcing it before the bridge existed would invite
+    // a front end onto a hub with nothing behind it.
+    #[cfg(target_family = "wasm")]
+    let tabs = match crate::listener::tab::serve(&hub, &plugins, &commands) {
+        Ok(serving) => Some(serving),
+        Err(e) => {
+            // Not fatal, and deliberately not an error the window sees: this
+            // tab holds the account and draws it either way. What is lost is
+            // the second tab, which finds nobody answering and says so.
+            log::warn!("this tab cannot serve the others: {e}");
+            None
+        }
+    };
+
     SERVICE.with(|cell| {
         *cell.borrow_mut() = Some(Service {
             hub: Arc::clone(&hub),
             commands: commands.clone(),
             _claim: claim,
             plugins: Arc::clone(&plugins),
+            #[cfg(target_family = "wasm")]
+            _tabs: tabs,
         });
     });
     Ok((hub, plugins, commands))
@@ -253,6 +281,29 @@ fn running() -> Result<Option<Running>, StartFailed> {
         }))
     })
 }
+
+/// Wait until this tab is the one holding the account.
+///
+/// A tab that lost the claim attaches to the tab that won it and draws the
+/// account through that connection. This is how it learns the connection is
+/// over for the one reason that matters — the other tab has gone — and what
+/// it does next is [`start`], which now succeeds.
+///
+/// Answers [`Promotion::Superseded`] where a later connection has taken over
+/// the wait: this caller's connection has already been remade, and there is
+/// nothing for it to do.
+///
+/// # Errors
+///
+/// The browser has no lock manager, so nothing here can tell when the tab
+/// holding the account leaves.
+#[cfg(target_family = "wasm")]
+pub async fn promotion() -> Result<Promotion, String> {
+    crate::claim::promotion().await
+}
+
+#[cfg(target_family = "wasm")]
+pub use crate::claim::Promotion;
 
 /// Why a session did not start here.
 ///
