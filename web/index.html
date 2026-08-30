@@ -48,13 +48,29 @@
          section unless asked to keep it, so without this the debug profile
          would produce a module whose symbols rustc emitted and this step
          threw away — and it costs the shipped build nothing, because there
-         the section it preserves does not exist. -->
+         the section it preserves does not exist.
+
+         `data-integrity="none"` turns off trunk's subresource integrity, and
+         what it turns off is a hash nothing checks. Trunk writes one onto
+         both links it injects, and the module's is inert twice over: a
+         browser ignores `integrity` on a preload whose destination does not
+         support it — `as="fetch"`, which is what a `.wasm` preload is
+         (https://crbug.com/981419, and the console says so on every load) —
+         and the fetch that really loads the module is wasm-bindgen's own
+         `fetch()`, which no `<link>` attribute reaches. What is left is the
+         glue's, where SRI is a same-origin hash of a file named by a
+         same-origin document: whoever can change the one can change the
+         other, so it is a warning on every load in exchange for nothing.
+         The build already proves the bundle is the one the page asks for —
+         the file names are content hashes, and the Pages workflow checks
+         every one of them is in `dist`. -->
     <link
       data-trunk
       rel="rust"
       href="../crates/gui/Cargo.toml"
       data-bin="oxidezap"
       data-bindgen-target="web"
+      data-integrity="none"
       data-wasm-opt="z"
       data-wasm-opt-params="-g --enable-bulk-memory --enable-threads --enable-mutable-globals --enable-nontrapping-float-to-int --enable-sign-ext"
     />
@@ -66,7 +82,11 @@
          response headers a static host does not let us set. A service worker
          can add them to its own responses, which is what this does: the
          first load registers it and reloads once, and every load after that
-         is already isolated.
+         is already isolated. It answers navigations and worker scripts and
+         passes everything else through, because those are the only responses
+         the two headers are read off — and a subresource answered by a
+         service worker is one the page's own preload can no longer be
+         matched against.
 
          This is the only JavaScript in the build that is not wasm-bindgen's
          own generated glue, and it is here because the alternative is a
