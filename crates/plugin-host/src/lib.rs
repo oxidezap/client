@@ -224,6 +224,16 @@ struct Worker {
     actions: Mutex<crate::guest::Rolling>,
 }
 
+/// Longest the whole of loading may take before the rest of the folder is
+/// left alone.
+///
+/// Generous against an ordinary start, where every module is a few kilobytes
+/// and loads in milliseconds, and short against the thing it bounds: a folder
+/// of modules each shaped to spend as long as they can inside a load nothing
+/// else prices. The daemon has not bound its socket yet, so what this really
+/// bounds is how long a front end waits for one.
+const MAX_LOAD_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What arrives on a plugin's queue.
 enum Job {
     Event(Arc<Event>),
@@ -256,7 +266,29 @@ impl Plugins {
         let mut workers = Vec::new();
 
         let mut taken: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let loading_began = Instant::now();
         for path in discover(dir) {
+            // Wall clock, which nothing else here bounds. Fuel prices guest
+            // instructions and `oxi_init` gets two hundred million of them;
+            // it prices neither reading up to `MAX_MODULE_BYTES` off the
+            // disk, nor wasmi's validation of them, nor the host work an init
+            // buys — a megabyte of key/value traffic, a `write_private` with
+            // its two syncs, sixteen parsed trees. `MAX_DUTY` starts at the
+            // worker, which is after all of this. So `MAX_PLUGINS` files of
+            // valid but pathological wasm are a gigabyte read, validated and
+            // instantiated before the daemon binds its socket.
+            //
+            // Between modules rather than inside one, because a module being
+            // loaded cannot be interrupted: what this bounds is how many of
+            // them a folder can spend, which is the part somebody can arrange
+            // by dropping files in it.
+            if loading_began.elapsed() >= MAX_LOAD_TIME {
+                log::warn!(
+                    "plugins took longer than {MAX_LOAD_TIME:?} to load; the rest of {} is skipped",
+                    dir.display()
+                );
+                break;
+            }
             let Some(id) = plugin_id(&path) else {
                 log::warn!(
                     "skipping {}: its name is not a usable plugin id",
@@ -895,18 +927,28 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
         // message and grow this vector without limit.
         let started = Instant::now();
         let outcome = runtime.deliver(event, timers.len());
+        let published = match outcome {
+            Ok(effects) => {
+                // Inside the measurement, because it is this plugin's work
+                // and it is not small: `set_roots` clones every plugin's tree,
+                // spends a state version and broadcasts to every front end.
+                // Closed before it, none of that counted against `MAX_DUTY`.
+                if let Some(roots) = effects.ui {
+                    registry.set_roots(&runtime.id, roots);
+                }
+                Ok(effects.timers)
+            }
+            Err(e) => Err(e),
+        };
         // Minus what it spent blocked on the daemon. `Commands` is
         // synchronous, so a slow session is time this thread sat still: bill
         // it and a plugin sending 32 messages is slept for ten times the
         // network's latency, which is the opposite of what this budget
         // measures.
         duty.spent(started.elapsed().saturating_sub(runtime.daemon_wait()));
-        match outcome {
-            Ok(effects) => {
-                if let Some(roots) = effects.ui {
-                    registry.set_roots(&runtime.id, roots);
-                }
-                timers.extend(deadlines(effects.timers));
+        match published {
+            Ok(armed) => {
+                timers.extend(deadlines(armed));
             }
             // The only way a plugin is disabled by its own doing. A trap is
             // fuel exhausted, memory refused, or the plugin running off the

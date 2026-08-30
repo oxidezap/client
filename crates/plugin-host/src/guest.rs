@@ -82,6 +82,21 @@ const MAX_UI_PER_CALL: usize = 16;
 /// three orders of magnitude under it.
 pub(crate) const MAX_LOG_BYTES_PER_WINDOW: usize = 256 * 1024;
 
+/// How many bytes of interface a plugin may publish over that window.
+///
+/// [`MAX_UI_PER_CALL`] bounds one handler, and every other cost here has a
+/// window budget beside its per-call one for the same reason: a plugin needs
+/// nobody's permission to arm a timer, so sixteen callbacks a second is the
+/// per-call cap answered sixteen times. Publishing is not cheap on this side
+/// either — `set_roots` clones every plugin's tree, spends a state version
+/// and broadcasts to every front end — and `caps::UI` and `caps::TIMERS` are
+/// both ungated, so this is what a `.wasm` somebody dropped in the folder can
+/// do before anybody has agreed to anything.
+///
+/// A megabyte, which is sixteen of the largest tree the encoder will read.
+/// Far past a settings panel republished on every press.
+pub(crate) const MAX_UI_BYTES_PER_WINDOW: usize = 16 * abi::ui::MAX_BYTES;
+
 /// How much a plugin may log before the loader has accepted it.
 ///
 /// `oxi_init` runs before the module is known to be loadable at all: it can
@@ -322,6 +337,9 @@ pub struct Guest {
     /// What this plugin has commanded across calls. See
     /// [`MAX_COMMANDS_PER_WINDOW`].
     pub command_budget: Rolling,
+    /// What this plugin has published across calls. See
+    /// [`MAX_UI_BYTES_PER_WINDOW`].
+    pub ui_budget: Rolling,
     /// Whether `oxi_set_name` has been *attempted*. An `Option` so the one
     /// call is claimed and answered in a single step, with no window in
     /// which two would both find it free.
@@ -386,6 +404,12 @@ impl Guest {
     /// Whether this plugin may do `cap` right now.
     fn allows(&self, cap: i64) -> bool {
         self.phase != Phase::Loading && self.caps() & cap != 0
+    }
+
+    /// Take `bytes` of this plugin's publishing budget, or refuse.
+    fn spend_ui(&mut self, bytes: usize) -> bool {
+        let elapsed = self.ui_budget.window_began.elapsed();
+        self.ui_budget.spend(elapsed, bytes)
     }
 
     /// Take one of this call's command budget, or refuse.
@@ -790,6 +814,12 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             };
             if len > abi::ui::MAX_BYTES {
                 return abi::outcome::INVALID;
+            }
+            // And across calls, which the per-call cap says nothing about: a
+            // plugin gives itself deliveries, and a tree costs the daemon a
+            // clone of every plugin's, a state version and a broadcast.
+            if !c.data_mut().spend_ui(len) {
+                return abi::outcome::STATE;
             }
             let Ok(bytes) = read_bytes(&mut c, ptr, len) else {
                 return abi::outcome::INVALID;
@@ -1281,7 +1311,9 @@ fn write_stored(caller: &mut Caller<'_, Guest>, key: &str, ptr: i32, cap: i32) -
 
 #[cfg(test)]
 mod tests {
-    use super::{HOST_LINE_COST, MAX_LOG_BYTES_PER_WINDOW, Rolling, escape_controls, may_report};
+    use super::{
+        HOST_LINE_COST, MAX_LOG_BYTES_PER_WINDOW, Rolling, abi, escape_controls, may_report,
+    };
 
     /// A refusal the *host* writes costs the journal what a plugin's own line
     /// costs, and a plugin can ask for one as often as it likes: an invalid
@@ -1345,6 +1377,31 @@ mod tests {
             !budget.spend(Duration::from_secs(1), 1),
             "sixteen callbacks a second do not each get a fresh allowance"
         );
+    }
+
+    /// Publishing had a per-call cap and no window budget, which is the one
+    /// cost here that had neither a price in fuel nor a bound across calls.
+    /// `caps::UI` and `caps::TIMERS` are both ungated, so a `.wasm` nobody
+    /// has agreed to anything for could arm a timer at the floor and publish
+    /// sixty-four kilobytes a callback for ever — each one cloning every
+    /// plugin's tree, spending a state version and broadcasting to every
+    /// front end.
+    #[test]
+    fn published_interface_is_bounded_across_calls_too() {
+        use std::time::Duration;
+
+        let tree = abi::ui::MAX_BYTES;
+        let mut budget = Rolling::new(super::MAX_UI_BYTES_PER_WINDOW);
+        for _ in 0..(super::MAX_UI_BYTES_PER_WINDOW / tree) {
+            assert!(budget.spend(Duration::from_millis(100), tree));
+        }
+        assert!(
+            !budget.spend(Duration::from_secs(1), tree),
+            "a fresh callback does not buy a fresh allowance"
+        );
+        // And the window does turn over, so an ordinary panel republished
+        // over minutes is never refused.
+        assert!(budget.spend(super::ROLLING_WINDOW, tree));
     }
 
     /// A plugin's line is one line. Embedding a newline would otherwise

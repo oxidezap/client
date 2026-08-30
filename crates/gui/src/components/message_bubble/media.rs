@@ -27,7 +27,7 @@ use oxidezap_core::{DownloadableMedia, MediaType};
 pub(super) struct MediaProps {
     pub video_player_state: Option<VideoPlayerState>,
     pub video_frame: Option<Arc<RenderImage>>,
-    pub sticker_image: Option<Arc<Image>>,
+    pub decoded_image: Option<Arc<Image>>,
     pub audio: Option<super::AudioProgress>,
     pub playback_speed: f32,
     pub is_downloading: bool,
@@ -46,7 +46,7 @@ pub(super) fn render_media_content(
     let MediaProps {
         video_player_state,
         video_frame,
-        sticker_image,
+        decoded_image,
         audio,
         playback_speed,
         is_downloading,
@@ -63,7 +63,7 @@ pub(super) fn render_media_content(
             if let Some(format) = still_image_format(&media_content) {
                 // Prefer the app-level cache: rebuilding from bytes clones the
                 // buffer and makes GPUI decode it again on every render.
-                let image = match sticker_image.clone() {
+                let image = match decoded_image.clone() {
                     Some(cached) => img(ImageSource::Image(cached))
                         .w(px(display_w))
                         .h(px(display_h))
@@ -146,15 +146,25 @@ pub(super) fn render_media_content(
                 && let Some(dl) = media_content.downloadable.clone()
             {
                 // Only the fallback PNG thumbnail is local: tapping fetches
-                // the real sticker, mirroring the image preview branch.
-                let image = render_image_from_bytes(
-                    media_content.data,
-                    format,
-                    display_w,
-                    display_h,
-                    cx.product().metrics.radius_lg(),
-                    false,
-                );
+                // the real sticker, mirroring the image preview branch. From
+                // the cache where there is one — the thumbnail is a picture
+                // like any other, and this branch takes precedence over the
+                // one below, so rebuilding it here was the whole saving of
+                // that cache given back on every repaint.
+                let image = match decoded_image {
+                    Some(cached) => img(ImageSource::Image(cached))
+                        .w(px(display_w))
+                        .h(px(display_h))
+                        .object_fit(gpui::ObjectFit::Contain),
+                    None => render_image_from_bytes(
+                        media_content.data,
+                        format,
+                        display_w,
+                        display_h,
+                        cx.product().metrics.radius_lg(),
+                        false,
+                    ),
+                };
                 let preview_id: SharedString = format!("sticker-preview-{}", message_id).into();
                 el.child(
                     div()
@@ -169,7 +179,7 @@ pub(super) fn render_media_content(
                         })
                         .child(image),
                 )
-            } else if let Some(cached_image) = sticker_image {
+            } else if let Some(cached_image) = decoded_image {
                 let sticker_id: SharedString = format!("sticker-{}", message_id).into();
                 el.child(
                     img(ImageSource::Image(cached_image))
@@ -214,8 +224,11 @@ pub(super) fn render_media_content(
             media_content,
             message_id,
             entity,
-            video_player_state,
-            video_frame,
+            VideoProps {
+                state: video_player_state,
+                frame: video_frame,
+                poster: decoded_image,
+            },
             max_media_size,
             cx,
         )),
@@ -569,15 +582,31 @@ fn format_bytes(bytes: u64) -> Option<String> {
     })
 }
 
+/// What a video row draws besides the media itself.
+///
+/// Together because they are one answer: which of the three is drawn depends
+/// on the other two, and a fourth loose argument beside them is how this grew
+/// past what anyone reads at a call site.
+struct VideoProps {
+    state: Option<VideoPlayerState>,
+    frame: Option<Arc<RenderImage>>,
+    /// Decoded once by the app. See `MediaProps`.
+    poster: Option<Arc<Image>>,
+}
+
 fn render_video_player(
     media_content: oxidezap_core::MediaContent,
     message_id: String,
     entity: Entity<WhatsAppApp>,
-    video_player_state: Option<VideoPlayerState>,
-    video_frame: Option<Arc<RenderImage>>,
+    video: VideoProps,
     max_media_size: f32,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    let VideoProps {
+        state: video_player_state,
+        frame: video_frame,
+        poster,
+    } = video;
     let (display_w, display_h) = scale_media_dimensions(
         media_content.width.unwrap_or(300),
         media_content.height.unwrap_or(200),
@@ -613,6 +642,21 @@ fn render_video_player(
             // and a decoded frame is the only picture left to draw.
             if let Some(frame) = video_frame.clone().filter(|_| is_playing || is_paused) {
                 render_video_frame(frame, display_w, display_h)
+            } else if let Some(cached) = poster {
+                // The poster, decoded once. Rebuilding it from the bytes
+                // clones the whole buffer and hashes every byte of it to name
+                // the image, per repaint.
+                div()
+                    .w_full()
+                    .h_full()
+                    .child(
+                        img(ImageSource::Image(cached))
+                            .w(px(display_w))
+                            .h(px(display_h))
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .rounded(cx.product().metrics.radius_lg()),
+                    )
+                    .into_any_element()
             } else if let Some(format) = still_image_format(&media_content) {
                 div()
                     .w_full()
@@ -825,5 +869,40 @@ mod tests {
         // A sender that omits the length still sends a downloadable document;
         // it just cannot promise what it will cost.
         assert_eq!(format_bytes(0), None);
+    }
+}
+
+#[cfg(test)]
+mod poster_cost_tests {
+    use super::*;
+
+    /// What one visible video poster used to cost per repaint.
+    ///
+    /// A stopwatch rather than an assertion, so it is ignored by default.
+    /// `render_image_from_bytes` does `Arc::unwrap_or_clone` on a buffer that
+    /// always has a second holder — the `ChatMessage` the timeline cloned —
+    /// so it is always a full copy, and `Image::from_bytes` then hashes every
+    /// byte of it to name the image. The app's decoded-image cache did not
+    /// cover `MediaType::Video`, so both happened on every frame.
+    ///
+    /// `cargo test -p oxidezap-gui --release -- --ignored poster_cost --nocapture`
+    #[test]
+    #[ignore = "a stopwatch, not a test"]
+    fn poster_cost() {
+        for kb in [200usize, 400, 800] {
+            let bytes = Arc::new(vec![0x7fu8; kb * 1024]);
+            let frames = 60u32;
+            let started = wacore::time::Instant::now();
+            for _ in 0..frames {
+                // Exactly the two costs: the clone the `Arc` cannot avoid,
+                // and the hash `Image::from_bytes` takes over the result.
+                let copy = Arc::unwrap_or_clone(Arc::clone(&bytes));
+                std::hint::black_box(Image::from_bytes(gpui::ImageFormat::Jpeg, copy));
+            }
+            println!(
+                "{kb} KB poster: {:?} per frame, per visible video",
+                started.elapsed() / frames
+            );
+        }
     }
 }

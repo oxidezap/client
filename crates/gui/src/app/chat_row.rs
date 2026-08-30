@@ -175,7 +175,8 @@ fn prefix_for(chat: &Chat, last: &ChatMessage) -> Option<String> {
     if !chat.is_group {
         return None;
     }
-    chat.author_name(last).map(single_line)
+    chat.author_name(last)
+        .map(|name| crate::utils::capped_name(&single_line(name)))
 }
 
 /// The preview text: a caption if there is one, otherwise the media's name.
@@ -220,7 +221,7 @@ fn body_for(last: &ChatMessage) -> String {
 /// saved under a person's name like any other contact, so without the suffix
 /// it reads as somebody else.
 pub fn display_name(name: &str, is_own_number: bool) -> String {
-    let name = single_line(name);
+    let name = crate::utils::capped_name(&single_line(name));
     if is_own_number {
         format!("{name} (You)")
     } else {

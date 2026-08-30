@@ -56,7 +56,7 @@ pub struct BubbleProps {
     pub starts_run: bool,
     pub video_player_state: Option<VideoPlayerState>,
     pub video_frame: Option<Arc<RenderImage>>,
-    pub sticker_image: Option<Arc<Image>>,
+    pub decoded_image: Option<Arc<Image>>,
     /// Where this clip's playback is, when this clip is the one playing.
     ///
     /// Read out by the list rather than looked up here: the virtual list has
@@ -236,7 +236,7 @@ pub fn render_message_bubble(
                                         MediaProps {
                                             video_player_state: props.video_player_state,
                                             video_frame: props.video_frame.clone(),
-                                            sticker_image: props.sticker_image.clone(),
+                                            decoded_image: props.decoded_image.clone(),
                                             audio: props.audio,
                                             playback_speed: props.playback_speed,
                                             is_downloading: props.is_downloading,

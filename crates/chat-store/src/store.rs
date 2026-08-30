@@ -458,35 +458,12 @@ struct RangeBound {
     keys: Option<Vec<String>>,
 }
 
-/// The furthest moment a stored timestamp may describe: the end of year 9999,
-/// which is also as far as the display path can render.
-const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_000;
-
-/// Milliseconds for a timestamp the peer chose.
-///
-/// The wire carries unsigned seconds and the columns are signed
-/// milliseconds, so the cast is the half that had no guard: past
-/// `i64::MAX` it wraps to a negative, and a merely absurd value saturates
-/// to `i64::MAX`, where the row sorts at the very top of the list forever
-/// while every surface that formats it falls back to the epoch — two
-/// fields of one row disagreeing, with the peer choosing which. Clamped to
-/// what the display path can represent, so ordering and rendering cannot
-/// say different things.
-fn peer_timestamp_ms(seconds: u64) -> i64 {
-    i64::try_from(seconds)
-        .ok()
-        .and_then(|seconds| seconds.checked_mul(1000))
-        .unwrap_or(MAX_TIMESTAMP_MS)
-        .clamp(0, MAX_TIMESTAMP_MS)
-}
-
 fn range_bound(
     range: &buffa::MessageField<wa::sync_action_value::SyncActionMessageRange>,
 ) -> Option<RangeBound> {
     let range = range.as_option()?;
     let ts_secs = range.last_message_timestamp.filter(|&ts| ts > 0)?;
-    // Signed here, and already filtered above zero.
-    let second_start_ms = peer_timestamp_ms(ts_secs.unsigned_abs());
+    let second_start_ms = crate::types::secs_to_ms(ts_secs);
     let keys: Vec<String> = range
         .messages
         .iter()
@@ -988,7 +965,14 @@ fn apply_writer_msg(
             Ok(())
         }
         WriterMsg::SendFailed { chat, msg_id } => {
-            let chat_str = chat.to_string();
+            // The routing every other write that targets a row goes through.
+            // The caller names the chat the send named, so a row written
+            // under a peer's LID was looked for under their phone number:
+            // nothing matched, nothing was invalidated, and the message sat
+            // PENDING for the rest of the session — a spinner with no error
+            // state and no retry.
+            let wire = chat.to_string();
+            let chat_str = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
             // Same guard as the nack path: a row past PENDING already got its
             // positive answer, so a late local failure must not regress it.
             let updated =
@@ -1002,6 +986,9 @@ fn apply_writer_msg(
             // A no-op update (row already acked, or unknown id) must not
             // broadcast an invalidation and re-hydrate the UI for nothing.
             if updated > 0 {
+                if chat_str != wire {
+                    cs.message_chats.insert(wire);
+                }
                 cs.message_chats.insert(chat_str);
             }
             Ok(())
@@ -2584,7 +2571,7 @@ fn apply_history_conversation(
     let chat = &crate::lid::route_chat_key(conn, device_id, conv.id.as_str(), cs)?;
     let last_ts_ms = conv
         .conversation_timestamp
-        .map(peer_timestamp_ms)
+        .map(crate::types::wire_secs_to_ms)
         .unwrap_or(0);
 
     {
@@ -2610,9 +2597,12 @@ fn apply_history_conversation(
                 // app-state paths) are milliseconds.
                 dsl::pinned_at.eq(conv
                     .pinned
-                    .map(|p| peer_timestamp_ms(p.into()))
+                    .map(|p| crate::types::secs_to_ms(i64::from(p)))
                     .filter(|&p| p > 0)),
-                dsl::muted_until.eq(conv.mute_end_time.map(peer_timestamp_ms).filter(|&m| m > 0)),
+                dsl::muted_until.eq(conv
+                    .mute_end_time
+                    .map(crate::types::wire_secs_to_ms)
+                    .filter(|&m| m > 0)),
                 dsl::archived.eq(conv.archived.unwrap_or(false)),
                 dsl::ephemeral_expiration.eq(conv.ephemeral_expiration.map(|e| e as i32)),
             ))
@@ -2662,7 +2652,10 @@ fn apply_history_message(
         .as_deref()
         .or(key.participant.as_deref())
         .unwrap_or(if from_me { "" } else { chat });
-    let ts_ms = wmi.message_timestamp.map(peer_timestamp_ms).unwrap_or(0);
+    let ts_ms = wmi
+        .message_timestamp
+        .map(crate::types::wire_secs_to_ms)
+        .unwrap_or(0);
 
     if let Some(name) = wmi.push_name.as_deref()
         && !name.is_empty()
@@ -3400,20 +3393,5 @@ mod deferred_ack_tests {
             acks.take_matching("OUT-OLD", CHAT, 0).is_none(),
             "the previous batch committed that consumption"
         );
-    }
-}
-
-#[cfg(test)]
-mod peer_time_tests {
-    use super::{MAX_TIMESTAMP_MS, peer_timestamp_ms};
-
-    /// A peer choosing the number cannot pin its conversation to the top of
-    /// the list forever while every surface that formats it says 1970.
-    #[test]
-    fn an_absurd_peer_timestamp_stays_inside_what_can_be_drawn() {
-        assert_eq!(peer_timestamp_ms(1_700_000_000), 1_700_000_000_000);
-        assert_eq!(peer_timestamp_ms(1_000_000_000_000_000), MAX_TIMESTAMP_MS);
-        assert_eq!(peer_timestamp_ms(u64::MAX), MAX_TIMESTAMP_MS);
-        assert!(chrono::DateTime::from_timestamp_millis(peer_timestamp_ms(u64::MAX)).is_some());
     }
 }

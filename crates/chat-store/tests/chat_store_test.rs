@@ -10,7 +10,9 @@ use std::time::Duration;
 use buffa::MessageField;
 use chrono::{Datelike, TimeZone, Utc};
 use diesel::RunQueryDsl;
-use oxidezap_chat_store::{ChatStore, MessageKind, MessageStatus, StoreChange};
+use oxidezap_chat_store::{
+    ChatCursor, ChatStore, MessageCursor, MessageKind, MessageStatus, StoreChange,
+};
 use wacore::proto_helpers::MessageBuilderExt;
 use wacore::types::events::{
     BatchOrigin, Event, InboundMessage, LazyHistorySync, MessageBatch, Receipt, ServerAck,
@@ -1165,6 +1167,116 @@ async fn keyset_pagination_covers_all_pages_in_order() {
     assert_eq!(seen, ["m4", "m3", "m2", "m1", "m0"]);
 }
 
+/// A conversation timestamp far outside anything a clock produces used to
+/// stop the chat list paginating for good: it sorts to the top, so it is very
+/// likely the row a page ends on, and the instant it reads back as is `None`
+/// — which the cursor writes as 0 and the next page reads as "older than the
+/// epoch", coming back empty for ever after.
+#[tokio::test]
+async fn an_impossible_timestamp_does_not_stop_the_chat_list() {
+    let (_store, chat_store) = test_store().await;
+
+    let history = wa::HistorySync {
+        sync_type: wa::history_sync::HistorySyncType::RECENT,
+        conversations: vec![
+            wa::Conversation {
+                id: "559900000004@s.whatsapp.net".to_string(),
+                // Above `i64::MAX`, so the cast wraps: a timestamp far in
+                // the future arriving as one far in the past is the same
+                // corrupt cursor by the other route.
+                conversation_timestamp: Some(u64::MAX),
+                ..Default::default()
+            },
+            wa::Conversation {
+                id: PEER.to_string(),
+                conversation_timestamp: Some(1_700_000_900),
+                ..Default::default()
+            },
+            wa::Conversation {
+                id: GROUP.to_string(),
+                conversation_timestamp: Some(u64::MAX / 2),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    feed(&chat_store, [history_sync_event(history)]).await;
+
+    let first = chat_store.chats_page(false, None, 1).await.unwrap();
+    assert_eq!(first.len(), 1);
+    let cursor = ChatCursor::from(&first[0]);
+    let second = chat_store
+        .chats_page(false, Some(cursor), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.len(),
+        2,
+        "the rest of the list is still reachable behind the corrupt row"
+    );
+}
+
+/// A vote in a poll used to raise the conversation to the top of the list
+/// with a blank preview and add one to a badge nobody could clear: the row
+/// went in as "unknown" and no bubble corresponds to it, so opening the chat
+/// reads nothing.
+#[tokio::test]
+async fn a_vote_does_not_raise_an_unclearable_badge() {
+    let (_store, chat_store) = test_store().await;
+
+    let vote = wa::Message {
+        poll_update_message: MessageField::some(wa::message::PollUpdateMessage {
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            vote,
+            incoming_info(PEER, PEER, "MSG-VOTE", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+    assert!(
+        chat_store.chats(false, 10).await.unwrap().is_empty(),
+        "a vote amends a poll; it is not a conversation"
+    );
+}
+
+/// A message inside a wrapper `get_base_message` does not peel classified as
+/// "unknown", so it landed as a blank bubble carrying an unread badge instead
+/// of as the text it is.
+#[tokio::test]
+async fn a_wrapped_message_is_still_the_message_inside_it() {
+    let (_store, chat_store) = test_store().await;
+
+    let wrapped = wa::Message {
+        group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
+            message: MessageField::some(wa::Message::text("bom dia")),
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            wrapped,
+            incoming_info(GROUP, PEER, "MSG-WRAP", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let msg = chat_store
+        .message(&jid(GROUP), "MSG-WRAP")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.kind, MessageKind::Text);
+    assert_eq!(msg.text.as_deref(), Some("bom dia"));
+}
+
 #[tokio::test]
 async fn history_sync_materializes_without_clobbering_live_rows() {
     let (_store, chat_store) = test_store().await;
@@ -2233,6 +2345,56 @@ async fn mark_read_range_preserves_newer_unread() {
     )
     .await;
     assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}
+
+/// The unread tail is the chat's newest incoming rows, so a caller paging
+/// back past them must be told the tail is spent rather than marking a second
+/// copy of it on every older page.
+#[tokio::test]
+async fn the_unread_tail_does_not_repeat_on_an_older_page() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        (0..4).map(|n| {
+            message_event(
+                wa::Message::text("oi"),
+                incoming_info(PEER, PEER, &format!("MSG-U{n}"), 1_700_000_000 + n),
+            )
+        }),
+    )
+    .await;
+    // Two of the four read from another device, so the tail is the two newest.
+    feed(
+        &chat_store,
+        [Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    message_range: range_up_to(1_700_000_001),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 2);
+
+    let (newest, unread) = chat_store
+        .page_with_unread(&jid(PEER), None, 2)
+        .await
+        .unwrap();
+    assert_eq!(unread, 2, "the newest page carries the whole tail");
+
+    let cursor = MessageCursor::from(newest.last().unwrap());
+    let (older, owed) = chat_store
+        .page_with_unread(&jid(PEER), Some(cursor), 2)
+        .await
+        .unwrap();
+    assert_eq!(older.len(), 2);
+    assert_eq!(owed, 0, "the page behind the tail owes no receipts");
 }
 
 #[tokio::test]
@@ -3642,6 +3804,36 @@ async fn known_mapping_keys_new_chat_by_lid() {
     assert_eq!(msg.status, MessageStatus::Read);
 }
 
+/// A send that failed left the bubble spinning for good: the row goes in
+/// under the peer's LID, the failure was looked for under the phone number
+/// the send named, nothing matched, and nothing said so — no error state, no
+/// retry, and no invalidation to redraw either.
+#[tokio::test]
+async fn a_failed_send_does_not_stay_pending_forever() {
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-FAIL",
+            &wa::Message::text("não saiu"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    // Addressed exactly as the send was, which is all the caller holds.
+    chat_store.mark_send_failed(&jid(PEER), "OUT-FAIL").unwrap();
+    chat_store.flush().await.unwrap();
+
+    let msg = chat_store
+        .message(&jid(PEER), "OUT-FAIL")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Error);
+}
+
 /// An inbound LID-addressed message joins the peer's existing PN-keyed
 /// thread instead of opening a twin chat.
 #[tokio::test]
@@ -4052,6 +4244,127 @@ async fn merge_folds_a_split_peer_identity_into_one_user() {
             (MessageStatus::Read, 1_700_000_300),
         ],
         "and both states survive: {receipts:?}"
+    );
+}
+
+/// A reaction left under one of the peer's identities and taken back under
+/// the other stayed on screen for ever: a removal is a reaction with an empty
+/// emoji, `reactions_for` filters those out, and the merge moved the rows to
+/// one chat without ever agreeing they came from one person.
+#[tokio::test]
+async fn merge_folds_a_reactor_split_across_their_identities() {
+    let (store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("alvo"),
+                incoming_info(PEER, PEER, "MSG-RX", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("alvo"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-RX-LID", 1_699_999_000),
+            ),
+        ],
+    )
+    .await;
+
+    let react = |chat: &str, emoji: &str, id: &str, ts: i64| {
+        message_event(
+            wa::Message {
+                reaction_message: MessageField::some(wa::message::ReactionMessage {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("MSG-RX".into()),
+                        ..Default::default()
+                    }),
+                    text: Some(emoji.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            incoming_info(chat, chat, id, ts),
+        )
+    };
+    feed(
+        &chat_store,
+        [
+            react(PEER, "👍", "RX1", 1_700_000_010),
+            // Taken back, from the same person addressing themselves the
+            // other way.
+            react(PEER_LID, "", "RX2", 1_700_000_020),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let reactions = chat_store.reactions(&jid(PEER), "MSG-RX").await.unwrap();
+    assert!(
+        reactions.is_empty(),
+        "the reaction was withdrawn: {reactions:?}"
+    );
+}
+
+/// A reaction and its withdrawal are exactly what land under two identities
+/// inside one tick, and the identity is the wrong thing to settle that with:
+/// ordered by JID, whichever sorts higher wins, so the reaction survives its
+/// own removal half the time. The rule the same-sender fold already uses —
+/// the empty emoji wins a tie — has to survive the cross-identity one.
+#[tokio::test]
+async fn a_withdrawal_beats_its_reaction_in_the_same_tick() {
+    let (store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("alvo"),
+                incoming_info(PEER, PEER, "MSG-TIE", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("alvo"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-TIE-LID", 1_699_999_000),
+            ),
+        ],
+    )
+    .await;
+
+    let react = |chat: &str, emoji: &str, id: &str| {
+        message_event(
+            wa::Message {
+                reaction_message: MessageField::some(wa::message::ReactionMessage {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("MSG-TIE".into()),
+                        ..Default::default()
+                    }),
+                    text: Some(emoji.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            // The same second on both, which is the tie.
+            incoming_info(chat, chat, id, 1_700_000_010),
+        )
+    };
+    // The tombstone under the identity that sorts *lower*, so an ordering by
+    // JID alone would keep the reaction it withdraws.
+    feed(
+        &chat_store,
+        [react(PEER, "👍", "TIE1"), react(PEER_LID, "", "TIE2")],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let reactions = chat_store.reactions(&jid(PEER), "MSG-TIE").await.unwrap();
+    assert!(
+        reactions.is_empty(),
+        "the withdrawal is the later word even when the clock cannot say so: {reactions:?}"
     );
 }
 

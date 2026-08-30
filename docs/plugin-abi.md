@@ -33,15 +33,27 @@ module's exported memory.
 
 ### Declaring — callable only from inside `oxi_init`
 
-Anywhere else these answer `-5` (`STATE`), which says *too early or too late*
-rather than *not allowed*. Each may be called once; a second call is recorded
-and refuses the load, because a plugin that could widen what it asked for
-after the user was shown the first list would make that list a lie.
+Each may be called once, and each answers differently, because two of the
+three have no result to answer with.
+
+`oxi_subscribe` and `oxi_request_caps` are declared without a result. Called
+anywhere but inside `oxi_init` the call is discarded and nothing is said —
+there is no `-5` to return, and a module that declares either with `(result
+i32)` is refused at instantiation for a signature mismatch, before any
+diagnostic could reach its author. A *second* call from inside `oxi_init` is
+recorded and refuses the load, because a plugin that could widen what it asked
+for after the user was shown the first list would make that list a lie.
+
+`oxi_set_name` does answer: `-5` (`STATE`) outside `oxi_init`, which says *too
+early or too late* rather than *not allowed*, and `-2` (`REFUSED`) for a
+second call. A second name does not refuse the load — the plugin runs under
+the first one — because a name is a label rather than a sentence the user
+agreed to.
 
 | Import | Signature |
 |---|---|
-| `oxi_subscribe` | `(mask: i64)` — which event kinds to deliver |
-| `oxi_request_caps` | `(mask: i64)` — which commands this plugin wants |
+| `oxi_subscribe` | `(mask: i64)` — which event kinds to deliver. No result. |
+| `oxi_request_caps` | `(mask: i64)` — which commands this plugin wants. No result. |
 | `oxi_set_name` | `(ptr: i32, len: i32) -> i32` — the name a user sees |
 
 A plugin may not act on the account during `oxi_init` at all: plugins load
@@ -248,7 +260,37 @@ appear.
 
 Flags: `1` enabled, `2` checked.
 
-Bounds: 8 deep, 256 nodes, 4096 bytes per id/label/value, 64 KiB encoded.
+Bounds: 8 deep, 256 nodes, 256 roots, 4096 bytes per id/label/value, 64 KiB
+encoded.
+
+### When the tree is refused
+
+All of it, not the node at fault: a tree is one payload, and a plugin drawing
+half of what it published would be worse than one drawing none of it. The host
+logs the reason against the plugin's id. A tree is refused when
+
+- the first byte is not the format byte, or a length or a child count runs off
+  the end of the payload;
+- there are bytes left over after the last root — a tree that decodes and then
+  has more behind it is not one this encoding produced;
+- the root count is above 256, or the tree is past any bound above;
+- a widget kind or a slot byte is one this ABI does not define, or a slot
+  appears on a node that is not a root, or is missing from one that is;
+- a button, toggle or field carries an empty id, which nothing could ever name
+  in an action;
+- children hang off a widget that is drawn without any — anything but a row, a
+  column or a section;
+- two interactive widgets in one slot share an id, since nothing would tell
+  the two presses apart;
+- an action id is not valid UTF-8, where a label with a broken byte is
+  replaced and drawn: an id is compared rather than read, and a replacement
+  character gives the front end an id the plugin will never recognise coming
+  back;
+- the reserved byte is not zero, or a flag bit outside `1|2` is set. Both are
+  refused rather than ignored so the space stays free to mean something later:
+  a reader that skipped them would let payloads carrying a value circulate,
+  and the day one acquires a meaning those become trees whose author never
+  agreed to it.
 
 An id names one widget **within a slot**. Across slots it may repeat, because
 an action says which slot it came from; twice in one slot is refused, since
@@ -279,7 +321,7 @@ copied or a task spawned. So the host bounds both.
 | 4096 event handles per call | Strings a handle clones into the host. |
 | 4 MiB of field bytes copied per call | `oxi_field_str` writes into your memory, and fuel prices the call rather than the copy. A length probe (`cap` of `0`) is free. |
 | 2 KiB per log line, 64 KiB per call, 256 KiB per window | Writing a line is host I/O fuel does not price. Newlines are escaped, so a plugin cannot forge a second log entry. Lines the host writes *about* a plugin — a refused tree — come out of the same window. |
-| 16 UI publishes per call | |
+| 16 UI publishes per call, 1 MiB published per window | Both answer `-5` (`STATE`) when spent — the tree is refused, the plugin runs on. Publishing is not free on the host's side: it clones every plugin's tree, spends a state version and broadcasts to every front end, and `UI` and `TIMERS` are both ungated, so a per-call cap alone bounds nothing. |
 | 32 commands per call, 256 per window | |
 | 1 MiB of key/value traffic per call, keys and values both, on reads as much as writes | 8 KiB per entry, 256 KiB per plugin — of stored bytes, not of the file, which JSON escaping can make several times larger. |
 | 16 timers, 100 ms floor, 7 day ceiling | The floor is why a plugin cannot spin on its own timer. |

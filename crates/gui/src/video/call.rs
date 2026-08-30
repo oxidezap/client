@@ -241,12 +241,23 @@ fn decode_loop(
         // its reference and output buffers from the parameter set — from
         // numbers the *peer* chose. `Scratch` refuses an oversized picture,
         // but it refuses one that has already been decoded, which is after
-        // the allocation the refusal is for. A unit carrying no parameter set
-        // declares no new geometry and is left alone.
-        if let Some((width, height)) = super::sps::coded_size(&unit.data)
-            && (width as usize).saturating_mul(height as usize) > MAX_PIXELS
-        {
-            log::warn!("refusing a {width}x{height} video stream on call {call_id}");
+        // the allocation the refusal is for.
+        let refuse = match super::sps::coded_size(&unit.data) {
+            // No new geometry: coded against a set already read and bounded.
+            super::sps::Geometry::NoParameterSet => None,
+            super::sps::Geometry::Size(width, height) => {
+                ((width as usize).saturating_mul(height as usize) > MAX_PIXELS)
+                    .then(|| format!("a {width}x{height} video stream"))
+            }
+            // A budget nothing could apply is not a budget. What reaches here
+            // is a parameter set shaped like a truncated or hostile one, and
+            // the sender is the one who chose its shape.
+            super::sps::Geometry::Unreadable => {
+                Some("a video stream whose parameter set cannot be read".to_string())
+            }
+        };
+        if let Some(reason) = refuse {
+            log::warn!("refusing {reason} on call {call_id}");
             // Not a gap to recover from: every unit that follows references
             // this picture, so the stream stays refused until the peer sends
             // a parameter set describing one that fits.

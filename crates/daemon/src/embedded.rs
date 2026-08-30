@@ -161,7 +161,7 @@ async fn service() -> Result<
     // order, kept even though a page's host is empty: this is the one place
     // the two daemons could quietly diverge, and the difference between them
     // is meant to be what `plugins::start` says it is and nothing else.
-    let plugins = crate::plugins::start(&hub, commands.clone());
+    let plugins = crate::plugins::start(&hub, commands.clone()).await;
 
     // Raised before the bridge exists and lowered only once it has returned,
     // which is a longer span than the command channel measures — see

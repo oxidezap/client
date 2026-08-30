@@ -81,6 +81,15 @@ pub fn put_evictable(key: &str, bytes: &[u8]) -> Result<String> {
 /// Returns the key, so a caller can hand it straight to the peer.
 pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
     let path = oxidezap_ipc::media_path(key).context("no media cache to write into")?;
+    let dir = path.parent().context("media path has no parent")?;
+    // Before the hit below and not after it. `metadata` follows a symlink, and
+    // a key here is derived from content the account has already published, so
+    // a link of the right length planted under one while the directory was
+    // open answered "already cached" and the daemon then served its target as
+    // the account's own media -- returning before the sweep that exists to
+    // remove it had run at all.
+    prepare_dir(dir)?;
+
     // Content-addressed: the same key is the same bytes, so a file that is
     // already there is already right. Size-checked rather than trusted, so a
     // write cut short by a crash is redone rather than served truncated.
@@ -88,25 +97,27 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
         return Ok(key.to_string());
     }
 
-    let dir = path.parent().context("media path has no parent")?;
-    prepare_dir(dir)?;
-
     // Through a temporary and a rename: a reader that opens the key must
     // never see half a file, and the reader is another process racing this
     // one by design.
     // Under a name nothing else claims: a temporary called `<key>.partN`
     // carried the key's own prefix, so a wipe and the budget sweep both read
     // a download in flight as theirs to delete.
+    //
+    // `create_new`, so nothing already at this name is opened: a plain
+    // `write` follows a symlink to wherever it points and truncates whatever
+    // is there. A leftover from a process that shared this pid and sequence
+    // and died mid-write is the one honest way to meet one, so it is unlinked
+    // once — the link and not its target — and the create tried again.
     let temp = dir.join(format!("{IN_PROGRESS_PREFIX}{}", write_ticket()));
-    std::fs::write(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
+    write_new(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
     // The rename happens under the wipe lock, which every entry point in
     // `media` takes before calling here: the file is either wholly before a
     // clear — and taken by it — or wholly after. What that cannot cover is
     // the caller's answer, which is a round trip later; a clear landing
     // there costs one refetch, since media the renderer does not have is
     // drawn as an offer to download. See `claim`.
-    let renamed = std::fs::rename(&temp, &path);
-    if let Err(e) = renamed {
+    if let Err(e) = std::fs::rename(&temp, &path) {
         // Windows will not rename onto an existing file, and two clients
         // asking for the same uncached media both miss the check above. The
         // other write winning is a cache hit, not a failure — the bytes are
@@ -139,6 +150,26 @@ pub fn take(key: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Write `bytes` to a path nothing is using, refusing any existing entry.
+fn write_new(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    };
+    let mut file = match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            create()?
+        }
+        other => other?,
+    };
+    file.write_all(bytes)
+}
+
 /// A name no other in-progress write is using.
 ///
 /// The process id alone is not enough: two clients of the same daemon asking
@@ -163,22 +194,32 @@ pub fn has(key: &str) -> bool {
 
 /// The cache directory carries a copy of every photo the account has shown,
 /// so it gets the same treatment as the socket beside it: ours alone.
-#[cfg(unix)]
+///
+/// It used to accept any existing entry that `Path::is_dir` answered for,
+/// which follows a symlink and asks nothing about owner or mode — so a
+/// `media` planted by another local account was taken as the cache and every
+/// attachment written into it. And the keys here are derived from content the
+/// account has already published, which makes them predictable: a file left
+/// under one while the directory was open is served as the attachment it
+/// names. So a directory found open is swept of what this daemon did not write,
+/// which is the whole of what an open directory can have gained.
 fn prepare_dir(dir: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => Ok(()),
-        // Already there is the common case, and the only failure that is not
-        // one: the directory is created once and written to thousands of
-        // times.
-        Err(_) if dir.is_dir() => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("creating {}", dir.display())),
+    if crate::private_dir::prepare(dir, "cached media")? == crate::private_dir::Found::WasOpen {
+        log::warn!(
+            "{} was reachable by other accounts on this machine; dropping what this daemon did not put there",
+            dir.display()
+        );
+        // What another account left, and only that. Emptying the directory was
+        // the wrong shape of the same sentence: this runs on the first cache
+        // write, the front end's own `stage` creates the directory with
+        // `create_dir_all` and so with the umask's mode, and the sweep then
+        // deleted the `u-` payload of a recording the send had not run yet --
+        // which is the one thing under this roof with no other copy. Ownership
+        // is the exact test, and a planted file is owned by whoever planted
+        // it: the same sweep the plugin directory takes.
+        crate::private_dir::drop_foreign_entries(dir)?;
     }
-}
-
-#[cfg(not(unix))]
-fn prepare_dir(dir: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
+    Ok(())
 }
 
 /// Drop the oldest files once enough has been written to be worth looking.
@@ -349,5 +390,71 @@ mod tests {
         assert!(live.exists(), "and one still being written is not taken");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// The front end's own `stage` makes this directory with `create_dir_all`,
+    /// which is the umask's mode and not `0700`, so the daemon's first cache
+    /// write finds it open. Emptying it there deleted the staged payload of a
+    /// recording whose send had not run yet: the send then failed with the
+    /// only copy of the note gone.
+    #[test]
+    fn repairing_the_cache_keeps_a_recording_waiting_to_be_sent() {
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-media-repair-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let staged = dir.join("u-local_audio_1");
+        std::fs::write(&staged, b"a voice note").unwrap();
+
+        super::prepare_dir(&dir).unwrap();
+
+        assert!(staged.exists(), "the only copy of the note is still there");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "and the directory was still tightened"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key here is derived from content the account has already published,
+    /// so it is predictable. A symlink of the right length planted under one
+    /// while the directory was open answered "already cached" before the
+    /// sweep that exists to remove it had run, and the daemon then served the
+    /// link's target as the account's own media.
+    #[test]
+    fn a_planted_link_is_not_a_cache_hit() {
+        let base = std::env::temp_dir().join(format!(
+            "oxidezap-media-plant-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("media");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let elsewhere = base.join("elsewhere");
+        std::fs::write(&elsewhere, b"not ours").unwrap();
+        let planted = dir.join("f-key");
+        std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        super::prepare_dir(&dir).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&planted).is_err(),
+            "the link is gone before anything asks whether it is a hit"
+        );
+        assert!(elsewhere.exists(), "and its target was never followed");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -2059,4 +2059,44 @@ mod tests {
         assert_eq!(msg.reactions.get("❤️").unwrap().len(), 2);
         assert_eq!(msg.reactions.get("😂").unwrap().len(), 1);
     }
+
+    /// What one frame of a long conversation used to copy.
+    ///
+    /// A stopwatch rather than an assertion, so it is ignored by default. The
+    /// conversation view held a `&Chat` across calls that need the app
+    /// mutably, so it cloned the whole chat — every message with its text,
+    /// its reaction map and its quote — on every frame, for readers that only
+    /// ever look at the timeline cache.
+    ///
+    /// `cargo test -p oxidezap-core --release -- --ignored conversation_clone_cost`
+    #[test]
+    #[ignore = "a stopwatch, not a test"]
+    fn conversation_clone_cost() {
+        for rows in [500usize, 1_000, 2_000, 5_000] {
+            let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+            chat.messages = (0..rows)
+                .map(|n| {
+                    let mut message = ChatMessage::new_incoming(
+                        format!("MSG-{n}"),
+                        "a@s.whatsapp.net".to_string(),
+                        "uma mensagem de tamanho bastante comum".to_string(),
+                    );
+                    message
+                        .reactions
+                        .insert("👍".to_string(), vec!["a@s.whatsapp.net".to_string()]);
+                    message
+                })
+                .collect();
+
+            let frames = 60u32;
+            let started = wacore::time::Instant::now();
+            for _ in 0..frames {
+                std::hint::black_box(chat.clone());
+            }
+            println!(
+                "{rows} messages: {:?} per frame",
+                started.elapsed() / frames
+            );
+        }
+    }
 }
