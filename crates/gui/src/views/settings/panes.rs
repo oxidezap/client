@@ -83,6 +83,37 @@ fn plugins(
         .can_install()
         .then(|| add_a_plugin(entity.clone(), metrics));
 
+    // Everything in the folder that published nothing. A module that fails
+    // to parse, answers the wrong ABI version or traps in `oxi_init` has no
+    // surface at all, so a screen drawn from the surfaces alone leaves the
+    // one file somebody most needs to remove with no control anywhere — and
+    // it goes on spending the folder's budget at every load.
+    let silent: Vec<String> = app
+        .installed_plugins()
+        .iter()
+        .filter(|id| !app.plugins().iter().any(|surface| &surface.id == *id))
+        .cloned()
+        .collect();
+    let broken = (!silent.is_empty()).then(|| {
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_md())
+            .child(card(
+                silent
+                    .iter()
+                    .map(|id| (id.clone(), "Installed, but it did not load".to_string()))
+                    .collect(),
+                metrics,
+                cx,
+            ))
+            .children(
+                silent
+                    .iter()
+                    .map(|id| remove_a_plugin(id, entity.clone(), metrics)),
+            )
+    });
+
     if app.plugins().is_empty() {
         // Two different empty lists, and only one of them is waiting for a
         // file somebody else has to put there.
@@ -97,6 +128,7 @@ fn plugins(
                     metrics,
                     cx,
                 ))
+                .children(broken)
                 .children(installer),
             metrics,
         )
@@ -121,6 +153,7 @@ fn plugins(
                             .then(|| remove_a_plugin(&surface.id, entity.clone(), metrics)),
                     )
             }))
+            .children(broken)
             .children(installer),
         metrics,
     )

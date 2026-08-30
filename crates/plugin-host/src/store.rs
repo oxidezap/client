@@ -314,9 +314,22 @@ impl Origin {
         // refused rather than landing behind it. See `Backing::write`.
         ACCOUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let Some(storage) = Self::local() else {
-            // No storage is nothing to retire, which is the ordinary case for
-            // a page that has never run a plugin.
-            return true;
+            // Not "there was nothing to retire". This browser refused the
+            // store *now*, and refusing it is not the same fact as its being
+            // empty — a blocked storage context can be unblocked, and the
+            // approvals this call was supposed to remove would then be read
+            // back for whoever paired in the meantime, with the same id and
+            // the same mask allowed to act under consent nobody in that
+            // account gave. Nothing here can tell an origin that never held
+            // one from an origin whose storage is shut, so the only honest
+            // answer is the one that fails closed: the caller refuses the
+            // wipe and says so, and the old account stays intact — a state
+            // somebody can act on again.
+            log::error!(
+                "this page has no storage to retire the plugins' permissions in; the wipe \
+                 cannot go ahead"
+            );
+            return false;
         };
         let prefix = Self::storage().prefix;
         // Collected before anything is removed: `key(i)` is an index into a

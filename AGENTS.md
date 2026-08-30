@@ -1195,6 +1195,22 @@ agent, and a latch would leave *that* host unable to write for the rest of the
 tab's life — grants rolled back, settings lost — while the tasks it was aimed
 at were the old host's.
 
+Retiring is where a page fails closed rather than tidily. A browser that
+refuses `localStorage` outright is not the same fact as an origin that never
+held an approval, and nothing here can tell the two apart — so `forget_all`
+answers `false` and the wipe is refused, because a storage context that is
+shut can be opened again and the approvals it still holds would then be read
+back for whoever paired in the meantime.
+
+What a page draws about that folder is two lists rather than one. A module
+that fails to parse, answers the wrong ABI version or traps in `oxi_init`
+publishes no surface at all, so Settings drawn from the surfaces alone leaves
+the one file somebody most needs to remove with no control anywhere — and it
+goes on spending the folder's budget at every load.
+`daemon::plugins::web::names` is that second list, asked when Settings opens
+and again after an install or a removal, the same shape and on the same terms
+as the storage total beside it.
+
 The front end says which of the two it is looking at rather than guessing:
 `platform::plugins::home` is the mirror of `daemon::plugins::start`, and the
 two halves are written to be read together — a page that drew "drop a .wasm in
@@ -1435,12 +1451,11 @@ by definition.
   desktop opens them one at a time, but nothing in a browser can open a file
   lazily from a synchronous loader, so `MAX_TOTAL_BYTES` bounds the folder
   where the desktop bounds the file, and installing checks what the folder
-  *would become* rather than what the new module weighs: a second plugin that
-  fits alone and not beside the first would otherwise be written, reported as
-  installed, and skipped at every load after. And a module that fails to load
-  publishes no surface, so a page has nowhere to draw a Remove button for
-  it: the list of installed ids is in `daemon::plugins::web::names`, and
-  nothing asks it yet.
+  *would become* rather than what the new module weighs — under a lock, since
+  two overlapping installs would otherwise weigh the same folder and both fit
+  in it. A second plugin that fits alone and not beside the first would
+  otherwise be written, reported as installed, and skipped at every load
+  after.
 - **A page with its own session cannot send media, and the reason is upstream.**
   `BrowserHttpClient` implements `execute` and nothing else, which the trait
   allows: the streaming paths default to refusing. But the library's upload

@@ -205,6 +205,46 @@ impl WhatsAppApp {
         &self.plugins
     }
 
+    /// Every plugin id in this front end's own folder, once it has been
+    /// asked. Empty until then, and forever where there is no folder.
+    #[must_use]
+    pub fn installed_plugins(&self) -> &[String] {
+        self.installed_plugins.as_deref().unwrap_or_default()
+    }
+
+    /// Read the folder, so Settings can offer to remove what is in it.
+    ///
+    /// The list of *surfaces* is not that list. A module that fails to parse,
+    /// answers the wrong ABI version or traps in `oxi_init` publishes nothing
+    /// at all, so a screen drawn from the surfaces alone leaves the one file
+    /// somebody most needs to remove with no control anywhere — and it goes
+    /// on spending the folder's budget at every load.
+    ///
+    /// Asked when Settings opens and again after an install or a removal,
+    /// which is the same shape the storage total is asked in: a pane that
+    /// starts on "reading…" every time is worse than one that is already
+    /// right.
+    pub fn refresh_installed_plugins(&mut self, cx: &mut Context<Self>) {
+        if !crate::platform::plugins::home().can_install() {
+            return;
+        }
+        cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
+            let found = crate::platform::plugins::installed().await;
+            let _ = entity.update(cx, |app, cx| {
+                match found {
+                    Ok(ids) => app.installed_plugins = Some(ids),
+                    // Left as it was rather than emptied: a read that failed
+                    // is not a folder that is empty, and drawing it as one
+                    // would take away the Remove button somebody was about
+                    // to press.
+                    Err(e) => log::warn!("cannot read this page's plugin folder: {e}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Put a `.wasm` somebody chose into this front end's own plugin folder.
     ///
     /// Only a page holding its own session has one; every other front end
@@ -223,11 +263,14 @@ impl WhatsAppApp {
             let _ = entity.update(cx, |app, cx| match outcome {
                 // Nobody chose anything. Not a failure, and not worth a line.
                 Ok(None) => {}
-                Ok(Some(id)) => app.notify_user(
-                    format!("{id} installed. Reload this page to run it."),
-                    super::notices::Tone::Info,
-                    cx,
-                ),
+                Ok(Some(id)) => {
+                    app.refresh_installed_plugins(cx);
+                    app.notify_user(
+                        format!("{id} installed. Reload this page to run it."),
+                        super::notices::Tone::Info,
+                        cx,
+                    );
+                }
                 Err(e) => {
                     log::warn!("cannot install a plugin: {e}");
                     app.notify_user(
@@ -252,11 +295,14 @@ impl WhatsAppApp {
         cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
             let outcome = crate::platform::plugins::uninstall(&id).await;
             let _ = entity.update(cx, |app, cx| match outcome {
-                Ok(()) => app.notify_user(
-                    format!("{id} removed. It stops at the next reload."),
-                    super::notices::Tone::Info,
-                    cx,
-                ),
+                Ok(()) => {
+                    app.refresh_installed_plugins(cx);
+                    app.notify_user(
+                        format!("{id} removed. It stops at the next reload."),
+                        super::notices::Tone::Info,
+                        cx,
+                    );
+                }
                 Err(e) => {
                     log::warn!("cannot remove the plugin {id}: {e}");
                     app.notify_user(

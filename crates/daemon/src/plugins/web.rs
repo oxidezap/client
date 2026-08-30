@@ -50,6 +50,19 @@ const DIR: &str = "plugins";
 /// in a browser is a promise and the host's loader is not async.
 pub const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
+thread_local! {
+    /// Held across one installation's weigh-and-write. See [`install`].
+    ///
+    /// Per agent, because that is the scope the folder is shared in: a page
+    /// has one, and a worker that ever ran this would have its own handle to
+    /// the same directory and its own reason to serialize. An async lock and
+    /// not a flag, because the section spans awaits and the second caller
+    /// should be made to wait rather than told to try again — a person who
+    /// pressed Add twice wants both files.
+    static INSTALLING: std::rc::Rc<tokio::sync::Mutex<()>> =
+        std::rc::Rc::new(tokio::sync::Mutex::new(()));
+}
+
 /// Everything installed, ready to hand to the host.
 ///
 /// Sorted by name, because the order plugins load in is the order their
@@ -129,6 +142,15 @@ pub async fn installed() -> Vec<Module> {
 /// installation notice for a plugin that never runs. Refused at the moment
 /// somebody can still do something about it.
 ///
+/// Weighing the folder and writing into it are one step, and the lock below
+/// is what makes them one. Two installations overlap easily — a second Add
+/// while the first file is still being read or written is a person pressing a
+/// button twice — and each would finish `occupied` against the same total
+/// before either write landed, so two modules that do not fit together would
+/// both be accepted. The page has one agent and every await here is a browser
+/// promise, so the lock is never contended for long and never deadlocks: it is
+/// held across the read and the write and nothing else.
+///
 /// # Errors
 ///
 /// The name is not one a plugin may have, the folder has no room for it, or
@@ -137,6 +159,8 @@ pub async fn install(file_name: &str, bytes: &[u8]) -> Result<String, String> {
     let id = plugin_id(file_name)
         .ok_or_else(|| format!("`{file_name}` is not a name a plugin can have"))?;
     let name = format!("{id}.wasm");
+    let installing = INSTALLING.with(std::rc::Rc::clone);
+    let _one_at_a_time = installing.lock().await;
     let dir = folder(true)
         .await
         .map_err(described)?

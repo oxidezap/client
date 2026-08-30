@@ -66,6 +66,15 @@ pub async fn install() -> Result<Option<String>, String> {
     imp::install().await
 }
 
+/// Every plugin id in this front end's own folder, loaded or not.
+///
+/// # Errors
+///
+/// There is no folder, or it could not be read.
+pub async fn installed() -> Result<Vec<String>, String> {
+    imp::installed().await
+}
+
 /// Take one out of this front end's own folder.
 ///
 /// # Errors
@@ -94,6 +103,12 @@ mod imp {
     /// See [`install`].
     pub async fn uninstall(_id: &str) -> Result<(), String> {
         Err("this front end cannot remove plugins".to_owned())
+    }
+
+    /// See [`install`]. The daemon's folder is not this front end's to list —
+    /// what it *runs* out of it arrives in the snapshot like everything else.
+    pub async fn installed() -> Result<Vec<String>, String> {
+        Err("this front end has no plugin folder of its own".to_owned())
     }
 }
 
@@ -160,6 +175,10 @@ mod imp {
 
     pub async fn uninstall(id: &str) -> Result<(), String> {
         oxidezap_daemon::plugins::web::uninstall(id).await
+    }
+
+    pub async fn installed() -> Result<Vec<String>, String> {
+        oxidezap_daemon::plugins::web::names().await
     }
 
     /// The file somebody picked, or `None` if they picked nothing.
