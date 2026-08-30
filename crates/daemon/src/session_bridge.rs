@@ -2073,7 +2073,7 @@ mod tests {
 
         assert_eq!(bridge.hub.chat("1@s.whatsapp.net").unwrap().unread, 1);
         assert_eq!(
-            bridge.reads.take_receipts("1@s.whatsapp.net").len(),
+            bridge.reads().take_receipts("1@s.whatsapp.net").len(),
             1,
             "and the badge agrees with the receipts this side owes"
         );
@@ -2095,7 +2095,7 @@ mod tests {
         };
         bridge.observe(arrival());
         // What marking the chat read does to this side.
-        assert_eq!(bridge.reads.take_receipts("1@s.whatsapp.net").len(), 1);
+        assert_eq!(bridge.reads().take_receipts("1@s.whatsapp.net").len(), 1);
 
         bridge.observe(arrival());
 
@@ -2105,7 +2105,7 @@ mod tests {
             "the badge is not raised a second time by the same message"
         );
         assert!(
-            bridge.reads.take_receipts("1@s.whatsapp.net").is_empty(),
+            bridge.reads().take_receipts("1@s.whatsapp.net").is_empty(),
             "and no second receipt is owed for it"
         );
     }

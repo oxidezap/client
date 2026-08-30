@@ -216,7 +216,7 @@ mod tests {
             }
         }
 
-        let started = std::time::Instant::now();
+        let started = wacore::time::Instant::now();
         assert!(
             socket_is_live(&path),
             "no answer is not a reason to take a live daemon's socket"

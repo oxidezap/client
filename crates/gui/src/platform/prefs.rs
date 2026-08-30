@@ -174,6 +174,21 @@ mod native {
         }
     }
 
+    /// The file's modification time, in milliseconds since the epoch.
+    ///
+    /// Only ever compared against another of these, so the epoch it counts
+    /// from does not matter — only that it moves when the file does.
+    pub fn revision() -> Option<super::Revision> {
+        let modified = std::fs::metadata(path()?)
+            .and_then(|meta| meta.modified())
+            .ok()?;
+        let since = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        super::Revision::try_from(since).ok()
+    }
+
     #[cfg(test)]
     mod tests {
         /// A theme written in place is one a full disk or a power cut can
@@ -193,21 +208,6 @@ mod native {
             assert_eq!(std::fs::read_to_string(&path).expect("readable"), "{}");
             let _ = std::fs::remove_dir_all(&dir);
         }
-    }
-
-    /// The file's modification time, in milliseconds since the epoch.
-    ///
-    /// Only ever compared against another of these, so the epoch it counts
-    /// from does not matter — only that it moves when the file does.
-    pub fn revision() -> Option<super::Revision> {
-        let modified = std::fs::metadata(path()?)
-            .and_then(|meta| meta.modified())
-            .ok()?;
-        let since = modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_millis();
-        super::Revision::try_from(since).ok()
     }
 }
 
