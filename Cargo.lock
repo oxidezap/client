@@ -6163,7 +6163,6 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "chrono",
- "env_logger",
  "futures-channel",
  "futures-util",
  "getrandom 0.2.17",
@@ -6173,6 +6172,7 @@ dependencies = [
  "log",
  "oxidezap-core",
  "oxidezap-ipc",
+ "oxidezap-logging",
  "oxidezap-plugin-host",
  "oxidezap-session",
  "portable-atomic",
@@ -6195,7 +6195,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "env_logger",
  "futures-channel",
  "futures-lite",
  "getrandom 0.4.3",
@@ -6213,6 +6212,7 @@ dependencies = [
  "oxidezap-core",
  "oxidezap-daemon",
  "oxidezap-ipc",
+ "oxidezap-logging",
  "portable-atomic",
  "qrcode",
  "rust-embed",
@@ -6248,6 +6248,17 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "oxidezap-logging"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "oxidezap-core",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

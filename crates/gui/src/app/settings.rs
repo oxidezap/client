@@ -7,7 +7,10 @@
 
 use gpui::{Context, WeakEntity};
 
+use oxidezap_core::LogLevel;
+
 use crate::app::WhatsAppApp;
+use crate::app::notices::Tone;
 use crate::session::StorageUsage;
 use crate::theme::{ActiveProductTheme as _, ThemeSettings, config};
 
@@ -174,6 +177,35 @@ impl WhatsAppApp {
             });
         })
         .detach();
+    }
+
+    /// Change how much is logged, here and in the daemon, now and next time.
+    ///
+    /// Three things, and each is a different process or a different day.
+    /// This window applies it to itself immediately — a front end writes its
+    /// own share of the log, and a page attached to no daemon writes all of
+    /// it. The daemon is told, because it holds the session and so writes
+    /// nearly everything worth reading. And both sides write the choice down,
+    /// each where it keeps its own: on a desktop that is one file both
+    /// processes read, and for a page it is a browser store the daemon
+    /// cannot reach, which is exactly why the daemon remembers it too.
+    ///
+    /// A store that will not take it is a notice rather than a refusal: the
+    /// level *has* changed, and what failed is only the memory of it.
+    pub fn set_log_level(&mut self, level: LogLevel, cx: &mut Context<Self>) {
+        let stored = oxidezap_logging::set(level);
+        if let Some(client) = &self.client {
+            client.set_log_level(level);
+        }
+        if let Err(e) = stored {
+            log::warn!("the log level was changed but not stored: {e}");
+            self.notify_user(
+                "Logging at that level now, but the choice will not survive a restart.",
+                Tone::Problem,
+                cx,
+            );
+        }
+        cx.notify();
     }
 
     /// Delete the cached media and re-measure.

@@ -1,0 +1,28 @@
+[package]
+name = "oxidezap-logging"
+description = "The log level: where it is kept, and how it is changed while the process runs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+log = { workspace = true }
+# `LogLevel` itself, which is also what crosses the daemon socket: a level a
+# front end picks and a level this crate writes down are one type.
+oxidezap-core = { workspace = true }
+
+# stderr, and an environment to read `RUST_LOG` out of.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+env_logger = "0.11"
+
+# The browser's console, its query string, and the store that survives a
+# reload.
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["console", "Location", "Storage", "Window"] }
+
+[lints]
+workspace = true

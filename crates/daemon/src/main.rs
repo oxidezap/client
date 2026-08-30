@@ -13,12 +13,16 @@ use anyhow::{Context, Result};
 use crate::state::StateHub;
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        // zbus narrates every D-Bus frame at info, which buries the daemon's
-        // own output the moment a tray is connected.
-        .filter_module("zbus", log::LevelFilter::Warn)
-        .filter_module("tracing", log::LevelFilter::Warn)
-        .init();
+    // The level the last person to change it chose, unless `RUST_LOG` says
+    // otherwise for this run — and changeable while the daemon runs, which is
+    // the point: nearly everything worth reading about a session is written
+    // at `debug`, and restarting the process to see it ends the connection
+    // that was being investigated.
+    //
+    // zbus narrates every D-Bus frame at info, which buries the daemon's own
+    // output the moment a tray is connected.
+    oxidezap_logging::install(&["zbus", "tracing"]);
+    oxidezap_logging::activate();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

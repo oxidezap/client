@@ -940,6 +940,16 @@ impl Session {
         });
     }
 
+    /// Say how much the daemon should log.
+    ///
+    /// Fire and forget: the level in *this* process is changed by the caller
+    /// before this is sent, and what comes back would only say that the
+    /// daemon heard. A daemon that is not there is a daemon writing no logs
+    /// to raise the level of.
+    pub fn set_log_level(&self, level: oxidezap_core::LogLevel) {
+        self.tell(ClientRequest::SetLogLevel { level });
+    }
+
     /// Wipe the local store and pair again.
     ///
     /// The daemon owns that file and stops itself once it is gone, so this is

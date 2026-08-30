@@ -1033,6 +1033,37 @@ async fn handle_request(
                 }),
             })
         }
+        // Applied here and now, and written down for the next start. Both,
+        // because they answer different questions: a person raising the
+        // level is asking about the session that is running, and the file is
+        // what keeps them from having to ask again after every restart.
+        //
+        // The write is off the runtime for the reason the plugin approval's
+        // is — it is a file created, flushed and renamed, which on a
+        // single-worker runtime stalls the session bridge and every other
+        // connection for as long as the disk takes. Awaited rather than
+        // spawned loose, so the acknowledgement means the choice is on disk.
+        ClientRequest::SetLogLevel { level } => {
+            oxidezap_logging::apply(level);
+            log::info!("logging at {level}, asked for by a front end");
+            let recorded =
+                oxidezap_session::unblock(move || oxidezap_logging::remember(level)).await;
+            match recorded {
+                Ok(Ok(())) => acted(Ok(())),
+                // The level *did* change; only the memory of it failed. Said
+                // in the log rather than refused, because answering `Refused`
+                // to a request that was carried out is the worse lie of the
+                // two.
+                Ok(Err(e)) => {
+                    log::warn!("the log level was changed but not stored: {e}");
+                    acted(Ok(()))
+                }
+                Err(_) => {
+                    log::warn!("the log level was changed but the store was not reached");
+                    acted(Ok(()))
+                }
+            }
+        }
         // The daemon has no window of its own, so this is relayed rather than
         // acted on: whoever owns a window is the only one that can raise it.
         // Published to every client, including the one that asked, because a
