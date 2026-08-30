@@ -1428,15 +1428,18 @@ it. The library takes it through `Client::set_relay_transport_provider`, a seam
 that exists upstream for exactly this and answers with a factory per relay
 endpoint, since the server names the relay per call.
 
-One fact is not in this tree and one line is waiting on it. An SDP answer must
-name the certificate the far end presents and a browser enforces the match
-(RFC 8122); the native transport does not care and says the fingerprint "is
-fixed and cosmetic at this layer". *Fixed* is the operative word — it is a
-constant in WhatsApp Web's own bundle, recoverable from one capture, and not
-anything the `<relay>` block carries. So `RELAY_DTLS_FINGERPRINT` is empty and
-the provider refuses with a sentence naming it, rather than building a peer
-connection that fails the handshake and reports a network fault. Everything
-else on that path is built.
+One fact on that path is a captured constant rather than something the
+protocol carries. An SDP answer must name the certificate the far end presents
+and a browser enforces the match (RFC 8122); the native transport does not care
+and says the fingerprint "is fixed and cosmetic at this layer". *Fixed* is the
+operative word, and it is a claim that was checked rather than taken: read out
+of `chrome://webrtc-internals` during calls placed on WhatsApp Web itself, the
+remote certificate was the same across separate calls that reached *different*
+relay addresses, while each tab's own certificate differed. One value, two
+endpoints — that is what makes `RELAY_DTLS_FINGERPRINT` a constant and not a
+per-call secret. It is not in the `<relay>` block and there is nowhere else to
+get it, so a build that lost it would fail every handshake, which is what
+`the_fingerprint_is_thirty_two_hex_pairs` is there to notice early.
 
 Whether a page can record is a question about the *browser* rather than about
 the build, which is why `can_record()` is a function where `CAN_RECORD` was a

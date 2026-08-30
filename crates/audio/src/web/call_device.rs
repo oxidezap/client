@@ -97,6 +97,9 @@ struct Graph {
     playout: web_sys::ScriptProcessorNode,
     _on_capture: Closure<dyn FnMut(web_sys::AudioProcessingEvent)>,
     _on_playout: Closure<dyn FnMut(web_sys::AudioProcessingEvent)>,
+    /// One per track, kept alive for as long as the graph is: a closure that
+    /// has been dropped traps when the browser calls it.
+    _on_ended: Vec<Closure<dyn FnMut(web_sys::Event)>>,
 }
 
 impl Drop for Graph {
@@ -109,6 +112,11 @@ impl Drop for Graph {
         let _ = self.playout.disconnect();
         for track in self.stream.get_tracks().iter() {
             if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
+                // Before `stop`, and before the closures below are dropped
+                // with `self`: `stop()` is specified not to fire `ended`, but
+                // a handler the browser calls after its closure has gone is a
+                // trap rather than a missed event, so nothing is left armed.
+                track.set_onended(None);
                 track.stop();
             }
         }
@@ -269,6 +277,9 @@ fn wire(
     mic: async_channel::Sender<Vec<i16>>,
     playout: Rc<RefCell<VecDeque<f32>>>,
 ) -> Result<Graph> {
+    // Taken before the capture callback moves the sender in; see the tracks'
+    // `ended` handlers at the end of this function.
+    let ended_mic = mic.clone();
     let source = context
         .create_media_stream_source(stream)
         .map_err(|e| anyhow!("the microphone could not be attached: {}", describe(&e)))?;
@@ -355,6 +366,27 @@ fn wire(
         .connect_with_audio_node(&context.destination())
         .map_err(|e| anyhow!("the playout graph would not connect: {}", describe(&e)))?;
 
+    // A microphone can end without the call ending: unplugged, revoked in the
+    // site settings, or taken by the operating system. The capture callback
+    // holds the sender, so nothing else would ever close it — the call stays
+    // up, the engine goes on waiting for input, and the person on the other
+    // end hears silence with nothing anywhere saying why. Closing the channel
+    // is the same ending the teardown uses, so it needs no second path out.
+    let on_ended: Vec<Closure<dyn FnMut(web_sys::Event)>> = stream
+        .get_tracks()
+        .iter()
+        .filter_map(|track| track.dyn_into::<web_sys::MediaStreamTrack>().ok())
+        .map(|track| {
+            let mic = ended_mic.clone();
+            let ended = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+                warn!("the call's microphone ended: its track stopped");
+                mic.close();
+            });
+            track.set_onended(Some(ended.as_ref().unchecked_ref()));
+            ended
+        })
+        .collect();
+
     Ok(Graph {
         context: context.clone(),
         stream: stream.clone(),
@@ -362,6 +394,7 @@ fn wire(
         playout: playout_node,
         _on_capture: on_capture,
         _on_playout: on_playout,
+        _on_ended: on_ended,
     })
 }
 

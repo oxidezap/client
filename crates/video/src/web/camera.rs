@@ -105,6 +105,11 @@ impl Drop for CameraGuard {
 fn stop_tracks(stream: &web_sys::MediaStream) {
     for track in stream.get_tracks().iter() {
         if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
+            // Disarmed before it is stopped. `stop()` is specified not to fire
+            // `ended`, but a handler the browser calls after its closure has
+            // been dropped is a trap rather than a missed event, and the
+            // closures go with the `Held` that is dropping now.
+            track.set_onended(None);
             track.stop();
         }
     }
@@ -122,6 +127,8 @@ struct Held {
     _on_tick: Closure<dyn FnMut()>,
     _on_chunk: Closure<dyn FnMut(web_sys::EncodedVideoChunk, wasm_bindgen::JsValue)>,
     _on_error: Closure<dyn FnMut(wasm_bindgen::JsValue)>,
+    /// One per track; see where it is installed in [`open_camera`].
+    _on_ended: Vec<Closure<dyn FnMut(web_sys::Event)>>,
 }
 
 impl Drop for Held {
@@ -283,6 +290,30 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
         )
         .map_err(|e| anyhow!("the capture timer would not start: {}", describe(&e)))?;
 
+    // A track ends without anyone asking when the device is unplugged or its
+    // permission is revoked mid-call. Nothing else notices: the capture timer
+    // goes on handing the encoder whatever the element last showed, so the
+    // registry keeps drawing a live camera over a still picture. Closing the
+    // frame channel is the same signal the encoder's own error path sends,
+    // and `pump_local` already reads it as the device having gone.
+    //
+    // `stop()` deliberately does *not* fire this — the specification says so —
+    // so an ordinary teardown does not come back through here.
+    let on_ended: Vec<Closure<dyn FnMut(web_sys::Event)>> = stream
+        .get_tracks()
+        .iter()
+        .filter_map(|track| track.dyn_into::<web_sys::MediaStreamTrack>().ok())
+        .map(|track| {
+            let tx = tx.clone();
+            let ended = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+                warn!("the camera stopped: its track ended");
+                tx.close();
+            });
+            track.set_onended(Some(ended.as_ref().unchecked_ref()));
+            ended
+        })
+        .collect();
+
     debug!(
         "the browser camera is open at {}x{}@{}",
         quality.width, quality.height, quality.fps
@@ -301,6 +332,7 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
             _on_tick: on_tick,
             _on_chunk: on_chunk,
             _on_error: on_error,
+            _on_ended: on_ended,
         }),
     })
 }
@@ -335,15 +367,86 @@ async fn open_device(
     let constraints = web_sys::MediaStreamConstraints::new();
     constraints.set_video(&video);
 
-    wasm_bindgen_futures::JsFuture::from(
-        devices
-            .get_user_media_with_constraints(&constraints)
-            .map_err(|e| anyhow!("the camera could not be opened: {}", describe(&e)))?,
-    )
+    let asked = devices
+        .get_user_media_with_constraints(&constraints)
+        .map_err(|e| anyhow!("the camera could not be opened: {}", describe(&e)))?;
+
+    // Bounded, because the thing this waits on is a person. `getUserMedia`
+    // settles when the permission prompt is answered and not before, and by
+    // the time a camera is asked for the *microphone* is already open: a
+    // prompt nobody answers would hold this task, the call's audio devices
+    // and a hangup that can only be recorded as deferred, for as long as the
+    // tab is left alone. Giving up downgrades the call to voice, which is
+    // what every other camera failure does.
+    let abandoned = Rc::new(Cell::new(false));
+    // A prompt answered after we gave up still opens the device, and the
+    // stream it resolves with is one nothing here is holding — so its tracks
+    // would run, with the tab's indicator on, until the page went away. The
+    // same promise is awaited twice, which is what promises are for.
+    {
+        let abandoned = Rc::clone(&abandoned);
+        let late = asked.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Ok(value) = wasm_bindgen_futures::JsFuture::from(late).await else {
+                return;
+            };
+            if !abandoned.get() {
+                return;
+            }
+            if let Ok(stream) = value.dyn_into::<web_sys::MediaStream>() {
+                warn!("the camera opened after the call gave up waiting for it; closing it again");
+                stop_tracks(&stream);
+            }
+        });
+    }
+
+    let opened = wasm_bindgen_futures::JsFuture::from(asked);
+    let deadline = after(window, PERMISSION_CEILING_MS);
+    let Some(opened) = futures_lite::future::or(async move { Some(opened.await) }, async move {
+        deadline.await;
+        None
+    })
     .await
-    .map_err(|e| anyhow!("the camera was refused: {}", describe(&e)))?
-    .dyn_into::<web_sys::MediaStream>()
-    .map_err(|_| anyhow!("the browser opened something that is not a stream"))
+    else {
+        abandoned.set(true);
+        bail!("the camera permission prompt went unanswered");
+    };
+
+    opened
+        .map_err(|e| anyhow!("the camera was refused: {}", describe(&e)))?
+        .dyn_into::<web_sys::MediaStream>()
+        .map_err(|_| anyhow!("the browser opened something that is not a stream"))
+}
+
+/// How long a camera permission prompt is waited on.
+///
+/// Generous, because it is a person reading a dialog, and a call that
+/// downgrades to voice while somebody was reaching for the mouse is the worse
+/// failure. Short enough that a prompt left on screen does not hold a call's
+/// microphone open indefinitely.
+const PERMISSION_CEILING_MS: i32 = 30_000;
+
+/// Resolve after `ms`, through the only clock this target has.
+///
+/// `tokio::time` links here and traps on the first await; the session says
+/// the same thing in `exec::sleep`, which this crate has no route to — it
+/// depends on nothing above `oxidezap-video`.
+async fn after(window: &web_sys::Window, ms: i32) {
+    let (tx, rx) = async_channel::bounded::<()>(1);
+    let fire = Closure::once_into_js(move || {
+        let _ = tx.try_send(());
+    });
+    if window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(fire.unchecked_ref(), ms)
+        .is_err()
+    {
+        // No timer to arm means no ceiling to enforce; waiting forever on a
+        // channel nothing will send to is what leaves the other side of the
+        // race the only one that can finish, which is the behaviour this had
+        // before the ceiling existed.
+        warn!("no timer to bound the camera permission prompt with");
+    }
+    let _ = rx.recv().await;
 }
 
 /// A `<video>` playing the stream, so a `VideoFrame` can be taken from it.

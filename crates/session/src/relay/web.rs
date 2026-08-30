@@ -45,15 +45,14 @@
 //! fingerprint is fixed and cosmetic at this layer, and media authentication
 //! is hop-by-hop SRTP keyed from callKey, not from this handshake".
 //!
-//! *Fixed* is the operative word and this tree does not contain the value.
-//! It is a constant in WhatsApp Web's own bundle, recoverable from one
-//! capture of a call placed there, and it is the single fact standing between
-//! this module and a call that connects. So it is [`RELAY_DTLS_FINGERPRINT`],
-//! empty, and [`BrowserRelay::factory`] refuses with a sentence naming it
-//! rather than building a peer connection that will fail the handshake and
-//! report a network fault.
+//! *Fixed* is the operative word, and it is now a value rather than a hope:
+//! `super::sdp::RELAY_DTLS_FINGERPRINT` holds the certificate the relays present,
+//! observed identical across separate calls placed on WhatsApp Web that
+//! reached *different* relay addresses. What varied in those captures was the
+//! browser's own certificate, which is what makes it the far end's and not a
+//! per-call one.
 //!
-//! Nothing else here is waiting on anything.
+//! Nothing here is waiting on anything.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -70,7 +69,7 @@ use whatsapp_rust::wacore::voip::transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };
 
-use super::{RELAY_DTLS_FINGERPRINT, synthetic_answer};
+use super::synthetic_answer;
 
 /// The DataChannel label WA Web opens, and the one the native stack uses.
 const CHANNEL_LABEL: &str = "pre-negotiated";
@@ -108,15 +107,6 @@ impl whatsapp_rust::wacore::voip::RelayTransportProvider for BrowserRelay {
         &self,
         relay: &RelayEndpointParams,
     ) -> Result<std::sync::Arc<dyn RelayTransportFactory>> {
-        if RELAY_DTLS_FINGERPRINT.is_empty() {
-            bail!(
-                "this build has no relay DTLS fingerprint, and a browser will not complete a \
-                 handshake without one: an SDP answer has to name the certificate the far end \
-                 presents (RFC 8122), the value is a constant in WhatsApp Web's own bundle rather \
-                 than anything the <relay> block carries, and it goes in \
-                 `relay::web::RELAY_DTLS_FINGERPRINT`"
-            );
-        }
         if !has_peer_connection() {
             bail!("this browser has no RTCPeerConnection, so it cannot carry a call's media");
         }

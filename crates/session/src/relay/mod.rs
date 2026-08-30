@@ -48,13 +48,21 @@ mod sdp {
     /// The SHA-256 fingerprint of the certificate a WhatsApp relay presents,
     /// formatted as SDP expects it (`AA:BB:...`, 32 upper-case hex pairs).
     ///
-    /// Empty, deliberately, and the one thing this module is waiting on. See the
-    /// module docs: the value is a constant in WhatsApp Web's bundle rather than
-    /// anything derivable from the `<relay>` block, and guessing it produces a
-    /// DTLS failure that reads as a network fault.
+    /// *Fixed*, which is the whole reason a constant can stand here at all:
+    /// the relays present one certificate rather than one per allocation. Read
+    /// out of `chrome://webrtc-internals` during calls placed on WhatsApp Web
+    /// itself -- the remote `certificate` entry, the one whose id is not the
+    /// local `a=fingerprint` -- and it was the same across separate calls that
+    /// reached *different* relay addresses, while each tab's own certificate
+    /// differed. One value, two endpoints, two sessions: that is the
+    /// observation that makes it a constant and not a per-call secret.
     ///
-    /// A build that has it fills this in and nothing else changes.
-    pub(crate) const RELAY_DTLS_FINGERPRINT: &str = "";
+    /// Not something the `<relay>` block carries, and not something a browser
+    /// will let us skip: an answer must name the certificate the far end
+    /// presents (RFC 8122). The native transport sets `insecure_skip_verify`
+    /// and never needed it.
+    pub(crate) const RELAY_DTLS_FINGERPRINT: &str = "F9:CA:0C:98:A3:CC:71:D6:42:CE:5A:E2:53:D2:15:20:\
+         D3:1B:BA:D8:57:A4:F0:AF:BE:0B:FB:F3:6B:0C:A0:68";
 
     /// The SCTP-over-DTLS WebRTC port. Fixed by the stack, not by the relay.
     const SCTP_PORT: u16 = 5000;
@@ -126,6 +134,23 @@ mod sdp {
             }
         }
 
+        /// The line continuation in the fingerprint literal is easy to get
+        /// wrong and impossible to see: a stray space makes an answer a
+        /// browser rejects, and the failure that reads back is a handshake
+        /// that did not happen rather than a malformed attribute.
+        #[test]
+        fn the_fingerprint_is_thirty_two_hex_pairs() {
+            let pairs: Vec<&str> = RELAY_DTLS_FINGERPRINT.split(':').collect();
+            assert_eq!(pairs.len(), 32, "{RELAY_DTLS_FINGERPRINT}");
+            for pair in pairs {
+                assert!(
+                    pair.len() == 2 && pair.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{pair:?} in {RELAY_DTLS_FINGERPRINT}"
+                );
+                assert_eq!(pair, pair.to_ascii_uppercase(), "{RELAY_DTLS_FINGERPRINT}");
+            }
+        }
+
         /// The mid travels from the offer, because an answer that renames it is
         /// rejected with nothing useful on the error.
         #[test]
@@ -183,4 +208,4 @@ mod sdp {
 }
 
 #[cfg(target_family = "wasm")]
-pub(crate) use sdp::{RELAY_DTLS_FINGERPRINT, synthetic_answer};
+pub(crate) use sdp::synthetic_answer;

@@ -126,10 +126,10 @@ mod video {
 /// ordinary voice call. There is nothing to withhold.
 ///
 /// The GUI has no route to `oxidezap-session`'s
-/// `relay::web::RELAY_DTLS_FINGERPRINT` -- it depends on ipc, core and audio,
+/// `relay::sdp::RELAY_DTLS_FINGERPRINT` -- it depends on ipc, core and audio,
 /// never on the session -- so this does not read that constant. It does not
-/// need to: the only arrangement that constant governs is a page holding its
-/// own session, and that is the arrangement this refuses outright.
+/// need to: that constant is filled in now, so what is left to ask is what
+/// this browser has.
 #[must_use]
 pub fn calls_unavailable() -> Option<&'static str> {
     calls::calls_unavailable()
@@ -145,7 +145,7 @@ mod calls {
 
 #[cfg(target_family = "wasm")]
 mod calls {
-    /// Asked of the *session*, not of the build, exactly as
+    /// Asked of the *session* first, not of the build, exactly as
     /// `media_send_unavailable` is — and for the same reason, which this
     /// answered wrongly at first by looking only at the page.
     ///
@@ -156,22 +156,36 @@ mod calls {
     /// blocks a call that would have worked.
     ///
     /// A page holding its own session is the case the browser relay exists
-    /// for, and it cannot complete a call yet whatever the browser has:
-    /// `oxidezap-session`'s `relay::web::RELAY_DTLS_FINGERPRINT` is empty, so
-    /// the provider refuses at setup. Refusing here instead is the same rule
-    /// the rest of this module follows — a control that is drawn and then
-    /// always fails is worse than one that is not drawn — and it is why this
-    /// does not ask about WebRTC at all: the answer would not change the
-    /// outcome. When that constant lands, this arm becomes the
-    /// `RTCPeerConnection` check.
+    /// for, and there the question is the browser's: the media rides a
+    /// pre-negotiated DataChannel over an `RTCPeerConnection`, so an agent
+    /// without one carries nothing. Asked before the control is drawn,
+    /// because a browser is not going to grow one between the question and
+    /// the press — the same rule the rest of this module follows.
     pub fn calls_unavailable() -> Option<&'static str> {
         match oxidezap_ipc::web::named_daemon() {
             oxidezap_ipc::web::NamedDaemon::Named(_) => None,
             // `Rejected` answered like `Nobody`, as above: the window is on
             // the refusal screen and drawing no call control either way.
+            _ if has_peer_connection() => None,
             _ => Some(
-                "A page that holds its own account cannot place calls yet:                  its relay has no certificate to check the far end against.                  Point this page at an oxidezapd with #daemon=ws://… and it                  calls through that.",
+                "This browser has no RTCPeerConnection, which is what carries \
+                 a call's media here.",
             ),
         }
+    }
+
+    /// Whether the agent this page runs in defines `RTCPeerConnection`.
+    ///
+    /// The twin of `oxidezap-session`'s own check, which this crate cannot
+    /// reach — it never depends on the session — so it is asked of the global
+    /// the same way rather than through a `web_sys` binding: the binding
+    /// exists whether the browser does or not.
+    fn has_peer_connection() -> bool {
+        let global = js_sys::global();
+        js_sys::Reflect::get(
+            &global,
+            &wasm_bindgen::JsValue::from_str("RTCPeerConnection"),
+        )
+        .is_ok_and(|v| !v.is_undefined() && !v.is_null())
     }
 }
