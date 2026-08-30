@@ -104,7 +104,11 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
     // copying the lot again: the two together held the whole track twice
     // over, on top of the MP4 the caller is still holding, before a sample
     // had been decoded.
-    let mut adts_data = Vec::with_capacity(mp4_data.len());
+    //
+    // Grown rather than reserved: the audio is a small fraction of a video
+    // file, and reserving the MP4's whole length asked for a second copy of
+    // it beside the one the caller is still holding.
+    let mut adts_data = Vec::new();
     let mut frames = 0usize;
     for sample_idx in 1..=sample_count {
         if let Ok(Some(sample)) = mp4.read_sample(track_id, sample_idx) {
