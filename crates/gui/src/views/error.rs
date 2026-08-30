@@ -13,7 +13,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Icon, IconName};
 
-use oxidezap_core::Fault;
+use oxidezap_core::{Fault, Recovery};
 
 use super::centered_view;
 use crate::app::WhatsAppApp;
@@ -78,7 +78,11 @@ pub fn render_error_view(
                 .flex()
                 .items_center()
                 .gap(metrics.space_lg())
-                .child(
+                // Only where reconnecting is the way out. A version
+                // mismatch fails identically for ever, and the body says so
+                // two lines up: offering the button there is the screen
+                // contradicting itself.
+                .children((fault.recovery != Recovery::Nothing).then(|| {
                     Button::new("retry")
                         .label(match retry_in {
                             // A countdown answers "is it stuck?" without the
@@ -89,8 +93,8 @@ pub fn render_error_view(
                         .primary()
                         .on_click(move |_, _, cx| {
                             retry_entity.update(cx, |this, cx| this.retry_connection(cx));
-                        }),
-                )
+                        })
+                }))
                 .child(
                     // The app is usable offline — history is local. Saying so
                     // is what stops this screen from being a dead end.
