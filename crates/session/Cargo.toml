@@ -46,14 +46,14 @@ whatsapp-rust = { workspace = true }
 # used to get wrong, and the reason a browser was told it had none. What it
 # supplies instead of the socket is a `RelayTransportProvider`; see
 # `src/relay/`.
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "claude/voip-wasm-relay-seam", default-features = false, features = [
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false, features = [
     "voip-mlow",
 ] }
 # Directly, because the library no longer re-exports it: `sqlite-storage` is
 # one of the defaults dropped above. Same crate the chat store opens, and
 # without the `bundled-sqlite` that wants a C toolchain — diesel supplies
 # SQLite itself on this target.
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "claude/voip-wasm-relay-seam", default-features = false }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
 # The browser, bound from Rust: the WebSocket, `fetch` and `setTimeout` that
 # stand in for the transport, the HTTP client and the runtime the defaults
 # would have supplied.

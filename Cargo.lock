@@ -9685,7 +9685,7 @@ dependencies = [
 [[package]]
 name = "wacore"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -9735,7 +9735,7 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "anyhow",
  "buffa",
@@ -9756,7 +9756,7 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "bytes",
  "compact_str",
@@ -9773,7 +9773,7 @@ dependencies = [
 [[package]]
 name = "wacore-derive"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9783,7 +9783,7 @@ dependencies = [
 [[package]]
 name = "wacore-libsignal"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "aes 0.9.3",
  "async-lock",
@@ -9814,7 +9814,7 @@ dependencies = [
 [[package]]
 name = "wacore-noise"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "anyhow",
  "buffa",
@@ -9857,7 +9857,7 @@ dependencies = [
 [[package]]
 name = "waproto"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "buffa",
  "buffa-build",
@@ -10369,7 +10369,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -10411,7 +10411,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-sqlite-storage"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "async-trait",
  "buffa",
@@ -10431,7 +10431,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-tokio-transport"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -10451,7 +10451,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-ureq-http-client"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?branch=claude%2Fvoip-wasm-relay-seam#521a08a096945ef3f4e0799d20a53821c869eb91"
+source = "git+https://github.com/oxidezap/whatsapp-rust?branch=main#60d80a272cd2f18798a214ef66f047e26b2c2b98"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -96,22 +96,21 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "claude/voip-wasm-relay-seam" }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "claude/voip-wasm-relay-seam" }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "claude/voip-wasm-relay-seam" }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 
 # The library and its satellites. One git source, one branch: cargo resolves
 # every entry below to the SAME commit, so `cargo update` moves them together
 # and no two crates can drift onto incompatible revisions. The exact commit is
 # pinned in the committed Cargo.lock.
 #
-# The branch is `claude/voip-wasm-relay-seam` rather than `main` while
-# oxidezap/whatsapp-rust#1364 is open: that is what splits the library's VoIP
-# runtime from its native UDP relay dialler and adds the
-# `RelayTransportProvider` seam a page reaches a call through. It goes back to
-# `main` when that lands. Every entry moves together, which is the rule this
-# block exists for -- a per-crate `rev` is what produces "expected `Jid`, found
-# `Jid`".
+# `main` carries the VoIP split this front end needs as of
+# oxidezap/whatsapp-rust#1364: the library's portable VoIP runtime is separate
+# from its native UDP relay dialler, and `Client::set_relay_transport_provider`
+# is the seam a page reaches a call through. Every entry moves together, which
+# is the rule this block exists for -- a per-crate `rev` is what produces
+# "expected `Jid`, found `Jid`".
 #
 # `whatsapp-rust` re-exports wacore, wacore-binary and waproto wholesale, so
 # anything already depending on it reaches them through that and does not
@@ -122,8 +121,8 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "claude/
 # crates that need none of it. `SharedSqlite` is also not re-exported, so the
 # chat store needs sqlite-storage directly regardless.
 #
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "claude/voip-wasm-relay-seam", features = ["voip"] }
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "claude/voip-wasm-relay-seam" }
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", features = ["voip"] }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 
 [profile.dev]
 # gpui is unusably slow unoptimized; match zed's own dev profile for it.
