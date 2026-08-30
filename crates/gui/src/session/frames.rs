@@ -89,9 +89,23 @@ impl<'a> Frames<'a> {
     ///
     /// A socket that simply closed has nothing to say; one the browser closed
     /// with a code does, and so does a frame too large to read.
+    #[cfg_attr(
+        not(target_family = "wasm"),
+        expect(
+            dead_code,
+            reason = "the page's transports blame; a socket names its ending"
+        )
+    )]
     pub(super) fn blame(&mut self, reason: String) {
-        self.reason
-            .get_or_insert_with(|| Fault::unreachable(reason));
+        self.fault(Fault::unreachable(reason));
+    }
+
+    /// The same, where the caller knows which ending this is.
+    ///
+    /// First one wins, like `blame`: what ended the connection is what the
+    /// screen should say, not whatever the teardown noticed afterwards.
+    pub(super) fn fault(&mut self, fault: Fault) {
+        self.reason.get_or_insert(fault);
     }
 
     /// One frame, applied.

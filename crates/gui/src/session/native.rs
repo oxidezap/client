@@ -111,9 +111,9 @@ fn read_frames(
         }
         if line.len() > MAX_FRAME_BYTES {
             log::error!("the daemon sent a frame past {MAX_FRAME_BYTES} bytes");
-            frames.blame(format!(
+            frames.fault(oxidezap_core::Fault::oversized(format!(
                 "the background service sent a frame larger than {MAX_FRAME_BYTES} bytes"
-            ));
+            )));
             break;
         }
 

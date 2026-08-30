@@ -132,6 +132,22 @@ impl Fault {
         }
     }
 
+    /// A frame this window will not read.
+    ///
+    /// Its own ending rather than an outage, because the countdown promises
+    /// something that cannot happen: the frame that overran is a history load
+    /// the daemon rebuilds on every attach, so reconnecting meets the same
+    /// one. What is left is reading what is already here.
+    pub fn oversized(detail: impl Into<String>) -> Self {
+        Self {
+            headline: "This window cannot read what the background service sent",
+            body: "One frame was larger than this window will accept, and attaching again \
+                   would meet the same one. Your messages are safe on this device.",
+            detail: detail.into(),
+            recovery: Recovery::Nothing,
+        }
+    }
+
     /// The window and the daemon are different builds.
     pub fn mismatched(detail: impl Into<String>) -> Self {
         Self {
