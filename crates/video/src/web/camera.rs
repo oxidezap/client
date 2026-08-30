@@ -187,6 +187,35 @@ fn stop_tracks(stream: &web_sys::MediaStream) {
     }
 }
 
+/// Closes an encoder that was built but never handed to [`Held`].
+///
+/// A `VideoEncoder` is asynchronous on both ends — a configuration it will not
+/// honour and a runtime failure both arrive at `on_error` later — so an
+/// encoder left open after setup returns is one that can still call into
+/// closures that have been dropped, which is a trap rather than a leak.
+/// Declared after those closures for the reason the audio graph's `Wiring`
+/// is: locals drop in reverse, and a guard that ran after them would be
+/// closing an encoder whose callbacks were already gone.
+struct EncoderGuard(Option<web_sys::VideoEncoder>);
+
+impl EncoderGuard {
+    /// Setup succeeded; [`Held`] closes it from here.
+    fn release(mut self) -> web_sys::VideoEncoder {
+        self.0.take().expect("a guard is released once")
+    }
+}
+
+impl Drop for EncoderGuard {
+    fn drop(&mut self) {
+        if let Some(encoder) = self.0.take()
+            && encoder.state() != web_sys::CodecState::Closed
+        {
+            let _ = encoder.close();
+            debug!("the video encoder is closed again: it opened but its setup did not finish");
+        }
+    }
+}
+
 /// Everything one open camera keeps alive, released together.
 ///
 /// The closures are held because the browser calls into them; the element is
@@ -301,7 +330,7 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
     // open, and every `?` below would otherwise leave it that way.
     let guard = CameraGuard(Some(open_device(&window, quality).await?));
     let stream = guard.0.as_ref().expect("just armed").clone();
-    let element = attach(&window, &stream)?;
+    let element = attach(&window, &stream).await?;
 
     let (tx, rx) = async_channel::bounded::<EncodedFrame>(FRAME_DEPTH);
     // Before the callback rather than after, so the chunk handler can ask for
@@ -367,8 +396,13 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
         on_error.as_ref().unchecked_ref(),
         on_chunk.as_ref().unchecked_ref(),
     );
-    let encoder = web_sys::VideoEncoder::new(&init)
-        .map_err(|e| anyhow!("no video encoder: {}", describe(&e)))?;
+    // Guarded from construction, and declared after the two closures it
+    // hands the browser: see `EncoderGuard`.
+    let guarded = EncoderGuard(Some(
+        web_sys::VideoEncoder::new(&init)
+            .map_err(|e| anyhow!("no video encoder: {}", describe(&e)))?,
+    ));
+    let encoder = guarded.0.as_ref().expect("just armed").clone();
     // The same config the support check asked about, not a second one built
     // to the same recipe: they cannot drift if there is only one.
     encoder.configure(&config).map_err(|e| {
@@ -427,7 +461,7 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
             // what closes it from here.
             stream: guard.release(),
             element,
-            encoder,
+            encoder: guarded.release(),
             timer: Some(timer),
             _on_tick: on_tick,
             _on_chunk: on_chunk,
@@ -556,7 +590,7 @@ async fn after(window: &web_sys::Window, ms: i32) {
 /// twice — once here and once wherever the front end puts the decoded frames.
 /// Muted also matters on its own, since autoplay of an unmuted element is
 /// refused.
-fn attach(
+async fn attach(
     window: &web_sys::Window,
     stream: &web_sys::MediaStream,
 ) -> Result<web_sys::HtmlVideoElement> {
@@ -571,12 +605,50 @@ fn attach(
     element.set_muted(true);
     let _ = element.set_attribute("playsinline", "");
     element.set_src_object(Some(stream));
-    // The promise is deliberately not awaited: playback starting is what the
-    // first frames wait on anyway, and a rejected autoplay on a muted element
-    // with a live `srcObject` is not something a call should stop for.
-    let _ = element.play();
+
+    // Awaited, because a refusal here is a camera that will produce nothing:
+    // the tick reads `ready_state` and would sit under it forever, or encode
+    // a paused picture, with the offer already out as video. A muted element
+    // is normally exempt from autoplay policy, which is why this was written
+    // as fire-and-forget — but "normally" is not the same as "always", and
+    // `play()` also rejects on a document that is not fully active or a media
+    // start that fails outright.
+    //
+    // Only a *rejection* is an answer, though. `play()` resolves when
+    // playback actually begins, and waiting on that unbounded would be the
+    // same defect as an unanswered permission prompt — so a slow resolve is
+    // not read as anything: the deadline lets setup carry on, and the ticks
+    // wait for readiness as they already do.
+    let playing = element
+        .play()
+        .map_err(|e| anyhow!("the camera preview would not start: {}", describe(&e)))?;
+    let refused = futures_lite::future::or(
+        async {
+            wasm_bindgen_futures::JsFuture::from(playing)
+                .await
+                .err()
+                .map(|e| describe(&e))
+        },
+        async {
+            after(window, PLAYBACK_GRACE_MS).await;
+            None
+        },
+    )
+    .await;
+    if let Some(reason) = refused {
+        bail!("the browser would not play the camera's own stream: {reason}");
+    }
     Ok(element)
 }
+
+/// How long a rejection from `play()` is waited for before setup carries on.
+///
+/// Not how long playback may take: a resolve means it started and a timeout
+/// means nothing at all, so this only bounds how long a *refusal* has to
+/// arrive in. Short, because a refusal is decided by policy rather than by
+/// the device, and the cost of missing one is the tick logging that the
+/// element is not ready.
+const PLAYBACK_GRACE_MS: i32 = 2_000;
 
 /// One capture tick: take what the element is showing and encode it.
 fn tick(

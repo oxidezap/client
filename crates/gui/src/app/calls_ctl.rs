@@ -413,10 +413,10 @@ impl WhatsAppApp {
             warn!("Cannot start call: this window is offline");
             return;
         }
-        let Some(client) = &self.client else {
+        if self.client.is_none() {
             warn!("Cannot start call: client is unavailable");
             return;
-        };
+        }
 
         // One call at a time: placing a second would leave the first with no
         // UI to end it.
@@ -436,6 +436,32 @@ impl WhatsAppApp {
             self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
             return;
         }
+
+        // The decoder is always this front end's, whoever holds the session:
+        // a daemon can open its camera, negotiate video and send perfectly
+        // while this window rejects every access unit, leaving both panes
+        // waiting on a picture that is arriving. So it is asked separately
+        // from `calls_unavailable`, which is about carrying the media.
+        //
+        // Downgraded rather than refused, which is what this module does with
+        // every other camera that will not work — the call is worth placing,
+        // and it is the picture that is not on offer.
+        let is_video = if is_video {
+            match crate::platform::video_decode_unavailable() {
+                Some(reason) => {
+                    warn!("Placing this call as voice: {reason}");
+                    self.notify_user(
+                        "This browser cannot show video, so this is a voice call.",
+                        crate::app::notices::Tone::Problem,
+                        cx,
+                    );
+                    false
+                }
+                None => true,
+            }
+        } else {
+            false
+        };
 
         let recipient_name = self
             .find_chat(&recipient_jid)
@@ -464,6 +490,12 @@ impl WhatsAppApp {
         );
         self.call_state.set_outgoing(call);
 
+        let Some(client) = &self.client else {
+            // Checked at the top; re-read here because the checks between
+            // need `self` and a borrow held across them would outlive them.
+            warn!("Cannot start call: client is unavailable");
+            return;
+        };
         client.start_call(&recipient_jid, is_video, placeholder_call_id);
         cx.notify();
     }

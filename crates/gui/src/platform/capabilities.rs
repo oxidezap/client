@@ -120,10 +120,17 @@ mod video {
 /// which is the same sentence this module makes about the microphone and
 /// about `VideoDecoder`.
 ///
-/// Not asked about video separately, and deliberately: a camera that will not
-/// open downgrades a call to voice rather than failing it, on both platforms,
-/// so a browser with `RTCPeerConnection` and no `VideoEncoder` places an
-/// ordinary voice call. There is nothing to withhold.
+/// Not asked about the *camera* separately, and deliberately: one that will
+/// not open downgrades a call to voice rather than failing it, on both
+/// platforms, so a browser with `RTCPeerConnection` and no `VideoEncoder`
+/// places an ordinary voice call. There is nothing to withhold.
+///
+/// The *decoder* is a different question and is asked separately, by the
+/// caller, through [`video_decode_unavailable`]. It belongs to this front end
+/// whoever holds the session — a daemon can open its camera, negotiate video
+/// and send perfectly while a window without `VideoDecoder` rejects every
+/// access unit — so it is not a reason a call cannot be carried, and it is a
+/// reason a call should not be *placed as video*.
 ///
 /// The GUI has no route to `oxidezap-session`'s
 /// `relay::sdp::RELAY_DTLS_FINGERPRINT` -- it depends on ipc, core and audio,
