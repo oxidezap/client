@@ -120,11 +120,10 @@ pub async fn reload(plugins: &Arc<Plugins>) -> usize {
 /// a panic — "there is no reactor running" — so approving a plugin in the
 /// browser has never once worked.
 ///
-/// # Errors
-///
-/// The thread recording it panicked, which the caller answers by refusing the
-/// request rather than acknowledging a permission the disk never received.
-pub async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> Result<(), ()> {
+/// Answers whether it was recorded. `false` is the thread that was writing it
+/// having panicked — the caller refuses the request rather than acknowledging
+/// a permission the disk never received.
+pub async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> bool {
     #[cfg(target_family = "wasm")]
     {
         // Inline, and there is nowhere else it could go. `spawn_blocking`
@@ -133,7 +132,7 @@ pub async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> 
         // write itself, which is a `localStorage` set: the same call a
         // plugin's own settings already make from inside a wasm call.
         plugins.approve(&plugin, approved);
-        Ok(())
+        true
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -143,9 +142,13 @@ pub async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> 
         // acknowledged for a permission the disk never received, with
         // Settings drawing a state nothing had recorded and no line in the
         // log.
-        tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved))
-            .await
-            .map_err(|e| log::error!("recording a plugin approval failed: {e}"))
+        match tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved)).await {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("recording a plugin approval failed: {e}");
+                false
+            }
+        }
     }
 }
 

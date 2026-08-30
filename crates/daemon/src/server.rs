@@ -1066,11 +1066,13 @@ async fn handle_request(
             // outright in a browser, so approving a plugin there never worked.
             // Awaited either way, so the acknowledgement still means the
             // answer is recorded.
-            match crate::plugins::approve(plugins, plugin, approved).await {
-                Ok(()) => acted(Ok(())),
-                Err(()) => acted(Err(ProtocolError::Refused {
+            let recorded = crate::plugins::approve(plugins, plugin, approved).await;
+            if recorded {
+                acted(Ok(()))
+            } else {
+                acted(Err(ProtocolError::Refused {
                     detail: "the approval could not be recorded".to_string(),
-                })),
+                }))
             }
         }
         // Answered when it has happened, not when it was taken: a front end

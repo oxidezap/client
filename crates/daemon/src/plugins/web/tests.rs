@@ -192,9 +192,10 @@ async fn approving_a_plugin_does_not_need_a_blocking_pool() {
     let host = std::sync::Arc::new(oxidezap_plugin_host::Plugins::none(std::sync::Arc::new(
         |_| {},
     )));
-    super::super::approve(&host, "nothing-loaded".to_owned(), true)
-        .await
-        .expect("a page records approvals inline");
+    assert!(
+        super::super::approve(&host, "nothing-loaded".to_owned(), true).await,
+        "a page records approvals inline"
+    );
 }
 
 /// And a reload runs on the page's own loop, for the same reason.
