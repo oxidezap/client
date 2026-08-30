@@ -491,9 +491,15 @@ impl WhatsAppApp {
             match download_with_timeout(download_rx).await {
                 Ok(data) => match hand_to_user(cx, file_name, data).await {
                     Ok(where_it_went) => info!("Document {message_id} saved to {where_it_went}"),
-                    Err(e) => warn!("Failed to save document {message_id}: {e}"),
+                    Err(e) => {
+                        warn!("Failed to save document {message_id}: {e}");
+                        say(&entity, cx, e);
+                    }
                 },
-                Err(e) => error!("Failed to download document {}: {}", message_id, e),
+                Err(e) => {
+                    error!("Failed to download document {}: {}", message_id, e);
+                    say(&entity, cx, format!("Could not download that file: {e}"));
+                }
             }
             let _ = entity.update(cx, |app, cx| {
                 app.finish_download(&message_id);
@@ -530,10 +536,13 @@ impl WhatsAppApp {
         let data = Arc::clone(&media.data);
         let id = message_id.to_string();
 
-        cx.spawn(async move |_entity: WeakEntity<Self>, cx| {
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match hand_to_user(cx, file_name, data).await {
                 Ok(where_it_went) => info!("Saved {id} to {where_it_went}"),
-                Err(e) => warn!("Failed to save {id}: {e}"),
+                Err(e) => {
+                    warn!("Failed to save {id}: {e}");
+                    say(&entity, cx, e);
+                }
             }
         })
         .detach();
@@ -889,6 +898,18 @@ impl WhatsAppApp {
 
         cx.notify();
     }
+}
+
+/// Put a failure in front of the person who asked for it.
+///
+/// These paths ran to `warn!` and stopped, which on a desktop is a save that
+/// quietly did not happen and in a browser is a first tap that does nothing
+/// and a second that works. The message is the one the platform wrote, which
+/// is why those are phrased for a reader rather than for a log.
+fn say(entity: &WeakEntity<WhatsAppApp>, cx: &mut gpui::AsyncApp, text: String) {
+    let _ = entity.update(cx, |app, cx| {
+        app.notify_user(text, crate::app::notices::Tone::Problem, cx);
+    });
 }
 
 /// Put a file where the user keeps things, on whichever thread can.

@@ -15,6 +15,7 @@ mod events;
 mod media;
 mod media_ctl;
 mod messages;
+pub mod notices;
 mod paging;
 mod plugins_ctl;
 mod recording;
@@ -703,6 +704,13 @@ pub struct WhatsAppApp {
     retry_task: Option<Task<()>>,
     /// Whether the error screen's technical detail is unfolded.
     error_detail_open: bool,
+    /// Transient lines drawn over whatever screen is up. See [`notices`].
+    notices: Vec<notices::Notice>,
+    /// Never reused, so a dismissal cannot land on a later notice.
+    next_notice_id: u64,
+    /// Expires them. Alive only while something is up.
+    #[allow(dead_code)]
+    notice_task: Option<Task<()>>,
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
@@ -947,6 +955,9 @@ impl WhatsAppApp {
             retry_at: None,
             retry_task: None,
             error_detail_open: false,
+            notices: Vec::new(),
+            next_notice_id: 0,
+            notice_task: None,
             downloads_in_flight: std::collections::HashSet::new(),
             call_state: CallState::new(),
             call_card: CallCard::default(),
@@ -3021,7 +3032,21 @@ impl Render for WhatsAppApp {
         // conversation need a keyboard too, and the window is what they get.
         self.sync_overlay_focus(window, cx);
 
-        root.child(body).children(call_overlay)
+        // Above the call card as well as the body: a notice raised by
+        // something the call did is about the call, and a card that covered
+        // it would leave the sentence unread.
+        let notices = (!self.notices.is_empty()).then(|| {
+            let entity = cx.entity().clone();
+            crate::components::notice::render_notices(
+                &self.notices,
+                move |id, cx| {
+                    entity.update(cx, |app, cx| app.dismiss_notice(id, cx));
+                },
+                cx,
+            )
+        });
+
+        root.child(body).children(call_overlay).children(notices)
     }
 }
 
