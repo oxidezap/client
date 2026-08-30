@@ -84,18 +84,30 @@ pub fn revision() -> Option<Revision> {
 mod native {
     use std::path::PathBuf;
 
-    /// `$XDG_CONFIG_HOME/oxidezap/theme.json`, falling back to `~/.config`.
+    /// Where this platform keeps a per-user configuration file.
+    ///
+    /// `%LOCALAPPDATA%` on Windows, the same side of the profile the daemon's
+    /// own state is on: a theme is about this machine, and a roaming profile
+    /// carries a file to another one. Elsewhere `$XDG_CONFIG_HOME`, falling
+    /// back to `~/.config`. It used to be the XDG path everywhere, with
+    /// `%USERPROFILE%` standing in for `$HOME` — so a Windows theme went into
+    /// a hidden directory of a convention that platform does not have, and
+    /// the message Settings shows told the reader to set `$XDG_CONFIG_HOME`
+    /// or `$HOME`, neither of which exists there.
     pub fn path() -> Option<PathBuf> {
         let not_empty =
             |value: std::ffi::OsString| (!value.is_empty()).then(|| PathBuf::from(value));
-        let dir = std::env::var_os("XDG_CONFIG_HOME")
-            .and_then(not_empty)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .and_then(not_empty)
-                    .or_else(|| std::env::var_os("USERPROFILE").and_then(not_empty))
-                    .map(|home| home.join(".config"))
-            })?;
+        let dir = if cfg!(windows) {
+            std::env::var_os("LOCALAPPDATA").and_then(not_empty)?
+        } else {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .and_then(not_empty)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .and_then(not_empty)
+                        .map(|home| home.join(".config"))
+                })?
+        };
         Some(dir.join("oxidezap").join("theme.json"))
     }
 
@@ -112,12 +124,75 @@ mod native {
     }
 
     pub fn write(document: &str) -> Result<(), String> {
-        let path = path()
-            .ok_or_else(|| "no config directory: set $XDG_CONFIG_HOME or $HOME".to_string())?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let path = path().ok_or_else(|| {
+            if cfg!(windows) {
+                "no config directory: %LOCALAPPDATA% is not set".to_string()
+            } else {
+                "no config directory: set $XDG_CONFIG_HOME or $HOME".to_string()
+            }
+        })?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "the theme path has no directory".to_string())?;
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+
+        // Through a temporary and a rename, and flushed on both sides of it —
+        // the same three steps the daemon's own state files take, for the same
+        // reason. Written in place, a full disk or a power cut in the middle
+        // leaves a half-written document, and the next start reports a theme
+        // with a problem on line N: the customization is simply gone, and the
+        // error the caller reports arrives after the file it was about.
+        let temp = path.with_extension(format!("tmp{}", std::process::id()));
+        write_and_sync(&temp, document).map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            format!("could not write {}: {e}", temp.display())
+        })?;
+        std::fs::rename(&temp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            format!("could not replace {}: {e}", path.display())
+        })?;
+        // The rename itself, so a file that looked written is one that is
+        // still there after a power cut: syncing the temporary persists its
+        // contents and not the directory entry that names it.
+        sync_dir(parent);
+        Ok(())
+    }
+
+    fn write_and_sync(path: &std::path::Path, document: &str) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(document.as_bytes())?;
+        file.sync_all()
+    }
+
+    /// Best effort: a platform that will not open a directory as a file — or
+    /// a filesystem that does not need this — is not a reason to report a
+    /// write that did happen as one that did not.
+    fn sync_dir(dir: &std::path::Path) {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
         }
-        std::fs::write(&path, document).map_err(|e| e.to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// A theme written in place is one a full disk or a power cut can
+        /// leave half-written, and the next start reads that as a problem on
+        /// line N with the customization gone. The temporary carries the
+        /// process id so two windows cannot collide over it.
+        #[test]
+        fn the_theme_is_replaced_rather_than_overwritten() {
+            let dir = std::env::temp_dir().join(format!(
+                "oxidezap-theme-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).expect("writable");
+            let path = dir.join("theme.json");
+            super::write_and_sync(&path, "{}").expect("written");
+            assert_eq!(std::fs::read_to_string(&path).expect("readable"), "{}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// The file's modification time, in milliseconds since the epoch.
