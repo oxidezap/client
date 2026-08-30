@@ -21,14 +21,39 @@ use anyhow::{Result, bail};
 /// after the first is read a few bytes off and the picture comes out skewed
 /// diagonally with nothing failing anywhere — which is a thing to find in a
 /// log rather than in a screenshot.
-fn warn_once_if_padded(format: &str, got: usize, expected: usize) {
+fn warn_once_if_padded(format: Pixels, got: usize, expected: usize) {
     use std::sync::atomic::{AtomicBool, Ordering};
-    static SAID: AtomicBool = AtomicBool::new(false);
-    if got != expected && !SAID.swap(true, Ordering::Relaxed) {
+    // One flag each, because the promise above is per format: shared, the
+    // first padded YUYV frame silenced every NV12 and GRAY camera after it.
+    static SAID: [AtomicBool; 3] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
+    if got != expected && !SAID[format as usize].swap(true, Ordering::Relaxed) {
+        let format = format.name();
         log::warn!(
             "camera hands over {got} bytes for a {format} frame the geometry accounts for {expected} of; \
              reading the rows as tightly packed"
         );
+    }
+}
+
+/// What a camera hands over, for the warning that names it.
+#[derive(Clone, Copy)]
+enum Pixels {
+    Yuyv,
+    Nv12,
+    Gray,
+}
+
+impl Pixels {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Yuyv => "YUYV",
+            Self::Nv12 => "NV12",
+            Self::Gray => "GRAY",
+        }
     }
 }
 use openh264::formats::{YUVBuffer, YUVSlices};
@@ -96,7 +121,7 @@ impl I420Buffer {
                 stride * height
             );
         }
-        warn_once_if_padded("YUYV", src.len(), stride * height);
+        warn_once_if_padded(Pixels::Yuyv, src.len(), stride * height);
         let (y_plane, u_plane, v_plane) = self.planes_mut();
         for row in 0..height {
             let src_row = &src[row * stride..row * stride + stride];
@@ -133,7 +158,7 @@ impl I420Buffer {
                 luma * 3 / 2
             );
         }
-        warn_once_if_padded("NV12", src.len(), luma * 3 / 2);
+        warn_once_if_padded(Pixels::Nv12, src.len(), luma * 3 / 2);
         let (y_plane, u_plane, v_plane) = self.planes_mut();
         y_plane.copy_from_slice(&src[..luma]);
         for (index, pair) in src[luma..luma * 3 / 2]
@@ -160,7 +185,7 @@ impl I420Buffer {
                 src.len()
             );
         }
-        warn_once_if_padded("NV12", src.len(), luma * 3 / 2);
+        warn_once_if_padded(Pixels::Gray, src.len(), luma);
         let (y_plane, u_plane, v_plane) = self.planes_mut();
         y_plane.copy_from_slice(&src[..luma]);
         u_plane.fill(128);
