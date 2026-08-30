@@ -140,6 +140,12 @@ struct Inner {
     /// Chats keyed by JID. A map, not a Vec: every update is a lookup by JID,
     /// and a Vec would make a rename or a receipt O(n) over every chat.
     chats: std::collections::HashMap<String, ChatEntry>,
+    /// Which account this is, counted up every time one leaves.
+    ///
+    /// Here rather than beside the lock, so a task that asks and then applies
+    /// can have both answered without the account leaving in between: see
+    /// [`StateHub::apply_for`].
+    account_generation: usize,
 }
 
 pub struct StateHub {
@@ -183,14 +189,6 @@ pub struct StateHub {
     /// A TUI or a notifier attached to summaries would otherwise make
     /// [`crate::window::show`] believe there was a window to raise.
     windows: std::sync::atomic::AtomicUsize,
-    /// Which account this is, counted up every time one leaves.
-    ///
-    /// A store read is answered from a task of its own, so a page of the old
-    /// account's chats can still be in flight when the account goes. Landing
-    /// afterwards it would put those summaries back into a hub that had just
-    /// been emptied, where the next pairing's first snapshot carries them.
-    /// A task reads this before it asks and again before it applies.
-    account: std::sync::atomic::AtomicUsize,
 }
 
 /// One attached client that owns a window, counted while it is connected.
@@ -226,6 +224,7 @@ impl StateHub {
                 account: None,
                 plugins: Vec::new(),
                 chats: std::collections::HashMap::new(),
+                account_generation: 0,
             }),
             updates,
             signals,
@@ -233,7 +232,6 @@ impl StateHub {
             video,
             tray,
             windows: std::sync::atomic::AtomicUsize::new(0),
-            account: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -375,14 +373,13 @@ impl StateHub {
         inner.account = None;
         inner.calls = oxidezap_core::CallState::new();
         inner.version = inner.version.next();
-        self.account
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        inner.account_generation += 1;
     }
 
     /// Which account the hub is holding, for a task that has to outlive its
     /// own answer. See [`Self::forget_account`].
     pub fn account_generation(&self) -> usize {
-        self.account.load(std::sync::atomic::Ordering::Relaxed)
+        self.lock().account_generation
     }
 
     /// Record what the plugins are now, and tell everyone.
@@ -553,6 +550,22 @@ impl StateHub {
     /// version bump together, so no two events can share a version and no
     /// observer can read a state whose version has not caught up.
     pub fn apply(&self, change: Change) -> StateVersion {
+        self.apply_unless_stale(change, None)
+            .expect("an unconditional apply always applies")
+    }
+
+    /// The same, for a change belonging to a particular account.
+    ///
+    /// Answers whether it applied. A store read is served from a task of its
+    /// own, so a page of the old account's chats can still be in flight when
+    /// the account goes; asked separately, the question and the write are two
+    /// steps a logout can land between, which is why the comparison happens
+    /// under the lock that does the writing.
+    pub fn apply_for(&self, generation: usize, change: Change) -> bool {
+        self.apply_unless_stale(change, Some(generation)).is_some()
+    }
+
+    fn apply_unless_stale(&self, change: Change, only_for: Option<usize>) -> Option<StateVersion> {
         let Change { event, from_store } = change;
         // Taken before the state lock is released and held across the send, so
         // frames leave in the order their versions were assigned. There is
@@ -567,6 +580,9 @@ impl StateHub {
         // the state free.
         let (version, tray, order) = {
             let mut inner = self.lock();
+            if only_for.is_some_and(|asked| asked != inner.account_generation) {
+                return None;
+            }
             inner.version = inner.version.next();
 
             match &event {
@@ -624,7 +640,7 @@ impl StateHub {
             }
         });
 
-        version
+        Some(version)
     }
 
     /// Put one versioned event on the update channel.
@@ -746,22 +762,30 @@ mod tests {
     }
 
     /// A store read is answered from a task of its own, so a page of the old
-    /// account's chats can be in flight when the account goes. The task reads
-    /// this before it applies; without it, the summaries it carries land in a
-    /// hub that has just been emptied and the next pairing's first snapshot
-    /// hands them to a window.
+    /// account's chats can be in flight when the account goes. Asked and
+    /// written under one lock; asked separately, the question and the write
+    /// are two steps a logout can land between, and the summaries then reach
+    /// a hub that has just been emptied, where the next pairing's first
+    /// snapshot hands them to a window.
     #[test]
-    fn an_account_leaving_is_something_a_late_answer_can_tell() {
+    fn a_page_from_the_account_that_left_is_not_applied() {
         let hub = StateHub::new();
-        let before = hub.account_generation();
+        let asked_as = hub.account_generation();
+        let page = |jid: &str| Change::from_store(DaemonEvent::ChatUpdated(chat(jid, 0, 10)));
+
+        assert!(
+            hub.apply_for(asked_as, page("1@s.whatsapp.net")),
+            "the account that asked is the account that is here"
+        );
+        assert_eq!(hub.snapshot().chats.len(), 1);
 
         hub.forget_account();
 
-        assert_ne!(
-            hub.account_generation(),
-            before,
-            "a page asked for under the old account must be able to say so"
+        assert!(
+            !hub.apply_for(asked_as, page("2@s.whatsapp.net")),
+            "and a page it asked for lands nowhere once it has gone"
         );
+        assert!(hub.snapshot().chats.is_empty());
     }
 
     /// A window can attach before there is an account to name: during
