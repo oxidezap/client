@@ -214,14 +214,36 @@ impl Stream {
             return;
         };
 
-        // A decoder that has stopped is one whose pictures will never come;
-        // the next keyframe builds a new one rather than feeding a dead one.
+        // A decoder that has stopped is one whose pictures will never come, so
+        // it is dropped and the next keyframe builds another. If *this* frame
+        // is a keyframe it is that one: returning here instead would discard
+        // the recovery point and leave the pane blank for a whole group of
+        // pictures, waiting for the keyframe after it.
         if let Some(e) = decoder.failure() {
             log::debug!("the {:?} video of a call stopped: {e}", self.stream);
             *held = None;
             self.started.set(false);
-            return;
+            if !frame.keyframe {
+                return;
+            }
+            self.started.set(true);
+            match webcodecs::Decoder::with_budget(
+                &frame.data,
+                Rotation::to_upright(frame.orientation),
+                MAX_PIXELS,
+                Some(self.sink()),
+            ) {
+                Ok(decoder) => *held = Some(decoder),
+                Err(e) => {
+                    log::warn!("no decoder for the {:?} video of a call: {e}", self.stream);
+                    self.started.set(false);
+                    return;
+                }
+            }
         }
+        let Some(decoder) = held.as_ref() else {
+            return;
+        };
 
         // Their device, not their picture: drawing it upright is undoing the
         // turn rather than repeating it.

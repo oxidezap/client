@@ -304,6 +304,13 @@ async fn serve(
             return receive_media(&mut stream, &key, origin.as_deref(), request.content_length)
                 .await;
         }
+        // The other half of staging: a send abandoned before the request ran
+        // leaves a payload nothing will ever read, and staged uploads are
+        // deliberately spared by the cache sweep, so without this they stay
+        // until the account is wiped. Narrowed the same way the write is.
+        if request.method == "DELETE" {
+            return discard_media(stream.get_mut(), key, origin.as_deref()).await;
+        }
         return serve_media(stream.get_mut(), key, origin.as_deref()).await;
     }
 
@@ -535,7 +542,7 @@ async fn serve_media(stream: &mut TcpStream, key: &str, origin: Option<&str>) ->
     if let Some(origin) = origin {
         head.push_str(&format!(
             "Access-Control-Allow-Origin: {origin}\r\n\
-             Access-Control-Allow-Methods: GET, PUT, OPTIONS\r\n\
+             Access-Control-Allow-Methods: GET, PUT, DELETE, OPTIONS\r\n\
              Vary: Origin\r\n"
         ));
     }
@@ -641,6 +648,34 @@ async fn receive_media(
     respond(stream.get_mut(), 204, "text/plain", origin, b"").await
 }
 
+/// Drop a staged payload whose send is not going to happen.
+///
+/// Only `u-` keys, for the reason the write takes only those: the daemon's
+/// own cache is not a caller's to delete either. Silent about a key that is
+/// not there, because the caller is discarding rather than asking.
+async fn discard_media(stream: &mut TcpStream, key: &str, origin: Option<&str>) -> Result<()> {
+    let key = percent_decode(key);
+    if !key.starts_with("u-") {
+        log::warn!("refusing to discard {key}: only staged payloads may be removed");
+        return respond(
+            stream,
+            403,
+            "text/plain",
+            origin,
+            b"only staged payloads may be removed",
+        )
+        .await;
+    }
+    if let Some(path) = oxidezap_ipc::media_path(&key) {
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => log::debug!("discarded the staged payload {key}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("could not discard {key}: {e}"),
+        }
+    }
+    respond(stream, 204, "text/plain", origin, b"").await
+}
+
 /// Why this staging request may not proceed, if it may not.
 ///
 /// Pure, and separate from the handler, because these three are the whole
@@ -709,7 +744,7 @@ fn preflight_head(origin: Option<&str>, private_network: bool) -> String {
         head.push_str("Access-Control-Max-Age: 600\r\n");
         head.push_str(&format!(
             "Access-Control-Allow-Origin: {origin}\r\n\
-             Access-Control-Allow-Methods: GET, PUT, OPTIONS\r\n\
+             Access-Control-Allow-Methods: GET, PUT, DELETE, OPTIONS\r\n\
              Access-Control-Allow-Headers: Content-Type\r\n\
              Vary: Origin\r\n"
         ));
@@ -755,7 +790,7 @@ async fn respond(
     if let Some(origin) = origin {
         head.push_str(&format!(
             "Access-Control-Allow-Origin: {origin}\r\n\
-             Access-Control-Allow-Methods: GET, PUT, OPTIONS\r\n\
+             Access-Control-Allow-Methods: GET, PUT, DELETE, OPTIONS\r\n\
              Vary: Origin\r\n"
         ));
     }
@@ -1044,6 +1079,16 @@ mod tests {
             Some(413)
         );
         assert_eq!(staging_refusal("u-abc", Some(MAX_UPLOAD_BYTES)), None);
+    }
+
+    /// A discard is narrowed the same way a write is: the daemon's own cache
+    /// is not a caller's to delete either.
+    #[test]
+    fn only_staged_keys_may_be_discarded() {
+        for key in ["f-abc", "d-abc", "abc"] {
+            assert!(!key.starts_with("u-"), "{key} should not be removable");
+        }
+        assert!("u-abc".starts_with("u-"));
     }
 
     /// The check this endpoint exists behind. A WebSocket is not subject to

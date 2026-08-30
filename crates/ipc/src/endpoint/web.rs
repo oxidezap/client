@@ -946,6 +946,30 @@ pub async fn upload_media(base: &str, key: &str, bytes: &[u8]) -> Result<(), Str
     Ok(())
 }
 
+/// Drop a payload the daemon staged for a send that is not going to run.
+///
+/// Best effort and unawaited by its caller: the send has already failed, and
+/// what this prevents is a file nothing will read staying until the account
+/// is wiped — staged uploads are deliberately spared by the cache sweep.
+pub async fn discard_media(base: &str, key: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let url = format!(
+        "{base}/{}{}",
+        js_sys::encode_uri_component(key),
+        media_token()
+    );
+    let options = web_sys::RequestInit::new();
+    options.set_method("DELETE");
+    if let Ok(promise) = window
+        .fetch_with_str_and_init(&url, &options)
+        .dyn_into::<js_sys::Promise>()
+    {
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+}
+
 /// The same, under a deadline the caller chooses.
 ///
 /// A frame's optional media and a download somebody asked for are not the

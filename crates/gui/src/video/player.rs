@@ -199,6 +199,15 @@ impl VideoPlayer {
     }
 
     fn update_current_frame(&mut self) -> bool {
+        // Asked every poll, because on a push decoder the failure arrives
+        // long after the call that caused it: a chunk refused, the error
+        // callback firing, a copy that would not complete. Without this the
+        // player stays in `Playing` with no picture and nothing to say, which
+        // is the one outcome worse than an error.
+        if let Some(reason) = self.decoder.as_ref().and_then(|d| d.failure()) {
+            self.set_error(reason);
+            return false;
+        }
         let Some(decoder) = &self.decoder else {
             return false;
         };

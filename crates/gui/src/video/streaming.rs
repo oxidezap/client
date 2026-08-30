@@ -647,6 +647,13 @@ impl StreamingVideoDecoder {
     }
 
     /// Get current decoded frame
+    /// Never: this decoder reports a refused sample where it happens and
+    /// carries no failure past it. The browser's is asynchronous and does,
+    /// so the player asks both and only one ever answers.
+    pub fn failure(&self) -> Option<String> {
+        None
+    }
+
     pub fn current_frame(&self) -> Option<&StreamingFrame> {
         self.current_frame.as_ref()
     }

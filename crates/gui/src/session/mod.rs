@@ -846,6 +846,19 @@ fn deliver(
     id: RequestId,
     request: ClientRequest,
 ) {
+    // Still ours to send. A staged request is delivered from the upload's
+    // completion, and the connection can end in between — `Frames::finish`
+    // drains every reservation and answers each one. The link it holds is a
+    // clone and does not necessarily refuse the write, so without this the
+    // daemon could receive and send a voice note the window has already
+    // reported as failed.
+    if !pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&id)
+    {
+        return;
+    }
     let frame = match serde_json::to_vec(&Request {
         id: Some(id),
         request,

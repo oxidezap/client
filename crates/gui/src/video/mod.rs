@@ -63,11 +63,21 @@ pub async fn build_decoder(
         .await
 }
 
-/// The same, on the one thread a page has. See the note above.
+/// The same, with only the half that has to be here left here.
+///
+/// The demux and the AAC decode are plain Rust over the whole file, twice,
+/// and a long attachment opened on the window thread stops scrolling for as
+/// long as they take. Only the `VideoDecoder` itself is bound to this thread,
+/// so the expensive half goes to the background executor and comes back as a
+/// [`unsupported::Prepared`] the decoder is built from here.
 #[cfg(target_family = "wasm")]
 pub async fn build_decoder(
-    _cx: &mut gpui::AsyncApp,
+    cx: &mut gpui::AsyncApp,
     data: std::sync::Arc<Vec<u8>>,
 ) -> anyhow::Result<StreamingVideoDecoder> {
-    StreamingVideoDecoder::new(&data)
+    use gpui::AppContext as _;
+    let prepared = cx
+        .background_spawn(async move { unsupported::Prepared::demux(&data) })
+        .await?;
+    StreamingVideoDecoder::attach(prepared)
 }

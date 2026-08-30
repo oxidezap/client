@@ -277,9 +277,21 @@ fn read_frame(
     slot: Rc<RefCell<Slot>>,
     sink: Option<Rc<dyn Fn(Picture)>>,
 ) {
-    let width = frame.coded_width() as usize;
-    let height = frame.coded_height() as usize;
+    // The *visible* rectangle, not the coded one. `copyTo` copies the visible
+    // region by default, and a coded frame is padded out to whole macroblocks
+    // — 1080 is not a multiple of 16 — so sizing the buffer from
+    // `coded_height` and then walking it as if the padding were there lays
+    // compact rows out against a wider stride. What that looks like is not a
+    // black band at the bottom but every row after the first sliding
+    // sideways, which is the kind of wrong that reads as a decoder bug.
+    let (width, height) = frame.visible_rect().map_or_else(
+        || (frame.coded_width() as usize, frame.coded_height() as usize),
+        |rect| (rect.width() as usize, rect.height() as usize),
+    );
     let timestamp_micros = frame.timestamp() as i64;
+
+    let options = web_sys::VideoFrameCopyToOptions::new();
+    options.set_format(web_sys::VideoPixelFormat::Rgba);
 
     // The decoder's own geometry, never the container's. See
     // [`super::geometry::frame_byte_len`] for why that distinction is the one
@@ -295,15 +307,29 @@ fn read_frame(
         return;
     };
 
-    let options = web_sys::VideoFrameCopyToOptions::new();
-    options.set_format(web_sys::VideoPixelFormat::Rgba);
-
     // Into a JS-side buffer rather than a `&mut [u8]` over wasm memory. The
     // copy resolves later, and the only Rust buffer that could back it is one
     // this function is about to move into an async block: the promise would
     // be writing through a pointer into memory that has since moved. A
     // `Uint8Array` is the browser's own and survives whatever this side does.
-    let destination = js_sys::Uint8Array::new_with_length(byte_len as u32);
+    // Asked of the frame rather than computed, because the browser knows its
+    // own layout: `byte_len` above is the budget's arithmetic and this is the
+    // buffer the copy will actually fill. They agree for packed RGBA, and
+    // where they do not it is the browser that is right.
+    let needed = frame
+        .allocation_size_with_options(&options)
+        .map_or(byte_len, |size| size as usize);
+    if needed > byte_len {
+        frame.close();
+        let mut slot = slot.borrow_mut();
+        if slot.failed.is_none() {
+            slot.failed = Some(format!(
+                "a decoded frame wanted {needed} bytes, past the budget"
+            ));
+        }
+        return;
+    }
+    let destination = js_sys::Uint8Array::new_with_length(needed as u32);
     // Returns the promise directly rather than a `Result`: a `copyTo` that
     // cannot be started rejects rather than throwing, so there is one failure
     // path and it is the awaited one below.
@@ -323,7 +349,7 @@ fn read_frame(
         }
 
         let source = destination.to_vec();
-        if source.len() != byte_len {
+        if source.len() < width * height * 4 {
             return;
         }
         let mut bgra = vec![0u8; byte_len];

@@ -70,6 +70,15 @@ struct Capture {
     /// Dropped when the recording ends, which is what closes the device: a
     /// track left live is a browser tab with its microphone indicator on.
     teardown: Option<Teardown>,
+    /// Which recording the capture state belongs to.
+    ///
+    /// `getUserMedia` prompts, so a person who starts and immediately cancels
+    /// leaves an open still in flight. Without this it resolved into the
+    /// state anyway and the microphone stayed live — indicator on, samples
+    /// accumulating — until another recording replaced it. The opener carries
+    /// the generation it started under and closes what it opened if that is
+    /// no longer the current one.
+    generation: u64,
 }
 
 /// The objects a live recording keeps alive, released together.
@@ -119,9 +128,35 @@ impl AudioRecorder {
         let Some(window) = web_sys::window() else {
             return false;
         };
-        let has_encoder = js_sys::Reflect::has(&window, &"AudioEncoder".into()).unwrap_or(false);
-        let has_devices = window.navigator().media_devices().is_ok();
-        has_encoder && has_devices
+        if !js_sys::Reflect::has(&window, &"AudioEncoder".into()).unwrap_or(false)
+            || window.navigator().media_devices().is_err()
+        {
+            return false;
+        }
+        // Having an `AudioEncoder` is not having Opus, so the configuration
+        // this recorder will actually use is tried here. What that catches is
+        // the synchronous half: a configuration the browser rejects outright.
+        //
+        // The other half is asynchronous — an unsupported *codec* is reported
+        // on the error callback rather than thrown — and the API that asks
+        // properly, `isConfigSupported`, is behind `web_sys_unstable_apis`,
+        // which is a build flag and not something to turn on as a side effect
+        // of this. So a browser that accepts the shape and then refuses Opus
+        // still reaches the failure at the end of a recording, where it is at
+        // least *said*: the error travels back through `Recording::Pending`
+        // and onto the notice surface rather than into a log.
+        let init = web_sys::AudioEncoderInit::new(
+            &js_sys::Function::new_no_args(""),
+            &js_sys::Function::new_no_args(""),
+        );
+        let Ok(probe) = web_sys::AudioEncoder::new(&init) else {
+            return false;
+        };
+        let config = web_sys::AudioEncoderConfig::new("opus", 1, TARGET_SAMPLE_RATE);
+        config.set_bitrate(BITRATE);
+        let accepted = probe.configure(&config).is_ok();
+        let _ = probe.close();
+        accepted
     }
 
     /// # Errors
@@ -152,13 +187,24 @@ impl AudioRecorder {
             return Err(RecorderError::AlreadyRecording);
         }
         self.init()?;
-        *self.capture.borrow_mut() = Capture::default();
+        let generation = {
+            let mut capture = self.capture.borrow_mut();
+            let next = capture.generation.wrapping_add(1);
+            *capture = Capture {
+                generation: next,
+                ..Capture::default()
+            };
+            next
+        };
         self.recording = true;
 
         let capture = Rc::clone(&self.capture);
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = open_microphone(&capture).await {
-                capture.borrow_mut().failed = Some(e);
+            if let Err(e) = open_microphone(&capture, generation).await {
+                let mut capture = capture.borrow_mut();
+                if capture.generation == generation {
+                    capture.failed = Some(e);
+                }
             }
         });
         Ok(())
@@ -187,8 +233,10 @@ impl AudioRecorder {
             let mut capture = self.capture.borrow_mut();
             // Dropping the teardown is what closes the device, and it happens
             // here rather than when the encode finishes: the microphone
-            // indicator should go out when the person stops talking.
+            // indicator should go out when the person stops talking. Moving
+            // the generation on is what closes an open still in flight.
             capture.teardown = None;
+            capture.generation = capture.generation.wrapping_add(1);
             (
                 std::mem::take(&mut capture.samples),
                 capture.sample_rate,
@@ -214,13 +262,14 @@ impl AudioRecorder {
         self.recording = false;
         let mut capture = self.capture.borrow_mut();
         capture.teardown = None;
+        capture.generation = capture.generation.wrapping_add(1);
         capture.samples.clear();
         capture.level = 0.0;
     }
 }
 
 /// Open the device and wire the capture graph.
-async fn open_microphone(capture: &Rc<RefCell<Capture>>) -> Result<(), String> {
+async fn open_microphone(capture: &Rc<RefCell<Capture>>, generation: u64) -> Result<(), String> {
     let window = web_sys::window().ok_or("no window to record from")?;
     let devices = window
         .navigator()
@@ -263,6 +312,9 @@ async fn open_microphone(capture: &Rc<RefCell<Capture>>) -> Result<(), String> {
                     return;
                 };
                 let mut capture = capture.borrow_mut();
+                if capture.generation != generation {
+                    return;
+                }
                 capture.level = rms(&channel);
                 capture.samples.extend_from_slice(&channel);
             },
@@ -281,6 +333,19 @@ async fn open_microphone(capture: &Rc<RefCell<Capture>>) -> Result<(), String> {
         .map_err(|e| format!("the capture graph would not run: {e:?}"))?;
 
     let mut held = capture.borrow_mut();
+    // Stopped or cancelled while the prompt was up. The teardown is built and
+    // dropped rather than never built, because it is what knows how to close
+    // the track and the context.
+    if held.generation != generation {
+        drop(Teardown {
+            context,
+            stream,
+            _on_audio: on_audio,
+            _node: node,
+            _source: source,
+        });
+        return Ok(());
+    }
     held.sample_rate = context.sample_rate() as u32;
     held.teardown = Some(Teardown {
         context,
@@ -312,6 +377,18 @@ async fn encode(samples: Vec<f32>, sample_rate: u32) -> Result<EncodedNote, Reco
     let waveform = crate::waveform::generate_waveform(&at_target);
 
     let packets = encode_opus(&at_target).await?;
+    // The same rule the desktop encoder follows, and the reason the check is
+    // shared: where the final frame's zero-padding cannot absorb the
+    // pre-skip — and an exact 20ms multiple has no padding at all — the
+    // packets stop short of the granule the header promises, and a decoder
+    // trims into real audio. One more encoded frame of silence covers it.
+    let packets = if crate::ogg_opus::needs_trailing_silence(packets.len(), at_target.len()) {
+        let mut padded = packets;
+        padded.extend(encode_opus(&vec![0.0; crate::ogg_opus::FRAME_SIZE_SAMPLES]).await?);
+        padded
+    } else {
+        packets
+    };
     let bytes = crate::ogg_opus::package(packets, at_target.len()).map_err(|e| {
         RecorderError::DeviceError(format!("the voice note would not package: {e}"))
     })?;
@@ -384,13 +461,21 @@ async fn encode_opus(samples: &[f32]) -> Result<Vec<Vec<u8>>, RecorderError> {
             TARGET_SAMPLE_RATE as f32,
             micros,
         );
+        // Refused rather than skipped. Packaging counts the *samples* that
+        // were captured, so a frame quietly left out makes the stream stop
+        // short of the granule the header promises: a note reported as
+        // encoded and truncated when it is played.
         let Ok(audio) = web_sys::AudioData::new(&init) else {
-            continue;
+            return Err(RecorderError::DeviceError(
+                "the browser would not take a frame of the recording".to_string(),
+            ));
         };
         let encoded = encoder.encode(&audio);
         audio.close();
-        if encoded.is_err() {
-            break;
+        if let Err(e) = encoded {
+            return Err(RecorderError::DeviceError(format!(
+                "the browser refused a frame of the recording: {e:?}"
+            )));
         }
         micros = micros.saturating_add(frame_micros);
     }

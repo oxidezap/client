@@ -213,10 +213,23 @@ impl MediaCache for Fetched {
         });
     }
 
+    /// Both copies: the page's, and the daemon's if one was staged.
+    ///
+    /// A staged payload is the one thing this side writes to the *other* end,
+    /// so forgetting it locally is only half the job — the daemon spares
+    /// staged uploads from its cache sweep, so a send abandoned after the
+    /// upload landed would leave that file until the account is wiped.
     fn discard(&self, key: &str) {
         self.bytes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key);
+        if key.starts_with("u-") {
+            let key = key.to_string();
+            let base = oxidezap_ipc::web::media_base_url();
+            wasm_bindgen_futures::spawn_local(async move {
+                oxidezap_ipc::web::discard_media(&base, &key).await;
+            });
+        }
     }
 }

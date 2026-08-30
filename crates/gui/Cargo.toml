@@ -132,6 +132,7 @@ web-sys = { version = "0.3", features = [
     "VideoDecoderConfig",
     "VideoDecoderInit",
     "VideoFrame",
+    "DomRectReadOnly",
     "VideoPixelFormat",
     "VideoFrameCopyToOptions",
     "PlaneLayout",
