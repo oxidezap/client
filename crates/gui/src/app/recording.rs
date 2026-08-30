@@ -172,11 +172,14 @@ impl WhatsAppApp {
                     crate::app::notices::Tone::Problem,
                     cx,
                 );
-                self.recording_state = RecordingState::Idle;
-                // Every abort path must reset the input area too, or it keeps
-                // rendering the recording UI forever.
-                self.update_input_recording(cx);
-                cx.notify();
+                // Said *and* acted on. Through the cancel, which is the only
+                // thing that releases the device: setting the state to idle
+                // alone left the capture running with `is_recording` false and
+                // the panel gone, so no control on screen could close the
+                // microphone after that — a notice about a microphone that is
+                // still open is the worse half of that bug, not a fix for it.
+                // The cancel resets the input area and notifies as well.
+                self.cancel_recording(cx);
                 return;
             }
         };

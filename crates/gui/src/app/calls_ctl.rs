@@ -78,14 +78,6 @@ impl WhatsAppApp {
         &self.call_card
     }
 
-    pub fn incoming_call(&self) -> Option<&IncomingCall> {
-        self.call_state.incoming()
-    }
-
-    pub fn outgoing_call(&self) -> Option<&OutgoingCall> {
-        self.call_state.outgoing()
-    }
-
     pub fn active_call(&self) -> Option<&ActiveCall> {
         self.call_state.active()
     }
@@ -168,6 +160,29 @@ impl WhatsAppApp {
         cx.notify();
     }
 
+    /// What the daemon's microphone really did, as the answer to what was
+    /// asked for here.
+    ///
+    /// The announcement is what ends the ask, not the state frames arriving
+    /// in the meantime — those carry the mute the daemon still held. It is
+    /// sent whether or not it agrees with what was asked, which is what makes
+    /// it the last word: an unmute the peer was never told about leaves the
+    /// device muted, and this is what draws that rather than what was wanted.
+    pub(super) fn settle_call_muted(&mut self, call_id: &str, muted: bool, cx: &mut Context<Self>) {
+        if !self.call_state.holds(call_id) {
+            return;
+        }
+        self.call_state.set_muted(&call_id.to_string(), muted);
+        if self
+            .call_muted_asked
+            .as_ref()
+            .is_some_and(|(asked_for, _)| asked_for == call_id)
+        {
+            self.call_muted_asked = None;
+        }
+        cx.notify();
+    }
+
     /// What the daemon's camera really did, as the answer to what was asked
     /// for here.
     ///
@@ -237,6 +252,15 @@ impl WhatsAppApp {
     /// into `decline_call` made the *visible* Decline button refuse a caller
     /// the user could not see, and leave the ringing one ringing.
     pub fn decline_waiting_call(&mut self, cx: &mut Context<Self>) {
+        // Before the call is taken out of the state: with no daemon to reach,
+        // nothing refuses anybody. The caller goes on ringing, and writing the
+        // refusal down anyway put a line in the conversation saying the call
+        // was declined when nothing had been declined at all. The visible
+        // Decline says the same by returning early.
+        if self.client.is_none() {
+            warn!("Cannot decline the waiting call: client is unavailable");
+            return;
+        }
         let Some(waiting) = self.call_state.take_waiting() else {
             return;
         };
@@ -325,6 +349,10 @@ impl WhatsAppApp {
         let Some(muted) = self.call_state.toggle_muted() else {
             return;
         };
+        // Held until the daemon answers, the way the camera's ask is: what
+        // comes back from the device is the last word, and until it does, no
+        // unrelated call frame may take this back.
+        self.call_muted_asked = Some((call_id.clone(), muted));
         if let Some(client) = &self.client {
             client.set_call_muted(&call_id, muted);
         }
@@ -423,16 +451,6 @@ impl WhatsAppApp {
         }
     }
 
-    /// Leave a record of a call in the conversation it belonged to.
-    ///
-    /// The record is local: the daemon does not persist call history, so this
-    /// survives the session and not a restart. Better than nothing — a missed
-    /// call the user never saw is the case this exists for — and it is why the
-    /// row is built from what the UI watched rather than queried back.
-    pub(super) fn record_call(&mut self, stage: &Stage, cx: &mut Context<Self>) {
-        self.record_call_as(stage, None, cx);
-    }
-
     /// Take the daemon's call state as authoritative.
     ///
     /// With one wrinkle. The daemon's state update and the session's
@@ -492,7 +510,20 @@ impl WhatsAppApp {
         }
         self.name_callers(&mut calls);
         let live = calls.active().is_some();
+        // A mute this window asked for and the daemon has not answered yet
+        // survives the frame. Every other call frame carries the mute the
+        // daemon still holds, and letting one of those land put the button
+        // back to "open" over a microphone on its way to muted — with the
+        // next press computing its toggle from that.
+        let pending_mute = self
+            .call_muted_asked
+            .take()
+            .filter(|(call_id, _)| calls.holds(call_id));
         self.call_state = calls;
+        if let Some((call_id, wanted)) = &pending_mute {
+            self.call_state.set_muted(call_id, *wanted);
+        }
+        self.call_muted_asked = pending_mute;
         // After the state, because what a picture may still be drawn for is
         // exactly what the new state says has a camera behind it.
         self.call_pictures.follow(&self.call_state);

@@ -8,7 +8,7 @@
 //! interleave with anything else.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use oxidezap_core::{CallOutcome, Chat, ChatMessage, MediaContent, UiEvent};
@@ -454,7 +454,7 @@ struct Bridge {
     /// a session event carries, and forgetting the session deletes exactly
     /// the directory it writes into.
     publisher: Option<crate::publisher::Handle>,
-    reads: ReadTracker,
+    reads: Arc<Mutex<ReadTracker>>,
     in_flight: Arc<Semaphore>,
     /// Set by [`Action::ForgetSession`]. Read by the event loop, which stops
     /// and wipes once the session has let go of the store.
@@ -475,7 +475,7 @@ impl Bridge {
             plugins,
             publish: Some(publish),
             publisher: Some(publisher),
-            reads: ReadTracker::default(),
+            reads: Arc::new(Mutex::new(ReadTracker::default())),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             forget: false,
         }
@@ -505,7 +505,7 @@ impl Bridge {
         // Before anything is published, so a `MarkRead` that arrives right
         // behind a message already covers it. What it answers is whether the
         // message is new to this side, which is what the badge below counts.
-        let first_sighting = self.reads.observe(&event);
+        let first_sighting = self.reads().observe(&event);
 
         if let Some(frame) = passthrough(&event) {
             self.hub.signal(&frame);
@@ -602,6 +602,26 @@ impl Bridge {
                 s.mark_unrecorded(id);
                 s.end(id);
             }),
+            // The connection the calls run over is gone, and nothing else
+            // says so: no session event ends a call when the socket dies, so
+            // the stage stood, `is_busy` went on refusing every new call after
+            // the reconnect, and the only way out was a cancel naming an id no
+            // attached window still had.
+            UiEvent::Disconnected(_) | UiEvent::LoggedOut(_) | UiEvent::Error(_) => {
+                self.hub.calls(|s| {
+                    s.end_all();
+                });
+                // And everything keyed to the account leaves with it. An
+                // account reset is a departure: a snapshot taken after the
+                // next pairing would otherwise open with the old identity, the
+                // old chat list, and a stage the new account's front end reads
+                // as a call that just ended — writing the previous account's
+                // call into this one's history.
+                if matches!(event, UiEvent::LoggedOut(_)) {
+                    self.hub.forget_account();
+                    self.reads().forget_all();
+                }
+            }
             UiEvent::AccountUpdated { name, jid, lid } => {
                 self.hub.set_account(oxidezap_ipc::AccountIdentity {
                     name: name.clone(),
@@ -638,7 +658,7 @@ impl Bridge {
             // again; keeping its ids would leak one entry per deleted
             // conversation.
             if let DaemonEvent::ChatRemoved { jid } = &change.event {
-                self.reads.forget(jid);
+                self.reads().forget(jid);
             }
             self.hub.apply(change);
         }
@@ -676,10 +696,215 @@ impl Bridge {
     /// session and returns.
     async fn execute(&mut self, client: &WhatsAppClient, command: SessionCommand) {
         let SessionCommand { action, reply } = command;
+        // The store reads answer from tasks of their own; what comes back here
+        // is everything else.
+        let Some((action, reply)) = self.begin_slow(client, action, reply) else {
+            return;
+        };
         let outcome = self.act(client, action).await;
         // A refusal nobody is listening for is not worth logging: the client
         // hung up, which is its right.
         let _ = reply.send(outcome);
+    }
+
+    fn reads(&self) -> std::sync::MutexGuard<'_, ReadTracker> {
+        self.reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Start the actions whose work is a store round trip, and answer from a
+    /// task of their own. Gives the command back when it is not one of them.
+    ///
+    /// Awaited in the run loop, one of these stops the loop for as long as
+    /// SQLite takes: a signal is not observed while it runs, and the video
+    /// channel — four frames deep, with this loop its only consumer —
+    /// overflows into dropped frames and keyframe requests for the length of
+    /// a local query. What the fold needs is shared rather than borrowed, so
+    /// what the daemon learns from a page it serves is learned wherever the
+    /// page lands.
+    ///
+    /// A page read takes a permit like every other slow action: the command
+    /// channel has no bound of its own, and a front end that reads its
+    /// acknowledgements would otherwise keep queueing SQLite reads, each
+    /// holding its page and that page's externalized media until it answers.
+    fn begin_slow(
+        &mut self,
+        client: &WhatsAppClient,
+        action: Action,
+        reply: tokio::sync::oneshot::Sender<CommandOutcome>,
+    ) -> Option<(Action, tokio::sync::oneshot::Sender<CommandOutcome>)> {
+        match action {
+            Action::MarkStatusWatched { message_ids } => {
+                // The other actions are finished when the session has taken
+                // them and what the network makes of them arrives later; this
+                // one *is* the write, there is no retry, and the answer is the
+                // only thing that can tell a window its ring is coming back.
+                let written = client.mark_status_watched(message_ids);
+                oxidezap_session::spawn(async move {
+                    let outcome = match written.await {
+                        Ok(true) => CommandOutcome::Accepted,
+                        Ok(false) => CommandOutcome::Refused(
+                            "the status view could not be recorded".to_string(),
+                        ),
+                        Err(e) => CommandOutcome::Refused(format!(
+                            "the status view could not be recorded: {e}"
+                        )),
+                    };
+                    let _ = reply.send(outcome);
+                });
+                None
+            }
+            Action::LoadMessages {
+                id,
+                jid,
+                before,
+                limit,
+                answer_to,
+            } => {
+                // Before the call, not after it: `load_messages` spawns the
+                // query as it returns, so taking the permit afterwards refused
+                // the request and ran it anyway.
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let page = client.load_messages(
+                    jid.clone(),
+                    before.map(|cursor| cursor.as_str().to_string()),
+                    limit.map_or(WhatsAppClient::MESSAGE_PAGE, i64::from),
+                );
+                let reads = Arc::clone(&self.reads);
+                // The cache epoch as it is *now*, not as it will be when the
+                // page lands. A `ForgetSession` in between retires this one,
+                // and `put_since` then refuses the write rather than putting
+                // the departed account's thumbnails back into a directory the
+                // wipe has already emptied.
+                let epoch = crate::media::epoch();
+                // Which account asked. A page of the old one's history
+                // landing after it left would be folded into a tracker that
+                // had just forgotten it, and the next account would carry the
+                // previous one's boundaries. See [`StateHub::forget_account`].
+                let asked_as = self.hub.account_generation();
+                let hub = Arc::clone(&self.hub);
+                oxidezap_session::spawn(async move {
+                    let answer = match page.await {
+                        Ok(Ok(mut page)) => {
+                            // The bytes travel the way they do everywhere
+                            // else: written to the media directory, named by
+                            // a key.
+                            externalize_messages(epoch, &mut page.items);
+                            // What this side served, it now knows. A read is
+                            // bounded by the messages the daemon has observed,
+                            // and the page a front end asked for is the
+                            // history it is about to read: without this, a
+                            // window naming a message from a page nobody told
+                            // the daemon about is refused, and the badge comes
+                            // back on the next hydration.
+                            //
+                            // Asked with the tracker's own lock held, which
+                            // is what makes the answer good enough: a logout
+                            // clears the tracker *after* it bumps the
+                            // generation, so either this reads the bump and
+                            // folds nothing, or it folds and the clear that
+                            // follows takes it.
+                            {
+                                let mut reads =
+                                    reads.lock().unwrap_or_else(|held| held.into_inner());
+                                if hub.account_generation() == asked_as {
+                                    for message in &page.items {
+                                        reads.observe_message(&jid, message);
+                                    }
+                                }
+                            }
+                            Ok(DaemonMessage::Messages {
+                                id,
+                                jid,
+                                messages: page.items,
+                                next: page.next.map(PageCursor::new),
+                            })
+                        }
+                        Ok(Err(detail)) => Err(detail),
+                        Err(_) => Err("the session stopped before the page arrived".to_string()),
+                    };
+                    answer_now(&answer_to, answered(id, answer));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
+            Action::LoadChats {
+                id,
+                after,
+                limit,
+                answer_to,
+            } => {
+                // As above: the permit is what decides whether the query
+                // runs, so it is taken before the call that starts one.
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let page = client.load_chats(
+                    after.map(|cursor| cursor.as_str().to_string()),
+                    limit.map_or(WhatsAppClient::CHAT_PAGE, i64::from),
+                );
+                let reads = Arc::clone(&self.reads);
+                let hub = Arc::clone(&self.hub);
+                // As above: taken now, so a wipe between the ask and the
+                // answer refuses the write rather than repopulating the cache.
+                let epoch = crate::media::epoch();
+                // As above: a page of the departed account's chats must not
+                // be put back into a hub that has just been emptied of it.
+                let asked_as = hub.account_generation();
+                oxidezap_session::spawn(async move {
+                    let answer = match page.await {
+                        Ok(Ok(mut page)) => {
+                            // The same rule. A chat past the attach window is
+                            // in no snapshot, and a read for one is refused
+                            // with "no such chat" until this side has been
+                            // told it exists. Its rows are learned as well as
+                            // its summary: a window opening such a chat names
+                            // the message it can see, and a read naming a
+                            // message this side has never observed is refused
+                            // for having no boundary — a badge that clears
+                            // locally, sends no receipt and comes straight
+                            // back on the next hydration.
+                            for chat in &mut page.items {
+                                externalize_messages(epoch, &mut chat.messages);
+                                let mut reads =
+                                    reads.lock().unwrap_or_else(|held| held.into_inner());
+                                for message in &chat.messages {
+                                    reads.observe_message(&chat.jid, message);
+                                }
+                                // Asked and written under one lock, so a
+                                // logout cannot land between the question and
+                                // the answer. What it refuses is folded back
+                                // out of the tracker: an entry for a departed
+                                // account's chat is a boundary the next one
+                                // would inherit.
+                                let summary = chat_updated(chat, &mut reads);
+                                if !hub.apply_for(asked_as, summary) {
+                                    reads.forget(&chat.jid);
+                                }
+                            }
+                            Ok(DaemonMessage::Chats {
+                                id,
+                                chats: page.items,
+                                next: page.next.map(PageCursor::new),
+                            })
+                        }
+                        Ok(Err(detail)) => Err(detail),
+                        Err(_) => Err("the session stopped before the page arrived".to_string()),
+                    };
+                    answer_now(&answer_to, answered(id, answer));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
+            action => Some((action, reply)),
+        }
     }
 
     async fn act(&mut self, client: &WhatsAppClient, action: Action) -> CommandOutcome {
@@ -766,41 +991,12 @@ impl Bridge {
                 jid,
                 through_message_id,
             } => self.mark_read(client, &jid, through_message_id.as_deref()),
-            // No permit and no boundary check: this writes one local row and
-            // sends nothing, so there is no receipt to get wrong and nothing
-            // for a stale client to consume on somebody's behalf. Watching an
-            // update it has already watched is the same row again.
-            //
-            // Awaited, unlike everything around it. The other actions are
-            // finished when the session has taken them and what the network
-            // makes of them arrives later; this one *is* the write, there is
-            // no retry, and a session torn down a moment later would cancel
-            // it — losing exactly the view the request exists to keep.
-            Action::MarkStatusWatched { message_ids } => {
-                let written = client.mark_status_watched(message_ids).await;
-                match written {
-                    // No frame of its own: the row that moved invalidates the
-                    // broadcast, so the reloader republishes it and every
-                    // attached front end — including this one — learns about
-                    // the view through the history channel it can already
-                    // recover from. A signal would be news on a lossy
-                    // channel, and a client behind by more than its capacity
-                    // would keep a ring nothing puts back.
-                    Ok(true) => CommandOutcome::Accepted,
-                    // Said rather than swallowed: the window has already
-                    // drawn the ring as watched, and a refusal is the only
-                    // thing that can tell it the ring is coming back.
-                    Ok(false) => {
-                        CommandOutcome::Refused("the status view could not be recorded".to_string())
-                    }
-                    Err(e) => CommandOutcome::Refused(format!(
-                        "the status view could not be recorded: {e}"
-                    )),
-                }
+            // Answered from a task of its own. See `begin_slow`.
+            Action::MarkStatusWatched { .. }
+            | Action::LoadMessages { .. }
+            | Action::LoadChats { .. } => {
+                CommandOutcome::Refused("a store read reached the wrong path".to_string())
             }
-            // No permit: these send one small stanza and hold nothing open,
-            // and a typing indicator refused for being busy would be a worse
-            // answer than a late one.
             Action::Typing { jid, composing } => {
                 if composing {
                     client.send_composing(&jid);
@@ -947,96 +1143,6 @@ impl Bridge {
                 client.request_video_keyframe();
                 CommandOutcome::Accepted
             }
-            // Awaited here rather than spawned, unlike a download: this is a
-            // page of local rows, which is milliseconds of SQLite, and what
-            // comes back has to be folded into this side's own state before
-            // it is sent. `MarkStatusWatched` waits on its write for the same
-            // reason.
-            Action::LoadMessages {
-                id,
-                jid,
-                before,
-                limit,
-                answer_to,
-            } => {
-                let page = client
-                    .load_messages(
-                        jid.clone(),
-                        before.map(|cursor| cursor.as_str().to_string()),
-                        limit.map_or(WhatsAppClient::MESSAGE_PAGE, i64::from),
-                    )
-                    .await;
-                let answer = match page {
-                    Ok(Ok(mut page)) => {
-                        // The bytes travel the way they do everywhere else:
-                        // written to the media directory, named by a key.
-                        externalize_messages(crate::media::epoch(), &mut page.items);
-                        // What this side served, it now knows. A read is
-                        // bounded by the messages the daemon has observed, and
-                        // the page a front end asked for is the history it is
-                        // about to read: without this, a window naming a
-                        // message from a page nobody told the daemon about is
-                        // refused, and the badge comes back on the next
-                        // hydration.
-                        for message in &page.items {
-                            self.reads.observe_message(&jid, message);
-                        }
-                        Ok(DaemonMessage::Messages {
-                            id,
-                            jid,
-                            messages: page.items,
-                            next: page.next.map(PageCursor::new),
-                        })
-                    }
-                    Ok(Err(detail)) => Err(detail),
-                    Err(_) => Err("the session stopped before the page arrived".to_string()),
-                };
-                answer_now(&answer_to, answered(id, answer));
-                CommandOutcome::Accepted
-            }
-            Action::LoadChats {
-                id,
-                after,
-                limit,
-                answer_to,
-            } => {
-                let page = client
-                    .load_chats(
-                        after.map(|cursor| cursor.as_str().to_string()),
-                        limit.map_or(WhatsAppClient::CHAT_PAGE, i64::from),
-                    )
-                    .await;
-                let answer = match page {
-                    Ok(Ok(mut page)) => {
-                        let epoch = crate::media::epoch();
-                        // The same rule. A chat past the attach window is in
-                        // no snapshot, and a read for one is refused with "no
-                        // such chat" until this side has been told it exists.
-                        // Its rows are learned as well as its summary: a
-                        // window opening such a chat names the message it can
-                        // see, and a read naming a message this side has never
-                        // observed is refused for having no boundary — which
-                        // is a badge that clears locally, sends no receipt and
-                        // comes straight back on the next hydration.
-                        for chat in &mut page.items {
-                            externalize_messages(epoch, &mut chat.messages);
-                            for message in &chat.messages {
-                                self.reads.observe_message(&chat.jid, message);
-                            }
-                            self.hub.apply(chat_updated(chat, &mut self.reads));
-                        }
-                        Ok(DaemonMessage::Chats {
-                            id,
-                            chats: page.items,
-                            next: page.next.map(PageCursor::new),
-                        })
-                    }
-                    Ok(Err(detail)) => Err(detail),
-                    Err(_) => Err("the session stopped before the page arrived".to_string()),
-                };
-                answer_now(&answer_to, answered(id, answer));
-                CommandOutcome::Accepted
-            }
             // Deferred rather than done here, because the file to delete is
             // the one the session still has open. The event loop already ends
             // by disconnecting and closing SQLite; the wipe belongs after
@@ -1064,7 +1170,19 @@ impl Bridge {
         media: oxidezap_core::DownloadableMedia,
         answer_to: Outbox,
     ) -> CommandOutcome {
-        let key = crate::media::download_key(&media.file_enc_sha256);
+        // No content to address by. Refused rather than filed under a key
+        // every such request would share, which answered one message's
+        // download with another's bytes.
+        let Some(key) = crate::media::download_key(&media.file_enc_sha256) else {
+            answer_now(
+                &answer_to,
+                downloaded(
+                    id,
+                    Err("that media carries no content hash to fetch it by".to_string()),
+                ),
+            );
+            return CommandOutcome::Accepted;
+        };
         // Already here: the same media shared into two chats, or a front end
         // that restarted. No network, no permit, no wait.
         //
@@ -1116,7 +1234,7 @@ impl Bridge {
         hold(
             permit,
             [
-                client.send_read_receipts(jid, self.reads.take_receipts(jid)),
+                client.send_read_receipts(jid, self.reads().take_receipts(jid)),
                 client.mark_chat_read(jid, boundary),
             ],
         );
@@ -1126,7 +1244,7 @@ impl Bridge {
         // stays busy — exactly when a user is most likely to be clearing it.
         // And remembered, so the reload that is already in flight for the
         // message that raised the badge cannot put it straight back.
-        self.reads.record_read(jid, read);
+        self.reads().record_read(jid, read);
         if let Some(mut summary) = self.hub.chat(jid).filter(ChatSummary::has_unread) {
             summary.unread = 0;
             summary.manually_unread = false;
@@ -1150,7 +1268,7 @@ impl Bridge {
             return Err(format!("no such chat: {}", observe_str(jid)));
         };
 
-        match self.reads.boundary(jid) {
+        match self.reads().boundary(jid) {
             Some((secs, ids)) => {
                 // What the requester says it is looking at, against the second
                 // this read would clear. A read is irreversible and clears
@@ -1335,7 +1453,8 @@ impl Bridge {
                     );
                 }
 
-                changes.extend(chats.iter().map(|chat| chat_updated(chat, &mut self.reads)));
+                let mut reads = self.reads();
+                changes.extend(chats.iter().map(|chat| chat_updated(chat, &mut reads)));
                 changes
             }
             _ => Vec::new(),
@@ -1437,11 +1556,11 @@ fn cache_media(cache_epoch: usize, message_id: &str, media: &mut Option<MediaCon
         // message's own key, so a photo whose eager fetch failed and was
         // fetched on demand later is on this disk under a name a hydrated row
         // never looks for. It was downloaded again on every restart.
-        if let Some(downloadable) = &media.downloadable {
-            let by_content = crate::media::download_key(&downloadable.file_enc_sha256);
-            if crate::media::has(&by_content) {
-                media.cache_key = Some(by_content);
-            }
+        if let Some(downloadable) = &media.downloadable
+            && let Some(by_content) = crate::media::download_key(&downloadable.file_enc_sha256)
+            && crate::media::has(&by_content)
+        {
+            media.cache_key = Some(by_content);
         }
         return;
     }
@@ -1735,6 +1854,18 @@ struct ChatReads {
 }
 
 impl ChatReads {
+    /// Drop what this chat remembers about `ids`, so a fresh answer about
+    /// them can be folded in.
+    ///
+    /// Both queues, because `seen` is what makes `observe` skip a message it
+    /// recognises: left behind, a message the store still reports unread
+    /// would never be queued for its receipt again.
+    fn forget<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        let ids: std::collections::HashSet<&str> = ids.into_iter().collect();
+        self.unread.retain(|(id, _)| !ids.contains(id.as_str()));
+        self.seen.retain(|id| !ids.contains(id.as_str()));
+    }
+
     /// Fold one message in, answering whether it is an incoming message this
     /// chat had not seen before.
     ///
@@ -1825,11 +1956,32 @@ impl ReadTracker {
             }
             UiEvent::HistoryLoaded { chats, .. } => {
                 for chat in chats {
-                    // Rebuilt rather than merged: the load is the store's
-                    // answer for this chat, so a message it now reports as
-                    // read must stop being something we send a receipt for.
                     let reads = self.chats.entry(chat.jid.clone()).or_default();
-                    *reads = ChatReads::default();
+                    // The boundary is only the store's answer when the load
+                    // reaches it. The same rule `observe` holds one message at
+                    // a time: a page older than what this side holds says
+                    // nothing about where the chat ends, and rebuilding from
+                    // one let the boundary recede — the window then named a
+                    // message it had just drawn in a read the daemon refused,
+                    // which is a badge that clears locally, sends no receipt
+                    // and comes back on the next hydration. A chat the store
+                    // reports with nothing in it is the one case where
+                    // receding is the answer.
+                    let newest = chat
+                        .messages
+                        .iter()
+                        .map(|message| message.timestamp.timestamp())
+                        .max();
+                    if newest.is_none_or(|newest| newest >= reads.newest_secs) {
+                        *reads = ChatReads::default();
+                    } else {
+                        // An older page answers for the rows in it and for
+                        // nothing else. Clearing the whole queue here dropped
+                        // the receipt owed for a live message the page does
+                        // not carry: the boundary still admitted a read
+                        // naming it, and no receipt went out for it.
+                        reads.forget(chat.messages.iter().map(|message| message.id.as_str()));
+                    }
                     for message in &chat.messages {
                         reads.observe(message);
                     }
@@ -1868,6 +2020,12 @@ impl ReadTracker {
             .get_mut(jid)
             .map(|reads| reads.unread.drain(..).collect())
             .unwrap_or_default()
+    }
+
+    /// Everything this account taught us, gone with it.
+    fn forget_all(&mut self) {
+        self.chats.clear();
+        self.read_through.clear();
     }
 
     /// Remember a read the store has not confirmed yet.
@@ -2011,7 +2169,7 @@ mod tests {
 
         assert_eq!(bridge.hub.chat("1@s.whatsapp.net").unwrap().unread, 1);
         assert_eq!(
-            bridge.reads.take_receipts("1@s.whatsapp.net").len(),
+            bridge.reads().take_receipts("1@s.whatsapp.net").len(),
             1,
             "and the badge agrees with the receipts this side owes"
         );
@@ -2033,7 +2191,7 @@ mod tests {
         };
         bridge.observe(arrival());
         // What marking the chat read does to this side.
-        assert_eq!(bridge.reads.take_receipts("1@s.whatsapp.net").len(), 1);
+        assert_eq!(bridge.reads().take_receipts("1@s.whatsapp.net").len(), 1);
 
         bridge.observe(arrival());
 
@@ -2043,7 +2201,7 @@ mod tests {
             "the badge is not raised a second time by the same message"
         );
         assert!(
-            bridge.reads.take_receipts("1@s.whatsapp.net").is_empty(),
+            bridge.reads().take_receipts("1@s.whatsapp.net").is_empty(),
             "and no second receipt is owed for it"
         );
     }
@@ -2297,6 +2455,58 @@ mod tests {
         // Answered or hung up, it is no longer something to attach to.
         bridge.observe(UiEvent::CallEnded("call-1".into()));
         assert!(bridge.hub.call_state().incoming().is_none());
+    }
+
+    /// An account reset is a departure. The hub only ever learned by event,
+    /// so a snapshot taken after the next pairing opened with the previous
+    /// account's identity and chat list.
+    #[test]
+    fn a_logout_takes_the_account_out_of_the_next_snapshot() {
+        let mut bridge = bridge();
+        bridge.observe(loaded(vec![stored_chat(
+            "1@s.whatsapp.net",
+            1,
+            vec![message("a", "1@s.whatsapp.net", 10, false, false)],
+        )]));
+        bridge.observe(UiEvent::AccountUpdated {
+            name: Some("Ana".to_string()),
+            jid: Some("1@s.whatsapp.net".to_string()),
+            lid: None,
+        });
+        assert!(bridge.hub.chat("1@s.whatsapp.net").is_some());
+
+        bridge.observe(UiEvent::LoggedOut("the server said no".into()));
+
+        assert!(bridge.hub.chat("1@s.whatsapp.net").is_none());
+        assert!(bridge.hub.store_backed_chat_jids().is_empty());
+        assert!(
+            bridge.reads().boundary("1@s.whatsapp.net").is_none(),
+            "and nothing this account taught the read tracker survives it"
+        );
+    }
+
+    /// Nothing on the session side ends a call when the socket dies, so the
+    /// stage stood: after the reconnect every new call was refused as busy,
+    /// and the only cancel that could clear it named an id no window held.
+    #[test]
+    fn a_lost_connection_does_not_leave_the_call_stage_standing() {
+        let mut bridge = bridge();
+        bridge.observe(UiEvent::IncomingCall(oxidezap_core::IncomingCall {
+            call_id: "call-1".into(),
+            caller_name: "Alice".into(),
+            caller_jid: "1@s.whatsapp.net".into(),
+            is_video: false,
+            is_offline: false,
+            received_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        }));
+        assert!(bridge.hub.call_state().is_busy());
+
+        bridge.observe(UiEvent::Disconnected("the socket went away".into()));
+        assert!(
+            !bridge.hub.call_state().is_busy(),
+            "a call cannot outlive the connection it runs over"
+        );
+        assert!(bridge.hub.call_state().stage().is_none());
     }
 
     /// The request is optimistic and the announcement can fail, so the state
@@ -2557,7 +2767,7 @@ mod tests {
         assert_eq!(at_boundary, ["a", "b", "mine"]);
 
         let mut owed: Vec<String> = bridge
-            .reads
+            .reads()
             .take_receipts("1@s.whatsapp.net")
             .into_iter()
             .map(|(id, _)| id)
@@ -2566,11 +2776,11 @@ mod tests {
         assert_eq!(owed, ["a", "b", "older"]);
 
         assert!(
-            bridge.reads.take_receipts("1@s.whatsapp.net").is_empty(),
+            bridge.reads().take_receipts("1@s.whatsapp.net").is_empty(),
             "a receipt is owed once, not every time"
         );
         assert!(
-            bridge.reads.boundary("1@s.whatsapp.net").is_some(),
+            bridge.reads().boundary("1@s.whatsapp.net").is_some(),
             "the boundary outlives the receipts: the next read still needs it"
         );
     }
@@ -2741,7 +2951,7 @@ mod tests {
 
         // What `mark_read` records once it has issued the action.
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(10, &["m1"]));
 
         // The reload the store already had queued, still carrying the count.
@@ -2768,7 +2978,7 @@ mod tests {
         let incoming = message("m1", "1@s.whatsapp.net", 10, false, false);
         bridge.observe(received("1@s.whatsapp.net", incoming.clone(), None));
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(10, &["m1"]));
 
         let reply = message("m2", "me@s.whatsapp.net", 20, true, false);
@@ -2794,7 +3004,7 @@ mod tests {
         let first = message("m1", "1@s.whatsapp.net", 10, false, false);
         bridge.observe(received("1@s.whatsapp.net", first.clone(), None));
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(10, &["m1"]));
 
         let second = message("m2", "1@s.whatsapp.net", 20, false, false);
@@ -2821,7 +3031,7 @@ mod tests {
         let read_msg = message("m1", "1@s.whatsapp.net", 20, false, false);
         bridge.observe(received("1@s.whatsapp.net", read_msg.clone(), None));
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(20, &["m1"]));
 
         // Same second, different message: the action named `m1`, not this.
@@ -2851,7 +3061,7 @@ mod tests {
 
         let mut stale = read_through(20, &["m1"]);
         stale.expires_at_ms = wacore::time::now_millis() - 1;
-        bridge.reads.record_read("1@s.whatsapp.net", stale);
+        bridge.reads().record_read("1@s.whatsapp.net", stale);
 
         bridge.observe(loaded(vec![stored_chat("1@s.whatsapp.net", 1, vec![only])]));
         assert_eq!(
@@ -2870,7 +3080,7 @@ mod tests {
         let only = message("m1", "1@s.whatsapp.net", 10, false, true);
         bridge.observe(received("1@s.whatsapp.net", only.clone(), None));
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(10, &["m1"]));
 
         // The read landed: the store now agrees, which spends the override.
@@ -2902,7 +3112,7 @@ mod tests {
                 None,
             ));
         }
-        let unread = bridge.reads.take_receipts("1@s.whatsapp.net");
+        let unread = bridge.reads().take_receipts("1@s.whatsapp.net");
         assert_eq!(unread.len(), MAX_TRACKED_UNREAD);
         assert_eq!(unread.first().unwrap().0, "m5", "the oldest went first");
     }
@@ -2924,8 +3134,65 @@ mod tests {
         )]));
 
         assert!(
-            bridge.reads.take_receipts("1@s.whatsapp.net").is_empty(),
+            bridge.reads().take_receipts("1@s.whatsapp.net").is_empty(),
             "read elsewhere, so nothing is owed"
+        );
+    }
+
+    /// A load that stops short of what this side has already seen says
+    /// nothing about where the chat ends. Rebuilding the boundary from it let
+    /// it recede, and the window's read then named a message it had just
+    /// drawn and was refused for it.
+    #[test]
+    fn an_older_page_does_not_move_the_boundary_back() {
+        let mut bridge = bridge();
+        bridge.observe(received(
+            "1@s.whatsapp.net",
+            message("newest", "1@s.whatsapp.net", 200, false, false),
+            None,
+        ));
+
+        bridge.observe(loaded(vec![stored_chat(
+            "1@s.whatsapp.net",
+            1,
+            vec![message("older", "1@s.whatsapp.net", 100, false, false)],
+        )]));
+
+        let (secs, ids) = bridge
+            .reads()
+            .boundary("1@s.whatsapp.net")
+            .expect("the chat still ends where it ended");
+        assert_eq!(secs, 200);
+        assert_eq!(
+            ids.iter().map(|(id, ..)| id.as_str()).collect::<Vec<_>>(),
+            ["newest"]
+        );
+    }
+
+    /// An older page answers for the rows in it. Clearing the whole queue on
+    /// one dropped the receipt owed for a live message the page does not
+    /// carry: the boundary correctly stayed where it was, so a read naming
+    /// that message was accepted, and no receipt ever went out for it.
+    #[test]
+    fn an_older_page_leaves_a_newer_messages_receipt_owed() {
+        let mut bridge = bridge();
+        bridge.observe(received(
+            "1@s.whatsapp.net",
+            message("newest", "1@s.whatsapp.net", 200, false, false),
+            None,
+        ));
+
+        bridge.observe(loaded(vec![stored_chat(
+            "1@s.whatsapp.net",
+            1,
+            vec![message("older", "1@s.whatsapp.net", 100, false, true)],
+        )]));
+
+        let owed = bridge.reads().take_receipts("1@s.whatsapp.net");
+        assert_eq!(
+            owed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["newest"],
+            "the page said nothing about the message it does not carry"
         );
     }
 
@@ -2940,13 +3207,13 @@ mod tests {
             vec![message("a", "1@s.whatsapp.net", 10, false, false)],
         )]));
         bridge
-            .reads
+            .reads()
             .record_read("1@s.whatsapp.net", read_through(10, &["m1"]));
-        assert!(bridge.reads.boundary("1@s.whatsapp.net").is_some());
+        assert!(bridge.reads().boundary("1@s.whatsapp.net").is_some());
 
         bridge.observe(loaded(Vec::new()));
-        assert!(bridge.reads.boundary("1@s.whatsapp.net").is_none());
-        assert!(!bridge.reads.read_through.contains_key("1@s.whatsapp.net"));
+        assert!(bridge.reads().boundary("1@s.whatsapp.net").is_none());
+        assert!(!bridge.reads().read_through.contains_key("1@s.whatsapp.net"));
     }
 
     /// The bound the command channel cannot provide: every session call spawns

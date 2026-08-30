@@ -15,6 +15,16 @@ use crate::system_notice::SystemNotice;
 /// Maximum number of unique emoji reactions per message to prevent spam
 const MAX_REACTIONS_PER_MESSAGE: usize = 50;
 
+/// Maximum reactors one message will record, across every emoji on it.
+///
+/// The emoji count was bounded and the list under each was not, so one
+/// message grew by a name per reaction — and reactions arrive from the
+/// network with the sender in the envelope, so the same emoji from a
+/// thousand JIDs is a row that is serialized into every history load and
+/// copied into every status rebuild. Generous, because a large group really
+/// does react.
+const MAX_REACTORS_PER_MESSAGE: usize = 500;
+
 pub fn fallback_chat_name(jid: &Jid) -> String {
     if jid.is_status_broadcast() {
         "Status".to_string()
@@ -136,6 +146,13 @@ pub struct MediaContent {
     /// end in another process reads it out of the daemon's media cache under
     /// [`cache_key`](Self::cache_key) instead. Skipping it here rather than
     /// remembering not to send it is what makes that mechanical.
+    ///
+    /// It is also the one exception to the rule the rest of these fields keep
+    /// — a field may only be skipped where its absence reads back as the
+    /// value that was skipped — and what makes the exception sound is the
+    /// field below: bytes are dropped from the frame only because a key names
+    /// where they went. Nothing in the type ties the two together, so
+    /// `media_bytes_only_leave_the_frame_once_a_key_names_them` does.
     #[serde(skip)]
     pub data: Arc<Vec<u8>>,
     /// Where the daemon's media cache holds [`data`](Self::data).
@@ -455,6 +472,21 @@ impl ChatMessage {
             }
         }
 
+        // The other half of the same bound: a distinct sender is a name this
+        // message keeps, and a message with no ceiling on those is one the
+        // network can grow without limit. Somebody who already reacted is
+        // changing their mind rather than adding to it, so they are never
+        // turned away.
+        if !emoji.is_empty()
+            && self.reactors() >= MAX_REACTORS_PER_MESSAGE
+            && !self
+                .reactions
+                .values()
+                .any(|senders| senders.contains(&sender))
+        {
+            return;
+        }
+
         // Remove any existing reaction from this sender (one reaction per person)
         for senders in self.reactions.values_mut() {
             senders.retain(|s| s != &sender);
@@ -467,6 +499,11 @@ impl ChatMessage {
         }
 
         self.reactions.entry(emoji).or_default().push(sender);
+    }
+
+    /// How many people have reacted to this message.
+    fn reactors(&self) -> usize {
+        self.reactions.values().map(Vec::len).sum()
     }
 
     /// Get the preview text for chat list display.
@@ -980,11 +1017,19 @@ impl Chat {
     /// or the preview. An id match replaces the live bubble: the store is
     /// authoritative (edits and revokes materialize there), so the hydrated
     /// copy must not be dropped in favor of stale content.
-    pub fn insert_history_message(&mut self, mut message: ChatMessage) {
+    /// Answers whether the timeline actually moved.
+    ///
+    /// A page re-fetched over rows it already holds is the common case — the
+    /// daemon publishes a history load on every ack and receipt, and the open
+    /// conversation asks again from the top — and a caller that invalidated
+    /// its rows for one of those rebuilt and re-measured the whole timeline
+    /// for nothing.
+    pub fn insert_history_message(&mut self, mut message: ChatMessage) -> bool {
         self.name_quoted_author(&mut message);
         // Id-only match: the hydrated copy may carry a slightly different
         // timestamp than the optimistic bubble. Remove-and-reinsert keeps
         // the (timestamp, id) sort invariant when the timestamp shifted.
+        let mut unchanged = false;
         if let Some(pos) = self.messages.iter().position(|m| m.id == message.id) {
             let existing = self.messages.remove(pos);
             // The store never holds downloaded media bytes — hydrated rows
@@ -992,13 +1037,13 @@ impl Chat {
             // bytes the live bubble already fetched so a reload can't
             // downgrade a full download.
             if let Some(new_media) = message.media.as_mut()
-                && let Some(old_media) = existing.media
+                && let Some(old_media) = existing.media.as_ref()
                 && !old_media.data.is_empty()
                 && (new_media.data.is_empty()
                     || (new_media.data_is_preview && !old_media.data_is_preview))
             {
-                new_media.data = old_media.data;
-                new_media.mime_type = old_media.mime_type;
+                new_media.data = Arc::clone(&old_media.data);
+                new_media.mime_type = old_media.mime_type.clone();
                 new_media.data_is_preview = old_media.data_is_preview;
             }
             // Live-only state the store doesn't carry must also survive the
@@ -1009,8 +1054,9 @@ impl Chat {
             // read bubble back to delivered.
             message.status.advance(existing.status);
             if message.sender_name.is_none() {
-                message.sender_name = existing.sender_name;
+                message.sender_name = existing.sender_name.clone();
             }
+            unchanged = existing == message;
         }
         let pos = self
             .messages
@@ -1021,6 +1067,7 @@ impl Chat {
             })
             .unwrap_or_else(|pos| pos);
         self.messages.insert(pos, message);
+        !unchanged
     }
 
     /// Mark all incoming messages as read and clear the unread badge.
@@ -1624,6 +1671,53 @@ mod tests {
         assert_eq!(chat.messages[0].content, "Message local_1000_0");
 
         assert!(!chat.rename_message("missing", "whatever"));
+    }
+
+    /// A page that repeats rows the conversation already holds is the common
+    /// case: the daemon publishes a history load on every ack and receipt,
+    /// and a conversation whose whole history fit in one page asks for that
+    /// page again each time. A caller that could not tell used to rebuild and
+    /// re-measure the entire timeline for it.
+    #[test]
+    fn a_row_that_arrives_again_unchanged_says_nothing_moved() {
+        let mut chat = Chat::new("test@s.whatsapp.net".to_string());
+        assert!(
+            chat.insert_history_message(make_message("3EB0AAA", 1000)),
+            "the first copy is news"
+        );
+        assert!(
+            !chat.insert_history_message(make_message("3EB0AAA", 1000)),
+            "the same row again is not"
+        );
+        assert_eq!(chat.messages.len(), 1);
+
+        let mut edited = make_message("3EB0AAA", 1000);
+        edited.content = "edited".to_string();
+        assert!(
+            chat.insert_history_message(edited),
+            "a row that changed is news again"
+        );
+    }
+
+    /// The emoji count was bounded and the reactor list under each was not,
+    /// so one message grew by a name for every reaction the network carried —
+    /// and that row is serialized into every history load.
+    #[test]
+    fn one_message_does_not_grow_a_name_per_reaction_forever() {
+        let mut message = make_message("3EB0AAA", 1000);
+        for reactor in 0..MAX_REACTORS_PER_MESSAGE + 200 {
+            message.add_reaction("👍".to_string(), format!("{reactor}@s.whatsapp.net"));
+        }
+        assert_eq!(message.reactors(), MAX_REACTORS_PER_MESSAGE);
+
+        // Somebody already counted is changing their mind, not adding to it.
+        message.add_reaction("🎉".to_string(), "0@s.whatsapp.net".to_string());
+        assert_eq!(message.reactors(), MAX_REACTORS_PER_MESSAGE);
+        assert_eq!(
+            message.reactions.get("🎉").map(Vec::len),
+            Some(1),
+            "and their new emoji is the one recorded"
+        );
     }
 
     #[test]

@@ -11,10 +11,6 @@
 //! in its own address space. Everything that differs there lives in
 //! `platform/`, so no component above it learns that browsers exist.
 
-// Allow dead code for WIP features (calls, media playback, etc.)
-#![allow(dead_code)]
-#![allow(clippy::too_many_arguments)]
-
 mod app;
 mod assets;
 mod components;

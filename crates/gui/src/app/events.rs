@@ -109,29 +109,7 @@ impl WhatsAppApp {
                     .filter(|message| message.is_read)
                     .map(|message| message.id.clone())
                     .collect();
-                // Sorted by the merge itself, on the same key.
-                self.merge_chats(chats);
-                // A selection that no longer names a chat is a selection of
-                // nothing: the conversation pane resolves it every frame and
-                // would draw the empty state with no way back on a phone.
-                self.forget_missing_selection();
-                // The merge above took the store's word for every row, and
-                // a merge assembled before a view was written does not carry
-                // it.
-                self.restore_watched_status(&agreed);
-                // Count-based cache guards can't see reordering/merges.
-                self.invalidate_chat_cache();
-                // Whatever arrived before its conversation did. A group
-                // change is announced to a window that has never seen the
-                // group, and this load is what makes it placeable.
-                self.flush_pending_notices(cx);
-                // A status update expires on the clock with nothing arriving
-                // to say so, and this is where the feed that holds one is
-                // installed. Without arming it here nothing ever did: the
-                // timer only re-armed itself, so the first one was never set
-                // and a lapsed update kept its row, its ring and its badge
-                // until some unrelated change happened to rebuild the list.
-                self.ensure_status_tick(cx);
+                self.install_chats(chats, &agreed, cx);
                 cx.notify();
             }
             UiEvent::QrCode { code, timeout_secs } => {
@@ -194,18 +172,12 @@ impl WhatsAppApp {
                 cx.notify();
             }
             UiEvent::Disconnected(reason) => {
-                self.leave_connected_view(cx);
-                self.app_state = AppState::Error(reason);
-                // The screen offers a retry; arming it is what makes the
-                // countdown on that button mean something.
-                self.schedule_retry(cx);
-                cx.notify();
+                // Nothing diagnosed it, so it is the outage the screen was
+                // written for.
+                self.connection_ended(oxidezap_core::Fault::unreachable(reason), cx);
             }
             UiEvent::Error(msg) => {
-                self.leave_connected_view(cx);
-                self.app_state = AppState::Error(msg);
-                self.schedule_retry(cx);
-                cx.notify();
+                self.connection_ended(oxidezap_core::Fault::unreachable(msg), cx);
             }
             UiEvent::MessageReceived {
                 chat_jid,
@@ -353,6 +325,10 @@ impl WhatsAppApp {
                     "Call {call_id} microphone is {}",
                     if muted { "muted" } else { "open" }
                 );
+                // The answer to what this window asked for, and the last word
+                // on it: what the state frames carried in the meantime was
+                // the mute the daemon still held.
+                self.settle_call_muted(&call_id, muted, cx);
             }
             // What the camera really is, once the daemon has opened or closed
             // it — and, unlike the mute correction, the *answer* to what this

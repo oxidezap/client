@@ -37,7 +37,19 @@ static LAUNCHED: Mutex<Option<Child>> = Mutex::new(None);
 /// watching summaries would otherwise stand in for a window that is not
 /// there — and the tray's Open would go back to doing nothing.
 pub fn show(hub: &StateHub) {
-    show_program(hub, &front_end_program());
+    let Some(program) = front_end_program() else {
+        // Said rather than guessed at: with nothing beside this binary there
+        // is no front end this daemon ships with, and the answer is to name
+        // one rather than to search the environment for something called
+        // `oxidezap`.
+        hub.signal(&DaemonMessage::ShowWindow);
+        log::warn!(
+            "no front end beside this binary; set {FRONT_END_ENV} to name one \
+             if there is no window to raise"
+        );
+        return;
+    };
+    show_program(hub, &program);
 }
 
 /// [`show`], with the program named. Split so a test can point it somewhere
@@ -88,23 +100,32 @@ const FRONT_END_ENV: &str = "OXIDEZAP_FRONT_END";
 /// Where to find the front end.
 ///
 /// [`FRONT_END_ENV`] first, then beside this binary: the two ship together
-/// and a release directory is not on anybody's `PATH`. A bare name otherwise,
-/// so a development build run from `cargo` finds the one on the path. The
-/// mirror of the front end's own `daemon_program`, down to the fallback.
-fn front_end_program() -> std::path::PathBuf {
+/// and a release directory is not on anybody's `PATH`. The mirror of the
+/// front end's own `daemon_program`.
+///
+/// `None` rather than the bare name, which is the whole of this function's
+/// history: a name with no directory in it is resolved through `PATH`, and
+/// the daemon inherits the environment of whoever started it — a tray icon
+/// launched from a session where `PATH` had been arranged runs whatever that
+/// arranged. Same user, so nothing is escalated; what it is is a silent
+/// execution path, and a release directory is not on anybody's `PATH`
+/// anyway. A `cargo`-run build finds its sibling in `target/debug` without
+/// any of this.
+fn front_end_program() -> Option<std::path::PathBuf> {
     const NAME: &str = if cfg!(windows) {
         "oxidezap.exe"
     } else {
         "oxidezap"
     };
     if let Some(named) = std::env::var_os(FRONT_END_ENV).filter(|value| !value.is_empty()) {
-        return std::path::PathBuf::from(named);
+        // The user's own variable naming their own program: theirs to
+        // resolve however they wrote it.
+        return Some(std::path::PathBuf::from(named));
     }
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
         .filter(|path| path.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from(NAME))
 }
 
 #[cfg(test)]
@@ -122,18 +143,10 @@ mod tests {
             return;
         }
 
-        let program = front_end_program();
-        let expected = if cfg!(windows) {
-            "oxidezap.exe"
-        } else {
-            "oxidezap"
-        };
-        assert_eq!(program.file_name().unwrap(), expected);
-
         // The test binary's directory holds no `oxidezap`, so this exercises
-        // the fallback: a bare name, for a `cargo`-run build to resolve on
-        // the path.
-        assert_eq!(program, std::path::PathBuf::from(expected));
+        // the answer for that: nothing. A bare name here would be resolved
+        // through the `PATH` this process inherited.
+        assert_eq!(front_end_program(), None);
     }
 
     /// A subscriber is not a window. Reading the signal channel is what every

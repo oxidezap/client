@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use super::{Wipe, is_staged_upload, is_staging_partial};
+use super::{IN_PROGRESS_PREFIX, Wipe, is_in_progress, is_staged_upload, is_staging_partial};
 
 /// How much media the cache may hold before the oldest is dropped.
 ///
@@ -111,13 +111,23 @@ pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
     // Through a temporary and a rename: a reader that opens the key must
     // never see half a file, and the reader is another process racing this
     // one by design.
+    // Under a name nothing else claims: a temporary called `<key>.partN`
+    // carried the key's own prefix, so a wipe and the budget sweep both read
+    // a download in flight as theirs to delete.
+    //
     // `create_new`, so nothing already at this name is opened: a plain
     // `write` follows a symlink to wherever it points and truncates whatever
     // is there. A leftover from a process that shared this pid and sequence
     // and died mid-write is the one honest way to meet one, so it is unlinked
     // once — the link and not its target — and the create tried again.
-    let temp = path.with_extension(format!("part{}", write_ticket()));
+    let temp = dir.join(format!("{IN_PROGRESS_PREFIX}{}", write_ticket()));
     write_new(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
+    // The rename happens under the wipe lock, which every entry point in
+    // `media` takes before calling here: the file is either wholly before a
+    // clear — and taken by it — or wholly after. What that cannot cover is
+    // the caller's answer, which is a round trip later; a clear landing
+    // there costs one refetch, since media the renderer does not have is
+    // drawn as an offer to download. See `claim`.
     if let Err(e) = std::fs::rename(&temp, &path) {
         // Windows will not rename onto an existing file, and two clients
         // asking for the same uncached media both miss the check above. The
@@ -223,11 +233,17 @@ fn prepare_dir(dir: &std::path::Path) -> Result<()> {
     // Once, here, because a daemon that is restarted is the case the
     // per-upload call cannot cover: the orphan was left by the run before
     // this one.
-    reclaim_stale_uploads(dir);
+    reclaim_abandoned_writes(dir);
     Ok(())
 }
 
-/// Delete staged uploads nobody came back for.
+/// Delete the writes nobody came back for.
+///
+/// Three kinds, and they are one rule: a staged upload, the partial of one,
+/// and a download this daemon was writing. Every one of them is spared the
+/// budget sweep — the bytes are the only copy, or are not all there yet — so
+/// every one of them needs an age rule somewhere, or being spared means never
+/// being taken at all.
 ///
 /// Split out of [`sweep`] because it has to be reachable without it. The
 /// sweep runs on a *cache-write* threshold, and a staged upload is written by
@@ -236,18 +252,24 @@ fn prepare_dir(dir: &std::path::Path) -> Result<()> {
 /// the allowance for ever with the rule that names it never running. Called
 /// where a staged payload is created, and once at startup, which between them
 /// cover both the long-running daemon and the one that was restarted.
-pub fn reclaim_stale_uploads(dir: &std::path::Path) {
+pub fn reclaim_abandoned_writes(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        // A partial is reclaimed on age like a finished upload, because it is
-        // spared the budget like one. Nothing else removes an upload whose
-        // connection died halfway.
-        if !is_staged_upload(&name) && !is_staging_partial(&name) {
+        // Two allowances rather than one, because the two say different
+        // things. A staged upload waits on a send somebody asked for and may
+        // sit through a reconnect; a `w-` file is a download this process was
+        // in the middle of, so one older than the grace is a write whose
+        // writer is gone — there is no second daemon to come back for it.
+        let allowance = if is_staged_upload(&name) || is_staging_partial(&name) {
+            STALE_UPLOAD
+        } else if is_in_progress(&name) {
+            super::IN_PROGRESS_GRACE
+        } else {
             continue;
-        }
+        };
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
             continue;
@@ -256,7 +278,7 @@ pub fn reclaim_stale_uploads(dir: &std::path::Path) {
             .modified()
             .ok()
             .and_then(|at| at.elapsed().ok())
-            .is_some_and(|age| age > STALE_UPLOAD)
+            .is_some_and(|age| age > allowance)
         {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -339,7 +361,7 @@ pub(super) fn delete(scope: Wipe) -> Result<()> {
 
 /// Delete oldest-first until the cache is under budget.
 fn sweep(dir: &std::path::Path) -> Result<()> {
-    reclaim_stale_uploads(dir);
+    reclaim_abandoned_writes(dir);
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     let mut total = 0u64;
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -357,14 +379,17 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         // waiting to have sent, and it never counted toward the budget it
         // would be dropped for: `put` is what feeds the sweep, and an upload
         // is written by the front end, not through it.
-        // Spared the budget, and reclaimed on age by `reclaim_stale_uploads`,
-        // which this calls first so a sweep also does the sweeping somebody
-        // reading only this function would expect it to. A partial is spared
-        // on the same terms and for a sharper reason: it is being written
-        // right now, so dropping it breaks the rename it is on its way to and
-        // fails a send because the cache happened to be full.
+        // Spared the budget, and reclaimed on age by
+        // `reclaim_abandoned_writes`, which this calls first so a sweep also
+        // does the sweeping somebody reading only this function would expect
+        // it to. A partial is spared on the same terms and for a sharper
+        // reason: it is being written right now, so dropping it breaks the
+        // rename it is on its way to and fails a send because the cache
+        // happened to be full. A download in progress is the third of the
+        // same kind — the bytes are not there yet and whoever asked for them
+        // is waiting — and the three differ only in who is writing.
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_staged_upload(&name) || is_staging_partial(&name) {
+        if is_staged_upload(&name) || is_staging_partial(&name) || is_in_progress(&name) {
             continue;
         }
         let age = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -387,9 +412,9 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use super::*;
 
     /// A staged payload is spared the budget, and not spared for ever.
     ///
@@ -480,7 +505,7 @@ mod tests {
             .set_modified(long_ago)
             .expect("an mtime");
 
-        super::reclaim_stale_uploads(&dir);
+        super::reclaim_abandoned_writes(&dir);
 
         assert!(
             writing.exists(),
@@ -491,65 +516,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The front end's own `stage` makes this directory with `create_dir_all`,
-    /// which is the umask's mode and not `0700`, so the daemon's first cache
-    /// write finds it open. Emptying it there deleted the staged payload of a
-    /// recording whose send had not run yet: the send then failed with the
-    /// only copy of the note gone.
+    /// A `w-` name is nobody's to reclaim while its writer is holding it, and
+    /// nobody's at all once that writer is gone: no wipe claims one and the
+    /// sweep skipped them outright, so a crash between the write and the
+    /// rename left a file that nothing on this machine would ever delete.
     #[test]
-    fn repairing_the_cache_keeps_a_recording_waiting_to_be_sent() {
-        let dir = std::env::temp_dir().join(format!(
-            "oxidezap-media-repair-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+    fn a_write_whose_process_is_gone_is_reclaimed() {
+        let dir = std::env::temp_dir().join(format!("oxidezap-orphan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let staged = dir.join("u-local_audio_1");
-        std::fs::write(&staged, b"a voice note").unwrap();
+        let orphan = dir.join(format!("{IN_PROGRESS_PREFIX}12345"));
+        std::fs::write(&orphan, b"half a photo").unwrap();
+        let long_ago = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(wacore::time::now_millis() as u64)
+            - super::super::IN_PROGRESS_GRACE * 2;
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(long_ago))
+            .unwrap();
 
-        super::prepare_dir(&dir).unwrap();
+        let live = dir.join(format!("{IN_PROGRESS_PREFIX}67890"));
+        std::fs::write(&live, b"a photo being written now").unwrap();
 
-        assert!(staged.exists(), "the only copy of the note is still there");
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700,
-            "and the directory was still tightened"
-        );
+        sweep(&dir).unwrap();
+
+        assert!(!orphan.exists(), "a write nobody is holding stays for ever");
+        assert!(live.exists(), "and one still being written is not taken");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A key here is derived from content the account has already published,
-    /// so it is predictable. A symlink of the right length planted under one
-    /// while the directory was open answered "already cached" before the
-    /// sweep that exists to remove it had run, and the daemon then served the
-    /// link's target as the account's own media.
-    #[test]
-    fn a_planted_link_is_not_a_cache_hit() {
-        let base = std::env::temp_dir().join(format!(
-            "oxidezap-media-plant-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        let dir = base.join("media");
-        std::fs::create_dir_all(&dir).unwrap();
+    /// The two below are unix only: what they set up and assert is a mode,
+    /// and Windows has none to read.
+    #[cfg(unix)]
+    mod modes {
+        use std::os::unix::fs::PermissionsExt as _;
 
-        let elsewhere = base.join("elsewhere");
-        std::fs::write(&elsewhere, b"not ours").unwrap();
-        let planted = dir.join("f-key");
-        std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        /// The front end's own `stage` makes this directory with `create_dir_all`,
+        /// which is the umask's mode and not `0700`, so the daemon's first cache
+        /// write finds it open. Emptying it there deleted the staged payload of a
+        /// recording whose send had not run yet: the send then failed with the
+        /// only copy of the note gone.
+        #[test]
+        fn repairing_the_cache_keeps_a_recording_waiting_to_be_sent() {
+            let dir = std::env::temp_dir().join(format!(
+                "oxidezap-media-repair-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        super::prepare_dir(&dir).unwrap();
+            let staged = dir.join("u-local_audio_1");
+            std::fs::write(&staged, b"a voice note").unwrap();
 
-        assert!(
-            std::fs::symlink_metadata(&planted).is_err(),
-            "the link is gone before anything asks whether it is a hit"
-        );
-        assert!(elsewhere.exists(), "and its target was never followed");
-        let _ = std::fs::remove_dir_all(&base);
+            crate::media::platform::prepare_dir(&dir).unwrap();
+
+            assert!(staged.exists(), "the only copy of the note is still there");
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "and the directory was still tightened"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A key here is derived from content the account has already published,
+        /// so it is predictable. A symlink of the right length planted under one
+        /// while the directory was open answered "already cached" before the
+        /// sweep that exists to remove it had run, and the daemon then served the
+        /// link's target as the account's own media.
+        #[test]
+        fn a_planted_link_is_not_a_cache_hit() {
+            let base = std::env::temp_dir().join(format!(
+                "oxidezap-media-plant-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            let dir = base.join("media");
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let elsewhere = base.join("elsewhere");
+            std::fs::write(&elsewhere, b"not ours").unwrap();
+            let planted = dir.join("f-key");
+            std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+            crate::media::platform::prepare_dir(&dir).unwrap();
+
+            assert!(
+                std::fs::symlink_metadata(&planted).is_err(),
+                "the link is gone before anything asks whether it is a hit"
+            );
+            assert!(elsewhere.exists(), "and its target was never followed");
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

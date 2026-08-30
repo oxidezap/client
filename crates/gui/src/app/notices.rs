@@ -49,7 +49,12 @@ const MAX_SHOWN: usize = 3;
 pub enum Tone {
     /// Something the person asked for did not happen.
     Problem,
-    /// Something happened that they did not ask about.
+    /// Something happened that they did not ask about. Nothing raises one
+    /// yet — `notice.rs` draws it, and the first caller takes this attribute
+    /// off. Named rather than left to a crate-wide `allow(dead_code)`, which
+    /// is what this crate stopped doing: one variant with a reason on it says
+    /// what a blanket attribute hides.
+    #[allow(dead_code)]
     Info,
 }
 
@@ -122,11 +127,6 @@ impl WhatsAppApp {
             }
             let _ = entity.update(cx, |app, _| app.notice_task = None);
         }));
-    }
-
-    /// What the root should draw this frame.
-    pub fn visible_notices(&self) -> &[Notice] {
-        &self.notices
     }
 }
 

@@ -83,6 +83,20 @@ diesel::table! {
     }
 }
 
+// Not ours: the device store owns this table, and this crate only reads it.
+// Declared rather than spelled as SQL text at every call, so a column renamed
+// under us is a compile error here and in `lid.rs` instead of a query that
+// parses fine and fails inside the writer loop, where a failed batch stops
+// history materializing with nothing on screen to say so.
+diesel::table! {
+    lid_pn_mapping (device_id, lid) {
+        device_id -> Integer,
+        lid -> Text,
+        phone_number -> Text,
+        updated_at -> BigInt,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     chats,
     messages,

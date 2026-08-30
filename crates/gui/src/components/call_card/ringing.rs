@@ -9,8 +9,8 @@
 
 use gpui::{App, Entity, IntoElement, ParentElement, Styled, div};
 use gpui_component::ActiveTheme as _;
+use gpui_component::Icon;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon};
 use oxidezap_core::{IncomingCall, OutgoingCall, OutgoingCallState};
 
 use crate::app::WhatsAppApp;
@@ -206,25 +206,4 @@ fn hint(text: &str, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
         .text_size(metrics.text_micro())
         .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
         .child(text.to_string())
-}
-
-/// The row of round controls an active call carries.
-///
-/// Shared with the video and group layouts so a control never moves or
-/// changes shape as the call's kind changes.
-pub fn control(
-    id: &'static str,
-    icon: impl Into<Icon>,
-    label: &'static str,
-    tooltip: &'static str,
-    enabled: bool,
-    metrics: Metrics,
-) -> Button {
-    Button::new(id)
-        .icon(icon.into())
-        .ghost()
-        .tooltip(tooltip)
-        .size(metrics.call_control())
-        .disabled(!enabled)
-        .label(label)
 }

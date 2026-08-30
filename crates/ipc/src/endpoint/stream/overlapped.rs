@@ -145,8 +145,12 @@ impl Overlapped {
     /// # Safety
     ///
     /// `start` must be a `ReadFile`/`WriteFile` over a buffer that stays valid
-    /// and untouched until this returns — which is the whole call, since it
-    /// waits.
+    /// and untouched until this returns.
+    ///
+    /// Which is the whole call, and the reason is the cancellation below
+    /// rather than the wait alone: a wait that *fails* has not ended the
+    /// operation, so every path out cancels and waits again before the frame
+    /// holding the `OVERLAPPED` — and the caller's buffer — goes away.
     unsafe fn perform(
         &mut self,
         start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> windows_sys::core::BOOL,
@@ -197,7 +201,21 @@ impl Overlapped {
         // cancelling rather than polling.
         let ok = unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 1) };
         if ok == 0 {
-            return Err(io::Error::last_os_error());
+            let failed = io::Error::last_os_error();
+            // The wait itself can fail — an abandoned event, a handle closed
+            // under us — and that says nothing about the operation, which is
+            // then still running against an `OVERLAPPED` and a buffer that
+            // both live on this frame. Returning there hands the kernel a
+            // place to write after the frame is gone.
+            //
+            // SAFETY: the handle and the `OVERLAPPED` the operation was
+            // started with. Cancelling returns at once, so the second wait is
+            // what makes it finished rather than merely asked for.
+            unsafe {
+                CancelIoEx(handle, &overlapped);
+                GetOverlappedResult(handle, &overlapped, &mut transferred, 1);
+            }
+            return Err(failed);
         }
         Ok(transferred as usize)
     }

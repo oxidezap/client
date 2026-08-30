@@ -7,6 +7,10 @@
 //! - Audio extraction from video files (for video audio track playback)
 //! - A live call's video, decoded per direction on threads of its own
 
+/// The audio track inside a video file, and the SPS below it: both are the
+/// decoder's, so on the web — where there is none — they compile and nothing
+/// reaches them.
+#[cfg_attr(target_family = "wasm", allow(dead_code, reason = "no decoder here"))]
 mod audio;
 /// A live call's two directions, decoded on threads of their own.
 #[cfg(not(target_family = "wasm"))]
@@ -20,6 +24,7 @@ mod demux;
 /// What every decoded picture obeys, whichever decoder produced it.
 mod geometry;
 mod player;
+#[cfg_attr(target_family = "wasm", allow(dead_code, reason = "no decoder here"))]
 mod sps;
 /// The browser's own H.264 decoder, standing in for openh264.
 #[cfg(target_family = "wasm")]

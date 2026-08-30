@@ -7116,6 +7116,267 @@ async fn a_view_never_regresses_a_row() {
     );
 }
 
+/// `Error` sits below `Pending` on WhatsApp's own scale, so folding a split
+/// by the raw number promoted a send that had failed for good back to
+/// "sending" — where nothing was ever going to move it again.
+#[tokio::test]
+async fn merging_a_split_does_not_put_a_failed_send_back_in_flight() {
+    let (store, chat_store) = test_store().await;
+
+    // The LID side first and older, so the merge keeps the PN side.
+    chat_store
+        .record_outgoing(
+            &jid(PEER_LID),
+            "OUT-SPLIT",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-SPLIT",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .mark_send_failed(&jid(PEER), "OUT-SPLIT")
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store.messages(&jid(PEER), None, 10).await.unwrap()[0].status,
+        MessageStatus::Error
+    );
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let merged = chat_store.messages(&jid(PEER), None, 10).await.unwrap();
+    let row = merged
+        .iter()
+        .find(|m| m.id == "OUT-SPLIT")
+        .expect("the send");
+    assert_eq!(
+        row.status,
+        MessageStatus::Error,
+        "a failure outranks a send still in flight"
+    );
+}
+
+/// A token the tokenizer throws away leaves a phrase with no terms in it.
+/// FTS5 answers that with a syntax error, which reached the caller as a
+/// storage failure rather than the invalid-query answer the API promises.
+#[cfg(feature = "search")]
+#[tokio::test]
+async fn a_query_of_punctuation_is_an_invalid_query_not_a_storage_error() {
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("reunião amanhã"),
+            incoming_info(PEER, PEER, "MSG-FTS-PUNCT", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    for query in ["-", "...", "- ;"] {
+        assert!(
+            matches!(
+                chat_store.search_messages(query, 10).await,
+                Err(oxidezap_chat_store::ChatStoreError::InvalidSearchQuery)
+            ),
+            "{query:?} names no term to search for"
+        );
+    }
+}
+
+/// A read covers both halves of a PN/LID pair, and the message key includes
+/// the chat: until a split is merged the same message exists under both. Drawn
+/// twice it fills two slots of the page's limit and moves the cursor past a
+/// row nobody was shown.
+#[tokio::test]
+async fn a_split_pair_does_not_hand_back_the_same_message_twice() {
+    let (store, chat_store) = test_store().await;
+    // No mapping yet, so the two identities form two threads.
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("via pn"),
+                incoming_info(PEER, PEER, "MSG-DUP-1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("via lid"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-DUP-1", 1_700_000_000),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(chat_store.chats(false, 10).await.unwrap().len(), 2);
+
+    add_lid_mapping(&store).await;
+    let messages = chat_store.messages(&jid(PEER), None, 10).await.unwrap();
+    assert_eq!(
+        messages.iter().filter(|m| m.id == "MSG-DUP-1").count(),
+        1,
+        "one message, whichever key it is filed under"
+    );
+}
+
+/// A page is `limit` messages, not `limit` rows. Collapsing a duplicate
+/// inside the page made it shorter than it asked for, and a page shorter than
+/// its limit is how the caller recognises the start of a conversation: the
+/// history ended at the split, with older messages unreachable.
+#[tokio::test]
+async fn a_collapsed_duplicate_does_not_shorten_the_page() {
+    let (store, chat_store) = test_store().await;
+    // No mapping yet, so the two identities file their own copy of the pair.
+    let mut events = Vec::new();
+    for (n, id) in ["DUP-A", "DUP-B"].iter().enumerate() {
+        let at = 1_700_000_000 + n as i64;
+        events.push(message_event(
+            wa::Message::text("under the number"),
+            incoming_info(PEER, PEER, id, at),
+        ));
+        events.push(message_event(
+            wa::Message::text("under the lid"),
+            incoming_info(PEER_LID, PEER_LID, id, at),
+        ));
+    }
+    events.push(message_event(
+        wa::Message::text("older, and only under the number"),
+        incoming_info(PEER, PEER, "OLDER", 1_699_999_000),
+    ));
+    feed(&chat_store, events).await;
+
+    add_lid_mapping(&store).await;
+    let page = chat_store.messages(&jid(PEER), None, 3).await.unwrap();
+    assert_eq!(
+        page.len(),
+        3,
+        "a duplicate collapsed inside the page is topped up from behind it"
+    );
+    assert!(
+        page.iter().any(|m| m.id == "OLDER"),
+        "and the row behind the duplicates is what fills the slot"
+    );
+}
+
+/// The same rule for the batch an attach load asks for. This one is worse
+/// than a short page: the attach limit is sized to cover the unread tail, so
+/// a message dropped out of it never reaches `ReadTracker` and its receipt is
+/// never sent — the badge comes back on the next hydration, for a message the
+/// person has read.
+#[tokio::test]
+async fn a_collapsed_duplicate_does_not_shorten_a_batched_page() {
+    let (store, chat_store) = test_store().await;
+    let mut events = Vec::new();
+    for (n, id) in ["BATCH-A", "BATCH-B"].iter().enumerate() {
+        let at = 1_700_000_000 + n as i64;
+        events.push(message_event(
+            wa::Message::text("under the number"),
+            incoming_info(PEER, PEER, id, at),
+        ));
+        events.push(message_event(
+            wa::Message::text("under the lid"),
+            incoming_info(PEER_LID, PEER_LID, id, at),
+        ));
+    }
+    events.push(message_event(
+        wa::Message::text("older, and only under the number"),
+        incoming_info(PEER, PEER, "BATCH-OLDER", 1_699_999_000),
+    ));
+    feed(&chat_store, events).await;
+
+    add_lid_mapping(&store).await;
+    let pages = chat_store.pages(vec![(jid(PEER), 3)]).await.unwrap();
+    let page = pages
+        .values()
+        .next()
+        .expect("the chat has rows under one of its two keys");
+    assert_eq!(
+        page.len(),
+        3,
+        "the batch fills to its limit in unique messages, as one chat's page does"
+    );
+    assert!(
+        page.iter().any(|m| m.id == "BATCH-OLDER"),
+        "and it is the row behind the duplicates that fills the slot"
+    );
+}
+
+/// The write has to look where the reads do. A thread living under the LID
+/// key, named here by the phone number, used to be updated under a key it has
+/// no rows beneath: the view was recorded nowhere and the ring stayed up.
+#[tokio::test]
+async fn a_watch_named_by_the_other_identity_still_moves_the_row() {
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("an update"),
+            incoming_info(PEER_LID, PEER_LID, "WATCH-LID-1", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    chat_store
+        .mark_status_watched(&jid(PEER), vec!["WATCH-LID-1".to_string()])
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let messages = chat_store.messages(&jid(PEER_LID), None, 10).await.unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .find(|m| m.id == "WATCH-LID-1")
+            .expect("the update")
+            .status,
+        MessageStatus::Read
+    );
+}
+
+/// The server redistributes app-state mutations on every resync. A pin the
+/// row already carries changes nothing, and the reload it used to buy is the
+/// only load allowed to prune the chat list.
+#[tokio::test]
+async fn a_redelivered_pin_buys_no_reload() {
+    let (_store, chat_store) = test_store().await;
+    let pin = |ts: i64| {
+        Event::PinUpdate(
+            wacore::types::events::PinUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(Utc.timestamp_opt(ts, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::PinAction {
+                    pinned: Some(true),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )
+    };
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("hello"),
+            incoming_info(PEER, PEER, "MSG-PIN-1", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    feed(&chat_store, [pin(1_700_000_050)]).await;
+    let mut changes = chat_store.subscribe();
+    // The same pin again, as a resync redelivers it.
+    feed(&chat_store, [pin(1_700_000_050)]).await;
+    assert!(
+        changes.try_recv().is_err(),
+        "a pin the row already holds moved nothing and must buy no reload"
+    );
+}
+
 /// An invalidation is a claim that something changed. Re-watching an update
 /// changes nothing, and a reload bought for nothing is what the rule exists
 /// to prevent.

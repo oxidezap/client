@@ -22,7 +22,7 @@ use oxidezap_ipc::{
 
 use super::media::MediaCache;
 use super::sink::EventSink;
-use super::{Awaiting, FromDaemon, Pending, StorageUsage};
+use super::{Awaiting, Fault, FromDaemon, Pending, StorageUsage};
 
 /// The reader's state, between frames.
 pub(super) struct Frames<'a> {
@@ -42,7 +42,7 @@ pub(super) struct Frames<'a> {
     /// What to tell the user when this ends. The generic message is right for
     /// a daemon that simply went away, and wrong for every case this side
     /// actually diagnosed.
-    reason: Option<String>,
+    reason: Option<Fault>,
     /// The decoders for whatever call is up, made when its first frame
     /// arrives and dropped when the call state says there is no call: a
     /// decoder held past its call keeps its reference frames for a picture
@@ -88,9 +88,24 @@ impl<'a> Frames<'a> {
     /// End this connection with a reason of the transport's own.
     ///
     /// A socket that simply closed has nothing to say; one the browser closed
-    /// with a code does.
+    /// with a code does, and so does a frame too large to read.
+    #[cfg_attr(
+        not(target_family = "wasm"),
+        expect(
+            dead_code,
+            reason = "the page's transports blame; a socket names its ending"
+        )
+    )]
     pub(super) fn blame(&mut self, reason: String) {
-        self.reason.get_or_insert(reason);
+        self.fault(Fault::unreachable(reason));
+    }
+
+    /// The same, where the caller knows which ending this is.
+    ///
+    /// First one wins, like `blame`: what ended the connection is what the
+    /// screen should say, not whatever the teardown noticed afterwards.
+    pub(super) fn fault(&mut self, fault: Fault) {
+        self.reason.get_or_insert(fault);
     }
 
     /// One frame, applied.
@@ -125,12 +140,10 @@ impl<'a> Frames<'a> {
                 error!(
                     "the daemon speaks protocol {protocol}, this build speaks {PROTOCOL_VERSION}"
                 );
-                self.reason = Some(format!(
-                    "This window and the background service are different \
-                     versions (protocol {protocol} against \
-                     {PROTOCOL_VERSION}). Quit oxidezap completely and start \
-                     it again."
-                ));
+                self.reason = Some(Fault::mismatched(format!(
+                    "the daemon speaks protocol {protocol}, this build speaks \
+                     {PROTOCOL_VERSION}"
+                )));
                 return ControlFlow::Break(());
             }
             DaemonMessage::Session { event } => {
@@ -229,11 +242,9 @@ impl<'a> Frames<'a> {
             // this connection ends.
             DaemonMessage::Resync => {
                 warn!("fell behind the daemon; reattaching from scratch");
-                self.reason = Some(
-                    "Fell behind the daemon and lost part of the stream. \
-                     Reconnect to start over."
-                        .to_string(),
-                );
+                self.reason = Some(Fault::fell_behind(
+                    "fell behind the daemon's stream and lost part of it",
+                ));
                 return ControlFlow::Break(());
             }
             DaemonMessage::ShowWindow => self.publish(FromDaemon::ShowWindow)?,
@@ -369,10 +380,9 @@ impl<'a> Frames<'a> {
         }
         let _ = self
             .events
-            .send(FromDaemon::Session(Box::new(UiEvent::Error(
-                self.reason
-                    .unwrap_or_else(|| "Lost the connection to the daemon".to_string()),
-            ))));
+            .send(FromDaemon::Ended(self.reason.unwrap_or_else(|| {
+                Fault::unreachable("lost the connection to the daemon")
+            })));
     }
 }
 
@@ -688,6 +698,35 @@ mod tests {
     use super::*;
     use oxidezap_core::CallState;
     use oxidezap_ipc::StateVersion;
+
+    /// Three endings reached one screen: "Can't reach WhatsApp… We'll keep
+    /// trying to reconnect", with the real reason folded away. Two of them
+    /// are diagnosed, and for one of those the retry the screen promises will
+    /// fail identically forever.
+    #[test]
+    fn a_diagnosed_ending_is_not_drawn_as_an_outage() {
+        let outage = Fault::unreachable("the socket went");
+        assert_eq!(outage.recovery, oxidezap_core::Recovery::AfterAWait);
+
+        let behind = Fault::fell_behind("lost part of the stream");
+        assert_eq!(
+            behind.recovery,
+            oxidezap_core::Recovery::Now,
+            "the body says it is attaching again, so it has to be"
+        );
+        assert_ne!(behind.headline, outage.headline);
+
+        let mismatch = Fault::mismatched("protocol 3 against 4");
+        assert_eq!(
+            mismatch.recovery,
+            oxidezap_core::Recovery::Nothing,
+            "reconnecting fails the same way forever, so nothing may promise it"
+        );
+        assert!(
+            mismatch.body.contains("Quit oxidezap"),
+            "and the thing that helps is on the screen rather than behind the fold"
+        );
+    }
 
     fn snapshot_of(chats: Vec<ChatSummary>) -> StateSnapshot {
         StateSnapshot {

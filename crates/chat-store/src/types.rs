@@ -136,15 +136,70 @@ pub enum MessageStatus {
 }
 
 impl MessageStatus {
+    /// Where a status stands when two copies of one message disagree.
+    ///
+    /// Not the stored order, and that is the whole point: the numbers are
+    /// WhatsApp's, and on that scale `Error` sits *below* `Pending`, so a
+    /// plain `<` promotes a send that failed for good back to "sending" and
+    /// leaves it there. What outranks what is: a failure outranks a send in
+    /// flight, and any real answer from the server outranks both.
+    pub fn precedence(self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Error => 1,
+            Self::ServerAck => 2,
+            Self::Delivered => 3,
+            Self::Read => 4,
+            Self::Played => 5,
+        }
+    }
+
+    /// Whether `self` is the answer to keep when both describe one message.
+    pub fn wins_over(self, held: Self) -> bool {
+        self.precedence() > held.precedence()
+    }
+
+    /// The projection of the stored number.
+    ///
+    /// Anything past the scale this build knows is a state WhatsApp added
+    /// beyond `Played`, so it reads as the furthest state there is rather
+    /// than collapsing into the middle of the order: a message delivered and
+    /// read used to render with the "sending" clock, and nothing corrected
+    /// it, because the number in the row was right all along and only the
+    /// projection lied.
     pub fn from_raw(raw: i32) -> Self {
         match raw {
             0 => Self::Error,
+            1 => Self::Pending,
             2 => Self::ServerAck,
             3 => Self::Delivered,
             4 => Self::Read,
-            5 => Self::Played,
+            raw if raw >= 5 => Self::Played,
+            // Below the scale entirely: nothing to read it as, and a send is
+            // at least under way.
             _ => Self::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::MessageStatus;
+
+    #[test]
+    fn a_status_past_the_scale_does_not_read_as_sending() {
+        assert_eq!(MessageStatus::from_raw(5), MessageStatus::Played);
+        assert_eq!(MessageStatus::from_raw(6), MessageStatus::Played);
+        assert_eq!(MessageStatus::from_raw(99), MessageStatus::Played);
+        assert_eq!(MessageStatus::from_raw(1), MessageStatus::Pending);
+        assert_eq!(MessageStatus::from_raw(0), MessageStatus::Error);
+    }
+
+    #[test]
+    fn a_failure_outranks_a_send_in_flight() {
+        assert!(MessageStatus::Error.wins_over(MessageStatus::Pending));
+        assert!(!MessageStatus::Pending.wins_over(MessageStatus::Error));
+        assert!(MessageStatus::ServerAck.wins_over(MessageStatus::Error));
     }
 }
 

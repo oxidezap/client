@@ -140,6 +140,12 @@ struct Inner {
     /// Chats keyed by JID. A map, not a Vec: every update is a lookup by JID,
     /// and a Vec would make a rename or a receipt O(n) over every chat.
     chats: std::collections::HashMap<String, ChatEntry>,
+    /// Which account this is, counted up every time one leaves.
+    ///
+    /// Here rather than beside the lock, so a task that asks and then applies
+    /// can have both answered without the account leaving in between: see
+    /// [`StateHub::apply_for`].
+    account_generation: usize,
 }
 
 pub struct StateHub {
@@ -218,6 +224,7 @@ impl StateHub {
                 account: None,
                 plugins: Vec::new(),
                 chats: std::collections::HashMap::new(),
+                account_generation: 0,
             }),
             updates,
             signals,
@@ -348,6 +355,31 @@ impl StateHub {
             return;
         }
         self.apply(Change::live(DaemonEvent::AccountChanged(account)));
+    }
+
+    /// Everything this account had, gone with it.
+    ///
+    /// An account reset is a departure, and the hub only ever learned by
+    /// event: nothing cleared the chats, the identity or the calls, so a
+    /// front end attaching after the next pairing was handed the previous
+    /// account's list and identity in its first snapshot. Cleared under one
+    /// lock and with one version bump, rather than a removal per chat: the
+    /// frame that follows says the account is gone, and a client that had
+    /// fallen far enough behind to need the rest recovers by snapshot
+    /// anyway. Plugins stay: they are the daemon's, not the account's.
+    pub fn forget_account(&self) {
+        let mut inner = self.lock();
+        inner.chats.clear();
+        inner.account = None;
+        inner.calls = oxidezap_core::CallState::new();
+        inner.version = inner.version.next();
+        inner.account_generation += 1;
+    }
+
+    /// Which account the hub is holding, for a task that has to outlive its
+    /// own answer. See [`Self::forget_account`].
+    pub fn account_generation(&self) -> usize {
+        self.lock().account_generation
     }
 
     /// Record what the plugins are now, and tell everyone.
@@ -518,6 +550,22 @@ impl StateHub {
     /// version bump together, so no two events can share a version and no
     /// observer can read a state whose version has not caught up.
     pub fn apply(&self, change: Change) -> StateVersion {
+        self.apply_unless_stale(change, None)
+            .expect("an unconditional apply always applies")
+    }
+
+    /// The same, for a change belonging to a particular account.
+    ///
+    /// Answers whether it applied. A store read is served from a task of its
+    /// own, so a page of the old account's chats can still be in flight when
+    /// the account goes; asked separately, the question and the write are two
+    /// steps a logout can land between, which is why the comparison happens
+    /// under the lock that does the writing.
+    pub fn apply_for(&self, generation: usize, change: Change) -> bool {
+        self.apply_unless_stale(change, Some(generation)).is_some()
+    }
+
+    fn apply_unless_stale(&self, change: Change, only_for: Option<usize>) -> Option<StateVersion> {
         let Change { event, from_store } = change;
         // Taken before the state lock is released and held across the send, so
         // frames leave in the order their versions were assigned. There is
@@ -532,6 +580,9 @@ impl StateHub {
         // the state free.
         let (version, tray, order) = {
             let mut inner = self.lock();
+            if only_for.is_some_and(|asked| asked != inner.account_generation) {
+                return None;
+            }
             inner.version = inner.version.next();
 
             match &event {
@@ -589,7 +640,7 @@ impl StateHub {
             }
         });
 
-        version
+        Some(version)
     }
 
     /// Put one versioned event on the update channel.
@@ -616,9 +667,14 @@ impl StateHub {
         }
     }
 
-    /// A poisoned lock means a previous holder panicked mid-mutation. The
-    /// state may be torn, so continuing would publish garbage; taking the
-    /// inner value and letting the panic propagate is the honest outcome.
+    /// A poisoned lock means a previous holder panicked mid-mutation.
+    ///
+    /// Panicked on rather than recovered, which is the rule in AGENTS.md
+    /// applied to what this lock covers: `Inner` holds the version, the
+    /// connection, the calls and the chats together, and a holder that died
+    /// between two of those left a state no frame should describe. The
+    /// ordering lock beside it is recovered for the same reason read the
+    /// other way round — it protects nothing but the order of two sends.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner
             .lock()
@@ -703,6 +759,33 @@ mod tests {
                 group_jid: None,
             })
             .build()
+    }
+
+    /// A store read is answered from a task of its own, so a page of the old
+    /// account's chats can be in flight when the account goes. Asked and
+    /// written under one lock; asked separately, the question and the write
+    /// are two steps a logout can land between, and the summaries then reach
+    /// a hub that has just been emptied, where the next pairing's first
+    /// snapshot hands them to a window.
+    #[test]
+    fn a_page_from_the_account_that_left_is_not_applied() {
+        let hub = StateHub::new();
+        let asked_as = hub.account_generation();
+        let page = |jid: &str| Change::from_store(DaemonEvent::ChatUpdated(chat(jid, 0, 10)));
+
+        assert!(
+            hub.apply_for(asked_as, page("1@s.whatsapp.net")),
+            "the account that asked is the account that is here"
+        );
+        assert_eq!(hub.snapshot().chats.len(), 1);
+
+        hub.forget_account();
+
+        assert!(
+            !hub.apply_for(asked_as, page("2@s.whatsapp.net")),
+            "and a page it asked for lands nowhere once it has gone"
+        );
+        assert!(hub.snapshot().chats.is_empty());
     }
 
     /// A window can attach before there is an account to name: during

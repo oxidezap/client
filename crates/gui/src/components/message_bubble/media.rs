@@ -224,9 +224,11 @@ pub(super) fn render_media_content(
             media_content,
             message_id,
             entity,
-            video_player_state,
-            video_frame,
-            decoded_image,
+            VideoProps {
+                state: video_player_state,
+                frame: video_frame,
+                poster: decoded_image,
+            },
             max_media_size,
             cx,
         )),
@@ -334,12 +336,17 @@ fn render_download_placeholder(
                 )
             }
         })
-        .on_click(move |_, _window, cx| {
-            let msg_id = message_id.clone();
-            let dl = dl.clone();
-            entity.update(cx, |app, cx| {
-                app.download_image(msg_id, dl, cx);
-            });
+        // Only while there is something to ask for. The cursor was already
+        // conditional and the handler was not, so tapping a box that says
+        // "Downloading…" asked for the same download again.
+        .when(!is_downloading, |el| {
+            el.on_click(move |_, _window, cx| {
+                let msg_id = message_id.clone();
+                let dl = dl.clone();
+                entity.update(cx, |app, cx| {
+                    app.download_image(msg_id, dl, cx);
+                });
+            })
         })
 }
 
@@ -575,17 +582,31 @@ fn format_bytes(bytes: u64) -> Option<String> {
     })
 }
 
+/// What a video row draws besides the media itself.
+///
+/// Together because they are one answer: which of the three is drawn depends
+/// on the other two, and a fourth loose argument beside them is how this grew
+/// past what anyone reads at a call site.
+struct VideoProps {
+    state: Option<VideoPlayerState>,
+    frame: Option<Arc<RenderImage>>,
+    /// Decoded once by the app. See `MediaProps`.
+    poster: Option<Arc<Image>>,
+}
+
 fn render_video_player(
     media_content: oxidezap_core::MediaContent,
     message_id: String,
     entity: Entity<WhatsAppApp>,
-    video_player_state: Option<VideoPlayerState>,
-    video_frame: Option<Arc<RenderImage>>,
-    // The poster, decoded once by the app. See `MediaProps`.
-    poster: Option<Arc<Image>>,
+    video: VideoProps,
     max_media_size: f32,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    let VideoProps {
+        state: video_player_state,
+        frame: video_frame,
+        poster,
+    } = video;
     let (display_w, display_h) = scale_media_dimensions(
         media_content.width.unwrap_or(300),
         media_content.height.unwrap_or(200),
@@ -602,6 +623,7 @@ fn render_video_player(
     let is_error = state.is_error();
     let scrim = cx.product().hsla(cx.product().palette.scrim);
     let on_scrim = cx.product().hsla(cx.product().palette.on_scrim);
+    let metrics = cx.product().metrics;
 
     div()
         .relative()
@@ -683,8 +705,7 @@ fn render_video_player(
                 .when(is_playing, |el| el.bg(scrim.opacity(0.)))
                 .child(if is_loading {
                     div()
-                        .w(px(48.))
-                        .h(px(48.))
+                        .size(metrics.media_control())
                         .rounded_full()
                         .bg(scrim.opacity(0.55))
                         .flex()
@@ -701,25 +722,39 @@ fn render_video_player(
                 } else if is_error {
                     // toggle_video's Error arm restarts the download; without
                     // a handler a transient failure left the video stuck.
+                    //
+                    // A `Button`, like the play and pause it stands in for:
+                    // this is a command rather than a surface, and drawn as a
+                    // `div` there was no way to reach a failed video from the
+                    // keyboard at all.
                     div()
-                        .id(button_id)
-                        .w(px(48.))
-                        .h(px(48.))
+                        .size(metrics.media_control())
                         .rounded_full()
                         .bg(cx.theme().danger.opacity(0.65))
                         .flex()
                         .justify_center()
                         .items_center()
-                        .child(Icon::new(IconName::Redo).text_color(on_scrim).size(px(20.)))
-                        .when_some(downloadable.clone(), |el, dl| {
-                            el.cursor_pointer().on_click(move |_, _window, cx| {
-                                let msg_id = message_id.clone();
-                                let dl = dl.clone();
-                                entity.update(cx, |app, cx| {
-                                    app.toggle_video(msg_id, dl, cx);
-                                });
-                            })
-                        })
+                        .child(
+                            Button::new(button_id)
+                                .icon(
+                                    Icon::new(IconName::Redo)
+                                        .text_color(on_scrim)
+                                        .size(metrics.icon_media()),
+                                )
+                                .ghost()
+                                .disabled(downloadable.is_none())
+                                .on_click({
+                                    let downloadable = downloadable.clone();
+                                    move |_, _window, cx| {
+                                        if let Some(dl) = downloadable.clone() {
+                                            let msg_id = message_id.clone();
+                                            entity.update(cx, |app, cx| {
+                                                app.toggle_video(msg_id, dl, cx);
+                                            });
+                                        }
+                                    }
+                                }),
+                        )
                         .into_any_element()
                 } else if !is_playing {
                     Button::new(button_id)
@@ -727,7 +762,7 @@ fn render_video_player(
                             Icon::default()
                                 .path("icons/play.svg")
                                 .text_color(on_scrim)
-                                .size(px(32.)),
+                                .size(metrics.icon_media_large()),
                         )
                         .ghost()
                         .disabled(!can_download)
@@ -754,7 +789,7 @@ fn render_video_player(
                                 // fixed white is a guess about someone else's
                                 // video.
                                 .text_color(on_scrim.opacity(0.6))
-                                .size(px(24.)),
+                                .size(metrics.icon_media_playing()),
                         )
                         .ghost()
                         .on_click({

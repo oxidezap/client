@@ -112,13 +112,20 @@ fn handle_message(m: Message<'_>) {
     let Some(chat) = chat.whole() else {
         return;
     };
+    // `whole` for the same reason as the JID above: an id is compared, never
+    // read, so one that did not fit is not a shorter id — it is a message
+    // that does not exist, and the peer would see the answer quoting
+    // nothing.
     let message_id = m.id();
+    let Some(message_id) = message_id.whole() else {
+        return;
+    };
     let reply = kv::text::<SETTING>(REPLY, DEFAULT_REPLY);
 
     // As a reply rather than a fresh message: an automatic answer that does
     // not say what it is answering is indistinguishable from a person
     // suddenly speaking.
-    send_reply(chat, reply.as_str(), message_id.as_str());
+    send_reply(chat, reply.as_str(), message_id);
 }
 
 fn handle_action(a: Action<'_>) {

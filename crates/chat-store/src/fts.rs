@@ -6,7 +6,10 @@
 //! feature leave no FTS objects behind.
 //!
 //! Caveat: the index maps by implicit rowid; after a manual `VACUUM`, run
-//! `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`.
+//! `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`. The same goes
+//! for any migration that rewrites `messages` rather than altering it: a
+//! `DROP TABLE` fires no trigger and renumbers rowids, so the index is left
+//! describing rows that no longer exist under those numbers.
 
 use diesel::prelude::*;
 use wacore_binary::Jid;
@@ -30,11 +33,22 @@ fn ensure_fts_inner(conn: &mut SqliteConnection) -> QueryResult<()> {
         #[diesel(sql_type = diesel::sql_types::Integer)]
         n: i32,
     }
-    let already_exists: bool = diesel::sql_query(
-        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+    // Both halves, because either can be missing on its own. A migration that
+    // rewrites `messages` the way this crate's own migrations do — `_new`,
+    // `INSERT SELECT`, `DROP`, `RENAME` — takes the triggers with it (a
+    // `DROP TABLE` fires none of them) and renumbers rowids, so the table
+    // surviving is no evidence the index still describes it. Whoever writes
+    // such a migration owes the index a rebuild; this is what notices when
+    // they did not.
+    let indexed: i32 = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM sqlite_master \
+         WHERE (type = 'table' AND name = 'messages_fts') \
+            OR (type = 'trigger' AND name IN \
+                ('messages_fts_ai', 'messages_fts_ad', 'messages_fts_au'))",
     )
     .get_result::<CountRow>(conn)?
-    .n > 0;
+    .n;
+    let already_exists = indexed == 4;
 
     // Canonical FTS5 external-content recipe: EVERY content row gets exactly
     // one index entry (NULL indexes as empty), and the update trigger pairs
@@ -59,8 +73,9 @@ fn ensure_fts_inner(conn: &mut SqliteConnection) -> QueryResult<()> {
     ] {
         diesel::sql_query(statement).execute(conn)?;
     }
-    // First enablement on a database that already has messages: the triggers
-    // only cover future writes, so index the existing rows once.
+    // First enablement on a database that already has messages, or an index
+    // whose triggers went out from under it: either way the rows on disk are
+    // not the rows the index describes, and only a rebuild says so.
     if !already_exists {
         diesel::sql_query("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
             .execute(conn)?;
@@ -68,12 +83,20 @@ fn ensure_fts_inner(conn: &mut SqliteConnection) -> QueryResult<()> {
     Ok(())
 }
 
-/// Turn free text into an FTS5 query: each whitespace token becomes a quoted
-/// prefix term (`"tok"*`), AND-combined. Sidesteps FTS5 operator syntax so
-/// user input can't produce a syntax error.
+/// Turn free text into an FTS5 query: each whitespace token that carries a
+/// term becomes a quoted prefix term (`"tok"*`), AND-combined. Sidesteps FTS5
+/// operator syntax so user input can't produce a syntax error, and answers
+/// `None` when nothing in the input is a term at all.
 fn build_match_query(input: &str) -> Option<String> {
     let mut query = String::with_capacity(input.len() + 8);
     for token in input.split_whitespace() {
+        // A token the tokenizer throws away leaves a phrase with no terms in
+        // it, which FTS5 answers with a syntax error: the caller then sees a
+        // storage failure where the API promises an invalid query, and the
+        // search box reports a database problem on every such keystroke.
+        if !token.chars().any(char::is_alphanumeric) {
+            continue;
+        }
         if !query.is_empty() {
             query.push(' ');
         }
@@ -248,7 +271,8 @@ fn fts_hits(
 
 #[cfg(test)]
 mod tests {
-    use super::build_match_query;
+    use super::*;
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
     #[test]
     fn match_query_neutralizes_operators_and_quotes() {
@@ -263,5 +287,62 @@ mod tests {
             Some("\"NOT\"* \"OR\"* \"AND\"*".into())
         );
         assert_eq!(build_match_query("   "), None);
+        // Nothing the tokenizer keeps: a phrase with no terms in it is a
+        // syntax error rather than a search.
+        assert_eq!(build_match_query("-"), None);
+        assert_eq!(build_match_query("... ;"), None);
+        assert_eq!(build_match_query("- ok"), Some("\"ok\"*".into()));
+    }
+
+    const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+    #[derive(QueryableByName)]
+    struct Hits {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        n: i32,
+    }
+
+    fn hits(conn: &mut SqliteConnection, term: &str) -> i32 {
+        diesel::sql_query(format!(
+            "SELECT COUNT(*) AS n FROM messages_fts WHERE messages_fts MATCH '{term}'"
+        ))
+        .get_result::<Hits>(conn)
+        .expect("match")
+        .n
+    }
+
+    /// A migration that rewrites `messages` — the `_new`/`INSERT SELECT`/
+    /// `DROP`/`RENAME` shape this crate's own migrations use — takes the
+    /// triggers with it and renumbers rowids. The table surviving used to be
+    /// the whole test, so the next open skipped the rebuild and the index
+    /// went on describing rows that were no longer there.
+    #[test]
+    fn an_index_whose_triggers_went_out_from_under_it_is_rebuilt() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        conn.run_pending_migrations(MIGRATIONS).expect("migrate");
+        ensure_fts(&mut conn).expect("create the index");
+
+        for statement in [
+            "INSERT INTO messages (device_id, chat_jid, msg_id, sender_jid, from_me, \
+             timestamp_ms, kind, text_content, status, starred, revoked) \
+             VALUES (1, 'c', 'm1', 's', 0, 1, 'text', 'reunião', 0, 0, 0)",
+            // What such a migration leaves behind.
+            "DROP TRIGGER messages_fts_ai",
+            "DROP TRIGGER messages_fts_ad",
+            "DROP TRIGGER messages_fts_au",
+            "INSERT INTO messages_fts(messages_fts) VALUES('delete-all')",
+        ] {
+            diesel::sql_query(statement)
+                .execute(&mut conn)
+                .expect("statement");
+        }
+        assert_eq!(hits(&mut conn, "reunião"), 0, "the index is empty now");
+
+        ensure_fts(&mut conn).expect("reopen");
+        assert_eq!(
+            hits(&mut conn, "reunião"),
+            1,
+            "the rows on disk are what the index has to describe"
+        );
     }
 }

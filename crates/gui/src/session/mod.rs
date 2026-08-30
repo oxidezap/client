@@ -60,6 +60,8 @@ pub struct StorageUsage {
 /// client attached to are things the *daemon* says to a front end. Keeping
 /// them apart is what stops the session's vocabulary from growing terms only
 /// one transport uses.
+pub use oxidezap_core::Fault;
+
 pub enum FromDaemon {
     /// Something the session said.
     Session(Box<UiEvent>),
@@ -80,6 +82,9 @@ pub enum FromDaemon {
     Plugins(Vec<oxidezap_core::PluginSurface>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
+    /// This connection is over, and why — in terms the screen can draw
+    /// rather than one line of prose for three different endings.
+    Ended(Fault),
     /// One page of a conversation, for the timeline that asked for it.
     ///
     /// Older rows than the window holds, or the first ones it has: which of
@@ -407,6 +412,13 @@ pub struct Session {
     /// declaration order, so the write half is released with `link` before
     /// the hangup runs. Cancelling a pipe read disconnects nothing — the
     /// pipe breaks when the last handle to it closes.
+    ///
+    /// Held for its `Drop` and read by nobody, which on a page is the whole
+    /// of it: there is no reader thread to end.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "a page's socket goes with the page")
+    )]
     teardown: Teardown,
 }
 
@@ -552,11 +564,13 @@ impl Session {
     fn ask(&self, request: ClientRequest, waiting: Awaiting) -> RequestId {
         let id = self.reserve(waiting);
         deliver(
-            &self.link,
-            &self.outbox,
-            &self.pending,
-            &self.events,
-            &self.media,
+            Wires {
+                link: &self.link,
+                outbox: &self.outbox,
+                pending: &self.pending,
+                events: &self.events,
+                media: &self.media,
+            },
             id,
             request,
             Delivery::Ordinary,
@@ -655,11 +669,13 @@ impl Session {
             audio,
             Box::new(move |staged| match staged {
                 Ok(()) => deliver(
-                    &link,
-                    &outbox,
-                    &pending,
-                    &events,
-                    &media,
+                    Wires {
+                        link: &link,
+                        outbox: &outbox,
+                        pending: &pending,
+                        events: &events,
+                        media: &media,
+                    },
                     id,
                     request,
                     Delivery::Staged(ticket),
@@ -1057,22 +1073,33 @@ enum Delivery {
     Staged(u64),
 }
 
+/// The connection's own handles, borrowed together.
+///
+/// One argument rather than five, because they always travel as a set: the
+/// staged path clones every one of them into a callback, and a free function
+/// taking them apart is how this reached eight parameters.
+struct Wires<'a> {
+    link: &'a Link,
+    outbox: &'a Sending,
+    pending: &'a Pending,
+    events: &'a EventSink,
+    media: &'a Arc<dyn MediaCache>,
+}
+
 /// Write a reserved request's frame, and answer for it if it will not go.
 ///
 /// A free function rather than a method because the staged path sends from a
 /// callback that outlives the borrow: everything it needs is cloneable, and
 /// the alternative was a second copy of the failure handling below, which is
 /// the part that must not drift.
-fn deliver(
-    link: &Link,
-    outbox: &Sending,
-    pending: &Pending,
-    events: &EventSink,
-    media: &Arc<dyn MediaCache>,
-    id: RequestId,
-    request: ClientRequest,
-    how: Delivery,
-) {
+fn deliver(conn: Wires<'_>, id: RequestId, request: ClientRequest, how: Delivery) {
+    let Wires {
+        link,
+        outbox,
+        pending,
+        events,
+        media,
+    } = conn;
     // Still ours to send. A staged request is delivered from the upload's
     // completion, and the connection can end in between — `Frames::finish`
     // drains every reservation and answers each one. The link it holds is a

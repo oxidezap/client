@@ -347,9 +347,9 @@ use crate::views::{
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
     ActiveCall, AppState, Availability, CachedQrCode, CallOutcome, CallRecord, CallState, Chat,
-    ChatMessage, ComposingKind, DownloadableMedia, Ending, IncomingCall, Issued, MediaContent,
-    MediaType, MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Resend,
-    Stage, SystemNotice, TypingSummary, UiEvent,
+    ChatMessage, ComposingKind, DownloadableMedia, Ending, Issued, MediaContent, MediaType,
+    MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Resend, Stage,
+    SystemNotice, TypingSummary, UiEvent,
 };
 
 // ChatListCache is now in chats.rs and re-exported above
@@ -420,6 +420,15 @@ const _: () = assert!(MIN_DECODED_IMAGES < MAX_DECODED_IMAGES);
 /// budget alone admits hundreds of them — which is the bound the count was
 /// quietly providing before it was removed.
 const MAX_DECODED_IMAGES: usize = 50;
+
+/// How many conversations keep their built timeline.
+///
+/// Each entry holds the rows *and* a second full copy of the history they
+/// index into, so this map grew by a whole conversation for every one opened
+/// — walking fifty long chats left fifty histories resident, with nothing
+/// but an account reset to clear them. The other two caches beside it are
+/// bounded for the same reason; this one was not.
+const MAX_CACHED_TIMELINES: usize = 8;
 
 /// Download timeout in seconds (for audio/video downloads)
 /// How long a download somebody asked for is allowed to take.
@@ -492,11 +501,6 @@ impl ActiveMedia {
     /// Check if this is an audio message
     fn is_audio(&self) -> bool {
         matches!(self, Self::Audio { .. })
-    }
-
-    /// Check if this is a video message
-    fn is_video(&self) -> bool {
-        matches!(self, Self::Video { .. })
     }
 
     /// Get the message ID if any media is playing
@@ -588,6 +592,9 @@ pub struct WhatsAppApp {
     client: Option<Session>,
     /// Scroll handle for chat list
     chat_list_scroll: VirtualListScrollHandle,
+    /// The Status sidebar's scroll position, so that list can have a
+    /// scrollbar like every other region that scrolls.
+    status_list_scroll: gpui::ScrollHandle,
     /// Focus handle for chat list keyboard navigation
     chat_list_focus: FocusHandle,
     /// Focus target for the call card, so its actions are reachable from
@@ -794,6 +801,15 @@ pub struct WhatsAppApp {
     /// every click, so somebody who changed their mind could not say so until
     /// the camera they no longer wanted had finished coming on.
     call_video_asked: Option<(String, bool)>,
+    /// The same, for the microphone.
+    ///
+    /// The announcement is a round trip through the daemon and the peer, and
+    /// every other call frame in between — the peer turning a camera on, a
+    /// waiting call promoted — carries the mute the daemon still holds. That
+    /// took the button back to "open", and the next press computed its toggle
+    /// from that stale value and asked to unmute a microphone the user
+    /// believed was muted.
+    call_muted_asked: Option<(String, bool)>,
     /// Cache of JID -> display name mappings (from notify/pushname attribute)
     name_cache: HashMap<String, String>,
     /// System notices whose conversation has not arrived yet.
@@ -948,6 +964,12 @@ impl WhatsAppApp {
                     }),
                     // The tray's "Open", or another front end asking on a
                     // user's behalf. One window, so there is one to raise.
+                    // The connection ended, and why. One screen drew three
+                    // different endings as an outage that would be retried;
+                    // this carries which one it was.
+                    FromDaemon::Ended(fault) => entity.update(cx, |app, cx| {
+                        app.connection_ended(fault, cx);
+                    }),
                     FromDaemon::ShowWindow => {
                         cx.update(|cx| {
                             if let Some(window) = cx.windows().first() {
@@ -973,6 +995,7 @@ impl WhatsAppApp {
             selected_chat: None,
             client: None,
             chat_list_scroll: VirtualListScrollHandle::new(),
+            status_list_scroll: gpui::ScrollHandle::new(),
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
@@ -996,7 +1019,9 @@ impl WhatsAppApp {
             conversation_search_input: None,
             chat_search_query: String::new(),
             chat_search_task: None,
-            message_list: new_timeline_state(0),
+            // The window's own base font is not known until it has been laid
+            // out; the reference scale is what it starts from.
+            message_list: new_timeline_state(0, crate::theme::Metrics::default()),
             timeline_anchor: None,
             input_area: None,
             composing_chat: None,
@@ -1025,6 +1050,7 @@ impl WhatsAppApp {
             call_card: CallCard::default(),
             call_pictures: CallPictures::default(),
             call_video_asked: None,
+            call_muted_asked: None,
             name_cache: HashMap::new(),
             pending_notices: HashMap::new(),
             video_players: HashMap::new(),
@@ -1106,11 +1132,6 @@ impl WhatsAppApp {
         }
     }
 
-    /// Get the current mobile panel state
-    pub fn mobile_panel(&self) -> MobilePanel {
-        self.mobile_panel
-    }
-
     /// Navigate back to chat list (for mobile)
     pub fn navigate_back(&mut self, cx: &mut Context<Self>) {
         self.mobile_panel = MobilePanel::ChatList;
@@ -1184,7 +1205,6 @@ impl WhatsAppApp {
             .collect();
 
         let new_cache = ChatListCache {
-            chat_count: rows.len(),
             version,
             chats_len: self.chats.len(),
             rows,
@@ -1353,9 +1373,9 @@ impl WhatsAppApp {
             };
             cached.unwrap_or_else(|| {
                 let built = MessageListCache::new(messages, is_group, typing);
-                self.message_list_cache
-                    .borrow_mut()
-                    .insert(chat_jid.to_string(), built.clone());
+                let mut cache = self.message_list_cache.borrow_mut();
+                cache.insert(chat_jid.to_string(), built.clone());
+                evict_stale_timelines(&mut cache, chat_jid);
                 built
             })
         };
@@ -1538,11 +1558,6 @@ impl WhatsAppApp {
         self.keyboard_surfaces = surfaces;
     }
 
-    /// The window's own focus target, which every frame draws.
-    pub fn root_focus(&self) -> &FocusHandle {
-        &self.root_focus
-    }
-
     /// Drop everything this window learned from the account it is leaving.
     ///
     /// Not only the chats. Anything keyed by a JID or a message id belongs to
@@ -1569,6 +1584,7 @@ impl WhatsAppApp {
         // a pane is exactly the kind of thing a reset exists to remove.
         self.call_pictures = CallPictures::default();
         self.call_video_asked = None;
+        self.call_muted_asked = None;
         // And the notices, which are drawn by the root over every screen and
         // so outlive the view they were raised in. "That recording could not
         // be sent" is about an account that has gone, shown to whoever pairs
@@ -1832,7 +1848,7 @@ impl WhatsAppApp {
     fn add_message_to_chat(&mut self, jid: &str, message: ChatMessage) -> bool {
         if let Some(index) = self.chats.iter().position(|c| c.jid == jid) {
             if Arc::make_mut(&mut self.chats[index]).add_message(message) {
-                self.move_chat_to_top(index);
+                self.reposition_chat_by_time(index);
             }
             // Always invalidate chat cache since the chat's content changed
             // (even if it didn't move, the last message preview needs updating)
@@ -1915,6 +1931,17 @@ impl WhatsAppApp {
         // position outliving its chat is a conversation that never asks for
         // its history again.
         self.forget_chat_paging(&gone);
+        for jid in &gone {
+            // A read owed by a chat that has left is a read nobody is waiting
+            // for. Kept, it is spent by the first merge that brings the chat
+            // back — archived elsewhere and unarchived months later — and
+            // marks messages nobody has looked at, which is the opposite of
+            // what a read is bounded by.
+            self.owed_reads.remove(jid);
+            // And a draft for a conversation that is gone has nowhere to be
+            // typed, let alone sent.
+            self.drafts.remove(jid);
+        }
         self.forget_missing_selection();
         // The viewer names a chat and a message in it, and resolves them every
         // frame: one left open over a chat that has just gone draws nothing,
@@ -1945,25 +1972,17 @@ impl WhatsAppApp {
         }
     }
 
-    /// Move a chat at the given index to the top of the list (index 0).
-    /// Does nothing if already at top.
-    fn move_chat_to_top(&mut self, index: usize) {
-        if index > 0 && index < self.chats.len() {
-            let chat = self.chats.remove(index);
-            self.chats.insert(0, chat);
-            // Note: chat cache invalidation is handled by the caller
-        }
-    }
-
     /// Move a chat to where its `last_message_time` belongs, newest first.
     ///
-    /// [`Self::move_chat_to_top`] is right for live traffic, where whatever
-    /// bumped the chat arrived just now and so is the newest thing the window
-    /// holds. A system notice is not always that: the held ones are replayed
-    /// immediately after a history load, carrying whatever clock they arrived
-    /// with, so one can advance its own conversation and still be older than
-    /// another chat's head. Dropping it at index 0 would stand it above a
-    /// strictly newer row in a list the sidebar draws newest-first.
+    /// The one answer for every arrival, live traffic included. "Advanced" is
+    /// a fact about that chat and not about the list: a catch-up drain after
+    /// a reconnect delivers conversations in whatever order the socket had
+    /// them, and dropping each at index 0 as it arrived left the sidebar in
+    /// arrival order — until the next history load sorted it, with the rows
+    /// jumping under the reader's finger. A held system notice is the same
+    /// case from the other direction: replayed after a load, it carries the
+    /// clock it arrived with, so it can advance its own conversation and
+    /// still be older than another chat's head.
     ///
     /// `None` sorts last, which is where `Reverse(last_message_time)` puts a
     /// chat with nothing in it.
@@ -1978,6 +1997,12 @@ impl WhatsAppApp {
     }
 
     /// Get the chat list scroll handle
+    /// The Status sidebar's scroll handle, which is also what its scrollbar
+    /// paints itself over.
+    pub fn status_list_scroll(&self) -> &gpui::ScrollHandle {
+        &self.status_list_scroll
+    }
+
     pub fn chat_list_scroll(&self) -> &VirtualListScrollHandle {
         &self.chat_list_scroll
     }
@@ -2003,11 +2028,6 @@ impl WhatsAppApp {
     /// Get the isolated input area view entity
     pub fn input_area(&self) -> Option<Entity<InputAreaView>> {
         self.input_area.clone()
-    }
-
-    /// Get the chat list focus handle
-    pub fn call_popup_focus(&self) -> &FocusHandle {
-        &self.call_focus
     }
 
     pub fn chat_list_focus(&self) -> &FocusHandle {
@@ -2264,8 +2284,9 @@ impl WhatsAppApp {
         self.forget_account_state(window, cx);
 
         if !asked {
-            self.app_state =
-                AppState::Error("Not connected to the daemon, so nothing was cleared".to_string());
+            self.app_state = AppState::Error(crate::session::Fault::unreachable(
+                "not connected to the daemon, so nothing was cleared",
+            ));
             cx.notify();
             return;
         }
@@ -2314,7 +2335,9 @@ impl WhatsAppApp {
                         };
                     }
                     Err(e) => {
-                        app.app_state = AppState::Error(format!("Failed to reach the daemon: {e}"));
+                        app.app_state = AppState::Error(crate::session::Fault::unreachable(
+                            format!("failed to reach the daemon: {e}"),
+                        ));
                         // The error screen says "we'll keep trying", and this
                         // is the attempt that was doing the trying: the timer
                         // that fired it has already ended. Without arming the
@@ -2685,10 +2708,10 @@ impl WhatsAppApp {
             // Status broadcasts: don't update any names
             let advanced = chat.add_message(message);
 
-            // Move chat to top of list (most recent first); duplicates and
-            // older backfills don't reorder
+            // To where its own head belongs, newest first; duplicates and
+            // older backfills do not reorder at all.
             if advanced {
-                self.move_chat_to_top(index);
+                self.reposition_chat_by_time(index);
             }
 
             // Always invalidate caches since chat content changed
@@ -3196,8 +3219,8 @@ impl Render for WhatsAppApp {
             AppState::Connected | AppState::Offline => {
                 render_connected_view(self, window, cx).into_any_element()
             }
-            AppState::Error(msg) => render_error_view(
-                msg,
+            AppState::Error(fault) => render_error_view(
+                fault,
                 self.retry_countdown(),
                 self.error_detail_open,
                 entity,
@@ -3248,11 +3271,30 @@ impl Render for WhatsAppApp {
     }
 }
 
-/// Where a chat whose head is `at` belongs in a newest-first list that does
-/// not contain it: the first slot whose neighbour is strictly older.
+/// Drop the least recently built timelines, sparing the one on screen.
 ///
-/// `None` is older than any timestamp, so an empty conversation lands at the
-/// end — the same place `Reverse(last_message_time)` puts it.
+/// The build number is a monotonic counter stamped when a timeline is built,
+/// so the smallest ones are the conversations nothing has touched for
+/// longest. Rebuilding one costs a pass over its rows, which is what opening
+/// a conversation already pays.
+fn evict_stale_timelines(cache: &mut HashMap<String, MessageListCache>, keep: &str) {
+    if cache.len() <= MAX_CACHED_TIMELINES {
+        return;
+    }
+    let mut by_age: Vec<(usize, String)> = cache
+        .iter()
+        .filter(|(jid, _)| jid.as_str() != keep)
+        .map(|(jid, rows)| (rows.build, jid.clone()))
+        .collect();
+    by_age.sort_unstable();
+    for (_, jid) in by_age
+        .into_iter()
+        .take(cache.len().saturating_sub(MAX_CACHED_TIMELINES))
+    {
+        cache.remove(&jid);
+    }
+}
+
 /// Whether the decoded-image cache should give up an entry.
 ///
 /// Two bounds and a floor, in one place because they only make sense
@@ -3262,6 +3304,11 @@ fn over_budget(held: usize, entries: usize) -> bool {
     entries >= MAX_DECODED_IMAGES || (held > DECODED_IMAGE_BUDGET && entries > MIN_DECODED_IMAGES)
 }
 
+/// Where a chat whose head is `at` belongs in a newest-first list that does
+/// not contain it: the first slot whose neighbour is strictly older.
+///
+/// `None` is older than any timestamp, so an empty conversation lands at the
+/// end — the same place `Reverse(last_message_time)` puts it.
 fn slot_newest_first(rest: &[Arc<Chat>], at: Option<chrono::DateTime<chrono::Utc>>) -> usize {
     rest.iter()
         .position(|other| other.last_message_time < at)
@@ -3719,6 +3766,41 @@ mod tests {
         // older than the chat above it.
         let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(10)))];
         assert_eq!(slot_newest_first(&rest, at(20)), 1);
+    }
+
+    /// Each entry holds a second full copy of the conversation, and nothing
+    /// but an account reset used to remove one: fifty long chats opened left
+    /// fifty histories resident.
+    #[test]
+    fn only_so_many_conversations_keep_their_rows() {
+        let mut cache: HashMap<String, MessageListCache> = HashMap::new();
+        for n in 0..MAX_CACHED_TIMELINES + 5 {
+            let jid = format!("{n}@s.whatsapp.net");
+            cache.insert(jid.clone(), timeline_of(&["m1", "m2"]));
+            evict_stale_timelines(&mut cache, &jid);
+        }
+        assert_eq!(cache.len(), MAX_CACHED_TIMELINES);
+        let newest = format!("{}@s.whatsapp.net", MAX_CACHED_TIMELINES + 4);
+        assert!(
+            cache.contains_key(&newest),
+            "the conversation on screen is never the one dropped"
+        );
+        assert!(
+            !cache.contains_key("0@s.whatsapp.net"),
+            "the oldest build goes first"
+        );
+    }
+
+    /// The catch-up case: an offline drain delivers conversations in whatever
+    /// order the socket had them, and a bump to index 0 per arrival left the
+    /// sidebar in arrival order — sorted only by the next history load, with
+    /// the rows jumping under the reader's finger.
+    #[test]
+    fn a_catch_up_arriving_out_of_order_still_lands_newest_first() {
+        let rest = [Arc::new(chat("b", Some(30))), Arc::new(chat("c", Some(20)))];
+        // An older conversation catching up does not stand above a newer one.
+        assert_eq!(slot_newest_first(&rest, at(25)), 1);
+        assert_eq!(slot_newest_first(&rest, at(35)), 0);
     }
 
     #[test]

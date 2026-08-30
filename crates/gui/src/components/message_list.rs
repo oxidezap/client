@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Entity, IntoElement, ListAlignment, ListState, ParentElement, Styled, div,
-    list, prelude::FluentBuilder as _, px,
+    list, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::scroll::Scrollbar;
@@ -30,16 +30,19 @@ use crate::utils::format_date_divider;
 
 use oxidezap_core::{MediaType, TypingSummary};
 
-/// How far beyond the viewport to keep rows laid out.
-///
-/// A screen either way: enough that a flick does not land on blank space
-/// while the rows under it are measured, and bounded so a long conversation
-/// is still only laying out what is near the reader.
-pub const TIMELINE_OVERDRAW: f32 = 800.0;
-
 /// A list state for a conversation, anchored at its newest row.
-pub fn new_timeline_state(item_count: usize) -> ListState {
-    ListState::new(item_count, ListAlignment::Bottom, px(TIMELINE_OVERDRAW))
+///
+/// The overdraw is a screen either way — enough that a flick does not land on
+/// blank space while the rows under it are measured, and bounded so a long
+/// conversation is still only laying out what is near the reader. "A screen"
+/// is a claim about the rows, so it comes off the rem scale like the row
+/// heights do rather than sitting at a pixel count.
+pub fn new_timeline_state(item_count: usize, metrics: Metrics) -> ListState {
+    ListState::new(
+        item_count,
+        ListAlignment::Bottom,
+        metrics.timeline_overdraw(),
+    )
 }
 
 /// The conversation, as one frame draws it.
@@ -59,7 +62,7 @@ pub fn render_message_list(
     is_own_number: bool,
     layout: ResponsiveLayout,
     _cx: &App,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
 
     // What the list holds, not what the chat holds. In a conversation with no

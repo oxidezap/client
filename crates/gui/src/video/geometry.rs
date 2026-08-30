@@ -98,6 +98,25 @@ pub(super) fn write_bgra_rotated(
     debug_assert_eq!(src.len(), width * height * 4);
     debug_assert_eq!(dst.len(), src.len());
 
+    // The common case, and worth its own path: a call at 720p in both
+    // directions is ~55 million pixels a second, and the general loop pays
+    // two bounds checks and a multiply per pixel for a rotation that is not
+    // happening.
+    if rotation == Rotation::None {
+        for (to, from) in dst
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src.as_chunks::<4>().0)
+        {
+            to[0] = from[2];
+            to[1] = from[1];
+            to[2] = from[0];
+            to[3] = from[3];
+        }
+        return;
+    }
+
     let dst_width = if rotation.transposes() { height } else { width };
 
     for y in 0..height {
@@ -115,6 +134,21 @@ pub(super) fn write_bgra_rotated(
             dst[t + 2] = src[s];
             dst[t + 3] = src[s + 3];
         }
+    }
+}
+
+/// RGBA to BGRA where the two are the same buffer.
+///
+/// For a frame that is not being turned: the destination is the buffer the
+/// image will own, so it can be written into directly and corrected in place
+/// rather than copied out of a scratch.
+// The caller is the call pane's own decoder, which is openh264 and so
+// native: a page decodes through WebCodecs and never holds an RGBA buffer of
+// its own to correct.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+pub(super) fn swap_rb_in_place(pixels: &mut [u8]) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
     }
 }
 
@@ -314,10 +348,14 @@ mod tests {
 /// rotations and nothing else, which is what this module is, and because a
 /// browser-only module is one the host test run never compiles.
 #[derive(Default)]
+// As `stamp_of`: the browser's decoder holds one, and a native build has no
+// browser to hold it.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 pub(super) struct TurnLog {
     held: std::collections::VecDeque<(i32, Rotation)>,
 }
 
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 impl TurnLog {
     /// How many turns are remembered at once.
     ///

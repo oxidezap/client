@@ -56,6 +56,14 @@ fn subtitle(
     }
 }
 
+// Nine, and each one is a fact about this header that the app does not hand
+// over as a unit: what the conversation is, what it is doing, and what this
+// window may do to it. A struct here would be a struct with nine fields and
+// one construction site.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "nine facts, none of them a group"
+)]
 pub fn render_chat_header(
     chat: &Chat,
     typing: Option<&TypingSummary>,

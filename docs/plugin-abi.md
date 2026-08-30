@@ -95,8 +95,11 @@ returns an outcome (below).
 | `oxi_log` | `(level: i32, ptr: i32, len: i32)` | none |
 | `oxi_now_ms` | `() -> i64` | none |
 
-`oxi_kv_get` follows the same short-buffer convention as `oxi_field_str`. An
-empty value passed to `oxi_kv_set` deletes the key. `oxi_ui_set` replaces the
+`oxi_kv_get` follows the same short-buffer convention as `oxi_field_str`, and
+answers `REFUSED` rather than `ABSENT` when the call's byte allowance is gone:
+a value read as absent comes back as the plugin's default, which the next
+action then writes over the user's own. An empty value passed to `oxi_kv_set`
+deletes the key. `oxi_ui_set` replaces the
 plugin's whole published tree.
 
 `oxi_now_ms` is the only clock: Unix milliseconds, which is the resolution a
@@ -118,6 +121,16 @@ call's fuel, so nothing here is a promise about timing side channels.
 
 `-1` is also `ABSENT` for the field reads, where there is no outcome to
 confuse it with.
+
+`REFUSED` is also what an allowance that is spent answers with, and the
+distinction from `STATE` is the point: the moment is fine, the budget is not,
+so there is no later moment to wait for. It is the answer to a second
+`oxi_set_name`, to `oxi_send_text`/`oxi_send_reply`/`oxi_mark_read`/`oxi_typing`
+past `MAX_COMMANDS_PER_CALL` or `MAX_COMMANDS_PER_WINDOW`, to `oxi_ui_set` past
+`MAX_UI_PER_CALL`, and to `oxi_kv_get` past `MAX_FIELD_BYTES_PER_CALL`'s
+key-value twin — which is the one place `ABSENT` would be a lie a plugin acts
+on, since a setting read as absent comes back as a default and is then written
+over the user's own.
 
 ## Capabilities
 

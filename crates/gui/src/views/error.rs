@@ -13,13 +13,15 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Icon, IconName};
 
+use oxidezap_core::{Fault, Recovery};
+
 use super::centered_view;
 use crate::app::WhatsAppApp;
 use crate::components::ProductIcon;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 
 pub fn render_error_view(
-    error: &str,
+    fault: &Fault,
     retry_in: Option<u64>,
     show_detail: bool,
     entity: Entity<WhatsAppApp>,
@@ -28,7 +30,7 @@ pub fn render_error_view(
     let metrics = cx.product().metrics;
     let retry_entity = entity.clone();
     let detail_entity = entity;
-    let detail = error.to_string();
+    let detail = fault.detail.clone();
 
     centered_view("error-screen", metrics.space_xxl())
         .child(
@@ -60,7 +62,7 @@ pub fn render_error_view(
                         .text_size(metrics.text_heading())
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(cx.theme().foreground)
-                        .child("Can't reach WhatsApp"),
+                        .child(fault.headline),
                 )
                 .child(
                     div()
@@ -68,10 +70,7 @@ pub fn render_error_view(
                         .text_color(cx.theme().muted_foreground)
                         // What it means and what happens next, in the order a
                         // reader needs them. Not the raw transport error.
-                        .child(
-                            "Your messages are safe on this device. \
-                             We'll keep trying to reconnect.",
-                        ),
+                        .child(fault.body),
                 ),
         )
         .child(
@@ -79,7 +78,11 @@ pub fn render_error_view(
                 .flex()
                 .items_center()
                 .gap(metrics.space_lg())
-                .child(
+                // Only where reconnecting is the way out. A version
+                // mismatch fails identically for ever, and the body says so
+                // two lines up: offering the button there is the screen
+                // contradicting itself.
+                .children((fault.recovery != Recovery::Nothing).then(|| {
                     Button::new("retry")
                         .label(match retry_in {
                             // A countdown answers "is it stuck?" without the
@@ -90,8 +93,8 @@ pub fn render_error_view(
                         .primary()
                         .on_click(move |_, _, cx| {
                             retry_entity.update(cx, |this, cx| this.retry_connection(cx));
-                        }),
-                )
+                        })
+                }))
                 .child(
                     // The app is usable offline — history is local. Saying so
                     // is what stops this screen from being a dead end.

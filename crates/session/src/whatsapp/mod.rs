@@ -999,9 +999,14 @@ impl WhatsAppClient {
                     if named.contains_key(&key) {
                         continue;
                     }
-                    if let Some(name) = names.known(&client, &jid, None).await {
-                        named.insert(key, name);
-                    }
+                    // Resolved, or the same last resort every other surface
+                    // falls back to: a notice naming somebody by the digits of
+                    // a LID reads as a phone number that is not one.
+                    let name = match names.known(&client, &jid, None).await {
+                        Some(name) => name,
+                        None => names.identity(&client, &jid).await.fallback_name.clone(),
+                    };
+                    named.insert(key, name);
                 }
                 let actor = crate::group_notice::actor_name(
                     update.participant.as_ref(),
@@ -1285,25 +1290,24 @@ impl WhatsAppClient {
             .await
             {
                 Some(data) => (data, mime, sticker.is_animated.unwrap_or(false), false),
-                None => (
-                    sticker
-                        .png_thumbnail
-                        .as_ref()
-                        .filter(|t| !t.is_empty())
-                        .cloned()
-                        .unwrap_or_default(),
-                    "image/png".to_string(),
-                    // What the sticker *is*, not what the thumbnail is. The
-                    // still is a PNG either way, and this flag travels with
-                    // the row past the fetch: `adopt_full_bytes` restores the
-                    // mime type from the download metadata and cannot restore
-                    // this, so a `false` written here is an animated sticker
-                    // that never animates. It used to be reached only by a
-                    // download that failed; it is now the ordinary path for
-                    // anything not fetched eagerly.
-                    sticker.is_animated.unwrap_or(false),
-                    true,
-                ),
+                None => {
+                    let still = still_preview(
+                        thumbnail_bytes(sticker.png_thumbnail.as_deref()),
+                        "image/png",
+                        mime,
+                        downloadable.is_some(),
+                    );
+                    (
+                        still.data,
+                        still.mime,
+                        // What the sticker *is*, not what the still is: the
+                        // flag describes the file that replaces it, and
+                        // `data_is_preview` beside it says which of the two
+                        // is in hand.
+                        sticker.is_animated.unwrap_or(false),
+                        still.is_preview,
+                    )
+                }
             };
             if data.is_empty() && downloadable.is_none() {
                 return None;
@@ -1357,16 +1361,18 @@ impl WhatsAppClient {
                             .unwrap_or_else(|| "image/jpeg".to_string()),
                         false,
                     ),
-                    None => (
-                        image
-                            .jpeg_thumbnail
-                            .as_ref()
-                            .filter(|t| !t.is_empty())
-                            .cloned()
-                            .unwrap_or_default(),
-                        "image/jpeg".to_string(),
-                        true,
-                    ),
+                    None => {
+                        let still = still_preview(
+                            thumbnail_bytes(image.jpeg_thumbnail.as_deref()),
+                            "image/jpeg",
+                            image
+                                .mimetype
+                                .clone()
+                                .unwrap_or_else(|| "image/jpeg".to_string()),
+                            downloadable.is_some(),
+                        );
+                        (still.data, still.mime, still.is_preview)
+                    }
                 };
             if data.is_empty() && downloadable.is_none() {
                 return None;
@@ -2731,8 +2737,13 @@ impl WhatsAppClient {
                     None => latest.push((who.canonical_jid.clone(), entry.emoji)),
                 }
             }
+            // Through `add_reaction` rather than into the map, because the
+            // bounds on a message's reactions live there: writing the rows
+            // straight in restored every stored reactor, so a message the
+            // live path had capped came back over the cap after a reload —
+            // and drew a different set from the copy beside it.
             for (sender, emoji) in latest {
-                msg.reactions.entry(emoji).or_default().push(sender);
+                msg.add_reaction(emoji, sender);
             }
         }
     }
@@ -2828,6 +2839,47 @@ fn history_preview(stored: Option<String>, newest: Option<&ChatMessage>) -> Opti
 /// Media metadata (thumbnail + download info) from a message proto, without
 /// downloading anything. Shared by hydration; the live path additionally
 /// downloads images/stickers eagerly.
+/// The stand-in bytes a still carries before its media is fetched.
+struct Still {
+    data: Vec<u8>,
+    mime: String,
+    is_preview: bool,
+}
+
+fn thumbnail_bytes(thumbnail: Option<&[u8]>) -> Vec<u8> {
+    thumbnail
+        .filter(|t| !t.is_empty())
+        .unwrap_or_default()
+        .to_vec()
+}
+
+/// What a still is holding, decided once for the live path and the hydrated
+/// one. They had drifted: the live path flagged a thumbnail as a preview with
+/// no download metadata to make good on it, so the viewer refused to open the
+/// only bytes that will ever exist and the daemon refused to cache them.
+///
+/// A preview is bytes standing in for a fetch that can actually be made, and
+/// the mime describes what is in hand rather than what is being waited for.
+/// The video paths do not come through here on purpose: a poster frame is
+/// never the video, download metadata or not.
+fn still_preview(
+    thumbnail: Vec<u8>,
+    thumbnail_mime: &str,
+    own_mime: String,
+    downloadable: bool,
+) -> Still {
+    let has_preview = !thumbnail.is_empty();
+    Still {
+        mime: if has_preview {
+            thumbnail_mime.to_string()
+        } else {
+            own_mime
+        },
+        is_preview: has_preview && downloadable,
+        data: thumbnail,
+    }
+}
+
 fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
     if let Some(sticker) = effective_sticker(msg) {
         let mime = sticker
@@ -2844,30 +2896,25 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             download_type: DownloadMediaType::Sticker,
         }
         .build();
-        let thumbnail = sticker
-            .png_thumbnail
-            .as_ref()
-            .filter(|thumbnail| !thumbnail.is_empty())
-            .cloned()
-            .unwrap_or_default();
-        if thumbnail.is_empty() && downloadable.is_none() {
+        let still = still_preview(
+            thumbnail_bytes(sticker.png_thumbnail.as_deref()),
+            "image/png",
+            mime,
+            downloadable.is_some(),
+        );
+        if still.data.is_empty() && downloadable.is_none() {
             return None;
         }
-        let has_preview = !thumbnail.is_empty();
         return Some(MediaContent {
             media_type: MediaType::Sticker,
-            data: Arc::new(thumbnail),
+            data: Arc::new(still.data),
             cache_key: None,
-            mime_type: if has_preview {
-                "image/png".to_string()
-            } else {
-                mime
-            },
+            mime_type: still.mime,
             width: sticker.width,
             height: sticker.height,
             caption: None,
             file_name: None,
-            data_is_preview: has_preview && downloadable.is_some(),
+            data_is_preview: still.is_preview,
             waveform: None,
             downloadable,
             // What the sticker *is*, not what the stand-in bytes are: the
@@ -2889,23 +2936,23 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             download_type: DownloadMediaType::Image,
         }
         .build();
-        let thumbnail = image
-            .jpeg_thumbnail
-            .as_ref()
-            .filter(|t| !t.is_empty())
-            .cloned()
-            .unwrap_or_default();
-        if thumbnail.is_empty() && downloadable.is_none() {
+        let still = still_preview(
+            thumbnail_bytes(image.jpeg_thumbnail.as_deref()),
+            "image/jpeg",
+            image
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "image/jpeg".to_string()),
+            downloadable.is_some(),
+        );
+        if still.data.is_empty() && downloadable.is_none() {
             return None;
         }
-        // Hydrated rows carry only the thumbnail; flag it so the renderer
-        // keeps offering the full download instead of treating it as final
-        let data_is_preview = !thumbnail.is_empty() && downloadable.is_some();
         return Some(MediaContent {
             media_type: MediaType::Image,
-            data: Arc::new(thumbnail),
+            data: Arc::new(still.data),
             cache_key: None,
-            mime_type: "image/jpeg".to_string(),
+            mime_type: still.mime,
             width: image.width,
             height: image.height,
             caption: image.caption.clone(),
@@ -2913,7 +2960,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             downloadable,
             is_animated: false,
             duration_secs: None,
-            data_is_preview,
+            data_is_preview: still.is_preview,
             waveform: None,
         });
     }
@@ -3544,7 +3591,7 @@ mod tests {
         ChatEntry, ChatStore, Client, LoadedHistory, NameBook, ReadBoundary, ReloadScope,
         SqliteStore, StoreChange, WhatsAppClient, apply_status_views, chat_cursor, media_metadata,
         merge_alias_history_messages, message_cursor, parse_chat_cursor, parse_message_cursor,
-        read_message_range,
+        read_message_range, still_preview,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
     use std::sync::Arc;
@@ -4102,6 +4149,21 @@ mod tests {
             !chats[1].messages[0].is_read,
             "a conversation is not the broadcast, whatever ids collide"
         );
+    }
+
+    #[test]
+    fn a_still_with_nothing_to_download_is_not_offered_as_a_preview() {
+        let orphan = still_preview(vec![1, 2, 3], "image/png", "image/webp".into(), false);
+        assert!(!orphan.is_preview);
+        assert_eq!(orphan.mime, "image/png");
+
+        let fetchable = still_preview(vec![1, 2, 3], "image/png", "image/webp".into(), true);
+        assert!(fetchable.is_preview);
+
+        // No bytes in hand: the mime describes the file being waited for.
+        let empty = still_preview(Vec::new(), "image/png", "image/webp".into(), true);
+        assert!(!empty.is_preview);
+        assert_eq!(empty.mime, "image/webp");
     }
 
     #[test]

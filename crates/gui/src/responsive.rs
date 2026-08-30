@@ -33,10 +33,12 @@ impl Breakpoint {
         matches!(self, Self::Mobile)
     }
 
+    #[expect(dead_code, reason = "the vocabulary is the point; see the note above")]
     pub fn is_tablet(&self) -> bool {
         matches!(self, Self::Tablet)
     }
 
+    #[expect(dead_code, reason = "the vocabulary is the point; see the note above")]
     pub fn is_desktop(&self) -> bool {
         matches!(self, Self::Desktop)
     }
@@ -105,6 +107,10 @@ impl ResponsiveLayout {
         &self.metrics
     }
 
+    #[expect(
+        dead_code,
+        reason = "one vocabulary for the layout, whether or not every word is spoken today"
+    )]
     pub fn breakpoint(&self) -> Breakpoint {
         self.breakpoint
     }
@@ -113,18 +119,34 @@ impl ResponsiveLayout {
         self.breakpoint.is_mobile()
     }
 
+    #[expect(
+        dead_code,
+        reason = "one vocabulary for the layout, whether or not every word is spoken today"
+    )]
     pub fn is_tablet(&self) -> bool {
         self.breakpoint.is_tablet()
     }
 
+    #[expect(
+        dead_code,
+        reason = "one vocabulary for the layout, whether or not every word is spoken today"
+    )]
     pub fn is_desktop(&self) -> bool {
         self.breakpoint.is_desktop()
     }
 
+    #[expect(
+        dead_code,
+        reason = "one vocabulary for the layout, whether or not every word is spoken today"
+    )]
     pub fn is_compact(&self) -> bool {
         self.is_mobile() || self.is_tablet()
     }
 
+    #[expect(
+        dead_code,
+        reason = "one vocabulary for the layout, whether or not every word is spoken today"
+    )]
     pub fn mobile_panel(&self) -> MobilePanel {
         self.mobile_panel
     }
@@ -275,6 +297,10 @@ impl ResponsiveLayout {
         self.metrics.space_xl()
     }
 
+    #[expect(
+        dead_code,
+        reason = "one vocabulary for the layout, whether or not every word is spoken today"
+    )]
     pub fn padding_small(&self) -> Pixels {
         if self.is_mobile() {
             self.metrics.space_md()

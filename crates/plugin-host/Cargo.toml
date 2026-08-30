@@ -29,10 +29,12 @@ wacore = { workspace = true }
 wasmi = { version = "1.0", default-features = false, features = ["std"] }
 
 # One call, `getuid`, for the check that refuses a plugin another local
-# account could have replaced. The kernel already knows the number; the
-# alternative is a whole crate to ask it.
+# account could have replaced — through the same crate the daemon and the IPC
+# crate already ask it with, which is what the root manifest says `rustix` is
+# here for: the syscalls this tree needs, as safe wrappers, instead of
+# hand-written `extern "C"`.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+rustix = { workspace = true }
 
 [dev-dependencies]
 # Fixture modules are hand-written `.wat` assembled at test time. A `.wasm`

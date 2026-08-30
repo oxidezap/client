@@ -134,6 +134,9 @@ pub(super) fn keyframe_at_or_before(samples: &[H264Sample], index: usize) -> usi
 ///
 /// The displayed position is computed from the index instead; see
 /// `StreamingFrame::timestamp`.
+// Read by the browser's decoder and by the tests below; a native build
+// compiles neither caller.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 pub(super) fn stamp_of(index: usize) -> i32 {
     i32::try_from(index).unwrap_or(i32::MAX)
 }

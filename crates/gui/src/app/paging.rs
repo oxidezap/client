@@ -188,8 +188,18 @@ impl WhatsAppApp {
             debug!("a page arrived for {}, which is gone", observe_str(&jid));
             return;
         };
+        let mut moved = false;
         for message in messages {
-            chat.insert_history_message(message);
+            moved |= chat.insert_history_message(message);
+        }
+        // A page that repeated rows this conversation already holds changed
+        // nothing to draw. The daemon publishes a history load on every ack
+        // and receipt, and a conversation whose whole history fit in one page
+        // reopens to `Unasked` and asks for that page again — so invalidating
+        // here rebuilt the rows and re-measured the timeline from scratch
+        // every time a receipt landed.
+        if !moved {
+            return;
         }
         // The rows moved, and the timeline's own measurements are keyed to
         // them: see `sync_timeline`, which is what turns this into a splice at
@@ -216,8 +226,12 @@ impl WhatsAppApp {
         if chats.is_empty() {
             return;
         }
-        self.merge_chats(chats);
-        self.invalidate_chat_cache();
+        // The same entrance a history load uses: a page that merely called
+        // `merge_chats` left a notice for a group that arrives only by page
+        // parked forever, and never armed the status tick for a broadcast
+        // that arrived the same way. Nothing here says a status update was
+        // watched — only a load knows that.
+        self.install_chats(chats, &std::collections::HashSet::new(), cx);
         cx.notify();
     }
 
@@ -552,7 +566,7 @@ mod tests {
     /// frame, and neither end of that is visible from our own code.
     #[test]
     fn an_unscrolled_timeline_names_the_row_past_its_last() {
-        let state = crate::components::new_timeline_state(12);
+        let state = crate::components::new_timeline_state(12, crate::theme::Metrics::default());
 
         assert_eq!(
             state.logical_scroll_top().item_ix,

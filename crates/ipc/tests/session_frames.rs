@@ -184,6 +184,67 @@ fn an_omitted_field_comes_back_as_what_it_was() {
     );
 }
 
+/// The one field the rule above cannot cover, and the one the test above is
+/// blind to: `data` is skipped whether it holds nothing or holds megabytes,
+/// so its absence reads back as the value that was skipped only while
+/// `cache_key` names where the bytes went. Nothing in the type pairs the two,
+/// so this is what does.
+#[test]
+fn media_bytes_only_leave_the_frame_once_a_key_names_them() {
+    use oxidezap_core::{ChatMessage, MediaContent, MediaType};
+    use std::sync::Arc;
+
+    let mut message =
+        ChatMessage::new_incoming("3EB0".into(), "1@s.whatsapp.net".into(), "oi".into());
+    let media = MediaContent {
+        media_type: MediaType::Image,
+        data: Arc::new(vec![0xab; 4096]),
+        cache_key: None,
+        mime_type: "image/jpeg".into(),
+        width: Some(1200),
+        height: Some(800),
+        caption: None,
+        file_name: None,
+        downloadable: None,
+        is_animated: false,
+        duration_secs: None,
+        data_is_preview: false,
+        waveform: None,
+    };
+    message.media = Some(media.clone());
+
+    let line = serde_json::to_string(&message).expect("serializes");
+    let back: ChatMessage = serde_json::from_str(&line).expect("parses back");
+    let read = back.media.expect("the media survives");
+    assert!(
+        read.data.is_empty(),
+        "the bytes never travel: the frame is newline-delimited JSON"
+    );
+    assert!(
+        read.cache_key.is_none(),
+        "and nothing invented a key for them"
+    );
+    // Which is the whole point: with no key, the bytes this frame dropped are
+    // reachable by nothing on the other side. Whoever sends media has to
+    // externalize it first, and this is what says so.
+    assert_ne!(
+        read, media,
+        "a media frame with bytes and no key does not round-trip"
+    );
+
+    let mut externalized = message.clone();
+    if let Some(media) = &mut externalized.media {
+        media.cache_key = Some("f-3EB0".into());
+        media.data = Arc::default();
+    }
+    let line = serde_json::to_string(&externalized).expect("serializes");
+    assert_eq!(
+        serde_json::from_str::<ChatMessage>(&line).expect("parses back"),
+        externalized,
+        "{line}"
+    );
+}
+
 /// A stopwatch rather than an assertion: what an attaching front end's first
 /// load costs to write and to read, at the shape the session sends it in and
 /// at the one it used to.

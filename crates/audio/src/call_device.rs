@@ -21,11 +21,6 @@ use cpal::{I24, Sample, SampleFormat, U24};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer as _, Producer as _, Split as _};
 
-/// Number of taps in the anti-alias pre-filter. Odd for linear phase; 63 taps
-/// at 48 kHz costs ~3M multiply-adds per second, which is noise next to the
-/// codec, and gives enough stopband rejection for an 8 kHz voice band.
-const LOWPASS_TAPS: usize = 63;
-
 /// Linear resampler that carries a fractional read cursor across calls so block
 /// boundaries don't click.
 ///
@@ -54,7 +49,7 @@ impl Resampler {
         let taps = if src_rate > dst_rate {
             // 0.45 rather than 0.5 of the destination Nyquist: leaves a
             // transition band so the passband edge is not already rolling off.
-            Self::lowpass_taps(0.45 * dst_rate as f32 / src_rate as f32)
+            crate::resample::lowpass_taps(0.45 * dst_rate as f32 / src_rate as f32)
         } else {
             Vec::new()
         };
@@ -67,30 +62,6 @@ impl Resampler {
             history,
             filtered: Vec::new(),
         }
-    }
-
-    /// Windowed-sinc low-pass, Hamming window, normalized to unity DC gain.
-    fn lowpass_taps(cutoff: f32) -> Vec<f32> {
-        let m = (LOWPASS_TAPS - 1) as f32;
-        let mut taps: Vec<f32> = (0..LOWPASS_TAPS)
-            .map(|n| {
-                let x = n as f32 - m / 2.0;
-                let sinc = if x.abs() < f32::EPSILON {
-                    2.0 * cutoff
-                } else {
-                    (2.0 * std::f32::consts::PI * cutoff * x).sin() / (std::f32::consts::PI * x)
-                };
-                let window = 0.54 - 0.46 * (2.0 * std::f32::consts::PI * n as f32 / m).cos();
-                sinc * window
-            })
-            .collect();
-        let sum: f32 = taps.iter().sum();
-        if sum.abs() > f32::EPSILON {
-            for t in &mut taps {
-                *t /= sum;
-            }
-        }
-        taps
     }
 
     /// Resample `src` into `out`. Allocation-free past the warmup.

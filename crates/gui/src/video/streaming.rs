@@ -31,7 +31,9 @@ use openh264::formats::YUVSource;
 use smallvec::SmallVec;
 
 use super::audio::VideoAudio;
-use super::demux::{H264Sample, avcc_to_annexb, build_sps_pps_annexb, is_keyframe};
+use super::demux::{
+    H264Sample, avcc_to_annexb, build_sps_pps_annexb, is_keyframe, keyframe_at_or_before,
+};
 use super::geometry::{
     MAX_VIDEO_PIXELS, Rotation, declares_more_than, declares_unreadably, frame_byte_len,
     write_bgra_rotated,
@@ -445,9 +447,14 @@ impl StreamingVideoDecoder {
             // Moving forward - continue from where we are
             (self.last_decoded_index + 1) as usize
         } else {
-            // Moving backward - need to reset decoder and start from beginning
+            // Backwards: the decoder's state is no use, so it is rebuilt — but
+            // from the keyframe the target is coded against rather than from
+            // the start of the file. Each sample already knows whether it is
+            // one; nothing asked. Dragging into the middle of three minutes at
+            // thirty frames a second re-decoded about 2700 frames, on the
+            // thread that draws the window.
             self.reset_decoder();
-            0
+            keyframe_at_or_before(&self.samples, target_index)
         };
 
         // Decode frames from start_index to target_index

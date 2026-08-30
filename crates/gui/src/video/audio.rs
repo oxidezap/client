@@ -93,8 +93,6 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
         channels
     );
 
-    // Extract raw AAC frames from MP4 (reusing the same reader)
-    //
     // The count is the container's, and the container is a file somebody
     // sent. Two ceilings, because neither alone is one: the file's length
     // bounds what it can carry, since a sample is at least a byte and `stsz`
@@ -105,24 +103,37 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
     // denial of service rather than the allocation.
     let ceiling = mp4_data.len().min(super::demux::MAX_TRACK_SAMPLES);
     let sample_count = sample_count.min(u32::try_from(ceiling).unwrap_or(u32::MAX));
-    let mut aac_frames: Vec<Vec<u8>> = Vec::new();
+
+    // Read straight into the ADTS stream, rather than collecting every frame
+    // and copying the lot again: the two together held the whole track twice
+    // over, on top of the MP4 the caller is still holding, before a sample
+    // had been decoded. The ceiling above still bounds it — what that bounds
+    // is how many samples are read, which is a question about the container
+    // rather than about where they are put.
+    //
+    // Grown rather than reserved: the audio is a small fraction of a video
+    // file, and reserving the MP4's whole length asked for a second copy of
+    // it beside the one the caller is still holding.
+    let mut adts_data = Vec::new();
+    let mut frames = 0usize;
     for sample_idx in 1..=sample_count {
         if let Ok(Some(sample)) = mp4.read_sample(track_id, sample_idx) {
-            aac_frames.push(sample.bytes.to_vec());
+            push_adts_frame(&mut adts_data, &sample.bytes, sample_rate, channels);
+            frames += 1;
         }
     }
+    drop(mp4);
 
-    if aac_frames.is_empty() {
+    if frames == 0 {
         log::info!("No AAC frames extracted");
         return None;
     }
 
-    log::info!("Extracted {} AAC frames from MP4", aac_frames.len());
-
-    // Convert raw AAC frames to ADTS format for symphonia
-    let adts_data = wrap_aac_as_adts(&aac_frames, sample_rate, channels);
-
-    log::info!("Created ADTS stream: {} bytes", adts_data.len());
+    log::info!(
+        "Extracted {} AAC frames from MP4 as {} bytes of ADTS",
+        frames,
+        adts_data.len()
+    );
 
     // Now decode ADTS using symphonia
     let cursor = Cursor::new(adts_data);
@@ -245,10 +256,8 @@ const MAX_DECODED_SAMPLES: usize = 48_000 * 1200;
 /// The largest an ADTS frame may say it is: the length field is 13 bits.
 const MAX_ADTS_FRAME: usize = (1 << 13) - 1;
 
-/// Wrap raw AAC frames in ADTS format for symphonia
-fn wrap_aac_as_adts(frames: &[Vec<u8>], sample_rate: u32, channels: u8) -> Vec<u8> {
-    let mut adts = Vec::new();
-
+/// One AAC frame, headered, appended to the ADTS stream being built.
+fn push_adts_frame(adts: &mut Vec<u8>, frame: &[u8], sample_rate: u32, channels: u8) {
     // Map sample rate to ADTS frequency index using lookup table
     let freq_idx = ADTS_FREQ_TABLE
         .iter()
@@ -265,37 +274,45 @@ fn wrap_aac_as_adts(frames: &[Vec<u8>], sample_rate: u32, channels: u8) -> Vec<u
     // fields it is masked into, where it would silently name another layout.
     let channels = channels.clamp(1, 7);
 
-    for frame in frames {
-        let frame_len = frame.len() + 7; // ADTS header is 7 bytes
-        // The length field is 13 bits, and the masks below simply drop what
-        // does not fit: the header would then claim a shorter frame, the
-        // parser would resynchronise somewhere inside it, and the rest of the
-        // track would be discarded with nothing said. Skipped and named
-        // instead.
-        if frame_len > MAX_ADTS_FRAME {
-            log::warn!("skipping a {frame_len} byte AAC frame, past what ADTS can describe");
-            continue;
-        }
-
-        // Build 7-byte ADTS header
-        let header: [u8; 7] = [
-            0xFF,
-            0xF1, // Syncword + MPEG-4 + no CRC
-            ((profile - 1) << 6) | (freq_idx << 2) | ((channels >> 2) & 0x01),
-            ((channels & 0x03) << 6) | ((frame_len >> 11) & 0x03) as u8,
-            ((frame_len >> 3) & 0xFF) as u8,
-            (((frame_len & 0x07) << 5) | 0x1F) as u8,
-            0xFC, // Buffer fullness VBR + 0 frames - 1
-        ];
-
-        adts.extend_from_slice(&header);
-        adts.extend_from_slice(frame);
+    let frame_len = frame.len() + 7; // ADTS header is 7 bytes
+    // The length field is 13 bits, and the masks below simply drop what does
+    // not fit: the header would then claim a shorter frame, the parser would
+    // resynchronise somewhere inside it, and the rest of the track would be
+    // discarded with nothing said. Skipped and named instead.
+    if frame_len > MAX_ADTS_FRAME {
+        log::warn!("skipping a {frame_len} byte AAC frame, past what ADTS can describe");
+        return;
     }
 
+    // Build 7-byte ADTS header
+    let header: [u8; 7] = [
+        0xFF,
+        0xF1, // Syncword + MPEG-4 + no CRC
+        ((profile - 1) << 6) | (freq_idx << 2) | ((channels >> 2) & 0x01),
+        ((channels & 0x03) << 6) | ((frame_len >> 11) & 0x03) as u8,
+        ((frame_len >> 3) & 0xFF) as u8,
+        (((frame_len & 0x07) << 5) | 0x1F) as u8,
+        0xFC, // Buffer fullness VBR + 0 frames - 1
+    ];
+    adts.extend_from_slice(&header);
+    adts.extend_from_slice(frame);
+}
+
+/// The same, over a whole track already in hand.
+///
+/// The extraction above streams straight into its buffer rather than
+/// collecting the frames first; this exists for the tests, which are about
+/// what one frame's header says.
+#[cfg(all(test, not(target_family = "wasm")))]
+fn wrap_aac_as_adts(frames: &[Vec<u8>], sample_rate: u32, channels: u8) -> Vec<u8> {
+    let mut adts = Vec::new();
+    for frame in frames {
+        push_adts_frame(&mut adts, frame, sample_rate, channels);
+    }
     adts
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::{MAX_ADTS_FRAME, MAX_DECODED_SAMPLES, wrap_aac_as_adts};
 

@@ -635,6 +635,14 @@ impl Plugins {
                 "plugin {}: stopped, {QUEUE_DEPTH} events behind and not catching up",
                 worker.id
             );
+            // And the channel goes with it, which is the same rule shutdown
+            // keeps: a stop message has to fit, and this queue is full by
+            // definition. Closed, the worker wakes out of `recv` and ends,
+            // releasing the thread, the `Store`, the linear memory and every
+            // event still queued; left open, all of it stayed until the daemon
+            // shut down and the backlog could never drain, because `try_offer`
+            // refuses to queue anything more for a stopped plugin.
+            *lock(&worker.queue) = None;
         }
     }
 
@@ -1149,10 +1157,10 @@ pub(crate) fn only_this_user_can_write(path: &Path) -> bool {
 /// This process's real user id.
 #[cfg(unix)]
 fn current_uid() -> u32 {
-    // SAFETY: `getuid` reads a field of the calling process and cannot fail.
-    // The one call site is a permission check, so the alternative is a crate
-    // in the tree for a number the kernel already told us.
-    unsafe { libc::getuid() }
+    // The same syscall the daemon and the IPC crate make, from the same
+    // crate: no `unsafe` at this call site, and one dependency fewer in a
+    // crate that otherwise has none of either.
+    rustix::process::getuid().as_raw()
 }
 
 /// Remove only the record of what the user allowed.
@@ -1200,6 +1208,22 @@ fn usable_state_dir(dir: Option<&Path>) -> Option<&Path> {
         );
         return None;
     }
+    // The directory itself, asked the same question the plugin directory is
+    // asked. `create_dir_all` and `set_permissions` both follow a symlink, so
+    // a link left where the state directory goes had this daemon tighten and
+    // then write into somebody else's directory — approvals and every
+    // plugin's settings with it. The forged `approvals.json` is still barred
+    // by the owner check below, so what this closes is the redirection of the
+    // writes rather than a way to grant a capability.
+    if !only_this_user_can_write(dir) {
+        log::warn!(
+            "not using {}: it is a symlink, or a directory another user on this machine \
+             can write. Plugin settings will not survive a restart, and permissions must \
+             be granted again.",
+            dir.display()
+        );
+        return None;
+    }
     // Creating it is not the whole question. A directory that was *already*
     // there, group- or world-writable, is one another local account may have
     // put an `approvals.json` into before this daemon started — and a
@@ -1238,7 +1262,20 @@ fn usable_state_dir(dir: Option<&Path>) -> Option<&Path> {
 /// account, which is not what "per-user state" means anywhere else in this
 /// daemon. Repaired as well as created, because a directory from an earlier
 /// version is one somebody already has.
+///
+/// A link is refused before anything is written rather than after: both calls
+/// below follow one, so a link planted where this directory goes had the
+/// daemon set the mode of whatever it named, chosen by whoever planted it,
+/// and only then find out. Asking first means the refusal costs nothing; the
+/// check that the directory is this user's still runs afterwards, because
+/// nothing here can close the gap between a question and a `chmod`.
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "it is a symlink",
+        ));
+    }
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {

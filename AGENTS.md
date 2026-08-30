@@ -125,7 +125,11 @@ cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxideza
 # A plugin. Its own workspace, its own target, and the file's name is its id.
 # `examples/template` is the same three commands; `cargo test` in either runs
 # its handlers against the SDK's test host, with no daemon and no wasm.
-cd examples/autoreply && cargo build --release --target wasm32-unknown-unknown
+# `RUSTFLAGS=` because the root's `.cargo/config.toml` sets `+atomics` and
+# `--shared-memory` for this target — that target is the *web front end* — and
+# cargo joins those into any build under this directory. A plugin built with
+# them has a shared memory, which the host refuses outright.
+cd examples/autoreply && RUSTFLAGS= cargo build --release --target wasm32-unknown-unknown
 cp target/wasm32-unknown-unknown/release/autoreply.wasm ~/.local/share/oxidezap/plugins/
 # And the one test that exercises the real SDK against the real host. Back at
 # the root first: the example is its own workspace and the root excludes it, so
@@ -264,6 +268,31 @@ profile here repeats it deliberately.
   `<pair-device>` from the handler that runs inline, and then sit there with
   no code on screen. `net::abort_requested` is the rule stated once: a value
   sent is an abort, a sender dropped is a detachment and waits forever.
+- **A poisoned lock is answered by what the lock protects.** Two answers, and
+  the choice is not a matter of taste: a lock over state whose invariants span
+  several fields — the daemon's `Inner`, a call registry — is *panicked* on,
+  because a holder that died mid-mutation may have left it torn and continuing
+  publishes that. A lock over one collection whose every operation is atomic
+  in itself — a memo, an ordering token, a map of lanes — is *recovered*
+  (`unwrap_or_else(PoisonError::into_inner)`), because a `HashMap` cannot be
+  left half-inserted and turning a naming question into a second panic is
+  worse than answering it. Nothing under the release profile is reachable
+  either way: `panic = "abort"` means no lock is ever poisoned there, so this
+  rule is about tests and debug builds, which is exactly where a second panic
+  hides the first.
+
+- **A directory that was open is one whose contents are suspect.** Tightening
+  the mode closes the door behind whatever is already inside, so the question
+  after a `chmod` is what that is. Authority is deleted — the plugin host
+  removes an `approvals.json` it finds in a directory another account could
+  have written, because a `chmod` now does not make that file the user's
+  answer. A cache is cleared for the same reason and at no cost: the daemon
+  drops the media directory when it has to tighten its state directory, since
+  a file planted under a content key would be served to the window as this
+  account's own photo, and everything in there can be fetched again. And a
+  directory that cannot be made private at all is refused: `usable_state_dir`
+  runs without one rather than trusting it.
+
 - **Nothing stops the daemon but `main`.** The tray's Quit and an IPC
   `Shutdown` ask through `shutdown::request`; ending the process from a D-Bus
   callback or a connection task would skip disconnecting the session and

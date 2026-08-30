@@ -13,8 +13,8 @@ use gpui::{
     prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
+use gpui_component::Icon;
 use gpui_component::button::Button;
-use gpui_component::{Icon, IconName};
 
 use crate::theme::ActiveProductTheme as _;
 
@@ -183,7 +183,3 @@ impl RenderOnce for EmptyState {
             })
     }
 }
-
-/// The icon an empty conversation pane uses, so the chat area and the sidebar
-/// do not each pick their own.
-pub const EMPTY_CONVERSATION_ICON: IconName = IconName::Inbox;

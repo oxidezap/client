@@ -308,6 +308,9 @@ pub struct Text<const N: usize> {
     /// How much of it is in `buf`.
     len: usize,
     present: bool,
+    /// Whether the host declined to answer at all — the per-call byte
+    /// allowance is spent. See [`Text::refused`].
+    refused: bool,
 }
 
 impl<const N: usize> Text<N> {
@@ -335,7 +338,21 @@ impl<const N: usize> Text<N> {
             full: 0,
             len: 0,
             present: false,
+            refused: false,
         }
+    }
+
+    /// Whether the host declined to answer rather than saying there is
+    /// nothing there.
+    ///
+    /// The two are different facts. A read that spent this call's byte
+    /// allowance comes back with nothing in it, and a plugin that cannot tell
+    /// it from an absent value falls back to its defaults, redraws with them,
+    /// and writes them over the user's configuration on the next action. Ask
+    /// this before treating an empty answer as the truth.
+    #[must_use]
+    pub fn refused(&self) -> bool {
+        self.refused
     }
 
     /// What was read, possibly truncated. Empty when the field was absent.
@@ -950,6 +967,10 @@ fn read_into<const N: usize>(mut call: impl FnMut(raw::Ptr, i32) -> i32) -> Text
     };
     let full = call(raw::into(&mut out.buf), cap);
     if full < 0 {
+        // Everything negative reads as "nothing came back", which is what an
+        // older plugin already assumed; the distinction is offered beside it
+        // rather than instead of it.
+        out.refused = full == abi::outcome::REFUSED;
         return out;
     }
     out.present = true;
@@ -1195,6 +1216,9 @@ pub mod kv {
     use super::{Outcome, Text, get, set};
 
     /// A stored flag. Absent reads back as `false`, by the absence rule.
+    ///
+    /// So does a read the host refused for a spent allowance: a `bool` has
+    /// nowhere to put the difference. [`text`] keeps it.
     #[must_use]
     pub fn flag(key: &str) -> bool {
         get::<2>(key).as_str() == "1"
@@ -1209,10 +1233,14 @@ pub mod kv {
     ///
     /// One size for the read and for what a plugin writes back, because two
     /// would mean a value kept whole and matched on its first `N` bytes.
+    ///
+    /// A refused read is handed back as it is, refusal and all: substituting
+    /// the fallback there is exactly the mistake `REFUSED` exists to
+    /// prevent, since the next action writes it over the user's own value.
     #[must_use]
     pub fn text<const N: usize>(key: &str, fallback: &str) -> Text<N> {
         let stored = get::<N>(key);
-        if stored.is_empty() {
+        if stored.is_empty() && !stored.refused() {
             Text::of(fallback)
         } else {
             stored

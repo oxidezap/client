@@ -13,9 +13,11 @@
 
 use gpui::{
     App, FontStyle, FontWeight, HighlightStyle, IntoElement, SharedString, StrikethroughStyle,
-    StyledText, px,
+    StyledText,
 };
 use gpui_component::ActiveTheme as _;
+
+use crate::theme::ActiveProductTheme as _;
 
 use oxidezap_core::{Emphasis, parse_rich_text};
 
@@ -34,6 +36,7 @@ pub fn render_rich_text(source: &str, cx: &App) -> gpui::AnyElement {
     let runs = rich.runs();
     let text: SharedString = rich.text.into();
     let mono = cx.theme().mono_font_family.clone();
+    let metrics = cx.product().metrics;
     // Two passes over the same partition, because GPUI takes the font family
     // apart from the rest of the style: highlights resolve against the
     // inherited text style, family overrides are applied at layout.
@@ -44,7 +47,7 @@ pub fn render_rich_text(source: &str, cx: &App) -> gpui::AnyElement {
         .collect();
     let highlights: Vec<_> = runs
         .into_iter()
-        .map(|(range, emphasis)| (range, style_for(emphasis)))
+        .map(|(range, emphasis)| (range, style_for(emphasis, metrics)))
         .collect();
 
     StyledText::new(text)
@@ -60,12 +63,12 @@ pub fn render_rich_text(source: &str, cx: &App) -> gpui::AnyElement {
 /// text is painted on three different grounds (the sent bubble's brand hue,
 /// the received bubble, a quote), and a tint chosen here would be checked
 /// against none of them.
-fn style_for(emphasis: Emphasis) -> HighlightStyle {
+fn style_for(emphasis: Emphasis, metrics: crate::theme::Metrics) -> HighlightStyle {
     HighlightStyle {
         font_weight: emphasis.bold.then_some(FontWeight::BOLD),
         font_style: emphasis.italic.then_some(FontStyle::Italic),
         strikethrough: emphasis.strikethrough.then(|| StrikethroughStyle {
-            thickness: px(1.),
+            thickness: metrics.hairline(),
             color: None,
         }),
         ..Default::default()

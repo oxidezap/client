@@ -12,6 +12,50 @@
 //! one add.
 
 use anyhow::{Result, bail};
+
+/// Say once, per format, that a camera handed over more than the geometry
+/// accounts for.
+///
+/// The extra is slack at the end of the buffer in every backend this has been
+/// seen on, and it is read as such. If it is row padding instead, every row
+/// after the first is read a few bytes off and the picture comes out skewed
+/// diagonally with nothing failing anywhere — which is a thing to find in a
+/// log rather than in a screenshot.
+fn warn_once_if_padded(format: Pixels, got: usize, expected: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // One flag each, because the promise above is per format: shared, the
+    // first padded YUYV frame silenced every NV12 and GRAY camera after it.
+    static SAID: [AtomicBool; 3] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
+    if got != expected && !SAID[format as usize].swap(true, Ordering::Relaxed) {
+        let format = format.name();
+        log::warn!(
+            "camera hands over {got} bytes for a {format} frame the geometry accounts for {expected} of; \
+             reading the rows as tightly packed"
+        );
+    }
+}
+
+/// What a camera hands over, for the warning that names it.
+#[derive(Clone, Copy)]
+enum Pixels {
+    Yuyv,
+    Nv12,
+    Gray,
+}
+
+impl Pixels {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Yuyv => "YUYV",
+            Self::Nv12 => "NV12",
+            Self::Gray => "GRAY",
+        }
+    }
+}
 use openh264::formats::{YUVBuffer, YUVSlices};
 
 /// A planar I420 frame, kept as one allocation and reused every frame.
@@ -56,6 +100,15 @@ impl I420Buffer {
     }
 
     /// Packed 4:2:2, two luma samples per `Y0 Cb Y1 Cr` quad.
+    ///
+    /// The row stride is taken to be `width * 2`, which is what the backends
+    /// this runs on hand over. A camera that aligned its rows to something
+    /// wider would be read a few bytes off from the second row on and the
+    /// picture would come out skewed diagonally, with nothing failing — so a
+    /// buffer that is not exactly the size the geometry calls for says so
+    /// once rather than being read in silence. It is not rejected: the slack
+    /// is at the end far more often than it is per row, and refusing there
+    /// would turn a working camera into a call with no picture.
     pub fn read_yuyv(&mut self, src: &[u8]) -> Result<()> {
         let (width, height) = (self.width, self.height);
         let stride = width * 2;
@@ -68,6 +121,7 @@ impl I420Buffer {
                 stride * height
             );
         }
+        warn_once_if_padded(Pixels::Yuyv, src.len(), stride * height);
         let (y_plane, u_plane, v_plane) = self.planes_mut();
         for row in 0..height {
             let src_row = &src[row * stride..row * stride + stride];
@@ -90,6 +144,8 @@ impl I420Buffer {
     }
 
     /// Planar luma followed by interleaved chroma at half resolution.
+    ///
+    /// Reads the luma plane as tightly packed, for the reason above.
     pub fn read_nv12(&mut self, src: &[u8]) -> Result<()> {
         let (width, height) = (self.width, self.height);
         let luma = width * height;
@@ -102,6 +158,7 @@ impl I420Buffer {
                 luma * 3 / 2
             );
         }
+        warn_once_if_padded(Pixels::Nv12, src.len(), luma * 3 / 2);
         let (y_plane, u_plane, v_plane) = self.planes_mut();
         y_plane.copy_from_slice(&src[..luma]);
         for (index, pair) in src[luma..luma * 3 / 2]
@@ -128,6 +185,7 @@ impl I420Buffer {
                 src.len()
             );
         }
+        warn_once_if_padded(Pixels::Gray, src.len(), luma);
         let (y_plane, u_plane, v_plane) = self.planes_mut();
         y_plane.copy_from_slice(&src[..luma]);
         u_plane.fill(128);

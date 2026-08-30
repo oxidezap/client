@@ -22,7 +22,7 @@ use crate::types::{
 ///
 /// SQLite's compiled-in parameter ceiling is 999 on older builds; a page well
 /// under it costs one extra statement per fifty chats at most.
-const BIND_CHUNK: usize = 400;
+pub(crate) const BIND_CHUNK: usize = 400;
 
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(crate::types::clamp_ms(ms))
@@ -475,7 +475,6 @@ impl ChatStore {
         before: Option<MessageCursor>,
         limit: i64,
     ) -> Result<Vec<StoredMessage>> {
-        use schema::messages::dsl;
         let limit = limit.max(0);
         let device_id = self.device_id();
         let chat = chat.to_string();
@@ -484,15 +483,59 @@ impl ChatStore {
             .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                page_query(device_id, &keys, before.as_ref())
-                    .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
-                    .limit(limit)
-                    .load(conn)
-                    .map_err(db_err)
+                fill_unique(conn, device_id, &keys, before, limit)
             })
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
+}
+
+/// One page of `limit` *unique* rows, not `limit` raw ones.
+///
+/// A caller reads a short page as the start of the conversation and stops
+/// asking, so a duplicate collapsed inside the page would end the history at
+/// the split rather than at its beginning — and a page that serves the unread
+/// tail would leave the messages it dropped out of `ReadTracker`, where their
+/// receipts are owed. Each pass costs a query only when the last one collapsed
+/// something, which a merged pair never does.
+///
+/// Both readers go through it: the single chat's page and the batch an attach
+/// load asks for. The batch is where this was missing, which is the shape of
+/// every other defect in this batch — the rule written once and not repeated on
+/// its twin.
+fn fill_unique(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    keys: &[String],
+    before: Option<MessageCursor>,
+    limit: i64,
+) -> std::result::Result<Vec<MessageRow>, wacore::store::error::StoreError> {
+    use schema::messages::dsl;
+    let mut kept: Vec<MessageRow> = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    let mut before = before;
+    while (kept.len() as i64) < limit {
+        let wanted = limit - kept.len() as i64;
+        let rows: Vec<MessageRow> = page_query(device_id, keys, before.as_ref())
+            .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
+            .limit(wanted)
+            .load(conn)
+            .map_err(db_err)?;
+        let exhausted = (rows.len() as i64) < wanted;
+        before = rows.last().map(|row| MessageCursor {
+            timestamp_ms: row.timestamp_ms,
+            seq: row.rowid,
+        });
+        for row in rows {
+            if ids.insert(row.msg_id.clone()) {
+                kept.push(row);
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+    Ok(kept)
 }
 
 /// The rows of one page, before they are ordered and limited.
@@ -549,7 +592,6 @@ impl ChatStore {
         &self,
         wanted: Vec<(Jid, i64)>,
     ) -> Result<HashMap<String, Vec<StoredMessage>>> {
-        use schema::messages::dsl;
         let device_id = self.device_id();
         let wanted: Vec<(String, i64)> = wanted
             .iter()
@@ -559,15 +601,18 @@ impl ChatStore {
             .db()
             .read(move |conn| {
                 let mut pages = HashMap::with_capacity(wanted.len());
+                // Every chat's other identity in one statement. Asked per
+                // chat, this read paid a mapping query for each of them
+                // inside the one snapshot it exists to hold.
+                let chats: Vec<String> = wanted.iter().map(|(chat, _)| chat.clone()).collect();
+                let candidates = crate::lid::chat_key_candidates_batch(conn, device_id, &chats)
+                    .map_err(db_err)?;
                 for (chat, limit) in wanted {
-                    let keys =
-                        crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
-                    let rows: Vec<MessageRow> = dsl::messages
-                        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
-                        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
-                        .limit(limit)
-                        .load(conn)
-                        .map_err(db_err)?;
+                    let keys = candidates
+                        .get(&chat)
+                        .cloned()
+                        .unwrap_or_else(|| vec![chat.clone()]);
+                    let rows = fill_unique(conn, device_id, &keys, None, limit)?;
                     if !rows.is_empty() {
                         pages.insert(chat, rows);
                     }
@@ -782,18 +827,38 @@ impl ChatStore {
         // Grouped here rather than by the query, because the order that
         // matters is the one within a message — the newest reaction from a
         // sender wins — and a chunked read cannot express it across pages.
-        let mut by_message: HashMap<String, Vec<ReactionEntry>> = HashMap::new();
+        // Keyed by sender as well as by message, because the union covers
+        // both halves of a PN/LID pair: until a split is merged the same
+        // person's reaction can exist under either key, and one reactor would
+        // otherwise be drawn twice. The rule is the writer's own — the newest
+        // per sender wins.
+        let mut by_message: HashMap<String, HashMap<String, (i64, ReactionEntry)>> = HashMap::new();
         for (msg_id, sender, emoji, ts) in rows {
-            by_message.entry(msg_id).or_default().push(ReactionEntry {
+            let entry = ReactionEntry {
                 sender_jid: parse_jid(&sender),
                 emoji,
                 timestamp: ms_to_utc(ts).unwrap_or_default(),
-            });
+            };
+            match by_message.entry(msg_id).or_default().entry(sender) {
+                std::collections::hash_map::Entry::Occupied(mut held) => {
+                    if held.get().0 <= ts {
+                        held.insert((ts, entry));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((ts, entry));
+                }
+            }
         }
-        for entries in by_message.values_mut() {
-            entries.sort_by_key(|entry| entry.timestamp);
-        }
-        Ok(by_message)
+        Ok(by_message
+            .into_iter()
+            .map(|(msg_id, senders)| {
+                let mut entries: Vec<ReactionEntry> =
+                    senders.into_values().map(|(_, entry)| entry).collect();
+                entries.sort_by_key(|entry| entry.timestamp);
+                (msg_id, entries)
+            })
+            .collect())
     }
 
     /// Per-user receipts of one message (group "delivered to"/"read by").

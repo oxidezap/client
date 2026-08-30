@@ -8,7 +8,7 @@
 
 use gpui::{
     AnyElement, App, Hsla, IntoElement, ParentElement, Pixels, RenderOnce, SharedString, Styled,
-    Window, div, linear_color_stop, linear_gradient, px,
+    Window, div, linear_color_stop, linear_gradient,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::{Icon, IconName};
@@ -101,7 +101,7 @@ impl RenderOnce for Avatar {
         let top = product.hsla(hue.mix(product.palette.secondary, 0.82));
         let bottom = product.hsla(product.palette.secondary);
 
-        let badge_size = (self.size * 0.28).max(px(10.0));
+        let badge_size = (self.size * 0.28).max(cx.product().metrics.badge_min());
 
         div()
             .relative()

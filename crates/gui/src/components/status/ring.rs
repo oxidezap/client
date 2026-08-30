@@ -57,8 +57,9 @@ pub fn status_ring(
 ) -> impl IntoElement + use<> {
     let lit = cx.theme().primary;
     let spent = cx.product().hsla(cx.product().palette.faint_foreground);
-    let thickness = px(2.0);
-    let gap = px(3.0);
+    let metrics = cx.product().metrics;
+    let thickness = metrics.ring_thickness();
+    let gap = metrics.ring_gap();
     let inner = inner_avatar(size, thickness, gap);
 
     // Loudest for a single update, easing off as they pile up: one is a thing
@@ -88,14 +89,17 @@ pub fn status_ring(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Metrics;
+    use gpui::px;
 
     /// The ring occupies what the caller asked for. Adding the border and its
     /// gap on the outside made the Status list 10px wider per row than the
     /// chat list, so switching destination slid every name sideways.
     #[test]
     fn the_ring_fits_inside_the_size_it_was_given() {
+        let metrics = Metrics::default();
         let size = px(44.0);
-        let inner = inner_avatar(size, px(2.0), px(3.0));
+        let inner = inner_avatar(size, metrics.ring_thickness(), metrics.ring_gap());
 
         assert_eq!(inner, px(34.0));
         assert!(inner < size, "the avatar has to give way to the ring");
@@ -104,6 +108,10 @@ mod tests {
     /// A size smaller than the ring itself must not produce a negative avatar.
     #[test]
     fn an_impossibly_small_ring_still_holds_something() {
-        assert_eq!(inner_avatar(px(4.0), px(2.0), px(3.0)), px(1.0));
+        let metrics = Metrics::default();
+        assert_eq!(
+            inner_avatar(px(4.0), metrics.ring_thickness(), metrics.ring_gap()),
+            px(1.0)
+        );
     }
 }

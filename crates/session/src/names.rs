@@ -118,23 +118,19 @@ impl NameBook {
         offered: Option<&str>,
         identity: &ChatIdentity,
     ) -> (String, u8) {
-        let usable = |name: &&str| {
-            !(name.trim().is_empty() || identity.has_phone && is_masked_phone_label(name))
-        };
-
         if jid.is_pn() || jid.is_lid() {
             for candidate in &identity.contact_jids {
                 if let Some(name) = self
                     .contact_name(store, candidate)
                     .await
-                    .filter(|name| usable(&name.as_str()))
+                    .filter(|name| usable_name(name, identity.has_phone))
                 {
                     return (name, priority::ADDRESS_BOOK);
                 }
             }
         }
 
-        if let Some(name) = offered.filter(usable) {
+        if let Some(name) = offered.filter(|name| usable_name(name, identity.has_phone)) {
             return (name.to_string(), priority::SELF_CHOSEN);
         }
 
@@ -158,10 +154,12 @@ impl NameBook {
         jid: &Jid,
         offered: Option<&str>,
     ) -> Option<String> {
-        let Some(store) = self.chat_store.lock().await.clone() else {
-            return offered.map(str::to_owned);
-        };
         let identity = self.identity(client, jid).await;
+        let Some(store) = self.chat_store.lock().await.clone() else {
+            return offered
+                .filter(|name| usable_name(name, identity.has_phone))
+                .map(str::to_owned);
+        };
         match self.resolve(&store, jid, offered, &identity).await {
             (_, priority::NONE) => None,
             (name, _) => Some(name),
@@ -174,11 +172,17 @@ impl NameBook {
         if let Some(known) = read(&self.contacts, &key) {
             return known;
         }
-        let name = store
-            .contact(jid)
-            .await
-            .ok()
-            .flatten()
+        // An error is not an answer, so it is not written down: memoizing it
+        // would file somebody as nameless for the rest of the session over a
+        // pool that was busy for a moment.
+        let contact = match store.contact(jid).await {
+            Ok(contact) => contact,
+            Err(e) => {
+                warn!("Address book lookup for {} failed: {}", key, e);
+                return None;
+            }
+        };
+        let name = contact
             .and_then(|contact| contact.display_name().map(str::to_owned))
             .filter(|name| !name.trim().is_empty());
         write(&self.contacts, key, name.clone());
@@ -225,6 +229,17 @@ async fn build_identity(client: &Client, jid: &Jid) -> (ChatIdentity, bool) {
     )
 }
 
+/// Whether a name is worth carrying.
+///
+/// One predicate rather than one per caller: the resolution order applies it
+/// to the address book and to the push name, and [`NameBook::known`] applies
+/// it on the path that runs before the chat store exists — where an unfiltered
+/// push name of three spaces used to become somebody's name, and stay it,
+/// since a name only ever gains weight.
+fn usable_name(name: &str, has_phone: bool) -> bool {
+    !(name.trim().is_empty() || has_phone && is_masked_phone_label(name))
+}
+
 /// The server's own stand-in for a number it will not spell out, e.g.
 /// `+55 ·· ···· ··43`. Worse than the number we already hold.
 fn is_masked_phone_label(name: &str) -> bool {
@@ -261,6 +276,16 @@ fn clear<T>(map: &Mutex<HashMap<String, T>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blank_or_masked_push_name_is_not_a_name() {
+        assert!(!usable_name("   ", false));
+        assert!(!usable_name("", true));
+        assert!(!usable_name("+55 ·· ···· ··43", true));
+        // Nothing better is known, so the mask is all there is.
+        assert!(usable_name("+55 ·· ···· ··43", false));
+        assert!(usable_name("Ana", true));
+    }
 
     #[test]
     fn a_masked_label_is_recognised_by_its_dots() {

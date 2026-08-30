@@ -712,7 +712,7 @@ async fn receive_media(
     // staged upload does not advance, so without this the age rule that
     // reclaims an orphan is only reachable through unrelated traffic.
     if let Some(dir) = oxidezap_ipc::media_dir() {
-        crate::media::reclaim_stale_uploads(&dir);
+        crate::media::reclaim_abandoned_writes(&dir);
     }
     respond(stream.get_mut(), 204, "text/plain", origin, b"").await
 }

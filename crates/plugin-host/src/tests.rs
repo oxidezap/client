@@ -1087,6 +1087,24 @@ fn a_plugin_stopped_for_falling_behind_is_offered_nothing_more() {
     }
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(commands.sent().len(), settled, "it is not still working");
+
+    // And it is not merely idle: the channel is closed, which is what wakes
+    // the worker out of `recv` and lets the thread, its `Store`, its linear
+    // memory and everything still queued go. Held open, a plugin that
+    // overflowed — the one holding the most of all of that — kept it until
+    // the daemon shut down.
+    assert!(
+        crate::lock(&plugins.workers[0].queue).is_none(),
+        "a stopped plugin's queue is closed, not left standing"
+    );
+    plugins.workers[0]
+        .thread
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .take()
+        .expect("the worker thread")
+        .join()
+        .expect("it ends on its own");
 }
 
 /// The snprintf contract, both halves: the answer is the value's *full*
@@ -1714,6 +1732,98 @@ const WRITES_A_LOT: &str = r#"(module
         (br $again)))
     (i32.const 0))
 )"#;
+
+/// `create_dir_all` and `set_permissions` both follow a symlink, so a link
+/// left where the state directory goes had the daemon tighten and then write
+/// into somebody else's directory — every plugin's settings with it. The
+/// forged approvals file is barred by the owner check either way; what this
+/// closes is where the writing goes.
+#[cfg(unix)]
+#[test]
+fn a_state_directory_behind_a_symlink_is_not_used() {
+    let dir = TempDir::new("state-link");
+    let elsewhere = dir.0.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("writable");
+    let linked = dir.0.join("state");
+    std::os::unix::fs::symlink(&elsewhere, &linked).expect("link");
+
+    assert_eq!(
+        crate::usable_state_dir(Some(&linked)),
+        None,
+        "a link is not this user's directory, whatever it points at"
+    );
+}
+
+/// And refused *before* anything is written. Both calls that prepare the
+/// directory follow a link, so asking afterwards left the daemon having set
+/// the mode of whatever the link named — a directory chosen by whoever
+/// planted it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_state_directory_is_refused_before_its_target_is_touched() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new("state-link-mode");
+    let elsewhere = dir.0.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("writable");
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let linked = dir.0.join("state");
+    std::os::unix::fs::symlink(&elsewhere, &linked).expect("link");
+
+    assert_eq!(crate::usable_state_dir(Some(&linked)), None);
+
+    let mode = std::fs::metadata(&elsewhere)
+        .expect("still there")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o755,
+        "the target's mode is not this daemon's to change"
+    );
+}
+
+/// A module the loader refuses — this one declares its capabilities twice,
+/// which is refused by design and refused again at every launch — used to
+/// write its settings file first: a serialize, a private write and two syncs
+/// on the startup path, for a plugin that will never be accepted.
+#[test]
+fn a_module_the_loader_refuses_leaves_no_settings_behind() {
+    let dir = TempDir::new("kv-refused");
+    dir.plugin(
+        "twice",
+        &versioned(
+            r#"(module
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_kv_set"       (func $kv_set (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (data (i32.const 200) "k")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $caps (i64.const 16))   ;; caps::STORAGE
+    (drop (call $kv_set (i32.const 200) (i32.const 1) (i32.const 1024) (i32.const 4096)))
+    ;; The second sentence, which is what the loader turns it away for.
+    (call $caps (i64.const 16))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32) (i32.const 0))
+)"#,
+        ),
+    );
+    let state = dir.0.join("state");
+    let published = Published::default();
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state),
+        Arc::new(Recorder::new(Outcome::Accepted)),
+        published.sink(),
+    );
+
+    assert!(plugins.ids().is_empty(), "the loader turned it away");
+    assert!(
+        !state.join("kv-twice.json").exists(),
+        "a module that was refused leaves nothing behind"
+    );
+}
 
 /// The same bound through the real path: a module hammering one key inside a
 /// single call survives it, and what it wrote is on disk once the call has
@@ -2617,6 +2727,30 @@ fn the_minimal_module_in_the_abi_document_loads() {
         surfaces[0].capabilities.is_empty(),
         "asking for nothing is asking for nothing"
     );
+
+    // And the codes it prints are the ones the ABI defines. The document is
+    // the contract for anyone not using the SDK, so a constant that moved
+    // under it is a plugin reading the wrong answer.
+    for (code, name) in [
+        (abi::outcome::ACCEPTED, "ACCEPTED"),
+        (abi::outcome::NO_SESSION, "NO_SESSION"),
+        (abi::outcome::REFUSED, "REFUSED"),
+        (abi::outcome::DENIED, "DENIED"),
+        (abi::outcome::INVALID, "INVALID"),
+        (abi::outcome::STATE, "STATE"),
+    ] {
+        assert!(
+            doc.contains(&format!("| `{code}` | `{name}` |")),
+            "the outcome table does not print {name} as {code}"
+        );
+    }
+
+    // Including the one an allowance that is spent answers with, which the
+    // table used to leave to be discovered.
+    assert!(
+        doc.contains("allowance that is spent answers with"),
+        "the document has to say which code a spent budget answers with"
+    );
 }
 
 /// The document said `oxi_subscribe` and `oxi_request_caps` answer `-5`
@@ -2824,6 +2958,67 @@ fn reading_one_stored_value_over_and_over_runs_out_of_budget() {
 
     plugins.observe(&message("a@s.whatsapp.net", "go"));
     until("the refusal", || commands.sent().len() == 1);
+    assert_eq!(commands.sent()[0].1, "refused");
+}
+
+/// A plugin that asks about long keys and copies nothing back.
+///
+/// `cap == 0` is the "how long is it?" form, so the value is never copied and
+/// only the key spends the allowance. Sends once the host answers `REFUSED`,
+/// and says so if it answers `ABSENT` instead.
+fn asks_about_long_keys() -> String {
+    versioned(
+        r#"(module
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_kv_get"       (func $kv_get (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 8)
+  (data (i32.const 100) "a@s.whatsapp.net")
+  (data (i32.const 150) "refused")
+  (data (i32.const 160) "absent")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $caps (i64.const 17))   ;; caps::SEND | caps::STORAGE
+    (call $subscribe (i64.const 2))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $i i32)
+    (local $n i32)
+    ;; Eight kilobyte keys of zero bytes, asking only for the length: nothing
+    ;; is stored under them, so every answer is a miss and the only thing
+    ;; being spent is the key.
+    (block $done
+      (loop $again
+        (local.set $n
+          (call $kv_get (i32.const 20000) (i32.const 8192) (i32.const 0) (i32.const 0)))
+        (br_if $done (i32.eq (local.get $n) (i32.const -2)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br_if $again (i32.lt_s (local.get $i) (i32.const 400)))))
+    (if (i32.eq (local.get $n) (i32.const -2))
+      (then (drop (call $send (i32.const 100) (i32.const 16) (i32.const 150) (i32.const 7))))
+      (else (drop (call $send (i32.const 100) (i32.const 16) (i32.const 160) (i32.const 6)))))
+    (i32.const 0))
+)"#,
+    )
+}
+
+/// A spent allowance is refused whichever half of the read spent it.
+///
+/// The key is charged before the value is copied, and that check answered
+/// `ABSENT` while the copy answered `REFUSED`. A plugin asking only for
+/// lengths therefore read its own settings as missing, which is the answer
+/// it writes its defaults over the user's own on.
+#[test]
+fn a_key_that_spends_the_allowance_is_refused_rather_than_missing() {
+    let dir = TempDir::new("kv-key-bytes");
+    dir.plugin("asker", &asks_about_long_keys());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    plugins.observe(&message("a@s.whatsapp.net", "go"));
+    until("the answer", || commands.sent().len() == 1);
     assert_eq!(commands.sent()[0].1, "refused");
 }
 

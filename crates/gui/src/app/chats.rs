@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use gpui::Context;
 use oxidezap_core::Chat;
 
 use super::chat_row::ChatRow;
@@ -101,8 +102,6 @@ pub fn survives_complete_load(
 /// feel heavy.
 #[derive(Clone)]
 pub struct ChatListCache {
-    /// Chat count the snapshot was taken at, for invalidation.
-    pub chat_count: usize,
     /// What [`WhatsAppApp::invalidate_chat_cache`] had been called this many
     /// times when the snapshot was taken.
     ///
@@ -186,6 +185,40 @@ impl WhatsAppApp {
         }
         self.chats
             .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
+    }
+
+    /// Put chats into the list, with everything that installing them owes.
+    ///
+    /// One entrance for both: a history load and a page of the sidebar. The
+    /// page went through `merge_chats` alone, so a notice waiting for a group
+    /// that only ever arrives by page stayed parked — and a notice lives in
+    /// no store, so "forever" is not a figure of speech — while the status
+    /// tick was never armed for a broadcast that arrived the same way.
+    ///
+    /// `watched` are the status updates this load says are read, which only a
+    /// load can know: a merge keeps the row this window marked, and afterwards
+    /// the two are indistinguishable.
+    pub(super) fn install_chats(
+        &mut self,
+        chats: Vec<Chat>,
+        watched: &std::collections::HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.merge_chats(chats);
+        // A selection that no longer names a chat is a selection of nothing:
+        // the conversation pane resolves it every frame and would draw the
+        // empty state with no way back on a phone.
+        self.forget_missing_selection();
+        // The merge above took the store's word for every row, and a merge
+        // assembled before a view was written does not carry it.
+        self.restore_watched_status(watched);
+        // Count-based cache guards cannot see reordering or merges.
+        self.invalidate_chat_cache();
+        // Whatever arrived before its conversation did.
+        self.flush_pending_notices(cx);
+        // A status update expires on the clock with nothing arriving to say
+        // so, and this is where the feed that holds one is installed.
+        self.ensure_status_tick(cx);
     }
 }
 

@@ -10,10 +10,24 @@
 //! (`WAWebMessageProcessUtils.selectChatForOneOnOneMessage`): legacy chat ids
 //! stay stable, only brand-new chats are keyed by LID.
 //!
+//! Two questions here look like one and are not. A *chat key* is where rows
+//! live, and it is decided by [`route_chat_key`] with WA Web parity: an
+//! existing thread keeps the key it already has, whichever identity addressed
+//! it, so a legacy conversation stays under its phone number forever. A
+//! *person's* canonical identity is the other question, answered in
+//! `session/names.rs`, which prefers the LID whenever the pair is known. They
+//! disagree on purpose, and neither is the other's answer: `canonical_jid`
+//! must never be used to key a chat, and a chat key says nothing about who
+//! somebody is. What makes the disagreement harmless is that every read here
+//! resolves both halves of the pair.
+//!
 //! The device store's `lid_pn_mapping` table lives in the same database file
 //! and is bidirectional, so both candidate keys of a peer are always
 //! derivable — it already is the alias index WA Web keeps as the chat table's
 //! `accountLid` column, and the chat-store needs no schema of its own.
+
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text};
@@ -21,6 +35,7 @@ use wacore_binary::{Jid, Server};
 
 use crate::schema;
 use crate::store::ChangeSet;
+use crate::types::MessageStatus;
 
 /// Bare 1:1 user chat key — the only namespace with a PN/LID alias. Hosted
 /// and interop namespaces alias differently and are left alone.
@@ -44,15 +59,8 @@ fn chat_key(chat: &str) -> String {
     user_chat(chat).map_or_else(|| chat.to_string(), |jid| jid.to_string())
 }
 
-#[derive(QueryableByName)]
-struct UserRow {
-    #[diesel(sql_type = Text)]
-    user: String,
-}
-
-/// The peer's other identity, from the device store's mapping table. PN
-/// resolves to its most recently updated LID (the same rule as
-/// `SqliteStore::get_pn_mapping`); LID resolves straight to its PN.
+/// The peer's other identity for a wire key, or `None` when the key is not a
+/// 1:1 user chat.
 pub(crate) fn counterpart_chat_key(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -64,35 +72,33 @@ pub(crate) fn counterpart_chat_key(
     counterpart_of(conn, device_id, &jid)
 }
 
-/// [`counterpart_chat_key`] for an already-normalized key, so callers that
-/// need the normalized form themselves don't parse twice.
+/// The peer's other identity, from the device store's mapping table. PN
+/// resolves to its most recently updated LID (the same rule as
+/// `SqliteStore::get_pn_mapping`); LID resolves straight to its PN.
 fn counterpart_of(
     conn: &mut SqliteConnection,
     device_id: i32,
     jid: &Jid,
 ) -> QueryResult<Option<String>> {
-    let (sql, server) = if jid.is_lid() {
-        (
-            "SELECT phone_number AS user FROM lid_pn_mapping \
-             WHERE lid = ? AND device_id = ? LIMIT 1",
-            Server::Pn,
-        )
-    } else {
-        (
-            // The lid tiebreak keeps routing stable when updated_at ties —
-            // flapping between counterpart keys would re-split the thread.
-            "SELECT lid AS user FROM lid_pn_mapping \
-             WHERE phone_number = ? AND device_id = ? \
-             ORDER BY updated_at DESC, lid DESC LIMIT 1",
-            Server::Lid,
-        )
-    };
-    let row: Option<UserRow> = diesel::sql_query(sql)
-        .bind::<Text, _>(jid.user.as_str())
-        .bind::<Integer, _>(device_id)
-        .get_result(conn)
-        .optional()?;
-    Ok(row.map(|r| Jid::new(r.user, server).to_string()))
+    use schema::lid_pn_mapping::dsl;
+    let user = jid.user.as_str();
+    if jid.is_lid() {
+        return Ok(dsl::lid_pn_mapping
+            .filter(dsl::device_id.eq(device_id).and(dsl::lid.eq(user)))
+            .select(dsl::phone_number)
+            .first::<String>(conn)
+            .optional()?
+            .map(|pn| Jid::new(pn, Server::Pn).to_string()));
+    }
+    Ok(dsl::lid_pn_mapping
+        .filter(dsl::device_id.eq(device_id).and(dsl::phone_number.eq(user)))
+        // The lid tiebreak keeps routing stable when updated_at ties —
+        // flapping between counterpart keys would re-split the thread.
+        .order((dsl::updated_at.desc(), dsl::lid.desc()))
+        .select(dsl::lid)
+        .first::<String>(conn)
+        .optional()?
+        .map(|lid| Jid::new(lid, Server::Lid).to_string()))
 }
 
 /// Every key the peer's rows may live under: the given key plus its mapped
@@ -111,6 +117,80 @@ pub(crate) fn chat_key_candidates(
         keys.push(alt);
     }
     Ok(keys)
+}
+
+/// [`chat_key_candidates`] for many chats in one query.
+///
+/// A batched read exists to stop paying a permit, a blocking task and a
+/// snapshot per chat; asking the mapping table per chat inside it puts a
+/// statement per chat straight back, and an attaching front end names a
+/// hundred of them.
+pub(crate) fn chat_key_candidates_batch(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chats: &[String],
+) -> QueryResult<HashMap<String, Vec<String>>> {
+    use schema::lid_pn_mapping::dsl;
+
+    let parsed: Vec<(String, Option<Jid>)> = chats
+        .iter()
+        .map(|chat| (chat.clone(), user_chat(chat)))
+        .collect();
+    let users: Vec<String> = parsed
+        .iter()
+        .filter_map(|(_, jid)| jid.as_ref().map(|jid| jid.user.to_string()))
+        .collect();
+
+    // One pass over the pairs either side of the mapping touches, folded
+    // here under the same rule `counterpart_of` reads with: newest wins, and
+    // the lid breaks a tie so routing cannot flap.
+    let mut pn_to_lid: HashMap<String, (i64, String)> = HashMap::new();
+    let mut lid_to_pn: HashMap<String, String> = HashMap::new();
+    for page in users.chunks(crate::queries::BIND_CHUNK) {
+        let rows: Vec<(String, String, i64)> = dsl::lid_pn_mapping
+            .filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::lid.eq_any(page).or(dsl::phone_number.eq_any(page))),
+            )
+            .select((dsl::lid, dsl::phone_number, dsl::updated_at))
+            .load(conn)?;
+        for (lid, pn, updated_at) in rows {
+            lid_to_pn.insert(lid.clone(), pn.clone());
+            match pn_to_lid.entry(pn) {
+                Entry::Occupied(mut held) => {
+                    if (updated_at, lid.as_str()) > (held.get().0, held.get().1.as_str()) {
+                        held.insert((updated_at, lid));
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert((updated_at, lid));
+                }
+            }
+        }
+    }
+
+    Ok(parsed
+        .into_iter()
+        .map(|(chat, jid)| {
+            let Some(jid) = jid else {
+                let keys = vec![chat.clone()];
+                return (chat, keys);
+            };
+            let mut keys = vec![jid.to_string()];
+            let alt = if jid.is_lid() {
+                lid_to_pn
+                    .get(jid.user.as_str())
+                    .map(|pn| Jid::new(pn.clone(), Server::Pn).to_string())
+            } else {
+                pn_to_lid
+                    .get(jid.user.as_str())
+                    .map(|(_, lid)| Jid::new(lid.clone(), Server::Lid).to_string())
+            };
+            keys.extend(alt);
+            (chat, keys)
+        })
+        .collect())
 }
 
 /// Storage key for a chat addressed as `wire_chat`, WA Web
@@ -257,11 +337,20 @@ pub(crate) fn merge_split_chat(
     .load(conn)?;
     for dup in &dups {
         use schema::messages::dsl;
-        diesel::update(
-            crate::store::message_row(device_id, dest, &dup.id).filter(dsl::status.lt(dup.status)),
-        )
-        .set(dsl::status.eq(dup.status))
-        .execute(conn)?;
+        // By precedence, not by the raw number. `Error` sits below `Pending`
+        // on WhatsApp's own scale, so `<` promoted a send that had failed for
+        // good back to "sending", where nothing would ever move it again.
+        let held: Option<i32> = crate::store::message_row(device_id, dest, &dup.id)
+            .select(dsl::status)
+            .first(conn)
+            .optional()?;
+        if held.is_some_and(|held| {
+            MessageStatus::from_raw(dup.status).wins_over(MessageStatus::from_raw(held))
+        }) {
+            diesel::update(crate::store::message_row(device_id, dest, &dup.id))
+                .set(dsl::status.eq(dup.status))
+                .execute(conn)?;
+        }
         if dup.starred {
             diesel::update(crate::store::message_row(device_id, dest, &dup.id))
                 .set(dsl::starred.eq(true))
