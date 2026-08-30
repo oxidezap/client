@@ -1191,6 +1191,17 @@ calls, keeps plugins, survives the tab and keeps the keys out of a browser's
 storage — but it no longer needs one. The export stays static either way: nothing here needs a
 server to be *hosted*. `.github/workflows/pages.yml` builds and publishes it.
 
+The same bundle ships in every release as `oxidezap-<version>-web.zip`, built
+by `.github/workflows/web-bundle.yml` — so hosting it somewhere else is
+unpacking a directory rather than installing a nightly toolchain and trunk.
+The one difference is the public URL: Pages knows its own directory and bakes
+it into the generated glue, and an archive cannot, so that build is told `./`
+and every asset is named relative to `index.html`. Which is why it is a second
+build rather than a copy of the Pages artifact, and why the workflow asserts
+the relocatability rather than trusting it — an asset named from the origin
+root is a bundle that only works unpacked at a domain's root, and that is the
+one way `--public-url` can silently come out wrong.
+
 The daemon a page runs is the daemon, minus the process:
 `daemon::embedded::start` assembles the state hub and the session bridge and
 hands the front end one end of a `tokio::io::duplex`, which `serve_client`

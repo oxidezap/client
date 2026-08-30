@@ -22,8 +22,14 @@ jobs:
     with:
       version: ${{ inputs.tag || github.ref_name }}
 
+  # The client as a page, packaged so it can be hosted without being built.
+  web:
+    uses: ./.github/workflows/web-bundle.yml
+    with:
+      version: ${{ inputs.tag || github.ref_name }}
+
   publish:
-    needs: build
+    needs: [build, web]
     runs-on: ubuntu-latest
     permissions:
       contents: write
