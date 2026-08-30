@@ -79,6 +79,14 @@ runs the whole client there — the session, the store and the window — under
 your account and nobody else's; the published bundle is still static, because
 nothing about that needs a server.
 
+Open it in as many tabs as you like. One of them holds the account — the
+session, the store and the one writer to it — and the others are windows onto
+that tab, over the same protocol the desktop window speaks to `oxidezapd`
+over. Nothing hands over, nothing disconnects, and closing whichever tab
+happened to be holding it hands the account to one of the others. It is the
+one thing WhatsApp Web will not do, and it costs nothing here because the
+session was never the window's to begin with.
+
 It can attach to an `oxidezapd` on your own machine instead, over a WebSocket
 and speaking the protocol the desktop window already speaks. That is worth
 preferring where you have one: a desktop daemon holds calls, runs your

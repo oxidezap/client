@@ -29,6 +29,8 @@ mod media;
 mod native;
 mod sink;
 #[cfg(target_family = "wasm")]
+mod tab;
+#[cfg(target_family = "wasm")]
 mod web;
 
 use std::collections::HashMap;

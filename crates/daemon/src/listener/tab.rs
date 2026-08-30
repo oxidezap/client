@@ -1,0 +1,383 @@
+//! The daemon's side of the transport between two tabs.
+//!
+//! One tab in an origin holds the account — it won the lock in
+//! `crate::claim` — and it is a daemon in every sense this codebase uses the
+//! word: it owns the session, the store and the media, and it serves front
+//! ends over a protocol. What is new is that the front ends it serves are no
+//! longer only its own window. A second tab is a window with no session,
+//! which is what a desktop front end has always been, and this is the
+//! endpoint it connects to.
+//!
+//! `serve_client` is untouched. It is generic over `AsyncRead + AsyncWrite`,
+//! so a connection here is one end of an in-process duplex with its lines
+//! moved across a `BroadcastChannel` — the same shape as the WebSocket
+//! bridge, which does exactly this over a socket.
+//!
+//! # What one connection costs, and what bounds it
+//!
+//! A duplex, two tasks and a channel, out of the same [`MAX_CLIENTS`] every
+//! other transport draws on: the tasks and the buffers come out of this tab's
+//! memory however a front end arrived. Beyond that the browser's own
+//! structured clone is the per-frame cost, once per connection — which is why
+//! each connection has a channel of its own rather than sharing the
+//! rendezvous, where every frame would be delivered to every tab in the
+//! origin.
+//!
+//! # How a connection ends
+//!
+//! Not by anything sent. A tab that is killed posts no goodbye and a
+//! `BroadcastChannel` has no close event, so the follower holds a lock for as
+//! long as it wants serving and this side waits on it — the browser releases
+//! it when that tab goes, whatever took it away. See
+//! [`oxidezap_ipc::tabs::liveness_lock_for`].
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use oxidezap_ipc::tabs::fields::{
+    bytes as bytes_field, flag as bool_field, number as number_field, set, string as string_field,
+};
+use oxidezap_ipc::tabs::{self, Rendezvous};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use wasm_bindgen::JsCast as _;
+use wasm_bindgen::prelude::Closure;
+use web_sys::{BroadcastChannel, MessageEvent};
+
+use crate::server::MAX_CLIENTS;
+use crate::session_bridge::Commands;
+use crate::state::StateHub;
+
+/// How much of a frame may sit in one connection's pipe before the writer
+/// waits.
+///
+/// Sized as the embedded pipe is, and for the same reason: a history load is
+/// written in one go, and both ends are scheduled cooperatively on this
+/// tab's one agent, so a full pipe is a yield rather than a deadlock.
+const PIPE: usize = 1 << 18;
+
+/// The rendezvous, answered for as long as this is held.
+///
+/// Dropping it stops this tab answering asks and closes the channel. That is
+/// the right behaviour and not merely tidy: what drops it is the session
+/// going away — an account forgotten, a bridge that stopped — and a tab that
+/// no longer has a session must stop offering one. The followers see their
+/// connections end, ask again, and one of them takes the lock.
+pub(crate) struct Serving {
+    channel: BroadcastChannel,
+    /// The handler behind the channel. A `Closure` dropped while the browser
+    /// still holds a reference is a panic rather than a missed call, so it
+    /// lives exactly as long as the channel does and is detached from it
+    /// first.
+    _answering: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        self.channel.set_onmessage(None);
+        self.channel.close();
+    }
+}
+
+/// Start answering the tabs in this origin that have no session.
+///
+/// Returns once the channel is open, which is before any tab has asked.
+/// Announcing on the way up is what makes a takeover quiet: the followers of
+/// a tab that just closed are each sitting on an unanswered ask, and this is
+/// what tells them to ask again rather than wait out their timeout.
+///
+/// # Errors
+///
+/// The browser would not open the channel. Not fatal to the account — this
+/// tab holds the session either way — so the caller logs it and goes on
+/// serving its own window.
+pub(crate) fn serve(
+    hub: &Arc<StateHub>,
+    plugins: &Arc<oxidezap_plugin_host::Plugins>,
+    commands: &Commands,
+) -> Result<Serving, String> {
+    let channel = BroadcastChannel::new(tabs::RENDEZVOUS)
+        .map_err(|e| format!("this browser would not open a channel between tabs: {e:?}"))?;
+
+    // How many front ends this tab is serving besides its own window.
+    //
+    // The window is not counted, because it is not this transport's: it is a
+    // pipe `embedded::start` made, and it is one connection whatever happens
+    // here. What this bounds is the thing that can multiply — a tab in a
+    // reload loop, or a page somebody scripted — and it is the same cap every
+    // other transport draws on rather than a second one beside it.
+    let served = Rc::new(std::cell::Cell::new(0_usize));
+
+    let hub = Arc::clone(hub);
+    let plugins = Arc::clone(plugins);
+    let commands = commands.clone();
+    let rendezvous = channel.clone();
+    let answering = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+        let Some(line) = event.data().as_string() else {
+            return;
+        };
+        let Some(Rendezvous::Ask { ask, .. }) = Rendezvous::decode(&line) else {
+            return;
+        };
+        if served.get() >= MAX_CLIENTS {
+            log::warn!("refusing a tab: already serving {MAX_CLIENTS} front ends");
+            return;
+        }
+        served.set(served.get() + 1);
+        accept(
+            &rendezvous,
+            &ask,
+            Arc::clone(&hub),
+            Arc::clone(&plugins),
+            commands.clone(),
+            Rc::clone(&served),
+        );
+    });
+    channel.set_onmessage(Some(answering.as_ref().unchecked_ref()));
+
+    // Said after the handler is installed, not before: a follower answers
+    // this by asking again, and an ask that arrives before there is anything
+    // listening is one nobody hears.
+    if let Some(line) = (Rendezvous::Leading { v: tabs::VERSION }).encode()
+        && let Err(e) = channel.post_message(&wasm_bindgen::JsValue::from_str(&line))
+    {
+        log::debug!("this tab could not announce that it holds the account: {e:?}");
+    }
+
+    log::info!("serving other tabs of this origin");
+    Ok(Serving {
+        channel,
+        _answering: answering,
+    })
+}
+
+/// Serve one tab.
+fn accept(
+    rendezvous: &BroadcastChannel,
+    ask: &str,
+    hub: Arc<StateHub>,
+    plugins: Arc<oxidezap_plugin_host::Plugins>,
+    commands: Commands,
+    served: Rc<std::cell::Cell<usize>>,
+) {
+    let name = tabs::channel_for(ask);
+    let frames = match BroadcastChannel::new(&name) {
+        Ok(frames) => frames,
+        Err(e) => {
+            log::error!("this browser would not open a channel for a tab: {e:?}");
+            served.set(served.get().saturating_sub(1));
+            return;
+        }
+    };
+
+    let (client, server) = tokio::io::duplex(PIPE);
+    oxidezap_session::spawn(async move {
+        if let Err(e) = crate::server::serve_client(server, hub, plugins, commands).await {
+            log::debug!("a tab disconnected: {e}");
+        }
+    });
+    let (from_server, mut to_server) = tokio::io::split(client);
+
+    // The write half as a queue into the task that owns it, exactly as the
+    // front end's own pipe does it: writing to a duplex is an await, and the
+    // browser hands this side its messages in a callback that cannot wait.
+    let (requests, mut to_write) = tokio::sync::mpsc::unbounded_channel::<String>();
+    oxidezap_session::spawn(async move {
+        while let Some(line) = to_write.recv().await {
+            if to_server.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+        // The client end, dropped. `serve_client` reads EOF and returns,
+        // which is how a connection this side gave up on is torn down at the
+        // other end of the pipe too.
+    });
+
+    // Everything the browser must not collect while the connection is open,
+    // and the one place that lets go of it. The liveness watch below is what
+    // clears it; nothing else here holds a strong reference.
+    let open = Rc::new(RefCell::new(Some(Connection {
+        channel: frames.clone(),
+        _handler: handler(&frames, &requests),
+    })));
+
+    // Reading the pipe and posting what comes out. Ends when `serve_client`
+    // does — an error frame it refused the client with, a `Shutdown`, or the
+    // teardown above.
+    {
+        let frames = frames.clone();
+        let open = Rc::clone(&open);
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut lines = BufReader::new(from_server).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if post_line(&frames, &line).is_err() {
+                    break;
+                }
+            }
+            // Said rather than merely stopped. The other tab is watching a
+            // channel that will simply go quiet otherwise, and a front end
+            // that never learns its connection ended never retries.
+            let _ = post_bye(
+                &frames,
+                "the tab holding this account closed the connection",
+            );
+            open.borrow_mut().take();
+        });
+    }
+
+    // The follower holds this for as long as it wants serving. Granted means
+    // it has gone — closed, crashed, or navigated away — and there is nothing
+    // to say to it.
+    let live = tabs::liveness_lock_for(ask);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = oxidezap_ipc::web_locks::wait_for(&live).await {
+            // Nothing to fall back on, and better said than silently leaked:
+            // without this the connection is held until the session goes.
+            log::warn!("this tab cannot tell when a front end leaves: {e}");
+            return;
+        }
+        open.borrow_mut().take();
+        served.set(served.get().saturating_sub(1));
+        log::debug!("a tab stopped listening");
+    });
+
+    // On the channel this tab is already listening on, rather than a second
+    // object opened to say one thing: a `BroadcastChannel` does not deliver to
+    // the object that posted, so answering here is also what keeps this tab
+    // from hearing its own answer and treating it as traffic.
+    if let Some(line) = (Rendezvous::Serve {
+        v: tabs::VERSION,
+        ask: ask.to_string(),
+        on: name,
+    })
+    .encode()
+        && let Err(e) = rendezvous.post_message(&wasm_bindgen::JsValue::from_str(&line))
+    {
+        log::error!("this tab could not answer another: {e:?}");
+    }
+}
+
+/// One served connection's browser objects.
+struct Connection {
+    channel: BroadcastChannel,
+    _handler: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.channel.set_onmessage(None);
+        self.channel.close();
+    }
+}
+
+/// What a follower says on its own channel, answered.
+fn handler(
+    frames: &BroadcastChannel,
+    requests: &tokio::sync::mpsc::UnboundedSender<String>,
+) -> Closure<dyn FnMut(MessageEvent)> {
+    let frames = frames.clone();
+    let requests = requests.clone();
+    Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+        let data = event.data();
+        let Some(kind) = string_field(&data, "k") else {
+            return;
+        };
+        match kind.as_str() {
+            "line" => {
+                let Some(mut line) = string_field(&data, "s") else {
+                    return;
+                };
+                // The terminator this transport does not carry and the pipe
+                // needs: a channel frames its own messages, a byte stream
+                // does not.
+                line.push('\n');
+                let _ = requests.send(line);
+            }
+            "read" => {
+                let (Some(id), Some(key)) = (number_field(&data, "id"), string_field(&data, "key"))
+                else {
+                    return;
+                };
+                // `deliver` releases the claim a requested download holds
+                // against the sweep, and `read` does not — the same two
+                // answers the tab that owns the cache gives itself, asked
+                // from one connection away.
+                let bytes = if bool_field(&data, "once") {
+                    crate::media::deliver(&key)
+                } else {
+                    crate::media::read(&key)
+                };
+                let _ = match bytes {
+                    Some(bytes) => post_media(&frames, id, &bytes),
+                    None => post_failure(&frames, "media", id, &format!("media {key} is not here")),
+                };
+            }
+            "stage" => {
+                let (Some(id), Some(key), Some(bytes)) = (
+                    number_field(&data, "id"),
+                    string_field(&data, "key"),
+                    bytes_field(&data, "b"),
+                ) else {
+                    return;
+                };
+                let _ = match crate::media::put_owned(&key, bytes) {
+                    Ok(_) => post_staged(&frames, id),
+                    Err(e) => post_failure(&frames, "staged", id, &e.to_string()),
+                };
+            }
+            "discard" => {
+                let Some(key) = string_field(&data, "key") else {
+                    return;
+                };
+                let _ = crate::media::take(&key);
+            }
+            _ => {}
+        }
+    })
+}
+
+fn post_line(frames: &BroadcastChannel, line: &str) -> Result<(), wasm_bindgen::JsValue> {
+    let message = js_sys::Object::new();
+    set(&message, "k", &"line".into())?;
+    set(&message, "s", &line.into())?;
+    frames.post_message(&message)
+}
+
+fn post_bye(frames: &BroadcastChannel, why: &str) -> Result<(), wasm_bindgen::JsValue> {
+    let message = js_sys::Object::new();
+    set(&message, "k", &"bye".into())?;
+    set(&message, "e", &why.into())?;
+    frames.post_message(&message)
+}
+
+fn post_media(
+    frames: &BroadcastChannel,
+    id: u64,
+    bytes: &[u8],
+) -> Result<(), wasm_bindgen::JsValue> {
+    let message = js_sys::Object::new();
+    set(&message, "k", &"media".into())?;
+    set(&message, "id", &(id as f64).into())?;
+    set(&message, "b", &js_sys::Uint8Array::from(bytes).into())?;
+    frames.post_message(&message)
+}
+
+fn post_staged(frames: &BroadcastChannel, id: u64) -> Result<(), wasm_bindgen::JsValue> {
+    let message = js_sys::Object::new();
+    set(&message, "k", &"staged".into())?;
+    set(&message, "id", &(id as f64).into())?;
+    frames.post_message(&message)
+}
+
+fn post_failure(
+    frames: &BroadcastChannel,
+    kind: &str,
+    id: u64,
+    why: &str,
+) -> Result<(), wasm_bindgen::JsValue> {
+    let message = js_sys::Object::new();
+    set(&message, "k", &kind.into())?;
+    set(&message, "id", &(id as f64).into())?;
+    set(&message, "e", &why.into())?;
+    frames.post_message(&message)
+}

@@ -77,6 +77,10 @@ js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+    # The transport between two tabs of one origin: this tab holds the
+    # account, and the others are front ends onto it. See `listener/tab.rs`.
+    "BroadcastChannel",
+    "MessageEvent",
     "Lock",
     "LockManager",
     "LockOptions",
