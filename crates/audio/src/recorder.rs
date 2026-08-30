@@ -366,8 +366,14 @@ mod capture {
             self.stop_draining();
             self.is_recording = false;
 
-            let duration = self.start_time.map_or(Duration::ZERO, |t| t.elapsed());
             let samples = self.samples.lock().map(|b| b.clone()).unwrap_or_default();
+            // From the samples that were kept, never from the wall clock. The
+            // drain stops appending at `max_recording_samples`, so a note left
+            // running past that would otherwise advertise a length its audio
+            // does not have: ten minutes of sound claiming twenty, with the
+            // player's scrubber over silence that is not there.
+            let duration =
+                Duration::from_secs_f64(samples.len() as f64 / f64::from(self.sample_rate.max(1)));
 
             info!(
                 "Recording stopped: {} samples, {:.1}s",
@@ -400,6 +406,25 @@ mod capture {
             };
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
+        }
+    }
+
+    impl Drop for AudioRecorder {
+        /// A recorder that is simply let go still has a thread in it.
+        ///
+        /// The drain leaves only on its stop flag: dropping the stream drops
+        /// the ring's producer, which the loop does not watch, so it goes on
+        /// waking every 20 ms for ever, holding the ring and the capture. The
+        /// two ways out of a recording -- `stop` and `cancel` -- both raise
+        /// the flag, and this is the third: a window closed mid-recording, or
+        /// a `RecorderError` on a path that returns the recorder rather than
+        /// cancelling it.
+        fn drop(&mut self) {
+            // Before the drain, for the reason `stop` does it in this order:
+            // nothing more is captured, and what is in the ring is drained
+            // rather than abandoned.
+            self.stream.take();
+            self.stop_draining();
         }
     }
 

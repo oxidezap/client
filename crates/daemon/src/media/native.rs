@@ -185,32 +185,23 @@ pub fn has(key: &str) -> bool {
 /// attachment written into it. And the keys here are derived from content the
 /// account has already published, which makes them predictable: a file left
 /// under one while the directory was open is served as the attachment it
-/// names. The cache is the one thing here that can simply be thrown away —
-/// every entry is re-fetchable, and the renderer already draws media it does
-/// not hold as an offer to download — so a directory found open is emptied
-/// rather than inherited.
+/// names. So a directory found open is swept of what this daemon did not write,
+/// which is the whole of what an open directory can have gained.
 fn prepare_dir(dir: &std::path::Path) -> Result<()> {
     if crate::private_dir::prepare(dir, "cached media")? == crate::private_dir::Found::WasOpen {
         log::warn!(
-            "{} was reachable by other accounts on this machine; dropping what is in it",
+            "{} was reachable by other accounts on this machine; dropping what this daemon did not put there",
             dir.display()
         );
-        clear_dir(dir)?;
-    }
-    Ok(())
-}
-
-/// Empty a directory without removing it, so a caller that has just made it
-/// private keeps the private directory it made.
-fn clear_dir(dir: &std::path::Path) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let path = entry?.path();
-        let removed = if path.is_dir() && !path.is_symlink() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        removed.with_context(|| format!("removing {}", path.display()))?;
+        // What another account left, and only that. Emptying the directory was
+        // the wrong shape of the same sentence: this runs on the first cache
+        // write, the front end's own `stage` creates the directory with
+        // `create_dir_all` and so with the umask's mode, and the sweep then
+        // deleted the `u-` payload of a recording the send had not run yet --
+        // which is the one thing under this roof with no other copy. Ownership
+        // is the exact test, and a planted file is owned by whoever planted
+        // it: the same sweep the plugin directory takes.
+        crate::private_dir::drop_foreign_entries(dir)?;
     }
     Ok(())
 }
@@ -329,4 +320,39 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The front end's own `stage` makes this directory with `create_dir_all`,
+    /// which is the umask's mode and not `0700`, so the daemon's first cache
+    /// write finds it open. Emptying it there deleted the staged payload of a
+    /// recording whose send had not run yet: the send then failed with the
+    /// only copy of the note gone.
+    #[test]
+    fn repairing_the_cache_keeps_a_recording_waiting_to_be_sent() {
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-media-repair-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let staged = dir.join("u-local_audio_1");
+        std::fs::write(&staged, b"a voice note").unwrap();
+
+        super::prepare_dir(&dir).unwrap();
+
+        assert!(staged.exists(), "the only copy of the note is still there");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "and the directory was still tightened"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

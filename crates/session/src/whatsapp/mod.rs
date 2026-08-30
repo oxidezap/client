@@ -661,6 +661,10 @@ impl WhatsAppClient {
             let names = names.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
+                // The dispatch loop's own handle. The one below is moved into
+                // the per-event closure, and what this asks the client is the
+                // PN/LID pairing that decides the lane.
+                let dispatch_client = client.clone();
                 let mut lanes = EventLanes::new(
                     move |event| {
                         let client = client.clone();
@@ -693,7 +697,7 @@ impl WhatsAppClient {
                     // nothing to say — the arms below speak only for the
                     // variants they handle.
                     debug!("client event: {:?}", event.kind());
-                    lanes.dispatch(event);
+                    lanes.dispatch(&dispatch_client, event).await;
                 }
             });
         }
@@ -1089,6 +1093,16 @@ impl WhatsAppClient {
         // the chat store materializes them durably (a reload shows the right
         // state), so don't fabricate a "[Media]" bubble under their own id.
         if base_msg.protocol_message.is_set() {
+            return;
+        }
+
+        // The same question the store asks, so a live conversation and a
+        // reloaded one agree. A poll update, an encrypted reaction or comment,
+        // a pin or a keep-in-chat carries nothing to draw: published live it
+        // is a `[Media]` bubble with an unread badge, and the store writes no
+        // row for it, so it vanishes at the next hydration having already
+        // raised a count nothing sent a receipt for.
+        if oxidezap_chat_store::is_control_only(msg) {
             return;
         }
 
@@ -3085,7 +3099,7 @@ impl EventLanes {
         Self { lanes }
     }
 
-    fn dispatch(&mut self, event: Arc<Event>) {
+    async fn dispatch(&mut self, client: &Client, event: Arc<Event>) {
         // A batch may span chats, and a lane is one chat's order: sent whole
         // on the first message's lane, a receipt for a later chat in it runs
         // on that chat's own lane and can overtake the message it answers.
@@ -3093,7 +3107,8 @@ impl EventLanes {
         // else about that chat, and two chats in one batch were never ordered
         // against each other.
         for event in split_by_subject(&event) {
-            let _ = self.lanes[lane_for(&event)].send(event);
+            let lane = lane_for(client, &event).await;
+            let _ = self.lanes[lane].send(event);
         }
     }
 }
@@ -3136,8 +3151,28 @@ fn split_by_subject(event: &Arc<Event>) -> Vec<Arc<Event>> {
 }
 
 /// Which lane an event is handled on. Same subject, same lane.
-fn lane_for(event: &Event) -> usize {
-    match event_subject(event) {
+///
+/// The address is canonicalized first, which is the whole reason this is not
+/// a pure function of the event. The wire names one peer two ways and the two
+/// hash to different lanes, so a message under a phone number and its receipt
+/// under the LID were handled concurrently: the receipt could overtake the
+/// message it answers -- most easily while that message waits on an eager
+/// media fetch -- and a front end drops a receipt naming a row it has not
+/// been given yet. The library keeps the pairing in memory in front of its
+/// store, so this is a map read for a peer already seen and not asked at all
+/// of a LID.
+async fn lane_for(client: &Client, event: &Event) -> usize {
+    let subject = match event_subject(event) {
+        Some(Subject::Call(id)) => Some(id),
+        Some(Subject::Chat(jid)) => Some(normalize_chat_jid(client, &jid.to_string()).await),
+        None => None,
+    };
+    lane_of(subject.as_deref())
+}
+
+/// The lane a subject hashes to, or the session-wide one for no subject.
+fn lane_of(subject: Option<&str>) -> usize {
+    match subject {
         Some(subject) => {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&subject, &mut hasher);
@@ -3151,18 +3186,41 @@ fn lane_for(event: &Event) -> usize {
 ///
 /// A call or a chat. `None` is a session-wide event, which is about the
 /// account rather than about anything in it.
-fn event_subject(event: &Event) -> Option<String> {
+enum Subject {
+    Call(String),
+    Chat(Jid),
+}
+
+fn event_subject(event: &Event) -> Option<Subject> {
     match event {
-        Event::IncomingCall(call) => Some(call.action.call_id().to_string()),
-        Event::MissedCall(missed) => Some(missed.call_id.clone()),
-        Event::CallEndedElsewhere(ended) => Some(ended.call_id.clone()),
+        Event::IncomingCall(call) => Some(Subject::Call(call.action.call_id().to_string())),
+        Event::MissedCall(missed) => Some(Subject::Call(missed.call_id.clone())),
+        Event::CallEndedElsewhere(ended) => Some(Subject::Call(ended.call_id.clone())),
         Event::Messages(batch) => batch
             .iter()
             .next()
-            .map(|inbound| inbound.info.source.chat.to_string()),
-        Event::Receipt(receipt) => Some(receipt.source.chat.to_string()),
-        Event::ChatPresence(update) => Some(update.source.chat.to_string()),
+            .map(|inbound| Subject::Chat(inbound.info.source.chat.clone())),
+        Event::Receipt(receipt) => Some(Subject::Chat(receipt.source.chat.clone())),
+        Event::ChatPresence(update) => Some(Subject::Chat(update.source.chat.clone())),
+        // Both name somebody, and both handlers go to the store for a name or
+        // an identity. On the session-wide lane a burst of either delayed
+        // `Connected`, `PairingQrCode` and `LoggedOut` behind it, which are
+        // the events a window is waiting on to draw anything at all.
+        Event::Presence(update) => Some(Subject::Chat(update.from.clone())),
+        Event::GroupUpdate(update) => Some(Subject::Chat(update.group_jid.clone())),
         _ => None,
+    }
+}
+
+impl Subject {
+    /// The address, before canonicalization. For tests and for logging: a
+    /// lane is chosen from the canonical form, which needs the client.
+    #[cfg(test)]
+    fn as_written(&self) -> String {
+        match self {
+            Self::Call(id) => id.clone(),
+            Self::Chat(jid) => jid.to_string(),
+        }
     }
 }
 
@@ -3643,7 +3701,18 @@ mod tests {
             whatsapp_rust::wacore::types::call::MissedReason::Offline,
         ));
 
-        assert_eq!(super::lane_for(&offer), super::lane_for(&missed));
+        assert_eq!(
+            super::lane_of(
+                super::event_subject(&offer)
+                    .map(|s| s.as_written())
+                    .as_deref()
+            ),
+            super::lane_of(
+                super::event_subject(&missed)
+                    .map(|s| s.as_written())
+                    .as_deref()
+            ),
+        );
     }
 
     /// A batch can span chats — the store's own fixtures build one over a
@@ -3690,7 +3759,7 @@ mod tests {
         assert_eq!(parts.len(), 3, "one per chat it is about");
         let mut subjects: Vec<String> = parts
             .iter()
-            .filter_map(|part| super::event_subject(part))
+            .filter_map(|part| super::event_subject(part).map(|s| s.as_written()))
             .collect();
         subjects.sort();
         assert_eq!(subjects, chats);
@@ -3719,6 +3788,7 @@ mod tests {
                 "MSG-LANE",
                 1_700_000_000
             ))
+            .map(|s| s.as_written())
             .as_deref(),
             Some(TEST_PEER)
         );
@@ -3729,8 +3799,35 @@ mod tests {
                 "MSG-LANE-2",
                 1_700_000_000,
             ))
+            .map(|s| s.as_written())
             .as_deref(),
             Some("120363000000000001@g.us")
+        );
+
+        // Presence is about a person and a group update about a group, and
+        // both handlers go to the store. On the session-wide lane a burst of
+        // either queued in front of `Connected`, `PairingQrCode` and
+        // `LoggedOut` -- the events a window waits on to draw anything.
+        let presence = whatsapp_rust::wacore::types::events::Event::Presence(
+            whatsapp_rust::wacore::types::events::PresenceUpdate::builder()
+                .from(TEST_PEER.parse().unwrap())
+                .unavailable(false)
+                .build(),
+        );
+        assert_eq!(
+            super::event_subject(&presence)
+                .map(|s| s.as_written())
+                .as_deref(),
+            Some(TEST_PEER)
+        );
+        assert_ne!(
+            super::lane_of(
+                super::event_subject(&presence)
+                    .map(|s| s.as_written())
+                    .as_deref()
+            ),
+            super::lane_of(None),
+            "and so is not on the account's own lane"
         );
     }
 

@@ -183,6 +183,11 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
                 return Ok(stream);
             }
             Err(e) if wacore::time::Instant::now() >= deadline => {
+                // The last one this call started, on the way out. Dropping a
+                // `Child` waits for nothing: on unix the process stays a
+                // zombie until this window exits, and the error screen retries
+                // startup, so repeated failures accumulate them.
+                reap(started.take());
                 return Err(std::io::Error::other(format!(
                     "no daemon listening on {} after {START_TIMEOUT:?}: {e}",
                     path.display()
