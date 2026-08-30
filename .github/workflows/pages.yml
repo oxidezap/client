@@ -132,6 +132,33 @@ jobs:
           echo "bundle contents:"
           ls -lh web/dist
 
+      # The number a regression shows up in. Everything above proves the
+      # bundle is *complete*; nothing proved it was not twice the size it was
+      # last week, and a module a visitor downloads before the first pixel is
+      # the one measurement this build can take for free.
+      #
+      # Printed to the step summary rather than asserted against a threshold:
+      # a build that fails because a legitimate feature cost 200 KB teaches
+      # people to raise the number, and the useful signal is the trend beside
+      # the diff that caused it.
+      - name: Say how big it came out
+        run: |
+          set -eu
+          wasm=$(ls web/dist/*_bg.wasm)
+          bytes=$(stat -c%s "$wasm")
+          gzip=$(gzip -9 -c "$wasm" | wc -c)
+          {
+            echo "### Bundle size"
+            echo ""
+            echo "| | bytes | MiB |"
+            echo "|---|---:|---:|"
+            printf '| `%s` | %s | %s |\n' \
+              "$(basename "$wasm")" "$bytes" "$(awk "BEGIN{printf \"%.2f\", $bytes/1048576}")"
+            printf '| the same, gzipped (what Pages serves) | %s | %s |\n' \
+              "$gzip" "$(awk "BEGIN{printf \"%.2f\", $gzip/1048576}")"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "wasm: $bytes bytes, $gzip gzipped"
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bundle

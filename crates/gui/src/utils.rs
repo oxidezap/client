@@ -130,6 +130,39 @@ pub fn format_time_local(timestamp: &DateTime<Utc>) -> String {
     local.format("%H:%M").to_string()
 }
 
+/// Whether `haystack` contains `needle`, ignoring case, without allocating.
+///
+/// `needle` must already be lowercase — the search box lowercases what was
+/// typed once, when it is typed. The haystack is what cannot be prepared:
+/// it is a chat's name and JID, and the sidebar asks this of every chat it
+/// holds on every frame. `to_lowercase()` there is two `String`s per chat per
+/// frame for a question whose answer is almost always "no" by the second
+/// character.
+///
+/// Case folding is per character, which is what `char::to_lowercase` does and
+/// is very slightly less than `str::to_lowercase` promises: Greek final sigma
+/// is decided by its position in the word, and this cannot see the word. A
+/// search box is the right place to spend that.
+pub fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.char_indices().any(|(at, _)| {
+        let mut want = needle.chars();
+        let mut have = haystack[at..].chars().flat_map(char::to_lowercase);
+        loop {
+            match (want.next(), have.next()) {
+                // Every character of the needle matched.
+                (None, _) => return true,
+                // The haystack ran out first.
+                (Some(_), None) => return false,
+                (Some(w), Some(h)) if w != h => return false,
+                _ => {}
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{mime_to_image_format, scale_media_dimensions};
@@ -193,5 +226,31 @@ mod tests {
         // 10:1 stays 10:1; the floor grow stops at max_size instead of
         // stretching only the short side (the old per-axis behavior).
         assert_close(scale_media_dimensions(200, 20, 300.0), (300.0, 30.0));
+    }
+}
+
+#[cfg(test)]
+mod case_insensitive_search {
+    use super::contains_ignore_case;
+
+    #[test]
+    fn it_agrees_with_the_allocating_form() {
+        for (haystack, needle) in [
+            ("Ana Paula", "ana"),
+            ("Ana Paula", "PAULA"),
+            ("Ana Paula", "paulo"),
+            ("ÅNGSTRÖM", "ngström"),
+            ("grupo do prédio", "prédio"),
+            ("", "a"),
+            ("a", ""),
+            ("5511999999999@s.whatsapp.net", "9999"),
+        ] {
+            let lowered = needle.to_lowercase();
+            assert_eq!(
+                contains_ignore_case(haystack, &lowered),
+                haystack.to_lowercase().contains(&lowered),
+                "{haystack:?} contains {needle:?}"
+            );
+        }
     }
 }

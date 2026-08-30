@@ -33,7 +33,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Ordered maps for deterministic cache eviction
 indexmap = "2"
 log = { workspace = true }
-mp4 = "0.14"
 
 oxidezap-audio = { workspace = true }
 oxidezap-core = { workspace = true }
@@ -55,11 +54,6 @@ smallvec = "1"
 # which is all the window ever used it for besides timers — and the only half
 # that builds for a page, since `smol`'s timer is an epoll loop.
 futures-lite = { version = "2", default-features = false, features = ["std"] }
-# Decodes the AAC track lifted out of an MP4 video. The container is demuxed by
-# the `mp4` crate and voice notes are Opus (handled in `oxidezap-audio`), so
-# only the AAC codec and the ISO-MP4 reader are reachable from here. Every
-# other format symphonia can register is dead weight in the probe tables.
-symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 # Channels only. The session runs in another process now, so nothing here
 # needs a runtime to drive it.
 tokio = { workspace = true, features = ["sync"] }
@@ -79,6 +73,19 @@ wacore-binary = { workspace = true }
 # environment variable to read a log filter out of.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 env_logger = "0.11"
+# The video's own audio track: `mp4` demuxes the container and `symphonia`
+# decodes the AAC out of it. Both are here rather than above because the only
+# caller is `video/streaming.rs`, which needs `openh264` — a C decoder — and
+# so is a desktop path from end to end. Voice notes are Opus and live in
+# `oxidezap-audio`, so only the AAC codec and the ISO-MP4 reader are ever
+# reachable; every other format symphonia can register is dead weight in the
+# probe tables.
+#
+# `mp4` comes back for every target the day a page demuxes for
+# `web_sys::VideoDecoder`: the container was never the problem there, the
+# codec was.
+mp4 = "0.14"
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 # Timers, on a platform that has a reactor to run them on.
 smol = "2"
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }

@@ -20,12 +20,10 @@ use super::{Wipe, is_staged_upload};
 
 /// How much media the page may hold before the oldest is dropped.
 ///
-/// Two orders of magnitude under the daemon's, and for a different reason.
-/// The daemon spends disk, which is cheap and outlives it; this is the wasm
-/// heap, which is bounded by the module's own maximum and shared with
-/// everything the interface is drawing. A cache that spent it would not be a
-/// slow page — it would be an allocation failure with no way back.
-const CACHE_BUDGET_BYTES: u64 = 48 * 1024 * 1024;
+/// [`WEB_MEDIA_BUDGET_BYTES`] is where the number and the reasoning live: the
+/// page's three media budgets are three ceilings on one heap, so they are one
+/// number or they are their sum.
+use oxidezap_core::WEB_MEDIA_BUDGET_BYTES as CACHE_BUDGET_BYTES;
 
 /// One entry, and when it was last useful.
 struct Entry {

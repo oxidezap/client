@@ -296,7 +296,7 @@ pub fn render_connected_view(
             } else {
                 el.child(render_chat_area(
                     ChatAreaProps {
-                        selected_chat: selected_chat.as_ref(),
+                        selected_chat: selected_chat.as_deref(),
                         message_cache,
                         banner,
                         typing: typing.as_ref(),
