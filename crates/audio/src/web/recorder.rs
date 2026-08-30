@@ -460,18 +460,6 @@ async fn encode(samples: Vec<f32>, sample_rate: u32) -> Result<EncodedNote, Reco
     let waveform = crate::waveform::generate_waveform(&at_target);
 
     let packets = encode_opus(&at_target).await?;
-    // The same rule the desktop encoder follows, and the reason the check is
-    // shared: where the final frame's zero-padding cannot absorb the
-    // pre-skip — and an exact 20ms multiple has no padding at all — the
-    // packets stop short of the granule the header promises, and a decoder
-    // trims into real audio. One more encoded frame of silence covers it.
-    let packets = if crate::ogg_opus::needs_trailing_silence(packets.len(), at_target.len()) {
-        let mut padded = packets;
-        padded.extend(encode_opus(&vec![0.0; crate::ogg_opus::FRAME_SIZE_SAMPLES]).await?);
-        padded
-    } else {
-        packets
-    };
     let bytes = crate::ogg_opus::package(packets, at_target.len()).map_err(|e| {
         RecorderError::DeviceError(format!("the voice note would not package: {e}"))
     })?;
@@ -492,12 +480,26 @@ async fn encode_opus(samples: &[f32]) -> Result<Vec<Vec<u8>>, RecorderError> {
 
     let on_output = {
         let packets = Rc::clone(&packets);
+        let failure = Rc::clone(&failure);
         Closure::<dyn FnMut(web_sys::EncodedAudioChunk)>::new(
             move |chunk: web_sys::EncodedAudioChunk| {
                 let size = chunk.byte_length() as usize;
                 let mut packet = vec![0u8; size];
-                if chunk.copy_to_with_u8_slice(&mut packet).is_ok() {
-                    packets.borrow_mut().push(packet);
+                // A packet that will not copy is a hole in the stream, and a
+                // hole is not something packaging can see: it counts the
+                // *samples* captured, so the header goes on promising a
+                // granule the packets no longer reach. Skipping it quietly
+                // sent a voice note that plays short or not at all, and the
+                // encode reported success. Recorded so the flush below can
+                // refuse the whole recording.
+                match chunk.copy_to_with_u8_slice(&mut packet) {
+                    Ok(()) => packets.borrow_mut().push(packet),
+                    Err(e) => {
+                        let mut failure = failure.borrow_mut();
+                        if failure.is_none() {
+                            *failure = Some(format!("an encoded packet could not be read: {e:?}"));
+                        }
+                    }
                 }
             },
         )
@@ -532,7 +534,28 @@ async fn encode_opus(samples: &[f32]) -> Result<Vec<Vec<u8>>, RecorderError> {
     // WhatsApp accepts as one.
     let mut micros: i32 = 0;
     let frame_micros = (1_000_000 * FRAME_SIZE_SAMPLES as i32) / TARGET_SAMPLE_RATE as i32;
-    for chunk in samples.chunks(FRAME_SIZE_SAMPLES) {
+
+    // The same rule the desktop encoder follows, and the reason the check is
+    // shared: where the final frame's zero-padding cannot absorb the
+    // pre-skip, and an exact 20ms multiple has no padding at all, the packets
+    // stop short of the granule the header promises and a decoder trims into
+    // real audio. One more encoded frame of silence covers it.
+    //
+    // Fed to *this* encoder, before its flush, which is what the desktop
+    // does. Encoding it separately afterwards produced a packet from a second
+    // encoder's own beginning rather than a flush of this one's buffered
+    // tail, so the note lost about a pre-skip of what was actually said. The
+    // count is predicted rather than measured because Opus answers one packet
+    // per frame at a fixed frame size, which is the same equality the desktop
+    // relies on by counting the packets it has just produced.
+    let frames = samples.len().div_ceil(FRAME_SIZE_SAMPLES);
+    let silence = crate::ogg_opus::needs_trailing_silence(frames, samples.len())
+        .then(|| vec![0.0f32; FRAME_SIZE_SAMPLES]);
+
+    for chunk in samples
+        .chunks(FRAME_SIZE_SAMPLES)
+        .chain(silence.iter().map(Vec::as_slice))
+    {
         let mut frame = chunk.to_vec();
         frame.resize(FRAME_SIZE_SAMPLES, 0.0);
         let data = js_sys::Float32Array::from(frame.as_slice());
