@@ -1935,15 +1935,20 @@ fn a_plugin_hammering_its_store_costs_one_write_and_keeps_running() {
     );
 
     plugins.observe(&message("a@s.whatsapp.net", "go"));
+    published.settles("the plugin to be listed", |s| !s.is_empty());
+    // The write happens as the call returns, on the plugin's own thread —
+    // waited for with a deadline rather than slept over, which is what the
+    // rest of this file does and for the stated reason. Five hundred
+    // interpreted `oxi_kv_set` calls take a few milliseconds on a quiet
+    // machine and rather more on a loaded two-core runner, so a fixed wait
+    // is a test that passes here and fails there.
+    until("the call to return and write what it kept", || {
+        state.join("kv-busy.json").exists()
+    });
     let surfaces = published.settles("the plugin to be listed", |s| !s.is_empty());
-    std::thread::sleep(Duration::from_millis(400));
     assert!(
         surfaces[0].is_running(),
         "five hundred sets in one call is not a reason to stop it"
-    );
-    assert!(
-        state.join("kv-busy.json").exists(),
-        "and the call returning wrote what it kept"
     );
 }
 
