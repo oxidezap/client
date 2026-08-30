@@ -240,10 +240,14 @@ files:
 - **Only `main` writes.** A pull request restores and never saves, or every
   branch would push out the one entry every other branch restores from.
 - **A job that is nobody's critical path does not cache a target directory.**
-  `build.yml` produces the nightly binaries under fat LTO for three platforms;
-  its three entries were the largest in the repository and they were evicting
-  the ones every pull request reads. It keeps the registry and the git
-  checkouts (`cache-targets: false`) and recompiles the rest.
+  The five entries the other workflows write come to 8 GB of the 10 —
+  2.17 GB for the Linux `Check`, 2.07 for Windows, 1.64 for macOS, 0.87 for
+  MSRV, 1.14 for `pages-wasm`, each read off its own upload log — and
+  `build.yml` wrote three more on top, one release target directory per
+  platform under fat LTO. There is no version of that which fits, so it keeps
+  the registry and the git checkouts (`cache-targets: false`) and recompiles
+  the rest. Its Windows job was spending 9m15 of a 17m45 run moving that cache
+  around (2m05 down, 7m10 up), which is the shape of the thing being given up.
 
 The other half is how big an entry is, because the download and the upload are
 themselves a minute each. What rust-cache stores is the *dependencies* — it

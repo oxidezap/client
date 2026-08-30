@@ -73,22 +73,36 @@ jobs:
       # The registry and the git checkouts, and deliberately not `target/`.
       #
       # A repository gets 10 GB of Actions cache in total and GitHub evicts the
-      # least recently used entry to stay under it. Every push to `main` writes
-      # nine entries between them — five from `ci.yml`, one from `pages.yml`
-      # and three from here — and this job's three are by some way the largest,
-      # because a release target directory is fat LTO with `codegen-units = 1`
-      # for three platforms. They were pushing `ci.yml`'s out: across the runs
-      # sampled while writing this, the macOS and Windows `Check` jobs restored
-      # nothing on every pull request, which is what turned a 3m49 Windows job
-      # on `main` into 12m26 on the pull request twenty minutes later.
+      # least recently used entry to stay under it. What the other workflows
+      # write on a push to `main`, read off their own upload logs:
       #
-      # So this job keeps the half of the cache that is cheap — the crates.io
-      # registry and the `whatsapp-rust` git checkout — and gives up the half
-      # that is expensive. What it loses is the dependency compile of a release
-      # build, on a job that is nobody's critical path and whose wall clock is
-      # mostly a fat LTO link that was never cached anyway. What every pull
-      # request gains is a warm cache on the two platforms where a cold one
-      # costs eight minutes.
+      #   ci.yml   Check (Linux)     2.17 GB
+      #   ci.yml   Check (Windows)   2.07 GB
+      #   ci.yml   Check (macOS)     1.64 GB
+      #   ci.yml   MSRV              0.87 GB
+      #   pages.yml pages-wasm       1.14 GB
+      #
+      # Which is already 8 GB before this job writes a byte, and this job
+      # writes three more — a release target directory under fat LTO with
+      # `codegen-units = 1`, per platform. So the budget was being overrun on
+      # every push, and what went missing rotated: across the pull requests
+      # sampled while writing this, the macOS and Windows `Check` jobs
+      # restored nothing on any of them, which is what turned a 3m49 Windows
+      # job on `main` into 12m26 on the pull request twenty minutes later.
+      #
+      # There is no version of this that keeps all three. So this job keeps the
+      # half of the cache that is cheap — the crates.io registry and the
+      # `whatsapp-rust` git checkout — and gives up the half that is over
+      # budget.
+      #
+      # It is a real trade rather than a free win, and the Windows job is where
+      # it is worth stating: with its cache it restored for 2m05, built for
+      # 7m51, and then spent 7m10 uploading — 9m15 of a 17m45 job moving a
+      # cache around. Cold, it loses the 7m51 and gains a full release
+      # compile; whether that job comes out ahead or behind is not something
+      # this change can predict, and it is the one job here that nobody is
+      # waiting on. What every pull request gains is not in doubt: a warm cache
+      # on the two platforms where a cold one costs eight minutes.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
