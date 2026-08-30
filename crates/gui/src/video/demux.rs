@@ -18,6 +18,21 @@ pub(super) struct H264Sample {
     pub is_keyframe: bool,
 }
 
+/// The most samples a track may declare before it is refused.
+///
+/// A file's length is not the bound it looks like. `stsz` can declare a
+/// *fixed* sample size of one byte, so a file inside the page's media budget
+/// still names tens of millions of samples, and the cost is not the payload
+/// but the bookkeeping: one `Vec` per sample is twenty-four bytes of metadata
+/// before a byte of it is read, which turns a 48 MiB attachment into more than
+/// a gigabyte and aborts a linear memory that has a ceiling.
+///
+/// A million is far past anything anybody sends: over nine hours of video at
+/// 30 fps, and more than five of audio at the 47 AAC frames a second 48 kHz
+/// gives. What it buys is that the metadata is bounded in the tens of
+/// megabytes whatever the file claims.
+pub(super) const MAX_TRACK_SAMPLES: usize = 1_000_000;
+
 /// Rewrite AVCC length-prefixed units as Annex B start-code units.
 ///
 /// `nal_length_size` is the container's, and it is 1, 2 or 4: assuming 4

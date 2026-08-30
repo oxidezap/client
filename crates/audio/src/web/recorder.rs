@@ -241,9 +241,29 @@ impl AudioRecorder {
         };
         self.recording = true;
 
+        // Built here, in the gesture, and not after the permission prompt.
+        // A browser grants an audio context permission to run only under a
+        // transient user activation, and `getUserMedia` is a dialog somebody
+        // takes seconds to answer — so a context constructed on the far side
+        // of that await can be born suspended. What that looks like is not an
+        // error: the permission is granted, the tracks are live, the node is
+        // connected, and `onaudioprocess` simply never fires, so stopping
+        // reports a microphone that produced nothing.
+        //
+        // The same reason the video path calls `unlock` before it downloads.
+        let context = web_sys::AudioContext::new().map_err(|e| {
+            self.recording = false;
+            RecorderError::DeviceError(format!("no audio context to record with: {e:?}"))
+        })?;
+        // Suspended is the state this is here to leave, and the answer is a
+        // promise nothing waits on: by the time it resolves the microphone is
+        // still opening, and a context that was already running ignores it.
+        let _ = context.resume();
+        let context = Closing(context);
+
         let capture = Rc::clone(&self.capture);
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = open_microphone(&capture, generation).await {
+            if let Err(e) = open_microphone(&capture, generation, context).await {
                 let mut capture = capture.borrow_mut();
                 if capture.generation == generation {
                     capture.failed = Some(e);
@@ -312,7 +332,11 @@ impl AudioRecorder {
 }
 
 /// Open the device and wire the capture graph.
-async fn open_microphone(capture: &Rc<RefCell<Capture>>, generation: u64) -> Result<(), String> {
+async fn open_microphone(
+    capture: &Rc<RefCell<Capture>>,
+    generation: u64,
+    context: Closing,
+) -> Result<(), String> {
     let window = web_sys::window().ok_or("no window to record from")?;
     let devices = window
         .navigator()
@@ -337,9 +361,8 @@ async fn open_microphone(capture: &Rc<RefCell<Capture>>, generation: u64) -> Res
     // indicator on and nothing holding it.
     let held = Tracks(stream);
 
-    let context = web_sys::AudioContext::new()
-        .map_err(|e| format!("no audio context to record with: {e:?}"))?;
-    let context = Closing(context);
+    // The context came from `start`, so it was built while the gesture was
+    // still live. It is still a guard, and every `?` below still closes it.
     let source = context
         .0
         .create_media_stream_source(&held.0)

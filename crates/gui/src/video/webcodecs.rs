@@ -37,7 +37,7 @@ use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 
 use super::geometry::{
-    MAX_VIDEO_PIXELS, Rotation, declares_more_than, declares_unreadably, frame_byte_len,
+    MAX_VIDEO_PIXELS, Rotation, TurnLog, declares_more_than, declares_unreadably, frame_byte_len,
     write_bgra_rotated,
 };
 
@@ -99,14 +99,14 @@ pub struct Decoder {
     /// How many frames have been handed to a copy, which is the order they
     /// were decoded in. See [`Slot::accepted`].
     submitted: Rc<Cell<u64>>,
-    /// The rotation applied to pictures on the way out.
+    /// The turn to apply to the next unit fed.
     ///
     /// A cell because a call's is per frame: a peer's orientation describes
-    /// their device, and they may turn it mid-call. Pictures arrive after the
-    /// unit that produced them, so a turn is applied one picture late and
-    /// corrects itself on the next — which is the cost of a push decoder and
-    /// is invisible beside the turn itself.
+    /// their device, and they may turn it mid-call.
     rotation: Rc<Cell<Rotation>>,
+    /// The turn each unit still in the decoder was fed under. See
+    /// [`TurnLog`], which is where the reasoning and the tests are.
+    turns: Rc<RefCell<TurnLog>>,
     /// How many pixels a picture may be before it is refused.
     max_pixels: usize,
     /// Kept alive for as long as the decoder is: a `Closure` that has been
@@ -167,18 +167,28 @@ impl Decoder {
 
         let generation = Rc::new(Cell::new(0u64));
         let submitted = Rc::new(Cell::new(0u64));
+        let turns: Rc<RefCell<TurnLog>> = Rc::new(RefCell::new(TurnLog::default()));
 
         let on_frame = {
             let slot = Rc::clone(&slot);
             let rotation = Rc::clone(&rotation);
+            let turns = Rc::clone(&turns);
             let generation = Rc::clone(&generation);
             let submitted = Rc::clone(&submitted);
             Closure::<dyn FnMut(web_sys::VideoFrame)>::new(move |frame: web_sys::VideoFrame| {
                 let seq = submitted.get().wrapping_add(1);
                 submitted.set(seq);
+                // The turn this picture was encoded under, not whatever the
+                // peer has done since. Falls back to the current one for a
+                // picture whose stamp was never recorded, which is the
+                // attachment path, where the turn never changes anyway.
+                let turn = turns
+                    .borrow_mut()
+                    .take(frame.timestamp() as i32)
+                    .unwrap_or_else(|| rotation.get());
                 read_frame(
                     frame,
-                    rotation.get(),
+                    turn,
                     max_pixels,
                     Rc::clone(&slot),
                     sink.clone(),
@@ -221,6 +231,7 @@ impl Decoder {
             generation,
             submitted,
             rotation,
+            turns,
             max_pixels,
             _on_frame: on_frame,
             _on_error: on_error,
@@ -259,6 +270,14 @@ impl Decoder {
         let Ok(chunk) = web_sys::EncodedVideoChunk::new(&init) else {
             return;
         };
+        // Stamped with the turn it goes in under, so the picture that comes
+        // back can be drawn the way it was encoded rather than the way the
+        // peer is holding their device by then. Bounded by the same depth the
+        // callers bound the decode queue at, twice over, so a stamp whose
+        // picture never arrives cannot accumulate.
+        self.turns
+            .borrow_mut()
+            .record(timestamp_micros, self.rotation.get());
         if let Err(e) = self.inner.decode(&chunk) {
             let mut slot = self.slot.borrow_mut();
             if slot.failed.is_none() {
@@ -298,6 +317,7 @@ impl Decoder {
         self.submitted.set(0);
 
         let _ = self.inner.reset();
+        self.turns.borrow_mut().clear();
         {
             let mut slot = self.slot.borrow_mut();
             slot.newest = None;

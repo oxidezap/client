@@ -300,3 +300,104 @@ mod tests {
         assert_eq!(reds(&dst), vec![5, 4, 3, 2, 1, 0]);
     }
 }
+
+/// The turn each unit still inside a decoder was fed under.
+///
+/// A push decoder answers later than it is asked, so the turn to draw a
+/// picture with is the one its *unit* went in under, not whatever the peer
+/// has done since. Reading the current one was right while nothing queued;
+/// with a decode queue a peer who turns mid-call has pictures already in
+/// flight, and drawing those under the new turn is a quarter turn wrong,
+/// which is a picture on its side rather than a picture slightly late.
+///
+/// Here rather than beside the decoder because it is arithmetic about
+/// rotations and nothing else, which is what this module is, and because a
+/// browser-only module is one the host test run never compiles.
+#[derive(Default)]
+pub(super) struct TurnLog {
+    held: std::collections::VecDeque<(i32, Rotation)>,
+}
+
+impl TurnLog {
+    /// How many turns are remembered at once.
+    ///
+    /// Comfortably more than either caller allows in its decode queue. A
+    /// stamp is eight bytes, and the cost of keeping one too many is nothing
+    /// beside drawing a picture sideways.
+    const CAPACITY: usize = 64;
+
+    /// Note the turn a unit is being fed under.
+    pub(super) fn record(&mut self, stamp: i32, turn: Rotation) {
+        self.held.push_back((stamp, turn));
+        while self.held.len() > Self::CAPACITY {
+            self.held.pop_front();
+        }
+    }
+
+    /// The turn a unit went in under, taken out when its picture comes back.
+    ///
+    /// Everything stamped in front of it goes too: pictures come out in the
+    /// order the decoder produces them, so a stamp still ahead of the one
+    /// being answered belongs to a unit that produced nothing.
+    ///
+    /// `None` for a stamp that was never recorded, which is the attachment
+    /// path, where the turn does not change and the caller has a current one
+    /// that is always right.
+    pub(super) fn take(&mut self, stamp: i32) -> Option<Rotation> {
+        let at = self.held.iter().position(|(held, _)| *held == stamp)?;
+        self.held.drain(..at);
+        self.held.pop_front().map(|(_, turn)| turn)
+    }
+
+    /// Forget everything, because the decoder has.
+    pub(super) fn clear(&mut self) {
+        self.held.clear();
+    }
+}
+
+#[cfg(test)]
+mod turn_log_tests {
+    use super::{Rotation, TurnLog};
+
+    /// A picture is turned the way its unit went in, not the way the peer is
+    /// holding their device by the time it comes out.
+    #[test]
+    fn a_picture_is_turned_the_way_its_unit_went_in() {
+        let mut turns = TurnLog::default();
+        turns.record(0, Rotation::None);
+        turns.record(1, Rotation::None);
+        turns.record(2, Rotation::Cw90);
+
+        assert_eq!(turns.take(0), Some(Rotation::None));
+        assert_eq!(turns.take(1), Some(Rotation::None));
+        assert_eq!(
+            turns.take(2),
+            Some(Rotation::Cw90),
+            "the turn the peer had made by then"
+        );
+        assert_eq!(turns.take(3), None, "and nothing is left over");
+    }
+
+    /// A unit that produced no picture does not strand the ones behind it.
+    #[test]
+    fn a_stamp_that_never_arrives_is_dropped_with_the_one_that_does() {
+        let mut turns = TurnLog::default();
+        turns.record(0, Rotation::None);
+        turns.record(1, Rotation::Cw180);
+
+        assert_eq!(turns.take(1), Some(Rotation::Cw180));
+        assert_eq!(turns.take(0), None, "the stamp in front of it went with it");
+    }
+
+    /// The log is bounded, so a stream of units whose pictures never arrive
+    /// cannot grow it.
+    #[test]
+    fn the_log_does_not_grow_without_bound() {
+        let mut turns = TurnLog::default();
+        for stamp in 0..(TurnLog::CAPACITY as i32 * 4) {
+            turns.record(stamp, Rotation::None);
+        }
+        assert_eq!(turns.held.len(), TurnLog::CAPACITY);
+        assert_eq!(turns.take(0), None, "the oldest were dropped");
+    }
+}

@@ -37,7 +37,8 @@ use mp4::{Mp4Reader, TrackType};
 
 use super::audio::VideoAudio;
 use super::demux::{
-    H264Sample, avcc_to_annexb, build_sps_pps_annexb, is_keyframe, keyframe_at_or_before, stamp_of,
+    H264Sample, MAX_TRACK_SAMPLES, avcc_to_annexb, build_sps_pps_annexb, is_keyframe,
+    keyframe_at_or_before, stamp_of,
 };
 use super::geometry::Rotation;
 use super::webcodecs;
@@ -149,7 +150,11 @@ impl StreamingVideoDecoder {
         // rather than an error, so it is bounded against the only thing that
         // cannot be forged, which is how many bytes the file actually has: a
         // sample carries a length prefix and at least one byte after it.
-        let ceiling = mp4_data.len() / (nal_length_size + 1);
+        // Two ceilings, because neither alone is one. The file's length
+        // bounds what it can carry, but a fixed one-byte sample size makes
+        // that bound tens of millions, and the per-sample bookkeeping is what
+        // costs rather than the payload.
+        let ceiling = (mp4_data.len() / (nal_length_size + 1)).min(MAX_TRACK_SAMPLES);
         let sample_count = (sample_count as usize).min(ceiling);
         if sample_count == 0 {
             return Err(anyhow!("No video samples could be extracted"));
