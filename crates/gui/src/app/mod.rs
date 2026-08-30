@@ -740,11 +740,13 @@ pub struct WhatsAppApp {
     /// Task for video frame updates
     #[allow(dead_code)]
     video_update_task: Option<Task<()>>,
-    /// Cache of decoded images (message_id -> Arc<Image>): sticker animation
-    /// state and per-render decode cost both depend on the Arc being stable.
+    /// Cache of decoded images (message_id -> the picture and what it was
+    /// decoded from): sticker animation state and per-render decode cost both
+    /// depend on the Arc being stable, and [`Cached`] is what stops it being
+    /// stable across a *different* picture under the same id.
     /// Uses RefCell for interior mutability since we need to cache during immutable render.
     /// Uses IndexMap to maintain insertion order for deterministic FIFO eviction.
-    decoded_images: RefCell<IndexMap<String, Arc<Image>>>,
+    decoded_images: RefCell<IndexMap<String, (Cached, Arc<Image>)>>,
     /// Cache of message list data per chat to avoid expensive recomputation on every render.
     /// Key is the chat JID, value is the cached data.
     message_list_cache: RefCell<HashMap<String, MessageListCache>>,
@@ -3066,6 +3068,24 @@ fn slot_newest_first(rest: &[Chat], at: Option<chrono::DateTime<chrono::Utc>>) -
         .unwrap_or(rest.len())
 }
 
+/// What a decoded image was decoded from.
+///
+/// A message's bytes are not fixed: a preview is replaced by the real
+/// picture, and one of the two paths that does it — `fill`, on the way in
+/// from the daemon — never reaches the app at all. So the cache remembers
+/// enough to notice, rather than trusting whoever swapped the bytes to have
+/// evicted the entry.
+///
+/// The length and the format, not a hash: the point is to spot a picture
+/// being replaced, hashing every byte is what the cache exists to avoid, and
+/// a replacement that matches both is the same picture as far as anything
+/// here can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cached {
+    bytes: usize,
+    format: gpui::ImageFormat,
+}
+
 /// Whether the timeline this frame is building may ask for the page before
 /// it.
 ///
@@ -3202,6 +3222,35 @@ mod tests {
             newest_shared_message(&chat).as_deref(),
             Some("3EB0ABCDEF"),
             "the newest message both sides hold"
+        );
+    }
+
+    /// A blurred preview used to survive the arrival of the real photo, and
+    /// `is_viewable` then let it be opened full screen: the cache is keyed by
+    /// message id, and only one of the two paths that replaces a preview with
+    /// real bytes evicts — `fill`, on the way in from the daemon, never
+    /// reaches the app at all. It came out after fifty other pictures had
+    /// pushed it through the cache, or an account reset.
+    #[test]
+    fn real_bytes_do_not_read_back_as_the_preview_they_replaced() {
+        let preview = Cached {
+            bytes: 4_096,
+            format: gpui::ImageFormat::Jpeg,
+        };
+        let full = Cached {
+            bytes: 812_344,
+            format: gpui::ImageFormat::Jpeg,
+        };
+        assert_ne!(preview, full);
+
+        // And a sticker's preview is a PNG where the real thing is a WebP,
+        // which the format half is for.
+        assert_ne!(
+            Cached {
+                bytes: 4_096,
+                format: gpui::ImageFormat::Png,
+            },
+            preview
         );
     }
 

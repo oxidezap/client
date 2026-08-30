@@ -557,8 +557,8 @@ impl WhatsAppApp {
     /// animation state per `Arc<Image>`, so a fresh one restarts an animated
     /// sticker on every frame; and building one copies the encoded bytes and
     /// makes GPUI decode them again. `update_message_media_data` evicts the
-    /// entry when the real bytes replace a preview, so a stale thumbnail cannot
-    /// outlive its download.
+    /// entry when the real bytes replace a preview — see [`Cached`] — so a
+    /// stale thumbnail cannot outlive its download.
     /// Uses interior mutability (RefCell) so it can be called during immutable render.
     ///
     /// `None` where `data` is not a still picture — a video's bytes are its
@@ -573,9 +573,26 @@ impl WhatsAppApp {
     ) -> Option<Arc<Image>> {
         let format = mime_to_image_format(mime_type)?;
 
-        // Check if already cached
-        if let Some(cached) = self.decoded_images.borrow().get(message_id).cloned() {
-            return Some(cached);
+        // Keyed by the id *and* what the bytes are, because a message's bytes
+        // are not fixed: a preview is replaced by the real picture, and there
+        // are two paths that do it — `update_message_media_data`, which
+        // evicts, and `fill` on the way in from the daemon, which never
+        // reaches this side at all. An entry keyed by the id alone therefore
+        // outlived its own download, and `is_viewable` then let the stale
+        // thumbnail be opened full screen, until fifty other pictures had
+        // pushed it out.
+        let cached = Cached {
+            bytes: data.len(),
+            format,
+        };
+        if let Some(image) = self
+            .decoded_images
+            .borrow()
+            .get(message_id)
+            .filter(|(seen, _)| *seen == cached)
+            .map(|(_, image)| Arc::clone(image))
+        {
+            return Some(image);
         }
 
         let image = Arc::new(Image::from_bytes(format, data.to_vec()));
@@ -588,7 +605,7 @@ impl WhatsAppApp {
             cache.shift_remove_index(0);
         }
 
-        cache.insert(message_id.to_string(), image.clone());
+        cache.insert(message_id.to_string(), (cached, Arc::clone(&image)));
         Some(image)
     }
     /// Toggle video playback for a message
