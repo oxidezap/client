@@ -71,7 +71,9 @@ pub mod tray;
 /// test binary that runs both halves at once, so the exclusion lives here —
 /// one mutex rather than one per module, because the two sides have to agree
 /// on it.
-#[cfg(test)]
+// Only the native tests spawn a daemon; the web ones run in a browser, where
+// there is neither a process to spawn nor a file lock to race for.
+#[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     static EXCLUSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
     EXCLUSION

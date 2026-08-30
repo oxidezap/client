@@ -426,16 +426,33 @@ fn is_missing(e: &JsValue) -> bool {
 ///
 /// Through the handle's own async iterator, which is the only listing a
 /// browser gives — there is no `read_dir` that answers at once.
+///
+/// Each step is read with `Reflect::get` rather than cast to
+/// `js_sys::IteratorNext`, and that is the whole of this module's history in
+/// production. `IteratorNext` is declared in js-sys with no `is_type_of`, so
+/// wasm-bindgen checks a cast to it with `instanceof IteratorNext` — against
+/// a global no engine defines. The shim's own try/catch turns the resulting
+/// `ReferenceError` into `false`, so `dyn_into` does not fail loudly: it
+/// answers `Err` with the value handed back, *always*, whatever the object
+/// is. Listing therefore failed on its first step for every page ever
+/// served, and with it installing, listing and removing — reported as
+/// `JsValue(Object({"done":true}))`, which is the perfectly good iterator
+/// result the cast had just refused.
+///
+/// A `{done, value}` record is a shape rather than a type — nothing in any
+/// browser is an instance of anything here — so reading the two fields is
+/// not a workaround for the cast, it is what the cast was pretending to be.
+/// `a_folder_lists_what_was_put_in_it` is what would have said so; it runs
+/// in a browser, because nothing else can.
 async fn entries(dir: &FileSystemDirectoryHandle) -> Result<Vec<String>, JsValue> {
     let iterator = dir.keys();
     let mut names = Vec::new();
     loop {
         let step = JsFuture::from(iterator.next()?).await?;
-        let step: js_sys::IteratorNext = step.dyn_into()?;
-        if step.done() {
+        if js_sys::Reflect::get(&step, &JsValue::from_str("done"))?.is_truthy() {
             return Ok(names);
         }
-        if let Some(name) = step.value().as_string() {
+        if let Some(name) = js_sys::Reflect::get(&step, &JsValue::from_str("value"))?.as_string() {
             names.push(name);
         }
     }
@@ -508,3 +525,6 @@ fn described(e: JsValue) -> String {
         .map(|e| String::from(e.message()))
         .unwrap_or_else(|| format!("{e:?}"))
 }
+
+#[cfg(test)]
+mod tests;
