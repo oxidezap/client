@@ -146,15 +146,25 @@ pub(super) fn render_media_content(
                 && let Some(dl) = media_content.downloadable.clone()
             {
                 // Only the fallback PNG thumbnail is local: tapping fetches
-                // the real sticker, mirroring the image preview branch.
-                let image = render_image_from_bytes(
-                    media_content.data,
-                    format,
-                    display_w,
-                    display_h,
-                    cx.product().metrics.radius_lg(),
-                    false,
-                );
+                // the real sticker, mirroring the image preview branch. From
+                // the cache where there is one — the thumbnail is a picture
+                // like any other, and this branch takes precedence over the
+                // one below, so rebuilding it here was the whole saving of
+                // that cache given back on every repaint.
+                let image = match decoded_image {
+                    Some(cached) => img(ImageSource::Image(cached))
+                        .w(px(display_w))
+                        .h(px(display_h))
+                        .object_fit(gpui::ObjectFit::Contain),
+                    None => render_image_from_bytes(
+                        media_content.data,
+                        format,
+                        display_w,
+                        display_h,
+                        cx.product().metrics.radius_lg(),
+                        false,
+                    ),
+                };
                 let preview_id: SharedString = format!("sticker-preview-{}", message_id).into();
                 el.child(
                     div()

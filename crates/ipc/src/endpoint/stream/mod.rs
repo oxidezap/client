@@ -260,9 +260,12 @@ fn server_sid(pipe: &std::fs::File) -> std::io::Result<String> {
     }
     let process = ServerProcess(process);
 
-    // SAFETY: an open process handle carrying the right this asks for.
-    let token = unsafe { crate::windows_user::token_of(process.0) }?;
-    crate::windows_user::sid_string_of(&token)
+    // SAFETY: an open process handle carrying the right this asks for, and
+    // then a buffer that call just produced.
+    unsafe {
+        let token = crate::windows_user::token_of(process.0)?;
+        crate::windows_user::sid_string_of(&token)
+    }
 }
 
 /// Closes the server's process handle however the caller leaves.

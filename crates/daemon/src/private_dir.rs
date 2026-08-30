@@ -83,25 +83,47 @@ pub(crate) fn prepare(dir: &Path, _purpose: &str) -> Result<Found> {
 /// For a directory that was reachable by another local account: tightening it
 /// says nothing about what was left inside while it was open, and every name
 /// under it is predictable — the socket, the lock, and media keys derived
-/// from content the account already published. A symlink is the one entry
-/// that is never ours under any of those names, and following one is how a
-/// planted entry becomes a file the daemon writes through.
+/// from content the account already published.
+///
+/// Two kinds go. A symlink, because it is never ours under any of those names
+/// and following one is how a planted entry becomes a file the daemon writes
+/// through. And anything owned by somebody else, which is the other half of
+/// the same sentence and the one with teeth: a `daemon.lock` another account
+/// holds open is a daemon that never starts, and a `daemon.sock` they are
+/// listening on is a bind that never happens and a front end that connects to
+/// them instead. Owned by *us* is the test that keeps this off a live sibling
+/// daemon's own socket and lock, which are the two entries here worth
+/// protecting.
 ///
 /// Reported rather than fatal: a directory that cannot be swept is one whose
 /// contents were about to be trusted, and the caller decides which of those
 /// is worse.
 #[cfg(unix)]
 pub(crate) fn drop_foreign_entries(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
-        if entry.file_type()?.is_symlink() {
-            log::warn!(
-                "removing {}, which this daemon did not put there",
-                entry.path().display()
-            );
-            std::fs::remove_file(entry.path())
-                .with_context(|| format!("removing {}", entry.path().display()))?;
+        let path = entry.path();
+        // About the link rather than through it, for the reason `prepare`
+        // reads it that way: the target's owner says nothing about who may
+        // put a different file there.
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("inspecting {}", path.display()))?;
+        let ours = !meta.file_type().is_symlink() && meta.uid() == current_uid();
+        if ours {
+            continue;
         }
+        log::warn!(
+            "removing {}, which this daemon did not put there",
+            path.display()
+        );
+        let removed = if meta.file_type().is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(())
 }
@@ -148,6 +170,11 @@ mod tests {
 
         assert!(!planted.exists() && planted.symlink_metadata().is_err());
         assert!(ours.exists(), "what this daemon writes is left alone");
+        // Including the two entries that are not symlinks and stop a daemon
+        // dead: a lock somebody else holds, and a socket they are listening
+        // on. Ours by uid is what tells them apart, so a live sibling
+        // daemon's own files are never the ones removed.
+        assert!(dir.join("daemon.lock").exists());
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700

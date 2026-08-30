@@ -228,6 +228,16 @@ pub(crate) fn secs_to_ms(secs: i64) -> i64 {
     clamp_ms(secs.saturating_mul(1000))
 }
 
+/// [`secs_to_ms`] for a wire field that counts seconds as a `u64`.
+///
+/// The cast is the half that has to happen first: `as i64` on anything above
+/// `i64::MAX` wraps to a negative, so a timestamp far in the future arrives
+/// as one far in the past — clamped to the wrong end of the range, and past
+/// the `> 0` filters that guard pinning and muting, which read it as unset.
+pub(crate) fn wire_secs_to_ms(secs: u64) -> i64 {
+    secs_to_ms(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
 /// A millisecond count inside the range a `DateTime` can hold.
 ///
 /// Applied on the way out as well as on the way in, because a row written

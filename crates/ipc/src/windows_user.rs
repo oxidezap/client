@@ -86,19 +86,23 @@ pub unsafe fn sid_of(token: &[u8]) -> *mut core::ffi::c_void {
 ///
 /// Stable, unique, and short enough to put in a pipe name.
 pub fn sid_string() -> io::Result<String> {
-    sid_string_of(&token()?)
+    // SAFETY: the buffer is one `token` just produced.
+    unsafe { sid_string_of(&token()?) }
 }
 
 /// [`sid_string`] for a token this module produced, whosever it is.
 ///
 /// # Safety
 ///
-/// None to state: `token` is checked to be a buffer of the right shape by
-/// having come from [`token`] or [`token_of`], which is what the two callers
-/// pass.
-pub fn sid_string_of(token: &[u8]) -> io::Result<String> {
-    // SAFETY: the buffer came from `token`/`token_of` and outlives this
-    // block.
+/// `token` must be a buffer [`token`] or [`token_of`] returned. It is read as
+/// a `TOKEN_USER`, whose `Sid` points past the end of the struct, so an
+/// arbitrary slice — empty, short, or simply somebody else's bytes — is a
+/// pointer this dereferences before Windows can refuse it. Safe on its face
+/// and unsafe in fact is the one shape this must not have: the caller is what
+/// knows where the buffer came from.
+pub unsafe fn sid_string_of(token: &[u8]) -> io::Result<String> {
+    // SAFETY: the caller guarantees the buffer's provenance, and it outlives
+    // this block.
     let sid = unsafe { sid_of(token) };
 
     let mut text: *mut u16 = std::ptr::null_mut();

@@ -1279,7 +1279,15 @@ impl WhatsAppClient {
                         .cloned()
                         .unwrap_or_default(),
                     "image/png".to_string(),
-                    false,
+                    // What the sticker *is*, not what the thumbnail is. The
+                    // still is a PNG either way, and this flag travels with
+                    // the row past the fetch: `adopt_full_bytes` restores the
+                    // mime type from the download metadata and cannot restore
+                    // this, so a `false` written here is an animated sticker
+                    // that never animates. It used to be reached only by a
+                    // download that failed; it is now the ordinary path for
+                    // anything not fetched eagerly.
+                    sticker.is_animated.unwrap_or(false),
                     true,
                 ),
             };
@@ -1911,8 +1919,13 @@ impl WhatsAppClient {
             .transpose()?;
 
         let limit = limit.clamp(1, Self::MESSAGE_PAGE);
-        let mut page = store
-            .messages(&chat, before.clone(), limit)
+        // The page and how much of the unread tail it owes, out of one
+        // snapshot: asked separately, a message committed between the two
+        // raises the counter without appearing in the page, and the tail then
+        // reaches a row further back than the page justifies — one already
+        // read, advertised as owing a receipt.
+        let (mut page, unread) = store
+            .page_with_unread(&chat, before, limit)
             .await
             .map_err(|e| e.to_string())?;
         // A page shorter than it asked for is the start of the
@@ -1937,10 +1950,6 @@ impl WhatsAppClient {
         // Exactly what the attach load does to its rows, which is what the
         // paragraph above promises: a page hydrated any other way is one whose
         // unread tail nobody ever sends a receipt for.
-        let unread = store
-            .unread_before(&chat, before)
-            .await
-            .map_err(|e| e.to_string())?;
         mark_unread_tail(&mut messages, unread.clamp(0, u32::MAX as i64) as u32);
         Ok(Page {
             items: messages,

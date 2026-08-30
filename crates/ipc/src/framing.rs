@@ -23,13 +23,24 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Longest single frame a daemon may send.
 ///
-/// Much larger, because this direction carries a history load: a hundred
-/// chats of fifty rows of JSON, with media externalized to files but every
-/// name, preview and quote inline. Still a bound, and that is the whole
-/// point — reading a daemon frame into a `String` with nothing stopping it
-/// grows until the front end is killed, so a peer that never sends a newline
-/// takes the window down.
-pub const MAX_DAEMON_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Much larger than a request, because this direction carries a history load:
+/// a hundred chats of fifty rows of JSON, with media externalized to files
+/// but every name, preview and quote inline. Five thousand rows, and this
+/// leaves fifty kilobytes for each of them — far past what a conversation
+/// looks like, and the point is that it is far past it, because the failure
+/// on this side is not a dropped frame. A frame over the cap ends the
+/// connection, the front end reconnects, and it asks for the same history
+/// again: rejecting a load the daemon legitimately built is a loop, where the
+/// unbounded read this replaced was one window dying once.
+///
+/// So it is a bound on a stream that has gone wrong rather than a policy
+/// about what a load may contain. What it does *not* prove is that no
+/// legitimate load can reach it: WhatsApp will carry a message of 64 KiB, and
+/// five thousand of those would be several times this. Proving it needs the
+/// protocol to say so — `HistoryLoaded` split across frames, or a cap on the
+/// text a row carries — which is a change to the wire rather than to this
+/// constant.
+pub const MAX_DAEMON_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 /// The outcome of reading one frame.
 #[derive(Debug)]

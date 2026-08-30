@@ -2496,7 +2496,7 @@ fn apply_history_conversation(
     let chat = &crate::lid::route_chat_key(conn, device_id, conv.id.as_str(), cs)?;
     let last_ts_ms = conv
         .conversation_timestamp
-        .map(|s| crate::types::secs_to_ms(s as i64))
+        .map(crate::types::wire_secs_to_ms)
         .unwrap_or(0);
 
     {
@@ -2522,11 +2522,11 @@ fn apply_history_conversation(
                 // app-state paths) are milliseconds.
                 dsl::pinned_at.eq(conv
                     .pinned
-                    .map(|p| crate::types::secs_to_ms(p as i64))
+                    .map(|p| crate::types::secs_to_ms(i64::from(p)))
                     .filter(|&p| p > 0)),
                 dsl::muted_until.eq(conv
                     .mute_end_time
-                    .map(|m| crate::types::secs_to_ms(m as i64))
+                    .map(crate::types::wire_secs_to_ms)
                     .filter(|&m| m > 0)),
                 dsl::archived.eq(conv.archived.unwrap_or(false)),
                 dsl::ephemeral_expiration.eq(conv.ephemeral_expiration.map(|e| e as i32)),
@@ -2579,7 +2579,7 @@ fn apply_history_message(
         .unwrap_or(if from_me { "" } else { chat });
     let ts_ms = wmi
         .message_timestamp
-        .map(|s| crate::types::secs_to_ms(s as i64))
+        .map(crate::types::wire_secs_to_ms)
         .unwrap_or(0);
 
     if let Some(name) = wmi.push_name.as_deref()

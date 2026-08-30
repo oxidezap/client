@@ -343,8 +343,13 @@ pub(crate) fn merge_split_chat(
     // tombstone is filtered out by `reactions_for`, so the reaction it
     // retracts stayed on screen for good, and two different emojis put the
     // same person in the list twice. Newest wins, the rule the live path
-    // holds, with the identity as the tiebreak so a tie leaves exactly one
-    // row standing rather than none.
+    // holds, and a same-second tie goes to the removal — the rule the
+    // statement above settles the same-sender case with, and the one this
+    // fold is most likely to meet: a reaction and its withdrawal are what
+    // land under two identities inside one tick. `emoji = ''` is 1 for the
+    // tombstone and 0 for a reaction, so it outranks. Only past that does
+    // the identity break the tie, so a tie leaves exactly one row standing
+    // rather than none.
     //
     // `?1` device_id, `?2` src, `?3` dest, as below.
     diesel::sql_query(
@@ -353,8 +358,9 @@ pub(crate) fn merge_split_chat(
            AND EXISTS (SELECT 1 FROM reactions s \
                         WHERE s.device_id = ?1 AND s.chat_jid IN (?2, ?3) \
                           AND s.sender_jid IN (?2, ?3) AND s.msg_id = reactions.msg_id \
-                          AND (s.ts_ms, s.chat_jid, s.sender_jid) \
-                              > (reactions.ts_ms, reactions.chat_jid, reactions.sender_jid))",
+                          AND (s.ts_ms, s.emoji = '', s.chat_jid, s.sender_jid) \
+                              > (reactions.ts_ms, reactions.emoji = '', \
+                                 reactions.chat_jid, reactions.sender_jid))",
     )
     .bind::<Integer, _>(device_id)
     .bind::<Text, _>(src)

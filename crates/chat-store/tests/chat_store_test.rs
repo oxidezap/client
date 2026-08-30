@@ -1181,7 +1181,10 @@ async fn an_impossible_timestamp_does_not_stop_the_chat_list() {
         conversations: vec![
             wa::Conversation {
                 id: "559900000004@s.whatsapp.net".to_string(),
-                conversation_timestamp: Some(u64::MAX / 2),
+                // Above `i64::MAX`, so the cast wraps: a timestamp far in
+                // the future arriving as one far in the past is the same
+                // corrupt cursor by the other route.
+                conversation_timestamp: Some(u64::MAX),
                 ..Default::default()
             },
             wa::Conversation {
@@ -1191,7 +1194,7 @@ async fn an_impossible_timestamp_does_not_stop_the_chat_list() {
             },
             wa::Conversation {
                 id: GROUP.to_string(),
-                conversation_timestamp: Some(1_700_000_800),
+                conversation_timestamp: Some(u64::MAX / 2),
                 ..Default::default()
             },
         ],
@@ -2379,22 +2382,19 @@ async fn the_unread_tail_does_not_repeat_on_an_older_page() {
     .await;
     assert_eq!(chat_store.unread_total().await.unwrap(), 2);
 
-    let newest = chat_store.messages(&jid(PEER), None, 2).await.unwrap();
-    assert_eq!(
-        chat_store.unread_before(&jid(PEER), None).await.unwrap(),
-        2,
-        "the newest page carries the whole tail"
-    );
+    let (newest, unread) = chat_store
+        .page_with_unread(&jid(PEER), None, 2)
+        .await
+        .unwrap();
+    assert_eq!(unread, 2, "the newest page carries the whole tail");
 
     let cursor = MessageCursor::from(newest.last().unwrap());
-    assert_eq!(
-        chat_store
-            .unread_before(&jid(PEER), Some(cursor))
-            .await
-            .unwrap(),
-        0,
-        "the page behind the tail owes no receipts"
-    );
+    let (older, owed) = chat_store
+        .page_with_unread(&jid(PEER), Some(cursor), 2)
+        .await
+        .unwrap();
+    assert_eq!(older.len(), 2);
+    assert_eq!(owed, 0, "the page behind the tail owes no receipts");
 }
 
 #[tokio::test]
@@ -4305,6 +4305,66 @@ async fn merge_folds_a_reactor_split_across_their_identities() {
     assert!(
         reactions.is_empty(),
         "the reaction was withdrawn: {reactions:?}"
+    );
+}
+
+/// A reaction and its withdrawal are exactly what land under two identities
+/// inside one tick, and the identity is the wrong thing to settle that with:
+/// ordered by JID, whichever sorts higher wins, so the reaction survives its
+/// own removal half the time. The rule the same-sender fold already uses —
+/// the empty emoji wins a tie — has to survive the cross-identity one.
+#[tokio::test]
+async fn a_withdrawal_beats_its_reaction_in_the_same_tick() {
+    let (store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("alvo"),
+                incoming_info(PEER, PEER, "MSG-TIE", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("alvo"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-TIE-LID", 1_699_999_000),
+            ),
+        ],
+    )
+    .await;
+
+    let react = |chat: &str, emoji: &str, id: &str| {
+        message_event(
+            wa::Message {
+                reaction_message: MessageField::some(wa::message::ReactionMessage {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("MSG-TIE".into()),
+                        ..Default::default()
+                    }),
+                    text: Some(emoji.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            // The same second on both, which is the tie.
+            incoming_info(chat, chat, id, 1_700_000_010),
+        )
+    };
+    // The tombstone under the identity that sorts *lower*, so an ordering by
+    // JID alone would keep the reaction it withdraws.
+    feed(
+        &chat_store,
+        [react(PEER, "👍", "TIE1"), react(PEER_LID, "", "TIE2")],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let reactions = chat_store.reactions(&jid(PEER), "MSG-TIE").await.unwrap();
+    assert!(
+        reactions.is_empty(),
+        "the withdrawal is the later word even when the clock cannot say so: {reactions:?}"
     );
 }
 

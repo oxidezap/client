@@ -45,7 +45,7 @@ recorded and refuses the load, because a plugin that could widen what it asked
 for after the user was shown the first list would make that list a lie.
 
 `oxi_set_name` does answer: `-5` (`STATE`) outside `oxi_init`, which says *too
-early or too late* rather than *not allowed*, and `-4` (`REFUSED`) for a
+early or too late* rather than *not allowed*, and `-2` (`REFUSED`) for a
 second call. A second name does not refuse the load — the plugin runs under
 the first one — because a name is a label rather than a sentence the user
 agreed to.

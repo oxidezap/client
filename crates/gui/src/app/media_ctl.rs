@@ -634,6 +634,12 @@ impl WhatsAppApp {
             cache.shift_remove_index(at);
         }
 
+        // Removed before it is inserted, not replaced in place: `insert`
+        // keeps an existing key where it is, so a picture decoded now would
+        // take the position of the one it replaced and be evicted before
+        // entries older than itself — a rebuild, which is the thing this
+        // whole path exists to avoid.
+        cache.shift_remove(message_id);
         cache.insert(message_id.to_string(), (cached, Arc::clone(&image)));
         Some(image)
     }

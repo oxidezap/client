@@ -2863,28 +2863,43 @@ fn read_bound(chat: &Chat) -> ReadBound {
 
 /// The newest message in `chat` that the daemon has also seen.
 ///
-/// Which excludes a send this window has drawn optimistically as well as its
-/// own notices: the id is invented here (`next_local_id`) and the daemon has
-/// never heard of it. That matters because messages sort by `(timestamp, id)`
-/// and `"local_…"` sorts after the uppercase hex the server issues, so a
-/// reply arriving in the same second as a send still in flight left the local
-/// id as the newest — the daemon refuses a read naming a message it does not
-/// know, the badge clears here anyway, no receipt goes out, and the next
-/// hydration puts it straight back.
+/// Which excludes a send this window has drawn but not yet had named, as well
+/// as its own notices: until `MessageIdAssigned` lands, the id is one
+/// [`WhatsAppApp::next_local_id`] invented here and the daemon has never
+/// heard of. That matters because messages sort by `(timestamp, id)` and a
+/// local id sorts after the uppercase hex the server issues, so a reply
+/// arriving in the same second as a send still in flight left the local id as
+/// the newest — the daemon refuses a read naming a message it does not know,
+/// the badge clears here anyway, no receipt goes out, and the next hydration
+/// puts it straight back.
+///
+/// The *id*, not the send's status. A send is renamed before the network
+/// attempt, so a bubble can be `Pending` or `Failed` and still carry a real
+/// id the daemon has folded into its own tracker; excluded by status, a chat
+/// whose only row is a failed send could never be read at all — `read_bound`
+/// answers `WhenLoaded`, and no load changes the answer.
 fn newest_shared_message(chat: &Chat) -> Option<String> {
     chat.messages
         .iter()
         .rev()
-        .find(|message| {
-            message.system.is_none()
-                && !(message.is_from_me
-                    && matches!(
-                        message.status,
-                        MessageStatus::Pending | MessageStatus::Failed
-                    ))
-        })
+        .find(|message| message.system.is_none() && !is_local_id(&message.id))
         .map(|message| message.id.clone())
 }
+
+/// Whether this id is one this window invented and nothing else has seen.
+///
+/// Beside [`WhatsAppApp::next_local_id`], which is its only producer, so the
+/// two cannot drift: every id it makes carries the prefix it was asked for
+/// and then an underscore, and the server's own ids are uppercase hex.
+fn is_local_id(id: &str) -> bool {
+    LOCAL_ID_PREFIXES
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+}
+
+/// Every prefix [`WhatsAppApp::next_local_id`] is called with for something
+/// that becomes a message. A call's placeholder is not one: it names a call.
+const LOCAL_ID_PREFIXES: [&str; 2] = ["local_", "local_audio_"];
 
 impl WhatsAppApp {
     /// One second, for the two things that change with no event behind them.
@@ -3232,7 +3247,7 @@ mod tests {
         );
         theirs.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let mut mine = ChatMessage::new_incoming(
-            "local_1".to_string(),
+            WhatsAppApp::next_local_id("local"),
             "me@s.whatsapp.net".to_string(),
             "já respondo".to_string(),
         );
@@ -3246,6 +3261,34 @@ mod tests {
             Some("3EB0ABCDEF"),
             "the newest message both sides hold"
         );
+    }
+
+    /// A send is renamed before the network attempt, so a bubble can be
+    /// `Pending` or `Failed` and still carry a real id the daemon knows. Held
+    /// back by status, a chat whose only row is a failed send could never be
+    /// read: `read_bound` answers `WhenLoaded`, and loading the same page
+    /// cannot change that.
+    #[test]
+    fn a_named_send_can_bound_a_read_however_it_ended() {
+        let mut chat = Chat::new("a@s.whatsapp.net".to_string());
+        let mut failed = ChatMessage::new_incoming(
+            "3EB0FAILED".to_string(),
+            "me@s.whatsapp.net".to_string(),
+            "não saiu".to_string(),
+        );
+        failed.is_from_me = true;
+        failed.status = MessageStatus::Failed;
+        chat.messages = vec![failed];
+
+        assert_eq!(
+            newest_shared_message(&chat).as_deref(),
+            Some("3EB0FAILED"),
+            "the daemon named this one, whatever became of it"
+        );
+        // And every prefix the window invents is still held back.
+        assert!(is_local_id(&WhatsAppApp::next_local_id("local")));
+        assert!(is_local_id(&WhatsAppApp::next_local_id("local_audio")));
+        assert!(!is_local_id("3EB0ABCDEF"));
     }
 
     /// A blurred preview used to survive the arrival of the real photo, and

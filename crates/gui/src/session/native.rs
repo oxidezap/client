@@ -178,7 +178,10 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
 
     loop {
         match Endpoint::connect() {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                reap(started.take());
+                return Ok(stream);
+            }
             Err(e) if wacore::time::Instant::now() >= deadline => {
                 return Err(std::io::Error::other(format!(
                     "no daemon listening on {} after {START_TIMEOUT:?}: {e}",
@@ -223,11 +226,30 @@ fn connect_or_start() -> std::io::Result<Endpoint> {
         let attempt = wacore::time::Instant::now() + START_ATTEMPT;
         while wacore::time::Instant::now() < attempt {
             if let Ok(stream) = Endpoint::connect() {
+                reap(started.take());
                 return Ok(stream);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
+}
+
+/// Wait for a daemon this process started, in a thread of its own.
+///
+/// The connection succeeding is not the end of the child: on Unix a process
+/// nobody waits on is a zombie from the moment it exits until its parent
+/// does, and the daemon outliving the window is the ordinary case — so the
+/// wait belongs somewhere that can outlive the connect loop. One parked
+/// thread per daemon this process started, which is at most one.
+fn reap(child: Option<std::process::Child>) {
+    let Some(mut child) = child else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("oxidezap-daemon-wait".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 /// Where to find the daemon.
