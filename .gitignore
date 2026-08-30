@@ -3,3 +3,9 @@
 # Example plugins are excluded from the workspace, so each has a target
 # directory of its own that `/target` above does not cover.
 target/
+
+# Where the browser is, for whoever is running the web tests. It names a path
+# on one machine — `crates/daemon/src/plugins/web/tests.rs` says what goes in
+# it — so it is a local answer rather than a shared one, and committing one
+# would point CI's driver at a binary that is not there.
+crates/daemon/webdriver.json
