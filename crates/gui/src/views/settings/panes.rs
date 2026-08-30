@@ -10,7 +10,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon, IconName};
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 
 use crate::app::{SettingsSection, WhatsAppApp};
 use crate::components::ProductIcon;
@@ -63,33 +63,41 @@ pub fn group(
 /// The loaded plugins, each with what it may do and whatever it drew for
 /// itself.
 ///
-/// A list of what is running rather than a place to install anything: a
-/// plugin is a file in a folder, and a screen that pretended otherwise would
-/// be describing a mechanism this daemon does not have.
+/// A list of what is running, and — where this front end has a folder of its
+/// own — the two things that change what is in it. A page holding its own
+/// session is the only front end with one: everywhere else a plugin is a file
+/// in another process's directory, and a screen offering to install one there
+/// would be describing a mechanism this window does not have.
 fn plugins(
     app: &WhatsAppApp,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     cx: &App,
 ) -> AnyElement {
-    let ctx = crate::components::PluginContext { entity, metrics };
+    let ctx = crate::components::PluginContext {
+        entity: entity.clone(),
+        metrics,
+    };
+    let home = crate::platform::plugins::home();
+    let installer = home
+        .can_install()
+        .then(|| add_a_plugin(entity.clone(), metrics));
+
     if app.plugins().is_empty() {
         // Two different empty lists, and only one of them is waiting for a
-        // file. Where the daemon cannot run plugins at all, advice about a
-        // folder is advice nobody can take — see
-        // [`crate::platform::plugins_unavailable`].
-        let (heading, detail) = crate::platform::plugins_unavailable().map_or_else(
-            || {
-                (
-                    "None loaded",
-                    "Drop a .wasm file in the plugins folder and restart".to_string(),
-                )
-            },
-            |why| ("Not available here", why.to_string()),
-        );
+        // file somebody else has to put there.
         return group(
             label("PLUGINS", metrics, cx),
-            card(vec![(heading.to_string(), detail)], metrics, cx),
+            div()
+                .flex()
+                .flex_col()
+                .gap(metrics.space_lg())
+                .child(card(
+                    vec![("None loaded".to_string(), home.nothing_loaded().to_string())],
+                    metrics,
+                    cx,
+                ))
+                .children(installer),
             metrics,
         )
         .into_any_element();
@@ -97,14 +105,61 @@ fn plugins(
 
     group(
         label("PLUGINS", metrics, cx),
-        div().flex().flex_col().gap(metrics.space_lg()).children(
-            app.plugins().iter().map(|surface| {
-                crate::components::plugin_ui::settings_entry(surface, app, &ctx, cx)
-            }),
-        ),
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_lg())
+            .children(app.plugins().iter().map(|surface| {
+                let entry = crate::components::plugin_ui::settings_entry(surface, app, &ctx, cx);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(metrics.space_md())
+                    .child(entry)
+                    .children(
+                        home.can_install()
+                            .then(|| remove_a_plugin(&surface.id, entity.clone(), metrics)),
+                    )
+            }))
+            .children(installer),
         metrics,
     )
     .into_any_element()
+}
+
+/// The control that puts a `.wasm` in this front end's own folder.
+fn add_a_plugin(entity: Entity<WhatsAppApp>, metrics: Metrics) -> impl IntoElement + use<> {
+    div().flex().justify_end().px(metrics.space_xs()).child(
+        Button::new("install-plugin")
+            .label("Add a plugin…")
+            .outline()
+            .on_click(move |_, _window, cx| {
+                entity.update(cx, |app, cx| app.install_plugin(cx));
+            }),
+    )
+}
+
+/// The control that takes one back out again.
+///
+/// Beside each plugin rather than inside its own tree: a plugin draws its
+/// widgets and this is not one of them — a module that could publish its own
+/// uninstall button could also publish something else under that id.
+fn remove_a_plugin(
+    id: &str,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+) -> impl IntoElement + use<> {
+    let id = id.to_owned();
+    div().flex().justify_end().px(metrics.space_xs()).child(
+        Button::new(gpui::SharedString::from(format!("remove-plugin-{id}")))
+            .label("Remove")
+            .ghost()
+            .small()
+            .on_click(move |_, _window, cx| {
+                let id = id.clone();
+                entity.update(cx, |app, cx| app.remove_plugin(id, cx));
+            }),
+    )
 }
 
 /// A short all-caps section label.

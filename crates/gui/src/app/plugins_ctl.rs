@@ -205,6 +205,71 @@ impl WhatsAppApp {
         &self.plugins
     }
 
+    /// Put a `.wasm` somebody chose into this front end's own plugin folder.
+    ///
+    /// Only a page holding its own session has one; every other front end
+    /// talks to a daemon whose folder is somebody else's, which is why the
+    /// control that calls this is drawn only where
+    /// [`crate::platform::PluginHome::can_install`] says so.
+    ///
+    /// It does not start the plugin. Loading happens once, before the session
+    /// does, and a plugin reloaded under itself mid-conversation is a
+    /// separate problem the daemon does not have an answer to either — so the
+    /// honest thing to say is that the next load runs it, which for a page is
+    /// a reload of the tab.
+    pub fn install_plugin(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
+            let outcome = crate::platform::plugins::install().await;
+            let _ = entity.update(cx, |app, cx| match outcome {
+                // Nobody chose anything. Not a failure, and not worth a line.
+                Ok(None) => {}
+                Ok(Some(id)) => app.notify_user(
+                    format!("{id} installed. Reload this page to run it."),
+                    super::notices::Tone::Info,
+                    cx,
+                ),
+                Err(e) => {
+                    log::warn!("cannot install a plugin: {e}");
+                    app.notify_user(
+                        format!("That plugin could not be installed: {e}"),
+                        super::notices::Tone::Problem,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Take one out of this front end's own plugin folder.
+    ///
+    /// The running plugin is not stopped, for the reason above: what this
+    /// changes is what the next load finds. Its recorded permission stays
+    /// until it is withdrawn, which is deliberate — an id reinstalled later
+    /// is the same id, and the answer was given against the id and its mask
+    /// rather than against the bytes.
+    pub fn remove_plugin(&mut self, id: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
+            let outcome = crate::platform::plugins::uninstall(&id).await;
+            let _ = entity.update(cx, |app, cx| match outcome {
+                Ok(()) => app.notify_user(
+                    format!("{id} removed. It stops at the next reload."),
+                    super::notices::Tone::Info,
+                    cx,
+                ),
+                Err(e) => {
+                    log::warn!("cannot remove the plugin {id}: {e}");
+                    app.notify_user(
+                        format!("{id} could not be removed: {e}"),
+                        super::notices::Tone::Problem,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Allow, or stop allowing, what a plugin asked to be able to do.
     pub fn approve_plugin(&mut self, plugin: &str, approved: bool, cx: &mut Context<Self>) {
         if let Some(client) = self.client.as_ref() {

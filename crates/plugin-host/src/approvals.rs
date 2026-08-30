@@ -16,10 +16,18 @@
 //!   to is no longer the sentence being asked.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use oxidezap_plugin_abi as abi;
+
+use crate::store::Backing;
+
+/// How large this document may be to be worth reading.
+///
+/// A mask per plugin id, at most [`crate::MAX_PLUGINS`] of them. Generous by
+/// two orders of magnitude, and the reason it is bounded at all is that
+/// reading it is an allocation made from whatever is in the state directory.
+const MAX_BYTES: usize = 64 * 1024;
 
 /// What a plugin holds, given what it asked for and what was agreed to.
 ///
@@ -42,46 +50,36 @@ pub fn effective(requested: i64, approved: i64) -> i64 {
 /// from naming it.
 pub const FILE_NAME: &str = "approvals.json";
 
-/// The approved mask per plugin id, mirrored to a file.
+/// The approved mask per plugin id, mirrored to a document that outlives the
+/// process.
 pub struct Approvals {
-    path: PathBuf,
+    store: Arc<dyn Backing>,
     granted: Mutex<BTreeMap<String, i64>>,
 }
 
 impl Approvals {
     /// Read what has been allowed, or start with nothing allowed.
     ///
-    /// A file that cannot be read starts empty, which is the safe direction:
-    /// the cost is a prompt the user has answered before, and the
+    /// A document that cannot be read starts empty, which is the safe
+    /// direction: the cost is a prompt the user has answered before, and the
     /// alternative is granting something nobody can account for.
     #[must_use]
-    pub fn open(dir: Option<&Path>) -> Self {
-        let Some(dir) = dir else {
-            return Self {
-                path: PathBuf::new(),
-                granted: Mutex::new(BTreeMap::new()),
-            };
-        };
-        let path = dir.join(FILE_NAME);
-        let granted = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                log::warn!(
-                    "{} is unreadable ({e}); every plugin starts unapproved",
-                    path.display()
-                );
-                BTreeMap::new()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => {
-                log::warn!(
-                    "cannot read {} ({e}); every plugin starts unapproved",
-                    path.display()
-                );
-                BTreeMap::new()
-            }
-        };
+    pub fn open(store: Arc<dyn Backing>) -> Self {
+        let granted = store
+            .read(FILE_NAME, MAX_BYTES)
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| {
+                        log::warn!(
+                            "{} is unreadable ({e}); every plugin starts unapproved",
+                            store.describe(FILE_NAME)
+                        );
+                    })
+                    .ok()
+            })
+            .unwrap_or_default();
         Self {
-            path,
+            store,
             granted: Mutex::new(granted),
         }
     }
@@ -125,7 +123,7 @@ impl Approvals {
         } else {
             granted.remove(id);
         }
-        if !Self::flush(&self.path, &granted) && approved {
+        if !self.flush(&granted) && approved {
             // A grant that could not be written down is not a grant. The
             // caller hands this mask straight to the running plugin, so
             // returning it would show the capability as allowed while nothing
@@ -143,80 +141,34 @@ impl Approvals {
         granted.get(id).copied().unwrap_or(0)
     }
 
-    /// Write the whole map out, atomically — through a temporary file and a
-    /// rename, so a daemon killed mid-write leaves the previous answers
-    /// rather than a truncated file that reads as "nothing was allowed".
+    /// Write the whole map out.
     ///
     /// Takes the guard rather than re-locking: the caller's mutation and this
-    /// write are one step, and the temporary name carries the process and
-    /// thread so a second daemon writing the same directory cannot land in
-    /// the middle of this one's rename.
-    /// Whether what is held is now on disk.
+    /// write are one step, and two clients answering at once must not be able
+    /// to leave the document disagreeing with the running host.
     ///
-    /// `true` for a store with nowhere to write: there is nothing it could
-    /// fail at. An associated function rather than a method, so the caller
-    /// can keep the guard it is holding.
-    fn flush(path: &Path, granted: &BTreeMap<String, i64>) -> bool {
-        if path.as_os_str().is_empty() {
-            return true;
-        }
+    /// Answers whether what is held is now stored. `true` for a store with
+    /// nowhere to write: there is nothing it could fail at.
+    fn flush(&self, granted: &BTreeMap<String, i64>) -> bool {
         let Ok(json) = serde_json::to_vec(granted) else {
             return false;
         };
-        let temp = path.with_extension(format!(
-            "json.{}.{:?}.tmp",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let landed = crate::write_private(&temp, &json)
-            .and_then(|()| std::fs::rename(&temp, path))
-            // The rename is metadata, and syncing the file did not persist
-            // it. Counted as part of the write rather than logged beside it:
-            // an answer that reported success while the entry was still only
-            // in memory is a withdrawal the next start hands back.
-            .and_then(|()| match path.parent() {
-                Some(dir) => crate::sync_dir(dir),
-                None => Ok(()),
-            });
-        if let Err(e) = landed {
-            // Fail closed. Leaving the previous file is the tempting answer
-            // and it is the wrong one: the write that most matters is a
-            // *withdrawal*, and a stale file that outlives one hands the
-            // capability back on the next start — revoked in this daemon,
-            // granted in the one after it. Removing it costs the answers the
-            // user has given, which they are asked for again; keeping it
-            // costs a permission nobody agreed to.
-            log::warn!(
-                "cannot write {}: {e}. Every plugin permission will be asked for again.",
-                path.display()
-            );
-            let _ = std::fs::remove_file(&temp);
-            match std::fs::remove_file(path) {
-                // The unlink is a directory entry like the rename above, and
-                // just as unpersisted until the directory is flushed: a file
-                // removed to withhold a grant is one that can come back.
-                Ok(()) => {
-                    if let Some(dir) = path.parent()
-                        && let Err(e) = crate::sync_dir(dir)
-                    {
-                        log::error!(
-                            "{} was removed but the removal is not on disk yet ({e}); a \
-                             withdrawn permission could come back",
-                            path.display()
-                        );
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log::error!(
-                    "and {} could not be removed either ({e}); it may still grant what was \
-                     just withdrawn",
-                    path.display()
-                ),
-            }
-            false
-        } else {
-            true
-        }
+        let Err(e) = self.store.write(FILE_NAME, &json) else {
+            return true;
+        };
+        // Fail closed. Leaving the previous document is the tempting answer
+        // and it is the wrong one: the write that most matters is a
+        // *withdrawal*, and a stale document that outlives one hands the
+        // capability back on the next start — revoked in this host, granted
+        // in the one after it. Removing it costs the answers the user has
+        // given, which they are asked for again; keeping it costs a
+        // permission nobody agreed to.
+        log::warn!(
+            "cannot write {}: {e}. Every plugin permission will be asked for again.",
+            self.store.describe(FILE_NAME)
+        );
+        self.store.remove(FILE_NAME);
+        false
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, i64>> {
@@ -230,7 +182,14 @@ impl Approvals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Files;
     use oxidezap_plugin_abi as abi;
+    use std::path::{Path, PathBuf};
+
+    /// The store these tests are about: files in a directory of their own.
+    fn files(dir: &Path) -> Arc<dyn Backing> {
+        Arc::new(Files::at(dir))
+    }
 
     struct TempDir(PathBuf);
 
@@ -257,7 +216,7 @@ mod tests {
     #[test]
     fn a_plugin_starts_unable_to_act_on_the_account() {
         let dir = TempDir::new("fresh");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         assert_eq!(a.granted("autoreply", abi::caps::SEND), 0);
         assert!(!a.is_approved("autoreply", abi::caps::SEND));
     }
@@ -268,7 +227,7 @@ mod tests {
     #[test]
     fn what_a_plugin_does_only_to_itself_needs_no_answer() {
         let dir = TempDir::new("ungated");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         let own = abi::caps::UI | abi::caps::STORAGE | abi::caps::TIMERS;
         assert_eq!(a.granted("p", own), own);
         assert!(a.is_approved("p", own));
@@ -278,7 +237,7 @@ mod tests {
     #[test]
     fn an_unapproved_plugin_keeps_only_what_it_does_to_itself() {
         let dir = TempDir::new("mixed");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         let asked = abi::caps::SEND | abi::caps::UI;
         assert_eq!(a.granted("p", asked), abi::caps::UI);
         assert!(!a.is_approved("p", asked));
@@ -289,7 +248,7 @@ mod tests {
     #[test]
     fn a_plugin_that_asks_for_nothing_is_approved_already() {
         let dir = TempDir::new("nothing");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         assert!(a.is_approved("watcher", 0));
     }
 
@@ -298,10 +257,10 @@ mod tests {
         let dir = TempDir::new("persist");
         let wanted = abi::caps::SEND | abi::caps::UI;
         {
-            let a = Approvals::open(Some(&dir.0));
+            let a = Approvals::open(files(&dir.0));
             a.set("autoreply", wanted, true);
         }
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         assert_eq!(a.granted("autoreply", wanted), wanted);
         assert!(a.is_approved("autoreply", wanted));
     }
@@ -309,7 +268,7 @@ mod tests {
     #[test]
     fn withdrawing_takes_everything_back() {
         let dir = TempDir::new("withdraw");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         a.set("autoreply", abi::caps::SEND, true);
         a.set("autoreply", abi::caps::SEND, false);
         assert_eq!(a.granted("autoreply", abi::caps::SEND), 0);
@@ -321,7 +280,7 @@ mod tests {
     #[test]
     fn a_plugin_that_wants_more_than_it_was_allowed_gets_none_of_it() {
         let dir = TempDir::new("widened");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         a.set("autoreply", abi::caps::SEND, true);
 
         let widened = abi::caps::SEND | abi::caps::MARK_READ;
@@ -338,7 +297,7 @@ mod tests {
     #[test]
     fn a_plugin_that_wants_less_keeps_working() {
         let dir = TempDir::new("narrowed");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         a.set("autoreply", abi::caps::SEND | abi::caps::MARK_READ, true);
         assert_eq!(a.granted("autoreply", abi::caps::SEND), abi::caps::SEND);
         assert!(a.is_approved("autoreply", abi::caps::SEND));
@@ -347,7 +306,7 @@ mod tests {
     #[test]
     fn plugins_do_not_share_an_answer() {
         let dir = TempDir::new("separate");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         a.set("one", abi::caps::SEND, true);
         assert_eq!(a.granted("two", abi::caps::SEND), 0);
     }
@@ -358,7 +317,7 @@ mod tests {
     #[test]
     fn a_failed_write_does_not_leave_a_grant_behind() {
         let dir = TempDir::new("fail-closed");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         a.set("autoreply", abi::caps::SEND, true);
         assert!(dir.0.join("approvals.json").exists());
 
@@ -368,7 +327,7 @@ mod tests {
         std::fs::create_dir(dir.0.join("approvals.json")).expect("writable");
         a.set("autoreply", abi::caps::SEND, false);
 
-        let reread = Approvals::open(Some(&dir.0));
+        let reread = Approvals::open(files(&dir.0));
         assert_eq!(
             reread.approved("autoreply"),
             0,
@@ -382,7 +341,7 @@ mod tests {
     #[test]
     fn a_grant_that_cannot_be_written_is_not_granted() {
         let dir = TempDir::new("grant-unwritable");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         // A directory where the file has to go, so the rename cannot land.
         std::fs::create_dir(dir.0.join("approvals.json")).expect("writable");
 
@@ -398,7 +357,7 @@ mod tests {
     fn a_corrupt_file_grants_nothing_rather_than_everything() {
         let dir = TempDir::new("corrupt");
         std::fs::write(dir.0.join("approvals.json"), b"{not json").expect("writable");
-        let a = Approvals::open(Some(&dir.0));
+        let a = Approvals::open(files(&dir.0));
         assert_eq!(a.granted("autoreply", abi::caps::SEND), 0);
     }
 }

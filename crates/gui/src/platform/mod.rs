@@ -21,5 +21,5 @@ pub use clock::{sleep, with_timeout};
 pub use identity::front_end_id;
 pub use launch::run;
 pub use lifecycle::watch_for_departure;
-pub use plugins::plugins_unavailable;
+pub use plugins::Home as PluginHome;
 pub use startup::{application, clocks, logging};

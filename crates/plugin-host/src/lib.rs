@@ -11,7 +11,10 @@
 //! # The shape of it
 //!
 //! * [`Plugins::load`] scans a directory, and each `.wasm` in it becomes a
-//!   [`Runtime`](runtime::Runtime) on a thread of its own.
+//!   [`Runtime`](runtime::Runtime) running on its own — a thread where there
+//!   is one, a task on the page's loop where there is not. [`Plugins::start`]
+//!   is the same thing above a list somebody else found, which is how a page
+//!   comes in.
 //! * [`Plugins::observe`] hands a session event to every plugin that asked
 //!   for that kind, and to no one else.
 //! * A plugin acts through [`Commands`], and draws by publishing a tree the
@@ -32,11 +35,13 @@ mod guest;
 mod kv;
 mod registry;
 mod runtime;
+mod sched;
+mod store;
 
 use portable_atomic::AtomicI64;
+#[cfg(not(target_family = "wasm"))]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use wacore::time::Instant;
 
@@ -44,11 +49,17 @@ use oxidezap_core::{PluginAction, PluginSlot, PluginSurface, UiEvent};
 use oxidezap_plugin_abi as abi;
 
 pub use registry::Sink;
+#[cfg(not(target_family = "wasm"))]
+pub use store::Files;
+#[cfg(target_family = "wasm")]
+pub use store::Origin;
+pub use store::{Backing, Nowhere};
 
 use crate::approvals::Approvals;
 use crate::event::Event;
 use crate::registry::Registry;
 use crate::runtime::Runtime;
+use crate::sched::{TrySend, Wake};
 
 /// How much linear memory one plugin may hold.
 ///
@@ -203,12 +214,12 @@ struct Worker {
     /// stop message has to fit: a plugin whose queue is full is exactly the
     /// one that needs stopping, and `try_send` on a full queue drops the
     /// request on the floor. A closed channel cannot be full.
-    queue: Mutex<Option<SyncSender<Job>>>,
+    queue: Mutex<Option<sched::Sender<Job>>>,
     /// Taken by whoever shuts down first. Behind a lock for the same reason
     /// the sender is: the daemon holds this whole host through an `Arc` — the
     /// server routes actions into it while the bridge feeds it events — and
     /// there is no moment where one of them has it exclusively.
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    thread: Mutex<Option<sched::Task>>,
     /// What the user has agreed to, read by the plugin's own thread on every
     /// command it attempts.
     ///
@@ -239,6 +250,20 @@ enum Job {
     Event(Arc<Event>),
 }
 
+/// One plugin the host has been told about, and how to get its bytes.
+///
+/// A closure rather than the bytes themselves, because a folder is not one
+/// module: read eagerly, a directory of `MAX_PLUGINS` modules is the folder's
+/// whole size held at once, where loading them one at a time is the largest
+/// single module. What a page hands over is already in memory, and a closure
+/// that returns it costs nothing.
+pub struct Module {
+    /// What the approval, the settings and every action are keyed on.
+    pub id: String,
+    /// Called on the loading thread, once, in order.
+    pub open: Box<dyn FnOnce() -> anyhow::Result<Vec<u8>> + Send>,
+}
+
 impl Plugins {
     /// Load every `.wasm` in `dir`.
     ///
@@ -246,9 +271,10 @@ impl Plugins {
     /// plugins, and a daemon that refused to start over an absent folder
     /// would be a daemon that refused to start.
     ///
-    /// `state_dir` is where a plugin's own settings live, one file per
+    /// `state_dir` is where a plugin's own settings live, one document per
     /// plugin. `None` runs them with memory-only storage, which is what a
     /// test wants and what a machine with no writable home gets.
+    #[cfg(not(target_family = "wasm"))]
     #[must_use]
     pub fn load(
         dir: &Path,
@@ -256,27 +282,61 @@ impl Plugins {
         commands: Arc<dyn Commands>,
         sink: Sink,
     ) -> Self {
-        // The approvals live beside the daemon's own state and never in a
+        // The approvals live beside the plugins themselves and never in a
         // plugin's key-value store: one that could write its own approval has
         // none.
-        let state_dir = usable_state_dir(state_dir);
+        let state: Arc<dyn Backing> = match usable_state_dir(state_dir) {
+            Some(dir) => Arc::new(store::Files::at(dir)),
+            None => Arc::new(Nowhere),
+        };
+        let modules = discover(dir)
+            .into_iter()
+            .filter_map(|path| {
+                let Some(id) = plugin_id(&path) else {
+                    log::warn!(
+                        "skipping {}: its name is not a usable plugin id",
+                        path.display()
+                    );
+                    return None;
+                };
+                Some(Module {
+                    id,
+                    open: Box::new(move || read_module(&path)),
+                })
+            })
+            .collect();
+        Self::start(modules, state, commands, sink)
+    }
 
-        let registry = Arc::new(Registry::new(sink, Approvals::open(state_dir)));
+    /// Run a set of modules somebody else found.
+    ///
+    /// What `load` is above a filesystem, and the whole of what a page needs:
+    /// a browser has no directory to scan and no file to read, so it hands
+    /// over the modules it holds and the storage its origin keeps, and
+    /// everything below this line is the same host the socket has.
+    #[must_use]
+    pub fn start(
+        modules: Vec<Module>,
+        state: Arc<dyn Backing>,
+        commands: Arc<dyn Commands>,
+        sink: Sink,
+    ) -> Self {
+        let registry = Arc::new(Registry::new(sink, Approvals::open(Arc::clone(&state))));
         let stopping = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::new();
 
         let mut taken: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let loading_began = Instant::now();
-        for path in discover(dir) {
+        // Bounded here as well as at discovery, because a caller that is not
+        // a directory scan has its own way of producing a list.
+        for module in modules.into_iter().take(MAX_PLUGINS) {
             // Wall clock, which nothing else here bounds. Fuel prices guest
             // instructions and `oxi_init` gets two hundred million of them;
-            // it prices neither reading up to `MAX_MODULE_BYTES` off the
-            // disk, nor wasmi's validation of them, nor the host work an init
-            // buys — a megabyte of key/value traffic, a `write_private` with
-            // its two syncs, sixteen parsed trees. `MAX_DUTY` starts at the
-            // worker, which is after all of this. So `MAX_PLUGINS` files of
-            // valid but pathological wasm are a gigabyte read, validated and
-            // instantiated before the daemon binds its socket.
+            // it prices neither reading up to `MAX_MODULE_BYTES`, nor wasmi's
+            // validation of them, nor the host work an init buys — a megabyte
+            // of key/value traffic, a write with its two syncs, sixteen
+            // parsed trees. `MAX_DUTY` starts at the worker, which is after
+            // all of this.
             //
             // Between modules rather than inside one, because a module being
             // loaded cannot be interrupted: what this bounds is how many of
@@ -284,39 +344,46 @@ impl Plugins {
             // by dropping files in it.
             if loading_began.elapsed() >= MAX_LOAD_TIME {
                 log::warn!(
-                    "plugins took longer than {MAX_LOAD_TIME:?} to load; the rest of {} is skipped",
-                    dir.display()
+                    "plugins took longer than {MAX_LOAD_TIME:?} to load; the rest is skipped"
                 );
                 break;
             }
-            let Some(id) = plugin_id(&path) else {
-                log::warn!(
-                    "skipping {}: its name is not a usable plugin id",
-                    path.display()
-                );
-                continue;
-            };
-            // An id is what an approval, a settings file and an action are
-            // all keyed on, so two files claiming one is not a duplicate — it
-            // is two plugins sharing an identity. `foo.wasm` and `foo.WASM`
-            // are different files on a case-sensitive filesystem and the same
-            // id here: both would run, the registry would hold whichever
-            // registered last, and withdrawing a permission would reach one
-            // of them while the other kept its own copy of the mask and went
-            // on acting. Refused rather than disambiguated, because a name
-            // this host invented is not one anybody could approve.
-            if !taken.insert(id.clone()) {
-                log::warn!(
-                    "skipping {}: another file already claims the plugin id `{id}`",
-                    path.display()
-                );
+            let Module { id, open } = module;
+            // Asked of every id, however the caller arrived at one. A
+            // desktop's comes from a file name and a page's from whoever
+            // installed the module, which is the same trust and no more — and
+            // an id is the stem of the plugin's own settings document, so one
+            // carrying a separator would name a document of its own choosing.
+            if !plugin_id_is_usable(&id) {
+                log::warn!("skipping `{id}`: it is not a usable plugin id");
                 continue;
             }
+            // An id is what an approval, a settings document and an action
+            // are all keyed on, so two modules claiming one is not a
+            // duplicate — it is two plugins sharing an identity. `foo.wasm`
+            // and `foo.WASM` are different files on a case-sensitive
+            // filesystem and the same id here: both would run, the registry
+            // would hold whichever registered last, and withdrawing a
+            // permission would reach one of them while the other kept its own
+            // copy of the mask and went on acting. Refused rather than
+            // disambiguated, because a name this host invented is not one
+            // anybody could approve.
+            if !taken.insert(id.clone()) {
+                log::warn!("skipping a second module claiming the plugin id `{id}`");
+                continue;
+            }
+            let bytes = match open() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::warn!("not loading {id}: {e:#}");
+                    continue;
+                }
+            };
             let granted = Arc::new(AtomicI64::new(registry.approved(&id)));
             match Runtime::load(
-                &path,
+                &bytes,
                 &id,
-                state_dir,
+                &state,
                 Arc::clone(&commands),
                 Arc::clone(&granted),
             ) {
@@ -330,7 +397,7 @@ impl Plugins {
                 // and once. A daemon that refused to serve an account because
                 // a file in a folder was stale would be a worse trade than
                 // any plugin is worth.
-                Err(e) => log::warn!("not loading {}: {e:#}", path.display()),
+                Err(e) => log::warn!("not loading {id}: {e:#}"),
             }
         }
 
@@ -359,7 +426,7 @@ impl Plugins {
     #[must_use]
     pub fn none(sink: Sink) -> Self {
         Self {
-            registry: Arc::new(Registry::new(sink, Approvals::open(None))),
+            registry: Arc::new(Registry::new(sink, Approvals::open(Arc::new(Nowhere)))),
             workers: Vec::new(),
             stopping: Arc::new(AtomicBool::new(false)),
             approving: Mutex::new(()),
@@ -548,11 +615,11 @@ impl Plugins {
             drop(lock(&worker.queue).take());
         }
         for worker in &self.workers {
-            let thread = lock(&worker.thread).take();
-            if let Some(thread) = thread
-                && thread.join().is_err()
+            let running = lock(&worker.thread).take();
+            if let Some(running) = running
+                && !running.join()
             {
-                log::warn!("plugin {}: its thread panicked on the way out", worker.id);
+                log::warn!("plugin {}: it panicked on the way out", worker.id);
             }
         }
     }
@@ -681,10 +748,10 @@ impl Plugins {
         };
         match queue.try_send(job) {
             Ok(()) => None,
-            Err(TrySendError::Full(job)) => Some(job),
-            // Its thread is gone, which means it already trapped and the
-            // registry already carries the reason.
-            Err(TrySendError::Disconnected(_)) => None,
+            Err(TrySend::Full(job)) => Some(job),
+            // It is gone, which means it already trapped and the registry
+            // already carries the reason.
+            Err(TrySend::Closed) => None,
         }
     }
 }
@@ -718,22 +785,22 @@ fn start(
         registry.set_roots(&id, roots);
     }
 
-    let (queue, jobs) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
-    let thread = {
+    let (queue, mut jobs) = sched::channel(QUEUE_DEPTH);
+    let running = {
         let registry = Arc::clone(&registry);
-        std::thread::Builder::new()
-            .name(format!("oxidezap-plugin-{id}"))
-            .spawn(move || run(&mut runtime, &jobs, &registry, &stopping))
+        sched::spawn(&format!("oxidezap-plugin-{id}"), async move {
+            run(&mut runtime, &mut jobs, &registry, &stopping).await;
+        })
     };
-    let thread = match thread {
-        Ok(thread) => Some(thread),
+    let running = match running {
+        Ok(running) => Some(running),
         // The entry and its interface are already published, so a plugin left
         // merely un-spawned would sit in Settings drawing live controls that
         // silently do nothing. Stopping it is what makes those widgets inert
         // and puts the reason beside them.
         Err(e) => {
-            log::error!("plugin {id}: cannot start its thread: {e}");
-            registry.stop(&id, format!("its thread could not be started: {e}"));
+            log::error!("plugin {id}: cannot start it: {e}");
+            registry.stop(&id, format!("it could not be started: {e}"));
             None
         }
     };
@@ -742,7 +809,7 @@ fn start(
         id,
         subscription,
         queue: Mutex::new(Some(queue)),
-        thread: Mutex::new(thread),
+        thread: Mutex::new(running),
         granted,
         actions: Mutex::new(crate::guest::Rolling::new(MAX_ACTIONS_PER_WINDOW)),
     }
@@ -791,7 +858,7 @@ impl Duty {
     ///
     /// Slept in slices so shutdown is not waiting on the whole debt: a plugin
     /// being throttled is still a plugin the daemon has to be able to join.
-    fn wait_its_turn(&mut self, stopping: &AtomicBool) {
+    async fn wait_its_turn(&mut self, stopping: &AtomicBool) {
         match self.decide(self.window_began.elapsed()) {
             Turn::Go => {}
             Turn::Roll => {
@@ -801,8 +868,8 @@ impl Duty {
             Turn::Wait(owed) => {
                 let mut left = owed;
                 while !left.is_zero() && !stopping.load(Ordering::Relaxed) {
-                    let slice = left.min(std::time::Duration::from_millis(50));
-                    std::thread::sleep(slice);
+                    let slice = left.min(sched::SLICE);
+                    sched::sleep(slice).await;
                     left -= slice;
                 }
             }
@@ -878,7 +945,12 @@ fn deadlines(asked: Vec<(i64, i64)>) -> Vec<(Instant, i64)> {
 
 /// One plugin's whole life: take a job or a due timer, run it, apply what it
 /// asked for.
-fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stopping: &AtomicBool) {
+async fn run(
+    runtime: &mut Runtime,
+    jobs: &mut sched::Receiver<Job>,
+    registry: &Registry,
+    stopping: &AtomicBool,
+) {
     // Deadlines as monotonic instants rather than wall-clock milliseconds.
     // `oxi_timer_set` takes a *delay*, and a wall-clock deadline moves with
     // the clock: an NTP correction or somebody setting the date fires the
@@ -902,7 +974,7 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
         // interval waited for the *next* call — and a plugin that changed one
         // and then heard nothing again has no next call, so it sat in memory
         // for as long as the plugin was quiet.
-        let job = match take(jobs, &mut timers, runtime.settings_due(), stopping) {
+        let job = match take(jobs, &mut timers, runtime.settings_due(), stopping).await {
             Next::Job(job) => job,
             Next::Flush => {
                 runtime.flush_settings();
@@ -910,7 +982,7 @@ fn run(runtime: &mut Runtime, jobs: &Receiver<Job>, registry: &Registry, stoppin
             }
             Next::Done => break,
         };
-        duty.wait_its_turn(stopping);
+        duty.wait_its_turn(stopping).await;
         // Asked before the call, not only after it: a plugin stopped by its
         // queue overflowing still has a live thread and a backlog, and
         // "stopped" has to mean it runs no more of them. Its own trap breaks
@@ -981,8 +1053,8 @@ enum Next {
 
 /// The next thing to hand the plugin: a queued job, or a timer that has come
 /// due — or, when neither is ready before `flush_at`, the pending write.
-fn take(
-    jobs: &Receiver<Job>,
+async fn take(
+    jobs: &mut sched::Receiver<Job>,
     timers: &mut Vec<(Instant, i64)>,
     flush_at: Option<Instant>,
     stopping: &AtomicBool,
@@ -1020,19 +1092,12 @@ fn take(
             (Some(timer), Some(flush)) => Some(timer.min(flush)),
             (only, None) | (None, only) => only,
         };
-        let job = match deadline {
-            Some(due) => match jobs.recv_timeout(due.saturating_duration_since(now)) {
-                Ok(job) => job,
-                // Something is due now; go round and do it.
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Next::Done,
-            },
-            None => match jobs.recv() {
-                Ok(job) => job,
-                Err(_) => return Next::Done,
-            },
-        };
-        return Next::Job(job);
+        match jobs.next_before(deadline).await {
+            Wake::Ready(job) => return Next::Job(job),
+            // Something is due now; go round and do it.
+            Wake::Elapsed => continue,
+            Wake::Closed => return Next::Done,
+        }
     }
 }
 
@@ -1041,6 +1106,7 @@ fn take(
 /// Sorted by name, because the order plugins load in is the order their
 /// buttons are drawn in, and a set that reshuffled between two starts would
 /// move a control under somebody's hand.
+#[cfg(not(target_family = "wasm"))]
 fn discover(dir: &Path) -> Vec<PathBuf> {
     // A directory anybody else can write is one where the file that runs
     // tomorrow is not the file that was approved today. Approval is recorded
@@ -1104,6 +1170,29 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// One module's bytes, bounded before the file is opened.
+///
+/// The size is asked of the *file* rather than of what was read: the bytes,
+/// and everything wasmi allocates parsing them, are spent before the store —
+/// and so before its limiter — exists. One downloaded file with an enormous
+/// section would otherwise exhaust the daemon during startup and take the
+/// account down with it.
+#[cfg(not(target_family = "wasm"))]
+fn read_module(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context as _;
+
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    if size > MAX_MODULE_BYTES as u64 {
+        return Err(anyhow::anyhow!(
+            "it is {size} bytes, past the {MAX_MODULE_BYTES} a plugin may be"
+        ));
+    }
+    std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+}
+
+#[cfg(not(target_family = "wasm"))]
 /// Whether only this account can change what is at `path`.
 ///
 /// Mode *and* owner: a file another user owns is one they may rewrite
@@ -1163,6 +1252,7 @@ fn current_uid() -> u32 {
     rustix::process::getuid().as_raw()
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Remove only the record of what the user allowed.
 ///
 /// The fallback for an account reset whose directory removal did not go
@@ -1182,6 +1272,7 @@ pub fn forget_approvals(state_dir: &Path) -> std::io::Result<()> {
     sync_dir(state_dir)
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// The state directory, if this daemon can make it its own.
 ///
 /// Asked *before* anything is read out of it, and answering `None` is what
@@ -1253,6 +1344,7 @@ fn usable_state_dir(dir: Option<&Path>) -> Option<&Path> {
     Some(dir)
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Make a directory only this user can enter.
 ///
 /// A plugin's store holds whatever it kept — an autoreply's list of who it
@@ -1285,6 +1377,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Write a file only this user can read.
 ///
 /// The mode is set on *creation* rather than afterwards, so there is no
@@ -1320,6 +1413,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Create `path`, failing if anything is already there.
+#[cfg(not(target_family = "wasm"))]
 fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1331,6 +1425,7 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Make a rename or an unlink in `dir` survive losing power.
 ///
 /// Syncing a temporary file persists its *contents*; the directory entry that
@@ -1364,16 +1459,30 @@ pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// Restricted to what can appear in a log line, a settings row and a file name
 /// without ambiguity — an id is also the stem of the plugin's own settings
 /// file, so one containing a separator would name a path of its own choosing.
+#[cfg(not(target_family = "wasm"))]
 fn plugin_id(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
-    let usable = !stem.is_empty()
-        && stem.len() <= 64
-        && stem
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    usable.then(|| stem.to_owned())
+    plugin_id_is_usable(stem).then(|| stem.to_owned())
 }
 
+/// Whether `id` is one this host will run.
+///
+/// Restricted to what can appear in a log line, a settings row and a document
+/// name without ambiguity — an id is also the stem of the plugin's own
+/// settings document, so one containing a separator would name a path of its
+/// own choosing. Asked of every id, however it was arrived at: a page's
+/// modules are named by whoever installed one, which is the same trust as a
+/// file in a folder and no more.
+#[must_use]
+pub fn plugin_id_is_usable(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+#[cfg(not(target_family = "wasm"))]
 /// Where plugins are looked for, unless the daemon is told otherwise.
 ///
 /// `OXIDEZAP_PLUGIN_DIR` wins, which is what a developer building one uses
@@ -1386,6 +1495,7 @@ pub fn default_dir() -> Option<PathBuf> {
     data_dir().map(|d| d.join("oxidezap").join("plugins"))
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Where a plugin's own settings and the user's permission answers live.
 ///
 /// Beside the plugins themselves rather than in the daemon's `state_dir`,
@@ -1402,6 +1512,7 @@ pub fn default_state_dir() -> Option<PathBuf> {
     data_dir().map(|d| d.join("oxidezap").join("plugin-state"))
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// The root under which the plugins and their state live.
 ///
 /// On Windows this is `%LOCALAPPDATA%` and deliberately not `%APPDATA%`,

@@ -86,12 +86,15 @@ plugins, survives the tab closing, and keeps your device keys in a `0700`
 directory rather than in a browser's storage. Naming one with `#daemon=` is
 how you choose it, and the rest of this section is how.
 
-Plugins are the clearest case of that trade, because they are all or nothing.
-Attached to a daemon you get its plugins in full — their panels, their buttons
-in the chat header, and the permission prompt each one asks — over the same
-protocol frames the desktop window uses. A page holding its own session gets
-none, and says so where the list would be: a plugin runs on its own thread in
-the process that holds the session, and a tab has no thread to give it.
+Plugins run either way, and which folder they come out of follows from which
+daemon it is. Attached to one you get *its* plugins in full — their panels,
+their buttons in the chat header, and the permission prompt each one asks —
+over the same protocol frames the desktop window uses, out of that machine's
+plugins folder. A page holding its own session has a folder of its own: the
+browser's origin-private filesystem, which Settings can add a `.wasm` to and
+take one out of. It runs the same host with the same sandbox and the same
+permission prompt; what it does not have is a thread per plugin, so a handler
+that works hard is worked hard on the page's own agent.
 
 ```bash
 # Nightly, because the standard library has to be rebuilt with the atomics
@@ -220,10 +223,13 @@ local history, which is exactly what the in-app "pair again" action does.
 
 ## Plugins
 
-A plugin is a `.wasm` file dropped in `~/.local/share/oxidezap/plugins`. It
-runs inside the daemon, sees the account's events, and can declare a small
-interface — a button in a chat header, a section on the Settings screen — that
-the window draws in its own theme.
+A plugin is a `.wasm` file dropped in `~/.local/share/oxidezap/plugins` — or,
+in a page running its own session, one added under Settings → Plugins, which
+keeps it in the browser's own storage. Either way it runs inside the daemon,
+sees the account's events, and can declare a small interface — a button in a
+chat header, a section on the Settings screen — that the window draws in its
+own theme. Adding or removing one changes what the *next* load runs, which for
+a page means reloading the tab and for a desktop means restarting the daemon.
 
 There is no WASI: the `oxidezap` import module is a plugin's entire outside
 world, so a downloaded file cannot read the disk or open a socket because no
@@ -241,11 +247,13 @@ document and has no privileged access to anything.
 * Voice calls only. The library's call facade is 1:1 audio, so video calls,
   group calls and output-device selection are drawn but disabled.
 * Spacing does not yet follow the rem scale, so the UI ignores base-font zoom.
-* The web build runs the whole client, but not all of it: no video decode, no
-  voice-note recording, no calls and no plugins, and its storage is a
-  browser's rather than a `0700` directory. Attaching it to a daemon on your
-  own machine gets those back; one elsewhere is reachable only through a
-  tunnel you set up. See [the web front end](#the-web-front-end).
+* The web build runs the whole client, but not all of it: no calls, and its
+  storage is a browser's rather than a `0700` directory. Plugins run — their
+  modules kept in the page's own storage, added from Settings — but they
+  share the page's single agent rather than getting a thread each. Attaching
+  it to a daemon on your own machine gets the calls back, and gives the
+  plugins a process; one elsewhere is reachable only through a tunnel you set
+  up. See [the web front end](#the-web-front-end).
 
 ## License
 

@@ -12,7 +12,9 @@
 //! goes when the account goes.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::store::Backing;
 
 /// How much one plugin may keep.
 ///
@@ -45,7 +47,10 @@ const MIN_WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 /// would buy nothing and would open the window where a daemon that stops
 /// loses the setting someone just changed.
 pub struct Kv {
-    path: PathBuf,
+    store: Arc<dyn Backing>,
+    /// What this plugin's document is called. Prefixed with `kv-`, which is
+    /// what keeps a plugin id from naming the approvals document.
+    name: String,
     entries: BTreeMap<String, String>,
     /// Set once a write has failed, so a full disk is reported once rather
     /// than on every key a plugin touches afterwards.
@@ -71,85 +76,42 @@ pub struct Kv {
 impl Kv {
     /// Open the store for one plugin, or start empty.
     ///
-    /// A file that cannot be read is logged and treated as empty rather than
-    /// refused: a plugin whose settings file was corrupted should come up
+    /// A document that cannot be read is logged and treated as empty rather
+    /// than refused: a plugin whose settings were corrupted should come up
     /// with its defaults, not fail to load. The first write replaces it.
     #[must_use]
-    pub fn open(dir: &Path, id: &str) -> Self {
-        // Prefixed, so no plugin id can name a file the host keeps in the
-        // same directory. A plugin called `approvals` would otherwise write
-        // its own settings over `approvals.json` every time somebody changed
-        // one — every permission answer on the machine unreadable, and read
-        // back on the next start as "nothing was allowed".
-        let path = dir.join(format!("kv-{id}.json"));
-        // The same question the approvals file is asked, and for a weaker but
-        // real version of the same reason: this directory may have been open
-        // before the host closed it, so a file in it can be one another local
-        // account wrote. A plugin's settings are not authority — nothing here
-        // grants anything — but they *steer* it, and an autoreply reading
-        // somebody else's list of phrases is a plugin doing what a stranger
-        // configured. Started empty rather than refused, which is what a
-        // corrupt file already does.
-        if path.exists() && !crate::only_this_user_can_write(&path) {
-            log::warn!(
-                "{} could have been written by another user on this machine; starting empty",
-                path.display()
-            );
-            let _ = std::fs::remove_file(&path);
-            return Self {
-                path,
-                entries: BTreeMap::new(),
-                bytes: 0,
-                complained: false,
-                wrote_at: None,
-                dirty: false,
-            };
-        }
-        // Bounded before it is read, not after it is parsed: reading a
-        // planted file to discover how big it is would be the allocation the
-        // limit exists to refuse.
-        //
-        // The ceiling is on the *encoded* size, which is not the budget:
-        // `MAX_BYTES` counts the bytes a plugin stored, and JSON writes a
-        // control character as `\u0000` — six bytes for one. A store full of
-        // them is a valid store this host wrote and would serialize past
-        // twice the budget, so a ceiling of `MAX_BYTES * 2` refused the
-        // daemon's own file and started the plugin empty, losing every
-        // setting it had. Eight covers the six with room for the quotes and
-        // commas around it, and what a file at that size decodes to is
-        // checked against the real budget below.
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES as u64 * 8) {
-            log::warn!(
-                "{} is larger than a plugin's whole budget; starting empty",
-                path.display()
-            );
-            return Self {
-                path,
-                entries: BTreeMap::new(),
-                bytes: 0,
-                complained: false,
-                wrote_at: None,
-                dirty: false,
-            };
-        }
-        let entries = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                log::warn!("plugin {id}: its stored settings are unreadable ({e}); starting empty");
-                BTreeMap::new()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => {
-                log::warn!("plugin {id}: cannot read its settings ({e}); starting empty");
-                BTreeMap::new()
-            }
-        };
-        // And what it decoded to, against the budget itself. The check above
-        // is about what may be *read*; this is the one that says whether the
-        // contents are something this host would have written, and it is the
-        // reason the encoded ceiling can be generous without the budget
-        // becoming eight times what it says.
-        let bytes = Self::size(&entries);
-        let entries = if bytes > MAX_BYTES {
+    pub fn open(store: Arc<dyn Backing>, id: &str) -> Self {
+        // Prefixed, so no plugin id can name a document the host keeps in the
+        // same place. A plugin called `approvals` would otherwise write its
+        // own settings over `approvals.json` every time somebody changed one
+        // — every permission answer unreadable, and read back on the next
+        // start as "nothing was allowed".
+        let name = format!("kv-{id}.json");
+        // The ceiling handed to the store is on the *encoded* size, which is
+        // not the budget: `MAX_BYTES` counts the bytes a plugin stored, and
+        // JSON writes a control character as `\u0000` — six bytes for one. A
+        // store full of them is a valid store this host wrote and would
+        // serialize past twice the budget, so a ceiling of `MAX_BYTES * 2`
+        // refused the host's own document and started the plugin empty,
+        // losing every setting it had. Eight covers the six with room for
+        // the quotes and commas around it, and what it decodes to is checked
+        // against the real budget below.
+        let entries: BTreeMap<String, String> = store
+            .read(&name, MAX_BYTES * 8)
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| {
+                        log::warn!(
+                            "plugin {id}: its stored settings are unreadable ({e}); starting empty"
+                        );
+                    })
+                    .ok()
+            })
+            .unwrap_or_default();
+        // And what it decoded to, against the budget itself. The ceiling
+        // above is about what may be *read*; this is the one that says
+        // whether the contents are something this host would have written.
+        let entries = if Self::size(&entries) > MAX_BYTES {
             log::warn!(
                 "plugin {id}: its stored settings hold more than its whole budget; starting empty"
             );
@@ -158,26 +120,10 @@ impl Kv {
             entries
         };
         Self {
-            path,
+            store,
+            name,
             bytes: Self::size(&entries),
             entries,
-            complained: false,
-            wrote_at: None,
-            dirty: false,
-        }
-    }
-
-    /// A store with nowhere to write, for a host that has no state directory.
-    ///
-    /// Reads and writes work for the life of the process and nothing
-    /// survives it. Better than refusing to run the plugin: a machine with no
-    /// writable home is one where the account itself is already in trouble.
-    #[must_use]
-    pub fn in_memory() -> Self {
-        Self {
-            path: PathBuf::new(),
-            entries: BTreeMap::new(),
-            bytes: 0,
             complained: false,
             wrote_at: None,
             dirty: false,
@@ -298,57 +244,31 @@ impl Kv {
         entries.iter().map(|(k, v)| k.len() + v.len()).sum()
     }
 
-    /// Write the whole map out, atomically.
+    /// Write the whole map out.
     ///
-    /// Through a temporary file and a rename: a daemon killed mid-write would
-    /// otherwise leave a truncated file, which is the one case the "start
-    /// empty" recovery above turns into silently losing every setting rather
-    /// than the last one.
-    /// Whether what is held is now on disk.
-    ///
-    /// `true` for a memory-only store: there is nothing it could fail to
-    /// write, so nothing stays pending.
+    /// Answers whether what is held is now stored. `true` for a memory-only
+    /// store: there is nothing it could fail to write, so nothing stays
+    /// pending.
     fn flush(&mut self) -> bool {
-        if self.path.as_os_str().is_empty() {
-            return true;
-        }
         let Ok(json) = serde_json::to_vec(&self.entries) else {
             return false;
         };
-        // Unique per process and thread, like the approvals file's. A fixed
-        // name is one two daemons sharing a state directory both write, so
-        // one can rename a file the other is still filling — and a plugin's
-        // settings then read back as corrupt and start empty.
-        let temp = self.path.with_extension(format!(
-            "json.{}.{:?}.tmp",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let outcome = crate::write_private(&temp, &json)
-            .and_then(|()| std::fs::rename(&temp, &self.path))
-            // As the approvals file does it, and for the same reason:
-            // syncing the contents does not persist the name. Unlike that
-            // file, this one is settings rather than authority — a sync that
-            // fails is a preference that may not survive a power cut, so it
-            // is reported the same way any other failed write here is, and
-            // the value stays dirty to be written again.
-            .and_then(|()| match self.path.parent() {
-                Some(dir) => crate::sync_dir(dir),
-                None => Ok(()),
-            });
-        if let Err(e) = outcome {
-            if !self.complained {
-                self.complained = true;
-                log::warn!(
-                    "cannot write {}: {e}. This plugin's settings will not survive a restart.",
-                    self.path.display()
-                );
+        match self.store.write(&self.name, &json) {
+            Ok(()) => {
+                self.complained = false;
+                true
             }
-            let _ = std::fs::remove_file(&temp);
-            false
-        } else {
-            self.complained = false;
-            true
+            Err(e) => {
+                if !self.complained {
+                    self.complained = true;
+                    log::warn!(
+                        "cannot write {}: {e}. This plugin's settings will not survive a \
+                         restart.",
+                        self.store.describe(&self.name)
+                    );
+                }
+                false
+            }
         }
     }
 }
@@ -356,6 +276,13 @@ impl Kv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Files;
+    use std::path::{Path, PathBuf};
+
+    /// The store these tests are about: files in a directory of their own.
+    fn files(dir: &Path) -> Arc<dyn Backing> {
+        Arc::new(Files::at(dir))
+    }
 
     /// A store this host wrote has to be a store it can read back.
     ///
@@ -366,7 +293,7 @@ mod tests {
     #[test]
     fn a_store_full_of_escapes_survives_a_restart() {
         let dir = TempDir::new("escapes");
-        let mut kv = Kv::open(&dir.0, "escaper");
+        let mut kv = Kv::open(files(&dir.0), "escaper");
 
         // Every byte of this value is written as `\u0000`: six on disk for
         // one in the budget.
@@ -376,7 +303,7 @@ mod tests {
         }
         kv.flush_pending();
 
-        let reopened = Kv::open(&dir.0, "escaper");
+        let reopened = Kv::open(files(&dir.0), "escaper");
         assert_eq!(
             reopened.get("k0"),
             Some(nuls.as_str()),
@@ -397,7 +324,7 @@ mod tests {
         }
         std::fs::write(&path, serde_json::to_vec(&entries).expect("encodes")).expect("writable");
 
-        let kv = Kv::open(&dir.0, "fat");
+        let kv = Kv::open(files(&dir.0), "fat");
         assert_eq!(kv.get("k0"), None, "started empty");
     }
 
@@ -426,7 +353,7 @@ mod tests {
     #[test]
     fn a_value_survives_reopening() {
         let dir = TempDir::new("reopen");
-        let mut kv = Kv::open(&dir.0, "autoreply");
+        let mut kv = Kv::open(files(&dir.0), "autoreply");
         assert!(kv.set("greeting", "hi"));
         // What the runtime does when the wasm call returns. A `set` alone is
         // not durable, deliberately: writing per key made filesystem I/O
@@ -434,7 +361,7 @@ mod tests {
         kv.commit();
         drop(kv);
 
-        let kv = Kv::open(&dir.0, "autoreply");
+        let kv = Kv::open(files(&dir.0), "autoreply");
         assert_eq!(kv.get("greeting"), Some("hi"));
     }
 
@@ -446,7 +373,7 @@ mod tests {
     fn a_plugin_cannot_turn_its_own_timer_into_disk_writes() {
         let dir = TempDir::new("debounce");
         let path = dir.0.join("kv-p.json");
-        let mut kv = Kv::open(&dir.0, "p");
+        let mut kv = Kv::open(files(&dir.0), "p");
 
         kv.set("k", "first");
         kv.commit();
@@ -456,20 +383,20 @@ mod tests {
         kv.set("k", "second");
         kv.commit();
         assert_eq!(
-            Kv::open(&dir.0, "p").get("k"),
+            Kv::open(files(&dir.0), "p").get("k"),
             Some("first"),
             "too soon after the last write, so it stays dirty"
         );
 
         // And nothing is lost: the plugin stopping writes what is pending.
         kv.flush_pending();
-        assert_eq!(Kv::open(&dir.0, "p").get("k"), Some("second"));
+        assert_eq!(Kv::open(files(&dir.0), "p").get("k"), Some("second"));
     }
 
     #[test]
     fn an_empty_value_deletes() {
         let dir = TempDir::new("delete");
-        let mut kv = Kv::open(&dir.0, "p");
+        let mut kv = Kv::open(files(&dir.0), "p");
         kv.set("k", "v");
         assert!(kv.set("k", ""));
         assert_eq!(kv.get("k"), None);
@@ -478,10 +405,10 @@ mod tests {
     #[test]
     fn plugins_do_not_share_a_file() {
         let dir = TempDir::new("separate");
-        let mut a = Kv::open(&dir.0, "a");
+        let mut a = Kv::open(files(&dir.0), "a");
         a.set("k", "from a");
         a.commit();
-        let b = Kv::open(&dir.0, "b");
+        let b = Kv::open(files(&dir.0), "b");
         assert_eq!(b.get("k"), None);
     }
 
@@ -492,7 +419,7 @@ mod tests {
         // missing-file branch instead, so a regression making a corrupt
         // settings file fatal would have passed.
         std::fs::write(dir.0.join("kv-p.json"), b"{not json").expect("writable");
-        let mut kv = Kv::open(&dir.0, "p");
+        let mut kv = Kv::open(files(&dir.0), "p");
         assert_eq!(kv.get("anything"), None);
         assert!(kv.set("k", "v"), "and it is usable again");
     }
@@ -500,7 +427,7 @@ mod tests {
     #[test]
     fn a_plugin_cannot_grow_past_its_budget() {
         let dir = TempDir::new("budget");
-        let mut kv = Kv::open(&dir.0, "p");
+        let mut kv = Kv::open(files(&dir.0), "p");
         let chunk = "x".repeat(MAX_ENTRY);
         let mut stored = 0;
         for i in 0..64 {
@@ -517,7 +444,7 @@ mod tests {
     #[test]
     fn replacing_a_value_is_not_growing() {
         let dir = TempDir::new("replace");
-        let mut kv = Kv::open(&dir.0, "p");
+        let mut kv = Kv::open(files(&dir.0), "p");
         let big = "y".repeat(MAX_ENTRY);
         while kv.set(&format!("k{}", kv.entries.len()), &big) {}
         assert!(kv.set("k0", &big), "same size, same key");
@@ -526,14 +453,14 @@ mod tests {
     #[test]
     fn an_oversized_entry_is_refused_outright() {
         let dir = TempDir::new("oversized");
-        let mut kv = Kv::open(&dir.0, "p");
+        let mut kv = Kv::open(files(&dir.0), "p");
         assert!(!kv.set("k", &"z".repeat(MAX_ENTRY + 1)));
         assert!(!kv.set("", "v"));
     }
 
     #[test]
     fn a_store_with_nowhere_to_write_still_works() {
-        let mut kv = Kv::in_memory();
+        let mut kv = Kv::open(Arc::new(crate::store::Nowhere), "p");
         assert!(kv.set("k", "v"));
         assert_eq!(kv.get("k"), Some("v"));
     }

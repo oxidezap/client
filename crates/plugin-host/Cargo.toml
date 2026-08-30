@@ -10,6 +10,12 @@ repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+# The parker a plugin's worker is driven by on a desktop, and the `or` that
+# races its queue against a timer in a page. Deliberately not a runtime: a
+# plugin's command reaches the daemon through `blocking_send`, which panics
+# inside a Tokio context, and the worker's future awaits nothing but this
+# crate's own platform calls.
+futures-lite = "2"
 # A 64-bit capability mask, through portable-atomic rather than std
 # (see /clippy.toml).
 portable-atomic = { workspace = true }
@@ -33,6 +39,23 @@ wasmi = { version = "1.0", default-features = false, features = ["std"] }
 # crate already ask it with, which is what the root manifest says `rustix` is
 # here for: the syscalls this tree needs, as safe wrappers, instead of
 # hand-written `extern "C"`.
+# The queue a plugin's worker takes jobs from, where there is no thread to
+# block: `sync` and `macros` are among the few parts of Tokio that work on
+# `wasm32-unknown-unknown`. Its `time` is not — the clock underneath it is
+# `std::time::Instant`, which traps on this target — so the waits go through
+# `sched`.
+[target.'cfg(target_family = "wasm")'.dependencies]
+futures-channel = "0.3"
+js-sys = "0.3"
+tokio = { workspace = true, features = ["sync"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Storage",
+    "Window",
+    "WorkerGlobalScope",
+] }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 

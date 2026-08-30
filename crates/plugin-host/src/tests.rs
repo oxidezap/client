@@ -202,9 +202,9 @@ fn waiting_on_the_daemon_is_not_charged_to_the_plugin() {
 
     let wait = Duration::from_millis(200);
     let mut runtime = crate::runtime::Runtime::load(
-        &dir.0.join("slow.wasm"),
+        &std::fs::read(dir.0.join("slow.wasm")).expect("the fixture is there"),
         "slow",
-        None,
+        &(Arc::new(crate::store::Nowhere) as Arc<dyn crate::store::Backing>),
         Arc::new(SlowCommands(wait)),
         Arc::new(AtomicI64::new(abi::caps::SEND)),
     )
@@ -487,6 +487,96 @@ fn host(dir: &TempDir, commands: Arc<Recorder>, published: &Published) -> Plugin
 /// The same, with nobody having agreed to anything.
 fn unapproved_host(dir: &TempDir, commands: Arc<Recorder>, published: &Published) -> Plugins {
     Plugins::load(&dir.0, None, Arc::new(commands), published.sink())
+}
+
+/// The entry a page comes in through: modules handed over as bytes, and a
+/// store that keeps nothing.
+///
+/// Everything below the list is the same host — the same sandbox, the same
+/// bounds, the same registry — so what this pins is that the two doors lead
+/// to one room. A page has no directory to scan and no file to read, and a
+/// second implementation of the loading path would be the thing that quietly
+/// drifted.
+#[test]
+fn modules_handed_over_as_bytes_run_like_files_in_a_folder() {
+    let module = wat::parse_str(pong().as_str()).expect("the fixture assembles");
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = Plugins::start(
+        vec![crate::Module {
+            id: "autoreply".to_owned(),
+            open: Box::new(move || Ok(module)),
+        }],
+        Arc::new(crate::store::Nowhere),
+        Arc::new(Arc::clone(&commands)) as Arc<dyn Commands>,
+        published.sink(),
+    );
+    assert_eq!(plugins.ids(), vec!["autoreply"]);
+    plugins.approve("autoreply", true);
+
+    plugins.observe(&message("5511999@s.whatsapp.net", "ping"));
+    until("the reply", || commands.sent().len() == 1);
+    assert_eq!(
+        commands.sent()[0],
+        ("5511999@s.whatsapp.net".into(), "pong".into(), None)
+    );
+}
+
+/// And an id that could name something else is refused before the module is
+/// even opened.
+///
+/// A page's modules are named by whoever installed one, which is the same
+/// trust as a file in a folder and no more: an id is the stem of the plugin's
+/// own settings document, so one carrying a separator would name a document
+/// of its own choosing.
+#[test]
+fn a_module_whose_id_is_not_usable_is_not_opened() {
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watched = Arc::clone(&opened);
+    let published = Published::default();
+    let plugins = Plugins::start(
+        vec![crate::Module {
+            id: "../approvals".to_owned(),
+            open: Box::new(move || {
+                watched.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            }),
+        }],
+        Arc::new(crate::store::Nowhere),
+        Arc::new(Recorder::new(Outcome::Accepted)) as Arc<dyn Commands>,
+        published.sink(),
+    );
+    assert!(plugins.is_empty(), "nothing with that name runs");
+    assert!(
+        !opened.load(std::sync::atomic::Ordering::SeqCst),
+        "and its bytes were never read"
+    );
+}
+
+/// Two modules claiming one id are two plugins sharing an identity, however
+/// the list was arrived at: withdrawing a permission would reach one of them
+/// and leave the other acting.
+#[test]
+fn two_modules_cannot_claim_one_id() {
+    let first = wat::parse_str(pong().as_str()).expect("the fixture assembles");
+    let second = first.clone();
+    let published = Published::default();
+    let plugins = Plugins::start(
+        vec![
+            crate::Module {
+                id: "autoreply".to_owned(),
+                open: Box::new(move || Ok(first)),
+            },
+            crate::Module {
+                id: "autoreply".to_owned(),
+                open: Box::new(move || Ok(second)),
+            },
+        ],
+        Arc::new(crate::store::Nowhere),
+        Arc::new(Recorder::new(Outcome::Accepted)) as Arc<dyn Commands>,
+        published.sink(),
+    );
+    assert_eq!(plugins.ids(), vec!["autoreply"]);
 }
 
 #[test]
@@ -1097,14 +1187,16 @@ fn a_plugin_stopped_for_falling_behind_is_offered_nothing_more() {
         crate::lock(&plugins.workers[0].queue).is_none(),
         "a stopped plugin's queue is closed, not left standing"
     );
-    plugins.workers[0]
-        .thread
-        .lock()
-        .unwrap_or_else(|held| held.into_inner())
-        .take()
-        .expect("the worker thread")
-        .join()
-        .expect("it ends on its own");
+    assert!(
+        plugins.workers[0]
+            .thread
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .take()
+            .expect("the worker")
+            .join(),
+        "it ends on its own"
+    );
 }
 
 /// The snprintf contract, both halves: the answer is the value's *full*
@@ -1593,14 +1685,15 @@ fn a_plugin_cannot_name_the_file_that_holds_its_own_approval() {
     let state = dir.0.join("state");
     std::fs::create_dir_all(&state).expect("writable");
 
-    let approvals = crate::approvals::Approvals::open(Some(&state));
+    let files: Arc<dyn crate::store::Backing> = Arc::new(crate::store::Files::at(&state));
+    let approvals = crate::approvals::Approvals::open(Arc::clone(&files));
     approvals.set("victim", abi::caps::SEND, true);
 
     // The worst case: a plugin actually called `approvals`.
-    let mut kv = crate::kv::Kv::open(&state, "approvals");
+    let mut kv = crate::kv::Kv::open(Arc::clone(&files), "approvals");
     kv.set("anything", "at all");
 
-    let reread = crate::approvals::Approvals::open(Some(&state));
+    let reread = crate::approvals::Approvals::open(files);
     assert_eq!(
         reread.approved("victim"),
         abi::caps::SEND,
@@ -1860,7 +1953,7 @@ fn a_plugins_settings_are_written_once_a_call_rather_than_once_a_key() {
     let state = dir.0.join("state");
     std::fs::create_dir_all(&state).expect("writable");
 
-    let mut kv = crate::kv::Kv::open(&state, "busy");
+    let mut kv = crate::kv::Kv::open(Arc::new(crate::store::Files::at(&state)), "busy");
     for i in 0..500 {
         kv.set("k", if i % 2 == 0 { "0" } else { "1" });
     }
@@ -2196,7 +2289,7 @@ fn settings_another_user_could_have_written_are_not_read() {
     std::fs::write(&planted, br#"{"keyword":"somebody else's"}"#).expect("writable");
     std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o666)).expect("chmod");
 
-    let kv = crate::kv::Kv::open(&dir.0, "autoreply");
+    let kv = crate::kv::Kv::open(Arc::new(crate::store::Files::at(&dir.0)), "autoreply");
     assert_eq!(kv.get("keyword"), None, "started empty");
     assert!(
         !planted.exists(),
@@ -2204,12 +2297,12 @@ fn settings_another_user_could_have_written_are_not_read() {
     );
 
     // One this user owns, privately, is read as before.
-    let mut mine = crate::kv::Kv::open(&dir.0, "autoreply");
+    let mut mine = crate::kv::Kv::open(Arc::new(crate::store::Files::at(&dir.0)), "autoreply");
     mine.set("keyword", "ping");
     mine.commit();
     drop(mine);
     assert_eq!(
-        crate::kv::Kv::open(&dir.0, "autoreply").get("keyword"),
+        crate::kv::Kv::open(Arc::new(crate::store::Files::at(&dir.0)), "autoreply").get("keyword"),
         Some("ping")
     );
 }
@@ -2404,7 +2497,7 @@ fn a_plugins_stored_settings_are_not_readable_by_other_users() {
         "nobody else may even enter it"
     );
 
-    let mut kv = crate::kv::Kv::open(&state, "p");
+    let mut kv = crate::kv::Kv::open(Arc::new(crate::store::Files::at(&state)), "p");
     kv.set("who", "somebody");
     kv.commit();
     assert_eq!(

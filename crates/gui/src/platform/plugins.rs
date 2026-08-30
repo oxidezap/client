@@ -1,53 +1,188 @@
-//! Whether the daemon this front end talks to can run plugins at all.
+//! Where this front end's plugins live, and whether it can add one.
 //!
-//! Not "are there any", which the plugin list already answers. A page that
-//! runs its own session has a daemon with no threads and no filesystem, so
-//! its plugin list is empty for a reason no amount of installing will change
-//! — and "None loaded: drop a .wasm in the plugins folder and restart" is
-//! then advice about a folder that does not exist, given to somebody who
-//! cannot act on it.
+//! A plugin belongs to the daemon that runs it, so this is a question about
+//! which daemon the window is talking to rather than about the window. A
+//! desktop front end reaches `oxidezapd`, whose plugins are files in a folder
+//! only the person at the machine can put them in; a page attached to one is
+//! in exactly the same position, and gets that daemon's plugins whole. It is
+//! only a page holding the session *itself* that has a folder of its own —
+//! its origin's private filesystem — and is therefore the one front end that
+//! can install anything.
 //!
 //! The daemon half of this is `daemon::plugins::start`, and the two have to
-//! agree: this decides what is drawn where a list would be, and that decides
-//! what is loaded.
+//! agree: this decides what is drawn, and that decides what is loaded.
 
-/// Why this front end's daemon runs no plugins, or `None` if it can.
-///
-/// A sentence, because it is drawn as one.
+/// Where the plugins this window can see come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Home {
+    /// A folder beside the daemon. Nothing here can write to it — it is
+    /// another process's directory, or another machine's — so the advice is
+    /// to put a file in it and restart.
+    Folder,
+    /// This page's own storage, which it can put a module into itself.
+    ///
+    /// Only ever answered on the web, so a desktop build constructs it
+    /// nowhere. Named with the reason rather than left to a crate-wide
+    /// allowance: the enum is what makes the two front ends' answers one
+    /// answer, and a variant that existed only on one target would put a
+    /// `cfg` in every caller that matches on it.
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    Page,
+}
+
+impl Home {
+    /// Whether this front end can install and remove plugins.
+    #[must_use]
+    pub const fn can_install(self) -> bool {
+        matches!(self, Self::Page)
+    }
+
+    /// What to tell somebody looking at an empty list.
+    #[must_use]
+    pub const fn nothing_loaded(self) -> &'static str {
+        match self {
+            Self::Folder => "Drop a .wasm file in the plugins folder and restart",
+            Self::Page => "Add a .wasm file below. It runs the next time this page loads.",
+        }
+    }
+}
+
+/// Which of the two this window is looking at.
 #[must_use]
-pub fn plugins_unavailable() -> Option<&'static str> {
-    imp::plugins_unavailable()
+pub fn home() -> Home {
+    imp::home()
+}
+
+/// Choose a `.wasm` and install it, answering the id it claimed.
+///
+/// `Ok(None)` is nobody having chosen anything, which is not a failure and is
+/// not worth a line on screen.
+///
+/// # Errors
+///
+/// The file could not be read, is not a name a plugin can have, or the
+/// browser refused to keep it.
+pub async fn install() -> Result<Option<String>, String> {
+    imp::install().await
+}
+
+/// Take one out of this front end's own folder.
+///
+/// # Errors
+///
+/// There is no folder to take it out of, or the browser refused.
+pub async fn uninstall(id: &str) -> Result<(), String> {
+    imp::uninstall(id).await
 }
 
 #[cfg(not(target_family = "wasm"))]
 mod imp {
-    /// A desktop front end reaches `oxidezapd`, which has both halves.
-    pub fn plugins_unavailable() -> Option<&'static str> {
-        None
+    use super::Home;
+
+    /// A desktop front end reaches `oxidezapd`, whose plugins are files.
+    pub fn home() -> Home {
+        Home::Folder
+    }
+
+    /// Not this front end's to do: the folder belongs to the daemon, which
+    /// may not even be on this machine. Present so the interface is one
+    /// interface — the call sites ask [`Home::can_install`] first.
+    pub async fn install() -> Result<Option<String>, String> {
+        Err("this front end cannot install plugins".to_owned())
+    }
+
+    /// See [`install`].
+    pub async fn uninstall(_id: &str) -> Result<(), String> {
+        Err("this front end cannot remove plugins".to_owned())
     }
 }
 
 #[cfg(target_family = "wasm")]
 mod imp {
+    use js_sys::Uint8Array;
+    use wasm_bindgen::JsCast as _;
+    use wasm_bindgen::prelude::Closure;
+    use wasm_bindgen_futures::JsFuture;
+
+    use super::Home;
+
     /// A page attached to a real daemon has that daemon's plugins: the web
     /// bridge hands `serve_client` the same host the socket does, so the
     /// interface, the approvals and the actions all travel the protocol they
-    /// already travel. It is only a page holding the session *itself* that
-    /// has none — asked the same way the session asks it, so the two cannot
-    /// answer differently.
-    pub fn plugins_unavailable() -> Option<&'static str> {
+    /// already travel — and the folder they came out of is that daemon's.
+    /// A page holding the session itself has its own, and is asked the same
+    /// way the session asks it, so the two cannot answer differently.
+    pub fn home() -> Home {
         match oxidezap_ipc::web::named_daemon() {
-            oxidezap_ipc::web::NamedDaemon::Named(_) => None,
+            oxidezap_ipc::web::NamedDaemon::Named(_) => Home::Folder,
             // Rejected is not "no daemon": the window is on the settled
-            // refusal screen and is drawing no Settings at all. Answered with
-            // the same sentence as `Nobody` rather than a third case, because
-            // a case nothing can reach is a case nobody maintains.
-            _ => Some(
-                "Plugins run in the daemon, and this page is its own: a plugin \
-                 gets a thread and a folder, and a tab has neither. Point this \
-                 page at an oxidezapd with #daemon=ws://… and its plugins \
-                 appear here.",
-            ),
+            // refusal screen and is drawing no Settings at all. Answered as
+            // `Page` rather than as a third case, because a case nothing can
+            // reach is a case nobody maintains.
+            _ => Home::Page,
         }
+    }
+
+    /// Ask the browser for a file, and put it in this origin's plugin folder.
+    ///
+    /// A file input rather than `showOpenFilePicker`, which is Chromium-only
+    /// and needs a secure context the published page has but a developer's
+    /// `trunk serve` may not. The element joins the document for the length
+    /// of the gesture and is taken out again — a detached input's `click()`
+    /// is ignored outright by some engines, and one that stays is a control
+    /// the page grew and never lost.
+    pub async fn install() -> Result<Option<String>, String> {
+        let Some(chosen) = choose().await else {
+            return Ok(None);
+        };
+        let name = chosen.name();
+        let buffer = JsFuture::from(chosen.array_buffer())
+            .await
+            .map_err(|e| format!("that file could not be read ({e:?})"))?;
+        let bytes = Uint8Array::new(&buffer).to_vec();
+        oxidezap_daemon::plugins::web::install(&name, &bytes)
+            .await
+            .map(Some)
+    }
+
+    pub async fn uninstall(id: &str) -> Result<(), String> {
+        oxidezap_daemon::plugins::web::uninstall(id).await
+    }
+
+    /// The file somebody picked, or `None` if they picked nothing.
+    ///
+    /// Two events, because a browser has two ways of ending this: `change`
+    /// when a file was chosen, and `cancel` when the dialog was dismissed.
+    /// Waiting only for the first leaves the task — and the closures it holds
+    /// — alive for the life of the page every time somebody changes their
+    /// mind.
+    async fn choose() -> Option<web_sys::File> {
+        let document = web_sys::window()?.document()?;
+        let input: web_sys::HtmlInputElement =
+            document.create_element("input").ok()?.dyn_into().ok()?;
+        input.set_type("file");
+        // A hint rather than a rule: every browser lets somebody switch the
+        // filter off, and the name is checked again before anything is kept.
+        input.set_accept(".wasm,application/wasm");
+        let style = input.style();
+        let _ = style.set_property("display", "none");
+        let body = document.body()?;
+        body.append_child(&input).ok()?;
+
+        let (tx, rx) = futures_channel::oneshot::channel::<()>();
+        let mut tx = Some(tx);
+        let done = Closure::<dyn FnMut()>::new(move || {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(());
+            }
+        });
+        let handler = done.as_ref().unchecked_ref();
+        let _ = input.add_event_listener_with_callback("change", handler);
+        let _ = input.add_event_listener_with_callback("cancel", handler);
+        input.click();
+        let _ = rx.await;
+        let _ = body.remove_child(&input);
+
+        input.files().and_then(|files| files.get(0))
     }
 }

@@ -103,6 +103,8 @@ openh264 = "0.9" # H.264 software decoder
 oxidezap-daemon = { workspace = true }
 # One tab has to be able to tell itself apart from another; see `front_end_id`.
 getrandom = { workspace = true }
+# The oneshot behind "wait for the file dialog to end"; see `platform/plugins.rs`.
+futures-channel = "0.3"
 js-sys = "0.3"
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
 wasm-bindgen = "0.2"
@@ -116,8 +118,13 @@ web-sys = { version = "0.3", features = [
     "Document",
     "Element",
     "EventTarget",
+    "CssStyleDeclaration",
+    "File",
+    "FileList",
     "HtmlAnchorElement",
     "HtmlElement",
+    # The file dialog a page installs a plugin through.
+    "HtmlInputElement",
     "Location",
     "Node",
     "PageTransitionEvent",

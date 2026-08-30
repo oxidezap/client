@@ -10,13 +10,15 @@
 
 use std::sync::Arc;
 
-#[cfg(not(target_family = "wasm"))]
-use oxidezap_plugin_host::{Commands, Outcome};
-use oxidezap_plugin_host::{Plugins, Sink};
+use oxidezap_plugin_host::{Commands, Outcome, Plugins, Sink};
 
-use crate::session_bridge::Commands as SessionCommands;
+#[cfg(target_family = "wasm")]
+pub mod web;
+
 #[cfg(not(target_family = "wasm"))]
-use crate::session_bridge::{Action, CommandOutcome, SessionCommand};
+use crate::session_bridge::CommandOutcome;
+use crate::session_bridge::Commands as SessionCommands;
+use crate::session_bridge::{Action, SessionCommand};
 use crate::state::StateHub;
 
 /// Build the plugin host, or an empty one when there is nowhere to look.
@@ -27,27 +29,25 @@ use crate::state::StateHub;
 pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
     let sink = publishing_to(hub);
 
-    // A page runs no plugins, and this is where that is decided rather than
-    // where it would otherwise happen by accident. Two things are missing and
-    // only one of them is a folder: a plugin gets its own OS thread and its
-    // own wasmi `Store`, and a tab has no threads to give it — the same fact
-    // r2d2 ran into, and the reason `Plugins::load` would publish a set of
-    // entries every one of which reads "its thread could not be started".
-    // There is nowhere to discover a module from either, and nowhere to keep
-    // an approval so the answer survives a reload.
+    // A page's plugins come out of its own origin: the modules from OPFS,
+    // the approvals and each plugin's settings from `localStorage`. What is
+    // *not* different is anything below this line — the same host, the same
+    // sandbox, the same bounds, the same protocol carrying the surfaces to
+    // whatever is drawing them. What a page gives a plugin instead of a
+    // thread is a task on its own loop; see `oxidezap_plugin_host::sched`.
     //
-    // Left as an early return with a reason instead of relying on
-    // `default_dir` answering `None`, which it does here only because a
-    // browser has no `HOME`: a refusal that depends on an environment
-    // variable being absent is one that comes back the moment somebody sets
-    // it. What the *front end* draws in place of a plugin list is its own
-    // (`platform::plugins_unavailable`); this is the daemon half, and the two
-    // have to agree.
+    // Awaited rather than spawned, for the binary's reason: the session must
+    // not start until the plugins subscribed to messages are there to receive
+    // them.
     #[cfg(target_family = "wasm")]
     {
-        let _ = commands;
-        log::info!("plugins need a daemon with threads and a filesystem; this page has neither");
-        return Arc::new(Plugins::none(sink));
+        let modules = web::installed().await;
+        Arc::new(Plugins::start(
+            modules,
+            Arc::new(oxidezap_plugin_host::Origin::storage()),
+            Arc::new(Bridge { commands }),
+            sink,
+        ))
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -103,17 +103,10 @@ fn publishing_to(hub: &Arc<StateHub>) -> Sink {
 }
 
 /// The plugin host's view of the session.
-///
-/// Native only, because it is the thing a plugin thread calls into and a page
-/// starts no plugin threads. Left out rather than compiled and unused, so
-/// `blocking_send` — which a browser's single agent may not make — is not
-/// reachable from a page's build at all.
-#[cfg(not(target_family = "wasm"))]
 struct Bridge {
     commands: SessionCommands,
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl Bridge {
     /// Hand one action to the session and wait for what it made of it.
     ///
@@ -123,6 +116,7 @@ impl Bridge {
     /// live with. Nothing on the daemon's side waits for this — the plugin
     /// thread is the only one parked — and a plugin parked here is one whose
     /// own queue is filling, which the host already has a rule for.
+    #[cfg(not(target_family = "wasm"))]
     fn ask(&self, action: Action) -> Outcome {
         let (reply, answer) = tokio::sync::oneshot::channel();
         if self
@@ -140,9 +134,38 @@ impl Bridge {
             Ok(CommandOutcome::Refused(_)) => Outcome::Refused,
         }
     }
+
+    /// Hand one action to the session, without waiting for what it made of
+    /// it.
+    ///
+    /// The one place a page's plugin is weaker than a desktop's, and it is
+    /// not a shortcut: the plugin's call is synchronous wasm on the *same*
+    /// agent the bridge runs on, so waiting for the answer would be waiting
+    /// for a task that cannot run until this call returns — a deadlock, not a
+    /// delay. So a page's plugin gets the same "it was taken" a socket front
+    /// end already lives with.
+    ///
+    /// What is still honest here is the refusal: a full command channel is a
+    /// session that will not take this now, and a closed one is no session at
+    /// all. Both are the answers a plugin acts on; only `Refused` for a
+    /// command the daemon would have declined is lost, and that arrives in
+    /// the event stream as it does for every other front end.
+    #[cfg(target_family = "wasm")]
+    fn ask(&self, action: Action) -> Outcome {
+        use tokio::sync::mpsc::error::TrySendError;
+
+        // Dropped, not awaited. The command is answered on a channel nobody
+        // is listening to, which the bridge already tolerates: every other
+        // sender there is a connection that has gone.
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        match self.commands.try_send(SessionCommand { action, reply }) {
+            Ok(()) => Outcome::Accepted,
+            Err(TrySendError::Full(_)) => Outcome::Refused,
+            Err(TrySendError::Closed(_)) => Outcome::NoSession,
+        }
+    }
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl Commands for Bridge {
     fn send_text(&self, jid: &str, text: &str, quoted: Option<&str>) -> Outcome {
         self.ask(Action::SendText {
