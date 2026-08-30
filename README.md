@@ -118,11 +118,11 @@ that works hard is worked hard on the page's own agent.
 rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown
 cargo install trunk
 
-# Through the script, which is the only thing that sets the toolchain and
+# Through the task, which is the only thing that sets the toolchain and
 # `CARGO_UNSTABLE_BUILD_STD`. Trunk cannot forward arguments to cargo, so
 # `trunk serve -- -Z build-std=…` passes them to the dev server instead and
 # the build fails on whatever toolchain happens to be default.
-TRUNK_ACTION=serve ./web/build.sh
+TRUNK_ACTION=serve cargo xtask web build
 ```
 
 The page will start its own session. To point it at a daemon instead, run one

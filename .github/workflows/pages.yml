@@ -95,42 +95,25 @@ jobs:
       # Where this build will be served from, which the generated glue has to
       # be told or it fetches the wasm from the account root and gets a 404.
       # A preview lives one directory deeper than the site.
+      #
+      # One task for both jobs that ask it: this was the same `if`/`else`
+      # written twice, with one output key different between them.
       - name: Work out where this will be served from
         id: where
-        run: |
-          repo='${{ github.event.repository.name }}'
-          if [ '${{ github.event_name }}' = 'pull_request' ]; then
-            echo "public_url=/$repo/pr/${{ github.event.number }}/" >> "$GITHUB_OUTPUT"
-            echo "target=pr/${{ github.event.number }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "public_url=/$repo/" >> "$GITHUB_OUTPUT"
-            echo "target=." >> "$GITHUB_OUTPUT"
-          fi
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+        run: cargo xtask pages where
 
       - name: Build the bundle
         env:
           PUBLIC_URL: ${{ steps.where.outputs.public_url }}
-        run: ./web/build.sh
+        run: cargo xtask web build
 
       # Proof the artifact is the one the page will ask for: trunk rewrites
       # `index.html` to point at hashed file names, and a mismatch is a blank
       # page rather than a failed build.
       - name: Check the bundle is complete
-        run: |
-          test -f web/dist/index.html || { echo "no index.html"; exit 1; }
-          test -f web/dist/coi-serviceworker.js || {
-            echo "the service worker is missing: the page will load without"
-            echo "cross-origin isolation and the window will have no executor"
-            exit 1
-          }
-          for asset in $(grep -oE '(href|src)="[^"]*"' web/dist/index.html |
-                         sed -E 's/.*="([^"]*)"/\1/' |
-                         grep -vE '^(https?:)?//'); do
-            file="web/dist/$(basename "$asset")"
-            test -f "$file" || { echo "index.html references $asset, which is not in dist"; exit 1; }
-          done
-          echo "bundle contents:"
-          ls -lh web/dist
+        run: cargo xtask bundle check web/dist
 
       # The number a regression shows up in. Everything above proves the
       # bundle is *complete*; nothing proved it was not twice the size it was
@@ -142,22 +125,7 @@ jobs:
       # people to raise the number, and the useful signal is the trend beside
       # the diff that caused it.
       - name: Say how big it came out
-        run: |
-          set -eu
-          wasm=$(ls web/dist/*_bg.wasm)
-          bytes=$(stat -c%s "$wasm")
-          gzip=$(gzip -9 -c "$wasm" | wc -c)
-          {
-            echo "### Bundle size"
-            echo ""
-            echo "| | bytes | MiB |"
-            echo "|---|---:|---:|"
-            printf '| `%s` | %s | %s |\n' \
-              "$(basename "$wasm")" "$bytes" "$(awk "BEGIN{printf \"%.2f\", $bytes/1048576}")"
-            printf '| the same, gzipped (what Pages serves) | %s | %s |\n' \
-              "$gzip" "$(awk "BEGIN{printf \"%.2f\", $gzip/1048576}")"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "wasm: $bytes bytes, $gzip gzipped"
+        run: cargo xtask bundle size web/dist
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -169,8 +137,8 @@ jobs:
   # `cancel-in-progress: false` protects the job that is running, and a third
   # member joining cancels the one that was pending — which for a preview's
   # single close event means it is never taken down at all. The serialization
-  # lives in `publish-pages.sh` instead, as a `--force-with-lease` against the
-  # tip it read, retried against the new one. Two publishes racing cost a
+  # lives in `xtask pages` instead, as a `--force-with-lease` against the tip
+  # it read, retried against the new one. Two publishes racing cost a
   # retry; none of them cost a lost update, and nothing is ever cancelled for
   # having waited.
   publish:
@@ -190,121 +158,73 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Work out where this goes
-        id: where
-        run: |
-          repo='${{ github.event.repository.name }}'
-          if [ '${{ github.event_name }}' = 'pull_request' ]; then
-            echo "target=pr/${{ github.event.number }}" >> "$GITHUB_OUTPUT"
-            echo "url=https://${{ github.repository_owner }}.github.io/$repo/pr/${{ github.event.number }}/" >> "$GITHUB_OUTPUT"
-          else
-            echo "target=." >> "$GITHUB_OUTPUT"
-            echo "url=https://${{ github.repository_owner }}.github.io/$repo/" >> "$GITHUB_OUTPUT"
-          fi
-
       # From the revision being published, and pinning it to the base branch
       # would not buy what it looks like it buys.
       #
-      # This job holds `contents: write` and the script it runs comes from the
+      # This job holds `contents: write` and the code it runs comes from the
       # pull request — but so does *this file*. A `pull_request` run uses the
-      # workflow from the merge ref, so anyone who could rewrite the script to
-      # ignore `TARGET` could equally rewrite the job that calls it; that is
-      # the whole reason `pull_request_target` exists and the whole reason it
-      # is not used here. Pinning the script to the base would move the
-      # problem, not close it, and it also cannot work: a script added *by* a
-      # pull request is not on the base branch yet, which is exactly how this
-      # was found.
+      # workflow from the merge ref, so anyone who could rewrite the publisher
+      # to ignore its target could equally rewrite the job that calls it; that
+      # is the whole reason `pull_request_target` exists and the whole reason
+      # it is not used here. Pinning it to the base would move the problem,
+      # not close it, and it also cannot work: code added *by* a pull request
+      # is not on the base branch yet, which is exactly how this was found.
       #
       # What bounds it is who can open such a branch. A fork can be opened by
       # anyone, gets a read-only token, and is refused by the guard above; a
       # same-repository branch already required push access, which is the
       # ability to change this file directly and without a pull request.
       #
-      # Only the publishing script, too: this job builds nothing, and a full
-      # checkout would just be another tree to keep out of the way of the
-      # branch it is about to rewrite.
+      # Only the publisher, too: this job builds nothing of the client, and a
+      # full checkout would just be another tree to keep out of the way of the
+      # branch it is about to rewrite. That `xtask/` alone is enough to build
+      # is why it carries its own `[workspace]` and no dependencies — a member
+      # of the root workspace would make cargo resolve eight git dependencies
+      # before it could compile a binary that needs none of them.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: .github/scripts
+          sparse-checkout: xtask
 
-      # "Is this still worth publishing?", as a command the publish retries.
-      #
-      # Two different questions hide here and both need asking more than once.
-      # Builds run in parallel, so the order two runs reach this job is the
-      # order their *builds* finished rather than the order their commits were
-      # pushed — a slower older build would otherwise replace the live site.
-      # And a pull request can close while a publish is in flight, in which
-      # case the preview has already been taken down and this run would put it
-      # back.
-      #
-      # A step that answered once could not close either window: the gap is
-      # between the answer and the push. So it is written to a file and handed
-      # to the script, which asks again before every attempt at the branch.
-      - name: Write the still-current check
-        run: |
-          set -eu
-          # Exit codes, because the two reasons this can fail want opposite
-          # things done about them:
-          #
-          #   0  publish
-          #   1  superseded — a newer run is publishing; stand down and touch
-          #      nothing, because what is up there is *newer* than ours
-          #   2  closed — the preview should not exist at all
-          #
-          # Collapsing them is how an older superseded build would have
-          # deleted the newer revision's perfectly good preview.
-          cat > "$RUNNER_TEMP/still-current.sh" <<'CHECK'
-          set -eu
-          api="https://api.github.com/repos/$REPO"
-          auth="Authorization: Bearer $GH_TOKEN"
-          json='Accept: application/vnd.github+json'
-          if [ "$EVENT" = 'pull_request' ]; then
-            pr=$(curl -fsSL -H "$auth" -H "$json" "$api/pulls/$PR_NUMBER")
-            [ "$(printf '%s' "$pr" | jq -r .state)" = 'open' ] || {
-              echo "pull request is closed; its preview should not exist" >&2
-              exit 2
-            }
-            [ "$(printf '%s' "$pr" | jq -r .head.sha)" = "$PR_HEAD" ] || {
-              echo "head has moved; a newer run publishes it" >&2
-              exit 1
-            }
-          else
-            tip=$(curl -fsSL -H "$auth" -H "$json" "$api/commits/$REF_NAME" | jq -r .sha)
-            [ "$tip" = "$SHA" ] || {
-              echo "$REF_NAME has moved; a newer run publishes it" >&2
-              exit 1
-            }
-          fi
-          CHECK
-          chmod +x "$RUNNER_TEMP/still-current.sh"
+      - name: Work out where this goes
+        id: where
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+        run: cargo run --quiet --manifest-path xtask/Cargo.toml -- pages where
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: bundle
           path: bundle
 
+      # `--check still-current` is "is this still worth publishing?", asked
+      # again before every attempt at the branch.
+      #
+      # Two different questions hide in it and both need asking more than
+      # once. Builds run in parallel, so the order two runs reach this job is
+      # the order their *builds* finished rather than the order their commits
+      # were pushed — a slower older build would otherwise replace the live
+      # site. And a pull request can close while a publish is in flight, in
+      # which case the preview has already been taken down and this run would
+      # put it back. A step that answered once could not close either window:
+      # the gap is between the answer and the push, which is why the question
+      # lives inside the retry loop rather than in front of it.
       - name: Publish to gh-pages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET: ${{ steps.where.outputs.target }}
-          REPO: ${{ github.repository }}
-          EVENT: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.number }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          REF_NAME: ${{ github.ref_name }}
-          SHA: ${{ github.sha }}
         run: |
-          set -eu
-          bash .github/scripts/publish-pages.sh \
-            --ordinal "$GITHUB_RUN_NUMBER" \
-            --only-if "sh $RUNNER_TEMP/still-current.sh" "$TARGET"
+          cargo run --quiet --manifest-path xtask/Cargo.toml -- pages publish \
+            --target '${{ steps.where.outputs.target }}' \
+            --ordinal '${{ github.run_number }}' \
+            --check still-current
 
       # If the pull request closed while we were publishing, undo it.
       #
-      # The check runs before every attempt at the branch, and that still
-      # leaves one gap it cannot close: a preview being published for the
-      # *first* time has nothing on `gh-pages` yet, so the close job finds
+      # The check above runs before every attempt at the branch, and that
+      # still leaves one gap it cannot close: a preview being published for
+      # the *first* time has nothing on `gh-pages` yet, so the close job finds
       # nothing to remove and exits without touching the branch — which means
       # it does not invalidate our lease either, and the push that follows
       # publishes a preview for a pull request nobody will ever close again.
@@ -313,84 +233,24 @@ jobs:
       # So this is a compensation rather than a guard: publish, ask again, and
       # take it back down if the answer changed. Either order converges — if
       # the close job runs after us it finds the preview and removes it, and
-      # if it ran before us we remove it here.
+      # if it ran before us we remove it here. The three-way reading that
+      # decides — open, superseded, closed — and the refusal to read a broken
+      # check as any of them are in `xtask`, where they are a `match` on an
+      # enum rather than a `case` on an exit code.
       - name: Take it down again if the pull request closed meanwhile
         id: undone
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET: ${{ steps.where.outputs.target }}
-          REPO: ${{ github.repository }}
-          EVENT: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.number }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          REF_NAME: ${{ github.ref_name }}
-          SHA: ${{ github.sha }}
         run: |
-          set -eu
-          # The same three-way reading the publish loop uses, because the
-          # same three things can happen and only one of them means remove.
-          set +e
-          sh "$RUNNER_TEMP/still-current.sh"
-          state=$?
-          set -e
-          case "$state" in
-            # Still open on this head: the preview we just published is the
-            # right one.
-            0)
-              echo "still open; the preview stays"
-              echo "removed=false" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-            # Superseded. A newer run of this same pull request published
-            # while we worked, so what is on the branch is newer than what we
-            # had — removing it would delete a preview that is wanted.
-            1)
-              echo "superseded; a newer run owns the preview"
-              echo "removed=false" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-            # Closed. Ours to undo.
-            2) ;;
-            # The check broke rather than answered. Reading that as "not
-            # closed" is how a closed pull request's preview stays published
-            # for good: the close event has already been spent, so nothing
-            # comes back to clean it up. Fail loudly and leave a job to retry.
-            *)
-              echo "the closure check failed with $state; refusing to guess" >&2
-              exit 1
-              ;;
-          esac
-          echo "closed while publishing; removing $TARGET again" >&2
-
-          # Re-asked per attempt, like every other write to this branch: the
-          # pull request can be reopened while this removal is fetching, and
-          # the `reopened` run's preview would then be what we delete.
-          #
-          # A translation, not a condition. The publisher's vocabulary is
-          # 0 = do it, 1/2 = stand down, anything else = broken; this removal
-          # wants the *opposite* sense, and the mapping has one case that is
-          # easy to lose in a shell one-liner — an operational failure must
-          # stay a failure rather than collapsing into "not closed".
-          cat > "$RUNNER_TEMP/still-closed-now.sh" <<'CLOSED'
-          set -u
-          sh "$RUNNER_TEMP/still-current.sh"
-          case $? in
-            2) exit 0 ;;   # closed: the removal is still wanted
-            0 | 1) exit 1 ;;  # open, or superseded: leave the branch alone
-            *) exit 3 ;;   # the check broke; the publisher refuses to guess
-          esac
-          CLOSED
-          bash .github/scripts/publish-pages.sh \
-            --ordinal "$GITHUB_RUN_NUMBER" \
-            --only-if "sh $RUNNER_TEMP/still-closed-now.sh" \
-            --remove "$TARGET"
-          echo "removed=true" >> "$GITHUB_OUTPUT"
+          cargo run --quiet --manifest-path xtask/Cargo.toml -- pages undo-if-closed \
+            --target '${{ steps.where.outputs.target }}' \
+            --ordinal '${{ github.run_number }}'
 
       - name: Say where it is
         if: github.event_name == 'pull_request' && steps.undone.outputs.removed != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
             echo "### Web preview"
@@ -420,37 +280,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: .github/scripts
-      # Re-asked before every attempt at the branch, exactly as publication
-      # re-asks the opposite. A pull request reopened while this job is still
-      # running has a `reopened` run publishing its preview behind us, and an
-      # unconditional removal would then delete a preview that is wanted —
-      # with no further event left to put it back.
-      - name: Write the still-closed check
-        run: |
-          set -eu
-          cat > "$RUNNER_TEMP/still-closed.sh" <<'CHECK'
-          set -eu
-          pr=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-                    -H 'Accept: application/vnd.github+json' \
-                    "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER")
-          # 2, matching the publisher's vocabulary: "the desired state is not
-          # what this job was started to do". Anything else this script can
-          # exit with is curl failing, which the caller refuses to read as an
-          # answer.
-          [ "$(printf '%s' "$pr" | jq -r .state)" = 'open' ] || exit 0
-          echo "pull request was reopened; its preview is wanted again" >&2
-          exit 2
-          CHECK
+          sparse-checkout: xtask
 
+      # `--check still-closed` is re-asked before every attempt at the branch,
+      # exactly as publication re-asks the opposite. A pull request reopened
+      # while this job is still running has a `reopened` run publishing its
+      # preview behind us, and an unconditional removal would then delete a
+      # preview that is wanted — with no further event left to put it back.
       - name: Remove the preview
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.number }}
         run: |
-          set -eu
-          bash .github/scripts/publish-pages.sh \
-            --ordinal "$GITHUB_RUN_NUMBER" \
-            --only-if "sh $RUNNER_TEMP/still-closed.sh" \
-            --remove "pr/$PR_NUMBER"
+          cargo run --quiet --manifest-path xtask/Cargo.toml -- pages remove \
+            --target 'pr/${{ github.event.number }}' \
+            --ordinal '${{ github.run_number }}' \
+            --check still-closed
