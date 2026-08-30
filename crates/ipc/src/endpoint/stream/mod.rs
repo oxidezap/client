@@ -97,6 +97,7 @@ impl Endpoint {
                 .write(true)
                 .custom_flags(overlapped::FILE_FLAG_OVERLAPPED)
                 .open(path)?;
+            check_peer(&pipe)?;
             overlapped::Overlapped::new(pipe).map(Self)
         }
         #[cfg(not(any(unix, windows)))]
@@ -143,6 +144,72 @@ impl Write for Writer {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.flush()
+    }
+}
+
+/// Refuse a daemon that is not us, on the other platform.
+///
+/// The same sentence as the Unix check above and for the same reason: the
+/// name is predictable — `\\.\pipe\oxidezap-<SID>` — and it is not reserved,
+/// so another local account can create it before the daemon does. The
+/// `first_pipe_instance` flag on the listener protects the daemon *after* it
+/// exists, which is the wrong half: the daemon then refuses to start and the
+/// client connects to whoever got there first, handing over its session
+/// requests and its message text. The kernel knows who is on the other end
+/// here too, so ask it.
+#[cfg(windows)]
+fn check_peer(pipe: &std::fs::File) -> std::io::Result<()> {
+    let server = server_sid(pipe)?;
+    let us = crate::windows_user::sid_string()?;
+    if server == us {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("the daemon pipe is served by {server}, not by us ({us}); refusing to talk to it"),
+    ))
+}
+
+/// The SID of whoever is serving this pipe.
+#[cfg(windows)]
+fn server_sid(pipe: &std::fs::File) -> std::io::Result<String> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let mut pid: u32 = 0;
+    // SAFETY: a live handle from the open above, and a valid out-pointer.
+    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle() as HANDLE, &mut pid) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // The narrowest right that answers the question: enough to read the
+    // token, and not enough to do anything to a process this side has just
+    // learned the id of.
+    // SAFETY: a plain call; the handle is checked below and closed by the
+    // guard.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let process = ServerProcess(process);
+
+    // SAFETY: an open process handle carrying the right this asks for.
+    let token = unsafe { crate::windows_user::token_of(process.0) }?;
+    crate::windows_user::sid_string_of(&token)
+}
+
+/// Closes the server's process handle however the caller leaves.
+#[cfg(windows)]
+struct ServerProcess(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        // SAFETY: opened above and closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
     }
 }
 

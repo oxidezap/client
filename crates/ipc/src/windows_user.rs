@@ -20,9 +20,24 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 /// splitting them would hand out a pointer into a buffer the caller does not
 /// own. Whoever wants the SID reads it out of this and keeps it alive.
 pub fn token() -> io::Result<Vec<u8>> {
+    // SAFETY: the pseudo-handle names this process and needs no closing.
+    unsafe { token_of(GetCurrentProcess()) }
+}
+
+/// [`token`] for a process this one has opened.
+///
+/// The same question asked of somebody else, which is what a client needs to
+/// know who answered its pipe.
+///
+/// # Safety
+///
+/// `process` must be an open process handle carrying
+/// `PROCESS_QUERY_LIMITED_INFORMATION`.
+pub unsafe fn token_of(process: HANDLE) -> io::Result<Vec<u8>> {
     let mut handle: HANDLE = std::ptr::null_mut();
-    // SAFETY: a valid out-pointer; the pseudo-handle needs no closing.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle) } == 0 {
+    // SAFETY: a valid process handle from the caller, and a valid
+    // out-pointer.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut handle) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let handle = OwnedHandle(handle);
@@ -71,9 +86,20 @@ pub unsafe fn sid_of(token: &[u8]) -> *mut core::ffi::c_void {
 ///
 /// Stable, unique, and short enough to put in a pipe name.
 pub fn sid_string() -> io::Result<String> {
-    let token = token()?;
-    // SAFETY: the buffer came from `token()` and outlives this block.
-    let sid = unsafe { sid_of(&token) };
+    sid_string_of(&token()?)
+}
+
+/// [`sid_string`] for a token this module produced, whosever it is.
+///
+/// # Safety
+///
+/// None to state: `token` is checked to be a buffer of the right shape by
+/// having come from [`token`] or [`token_of`], which is what the two callers
+/// pass.
+pub fn sid_string_of(token: &[u8]) -> io::Result<String> {
+    // SAFETY: the buffer came from `token`/`token_of` and outlives this
+    // block.
+    let sid = unsafe { sid_of(token) };
 
     let mut text: *mut u16 = std::ptr::null_mut();
     // SAFETY: a SID from the token above, and a valid out-pointer.
