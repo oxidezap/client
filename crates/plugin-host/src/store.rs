@@ -287,6 +287,17 @@ impl Backing for Origin {
     }
 
     fn remove(&self, name: &str) -> Result<(), String> {
+        // The same question `write` asks, and asking it here is what makes
+        // that guard whole rather than a way in. A superseded handle's write
+        // is refused *because* it is superseded, and the one caller that acts
+        // on a refused write answers it by removing the document instead — so
+        // leaving this unguarded let a stale host delete the live host's
+        // approvals, which is every plugin unapproved on the next start on
+        // the say-so of a host that has already been replaced. A handle that
+        // may not write may not delete.
+        if !self.live() {
+            return Err("this store belongs to a host that has been replaced".to_owned());
+        }
         let storage = Self::local().ok_or_else(|| "this page has no storage".to_owned())?;
         storage
             .remove_item(&Self::key(name))
