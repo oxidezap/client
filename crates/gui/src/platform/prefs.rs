@@ -182,16 +182,21 @@ mod web {
             .map_err(|e| format!("could not save the theme: {e:?}"))?;
         // This page's own write does not raise a `storage` event here — the
         // event is for the *other* tabs — so the memo is told directly.
-        MEMO.with(|memo| memo.set(Some(hash(document))));
+        MEMO.with(|memo| memo.set(Some(Some(hash(document)))));
         Ok(())
     }
 
     thread_local! {
         /// The revision last computed, kept so the poll is not I/O.
         ///
-        /// `None` means "ask the store": nothing has been read yet, or
-        /// another tab wrote and the listener below cleared it.
-        static MEMO: Cell<Option<super::Revision>> = const { Cell::new(None) };
+        /// Three states, not two, and the third is the common one: no theme
+        /// has been saved. `None` is "ask the store" — nothing read yet, or
+        /// another tab wrote and the listener below cleared it. `Some(None)`
+        /// is "asked, and there is no document", which has to be *rememberable*
+        /// or the default configuration reads `localStorage` on every poll
+        /// forever, which is the stall this memo exists to remove. `Some(Some)`
+        /// is the document's hash.
+        static MEMO: Cell<Option<Option<super::Revision>>> = const { Cell::new(None) };
         /// The listener that clears it, held for the life of the page.
         static ELSEWHERE: RefCell<Option<Closure<dyn FnMut(web_sys::StorageEvent)>>> =
             const { RefCell::new(None) };
@@ -223,11 +228,15 @@ mod web {
     pub fn revision() -> Option<super::Revision> {
         watch_other_tabs();
         if let Some(known) = MEMO.with(Cell::get) {
-            return Some(known);
+            return known;
         }
-        let revision = hash(&read().ok().flatten()?);
+        // A store this page cannot reach at all is left unmemoized: that is
+        // not "there is no theme", it is "no answer", and a browser that
+        // starts permitting storage later should be believed.
+        let document = read().ok()?;
+        let revision = document.as_deref().map(hash);
         MEMO.with(|memo| memo.set(Some(revision)));
-        Some(revision)
+        revision
     }
 
     /// Clear the memo whenever another tab writes the theme.

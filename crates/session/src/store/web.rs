@@ -79,7 +79,12 @@ pub async fn prepare() -> Result<(), String> {
         "opened the browser store, holding {} file(s)",
         store.count()
     );
-    report_headroom().await;
+    // Bounded, and nothing waits on the answer beyond that. This is one log
+    // line: `navigator.storage.estimate()` is a promise the browser is under
+    // no obligation to settle, and an account that will not open because a
+    // quota-reporting API went quiet is a far worse failure than the one the
+    // line is warning about.
+    let _ = crate::exec::with_timeout(report_headroom(), HEADROOM_ASK).await;
     // Kept for [`wipe`], and only the first one needs keeping: `install`
     // registers the VFS under `vfs_name` once and every later call finds it
     // registered and hands back another `RelaxedIdbUtil` over the *same*
@@ -93,6 +98,13 @@ pub async fn prepare() -> Result<(), String> {
     });
     Ok(())
 }
+
+/// How long the headroom question may take before it is abandoned.
+///
+/// Generous, because the answer is worth having and the browser is usually
+/// instant; bounded, because it is a diagnostic on the path that opens the
+/// account.
+const HEADROOM_ASK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How little room may be left before it is worth saying so.
 ///
