@@ -36,6 +36,12 @@ repository = "https://github.com/oxidezap/client"
 [workspace.lints.clippy]
 disallowed_methods = "deny"
 disallowed_types = "deny"
+# Diagnostics belong in `log`: a line on stdout is invisible to the journal
+# and, in the daemon, competes with nothing that reads it. `clippy.toml`'s
+# `allow-print-in-tests` is what keeps a measurement's `--nocapture` output
+# legitimate, and it was configured here against lints nothing turned on.
+print_stdout = "deny"
+print_stderr = "deny"
 
 [workspace.dependencies]
 

@@ -3776,6 +3776,104 @@ async fn reconcile_merges_split_pair() {
     assert_eq!(chats[0].unread_count, 2);
 }
 
+/// A receipt names the peer's device (`user:48@lid`), and that is the form
+/// a reconcile can be asked for under. `merge_split_chat` took its keys raw
+/// where every other entry point normalizes, so nothing was filed under the
+/// name it was given, the early return fired, and the repair that was asked
+/// for silently did not happen.
+#[tokio::test]
+async fn a_reconcile_named_by_a_device_still_merges_the_pair() {
+    let (store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("via pn"),
+                incoming_info(PEER, PEER, "MSG-AD-A", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("via lid"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-AD-B", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(chat_store.chats(false, 10).await.unwrap().len(), 2);
+
+    add_lid_mapping(&store).await;
+    let with_device: Jid = format!("{}:48@s.whatsapp.net", jid(PEER).user)
+        .parse()
+        .expect("valid device address");
+    chat_store.reconcile_chat(&with_device).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1, "the pair asked about is the pair merged");
+    assert_eq!(chats[0].jid, jid(PEER_LID));
+}
+
+/// Reaction timestamps are whole seconds, so adding and removing inside one
+/// second ties. The merge dropped a destination row only for a *strictly*
+/// newer source row, so a tie kept the emoji and threw away the tombstone
+/// that cancelled it, and a removed reaction came back. The live path
+/// settles the same tie the other way (`ts_ms <= ts_ms`).
+#[tokio::test]
+async fn a_removal_that_ties_with_its_reaction_survives_the_merge() {
+    let (store, chat_store) = test_store().await;
+    let alice = "559900000002@s.whatsapp.net";
+
+    // The same message reached both sides of the split, and so did alice:
+    // the removal landed on the PN side and the emoji on the LID side, which
+    // newer activity makes the merge's destination, both stamped to the same
+    // second.
+    let react = |chat: &str, emoji: &str, id: &str| {
+        message_event(
+            wa::Message {
+                reaction_message: MessageField::some(wa::message::ReactionMessage {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("MSG-TIE".into()),
+                        ..Default::default()
+                    }),
+                    text: Some(emoji.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            incoming_info(chat, alice, id, 1_700_000_010),
+        )
+    };
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("target"),
+                incoming_info(PEER, PEER, "MSG-TIE", 1_700_000_000),
+            ),
+            react(PEER, "", "R-DEL"),
+            message_event(
+                wa::Message::text("target"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-TIE", 1_700_000_100),
+            ),
+            react(PEER_LID, "\u{1f44d}", "R-ADD"),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    assert!(
+        chat_store
+            .reactions(&jid(PEER), "MSG-TIE")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a removal is always later than the reaction it cancels"
+    );
+}
+
 /// The same message stored under both keys keeps the most advanced status
 /// after the merge.
 #[tokio::test]
@@ -6481,6 +6579,79 @@ async fn mark_send_failed_fails_pending_row_only() {
     chat_store.flush().await.unwrap();
     let msg = chat_store.message(&chat, "OUT-WON").await.unwrap().unwrap();
     assert_eq!(msg.status, MessageStatus::ServerAck);
+}
+
+/// A failure is terminal. `ERROR` is 0, so every "never move backwards"
+/// guard here (`status < SERVER_ACK`, `status < DELIVERY_ACK`) admitted it
+/// from below: a delivery receipt or a positive ack arriving after the row
+/// had failed showed the user a send as delivered that the UI had already
+/// reported as failed.
+#[tokio::test]
+async fn a_late_receipt_does_not_revive_a_failed_send() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    for id in ["OUT-NACKED", "OUT-ACKED"] {
+        chat_store
+            .record_outgoing(
+                &chat,
+                id,
+                &wa::Message::text("oi"),
+                Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+            )
+            .unwrap();
+    }
+    // One failed by the server, one by this side. Both end in `Error`.
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-NACKED".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .error("479".to_string())
+                .build(),
+        )],
+    )
+    .await;
+    chat_store.mark_send_failed(&chat, "OUT-ACKED").unwrap();
+    chat_store.flush().await.unwrap();
+
+    // The peer's receipt, arriving late, and the ack the nack raced.
+    feed(
+        &chat_store,
+        [
+            Event::Receipt(
+                Receipt::builder()
+                    .source(MessageSource {
+                        chat: chat.clone(),
+                        sender: chat.clone(),
+                        ..Default::default()
+                    })
+                    .message_ids(vec!["OUT-NACKED".to_string(), "OUT-ACKED".to_string()])
+                    .timestamp(Utc.timestamp_opt(1_700_000_300, 0).unwrap())
+                    .r#type(ReceiptType::Delivered)
+                    .offline(false)
+                    .build(),
+            ),
+            Event::ServerAck(
+                ServerAck::builder()
+                    .id("OUT-ACKED".to_string())
+                    .class("message".to_string())
+                    .from(chat.clone())
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+
+    for id in ["OUT-NACKED", "OUT-ACKED"] {
+        assert_eq!(
+            chat_store.message(&chat, id).await.unwrap().unwrap().status,
+            MessageStatus::Error,
+            "{id} was reported as failed, so nothing may show it as delivered"
+        );
+    }
 }
 
 const STATUS_BROADCAST: &str = "status@broadcast";

@@ -70,6 +70,22 @@ enum Delivery {
     Dropped,
 }
 
+impl Delivery {
+    /// Whether a gap is still owed to whoever draws next.
+    ///
+    /// Only a frame that arrived spends the mark. A slot nobody was
+    /// listening to carried nothing, so clearing the mark there hands the
+    /// next frame to a decoder still missing the units before it, with
+    /// nothing on it to say so.
+    fn still_owes_a_gap(self, pending: bool) -> bool {
+        match self {
+            Delivery::Sent => false,
+            Delivery::Dropped => true,
+            Delivery::NoSubscriber => pending,
+        }
+    }
+}
+
 /// Hand one frame to whoever is subscribed, if anyone is.
 ///
 /// The frame is *built* by the caller's closure and only when there is
@@ -150,6 +166,10 @@ pub(crate) struct LocalVideo {
     drawable: Arc<AtomicBool>,
     /// The fan-out task, stopped by dropping the camera's channel.
     pump: tokio::task::JoinHandle<()>,
+    /// The peer's half of the same `Endpoints` pair, held for the same
+    /// reason: nothing else here can end it, and one that outlived the pair
+    /// publishes into whatever call the id slot names next.
+    remote_pump: tokio::task::JoinHandle<()>,
     /// Cleared by the pump *before* it reports the loss, so a caller still
     /// wiring this camera up can ask whether the device is still there.
     ///
@@ -216,10 +236,22 @@ impl LocalVideo {
         // been polled yet — so the device is closed by the owner rather than
         // by whoever happens to drop the last reference.
         self.pump.abort();
+        // The peer's pump too, and for the reason the local one is aborted:
+        // it is the other half of one `Endpoints` pair, and the only thing
+        // that ends it otherwise is the library dropping the sink. One that
+        // outlived its pair would go on publishing `VideoStream::Remote`
+        // under whatever call id the slot holds next, interleaved with the
+        // new call's own pump.
+        self.remote_pump.abort();
         let camera = self.camera;
         // On a blocking thread: closing waits for the frame the capture
-        // thread is asleep in.
-        let _ = tokio::task::spawn_blocking(move || camera.stop()).await;
+        // thread is asleep in. The answer is read rather than dropped
+        // because a backend that panicked is what leaves the device held,
+        // and the next call's `open` then fails with nothing in the log to
+        // connect the two.
+        if let Err(e) = tokio::task::spawn_blocking(move || camera.stop()).await {
+            warn!("closing the camera failed: {e}");
+        }
     }
 }
 
@@ -287,12 +319,13 @@ pub(crate) async fn open(
         drawable: Arc::clone(&drawable),
         alive: Arc::clone(&alive),
     }));
-    tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publisher));
+    let remote_pump = tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publisher));
 
     Ok((
         LocalVideo {
             camera,
             pump,
+            remote_pump,
             id: call_id,
             camera_id,
             drawable,
@@ -364,10 +397,10 @@ async fn pump_local(pump: LocalPump) {
             // that emits one every few seconds anyway — against a self-view
             // frozen until the next, and the mark travels with the frame that
             // does arrive.
-            gap = drawn == Delivery::Dropped;
-            if gap {
+            if drawn == Delivery::Dropped {
                 camera.request_keyframe();
             }
+            gap = drawn.still_owes_a_gap(gap);
         }
         if plane.try_send(data).is_err() {
             if plane.is_closed() {
@@ -423,7 +456,34 @@ async fn pump_remote(
         });
         // Nothing here can ask the peer for a keyframe, so the most this can
         // do is tell the decoder not to draw on what it no longer has.
-        gap = drawn == Delivery::Dropped;
+        gap = drawn.still_owes_a_gap(gap);
     }
     debug!("remote video for {} ended", read(&call_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A gap is spent by the frame that carries it, and nothing else. A slot
+    /// nobody was listening to used to clear one: a frame dropped, the next
+    /// found the subscriber replaced, and the one after that arrived unmarked
+    /// at a decoder still missing the units before it.
+    #[test]
+    fn a_gap_survives_a_frame_nobody_was_there_to_take() {
+        let pending = Delivery::Dropped.still_owes_a_gap(false);
+        assert!(pending, "a drop is what owes a gap");
+
+        let across = Delivery::NoSubscriber.still_owes_a_gap(pending);
+        assert!(across, "and nobody watching does not settle it");
+
+        assert!(
+            !Delivery::Sent.still_owes_a_gap(across),
+            "the frame that arrives is what spends it"
+        );
+        assert!(
+            !Delivery::NoSubscriber.still_owes_a_gap(false),
+            "and nothing owed stays nothing owed"
+        );
+    }
 }

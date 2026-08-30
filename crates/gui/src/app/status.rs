@@ -347,12 +347,15 @@ impl WhatsAppApp {
     /// the feed is derived from messages that arrive from the daemon, and
     /// this is where the answer is about to be drawn.
     pub fn reconcile_status_pane(&mut self, cx: &mut Context<Self>) {
-        let Some(anchor) = self.status_pane.shown().map(str::to_string) else {
-            return;
-        };
         let Some(author_jid) = self.status_pane.author().map(str::to_string) else {
             return;
         };
+        // Asked after the author, and allowed to be absent. `follow` records
+        // `None` when the author being opened had nothing in the feed, which
+        // a short race between the row being drawn and the run lapsing can
+        // returning on that left the reader open on an empty pane forever,
+        // because the branch that closes it is below.
+        let anchor = self.status_pane.shown().map(str::to_string);
         let feed = self.status_feed();
         let Some(author) = feed.author(&author_jid) else {
             // Their whole run is gone — the last of it lapsed, or the only
@@ -361,8 +364,15 @@ impl WhatsAppApp {
             // either: stop what was playing and close the reader, which would
             // otherwise be an empty state with no way out of it on a phone.
             self.status_pane.follow(None);
-            self.stop_status_media(Some(anchor));
+            self.stop_status_media(anchor);
             self.close_status(cx);
+            return;
+        };
+        // There is a run, and the reader is following nothing in it. Adopt
+        // whatever its position resolves to, announced like any other change:
+        // nothing is being left, so there is nothing to stop.
+        let Some(anchor) = anchor else {
+            self.shown_status_changed(None, cx);
             return;
         };
         match feed.updates_of(author).position(|m| m.id == anchor) {

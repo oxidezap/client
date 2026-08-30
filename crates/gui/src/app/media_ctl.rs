@@ -573,26 +573,53 @@ impl WhatsAppApp {
     ) -> Option<Arc<Image>> {
         let format = mime_to_image_format(mime_type)?;
 
-        // Check if already cached
-        if let Some(cached) = self.decoded_images.borrow().get(message_id).cloned() {
-            return Some(cached);
+        // A hit moves the entry to the back, which is what makes the order
+        // below least-recently-used rather than insertion order. By
+        // insertion, the entry evicted first was as likely as not the one
+        // being drawn this frame: the viewer and the status reader both
+        // resolve before the list's rows do, so a picture opened full screen
+        // was thrown out and rebuilt under itself: animated stickers
+        // restarting, and the bytes decoded again, which is the whole of what
+        // this cache exists to avoid.
+        {
+            let mut cache = self.decoded_images.borrow_mut();
+            if let Some(at) = cache.get_index_of(message_id) {
+                let last = cache.len() - 1;
+                cache.move_index(at, last);
+                return cache.get_index(last).map(|(_, image)| Arc::clone(image));
+            }
         }
 
         let image = Arc::new(Image::from_bytes(format, data.to_vec()));
 
+        // What is on screen right now, which may not be evicted whatever the
+        // order says: dropping it is a rebuild inside the same frame.
+        let pinned = [
+            self.media_viewer.as_ref().and_then(MediaViewer::current_id),
+            self.status_pane.shown(),
+        ];
         let mut cache = self.decoded_images.borrow_mut();
 
-        // Oldest first, until this one fits under both ceilings — see
-        // `DECODED_IMAGE_BUDGET` for why there are two. An image larger than
-        // the whole budget still goes in and is then alone in the cache;
-        // refusing it would mean a picture the reader opened being decoded
-        // again on every frame.
+        // Oldest first, never one that is being drawn, until this one fits
+        // under both ceilings — see `DECODED_IMAGE_BUDGET` for why there are
+        // two. An image larger than the whole budget still goes in and is then
+        // alone in the cache; refusing it would mean a picture the reader
+        // opened being decoded again on every frame.
         let cost = image.bytes.len();
         let mut held: usize = cache.values().map(|image| image.bytes.len()).sum();
-        while (held + cost > DECODED_IMAGE_BUDGET || cache.len() >= MAX_DECODED_IMAGES)
-            && !cache.is_empty()
-        {
-            if let Some((_, evicted)) = cache.shift_remove_index(0) {
+        while held + cost > DECODED_IMAGE_BUDGET || cache.len() >= MAX_DECODED_IMAGES {
+            let Some(at) = cache
+                .keys()
+                .position(|key| !pinned.contains(&Some(key.as_str())))
+            else {
+                // Everything left is being drawn — or there is nothing left at
+                // all, which is the same answer: this image is larger than the
+                // budget and goes in alone. Otherwise never reached, with
+                // ceilings this far above the two things that can be pinned;
+                // the entry is kept rather than one of them dropped.
+                break;
+            };
+            if let Some((_, evicted)) = cache.shift_remove_index(at) {
                 held = held.saturating_sub(evicted.bytes.len());
             }
         }

@@ -9,24 +9,35 @@ use super::centered_view;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use oxidezap_core::{CachedQrCode, Issued, Lifetime};
 
-/// Generate QR code as PNG bytes (called once when QR data changes)
+/// The QR code as PNG bytes, built once each time the code rotates.
+///
+/// `None` means it could not be drawn, and both ways of getting there are
+/// said out loud: the screen has nothing else to show for it, and the only
+/// thing the user sees is a code that never appears.
 pub fn generate_qr_png(data: &str) -> Option<Vec<u8>> {
     use image::ImageEncoder;
     use qrcode::QrCode;
 
-    let code = QrCode::new(data.as_bytes()).ok()?;
+    let code = match QrCode::new(data.as_bytes()) {
+        Ok(code) => code,
+        Err(e) => {
+            log::warn!("the server's pairing payload would not fit in a QR code: {e}");
+            return None;
+        }
+    };
     let image = code.render::<image::Luma<u8>>().build();
 
     let mut png_bytes = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
-    encoder
-        .write_image(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            image::ExtendedColorType::L8,
-        )
-        .ok()?;
+    if let Err(e) = encoder.write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::L8,
+    ) {
+        log::warn!("could not encode the QR code: {e}");
+        return None;
+    }
 
     Some(png_bytes)
 }
@@ -250,4 +261,22 @@ fn render_expiry(
                     "refreshing…".to_string()
                 }),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_qr_png;
+
+    /// A payload the encoder refuses answers `None` rather than a picture,
+    /// which is the case the caller has to keep the previous code for. QR
+    /// version 40 at the lowest correction level holds under 3 KiB, so this
+    /// is past every one of them.
+    #[test]
+    fn a_payload_that_will_not_fit_is_refused_rather_than_drawn() {
+        assert!(generate_qr_png(&"x".repeat(8192)).is_none());
+        assert!(
+            generate_qr_png("2@abcd,efgh,ijkl,1").is_some(),
+            "and an ordinary pairing payload is drawn"
+        );
+    }
 }

@@ -785,6 +785,9 @@ pub struct WhatsAppApp {
     message_list_cache: RefCell<HashMap<String, MessageListCache>>,
     /// Cache of chat list data to avoid recomputation on every render.
     chat_list_cache: RefCell<Option<ChatListCache>>,
+    /// How many times the chat cache has been invalidated. See
+    /// [`ChatListCache::version`].
+    chat_cache_version: std::cell::Cell<u64>,
     /// Mobile navigation state - which panel to show on mobile devices
     mobile_panel: MobilePanel,
     /// Which conversations the sidebar is showing.
@@ -991,6 +994,7 @@ impl WhatsAppApp {
             decoded_images: RefCell::new(IndexMap::new()),
             message_list_cache: RefCell::new(HashMap::new()),
             chat_list_cache: RefCell::new(None),
+            chat_cache_version: std::cell::Cell::new(0),
             storage_usage: None,
             destination: Destination::default(),
             status_pane: StatusPane::default(),
@@ -1097,6 +1101,25 @@ impl WhatsAppApp {
     pub fn get_chat_list_cache(&self) -> ChatListCache {
         let mut cache = self.chat_list_cache.borrow_mut();
 
+        // Asked before anything is filtered, which is the whole of this: the
+        // filter walks every chat, and it used to run on every frame just to
+        // compare the count it produced. Both halves of this are O(1). The
+        // version is what every path that changes a preview (a receipt, a
+        // draft, a typing notice) already announces; the length is what
+        // catches a chat that reached the list without announcing anything.
+        //
+        // The walk itself no longer allocates either — `contains_ignore_case`
+        // folds as it goes rather than lowercasing a name and a JID into two
+        // `String`s per chat — which is what the *miss* path costs, and a
+        // search misses on every keystroke.
+        let version = self.chat_cache_version.get();
+        if let Some(cached) = cache.as_ref()
+            && cached.version == version
+            && cached.chats_len == self.chats.len()
+        {
+            return cached.clone();
+        }
+
         let query = &self.chat_search_query;
         let matches = |chat: &Chat| {
             self.chat_filter.matches(chat)
@@ -1104,22 +1127,8 @@ impl WhatsAppApp {
                     || contains_ignore_case(&chat.jid, query))
         };
 
-        // The count alone cannot see a preview change — a receipt, a draft, a
-        // typing notice — so every path that changes one invalidates the cache
-        // explicitly. This guard only skips the rebuild when nothing was
-        // added or removed *and* nothing claimed a change.
-        //
-        // Counted rather than collected, because this is the path a frame
-        // almost always takes: the rows are already right, and building the
-        // `Vec<&Chat>` that proves it is an allocation per frame for a value
-        // about to be dropped.
-        if let Some(cached) = cache.as_ref()
-            && cached.chat_count == self.conversations().filter(|c| matches(c)).count()
-        {
-            return cached.clone();
-        }
-
         let filtered: Vec<&Chat> = self.conversations().filter(|c| matches(c)).collect();
+
         let rows: Arc<[ChatRow]> = filtered
             .into_iter()
             .map(|chat| {
@@ -1138,6 +1147,8 @@ impl WhatsAppApp {
 
         let new_cache = ChatListCache {
             chat_count: rows.len(),
+            version,
+            chats_len: self.chats.len(),
             rows,
         };
 
@@ -1262,6 +1273,8 @@ impl WhatsAppApp {
     /// second cache that outlived the first would draw a run of updates that
     /// no longer matches the messages behind it.
     fn invalidate_chat_cache(&self) {
+        self.chat_cache_version
+            .set(self.chat_cache_version.get().wrapping_add(1));
         *self.chat_list_cache.borrow_mut() = None;
         *self.status_feed_cache.borrow_mut() = None;
     }
@@ -2164,12 +2177,13 @@ impl WhatsAppApp {
     pub fn reset_and_pair_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.app_state = AppState::Loading;
 
-        let asked = self
-            .client
-            .take()
-            .inspect(Session::forget_session)
-            .is_some();
+        let dying = self.client.take().inspect(Session::forget_session);
+        // Before the connection goes, because dropping it waits for its
+        // reader to leave and a reader parked for room in this queue is
+        // waiting on the thread standing here.
         self.event_task.take();
+        let asked = dying.is_some();
+        drop(dying);
 
         self.forget_account_state(window, cx);
 
@@ -2191,9 +2205,14 @@ impl WhatsAppApp {
         self.app_state = AppState::Loading;
 
         // Drop the old connection first: a second one alongside it would be
-        // served the whole history again for nothing.
-        self.client.take();
+        // served the whole history again for nothing — and dropping it is
+        // what ends its reader, which is the half the daemon counts.
+        //
+        // The event task goes first, because dropping the session waits for
+        // the reader to leave and a reader parked for room in that queue is
+        // waiting on this very thread to drain it.
         self.event_task.take();
+        self.client.take();
 
         // A failure routes back to the error screen, where retry stays
         // available.

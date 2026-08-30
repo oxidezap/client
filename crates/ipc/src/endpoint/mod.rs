@@ -19,7 +19,7 @@ mod stream;
 pub mod web;
 
 #[cfg(not(target_family = "wasm"))]
-pub use stream::{Endpoint, Reader, Writer};
+pub use stream::{Endpoint, Hangup, Reader, Writer};
 
 /// Whether a host names this machine.
 ///
