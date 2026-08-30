@@ -74,6 +74,42 @@ impl CameraControl {
     }
 }
 
+/// Stops a camera that was opened but never handed to [`Held`].
+///
+/// Dropping a `MediaStream` does **not** stop its tracks: the specification
+/// ties a source's lifetime to `stop()` on each track, not to the object, so
+/// a stream that only ever gets garbage collected leaves the camera running
+/// with its indicator lit. Every `?` between `getUserMedia` returning and
+/// `Held` taking ownership is such a path — an encoder the browser will not
+/// build, a codec it refuses, a timer that will not start — and each of them
+/// downgrades the call to voice, which is exactly when the light must go out.
+struct CameraGuard(Option<web_sys::MediaStream>);
+
+impl CameraGuard {
+    /// Hand the stream on; setup succeeded, so [`Held`] closes it from here.
+    fn release(mut self) -> web_sys::MediaStream {
+        self.0.take().expect("a guard is released once")
+    }
+}
+
+impl Drop for CameraGuard {
+    fn drop(&mut self) {
+        if let Some(stream) = self.0.take() {
+            stop_tracks(&stream);
+            debug!("the camera is closed again: it opened but its setup did not finish");
+        }
+    }
+}
+
+/// End every track, which is what actually releases the device.
+fn stop_tracks(stream: &web_sys::MediaStream) {
+    for track in stream.get_tracks().iter() {
+        if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
+            track.stop();
+        }
+    }
+}
+
 /// Everything one open camera keeps alive, released together.
 ///
 /// The closures are held because the browser calls into them; the element is
@@ -102,11 +138,7 @@ impl Drop for Held {
             let _ = self.encoder.close();
         }
         self.element.set_src_object(None);
-        for track in self.stream.get_tracks().iter() {
-            if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
-                track.stop();
-            }
-        }
+        stop_tracks(&self.stream);
         debug!("the camera is closed");
     }
 }
@@ -170,12 +202,21 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
         bail!("this browser has no VideoEncoder, so it cannot send a picture");
     }
     let window = web_sys::window().ok_or_else(|| anyhow!("no window to open a camera from"))?;
-    let stream = open_device(&window, quality).await?;
+    // Armed before anything else can fail: from here to `Held` the camera is
+    // open, and every `?` below would otherwise leave it that way.
+    let guard = CameraGuard(Some(open_device(&window, quality).await?));
+    let stream = guard.0.as_ref().expect("just armed").clone();
     let element = attach(&window, &stream)?;
 
     let (tx, rx) = async_channel::bounded::<EncodedFrame>(FRAME_DEPTH);
+    // Before the callback rather than after, so the chunk handler can ask for
+    // a keyframe when it is the one that drops a unit.
+    let control = CameraControl(Rc::new(Control {
+        keyframe: Cell::new(true),
+    }));
     let on_chunk = {
         let tx = tx.clone();
+        let control = control.clone();
         Closure::<dyn FnMut(web_sys::EncodedVideoChunk, wasm_bindgen::JsValue)>::new(
             move |chunk: web_sys::EncodedVideoChunk, _metadata: wasm_bindgen::JsValue| {
                 let mut data = vec![0u8; chunk.byte_length() as usize];
@@ -190,19 +231,36 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
                 // Dropped rather than queued: this is the same trade the
                 // desktop's plane makes one step further along. A unit the
                 // session has not taken by the time the next is encoded is
-                // one the peer is better off not waiting for -- and the drop
-                // costs a keyframe, which the session asks for when its own
-                // send fails.
-                let _ = tx.try_send(EncodedFrame { data, keyframe });
+                // one the peer is better off not waiting for.
+                //
+                // The keyframe is asked for *here*, though, and not left to
+                // the session: a unit dropped at this queue never reaches the
+                // session at all, so its own "my send failed" path cannot see
+                // the gap, and every P-frame after this one references a
+                // picture the peer will never hold. Only on `Full` — a closed
+                // channel means the call is over and nothing wants a picture.
+                if let Err(async_channel::TrySendError::Full(_)) =
+                    tx.try_send(EncodedFrame { data, keyframe })
+                {
+                    control.request_keyframe();
+                }
             },
         )
     };
-    let on_error =
+    let on_error = {
+        let tx = tx.clone();
         Closure::<dyn FnMut(wasm_bindgen::JsValue)>::new(move |error: wasm_bindgen::JsValue| {
-            // The encoder is done after an error; the channel closing is what
-            // the session reads as the device having gone.
+            // The encoder is done after an error, and this is asynchronous:
+            // nothing above is returning an `Err` for it. Closing the channel
+            // is what the session reads as the device having gone, so it has
+            // to happen *here* — the chunk callback holds a sender for as
+            // long as the camera is held, so without this the frame pump
+            // waits forever on a channel nothing will ever send to again, and
+            // the registry goes on drawing a camera that stopped.
             warn!("the video encoder stopped: {}", describe(&error));
-        });
+            tx.close();
+        })
+    };
 
     let init = web_sys::VideoEncoderInit::new(
         on_error.as_ref().unchecked_ref(),
@@ -217,9 +275,6 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
         )
     })?;
 
-    let control = CameraControl(Rc::new(Control {
-        keyframe: Cell::new(true),
-    }));
     let on_tick = tick(&element, &encoder, &control, quality);
     let timer = window
         .set_interval_with_callback_and_timeout_and_arguments_0(
@@ -237,7 +292,9 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
         quality,
         control,
         held: Some(Held {
-            stream,
+            // Setup finished: the guard hands the camera to `Held`, which is
+            // what closes it from here.
+            stream: guard.release(),
             element,
             encoder,
             timer: Some(timer),

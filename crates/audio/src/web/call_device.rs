@@ -44,7 +44,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use log::{debug, warn};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
@@ -117,6 +117,40 @@ impl Drop for Graph {
     }
 }
 
+/// Releases the context and the microphone if setup does not reach [`Graph`].
+///
+/// [`Graph`] closes both when it drops, which covers every ending of a call
+/// that started. What it does not cover is a setup that fails *before* it
+/// exists: `wire` can refuse at any of half a dozen browser calls, and a
+/// `MediaStream` that is only dropped keeps the microphone — and its
+/// indicator — running, because the specification ends a source on `stop()`
+/// and not on the last reference going away.
+struct Opening {
+    context: web_sys::AudioContext,
+    stream: Option<web_sys::MediaStream>,
+}
+
+impl Opening {
+    /// Setup finished; [`Graph`] closes them from here.
+    fn release(mut self) -> web_sys::MediaStream {
+        self.stream.take().expect("a guard is released once")
+    }
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            for track in stream.get_tracks().iter() {
+                if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
+                    track.stop();
+                }
+            }
+            let _ = self.context.close();
+            debug!("the call's audio is closed again: it opened but its setup did not finish");
+        }
+    }
+}
+
 /// Open the microphone and the speaker for one call.
 ///
 /// Async where the desktop's is blocking, and it has to be: `getUserMedia` is
@@ -131,9 +165,13 @@ pub async fn open_call_audio() -> Result<(
         .map_err(|e| anyhow!("this browser has no AudioContext: {}", describe(&e)))?;
     let rate = context.sample_rate() as u32;
 
-    let stream = open_microphone().await.inspect_err(|_| {
-        let _ = context.close();
-    })?;
+    let opening = Opening {
+        context: context.clone(),
+        stream: Some(open_microphone().await.inspect_err(|_| {
+            let _ = context.close();
+        })?),
+    };
+    let stream = opening.stream.as_ref().expect("just armed").clone();
 
     let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(MIC_DEPTH);
     let (speaker_tx, speaker_rx) = async_channel::bounded::<Vec<i16>>(MIC_DEPTH * 4);
@@ -146,11 +184,29 @@ pub async fn open_call_audio() -> Result<(
 
     let graph = wire(&context, &stream, rate, mic_tx.clone(), Rc::clone(&playout))?;
 
-    // The context may open suspended when the page has had no gesture yet. A
-    // call is placed or answered by pressing something, so the gesture is
-    // there — but the resume is asynchronous and worth not waiting on: the
-    // graph is already running by the time it settles.
-    let _ = context.resume();
+    // Awaited, and then checked. A context opens suspended when the page has
+    // had no gesture yet, and `resume` is a promise that autoplay policy may
+    // *reject* — a call answered from a notification rather than from a press
+    // is exactly that case. Neither `ScriptProcessorNode` is called while the
+    // context is suspended, so letting this go unwatched returns a microphone
+    // and a speaker that look live, lets the call be offered or accepted, and
+    // produces silence in both directions with nothing anywhere saying why.
+    let resuming = context
+        .resume()
+        .map_err(|e| anyhow!("the browser would not start audio: {}", describe(&e)))?;
+    if let Err(e) = wasm_bindgen_futures::JsFuture::from(resuming).await {
+        bail!(
+            "the browser would not start audio for this call: {}",
+            describe(&e)
+        );
+    }
+    if context.state() != web_sys::AudioContextState::Running {
+        bail!("the browser left this call's audio suspended, so nothing would be heard");
+    }
+
+    // Past every fallible step: `Graph` owns the context and the microphone
+    // from here, and closes both when the call ends.
+    let _stream = opening.release();
 
     // One task owns the graph, and it ends when the call does. Both channels
     // are dropped together by the call's teardown, so whichever is noticed

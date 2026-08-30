@@ -180,6 +180,35 @@ struct Wiring {
     _on_state: Closure<dyn FnMut(web_sys::Event)>,
 }
 
+/// Closes a peer connection that was built but never handed to a channel.
+///
+/// A `RTCPeerConnection` is not released by dropping the handle: it keeps its
+/// ICE agent and DTLS session until `close()` or until the tab's collector
+/// reaches it. Every failure in `connect_peer_connection` after construction
+/// returns before [`BrowserRelayChannel`] owns it, and against a relay that is
+/// unreachable or refuses the answer that is one leaked connection per
+/// attempt.
+struct ConnectionGuard(Option<web_sys::RtcPeerConnection>);
+
+impl ConnectionGuard {
+    fn get(&self) -> &web_sys::RtcPeerConnection {
+        self.0.as_ref().expect("held until released")
+    }
+
+    /// Setup succeeded; the channel closes it from here.
+    fn release(mut self) -> web_sys::RtcPeerConnection {
+        self.0.take().expect("a guard is released once")
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.take() {
+            connection.close();
+        }
+    }
+}
+
 /// The open media channel, as the call driver sees it.
 struct BrowserRelayChannel {
     connection: web_sys::RtcPeerConnection,
@@ -227,7 +256,12 @@ impl Inbound {
                 {
                     warn!("the relay channel dropped a STUN packet: the call driver is behind");
                 }
-                self.dropped.set(pending.saturating_add(1));
+                // `self.dropped.get()` and not `pending`: the report above
+                // may have just succeeded and zeroed the cell, and adding to
+                // the pre-report value would count those losses a second
+                // time — and again on every recurrence, so the number the
+                // driver is told grows without any packet being lost.
+                self.dropped.set(self.dropped.get().saturating_add(1));
             }
             Err(async_channel::TrySendError::Closed(_)) => {}
         }
@@ -258,6 +292,15 @@ impl RelayTransport for BrowserRelayChannel {
 
 impl Drop for BrowserRelayChannel {
     fn drop(&mut self) {
+        // Detached whether or not this is the close that does the work, and
+        // *before* `Wiring` drops its closures a line later. `close()`
+        // dispatches `onclose` asynchronously, so an ordinary teardown —
+        // `disconnect` sets the flag, the driver drops the transport, the
+        // browser then fires the event — would call a wasm-bindgen closure
+        // that has already been freed, which traps and takes the tab. The
+        // early return below is what makes this the only safe place for it:
+        // it skips the closes, and it must not skip this.
+        detach(&self.channel);
         if self.closed.replace(true) {
             return;
         }
@@ -267,6 +310,15 @@ impl Drop for BrowserRelayChannel {
         self.channel.close();
         self.connection.close();
     }
+}
+
+/// Take every handler off the channel, so the closures behind them are safe to
+/// drop. Idempotent, and cheap enough not to be worth a flag.
+fn detach(channel: &web_sys::RtcDataChannel) {
+    channel.set_onmessage(None);
+    channel.set_onclose(None);
+    channel.set_onerror(None);
+    channel.set_onopen(None);
 }
 
 /// Build the peer connection, feed it the synthetic answer, and wait for the
@@ -282,15 +334,25 @@ async fn connect_peer_connection(
     // round trip to a relay that is already the reflexive address.
     let config = web_sys::RtcConfiguration::new();
     config.set_ice_servers(&js_sys::Array::new());
-    let connection = web_sys::RtcPeerConnection::new_with_configuration(&config)
-        .map_err(|e| anyhow!("RTCPeerConnection: {}", describe(&e)))?;
+    // Guarded from here: every `?` below — `createOffer`, either description,
+    // a channel that never opens, the caller's timeout cancelling this future
+    // — returns before `BrowserRelayChannel` owns the connection, and a peer
+    // connection nothing closes keeps its ICE and DTLS state alive until the
+    // tab's garbage collector gets to it. Against an unreachable relay that is
+    // once per attempt.
+    let connection = ConnectionGuard(Some(
+        web_sys::RtcPeerConnection::new_with_configuration(&config)
+            .map_err(|e| anyhow!("RTCPeerConnection: {}", describe(&e)))?,
+    ));
 
     let init = web_sys::RtcDataChannelInit::new();
     init.set_negotiated(true);
     init.set_id(CHANNEL_ID);
     init.set_ordered(false);
     init.set_max_retransmits(0);
-    let channel = connection.create_data_channel_with_data_channel_dict(CHANNEL_LABEL, &init);
+    let channel = connection
+        .get()
+        .create_data_channel_with_data_channel_dict(CHANNEL_LABEL, &init);
     channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
     let (events_tx, events_rx) = async_channel::bounded(INBOUND_DEPTH);
@@ -325,7 +387,15 @@ async fn connect_peer_connection(
     let on_close = {
         let events = events_tx.clone();
         Closure::wrap(Box::new(move |_: web_sys::Event| {
-            let _ = events.try_send(RelayTransportEvent::Disconnected(
+            // `force_send` rather than `try_send`: this is the one event the
+            // driver cannot do without. A packet queue that is full is
+            // exactly the state a dying relay leaves behind, so a `try_send`
+            // here loses the disconnect precisely when it matters — and the
+            // callbacks hold sender clones for the life of the channel, so
+            // the receiver never sees a closure either and the call waits on
+            // a relay that is already gone. Evicting the oldest packet to say
+            // so is the right trade: media is what a call can afford to lose.
+            let _ = events.force_send(RelayTransportEvent::Disconnected(
                 RelayDisconnectReason::Closed,
             ));
         }) as Box<dyn FnMut(web_sys::Event)>)
@@ -341,7 +411,8 @@ async fn connect_peer_connection(
                 .dyn_ref::<web_sys::RtcDataChannelEvent>()
                 .map(|_| "the relay channel reported an error".to_string())
                 .unwrap_or_else(|| event.type_());
-            let _ = events.try_send(RelayTransportEvent::Disconnected(
+            // Terminal, so `force_send` for the reason `on_close` gives.
+            let _ = events.force_send(RelayTransportEvent::Disconnected(
                 RelayDisconnectReason::ReadError(reason),
             ));
         }) as Box<dyn FnMut(web_sys::Event)>)
@@ -359,7 +430,7 @@ async fn connect_peer_connection(
     channel.set_onopen(Some(on_state.as_ref().unchecked_ref()));
 
     let offer = js_sys::Reflect::get(
-        &wasm_bindgen_futures::JsFuture::from(connection.create_offer())
+        &wasm_bindgen_futures::JsFuture::from(connection.get().create_offer())
             .await
             .map_err(|e| anyhow!("createOffer: {}", describe(&e)))?,
         &wasm_bindgen::JsValue::from_str("sdp"),
@@ -370,14 +441,14 @@ async fn connect_peer_connection(
 
     let local = web_sys::RtcSessionDescriptionInit::new(web_sys::RtcSdpType::Offer);
     local.set_sdp(&offer);
-    wasm_bindgen_futures::JsFuture::from(connection.set_local_description(&local))
+    wasm_bindgen_futures::JsFuture::from(connection.get().set_local_description(&local))
         .await
         .map_err(|e| anyhow!("setLocalDescription: {}", describe(&e)))?;
 
     let answer = synthetic_answer(&offer, params)?;
     let remote = web_sys::RtcSessionDescriptionInit::new(web_sys::RtcSdpType::Answer);
     remote.set_sdp(&answer);
-    wasm_bindgen_futures::JsFuture::from(connection.set_remote_description(&remote))
+    wasm_bindgen_futures::JsFuture::from(connection.get().set_remote_description(&remote))
         .await
         .map_err(|e| anyhow!("setRemoteDescription: {}", describe(&e)))?;
 
@@ -391,7 +462,7 @@ async fn connect_peer_connection(
     debug!("voip: the relay media channel to {} is open", params.addr);
     Ok((
         std::sync::Arc::new(BrowserRelayChannel {
-            connection,
+            connection: connection.release(),
             channel,
             _wiring: Wiring {
                 _on_message: on_message,

@@ -62,6 +62,7 @@ web-sys = { version = "0.3", features = [
     # JavaScript module file, and the one hand-written JS file in this tree is
     # the service worker, which exists because nothing else can set a header.
     "AudioContextOptions",
+    "AudioContextState",
     "AudioData",
     "AudioDataCopyToOptions",
     "AudioDataInit",

@@ -125,11 +125,11 @@ mod video {
 /// so a browser with `RTCPeerConnection` and no `VideoEncoder` places an
 /// ordinary voice call. There is nothing to withhold.
 ///
-/// What this cannot see is whether the *build* can complete the handshake:
-/// that is `oxidezap-session`'s `relay::web::RELAY_DTLS_FINGERPRINT`, and a
-/// front end has no route to it -- the GUI depends on ipc, core and audio,
-/// never on the session. A build missing it fails at setup with its own
-/// reason instead, which is the weaker of the two places to learn it.
+/// The GUI has no route to `oxidezap-session`'s
+/// `relay::web::RELAY_DTLS_FINGERPRINT` -- it depends on ipc, core and audio,
+/// never on the session -- so this does not read that constant. It does not
+/// need to: the only arrangement that constant governs is a page holding its
+/// own session, and that is the arrangement this refuses outright.
 #[must_use]
 pub fn calls_unavailable() -> Option<&'static str> {
     calls::calls_unavailable()
@@ -145,17 +145,33 @@ mod calls {
 
 #[cfg(target_family = "wasm")]
 mod calls {
-    /// Asked of the global rather than by constructing one, for the reason
-    /// `video_decode_unavailable` is: building an `RTCPeerConnection` to find
-    /// out is work, and this is a question with a constant answer.
+    /// Asked of the *session*, not of the build, exactly as
+    /// `media_send_unavailable` is — and for the same reason, which this
+    /// answered wrongly at first by looking only at the page.
+    ///
+    /// A page attached to a real daemon does not place its call in the
+    /// browser at all: the daemon holds the session, and with it the UDP
+    /// socket and the native relay dialler. Whether *this* browser has
+    /// `RTCPeerConnection` is beside the point there, and refusing on it
+    /// blocks a call that would have worked.
+    ///
+    /// A page holding its own session is the case the browser relay exists
+    /// for, and it cannot complete a call yet whatever the browser has:
+    /// `oxidezap-session`'s `relay::web::RELAY_DTLS_FINGERPRINT` is empty, so
+    /// the provider refuses at setup. Refusing here instead is the same rule
+    /// the rest of this module follows — a control that is drawn and then
+    /// always fails is worse than one that is not drawn — and it is why this
+    /// does not ask about WebRTC at all: the answer would not change the
+    /// outcome. When that constant lands, this arm becomes the
+    /// `RTCPeerConnection` check.
     pub fn calls_unavailable() -> Option<&'static str> {
-        let global = js_sys::global();
-        match js_sys::Reflect::get(
-            &global,
-            &wasm_bindgen::JsValue::from_str("RTCPeerConnection"),
-        ) {
-            Ok(found) if !found.is_undefined() && !found.is_null() => None,
-            _ => Some("Calls need a browser with WebRTC, and this one has none."),
+        match oxidezap_ipc::web::named_daemon() {
+            oxidezap_ipc::web::NamedDaemon::Named(_) => None,
+            // `Rejected` answered like `Nobody`, as above: the window is on
+            // the refusal screen and drawing no call control either way.
+            _ => Some(
+                "A page that holds its own account cannot place calls yet:                  its relay has no certificate to check the far end against.                  Point this page at an oxidezapd with #daemon=ws://… and it                  calls through that.",
+            ),
         }
     }
 }
