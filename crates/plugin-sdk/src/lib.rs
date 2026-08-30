@@ -1216,6 +1216,9 @@ pub mod kv {
     use super::{Outcome, Text, get, set};
 
     /// A stored flag. Absent reads back as `false`, by the absence rule.
+    ///
+    /// So does a read the host refused for a spent allowance: a `bool` has
+    /// nowhere to put the difference. [`text`] keeps it.
     #[must_use]
     pub fn flag(key: &str) -> bool {
         get::<2>(key).as_str() == "1"
@@ -1230,10 +1233,14 @@ pub mod kv {
     ///
     /// One size for the read and for what a plugin writes back, because two
     /// would mean a value kept whole and matched on its first `N` bytes.
+    ///
+    /// A refused read is handed back as it is, refusal and all: substituting
+    /// the fallback there is exactly the mistake `REFUSED` exists to
+    /// prevent, since the next action writes it over the user's own value.
     #[must_use]
     pub fn text<const N: usize>(key: &str, fallback: &str) -> Text<N> {
         let stored = get::<N>(key);
-        if stored.is_empty() {
+        if stored.is_empty() && !stored.refused() {
             Text::of(fallback)
         } else {
             stored
