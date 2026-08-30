@@ -81,6 +81,9 @@ web-sys = { version = "0.3", features = [
     "Window",
     "DomException",
 ] }
+# Racing the call's teardown against its own playout drain. Same crate the
+# session uses for the same shape.
+futures-lite = "2"
 
 [lints]
 workspace = true

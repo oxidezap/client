@@ -597,6 +597,12 @@ impl WhatsAppClient {
             }
         };
 
+        // Give the client this platform's way onto a call's media wire, before
+        // anything can ring. Nothing on a desktop, where the library's own UDP
+        // dialler is the default and is right; on a page it is the whole
+        // reason a call can be placed at all. See `crate::relay`.
+        crate::relay::install(&bot.client());
+
         // Hydrate the UI from durable history before the network is even up
         // (bot.run() is what connects). The client is needed here so hydrated
         // JIDs normalize through the same PN->LID mapping live events use.

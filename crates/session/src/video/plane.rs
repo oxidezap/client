@@ -1,5 +1,18 @@
 //! A call's video plane: the camera in, the peer's picture out.
 //!
+//! Written once for both platforms. It used to be a split -- a real plane on
+//! a desktop and, on the web, the names it promises with an `open` that
+//! always refused -- and the reason was never this file: it was that nokhwa
+//! is three operating systems and OpenH264 is C. Neither is true of a
+//! browser's own camera and encoder, so `oxidezap-video` grew the second
+//! backend and this became one implementation again.
+//!
+//! What is left of the platform here is where its work runs
+//! ([`crate::exec`]) and how a pump is stopped. A page's spawned task cannot
+//! be aborted, so nothing here aborts one: teardown closes the channels the
+//! pumps read, which ends them at their next `recv` and is what the abort was
+//! approximating anyway.
+//!
 //! The session owns the camera for the same reason it owns the microphone —
 //! it is the process holding the call — and the whole of what leaves this
 //! module is *encoded*. That is what makes a picture affordable across the
@@ -25,6 +38,8 @@ use std::sync::Arc;
 use log::{debug, warn};
 use oxidezap_core::{CallVideoFrame, VideoStream};
 use oxidezap_video::{CameraControl, CameraStream, EncodedFrame, VideoQuality};
+
+use crate::exec::Task;
 use whatsapp_rust::voip::{VideoFrame, VideoSource};
 
 /// Where finished frames go on their way to whoever draws them.
@@ -164,12 +179,17 @@ pub(crate) struct LocalVideo {
     /// would base64 a 720p stream across the socket, spin up a decoder and
     /// convert every frame to pixels, all of it to be thrown away on arrival.
     drawable: Arc<AtomicBool>,
-    /// The fan-out task, stopped by dropping the camera's channel.
-    pump: tokio::task::JoinHandle<()>,
+    /// The fan-out task, stopped by closing the camera's channel.
+    pump: Task<()>,
+    /// The camera's own frame channel, so [`Self::stop`] can end the pump on
+    /// a page, where a spawned task cannot be aborted.
+    frames: async_channel::Receiver<EncodedFrame>,
     /// The peer's half of the same `Endpoints` pair, held for the same
     /// reason: nothing else here can end it, and one that outlived the pair
     /// publishes into whatever call the id slot names next.
-    remote_pump: tokio::task::JoinHandle<()>,
+    remote_pump: Task<()>,
+    /// The peer half's channel, closed for the same reason as `frames`.
+    sink: async_channel::Receiver<VideoFrame>,
     /// Whether this camera is still producing, cleared by the pump on every
     /// way out of it.
     ///
@@ -235,26 +255,29 @@ impl LocalVideo {
     /// Waited for because the next call opens the same camera, and a backend
     /// that still holds it fails that open rather than queueing behind it.
     pub(crate) async fn stop(self) {
-        // Aborting the pump is a request, not a fact — the task may not have
-        // been polled yet — so the device is closed by the owner rather than
-        // by whoever happens to drop the last reference.
-        self.pump.abort();
-        // The peer's pump too, and for the reason the local one is aborted:
-        // it is the other half of one `Endpoints` pair, and the only thing
-        // that ends it otherwise is the library dropping the sink. One that
+        // Closed rather than aborted. An abort is a request the task may
+        // never be polled to hear, and on a page there is no abort at all --
+        // a `spawn_local` task is cancelled by nothing. Closing the channel a
+        // pump is parked in ends it at the `recv` it is already sitting in,
+        // on both platforms and without a second mechanism.
+        self.frames.close();
+        // The peer's pump too, and for the reason the local one is ended: it
+        // is the other half of one `Endpoints` pair, and the only thing that
+        // would end it otherwise is the library dropping the sink. One that
         // outlived its pair would go on publishing `VideoStream::Remote`
         // under whatever call id the slot holds next, interleaved with the
         // new call's own pump.
-        self.remote_pump.abort();
-        let camera = self.camera;
-        // On a blocking thread: closing waits for the frame the capture
-        // thread is asleep in. The answer is read rather than dropped
-        // because a backend that panicked is what leaves the device held,
-        // and the next call's `open` then fails with nothing in the log to
-        // connect the two.
-        if let Err(e) = tokio::task::spawn_blocking(move || camera.stop()).await {
-            warn!("closing the camera failed: {e}");
-        }
+        self.sink.close();
+        // Waited for, because the next call opens the same device and a
+        // backend that still holds it fails that open rather than queueing
+        // behind it. Where that wait is a blocking one, the camera itself is
+        // what moves it off a runtime thread.
+        self.camera.stop().await;
+        // And the pumps, so a camera reported as stopped is one that has
+        // stopped: a pump still draining its queue can publish a frame after
+        // the call that owned it is gone.
+        let _ = self.pump.await;
+        let _ = self.remote_pump.await;
     }
 }
 
@@ -297,9 +320,8 @@ pub(crate) async fn open(
     lost: CameraLost,
 ) -> Result<(LocalVideo, Endpoints), String> {
     let quality = VideoQuality::from_environment();
-    let camera = tokio::task::spawn_blocking(move || oxidezap_video::open(quality))
+    let camera = oxidezap_video::open_camera(quality)
         .await
-        .map_err(|e| format!("camera task failed: {e}"))?
         .map_err(|e| format!("{e:#}"))?;
     let stride = camera.quality().timestamp_stride();
     let camera_id = next_camera_id();
@@ -311,9 +333,10 @@ pub(crate) async fn open(
     let (source_tx, source_rx) = async_channel::bounded(PLANE_DEPTH);
     let (sink_tx, sink_rx) = async_channel::bounded(PLANE_DEPTH);
 
-    let pump = tokio::spawn(pump_local(LocalPump {
+    let frames = camera.frames();
+    let pump = crate::exec::spawn(pump_local(LocalPump {
         call_id: Arc::clone(&call_id),
-        frames: camera.frames(),
+        frames: frames.clone(),
         camera: camera.control(),
         plane: source_tx,
         publisher: publisher.clone(),
@@ -322,13 +345,19 @@ pub(crate) async fn open(
         drawable: Arc::clone(&drawable),
         alive: Arc::clone(&alive),
     }));
-    let remote_pump = tokio::spawn(pump_remote(Arc::clone(&call_id), sink_rx, publisher));
+    let remote_pump = crate::exec::spawn(pump_remote(
+        Arc::clone(&call_id),
+        sink_rx.clone(),
+        publisher,
+    ));
 
     Ok((
         LocalVideo {
             camera,
             pump,
+            frames,
             remote_pump,
+            sink: sink_rx,
             id: call_id,
             camera_id,
             drawable,

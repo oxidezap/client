@@ -166,3 +166,125 @@ mod tests {
         assert_eq!(resample(&src, 16_000, 16_000), src);
     }
 }
+
+/// A resampler for a stream that arrives in blocks.
+///
+/// Shared rather than per-backend: a call is 16 kHz mono and no sound card is
+/// -- cpal answers 44.1 or 48, and a browser's `AudioContext` answers whatever
+/// the machine runs at -- so both ends of a call need this on both platforms.
+/// The whole-clip [`resample`] above cannot stand in: it restarts its cursor
+/// and its filter history at every call, which at a 20 ms block boundary is an
+/// audible click sixty times a second.
+///
+/// Linear resampler that carries a fractional read cursor across calls so block
+/// boundaries don't click.
+///
+/// When downsampling it first runs a windowed-sinc low-pass at the source rate.
+/// Linear interpolation alone does not attenuate anything above the destination
+/// Nyquist, so a 48 -> 16 kHz pull is effectively "take every third sample" and
+/// folds everything above 8 kHz back into the voice band as aliasing.
+/// Upsampling needs no such filter: interpolation cannot create content above
+/// the source Nyquist.
+pub(crate) struct Stream {
+    src_rate: u32,
+    dst_rate: u32,
+    /// Fractional index into a virtual stream, carried across blocks.
+    pos: f64,
+    /// Empty when not downsampling.
+    taps: Vec<f32>,
+    /// `taps.len() - 1` samples of the previous block, so the filter has
+    /// history at a block boundary instead of ringing from zeros.
+    history: Vec<f32>,
+    /// Scratch for the filtered block; reused to keep the drain allocation-free.
+    filtered: Vec<f32>,
+}
+
+impl Stream {
+    pub(crate) fn new(src_rate: u32, dst_rate: u32) -> Self {
+        let taps = if src_rate > dst_rate {
+            // 0.45 rather than 0.5 of the destination Nyquist: leaves a
+            // transition band so the passband edge is not already rolling off.
+            lowpass_taps(0.45 * dst_rate as f32 / src_rate as f32)
+        } else {
+            Vec::new()
+        };
+        let history = vec![0.0; taps.len().saturating_sub(1)];
+        Self {
+            src_rate,
+            dst_rate,
+            pos: 0.0,
+            taps,
+            history,
+            filtered: Vec::new(),
+        }
+    }
+
+    /// Resample `src` into `out`. Allocation-free past the warmup.
+    pub(crate) fn process(&mut self, src: &[i16], out: &mut Vec<i16>) {
+        if src.is_empty() {
+            return;
+        }
+        let step = self.src_rate as f64 / self.dst_rate as f64;
+
+        // Band-limit at the source rate before the cursor decimates.
+        let filtered: &[f32] = if self.taps.is_empty() {
+            self.filtered.clear();
+            self.filtered.extend(src.iter().map(|&s| s as f32));
+            &self.filtered
+        } else {
+            self.filtered.clear();
+            self.filtered.reserve(src.len());
+            let hist = self.history.len();
+            for i in 0..src.len() {
+                let mut acc = 0.0f32;
+                for (k, &tap) in self.taps.iter().enumerate() {
+                    // Tap k reads k samples back; anything before this block
+                    // comes out of the carried history.
+                    let idx = i as isize - k as isize;
+                    let sample = if idx >= 0 {
+                        src[idx as usize] as f32
+                    } else {
+                        let h = hist as isize + idx;
+                        if h >= 0 {
+                            self.history[h as usize]
+                        } else {
+                            0.0
+                        }
+                    };
+                    acc += tap * sample;
+                }
+                self.filtered.push(acc);
+            }
+            // Carry this block's tail as the next block's history.
+            if hist > 0 {
+                let keep = hist.min(src.len());
+                self.history.rotate_left(keep);
+                let start = self.history.len() - keep;
+                for (slot, &s) in self.history[start..]
+                    .iter_mut()
+                    .zip(&src[src.len() - keep..])
+                {
+                    *slot = s as f32;
+                }
+            }
+            &self.filtered
+        };
+
+        let mut p = self.pos;
+        while p < filtered.len() as f64 {
+            let i = p as usize;
+            let frac = (p - i as f64) as f32;
+            let a = filtered[i];
+            let b = if i + 1 < filtered.len() {
+                filtered[i + 1]
+            } else {
+                a
+            };
+            out.push((a + (b - a) * frac).round().clamp(-32768.0, 32767.0) as i16);
+            p += step;
+        }
+        // Carry the leftover fraction (relative to the next block's start) so
+        // the next call continues smoothly instead of restarting at 0.
+        self.pos = p - filtered.len() as f64;
+    }
+}

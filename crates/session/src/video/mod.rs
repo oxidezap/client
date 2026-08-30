@@ -1,20 +1,20 @@
-//! A call's video plane, or the absence of one.
+//! A call's video plane.
 //!
-//! The same arrangement as [`crate::net`] and [`crate::exec`]: one set of
-//! names, two implementations behind it, and no `cfg` in the session's own
-//! logic above. What differs here is that the browser half is not a second
-//! way of doing the same thing — it is the honest answer that a page cannot
-//! do it at all. The camera is nokhwa (V4L2, AVFoundation, Media Foundation)
-//! and the encoder is OpenH264, which is C.
+//! One implementation now, where there were two. The split existed because
+//! the camera was nokhwa — V4L2, AVFoundation, Media Foundation — and the
+//! encoder was OpenH264, which is C; a browser has neither, so the web half
+//! was the names this module promises with an `open` that always refused, and
+//! the comment above it said a page could not send a picture at all.
 //!
-//! A browser has both, through `getUserMedia` and `VideoEncoder`, and neither
-//! is bound yet. That is an API change rather than a backend swap — one is a
-//! device the page must be granted, the other is asynchronous where this is
-//! pulled — so what a page gets meanwhile is a camera that will not open,
-//! reported where it is asked for.
+//! It can. `getUserMedia` is the device and `VideoEncoder` is the codec, and
+//! [`oxidezap_video`] now answers with either behind one name. What was a
+//! platform split here is a platform split one crate down, which is where the
+//! platform actually is.
+//!
+//! What remains of it in [`plane`] is two lines: where a pump runs
+//! ([`crate::exec`]) and how it is stopped. A page's spawned task cannot be
+//! aborted, so nothing is — teardown closes the channels the pumps read.
 
-#[cfg_attr(target_family = "wasm", path = "web.rs")]
-#[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
-mod platform;
+mod plane;
 
-pub use platform::*;
+pub use plane::*;

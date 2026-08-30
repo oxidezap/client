@@ -8,6 +8,7 @@ mod group_notice;
 mod names;
 mod net;
 mod quoting;
+mod relay;
 mod store;
 mod video;
 mod whatsapp;

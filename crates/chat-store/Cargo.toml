@@ -44,7 +44,7 @@ waproto = { workspace = true }
 whatsapp-rust-sqlite-storage = { workspace = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "claude/voip-wasm-relay-seam", default-features = false }
 # Both majors are in this graph and each refuses to build for wasm without
 # being told where the entropy comes from. The browser's own generator, as
 # everywhere else in the workspace.
