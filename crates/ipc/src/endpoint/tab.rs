@@ -79,6 +79,7 @@ pub struct Connection {
 pub struct Incoming {
     queued: Receiver<FromTab>,
     ended: Rc<std::cell::Cell<bool>>,
+    gone: Rc<std::cell::Cell<bool>>,
 }
 
 impl Incoming {
@@ -97,6 +98,25 @@ impl Incoming {
         self.ended.get()
     }
 
+    /// Whether the tab on the other end is the reason it ended.
+    ///
+    /// Two questions rather than one, and the socket path's answer is why:
+    /// there a closed connection says *nothing* about the media sideband,
+    /// because the sideband is a different endpoint — so a `Downloaded`
+    /// frame, which is somebody's answer rather than a frame's decoration,
+    /// is still fetched after a close this page itself caused.
+    ///
+    /// Here the two are one channel to one tab. When that tab is the reason
+    /// the connection ended, it cannot answer for the media either, and
+    /// asking anyway spends the whole download allowance discovering it —
+    /// with the takeover queued behind. So the exception survives only for
+    /// the ending this side chose, where the other tab is still perfectly
+    /// well.
+    #[must_use]
+    pub fn peer_is_gone(&self) -> bool {
+        self.gone.get()
+    }
+
     /// The next thing that happened, oldest first.
     pub async fn recv(&mut self) -> Option<FromTab> {
         self.queued.recv().await
@@ -113,6 +133,7 @@ impl Incoming {
 pub struct Hangup {
     inbound: Sender<FromTab>,
     ended: Rc<std::cell::Cell<bool>>,
+    gone: Rc<std::cell::Cell<bool>>,
 }
 
 impl Hangup {
@@ -125,6 +146,10 @@ impl Hangup {
     /// a media deadline first is a takeover measured in hours.
     pub fn close(&self, reason: String) {
         self.ended.set(true);
+        // Every way this is reached is one where the other tab will not be
+        // answering anything more: it took the account, it could not be
+        // written to, or this front end has let go of the connection.
+        self.gone.set(true);
         deliver(&self.inbound, FromTab::Closed(reason));
     }
 }
@@ -308,13 +333,15 @@ pub async fn connect() -> Result<Connection, String> {
 
     let (incoming, from_leader) = channel(MAX_QUEUED_FRAMES);
     let ended = Rc::new(std::cell::Cell::new(false));
+    let gone = Rc::new(std::cell::Cell::new(false));
     let answers: Rc<RefCell<HashMap<u64, Answer>>> = Rc::new(RefCell::new(HashMap::new()));
-    let on_frame = frame_handler(&incoming, &answers, &ended);
+    let on_frame = frame_handler(&incoming, &answers, &ended, &gone);
     frames.set_onmessage(Some(on_frame.as_ref().unchecked_ref()));
 
     let hangup = Hangup {
         inbound: incoming,
         ended: Rc::clone(&ended),
+        gone: Rc::clone(&gone),
     };
 
     // One listener on the rendezvous, opened before the ask and kept for the
@@ -345,12 +372,27 @@ pub async fn connect() -> Result<Connection, String> {
         // wherever a click lands and `Link` takes a string channel, so the
         // joining happens here rather than in every caller.
         let asks = asks.clone();
+        let released = hangup.clone();
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(line) = written.recv().await {
                 if asks.send(Outgoing::Line(line)).is_err() {
                     break;
                 }
             }
+            // The `Link` going is the front end letting go of this
+            // connection, and it is the *only* signal of that: a Reconnect
+            // drops the session while the channel is perfectly quiet, and
+            // nothing else here would ever notice. Without this the reader
+            // task waits on frames that will not come while holding the
+            // media handles, those hold the outgoing task, and that holds the
+            // liveness lock — so the leader goes on serving a connection
+            // nobody is reading, one more per reconnection, until it is
+            // serving `MAX_CLIENTS` ghosts.
+            //
+            // Saying it here unwinds the whole chain in order: the reader
+            // stops on the `Closed`, drops the media handles, and the
+            // outgoing task ends with the lock.
+            released.close("this window let go of the connection".to_string());
         });
     }
 
@@ -410,55 +452,10 @@ pub async fn connect() -> Result<Connection, String> {
         incoming: Incoming {
             queued: from_leader,
             ended,
+            gone,
         },
         media: Media { asks },
         hangup,
-    })
-}
-
-/// The rendezvous, listened to for as long as the connection lasts.
-///
-/// Held by the caller: closing the channel is what stops the watch, and a
-/// `Closure` dropped while the browser still holds a reference is a panic
-/// rather than a missed call.
-struct Watching {
-    channel: BroadcastChannel,
-    _heard: Closure<dyn FnMut(MessageEvent)>,
-}
-
-impl Drop for Watching {
-    /// The handler comes off before it is dropped: a browser holding a
-    /// reference to a freed callback is a crash rather than a missed event.
-    fn drop(&mut self) {
-        self.channel.set_onmessage(None);
-        self.channel.close();
-    }
-}
-
-/// End this connection when some other tab announces that it holds the
-/// account.
-fn watch_for_a_new_leader(hangup: &Hangup) -> Result<Watching, String> {
-    let channel = BroadcastChannel::new(tabs::RENDEZVOUS)
-        .map_err(|e| format!("this browser would not open a channel between tabs: {e:?}"))?;
-    let hangup = hangup.clone();
-    let heard = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-        let Some(line) = event.data().as_string() else {
-            return;
-        };
-        if matches!(Rendezvous::decode(&line), Some(Rendezvous::Leading { .. })) {
-            // Whoever posted it is not the tab this connection is to: a
-            // `BroadcastChannel` does not deliver to the object that posted,
-            // and a leader announces exactly once, on the way up. So this is
-            // always a *new* leader, and this connection is always to a tab
-            // that has gone.
-            log::info!("another tab has taken the account; reconnecting to it");
-            hangup.close("another tab has taken the account".to_string());
-        }
-    });
-    channel.set_onmessage(Some(heard.as_ref().unchecked_ref()));
-    Ok(Watching {
-        channel,
-        _heard: heard,
     })
 }
 
@@ -598,10 +595,12 @@ fn frame_handler(
     incoming: &Sender<FromTab>,
     answers: &Rc<RefCell<HashMap<u64, Answer>>>,
     ended: &Rc<std::cell::Cell<bool>>,
+    gone: &Rc<std::cell::Cell<bool>>,
 ) -> Closure<dyn FnMut(MessageEvent)> {
     let incoming = incoming.clone();
     let answers = Rc::clone(answers);
     let ended = Rc::clone(ended);
+    let gone = Rc::clone(gone);
     Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         let data = event.data();
         let Some(kind) = string_field(&data, "k") else {
@@ -674,13 +673,18 @@ fn frame_handler(
                 }
             }
             "bye" => {
-                // The flag before the frame, and `deliver` rather than a bare
+                // The flags before the frame, and `deliver` rather than a bare
                 // `try_send`, for the two reasons the overflow path has them:
                 // a `Closed` lost to a full queue leaves the front end waiting
                 // on a connection that has already gone, and a backlog that
                 // does not know the connection ended goes on asking a
                 // departed tab for media, one per-frame deadline at a time.
+                //
+                // And this ending is the *other tab's*, which is the half that
+                // also gives up on a requested download rather than spending
+                // its whole allowance asking a tab that has said goodbye.
                 ended.set(true);
+                gone.set(true);
                 deliver(
                     &incoming,
                     FromTab::Closed(string_field(&data, "e").unwrap_or_else(|| {

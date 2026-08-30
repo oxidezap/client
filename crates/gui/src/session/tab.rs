@@ -152,7 +152,10 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
                         &media,
                         held.as_ref(),
                         &pending,
-                        incoming.connection_ended(),
+                        Ended {
+                            connection: incoming.connection_ended(),
+                            peer: incoming.peer_is_gone(),
+                        },
                     )
                     .await;
                     if frames.apply(message).is_break() {
@@ -175,24 +178,32 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
 /// which a per-request deadline bounds one request at a time and therefore
 /// does not bound at all across a frame naming a hundred keys.
 ///
-/// `after_close` skips the optional half outright, exactly as the socket path
-/// does: once the other tab has gone, the frames still queued are worth
-/// applying and the media they name is not worth waiting for — the renderer
-/// draws what is missing as an offer to download. It does not skip a
-/// `Downloaded`, which *is* somebody's answer.
+/// A connection that has ended skips the optional half outright, exactly as
+/// the socket path does: the frames still queued are worth applying and the
+/// media they name is not worth waiting for — the renderer draws what is
+/// missing as an offer to download.
+///
+/// The requested half is where this stops copying the socket path, because
+/// the reason behind it does not carry. There the sideband is HTTP: a closed
+/// WebSocket says nothing about it, so a `Downloaded` frame is still fetched.
+/// Here both are one channel to one tab, so once *that tab* is the reason the
+/// connection ended, the request cannot be answered by anybody — and asking
+/// spends the whole download allowance finding out, with the takeover waiting
+/// behind it. An ending this side chose is different: the other tab is well,
+/// and its answer is worth having.
 async fn gather(
     message: &DaemonMessage,
     media: &Media,
     into: &Fetched,
     pending: &super::Pending,
-    after_close: bool,
+    ended: Ended,
 ) {
     // A download somebody asked for is not rationed and is one key; a frame's
     // own media is both. The same division the socket path makes, made for
     // the same reason: a `Downloaded` frame *is* somebody's answer, and
     // skipping it would report a fetch that succeeded as one that failed.
     let answering_a_request = matches!(message, DaemonMessage::Downloaded { .. });
-    if after_close && !answering_a_request {
+    if ended.connection && (!answering_a_request || ended.peer) {
         return;
     }
     let ceiling = if answering_a_request {
@@ -256,6 +267,18 @@ async fn gather(
     if crate::platform::with_timeout(all, budget).await.is_none() {
         log::debug!("this frame's media did not arrive within its budget");
     }
+}
+
+/// How a connection ended, as the media pass has to ask it.
+///
+/// Two bits rather than one: what may still be *fetched* depends on whether
+/// the tab that would answer is the reason there is nothing to fetch from.
+#[derive(Clone, Copy)]
+struct Ended {
+    /// The connection is over, whoever ended it.
+    connection: bool,
+    /// And the other tab is why, so nothing more will be answered.
+    peer: bool,
 }
 
 /// What the other tab has already handed over, held until the frame that
