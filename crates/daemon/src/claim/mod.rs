@@ -17,5 +17,7 @@
 mod platform;
 
 #[cfg(target_family = "wasm")]
+pub use platform::Promotion;
+#[cfg(target_family = "wasm")]
 pub(crate) use platform::promotion;
 pub(crate) use platform::{Claim, take};

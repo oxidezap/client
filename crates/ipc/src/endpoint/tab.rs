@@ -150,18 +150,20 @@ fn deliver(inbound: &Sender<FromTab>, event: FromTab) {
     }
 }
 
-/// How long one sideband request may take before it is given up on.
+/// How long staging a payload may take before it is given up on.
 ///
 /// Both ends are in one browser, so this is not a network allowance — it is
 /// the bound on the one failure that has no other end: the tab holding the
 /// account can go away between a request and its answer, and nothing about a
-/// `BroadcastChannel` says so. Without it the frame waiting on that answer
-/// waits for the life of the page, with every frame behind it.
+/// `BroadcastChannel` says so. Without it the send waiting on that answer
+/// waits for the life of the page.
 ///
 /// The lock in `daemon/claim` is what notices the tab leaving, and it is
 /// quicker than this — this is the floor under a leader that is present but
 /// not answering, which is a bug rather than a state.
-const ANSWER_MS: i32 = 15_000;
+///
+/// Reads carry their own, because theirs differ: see [`Ask::within_ms`].
+const STAGE_MS: i32 = 15_000;
 
 /// The media sideband, as the asking side sees it.
 ///
@@ -173,37 +175,48 @@ pub struct Media {
     asks: UnboundedSender<Outgoing>,
 }
 
+/// What one media read is allowed, and for how long.
+///
+/// Three terms rather than three arguments, because they are one decision:
+/// a frame's own media is rationed and short, and the answer to a download
+/// somebody asked for is neither. Splitting them into positional flags is how
+/// the second kind quietly inherited the first kind's deadline.
+#[derive(Clone, Copy)]
+pub struct Ask {
+    /// Release the other tab's claim on these bytes, exactly as
+    /// `MediaCache::read_once` does in the tab that holds the cache: the
+    /// sideband is a different shape here, not a different contract.
+    pub once: bool,
+    /// The largest payload worth having, enforced by the tab that *has* the
+    /// bytes rather than by the tab that asked. That is the only place it can
+    /// be: a ceiling applied on arrival is applied after the copy it exists to
+    /// prevent — the sending tab has already built a `Uint8Array` and the
+    /// browser has already cloned it into this heap.
+    pub most: u64,
+    /// How long to wait for it. The bound here is the tab on the other end
+    /// going away, which nothing about a `BroadcastChannel` announces —
+    /// posting to a channel with no listener succeeds.
+    pub within_ms: i32,
+}
+
 impl Media {
     /// The bytes under `key`, from the tab that has them.
-    ///
-    /// `once` releases the daemon's claim on a payload somebody requested,
-    /// exactly as `MediaCache::read_once` does in the tab that holds the
-    /// cache: the sideband is a different shape here, not a different
-    /// contract.
-    ///
-    /// `most` is the largest payload worth having, and it is enforced by the
-    /// tab that *has* the bytes rather than by the tab that asked. That is the
-    /// only place it can be: a ceiling applied on arrival is applied after the
-    /// copy it exists to prevent — the sending tab has already built a
-    /// `Uint8Array` and the browser has already cloned it into this heap — so
-    /// a single payload larger than the whole allowance is spent before
-    /// anything here could refuse it.
     ///
     /// # Errors
     ///
     /// The connection has gone, the other tab does not have the bytes, or they
-    /// are larger than `most`.
-    pub async fn read(&self, key: &str, once: bool, most: u64) -> Result<Vec<u8>, String> {
+    /// are larger than the ceiling this ask carried.
+    pub async fn read(&self, key: &str, ask: Ask) -> Result<Vec<u8>, String> {
         let (tell, told) = futures_channel::oneshot::channel();
         self.asks
             .send(Outgoing::Read {
                 key: key.to_string(),
-                once,
-                most,
+                once: ask.once,
+                most: ask.most,
                 answer: tell,
             })
             .map_err(|_| "the tab holding this account has gone".to_string())?;
-        match deadline(told, ANSWER_MS).await {
+        match deadline(told, ask.within_ms).await {
             Some(Ok(answer)) => answer,
             _ => Err("the tab holding this account did not answer".to_string()),
         }
@@ -224,7 +237,7 @@ impl Media {
                 answer: tell,
             })
             .map_err(|_| "the tab holding this account has gone".to_string())?;
-        match deadline(told, ANSWER_MS).await {
+        match deadline(told, STAGE_MS).await {
             Some(Ok(answer)) => answer,
             _ => Err("the tab holding this account did not answer".to_string()),
         }
@@ -585,10 +598,19 @@ fn frame_handler(
                 }
             }
             "bye" => {
-                let _ =
-                    incoming.try_send(FromTab::Closed(string_field(&data, "e").unwrap_or_else(
-                        || "the tab holding this account closed the connection".to_string(),
-                    )));
+                // The flag before the frame, and `deliver` rather than a bare
+                // `try_send`, for the two reasons the overflow path has them:
+                // a `Closed` lost to a full queue leaves the front end waiting
+                // on a connection that has already gone, and a backlog that
+                // does not know the connection ended goes on asking a
+                // departed tab for media, one per-frame deadline at a time.
+                ended.set(true);
+                deliver(
+                    &incoming,
+                    FromTab::Closed(string_field(&data, "e").unwrap_or_else(|| {
+                        "the tab holding this account closed the connection".to_string()
+                    })),
+                );
             }
             _ => {}
         }

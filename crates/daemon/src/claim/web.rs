@@ -301,7 +301,7 @@ pub(crate) async fn take() -> Result<Claim, String> {
 ///
 /// No lock manager to ask. A follower that cannot wait has no way to notice
 /// its leader leaving, which is worth saying rather than retrying forever.
-pub(crate) async fn promotion() -> Result<(), String> {
+pub(crate) async fn promotion() -> Result<Promotion, String> {
     if PROMOTED.with(|cell| cell.borrow().is_some())
         || ASK.with(|cell| {
             cell.borrow()
@@ -309,7 +309,7 @@ pub(crate) async fn promotion() -> Result<(), String> {
                 .is_some_and(|ask| ask.borrow().held.is_some())
         })
     {
-        return Ok(());
+        return Ok(Promotion::Granted);
     }
 
     let (tell, told) = futures_channel::oneshot::channel();
@@ -317,9 +317,23 @@ pub(crate) async fn promotion() -> Result<(), String> {
         let mut slot = cell.borrow_mut();
         match slot.as_ref() {
             // Somebody is already waiting on the browser. This caller joins
-            // them rather than queuing a second request behind the first.
+            // them rather than queuing a second request behind the first —
+            // and *replaces* them, because there is only ever one caller with
+            // anything to do with the answer.
+            //
+            // A follower reconnects for reasons that have nothing to do with
+            // the leader leaving: an overflow, a resync, a hello refused. Each
+            // reconnection asks again, and a waiter kept from the connection
+            // before it is a task parked until the account changes hands,
+            // holding a `Hangup` onto a connection that is already over.
+            // Coalescing the browser's lock request without coalescing the
+            // callers left the request count right and the task count
+            // growing.
             Some(waiting) => {
-                waiting.borrow_mut().push(tell);
+                let superseded = std::mem::replace(&mut *waiting.borrow_mut(), vec![tell]);
+                for stale in superseded {
+                    let _ = stale.send(Ok(Promotion::Superseded));
+                }
                 None
             }
             None => {
@@ -344,7 +358,7 @@ pub(crate) async fn promotion() -> Result<(), String> {
                 // documents at length.
                 Ok(held) => {
                     PROMOTED.with(|cell| *cell.borrow_mut() = Some(Rc::new(held)));
-                    Ok(())
+                    Ok(Promotion::Granted)
                 }
                 Err(e) => Err(e),
             };
@@ -366,7 +380,24 @@ pub(crate) async fn promotion() -> Result<(), String> {
 }
 
 /// One caller waiting to be told this tab now holds the account.
-type Waiter = futures_channel::oneshot::Sender<Result<(), String>>;
+type Waiter = futures_channel::oneshot::Sender<Result<Promotion, String>>;
+
+/// What became of a wait for the account.
+///
+/// Two outcomes and not one, because a caller that has been replaced must be
+/// able to stop *quietly*: it is a connection that has already been remade,
+/// not a failure worth a line in anybody's console.
+///
+/// `pub` rather than `pub(crate)` because it leaves the crate: the front end
+/// is what waits, through `embedded::promotion`, and it is the side that has
+/// to tell the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Promotion {
+    /// This tab holds the account now.
+    Granted,
+    /// A later connection is waiting instead; this caller has nothing to do.
+    Superseded,
+}
 
 /// How a caller that did not do the asking gets its answer.
 enum Waiting {

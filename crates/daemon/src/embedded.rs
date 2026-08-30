@@ -289,14 +289,21 @@ fn running() -> Result<Option<Running>, StartFailed> {
 /// over for the one reason that matters — the other tab has gone — and what
 /// it does next is [`start`], which now succeeds.
 ///
+/// Answers [`Promotion::Superseded`] where a later connection has taken over
+/// the wait: this caller's connection has already been remade, and there is
+/// nothing for it to do.
+///
 /// # Errors
 ///
 /// The browser has no lock manager, so nothing here can tell when the tab
 /// holding the account leaves.
 #[cfg(target_family = "wasm")]
-pub async fn promotion() -> Result<(), String> {
+pub async fn promotion() -> Result<Promotion, String> {
     crate::claim::promotion().await
 }
+
+#[cfg(target_family = "wasm")]
+pub use crate::claim::Promotion;
 
 /// Why a session did not start here.
 ///

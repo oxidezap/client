@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use oxidezap_ipc::tab::{self, FromTab, Incoming, Media};
+use oxidezap_ipc::tab::{self, Ask, FromTab, Incoming, Media};
 use oxidezap_ipc::{ClientRequest, DaemonMessage, PROTOCOL_VERSION};
 use wasm_bindgen_futures::spawn_local;
 
@@ -103,10 +103,15 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     // finds the claim already held and starts the session in this tab.
     spawn_local(async move {
         match oxidezap_daemon::embedded::promotion().await {
-            Ok(()) => {
+            Ok(oxidezap_daemon::embedded::Promotion::Granted) => {
                 log::info!("the tab holding this account has gone; taking it");
                 hangup.close("this tab is taking over the account".to_string());
             }
+            // This connection was replaced before the account changed hands —
+            // a resync, an overflow, a hello refused. The connection that
+            // replaced it is doing the waiting now, and this task's only job
+            // is to stop holding what it closed over.
+            Ok(oxidezap_daemon::embedded::Promotion::Superseded) => {}
             // Nothing to fall back on. Said once rather than retried: without
             // a lock manager this tab cannot tell when the other one leaves,
             // and a poll would be a different design rather than a smaller
@@ -186,6 +191,22 @@ async fn gather(
     } else {
         FRAME_MEDIA_CEILING
     };
+    // A download somebody asked for gets the allowance it was promised, and
+    // that is the whole allowance rather than this path's own. `Downloaded`
+    // is the *answer* to a request the front end lets run for
+    // `DOWNLOAD_TIMEOUT_SECS`, so capping it at a frame's budget reports a
+    // document the daemon really fetched — and really handed over — as a
+    // failure, after the wait. The socket path draws the same distinction for
+    // the same reason.
+    let budget = if answering_a_request {
+        std::time::Duration::from_secs(crate::app::DOWNLOAD_TIMEOUT_SECS)
+    } else {
+        FRAME_MEDIA_BUDGET
+    };
+    // The per-request deadline as well as the one over the pass. Raising only
+    // the outer one leaves the inner one aborting the transfer anyway, which
+    // is the same failure wearing a different hat.
+    let within_ms = i32::try_from(budget.as_millis()).unwrap_or(i32::MAX);
 
     let all = async {
         let mut held: u64 = 0;
@@ -204,7 +225,17 @@ async fn gather(
             // `once` on the frame that answers a request, which is what
             // releases the other tab's claim on those bytes — the same two
             // answers that tab gives itself, asked from one connection away.
-            match media.read(&key, answering_a_request, left).await {
+            match media
+                .read(
+                    &key,
+                    Ask {
+                        once: answering_a_request,
+                        most: left,
+                        within_ms,
+                    },
+                )
+                .await
+            {
                 Ok(bytes) => {
                     held = held.saturating_add(bytes.len() as u64);
                     into.put(key, bytes);
@@ -213,10 +244,7 @@ async fn gather(
             }
         }
     };
-    if crate::platform::with_timeout(all, FRAME_MEDIA_BUDGET)
-        .await
-        .is_none()
-    {
+    if crate::platform::with_timeout(all, budget).await.is_none() {
         log::debug!("this frame's media did not arrive within its budget");
     }
 }
