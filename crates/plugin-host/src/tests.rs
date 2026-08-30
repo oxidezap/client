@@ -2898,6 +2898,67 @@ fn reading_one_stored_value_over_and_over_runs_out_of_budget() {
     assert_eq!(commands.sent()[0].1, "refused");
 }
 
+/// A plugin that asks about long keys and copies nothing back.
+///
+/// `cap == 0` is the "how long is it?" form, so the value is never copied and
+/// only the key spends the allowance. Sends once the host answers `REFUSED`,
+/// and says so if it answers `ABSENT` instead.
+fn asks_about_long_keys() -> String {
+    versioned(
+        r#"(module
+  (import "oxidezap" "oxi_subscribe"    (func $subscribe (param i64)))
+  (import "oxidezap" "oxi_request_caps" (func $caps (param i64)))
+  (import "oxidezap" "oxi_kv_get"       (func $kv_get (param i32 i32 i32 i32) (result i32)))
+  (import "oxidezap" "oxi_send_text"    (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 8)
+  (data (i32.const 100) "a@s.whatsapp.net")
+  (data (i32.const 150) "refused")
+  (data (i32.const 160) "absent")
+  (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+  (func (export "oxi_init") (result i32)
+    (call $caps (i64.const 17))   ;; caps::SEND | caps::STORAGE
+    (call $subscribe (i64.const 2))
+    (i32.const 0))
+  (func (export "oxi_on_event") (param $kind i32) (param $ev i32) (result i32)
+    (local $i i32)
+    (local $n i32)
+    ;; Eight kilobyte keys of zero bytes, asking only for the length: nothing
+    ;; is stored under them, so every answer is a miss and the only thing
+    ;; being spent is the key.
+    (block $done
+      (loop $again
+        (local.set $n
+          (call $kv_get (i32.const 20000) (i32.const 8192) (i32.const 0) (i32.const 0)))
+        (br_if $done (i32.eq (local.get $n) (i32.const -2)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br_if $again (i32.lt_s (local.get $i) (i32.const 400)))))
+    (if (i32.eq (local.get $n) (i32.const -2))
+      (then (drop (call $send (i32.const 100) (i32.const 16) (i32.const 150) (i32.const 7))))
+      (else (drop (call $send (i32.const 100) (i32.const 16) (i32.const 160) (i32.const 6)))))
+    (i32.const 0))
+)"#,
+    )
+}
+
+/// A spent allowance is refused whichever half of the read spent it.
+///
+/// The key is charged before the value is copied, and that check answered
+/// `ABSENT` while the copy answered `REFUSED`. A plugin asking only for
+/// lengths therefore read its own settings as missing, which is the answer
+/// it writes its defaults over the user's own on.
+#[test]
+fn a_key_that_spends_the_allowance_is_refused_rather_than_missing() {
+    let dir = TempDir::new("kv-key-bytes");
+    dir.plugin("asker", &asks_about_long_keys());
+    let commands = Recorder::new(Outcome::Accepted);
+    let published = Published::default();
+    let plugins = host(&dir, Arc::clone(&commands), &published);
+
+    plugins.observe(&message("a@s.whatsapp.net", "go"));
+    until("the answer", || commands.sent().len() == 1);
+    assert_eq!(commands.sent()[0].1, "refused");
+}
+
 /// A module reached through a symlink is not a module this account controls.
 ///
 /// The target can be owned by this user and `0600` and still sit in a

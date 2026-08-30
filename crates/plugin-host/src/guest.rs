@@ -837,10 +837,15 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
             // as writing does: the key is copied out of guest memory either
             // way, and a loop of misses costs exactly as much as a loop of
             // writes. Charging only the writes left half the door open.
+            //
+            // Refused rather than absent, the same answer the copy below
+            // gives: a spent allowance is not a missing setting, and read as
+            // one it comes back as the plugin's default and is written over
+            // the user's own.
             let spent = &mut c.data_mut().kv_bytes;
             let asked = key_len as usize;
             if asked > MAX_KV_BYTES_PER_CALL.saturating_sub(*spent) {
-                return abi::ABSENT;
+                return abi::outcome::REFUSED;
             }
             *spent += asked;
             let Ok(key) = read_str(&mut c, key, key_len) else {
