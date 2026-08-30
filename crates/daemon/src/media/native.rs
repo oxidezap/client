@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use super::{Wipe, is_staged_upload};
+use super::{Wipe, is_staged_upload, is_staging_partial};
 
 /// How much media the cache may hold before the oldest is dropped.
 ///
@@ -241,7 +241,11 @@ pub fn reclaim_stale_uploads(dir: &std::path::Path) {
         return;
     };
     for entry in entries.flatten() {
-        if !is_staged_upload(&entry.file_name().to_string_lossy()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // A partial is reclaimed on age like a finished upload, because it is
+        // spared the budget like one. Nothing else removes an upload whose
+        // connection died halfway.
+        if !is_staged_upload(&name) && !is_staging_partial(&name) {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -355,8 +359,12 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         // is written by the front end, not through it.
         // Spared the budget, and reclaimed on age by `reclaim_stale_uploads`,
         // which this calls first so a sweep also does the sweeping somebody
-        // reading only this function would expect it to.
-        if is_staged_upload(&entry.file_name().to_string_lossy()) {
+        // reading only this function would expect it to. A partial is spared
+        // on the same terms and for a sharper reason: it is being written
+        // right now, so dropping it breaks the rename it is on its way to and
+        // fails a send because the cache happened to be full.
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_staged_upload(&name) || is_staging_partial(&name) {
             continue;
         }
         let age = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -433,6 +441,52 @@ mod tests {
             cached.exists(),
             "and the cache is under budget, so nothing there is touched"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A partial is the same payload one moment earlier, and is treated as
+    /// one: kept while it is being written, taken once nothing is coming back
+    /// for it. Sparing it without the age rule leaks an upload whose
+    /// connection died mid-`PUT`, since the budget sweep is now told to look
+    /// away from it too.
+    #[test]
+    fn a_partial_upload_is_kept_while_fresh_and_reclaimed_when_abandoned() {
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-media-partial-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+
+        let prefix = crate::media::STAGING_PARTIAL_PREFIX;
+        let writing = dir.join(format!("{prefix}1-u-local_1"));
+        let abandoned = dir.join(format!("{prefix}2-u-local_2"));
+        for path in [&writing, &abandoned] {
+            std::fs::write(path, b"payload").expect("a file");
+        }
+
+        let long_ago = std::fs::metadata(&abandoned)
+            .expect("the partial")
+            .modified()
+            .expect("an mtime")
+            - super::STALE_UPLOAD
+            - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&abandoned)
+            .expect("the partial")
+            .set_modified(long_ago)
+            .expect("an mtime");
+
+        super::reclaim_stale_uploads(&dir);
+
+        assert!(
+            writing.exists(),
+            "a rename is still on its way to that payload"
+        );
+        assert!(!abandoned.exists(), "nothing will ever rename that one");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

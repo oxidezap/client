@@ -703,6 +703,13 @@ impl WhatsAppApp {
                 }
                 self.audio_player.pause();
                 self.active_media = ActiveMedia::None;
+                // After the clear, like the two paths that end a playback: a
+                // paused player is idle, and a codec session is hardware a
+                // browser allows a handful of. `stop` is the one clear that
+                // keeps its decoder, because that is where a poster frame is
+                // asked for; a pause already has the frame it is showing, and
+                // resuming rebuilds from the samples that stay.
+                self.release_idle_decoders();
                 self.video_update_task = None;
             }
             Some(VideoPlayerState::Paused) => {

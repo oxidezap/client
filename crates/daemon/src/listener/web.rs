@@ -685,7 +685,8 @@ async fn receive_media(
     // delete out from under the rename. The counter keeps two uploads of one
     // key from writing over each other's temporary file.
     let partial = path.with_file_name(format!(
-        ".staging-{}-{key}",
+        "{}{}-{key}",
+        crate::media::STAGING_PARTIAL_PREFIX,
         STAGING_SEQUENCE.fetch_add(1, portable_atomic::Ordering::Relaxed)
     ));
     let staged = async {
