@@ -6260,11 +6260,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "libc",
  "log",
  "oxidezap-core",
  "oxidezap-plugin-abi",
  "portable-atomic",
+ "rustix 1.1.4",
  "serde_json",
  "wacore",
  "wasmi",

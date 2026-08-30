@@ -1052,10 +1052,10 @@ pub(crate) fn only_this_user_can_write(path: &Path) -> bool {
 /// This process's real user id.
 #[cfg(unix)]
 fn current_uid() -> u32 {
-    // SAFETY: `getuid` reads a field of the calling process and cannot fail.
-    // The one call site is a permission check, so the alternative is a crate
-    // in the tree for a number the kernel already told us.
-    unsafe { libc::getuid() }
+    // The same syscall the daemon and the IPC crate make, from the same
+    // crate: no `unsafe` at this call site, and one dependency fewer in a
+    // crate that otherwise has none of either.
+    rustix::process::getuid().as_raw()
 }
 
 /// Remove only the record of what the user allowed.
