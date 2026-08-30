@@ -392,69 +392,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The two below are unix only: what they set up and assert is a mode,
+    /// and Windows has none to read.
     #[cfg(unix)]
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt as _;
+    mod modes {
+        use std::os::unix::fs::PermissionsExt as _;
 
-    /// The front end's own `stage` makes this directory with `create_dir_all`,
-    /// which is the umask's mode and not `0700`, so the daemon's first cache
-    /// write finds it open. Emptying it there deleted the staged payload of a
-    /// recording whose send had not run yet: the send then failed with the
-    /// only copy of the note gone.
-    #[test]
-    fn repairing_the_cache_keeps_a_recording_waiting_to_be_sent() {
-        let dir = std::env::temp_dir().join(format!(
-            "oxidezap-media-repair-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        /// The front end's own `stage` makes this directory with `create_dir_all`,
+        /// which is the umask's mode and not `0700`, so the daemon's first cache
+        /// write finds it open. Emptying it there deleted the staged payload of a
+        /// recording whose send had not run yet: the send then failed with the
+        /// only copy of the note gone.
+        #[test]
+        fn repairing_the_cache_keeps_a_recording_waiting_to_be_sent() {
+            let dir = std::env::temp_dir().join(format!(
+                "oxidezap-media-repair-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let staged = dir.join("u-local_audio_1");
-        std::fs::write(&staged, b"a voice note").unwrap();
+            let staged = dir.join("u-local_audio_1");
+            std::fs::write(&staged, b"a voice note").unwrap();
 
-        super::prepare_dir(&dir).unwrap();
+            crate::media::platform::prepare_dir(&dir).unwrap();
 
-        assert!(staged.exists(), "the only copy of the note is still there");
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700,
-            "and the directory was still tightened"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+            assert!(staged.exists(), "the only copy of the note is still there");
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "and the directory was still tightened"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
 
-    /// A key here is derived from content the account has already published,
-    /// so it is predictable. A symlink of the right length planted under one
-    /// while the directory was open answered "already cached" before the
-    /// sweep that exists to remove it had run, and the daemon then served the
-    /// link's target as the account's own media.
-    #[test]
-    fn a_planted_link_is_not_a_cache_hit() {
-        let base = std::env::temp_dir().join(format!(
-            "oxidezap-media-plant-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        let dir = base.join("media");
-        std::fs::create_dir_all(&dir).unwrap();
+        /// A key here is derived from content the account has already published,
+        /// so it is predictable. A symlink of the right length planted under one
+        /// while the directory was open answered "already cached" before the
+        /// sweep that exists to remove it had run, and the daemon then served the
+        /// link's target as the account's own media.
+        #[test]
+        fn a_planted_link_is_not_a_cache_hit() {
+            let base = std::env::temp_dir().join(format!(
+                "oxidezap-media-plant-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            let dir = base.join("media");
+            std::fs::create_dir_all(&dir).unwrap();
 
-        let elsewhere = base.join("elsewhere");
-        std::fs::write(&elsewhere, b"not ours").unwrap();
-        let planted = dir.join("f-key");
-        std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let elsewhere = base.join("elsewhere");
+            std::fs::write(&elsewhere, b"not ours").unwrap();
+            let planted = dir.join("f-key");
+            std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        super::prepare_dir(&dir).unwrap();
+            crate::media::platform::prepare_dir(&dir).unwrap();
 
-        assert!(
-            std::fs::symlink_metadata(&planted).is_err(),
-            "the link is gone before anything asks whether it is a hit"
-        );
-        assert!(elsewhere.exists(), "and its target was never followed");
-        let _ = std::fs::remove_dir_all(&base);
+            assert!(
+                std::fs::symlink_metadata(&planted).is_err(),
+                "the link is gone before anything asks whether it is a hit"
+            );
+            assert!(elsewhere.exists(), "and its target was never followed");
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }
