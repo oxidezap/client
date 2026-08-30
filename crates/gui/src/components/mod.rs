@@ -33,7 +33,7 @@ pub use message_bubble::render_message_bubble;
 pub use message_list::{new_timeline_state, render_message_list};
 pub use nav_rail::render_nav_rail;
 pub use plugin_ui::PluginContext;
-pub use rich_text::render_rich_text;
+pub use rich_text::{BubbleText, render_rich_text};
 pub use status::{
     StatusListProps, StatusSelection, StatusViewProps, render_status_list, render_status_view,
 };

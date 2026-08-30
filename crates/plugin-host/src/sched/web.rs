@@ -10,6 +10,8 @@
 //! and forgets it. The host's shutdown does not depend on the wait, only on
 //! the flag it raises and the sender it drops; see `Plugins::shutdown`.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use wacore::time::Instant;
@@ -87,6 +89,23 @@ enum Timers {
     Worker(web_sys::WorkerGlobalScope),
 }
 
+thread_local! {
+    /// The agent's global, resolved once rather than per wait: a throttled
+    /// plugin sleeps in slices, so this is asked for far more often than a
+    /// plugin is scheduled.
+    static TIMERS: Option<Timers> = Timers::here();
+}
+
+/// Do something with this agent's timers, if it has any.
+fn with_timers<T>(f: impl FnOnce(&Timers) -> T) -> Option<T> {
+    // `try_with`, because a `Timer` can be dropped while thread locals are
+    // being destroyed and a panic there is a panic in a destructor.
+    TIMERS
+        .try_with(|timers| timers.as_ref().map(f))
+        .ok()
+        .flatten()
+}
+
 impl Timers {
     fn here() -> Option<Self> {
         if let Some(window) = web_sys::window() {
@@ -139,36 +158,44 @@ pub async fn sleep(duration: Duration) {
     /// armed fires into a freed `Closure`, which is a panic rather than a
     /// missed wakeup, and this is raced against something that wins often.
     struct Timer {
-        timers: Timers,
         handle: i32,
+        /// Raised by the callback below: a timer that has already fired has
+        /// nothing to cancel, and `clearTimeout` is a call across the
+        /// boundary either way.
+        fired: Rc<Cell<bool>>,
         _fire: Closure<dyn FnMut()>,
     }
 
     impl Drop for Timer {
         fn drop(&mut self) {
-            self.timers.disarm(self.handle);
+            if self.fired.get() {
+                return;
+            }
+            with_timers(|timers| timers.disarm(self.handle));
         }
     }
 
     let (tx, rx) = futures_channel::oneshot::channel::<()>();
     let mut tx = Some(tx);
+    let fired = Rc::new(Cell::new(false));
+    let raise = Rc::clone(&fired);
     let fire = Closure::<dyn FnMut()>::new(move || {
+        raise.set(true);
         if let Some(tx) = tx.take() {
             let _ = tx.send(());
         }
     });
-    let armed = Timers::here().and_then(|timers| {
-        let handle = timers
-            .arm(
-                &fire,
-                i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
-            )
-            .ok()?;
-        Some(Timer {
-            timers,
-            handle,
-            _fire: fire,
-        })
+    let armed = with_timers(|timers| {
+        timers.arm(
+            &fire,
+            i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
+        )
+    })
+    .and_then(|handle| handle.ok())
+    .map(|handle| Timer {
+        handle,
+        fired,
+        _fire: fire,
     });
     let Some(_timer) = armed else {
         log::error!("this agent has no timer; the plugin that was waiting on one stops here");

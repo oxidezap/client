@@ -55,6 +55,28 @@ mod web {
     use wasm_bindgen::JsCast as _;
     use wasm_bindgen::prelude::Closure;
 
+    thread_local! {
+        /// The page's window, resolved once.
+        ///
+        /// `web_sys::window()` is an `instanceof` across the wasm/JS boundary,
+        /// and this used to ask twice per wait — once to arm and once in the
+        /// guard's `Drop`. Every caller here is a loop, so the cost is per
+        /// tick rather than per screen.
+        static WINDOW: Option<web_sys::Window> = web_sys::window();
+    }
+
+    /// Do something with the page's window, if this agent has one.
+    ///
+    /// `try_with` rather than `with`: the guard below is dropped from an
+    /// async task that can be torn down while thread locals are being
+    /// destroyed, and a panic there is a panic in a destructor.
+    fn with_window<T>(f: impl FnOnce(&web_sys::Window) -> T) -> Option<T> {
+        WINDOW
+            .try_with(|window| window.as_ref().map(f))
+            .ok()
+            .flatten()
+    }
+
     /// A `setTimeout` that has been armed, as a future.
     ///
     /// The closure has to outlive this call and be dropped when the timer
@@ -78,14 +100,15 @@ mod web {
         // Milliseconds, saturating: `setTimeout` takes an `i32` and a wait
         // longer than 24 days is not a wait this window ever asks for.
         let millis = i32::try_from(duration.as_millis()).unwrap_or(i32::MAX);
-        let handle = web_sys::window().and_then(|window| {
+        let handle = with_window(|window| {
             window
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
                     ring.as_ref().unchecked_ref(),
                     millis,
                 )
                 .ok()
-        });
+        })
+        .flatten();
 
         // Nothing to wait on: no window, or the browser refused the timer.
         //
@@ -102,6 +125,7 @@ mod web {
 
         let _guard = Cancel {
             handle,
+            fired: Rc::clone(&fired),
             _ring: ring,
         };
         std::future::poll_fn(|cx| {
@@ -127,14 +151,24 @@ mod web {
     /// a crash rather than a missed wake.
     struct Cancel {
         handle: Option<i32>,
+        /// What the callback raised. A timer that has already fired has
+        /// nothing to cancel, and the ordinary end of a wait is exactly that
+        /// — so cancelling unconditionally spent a `clearTimeout` per tick of
+        /// every loop in the window for a handle the browser had already
+        /// retired.
+        fired: Rc<RefCell<State>>,
         _ring: Closure<dyn FnMut()>,
     }
 
     impl Drop for Cancel {
         fn drop(&mut self) {
-            if let (Some(window), Some(handle)) = (web_sys::window(), self.handle) {
-                window.clear_timeout_with_handle(handle);
+            if self.fired.borrow().fired {
+                return;
             }
+            let Some(handle) = self.handle else {
+                return;
+            };
+            with_window(|window| window.clear_timeout_with_handle(handle));
         }
     }
 }

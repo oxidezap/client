@@ -721,10 +721,12 @@ mod tests {
     /// What one received message can cost the window.
     ///
     /// A stopwatch rather than an assertion, so it is ignored by default. The
-    /// old `runs` asked every span about every gap between edges, and
-    /// `render_rich_text` calls it on every repaint of every visible bubble:
-    /// a message the peer can simply send made repainting the conversation
-    /// take longer than a frame, by a lot.
+    /// old `runs` asked every span about every gap between edges, and the
+    /// window used to call it on every repaint of every visible bubble: a
+    /// message the peer can simply send made repainting the conversation take
+    /// longer than a frame, by a lot. The window now asks once, when it builds
+    /// the rows — which is what makes this a cost per message rather than a
+    /// cost per frame, and no reason at all for it to be quadratic again.
     ///
     /// `cargo test -p oxidezap-core -- --ignored runs_cost`
     #[test]

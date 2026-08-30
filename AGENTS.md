@@ -780,12 +780,32 @@ profile here repeats it deliberately.
   an `Arc<ChatMessage>`, and the four to seven element ids a bubble draws
   under are formatted into `MessageListCache` when the rows are built rather
   than per row per frame — that cache is already rebuilt exactly when the
-  messages change, which is exactly when an id could differ. `app::frame_cost`
-  is what holds it: a counting allocator, ignored by default, asserting that
-  the per-frame path does not scale with the conversation behind it. It counts
-  allocations rather than milliseconds deliberately — the machine with the
-  problem is a browser running `dlmalloc`, and a count is the same count on
-  both.
+  messages change, which is exactly when an id could differ. The text goes
+  the same way and for the same sentence: `BubbleText` is the markup already
+  resolved, so a bubble no longer clones `content` into a `SharedString` and
+  parses it — a scan of the peer's message and the partition its spans
+  resolve to — for every visible row of every frame. What it is *not* is the
+  appearance: a `HighlightStyle` is built against `cx.theme()` and the
+  metrics, either of which can move under a timeline nothing else
+  invalidates, so the parse is cached and the styling is the asking frame's.
+  `app::frame_cost` is what holds all of it: a counting allocator, ignored by
+  default, asserting that the per-frame path does not scale with the
+  conversation behind it. It counts allocations rather than milliseconds
+  deliberately — the machine with the problem is a browser running
+  `dlmalloc`, and a count is the same count on both.
+- **A wait is a call across the boundary, and there are three of them.** Every
+  `setTimeout`-as-a-future in the tree — the window's clock, the library's
+  runtime clock, a plugin's scheduler — used to ask `web_sys::window()` to arm
+  and ask again in its guard's `Drop`, and then `clearTimeout` a handle the
+  browser had already retired. That is an `instanceof` plus two calls per
+  *tick* of every loop the page runs, and the loops are not rare: the
+  library's `yield_now` is its clock at zero milliseconds with a
+  `yield_frequency` of one, so a history sync arms one per message. The
+  global is resolved once per agent into a thread local, and the callback
+  raises a flag the guard reads, so a wait that ended the ordinary way
+  cancels nothing. `try_with` rather than `with`, because these guards are
+  dropped from tasks that can be torn down while thread locals are being
+  destroyed and a panic there is a panic in a destructor.
 - **Decoded images are cached by message id**, because GPUI tracks animation
   state per `Arc<Image>` and rebuilding one re-decodes the bytes. Whoever
   replaces a preview with real bytes must evict the entry.
@@ -1685,13 +1705,24 @@ by definition.
   the native cache keeping claims the way the page's does, which is the index
   that module opens by saying it does not have — worth it only if somebody
   meets it.
-- **The page's parsed markup is rebuilt on every frame.** `render_rich_text`
-  reparses a bubble's text per frame and allocates a `String` and two `Vec`s
-  doing it, and the plain path allocates a copy too. It belongs in
-  `MessageListCache` beside the element ids — except that a `StyledText` is
-  built against `cx.theme()`, so what is cached and what a theme change
-  invalidates is a decision rather than a move. The complexity of `runs()` is
-  not the thing to chase: `spans` is small, and the cost is the allocation.
+- **An idle window wakes twenty times a second, and none of it is ours.** A
+  DevTools trace of the published page sitting with nothing happening —
+  no pointer, no message, no rAF at all, which is the part that is *right*:
+  the window does not repaint itself — still spends about 1% of a core, and
+  almost the whole of it is one `setTimeout(50ms)` re-armed 20 times a
+  second. It is `gpui_component::NotificationList::new`, which spawns
+  `loop { timer(50ms); advance() }` for the life of the app whether or not a
+  notification has ever been raised, and `Root::new` builds one
+  unconditionally. Nothing here can decline it: `Root`'s fields are
+  `pub(crate)`, so the layers we do use — the tooltip overlay and the context
+  menus — cannot be assembled without it, and every other repeating timer in
+  this tree already ends itself (the heartbeat stops when there is no
+  `theme.json` to watch, the typing monitor when the composing stops, the
+  playback ticks when nothing is playing). So it is upstream's to fix, and it
+  is worth knowing about before reading a flame graph of an idle page and
+  concluding the window is busy. Measured at `fbf286c`: 2 seconds of a
+  genuinely idle page is 23ms of main thread, 44 timer fires, 0 animation
+  frames.
 - **What the module weighs is nobody's job to notice.** The Pages workflow
   prints it now, and the numbers to compare against are: 29,825,238 bytes at
   `17e6d4f`, of which the code section is 84.5% and the data section 15.1%,
