@@ -354,6 +354,7 @@ pub async fn connect() -> Result<Connection, String> {
         });
     }
 
+    let failed = hangup.clone();
     wasm_bindgen_futures::spawn_local(async move {
         // Everything the browser must not collect while this connection is
         // open lives in this task and nowhere a caller could drop it: the
@@ -387,7 +388,17 @@ pub async fn connect() -> Result<Connection, String> {
                 Outgoing::Discard { key } => post_discard(&frames, &key),
             };
             if let Err(e) = posted {
+                // Said to the front end, not only to the console. This
+                // direction failing is the connection ending — there is no
+                // way to ask the other tab anything after it — and a reader
+                // that is never told goes on waiting for frames that cannot
+                // come, with every request it has outstanding unanswered. It
+                // is the same rule the two receiving paths already follow,
+                // arrived at from the side that writes.
                 log::error!("this tab could not reach the one holding the account: {e:?}");
+                failed.close(
+                    "this tab lost its connection to the one holding the account".to_string(),
+                );
                 break;
             }
         }

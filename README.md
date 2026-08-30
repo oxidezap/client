@@ -82,10 +82,18 @@ nothing about that needs a server.
 Open it in as many tabs as you like. One of them holds the account — the
 session, the store and the one writer to it — and the others are windows onto
 that tab, over the same protocol the desktop window speaks to `oxidezapd`
-over. Nothing hands over, nothing disconnects, and closing whichever tab
-happened to be holding it hands the account to one of the others. It is the
-one thing WhatsApp Web will not do, and it costs nothing here because the
-session was never the window's to begin with.
+over. Opening a second tab disconnects nothing: the first goes on running the
+account and the second draws it live. That is the one thing WhatsApp Web will
+not do, and it is possible here because the session was never the window's to
+begin with.
+
+Two costs, since neither is nothing. Each tab is served its own copy of every
+frame, so a history load is cloned once per tab — fine at the number of tabs a
+person opens, and the reason this is not the end state. And closing the tab
+that holds the account hands it to one of the others rather than ending it,
+but that tab *starts* the session rather than inheriting it: it reconnects and
+reloads from the store, a second or two, with nothing lost because the tab
+that had it committed everything as it went.
 
 It can attach to an `oxidezapd` on your own machine instead, over a WebSocket
 and speaking the protocol the desktop window already speaks. That is worth
