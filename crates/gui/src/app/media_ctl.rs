@@ -672,6 +672,16 @@ impl WhatsAppApp {
         // Get player state first to determine action
         let player_state = self.video_players.get(&message_id).map(|p| p.state());
 
+        // Here, in the gesture, for the reason the voice note path says it
+        // there: a browser grants an audio context permission to play only
+        // under a transient user activation, and the first play of a video
+        // downloads and demuxes the attachment before any sound starts, so
+        // the click that authorised it has long expired by the time
+        // `play_samples` calls `resume`. What that looks like is a video that
+        // plays with no sound at all. Free where a sound card needs no
+        // permission, and harmless on the paths that turn out not to need it.
+        self.audio_player.unlock();
+
         match player_state {
             Some(VideoPlayerState::Playing) => {
                 // Pause video and its audio

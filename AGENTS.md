@@ -1158,6 +1158,13 @@ A discard is the mirror and has the same hazard: a `DELETE` issued while the
 with nothing that will ever read it. So a send abandoned mid-upload is
 *recorded* rather than removed, and the upload's own completion is what
 removes it, one decision, made after the write it is undoing.
+And what waits in that queue is a frame *and the reservation it answers for*,
+because the connection can end while it waits: `Frames::finish` fails every
+reservation and knows nothing about the outbox, and the `Link` it holds is a
+clone that does not necessarily refuse a later write. Without the id a line
+typed behind a voice note reaches the daemon after the window has already
+drawn it as failed. A frame carrying no id is fire-and-forget and writing it
+late costs nothing.
 
 **Which tab holds the account is claimed, not assumed.** `daemon/claim/` is a
 lock file on the desktop and a Web Lock in a browser, taken with `ifAvailable`
