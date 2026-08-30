@@ -490,62 +490,33 @@ impl Session {
 
     /// Send a request and remember what its answer means.
     fn ask(&self, request: ClientRequest, waiting: Awaiting) -> RequestId {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            // Whoever gave up is no longer listening, and its answer may never
-            // come. Swept here rather than on a timer: this is the only thing
-            // that grows the map, so it is the only place that needs to shrink
-            // it.
-            pending.retain(|_, waiting| !waiting.is_abandoned());
-            pending.insert(id, waiting);
-        }
-        if let Err(e) = self.send_frame(&Request {
-            id: Some(id),
+        let id = self.reserve(waiting);
+        deliver(
+            &self.link,
+            &self.pending,
+            &self.events,
+            &self.media,
+            id,
             request,
-        }) {
-            error!("could not reach the daemon: {e}");
-            // Answer here rather than leaving the caller waiting on a request
-            // that never went out.
-            if let Some(waiting) = self
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id)
-            {
-                let detail = format!("could not reach the daemon: {e}");
-                // This request is not going to run, so whatever it staged is
-                // dead: nothing will read those bytes and every retry would
-                // stage another copy.
-                if let Some(key) = waiting.staged_key() {
-                    self.media.discard(key);
-                }
-                match waiting {
-                    // This runs on the GPUI executor, and that executor is
-                    // what drains this queue. `failed` publishes with the
-                    // waiting variant of the send, so a full queue would park
-                    // the only thread that could empty it — the window stops
-                    // rather than saying the message did not go.
-                    Awaiting::Send {
-                        chat_jid, local_id, ..
-                    } => {
-                        self.report_send_failed(&chat_jid, &local_id, detail);
-                    }
-                    // Same thread, same rule: `failed` would `blocking_send`
-                    // on the queue this executor drains.
-                    Awaiting::StatusView { message_ids } => {
-                        self.report_status_view_lost(message_ids, &detail);
-                    }
-                    // And the same rule again, for the same reason it is a
-                    // rule: a view waiting on a page asks for nothing until it
-                    // hears, so a request that never left has to say so — the
-                    // reconnect keeps the chats and the paging state, and a
-                    // list left `Loading` never asks again.
-                    Awaiting::Page { jid } => self.report_page_lost(jid, &detail),
-                    waiting => waiting.failed(&detail, None),
-                }
-            }
-        }
+        );
+        id
+    }
+
+    /// Claim an id and record what its answer will mean.
+    ///
+    /// Split from the send because a staged request reserves now and leaves
+    /// later: the payload has to reach the daemon before the frame naming it
+    /// does, and the id still has to be taken in the order the person acted
+    /// in. See [`Self::send_audio_message`].
+    fn reserve(&self, waiting: Awaiting) -> RequestId {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        // Whoever gave up is no longer listening, and its answer may never
+        // come. Swept here rather than on a timer: this is the only thing
+        // that grows the map, so it is the only place that needs to shrink
+        // it.
+        pending.retain(|_, waiting| !waiting.is_abandoned());
+        pending.insert(id, waiting);
         id
     }
 
@@ -584,31 +555,42 @@ impl Session {
         // sends that does not belong in a frame. The key is the local id,
         // which is already unique per recording.
         let upload = format!("u-{}", sanitize(&local_id));
-        if let Err(e) = self.media.stage(&upload, &audio) {
-            // The caller draws the bubble either way, and nothing was
-            // registered as pending here — so this is the only chance to say
-            // the recording is not going anywhere.
-            self.report_send_failed(
-                jid,
-                &local_id,
-                format!("could not stage the recording: {e}"),
-            );
-            return;
-        }
-        self.ask(
-            ClientRequest::SendAudio {
-                jid: jid.to_string(),
-                upload: upload.clone(),
-                duration_secs,
-                waveform,
-                local_id: Some(local_id.clone()),
-                quoted,
-            },
-            Awaiting::Send {
-                chat_jid: jid.to_string(),
-                local_id,
-                staged: Some(upload),
-            },
+        let request = ClientRequest::SendAudio {
+            jid: jid.to_string(),
+            upload: upload.clone(),
+            duration_secs,
+            waveform,
+            local_id: Some(local_id.clone()),
+            quoted,
+        };
+        // Reserved before the payload is staged and sent after it lands. The
+        // id is taken in the order the person acted in, which a reservation
+        // made later would not be; the *frame* waits, because the daemon
+        // opens the payload when it handles the request and a page stages it
+        // over HTTP. Where staging is a local write this all still happens
+        // before the call returns.
+        let id = self.reserve(Awaiting::Send {
+            chat_jid: jid.to_string(),
+            local_id,
+            staged: Some(upload.clone()),
+        });
+        let link = self.link.clone();
+        let pending = Arc::clone(&self.pending);
+        let events = self.events.clone();
+        let media = Arc::clone(&self.media);
+        self.media.stage_then(
+            &upload,
+            audio,
+            Box::new(move |staged| match staged {
+                Ok(()) => deliver(&link, &pending, &events, &media, id, request),
+                Err(e) => fail_reserved(
+                    &pending,
+                    &events,
+                    &media,
+                    id,
+                    format!("could not stage the recording: {e}"),
+                ),
+            }),
         );
     }
 
@@ -847,6 +829,98 @@ impl Session {
             Awaiting::Download(tx),
         );
         rx
+    }
+}
+
+/// Write a reserved request's frame, and answer for it if it will not go.
+///
+/// A free function rather than a method because the staged path sends from a
+/// callback that outlives the borrow: everything it needs is cloneable, and
+/// the alternative was a second copy of the failure handling below, which is
+/// the part that must not drift.
+fn deliver(
+    link: &Link,
+    pending: &Pending,
+    events: &EventSink,
+    media: &Arc<dyn MediaCache>,
+    id: RequestId,
+    request: ClientRequest,
+) {
+    let frame = match serde_json::to_vec(&Request {
+        id: Some(id),
+        request,
+    }) {
+        Ok(frame) => frame,
+        Err(e) => {
+            fail_reserved(pending, events, media, id, format!("unserializable: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = link.send_line(&frame) {
+        error!("could not reach the daemon: {e}");
+        fail_reserved(
+            pending,
+            events,
+            media,
+            id,
+            format!("could not reach the daemon: {e}"),
+        );
+    }
+}
+
+/// Answer a reserved request that is never going to run.
+///
+/// Whoever reserved an id is waiting on it, so a request that never left has
+/// to say so in the terms that request was made in.
+fn fail_reserved(
+    pending: &Pending,
+    events: &EventSink,
+    media: &Arc<dyn MediaCache>,
+    id: RequestId,
+    detail: String,
+) {
+    let Some(waiting) = pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id)
+    else {
+        return;
+    };
+    // This request is not going to run, so whatever it staged is dead:
+    // nothing will read those bytes and every retry would stage another copy.
+    if let Some(key) = waiting.staged_key() {
+        media.discard(key);
+    }
+    match waiting {
+        // This runs on the GPUI executor, and that executor is what drains
+        // this queue. `failed` publishes with the waiting variant of the
+        // send, so a full queue would park the only thread that could empty
+        // it — the window stops rather than saying the message did not go.
+        Awaiting::Send {
+            chat_jid, local_id, ..
+        } => {
+            error!("send failed before it left: {detail}");
+            events.try_send(FromDaemon::Session(Box::new(UiEvent::SendFailed {
+                chat_jid,
+                message_id: local_id,
+                reason: detail,
+            })));
+        }
+        // Same thread, same rule: `failed` would `blocking_send` on the queue
+        // this executor drains.
+        Awaiting::StatusView { message_ids } => {
+            error!("a status view never left this process: {detail}");
+            events.try_send(FromDaemon::StatusViewLost(message_ids));
+        }
+        // And the same rule again, for the same reason it is a rule: a view
+        // waiting on a page asks for nothing until it hears, so a request
+        // that never left has to say so — the reconnect keeps the chats and
+        // the paging state, and a list left `Loading` never asks again.
+        Awaiting::Page { jid } => {
+            error!("a page request never left this process: {detail}");
+            events.try_send(FromDaemon::PageLost { jid });
+        }
+        waiting => waiting.failed(&detail, None),
     }
 }
 

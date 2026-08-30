@@ -14,6 +14,13 @@
 
 use std::sync::Arc;
 
+/// What to do once a payload is staged, or once staging has failed.
+///
+/// Boxed because it is handed across a trait whose implementations finish at
+/// different times, and `Send` because the native cache is written from
+/// whichever thread made the request.
+pub type StageThen = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
+
 /// Where a front end finds the bytes a frame only named.
 ///
 /// `Send + Sync` because the native reader thread holds one while the UI
@@ -65,9 +72,24 @@ pub trait MediaCache: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Where there is no shared place to stage into — a page cannot hand the
-    /// daemon a file — which is also why nothing on that platform records.
+    /// Nowhere to write, or the write failed.
     fn stage(&self, key: &str, bytes: &[u8]) -> Result<(), String>;
+
+    /// Stage, and only then run `then`.
+    ///
+    /// Staging is a local write where the daemon shares a filesystem and a
+    /// round trip where it does not, and the request naming the key may not go
+    /// out before the bytes have landed — the daemon reads the payload when it
+    /// handles the request, so a frame that overtakes its own upload names a
+    /// file that is not there yet.
+    ///
+    /// So the continuation belongs to the implementation rather than to the
+    /// caller. Where staging is synchronous this runs `then` before returning
+    /// and the ordering is exactly what it always was; where it is not, the
+    /// caller's frame is sent from the upload's own completion.
+    fn stage_then(&self, key: &str, bytes: Vec<u8>, then: StageThen) {
+        then(self.stage(key, &bytes));
+    }
 
     /// Drop a staged payload whose request is never going to run.
     ///
@@ -166,13 +188,29 @@ impl MediaCache for Fetched {
             .ok_or_else(|| format!("media {key} was not fetched with its frame"))
     }
 
+    /// Refused, because staging from a page is not synchronous.
+    ///
+    /// The bytes go to the daemon over HTTP, which cannot be awaited from
+    /// here. [`stage_then`](MediaCache::stage_then) is the one that works, and
+    /// this stays as the loud failure for anything that has not been moved
+    /// onto it — silently going out naming a payload that is not there is the
+    /// outcome worth refusing.
     fn stage(&self, _key: &str, _bytes: &[u8]) -> Result<(), String> {
-        // Nothing to stage into: the daemon reads a file and a page has no
-        // filesystem to put one in. Recording is unavailable on this platform
-        // for the same reason, so nothing reaches here in practice — but a
-        // send that somehow did must fail loudly rather than silently go out
-        // naming bytes that are not there.
-        Err("a page cannot stage a payload for the daemon".to_string())
+        Err("a page stages over HTTP, which cannot be awaited here".to_string())
+    }
+
+    /// Upload, then continue.
+    ///
+    /// The page's own copy is dropped when this finishes either way: on
+    /// success the daemon holds it, and on failure the send is not going to
+    /// run. A tab's memory has a ceiling and a voice note is the one payload
+    /// this side allocates whole.
+    fn stage_then(&self, key: &str, bytes: Vec<u8>, then: StageThen) {
+        let key = key.to_string();
+        let base = oxidezap_ipc::web::media_base_url();
+        wasm_bindgen_futures::spawn_local(async move {
+            then(oxidezap_ipc::web::upload_media(&base, &key, &bytes).await);
+        });
     }
 
     fn discard(&self, key: &str) {
