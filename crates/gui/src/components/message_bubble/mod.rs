@@ -36,7 +36,7 @@ use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use crate::utils::format_time_local;
 use crate::video::VideoPlayerState;
-use oxidezap_core::{ChatMessage, MediaType};
+use oxidezap_core::ChatMessage;
 
 /// Everything one bubble needs, gathered by the list.
 pub struct BubbleProps {
@@ -387,12 +387,4 @@ fn render_meta(
                 .child(time),
         )
         .children(status.map(|status| bubble_status_ticks(status, metrics.icon_small(), cx)))
-}
-
-/// Whether a media kind is drawn as a picture rather than a control row.
-pub(crate) fn is_pictorial(media_type: &MediaType) -> bool {
-    matches!(
-        media_type,
-        MediaType::Image | MediaType::Sticker | MediaType::Video
-    )
 }

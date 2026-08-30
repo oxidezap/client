@@ -327,10 +327,6 @@ impl InputAreaView {
         cx.notify();
     }
 
-    pub fn reply(&self) -> Option<&ReplyDraft> {
-        self.reply.as_ref()
-    }
-
     fn clear_reply(&mut self, cx: &mut Context<Self>) {
         self.reply = None;
         cx.emit(InputAreaEvent::CancelReply);

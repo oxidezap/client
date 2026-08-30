@@ -53,9 +53,10 @@ pub struct AccountSummary {
 /// everything the sizes are derived from, so a base-font change or a resize
 /// rebuilds them and nothing else does.
 fn row_sizes(rows: usize, width: Pixels, height: Pixels) -> Rc<Vec<Size<Pixels>>> {
+    /// The sizes and everything they were derived from.
+    type Cached = (usize, Pixels, Pixels, Rc<Vec<Size<Pixels>>>);
     thread_local! {
-        static SIZES: RefCell<Option<(usize, Pixels, Pixels, Rc<Vec<Size<Pixels>>>)>> =
-            const { RefCell::new(None) };
+        static SIZES: RefCell<Option<Cached>> = const { RefCell::new(None) };
     }
     SIZES.with(|held| {
         let mut held = held.borrow_mut();

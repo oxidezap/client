@@ -2,10 +2,6 @@
 //!
 //! This is the main entry point for the WhatsApp UI application.
 
-// Allow dead code for WIP features (calls, media playback, etc.)
-#![allow(dead_code)]
-#![allow(clippy::too_many_arguments)]
-
 mod app;
 mod assets;
 mod components;

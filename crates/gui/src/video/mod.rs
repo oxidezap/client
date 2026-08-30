@@ -7,6 +7,10 @@
 //! - Audio extraction from video files (for video audio track playback)
 //! - A live call's video, decoded per direction on threads of its own
 
+/// The audio track inside a video file, and the SPS below it: both are the
+/// decoder's, so on the web — where there is none — they compile and nothing
+/// reaches them.
+#[cfg_attr(target_family = "wasm", allow(dead_code, reason = "no decoder here"))]
 mod audio;
 /// A live call's two directions, decoded on threads of their own.
 #[cfg(not(target_family = "wasm"))]
@@ -16,6 +20,7 @@ mod call;
 #[path = "call_unsupported.rs"]
 mod call;
 mod player;
+#[cfg_attr(target_family = "wasm", allow(dead_code, reason = "no decoder here"))]
 mod sps;
 
 /// The real decoder: `mp4` for the container, `openh264` for the picture.

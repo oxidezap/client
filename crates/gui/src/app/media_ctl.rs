@@ -271,17 +271,6 @@ impl WhatsAppApp {
         }
         cx.notify();
     }
-    /// Stop audio playback (only if audio is currently playing)
-    pub fn stop_audio(&mut self, cx: &mut Context<Self>) {
-        if self.active_media.is_audio() {
-            self.audio_player.stop();
-            // The clip goes with the stream. Left behind, a speed change
-            // would prepare bytes the sink no longer has anything to do with.
-            self.audio = AudioHolder::None;
-            self.active_media = ActiveMedia::None;
-            cx.notify();
-        }
-    }
     /// Toggle play/pause for the current audio
     pub fn toggle_audio(
         &mut self,

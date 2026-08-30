@@ -78,14 +78,6 @@ impl WhatsAppApp {
         &self.call_card
     }
 
-    pub fn incoming_call(&self) -> Option<&IncomingCall> {
-        self.call_state.incoming()
-    }
-
-    pub fn outgoing_call(&self) -> Option<&OutgoingCall> {
-        self.call_state.outgoing()
-    }
-
     pub fn active_call(&self) -> Option<&ActiveCall> {
         self.call_state.active()
     }
@@ -457,16 +449,6 @@ impl WhatsAppApp {
             self.call_card.set_minimized(false);
             cx.notify();
         }
-    }
-
-    /// Leave a record of a call in the conversation it belonged to.
-    ///
-    /// The record is local: the daemon does not persist call history, so this
-    /// survives the session and not a restart. Better than nothing — a missed
-    /// call the user never saw is the case this exists for — and it is why the
-    /// row is built from what the UI watched rather than queried back.
-    pub(super) fn record_call(&mut self, stage: &Stage, cx: &mut Context<Self>) {
-        self.record_call_as(stage, None, cx);
     }
 
     /// Take the daemon's call state as authoritative.

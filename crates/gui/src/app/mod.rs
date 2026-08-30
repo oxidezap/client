@@ -344,9 +344,9 @@ use crate::views::{
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
     ActiveCall, AppState, Availability, CachedQrCode, CallOutcome, CallRecord, CallState, Chat,
-    ChatMessage, ComposingKind, DownloadableMedia, Ending, IncomingCall, Issued, MediaContent,
-    MediaType, MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Resend,
-    Stage, SystemNotice, TypingSummary, UiEvent,
+    ChatMessage, ComposingKind, DownloadableMedia, Ending, Issued, MediaContent, MediaType,
+    MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Resend, Stage,
+    SystemNotice, TypingSummary, UiEvent,
 };
 
 // ChatListCache is now in chats.rs and re-exported above
@@ -453,11 +453,6 @@ impl ActiveMedia {
     /// Check if this is an audio message
     fn is_audio(&self) -> bool {
         matches!(self, Self::Audio { .. })
-    }
-
-    /// Check if this is a video message
-    fn is_video(&self) -> bool {
-        matches!(self, Self::Video { .. })
     }
 
     /// Get the message ID if any media is playing
@@ -1054,11 +1049,6 @@ impl WhatsAppApp {
         }
     }
 
-    /// Get the current mobile panel state
-    pub fn mobile_panel(&self) -> MobilePanel {
-        self.mobile_panel
-    }
-
     /// Navigate back to chat list (for mobile)
     pub fn navigate_back(&mut self, cx: &mut Context<Self>) {
         self.mobile_panel = MobilePanel::ChatList;
@@ -1465,11 +1455,6 @@ impl WhatsAppApp {
     /// [`KeyboardSurfaces`].
     pub fn note_keyboard_surfaces(&mut self, surfaces: KeyboardSurfaces) {
         self.keyboard_surfaces = surfaces;
-    }
-
-    /// The window's own focus target, which every frame draws.
-    pub fn root_focus(&self) -> &FocusHandle {
-        &self.root_focus
     }
 
     /// Drop everything this window learned from the account it is leaving.
@@ -1906,11 +1891,6 @@ impl WhatsAppApp {
     /// Get the isolated input area view entity
     pub fn input_area(&self) -> Option<Entity<InputAreaView>> {
         self.input_area.clone()
-    }
-
-    /// Get the chat list focus handle
-    pub fn call_popup_focus(&self) -> &FocusHandle {
-        &self.call_focus
     }
 
     pub fn chat_list_focus(&self) -> &FocusHandle {

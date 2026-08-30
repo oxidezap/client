@@ -21,10 +21,6 @@ impl WhatsAppApp {
         })
     }
 
-    pub fn is_error_detail_open(&self) -> bool {
-        self.error_detail_open
-    }
-
     pub fn toggle_error_detail(&mut self, cx: &mut Context<Self>) {
         self.error_detail_open = !self.error_detail_open;
         cx.notify();

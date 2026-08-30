@@ -117,7 +117,12 @@ pub(super) fn write_bgra_rotated(
     // two bounds checks and a multiply per pixel for a rotation that is not
     // happening.
     if rotation == Rotation::None {
-        for (to, from) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        for (to, from) in dst
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src.as_chunks::<4>().0)
+        {
             to[0] = from[2];
             to[1] = from[1];
             to[2] = from[0];
@@ -152,7 +157,7 @@ pub(super) fn write_bgra_rotated(
 /// image will own, so it can be written into directly and corrected in place
 /// rather than copied out of a scratch.
 pub(super) fn swap_rb_in_place(pixels: &mut [u8]) {
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
 }

@@ -179,6 +179,7 @@ impl WhatsAppApp {
     ///
     /// Not built yet: the reaction path exists inbound only, and a picker that
     /// cannot send is worse than one that says so.
+    #[expect(dead_code, reason = "the outbound reaction path is not built yet")]
     pub fn open_reaction_picker(
         &mut self,
         message_id: &str,

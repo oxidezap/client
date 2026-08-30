@@ -194,16 +194,6 @@ fn build_items(messages: &[ChatMessage], typing: Option<TypingSummary>) -> Vec<T
     items
 }
 
-/// Check if this message should show the sender name (for grouping)
-pub fn should_show_sender(messages: &[ChatMessage], index: usize) -> bool {
-    if index == 0 {
-        return true;
-    }
-    let current = &messages[index];
-    let previous = &messages[index - 1];
-    current.sender != previous.sender || current.is_from_me != previous.is_from_me
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

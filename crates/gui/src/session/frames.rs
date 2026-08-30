@@ -89,6 +89,13 @@ impl<'a> Frames<'a> {
     ///
     /// A socket that simply closed has nothing to say; one the browser closed
     /// with a code does.
+    #[cfg_attr(
+        not(target_family = "wasm"),
+        expect(
+            dead_code,
+            reason = "a socket that closed has nothing to say; the web transport does"
+        )
+    )]
     pub(super) fn blame(&mut self, reason: String) {
         self.reason.get_or_insert(reason);
     }

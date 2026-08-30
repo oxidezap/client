@@ -188,6 +188,13 @@ impl Metrics {
     /// everything derived from the rem — every token in this file, and the
     /// cache keys taken from [`Self::rem_size`] — follows the window without
     /// a single call site learning that windows have sizes.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the window resolves its own metrics; this is how the scale is stated"
+        )
+    )]
     pub fn for_viewport(rem_size: f32, density: Density, viewport: Size<Pixels>) -> Self {
         Self::new(rem_size * viewport_fit(viewport), density)
     }
@@ -345,6 +352,10 @@ impl Metrics {
         self.dense(64.0)
     }
     /// The presence dot on an avatar.
+    #[expect(
+        dead_code,
+        reason = "a step nothing draws today is still the step between the ones that do"
+    )]
     pub fn presence_dot(&self) -> Pixels {
         self.scaled(12.0)
     }
@@ -380,6 +391,10 @@ impl Metrics {
     pub fn touch_target(&self) -> Pixels {
         self.dense(48.0)
     }
+    #[expect(
+        dead_code,
+        reason = "a step nothing draws today is still the step between the ones that do"
+    )]
     pub fn search_field_height(&self) -> Pixels {
         self.dense(38.0)
     }
@@ -468,9 +483,17 @@ impl Metrics {
     pub fn bubble_gap_authored(&self) -> Pixels {
         self.dense(8.0)
     }
+    #[expect(
+        dead_code,
+        reason = "a step nothing draws today is still the step between the ones that do"
+    )]
     pub fn date_divider_height(&self) -> Pixels {
         self.dense(34.0)
     }
+    #[expect(
+        dead_code,
+        reason = "a step nothing draws today is still the step between the ones that do"
+    )]
     pub fn typing_row_height(&self) -> Pixels {
         self.dense(46.0)
     }
@@ -478,6 +501,10 @@ impl Metrics {
     pub fn reaction_overlap(&self) -> Pixels {
         self.dense(6.0)
     }
+    #[expect(
+        dead_code,
+        reason = "a step nothing draws today is still the step between the ones that do"
+    )]
     pub fn reaction_height(&self) -> Pixels {
         self.dense(22.0)
     }
@@ -491,6 +518,10 @@ impl Metrics {
     }
 
     /// One line of body text in a bubble.
+    #[expect(
+        dead_code,
+        reason = "a step nothing draws today is still the step between the ones that do"
+    )]
     pub fn line_height(&self) -> Pixels {
         self.scaled(22.0)
     }

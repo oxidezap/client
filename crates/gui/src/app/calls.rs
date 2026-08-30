@@ -45,6 +45,14 @@ impl CallCard {
         self.minimized
     }
 
+    /// Where the card has been dragged to.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the drag is asserted about; the render reads the field"
+        )
+    )]
     pub fn offset(&self) -> Point<Pixels> {
         self.offset
     }
