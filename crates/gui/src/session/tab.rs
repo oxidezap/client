@@ -80,6 +80,10 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     // attached and a tab that was stuck looking identical from a console, and
     // that is exactly the report this is meant to answer.
     log::info!("attached to the tab holding this account");
+    // A front end, with no session of its own. What reads this is the plugin
+    // pane, which may offer an install into this origin's folder and must not
+    // promise that reloading *this* tab starts it.
+    super::note_account_is_here(false);
 
     let (events, rx) = sink::channel();
     let held = Arc::new(Fetched::new(media.clone()));

@@ -759,6 +759,39 @@ fn post_discard(frames: &BroadcastChannel, key: &str) -> Result<(), wasm_bindgen
     frames.post_message(&message)
 }
 
+/// A `setTimeout`, cleared whenever this is dropped.
+///
+/// A drop guard rather than a cleanup at the end of the race, and the
+/// difference is the whole reason the type exists: the futures here *are*
+/// dropped mid-await — a media read sits inside `gather`, which sits inside a
+/// budget for the whole frame — and a timer still armed when its Rust
+/// `Closure` has been freed fires into a dropped closure. The same shape, and
+/// the same reason, as the WebSocket's `FetchDeadline`.
+struct Timer {
+    /// Whatever `setTimeout` answered, kept as it came: a window hands back a
+    /// number and some workers hand back an object, and `clearTimeout` wants
+    /// the one it gave out. Nothing here looks inside it.
+    handle: Option<wasm_bindgen::JsValue>,
+    /// Held so the browser does not collect it before it fires, and dropped
+    /// with this — after the handle above has been cleared, never before.
+    _fire: Closure<dyn FnMut()>,
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let global = js_sys::global();
+        if let Ok(clear) =
+            js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("clearTimeout"))
+            && let Ok(clear) = clear.dyn_into::<js_sys::Function>()
+        {
+            let _ = clear.call1(&global, &handle);
+        }
+    }
+}
+
 /// Race a future against a timer, and say which won.
 ///
 /// `tokio::time` is the row in /AGENTS.md that says compiling is not the
@@ -787,23 +820,18 @@ async fn deadline<T>(
                 .ok()
         });
 
-    let answered = futures_lite::future::or(async { Some(waiting.await) }, async {
+    // Armed and owned before the await, so that a caller dropping this future
+    // takes the timer with it.
+    let _timer = Timer {
+        handle,
+        _fire: fire,
+    };
+
+    futures_lite::future::or(async { Some(waiting.await) }, async {
         let _ = was_fired.await;
         None
     })
-    .await;
-
-    // Cleared whichever way it went: a timer still armed would fire into a
-    // closure this function is about to drop.
-    if let Some(handle) = handle
-        && let Ok(clear) =
-            js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("clearTimeout"))
-        && let Ok(clear) = clear.dyn_into::<js_sys::Function>()
-    {
-        let _ = clear.call1(&global, &handle);
-    }
-    drop(fire);
-    answered
+    .await
 }
 
 /// A name for one connection.

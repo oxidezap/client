@@ -33,6 +33,35 @@ mod tab;
 #[cfg(target_family = "wasm")]
 mod web;
 
+/// Whether the session this window talks to is in this tab.
+///
+/// One bit, and it is the front end's only piece of "which arrangement am I
+/// in" — the interface never asks it, and the one thing that does is the
+/// plugin pane: a folder is one per origin, a host is one per account, and a
+/// window with no session of its own can write to the first and cannot start
+/// anything in the second. See `platform::plugins::home`.
+///
+/// An atomic rather than a `thread_local`, because it is read from the render
+/// pass and written from whichever task settled the connection, and false
+/// until something says otherwise: a window that has not attached to anything
+/// yet holds no account, which is the answer that withholds rather than the
+/// one that promises.
+static HOLDS_THE_ACCOUNT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this tab is the one running the session.
+#[must_use]
+pub fn this_tab_holds_the_account() -> bool {
+    HOLDS_THE_ACCOUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Say which arrangement this window ended up in.
+///
+/// Called by each of the ways a connection is made, at the moment it is made
+/// — not before, because a tab that is still asking has not settled anything.
+pub(crate) fn note_account_is_here(here: bool) {
+    HOLDS_THE_ACCOUNT.store(here, std::sync::atomic::Ordering::Relaxed);
+}
+
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};

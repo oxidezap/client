@@ -200,6 +200,16 @@ fn accept(
         }
     };
 
+    // What this connection has staged and nobody has taken.
+    //
+    // A payload under `u-` is a front end's only copy of something it is
+    // about to send, so the media sweep spares it — which means a tab that
+    // records a note and then vanishes before sending or discarding it leaves
+    // bytes nothing will ever reclaim, in a heap that has a ceiling. The
+    // connection's own teardown is the one moment that knows those bytes are
+    // now unreachable: the tab that named them is gone.
+    let staged: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+
     let (client, server) = tokio::io::duplex(PIPE);
     oxidezap_session::spawn(async move {
         if let Err(e) = crate::server::serve_client(server, hub, plugins, commands).await {
@@ -228,7 +238,7 @@ fn accept(
     // clears it; nothing else here holds a strong reference.
     let open = Rc::new(RefCell::new(Some(Connection {
         channel: frames.clone(),
-        _handler: handler(&frames, &requests),
+        _handler: handler(&frames, &requests, &staged),
     })));
 
     // Reading the pipe and posting what comes out. Ends when `serve_client`
@@ -274,6 +284,20 @@ fn accept(
         // repeat this guards against belongs to a connection that is opening;
         // once one has ended, its name is nobody's.
         serving.borrow_mut().remove(&live_name);
+        // And so are the payloads it staged and never sent. A key the send
+        // did reach is already gone — the session takes it when it reads it —
+        // so this removes what is left, which is what nobody is coming back
+        // for.
+        //
+        // The one thing it can race is a send whose command is still queued
+        // behind others when the tab vanishes in the same instant. That send
+        // then fails, in a window nobody is watching, which is the better half
+        // of the trade against bytes that are never reclaimed at all.
+        for key in std::mem::take(&mut *staged.borrow_mut()) {
+            if crate::media::take(&key).is_some() {
+                log::debug!("reclaimed {key}, staged by a tab that has gone");
+            }
+        }
         log::debug!("a tab stopped listening");
     });
 
@@ -319,9 +343,11 @@ impl Drop for Connection {
 fn handler(
     frames: &BroadcastChannel,
     requests: &tokio::sync::mpsc::UnboundedSender<String>,
+    staged: &Rc<RefCell<HashSet<String>>>,
 ) -> Closure<dyn FnMut(MessageEvent)> {
     let frames = frames.clone();
     let requests = requests.clone();
+    let staged = Rc::clone(staged);
     Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         let data = event.data();
         let Some(kind) = string_field(&data, "k") else {
@@ -381,7 +407,10 @@ fn handler(
                     return;
                 };
                 let _ = match crate::media::put_owned(&key, bytes) {
-                    Ok(_) => post_staged(&frames, id),
+                    Ok(_) => {
+                        staged.borrow_mut().insert(key);
+                        post_staged(&frames, id)
+                    }
                     Err(e) => post_failure(&frames, "staged", id, &e.to_string()),
                 };
             }
@@ -389,6 +418,7 @@ fn handler(
                 let Some(key) = string_field(&data, "key") else {
                     return;
                 };
+                staged.borrow_mut().remove(&key);
                 let _ = crate::media::take(&key);
             }
             _ => {}

@@ -361,6 +361,9 @@ fn description_for(section: SettingsSection) -> Option<&'static str> {
             crate::platform::PluginHome::Page => {
                 "Kept in this browser. Each one says what it may do."
             }
+            crate::platform::PluginHome::AnotherTab => {
+                "Kept in this browser, and loaded by the tab holding this account."
+            }
         }),
         _ => None,
     }

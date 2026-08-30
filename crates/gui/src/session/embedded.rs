@@ -57,6 +57,11 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         Held::Session(pipe) => pipe,
         Held::AnotherTab(attached) => return Ok(attached),
     };
+    // This tab took the account. Said here rather than inside `take_or_attach`
+    // so that it is stamped on exactly one outcome: the pipe existing *is* the
+    // session being in this tab.
+    super::note_account_is_here(true);
+
     let (reader, mut writer) = tokio::io::split(pipe);
 
     // The write half, as a queue into the task that owns it — the same
