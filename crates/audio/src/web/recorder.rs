@@ -94,6 +94,16 @@ struct Teardown {
 
 impl Drop for Teardown {
     fn drop(&mut self) {
+        // The handler goes first, while the closure it points at is still
+        // alive. `AudioContext::close` is asynchronous, so a processing event
+        // already queued, or dispatched before that promise settles, would
+        // otherwise call into a `Closure` this very drop is about to free,
+        // which on this target is not an error but the end of the tab. The
+        // graph is disconnected for the same reason: a node still wired to a
+        // running context is a node that can still be asked for a block.
+        self._node.set_onaudioprocess(None);
+        let _ = self._node.disconnect();
+        let _ = self._source.disconnect();
         stop_tracks(&self.stream);
         let _ = self.context.close();
     }
@@ -103,37 +113,61 @@ impl Drop for Teardown {
 ///
 /// Between `getUserMedia` answering and the graph being wired there are four
 /// fallible steps, and on every one of them the microphone is already live.
-struct Tracks(web_sys::MediaStream);
+///
+/// The handle is moved out on `disarm` rather than cloned. Cloning it and
+/// forgetting the guard leaves the original rooted in wasm-bindgen's object
+/// table for the life of the tab, since `mem::forget` is exactly the promise
+/// never to run the drop that would release it, so every recording left a
+/// stream and a context behind.
+struct Tracks(Option<web_sys::MediaStream>);
 
 impl Tracks {
+    fn new(stream: web_sys::MediaStream) -> Self {
+        Self(Some(stream))
+    }
+
     /// Hand the stream over to something that will close it.
-    fn disarm(self) -> web_sys::MediaStream {
-        let stream = self.0.clone();
-        std::mem::forget(self);
-        stream
+    fn disarm(mut self) -> web_sys::MediaStream {
+        self.0.take().expect("a disarmed guard is dropped at once")
+    }
+
+    /// The stream, while this still holds it.
+    fn get(&self) -> &web_sys::MediaStream {
+        self.0.as_ref().expect("held until disarmed")
     }
 }
 
 impl Drop for Tracks {
     fn drop(&mut self) {
-        stop_tracks(&self.0);
+        if let Some(stream) = self.0.take() {
+            stop_tracks(&stream);
+        }
     }
 }
 
 /// The same for the context, which holds the hardware open in its own right.
-struct Closing(web_sys::AudioContext);
+struct Closing(Option<web_sys::AudioContext>);
 
 impl Closing {
-    fn disarm(self) -> web_sys::AudioContext {
-        let context = self.0.clone();
-        std::mem::forget(self);
-        context
+    fn new(context: web_sys::AudioContext) -> Self {
+        Self(Some(context))
+    }
+
+    fn disarm(mut self) -> web_sys::AudioContext {
+        self.0.take().expect("a disarmed guard is dropped at once")
+    }
+
+    /// The context, while this still holds it.
+    fn get(&self) -> &web_sys::AudioContext {
+        self.0.as_ref().expect("held until disarmed")
     }
 }
 
 impl Drop for Closing {
     fn drop(&mut self) {
-        let _ = self.0.close();
+        if let Some(context) = self.0.take() {
+            let _ = context.close();
+        }
     }
 }
 
@@ -259,7 +293,7 @@ impl AudioRecorder {
         // promise nothing waits on: by the time it resolves the microphone is
         // still opening, and a context that was already running ignores it.
         let _ = context.resume();
-        let context = Closing(context);
+        let context = Closing::new(context);
 
         let capture = Rc::clone(&self.capture);
         wasm_bindgen_futures::spawn_local(async move {
@@ -359,16 +393,16 @@ async fn open_microphone(
     // already been granted and the tracks are already live, so a failure that
     // merely dropped the JS wrapper would leave the microphone open with its
     // indicator on and nothing holding it.
-    let held = Tracks(stream);
+    let held = Tracks::new(stream);
 
     // The context came from `start`, so it was built while the gesture was
     // still live. It is still a guard, and every `?` below still closes it.
     let source = context
-        .0
-        .create_media_stream_source(&held.0)
+        .get()
+        .create_media_stream_source(held.get())
         .map_err(|e| format!("the microphone could not be attached: {e:?}"))?;
     let node = context
-        .0
+        .get()
         .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
             CAPTURE_CHUNK,
             1,
@@ -420,7 +454,7 @@ async fn open_microphone(
     // even though nothing here wants to hear the input: the output buffer is
     // left untouched and therefore silent, so this feeds the speakers zeros
     // rather than the microphone.
-    node.connect_with_audio_node(&context.0.destination())
+    node.connect_with_audio_node(&context.get().destination())
         .map_err(|e| format!("the capture graph would not run: {e:?}"))?;
 
     let mut capture = capture.borrow_mut();
@@ -429,7 +463,7 @@ async fn open_microphone(
     if capture.generation != generation {
         return Ok(());
     }
-    capture.sample_rate = context.0.sample_rate() as u32;
+    capture.sample_rate = context.get().sample_rate() as u32;
     capture.teardown = Some(Teardown {
         context: context.disarm(),
         stream: held.disarm(),

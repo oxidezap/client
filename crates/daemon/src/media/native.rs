@@ -25,6 +25,17 @@ use super::{Wipe, is_staged_upload};
 /// image it has ever shown.
 const CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
+/// How long a staged payload may sit unsent before it is treated as
+/// abandoned.
+///
+/// The gap this closes is the one that has no other end: a staged upload is
+/// spared the budget because it is the only copy of something somebody is
+/// waiting to send, so nothing else in the daemon will ever remove it. The
+/// send that names it arrives milliseconds after the upload, which makes any
+/// large number a safe one, and six hours is chosen to be obviously past a
+/// slow network rather than tuned to anything.
+const STALE_UPLOAD: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
 /// Bytes written since the last sweep before another one runs.
 ///
 /// Sweeping reads the whole directory, and a history load writes hundreds of
@@ -306,6 +317,22 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
         // would be dropped for: `put` is what feeds the sweep, and an upload
         // is written by the front end, not through it.
         if is_staged_upload(&entry.file_name().to_string_lossy()) {
+            // Spared the budget, not spared for ever. A staged payload is
+            // opened by the send that names it, which follows its upload by
+            // milliseconds, so one this old belongs to a send that never
+            // came: a front end that went away between the two, or an upload
+            // whose answer was lost while the write landed anyway, where the
+            // discard raced the rename and lost. Nothing else would ever
+            // remove it, because the sweep is the only thing that looks and
+            // it was told to look away.
+            if meta
+                .modified()
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age > STALE_UPLOAD)
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
             continue;
         }
         let age = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -331,6 +358,60 @@ fn sweep(dir: &std::path::Path) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+
+    /// A staged payload is spared the budget, and not spared for ever.
+    ///
+    /// Nothing else in the daemon removes one: the sweep is the only thing
+    /// that looks at the directory and it was told to look away from these.
+    /// So a send that never came, or an upload whose answer was lost while
+    /// the write landed anyway, left a file until the account was wiped.
+    #[test]
+    fn a_staged_upload_that_was_never_sent_is_reclaimed() {
+        // The same shape the tests below use: a named directory rather than
+        // a crate added for one case.
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-media-stale-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+
+        let fresh = dir.join("u-local_1");
+        let stale = dir.join("u-local_2");
+        let cached = dir.join("f-3EB0ABC");
+        for path in [&fresh, &stale, &cached] {
+            std::fs::write(path, b"payload").expect("a file");
+        }
+
+        // Older than the allowance by a wide margin. Measured back from the
+        // file's own timestamp rather than from a clock: `SystemTime::now` is
+        // disallowed in this tree, and the file was written a moment ago, so
+        // its mtime is the same answer.
+        let long_ago = std::fs::metadata(&stale)
+            .expect("the staged file")
+            .modified()
+            .expect("an mtime")
+            - super::STALE_UPLOAD
+            - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("the staged file")
+            .set_modified(long_ago)
+            .expect("an mtime");
+
+        super::sweep(&dir).expect("the sweep runs");
+
+        assert!(fresh.exists(), "a payload a send is still coming for");
+        assert!(!stale.exists(), "one no send ever came for");
+        assert!(
+            cached.exists(),
+            "and the cache is under budget, so nothing there is touched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The front end's own `stage` makes this directory with `create_dir_all`,
     /// which is the umask's mode and not `0700`, so the daemon's first cache
