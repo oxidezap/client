@@ -42,6 +42,16 @@ use super::demux::{
 use super::geometry::Rotation;
 use super::webcodecs;
 
+/// How many units may sit in the browser's decode queue before this stops
+/// feeding it.
+///
+/// The desktop path bounds its own queue at four frames; this bounds the one
+/// on the far side of the binding, which is the only one that exists here. A
+/// little deeper than four, because a seek wants a run of pictures decoded
+/// and thrown away to reach the one it is after, and each tick resumes where
+/// the last stopped.
+const MAX_QUEUED_UNITS: u32 = 16;
+
 /// One decoded frame, in the shape the player above expects.
 pub struct StreamingFrame {
     pub image: std::sync::Arc<RenderImage>,
@@ -289,6 +299,16 @@ impl StreamingVideoDecoder {
             return;
         }
 
+        // Already fed, and its picture is on the way: the browser decodes on
+        // its own schedule, so "asked for and not arrived" is the ordinary
+        // state a moment after a seek. Resetting here threw away the very
+        // work that was about to answer, and then replayed the whole group of
+        // pictures to ask for it again.
+        if i64::try_from(target_index).unwrap_or(i64::MAX) == i64::from(self.last_fed_index) {
+            self.collect();
+            return;
+        }
+
         let start = if target_index as i32 > self.last_fed_index {
             (self.last_fed_index + 1) as usize
         } else {
@@ -303,6 +323,17 @@ impl StreamingVideoDecoder {
         };
 
         for index in start..=target_index {
+            // The browser's decode queue is the browser's, and the only back
+            // pressure this side has is to stop handing it units. A backward
+            // seek in a long group of pictures, or a file with no keyframe
+            // the walk recognised, would otherwise submit the whole run at
+            // once, a tab's memory spent on compressed frames whose pictures
+            // are obsolete before they are drawn. Stopping is safe because
+            // `last_fed_index` records where it stopped and the player asks
+            // again on its next tick, which resumes forwards from here.
+            if self.decoder.queued() >= MAX_QUEUED_UNITS {
+                break;
+            }
             let Some(sample) = self.samples.get(index) else {
                 break;
             };

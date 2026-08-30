@@ -320,7 +320,12 @@ async fn serve(
         // a byte at a time but a client may send head and body in one
         // segment, so the first of the payload can already be sitting in the
         // buffer. Reading the raw stream would drop exactly that much.
-        if request.method == "PUT" || request.method == "POST" {
+        //
+        // `PUT` and nothing else, because the preflight below advertises
+        // exactly this list: taking a method the browser is told it may not
+        // use is a route no page can reach, and one the next reader has to
+        // work out is dead.
+        if request.method == "PUT" {
             let key = key.to_string();
             return receive_media(&mut stream, &key, origin.as_deref(), request.content_length)
                 .await;
@@ -675,7 +680,14 @@ async fn receive_media(
     // leaves is a valid-looking key holding a truncated voice note, which the
     // daemon then opens when it handles the send. A rename within one
     // directory is atomic, so the key holds the whole payload or nothing.
-    let partial = path.with_extension("partial");
+    // Named so that no key can address it: `media_path` refuses a leading
+    // dot, so this file is not something a caller can read half-written or
+    // delete out from under the rename. The counter keeps two uploads of one
+    // key from writing over each other's temporary file.
+    let partial = path.with_file_name(format!(
+        ".staging-{}-{key}",
+        STAGING_SEQUENCE.fetch_add(1, portable_atomic::Ordering::Relaxed)
+    ));
     let staged = async {
         tokio::fs::write(&partial, &body).await?;
         tokio::fs::rename(&partial, &path).await
@@ -737,6 +749,9 @@ async fn discard_media(stream: &mut TcpStream, key: &str, origin: Option<&str>) 
 ///
 /// `f-` and `d-` are the daemon's own cache of what it fetched and can fetch
 /// again; those are not a caller's to replace or delete.
+/// Distinguishes one in-flight staging write from another.
+static STAGING_SEQUENCE: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
 fn is_staged(key: &str) -> bool {
     key.starts_with("u-")
 }

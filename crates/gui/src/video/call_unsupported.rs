@@ -85,6 +85,13 @@ impl LatestFrames {
 /// reason.
 const MAX_PIXELS: usize = 3840 * 2160;
 
+/// How many units may sit in the browser's decode queue before frames are
+/// dropped instead of fed.
+///
+/// The desktop path gives each direction a four-frame queue; this is that
+/// bound moved to the far side of the binding, where the queue actually is.
+const MAX_QUEUED_UNITS: u32 = 4;
+
 /// Both directions of a call, each decoded as its units arrive.
 pub struct CallVideo {
     call_id: String,
@@ -204,18 +211,12 @@ impl Stream {
         let mut held = self.decoder.borrow_mut();
         if held.is_none() {
             // The first keyframe is what carries the sets, so it is also what
-            // the decoder can first be built from.
-            match webcodecs::Decoder::with_budget(
-                &frame.data,
-                Rotation::to_upright(frame.orientation),
-                MAX_PIXELS,
-                Some(self.sink()),
-            ) {
-                Ok(decoder) => *held = Some(decoder),
-                Err(e) => {
-                    log::warn!("no decoder for the {:?} video of a call: {e}", self.stream);
-                    // Refused for this keyframe, not for good: a later one may
-                    // carry a set this browser will take.
+            // the decoder can first be built from. Refused for this keyframe
+            // rather than for good: a later one may carry a set this browser
+            // will take.
+            match self.build(&frame) {
+                Some(decoder) => *held = Some(decoder),
+                None => {
                     self.started.set(false);
                     return;
                 }
@@ -238,15 +239,9 @@ impl Stream {
                 return;
             }
             self.started.set(true);
-            match webcodecs::Decoder::with_budget(
-                &frame.data,
-                Rotation::to_upright(frame.orientation),
-                MAX_PIXELS,
-                Some(self.sink()),
-            ) {
-                Ok(decoder) => *held = Some(decoder),
-                Err(e) => {
-                    log::warn!("no decoder for the {:?} video of a call: {e}", self.stream);
+            match self.build(&frame) {
+                Some(decoder) => *held = Some(decoder),
+                None => {
                     self.started.set(false);
                     return;
                 }
@@ -256,12 +251,47 @@ impl Stream {
             return;
         };
 
+        // The browser's decode queue is unbounded and a call is a stream that
+        // does not wait: a browser decoding slower than the peer encodes
+        // would bank compressed units for the length of the call, drawing a
+        // picture further behind with every one. Dropped rather than queued,
+        // which is what every other queue on this path does, and the drop
+        // costs the reference chain, so the stream waits for the next
+        // keyframe exactly as it does after a gap.
+        if decoder.queued() >= MAX_QUEUED_UNITS {
+            log::debug!(
+                "dropping a {:?} call frame: the browser's decoder is behind",
+                self.stream
+            );
+            self.started.set(false);
+            return;
+        }
+
         // Their device, not their picture: drawing it upright is undoing the
         // turn rather than repeating it.
         decoder.set_rotation(Rotation::to_upright(frame.orientation));
         let stamp = self.fed.get();
         self.fed.set(stamp.wrapping_add(1));
         decoder.decode(&frame.data, stamp, frame.keyframe);
+    }
+
+    /// Build a decoder from the parameter sets this keyframe carries.
+    ///
+    /// One place rather than two, because the first build and the rebuild
+    /// after a failure differ only in what the caller does with `started`.
+    fn build(&self, frame: &CallVideoFrame) -> Option<webcodecs::Decoder> {
+        match webcodecs::Decoder::with_budget(
+            &frame.data,
+            Rotation::to_upright(frame.orientation),
+            MAX_PIXELS,
+            Some(self.sink()),
+        ) {
+            Ok(decoder) => Some(decoder),
+            Err(e) => {
+                log::warn!("no decoder for the {:?} video of a call: {e}", self.stream);
+                None
+            }
+        }
     }
 
     /// Where this direction's pictures go once they are decoded.

@@ -10,6 +10,27 @@ pub const TARGET_SAMPLE_RATE: u32 = 16000;
 #[cfg(not(target_family = "wasm"))]
 const CAPTURE_SAMPLE_RATE: u32 = 48000;
 
+/// Longest voice note either platform will hold.
+///
+/// Ten minutes, past which the capture stops growing rather than growing
+/// until something is killed. At a capture rate of 48 kHz that is already 115
+/// MB of `f32`, which is far more than anybody records by mistake, and on
+/// the web it is a linear memory with a ceiling, where running out is an
+/// abort rather than an error.
+pub(crate) const MAX_RECORDING_SECS: usize = 600;
+
+/// That ceiling in samples, at the rate the device is actually running.
+///
+/// Derived rather than fixed: a microphone that will not do 48 kHz is opened
+/// at its best rate, and a count of samples is a length of time only against
+/// the rate producing them. Fixed at 48 kHz, a 96 kHz device stopped
+/// capturing after five minutes while `stop` went on reporting the wall clock
+///, a voice note truncated in silence, claiming a duration longer than its
+/// audio.
+pub(crate) fn max_recording_samples(sample_rate: u32) -> usize {
+    sample_rate as usize * MAX_RECORDING_SECS
+}
+
 pub struct RecordedAudio {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
@@ -140,7 +161,9 @@ mod capture {
     use ringbuf::traits::Split as _;
     use wacore::time::Instant;
 
-    use super::{CAPTURE_SAMPLE_RATE, RecordedAudio, RecorderError, Recording};
+    use super::{
+        CAPTURE_SAMPLE_RATE, RecordedAudio, RecorderError, Recording, max_recording_samples,
+    };
 
     /// How much of the tail the meter averages: 150ms.
     /// Short enough to follow speech, long enough not to flicker.
@@ -171,32 +194,22 @@ mod capture {
     /// Chosen so a normal speaking voice fills roughly half the meter.
     const LEVEL_GAIN: f32 = 4.0;
 
-    /// How much captured audio the ring holds before the drain has to have
+    /// How long the ring holds captured audio before the drain has to have
     /// taken it: two seconds, which is two hundred callbacks at the usual
     /// block size. Bounded because a ring is, and generous because losing
     /// samples here is losing part of what somebody said.
-    const RING_SAMPLES: usize = CAPTURE_SAMPLE_RATE as usize * 2;
+    const RING_SECS: usize = 2;
 
-    /// Longest voice note this will hold.
+    /// That window in samples, at the rate the device actually opened at.
     ///
-    /// Ten minutes, past which the capture stops growing rather than growing
-    /// until the process is killed. At the capture rate that is already 115
-    /// MB of `f32`, which is far more than anybody records by mistake.
-    const MAX_RECORDING_SECS: usize = 600;
-
-    /// That ceiling in samples, at the rate the device is actually running.
-    ///
-    /// Derived rather than fixed for the reason [`level_window`] is: a
-    /// microphone that will not do 48 kHz is opened at its best rate, and a
-    /// count of samples is a length of time only against the rate producing
-    /// them. Fixed at 48 kHz, a 96 kHz device stopped capturing after five
-    /// minutes while `stop` went on reporting the wall clock — a voice note
-    /// truncated in silence, claiming a duration longer than its audio.
-    fn max_recording_samples(sample_rate: u32) -> usize {
-        sample_rate as usize * MAX_RECORDING_SECS
+    /// Derived for the reason [`level_window`] is: fixed at 48 kHz, a 96 kHz
+    /// fallback device gets one second of slack and a 192 kHz one gets half,
+    /// and a drain delayed past that drops microphone samples on the floor.
+    fn ring_samples(sample_rate: u32) -> usize {
+        sample_rate as usize * RING_SECS
     }
 
-    /// How often the drain empties the ring. Short against `RING_SAMPLES`, so
+    /// How often the drain empties the ring. Short against `RING_SECS`, so
     /// a scheduling hiccup on this side costs nothing.
     const DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -325,7 +338,7 @@ mod capture {
             // The callback writes into a lock-free ring and nothing else; a
             // thread on this side is what turns that into the capture. See
             // `spawn_drain`.
-            let (producer, consumer) = HeapRb::<f32>::new(RING_SAMPLES).split();
+            let (producer, consumer) = HeapRb::<f32>::new(ring_samples(self.sample_rate)).split();
 
             let stream = match self.sample_format {
                 SampleFormat::F32 => build_input_stream::<f32, _>(device, config, producer),
@@ -478,7 +491,7 @@ mod capture {
         let handle = std::thread::Builder::new()
             .name("oxidezap-recorder-drain".to_string())
             .spawn(move || {
-                let mut block = vec![0.0f32; RING_SAMPLES];
+                let mut block = vec![0.0f32; ring_samples(CAPTURE_SAMPLE_RATE)];
                 // The meter's window, kept here so reading it never touches
                 // the capture's lock.
                 let mut tail: std::collections::VecDeque<f32> =
@@ -582,7 +595,8 @@ mod capture {
         /// grows, locks or averages belongs on this side of the ring.
         #[test]
         fn what_the_callback_pushed_becomes_the_capture() {
-            let (mut producer, consumer) = HeapRb::<f32>::new(RING_SAMPLES).split();
+            let (mut producer, consumer) =
+                HeapRb::<f32>::new(ring_samples(CAPTURE_SAMPLE_RATE)).split();
             let capture = Arc::new(Mutex::new(Vec::new()));
             let level = Arc::new(std::sync::atomic::AtomicU32::new(0));
             let (stop, handle) = spawn_drain(
@@ -622,7 +636,10 @@ mod capture {
                 max_recording_samples(48_000) / 48_000,
                 max_recording_samples(96_000) / 96_000
             );
-            assert_eq!(max_recording_samples(48_000) / 48_000, MAX_RECORDING_SECS);
+            assert_eq!(
+                max_recording_samples(48_000) / 48_000,
+                crate::recorder::MAX_RECORDING_SECS
+            );
         }
 
         /// A capture with nothing stopping it grows until the process is
@@ -632,7 +649,8 @@ mod capture {
         fn a_capture_stops_growing_at_its_ceiling() {
             let ceiling = max_recording_samples(CAPTURE_SAMPLE_RATE);
             let capture = Arc::new(Mutex::new(vec![0.0f32; ceiling - 8]));
-            let (mut producer, consumer) = HeapRb::<f32>::new(RING_SAMPLES).split();
+            let (mut producer, consumer) =
+                HeapRb::<f32>::new(ring_samples(CAPTURE_SAMPLE_RATE)).split();
             let level = Arc::new(std::sync::atomic::AtomicU32::new(0));
             let (stop, handle) = spawn_drain(
                 consumer,

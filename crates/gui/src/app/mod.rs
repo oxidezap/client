@@ -2489,6 +2489,16 @@ impl WhatsAppApp {
         self.video_update_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             // Create a fused future for completion (handles None case)
             let mut completion_rx = completion_rx;
+            // How many polls a player that has left `Playing` still gets.
+            //
+            // Stopping on the same tick was right while every decode was
+            // inline: `stop` asks for the first frame and the answer was
+            // already there. Where the decoder is the browser's it is not,
+            // and a loop that ended immediately left the poster frame
+            // nowhere to arrive. A third of a second, after which the last
+            // frame is what the video is worth showing anyway.
+            const SETTLING_POLLS: u8 = 10;
+            let mut settling = 0u8;
 
             loop {
                 // Check for completion event (non-blocking)
@@ -2534,8 +2544,14 @@ impl WhatsAppApp {
                             if player.update() {
                                 cx.notify();
                             }
-                            // Continue as long as we're in Playing state
-                            return player.state() != VideoPlayerState::Playing;
+                            if player.state() == VideoPlayerState::Playing {
+                                settling = 0;
+                                return false;
+                            }
+                            // Left `Playing`, and possibly still waiting on a
+                            // picture it has already asked for.
+                            settling = settling.saturating_add(1);
+                            return settling >= SETTLING_POLLS;
                         }
                         true // Stop if no playing video
                     })

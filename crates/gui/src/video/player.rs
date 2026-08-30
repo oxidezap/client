@@ -177,7 +177,12 @@ impl VideoPlayer {
             return false;
         };
         if self.state != VideoPlayerState::Playing {
-            return false;
+            // A picture asked for is not a picture in hand. On a push decoder
+            // `seek` and `reset` return having *asked*, and the answer lands
+            // on a later poll, so a stop that only polled once went on
+            // showing the last frame where the desktop, whose decode is
+            // inline, shows the first.
+            return self.update_current_frame();
         }
 
         let current_time = self.current_time();

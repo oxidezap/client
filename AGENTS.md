@@ -1147,6 +1147,17 @@ names a file that is not there. The continuation therefore belongs to the
 implementation — it runs before returning wherever staging is a local write,
 and from the upload's own completion where it is not — and the request id is
 still reserved in the order the person acted in. Only the frame waits.
+And what it waits *in* is a queue of places rather than a count: two notes can
+be staging at once and their uploads finish in whatever order the network
+settles them, so a send takes its position when it is made and the upload only
+fills it. Counting them instead told whichever finished first that it was the
+head of the queue, which is the same bug one level down, record two notes and
+let the shorter one land first, and they arrive reversed.
+A discard is the mirror and has the same hazard: a `DELETE` issued while the
+`PUT` is still crossing can be overtaken by it, leaving the payload staged
+with nothing that will ever read it. So a send abandoned mid-upload is
+*recorded* rather than removed, and the upload's own completion is what
+removes it, one decision, made after the write it is undoing.
 
 **Which tab holds the account is claimed, not assumed.** `daemon/claim/` is a
 lock file on the desktop and a Web Lock in a browser, taken with `ifAvailable`

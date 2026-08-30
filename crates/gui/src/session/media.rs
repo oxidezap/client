@@ -137,6 +137,19 @@ impl MediaCache for Directory {
 #[derive(Default)]
 pub struct Fetched {
     bytes: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
+    /// Keys whose upload is in flight, and whether the send was abandoned
+    /// while it was.
+    ///
+    /// A `DELETE` issued while the `PUT` is still going is a race the daemon
+    /// cannot settle: the two are separate requests and the write can land
+    /// after the removal, leaving the payload staged with nothing that will
+    /// ever read it. So a discard during an upload is *recorded* rather than
+    /// sent, and the upload's own completion is what removes it, one place
+    /// deciding, after the write it is undoing.
+    ///
+    /// Shared rather than borrowed: the completion that reads it runs in a
+    /// spawned task, which cannot borrow this cache.
+    uploading: Arc<std::sync::Mutex<std::collections::HashMap<String, bool>>>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -208,8 +221,29 @@ impl MediaCache for Fetched {
     fn stage_then(&self, key: &str, bytes: Vec<u8>, then: StageThen) {
         let key = key.to_string();
         let base = oxidezap_ipc::web::media_base_url();
+        self.uploading
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), false);
+        let uploading = Arc::clone(&self.uploading);
         wasm_bindgen_futures::spawn_local(async move {
-            then(oxidezap_ipc::web::upload_media(&base, &key, &bytes).await);
+            let staged = oxidezap_ipc::web::upload_media(&base, &key, &bytes).await;
+            let abandoned = uploading
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+                .unwrap_or(false);
+            if abandoned {
+                // The send was given up on while this was crossing. The
+                // payload is now really there, so this is the removal the
+                // discard could not safely make at the time.
+                if staged.is_ok() {
+                    oxidezap_ipc::web::discard_media(&base, &key).await;
+                }
+                then(Err("that send was abandoned".to_string()));
+                return;
+            }
+            then(staged);
         });
     }
 
@@ -224,12 +258,22 @@ impl MediaCache for Fetched {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key);
-        if key.starts_with("u-") {
-            let key = key.to_string();
-            let base = oxidezap_ipc::web::media_base_url();
-            wasm_bindgen_futures::spawn_local(async move {
-                oxidezap_ipc::web::discard_media(&base, &key).await;
-            });
+        if !key.starts_with("u-") {
+            return;
         }
+        {
+            // Still on its way: marked instead of removed, because a `DELETE`
+            // that overtakes its own `PUT` leaves the payload staged for ever.
+            let mut uploading = self.uploading.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(abandoned) = uploading.get_mut(key) {
+                *abandoned = true;
+                return;
+            }
+        }
+        let key = key.to_string();
+        let base = oxidezap_ipc::web::media_base_url();
+        wasm_bindgen_futures::spawn_local(async move {
+            oxidezap_ipc::web::discard_media(&base, &key).await;
+        });
     }
 }

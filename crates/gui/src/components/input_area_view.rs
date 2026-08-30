@@ -114,6 +114,13 @@ pub struct InputAreaView {
     /// Task that monitors typing state
     #[allow(dead_code)]
     typing_monitor_task: Option<Task<()>>,
+    /// Whether a voice note can be recorded here at all.
+    ///
+    /// Asked once rather than per frame: on the web the answer is whether the
+    /// browser has an Opus encoder, which is a `AudioEncoder` constructed,
+    /// configured and closed, real work, on every render of the composer,
+    /// for a value that cannot change while the tab is open.
+    can_record: bool,
 }
 
 impl EventEmitter<InputAreaEvent> for InputAreaView {}
@@ -145,6 +152,7 @@ impl InputAreaView {
             touch_target: None,
             typing_state: TypingState::default(),
             typing_monitor_task: None,
+            can_record: oxidezap_audio::can_record(),
         }
     }
 
@@ -450,7 +458,7 @@ impl InputAreaView {
                 // does nothing is the worse answer: the browser has no Opus
                 // encoder, and that is knowable before the microphone is ever
                 // asked for.
-                let can_record = oxidezap_audio::can_record();
+                let can_record = self.can_record;
                 Button::new("ptt")
                     .icon(ProductIcon::Mic)
                     .ghost()

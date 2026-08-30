@@ -78,14 +78,27 @@ impl WhatsAppApp {
             return;
         }
 
-        // Initialize and start recording
+        // Initialize and start recording. Said out loud on both paths: a
+        // microphone the browser refused, or a device that will not open, is
+        // a press that otherwise does nothing at all, the composer stays as
+        // it was, with the reason only in the log.
         if let Err(e) = self.audio_recorder.init() {
             error!("Failed to initialize audio recorder: {}", e);
+            self.notify_user(
+                "The microphone could not be opened.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             return;
         }
 
         if let Err(e) = self.audio_recorder.start() {
             error!("Failed to start recording: {}", e);
+            self.notify_user(
+                "Recording could not be started.".to_string(),
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
             return;
         }
 

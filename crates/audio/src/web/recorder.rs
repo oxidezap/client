@@ -368,7 +368,23 @@ async fn open_microphone(capture: &Rc<RefCell<Capture>>, generation: u64) -> Res
                     return;
                 }
                 capture.level = rms(&channel);
-                capture.samples.extend_from_slice(&channel);
+                // The same ten-minute ceiling the desktop capture holds, and
+                // it matters more here: a tab's linear memory has a fixed
+                // roof, and an allocation that fails past it aborts rather
+                // than returning an error. A recording left running would
+                // otherwise take the whole application down.
+                // The buffer's own rate rather than the capture's: this
+                // callback can run before the open that records it, and a
+                // ceiling derived from zero is a recording six hundred
+                // samples long.
+                let ceiling =
+                    crate::recorder::max_recording_samples(buffer.sample_rate().max(1.0) as u32);
+                if capture.samples.len() >= ceiling {
+                    return;
+                }
+                let room = ceiling - capture.samples.len();
+                let taking = channel.len().min(room);
+                capture.samples.extend_from_slice(&channel[..taking]);
             },
         )
     };

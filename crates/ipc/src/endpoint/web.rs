@@ -47,6 +47,13 @@ const MEDIA_TIMEOUT_MS: i32 = 30_000;
 /// send.
 const UPLOAD_TIMEOUT_MS: i32 = 60_000;
 
+/// How long a discard may take before it is given up on.
+///
+/// Far shorter than an upload, because this carries no body: it is one
+/// request naming a key the daemon already holds. What is behind it is a send
+/// that has already failed, so waiting a minute for the cleanup buys nothing.
+const DISCARD_TIMEOUT_MS: i32 = 10_000;
+
 /// A `setTimeout` that aborts a fetch, cleared when the fetch finishes first.
 struct FetchDeadline {
     handle: i32,
@@ -962,6 +969,17 @@ pub async fn discard_media(base: &str, key: &str) {
     );
     let options = web_sys::RequestInit::new();
     options.set_method("DELETE");
+    // Under a deadline like every other request here. Nothing awaits *this*
+    // for an answer, but the task holding it is one the staging path can be
+    // waiting behind, and a fetch with no signal is one a daemon that has
+    // stopped answering never resolves.
+    let Ok(abort) = web_sys::AbortController::new() else {
+        return;
+    };
+    options.set_signal(Some(&abort.signal()));
+    let Ok(_timeout) = FetchDeadline::arm(&window, &abort, DISCARD_TIMEOUT_MS) else {
+        return;
+    };
     if let Ok(promise) = window
         .fetch_with_str_and_init(&url, &options)
         .dyn_into::<js_sys::Promise>()

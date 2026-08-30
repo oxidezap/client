@@ -26,7 +26,11 @@ pub(super) fn avcc_to_annexb(avcc_data: &[u8], nal_length_size: usize) -> Vec<u8
     let mut annexb = Vec::with_capacity(avcc_data.len() + 16);
     let mut pos = 0;
 
-    while pos + nal_length_size <= avcc_data.len() {
+    // Subtraction rather than `pos + nal_length_size <= len`: this target is
+    // 32-bit and a four-byte prefix reads up to `0xffff_ffff`, so the sum is
+    // one a malformed file can carry past `usize`. What that costs is not a
+    // wrong answer but a panic in the slice below, on a file somebody sent.
+    while avcc_data.len().saturating_sub(pos) >= nal_length_size {
         let mut nal_len = 0usize;
         for i in 0..nal_length_size {
             nal_len = (nal_len << 8) | avcc_data[pos + i] as usize;
@@ -34,14 +38,21 @@ pub(super) fn avcc_to_annexb(avcc_data: &[u8], nal_length_size: usize) -> Vec<u8
         pos += nal_length_size;
 
         // A length that runs past the buffer is a truncated or malformed
-        // sample; what has been read so far is still decodable.
-        if nal_len == 0 || pos + nal_len > avcc_data.len() {
+        // sample; what has been read so far is still decodable. So is one
+        // that cannot be added to the position at all.
+        if nal_len == 0 {
             break;
         }
+        let Some(end) = pos
+            .checked_add(nal_len)
+            .filter(|end| *end <= avcc_data.len())
+        else {
+            break;
+        };
 
         annexb.extend_from_slice(NAL_START_CODE);
-        annexb.extend_from_slice(&avcc_data[pos..pos + nal_len]);
-        pos += nal_len;
+        annexb.extend_from_slice(&avcc_data[pos..end]);
+        pos = end;
     }
 
     annexb
@@ -115,6 +126,29 @@ pub(super) fn stamp_of(index: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A length prefix is four bytes a file chose, and on the 32-bit target a
+    /// large one plus the position is a sum `usize` cannot hold. What that
+    /// cost is not a wrong answer but a panic in the slice, on a video
+    /// somebody sent.
+    #[test]
+    fn a_length_that_cannot_be_added_stops_the_walk() {
+        let mut sample = vec![0xff, 0xff, 0xff, 0xff];
+        sample.extend_from_slice(&[0x65, 0x00]);
+        assert!(
+            avcc_to_annexb(&sample, 4).is_empty(),
+            "a length past the buffer yields nothing rather than panicking"
+        );
+
+        // And the units before it are still delivered.
+        let mut mixed = vec![0x00, 0x00, 0x00, 0x02, 0x65, 0x88];
+        mixed.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(
+            avcc_to_annexb(&mixed, 4),
+            [NAL_START_CODE, &[0x65, 0x88]].concat(),
+            "what was readable before the bad length still comes back"
+        );
+    }
 
     /// The prefix width is the container's, and a narrower one is not an
     /// unusual file: reading every sample as 4-byte-prefixed turns a valid

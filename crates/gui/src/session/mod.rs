@@ -265,14 +265,75 @@ type Pending = Arc<Mutex<HashMap<RequestId, Awaiting>>>;
 /// voice note, type a line, and the recipient reads the line first.
 ///
 /// So while a staging is in flight everything queues behind it. On a desktop
-/// staging completes before the call that started it returns, so `holding` is
-/// raised and cleared inside one call and nothing ever queues.
+/// staging completes before the call that started it returns, so the slot is
+/// claimed and filled inside one call and nothing ever queues.
+///
+/// A queue of *slots* rather than a count and a queue of frames, because two
+/// voice notes can be staging at once and their uploads finish in whatever
+/// order the network settles them. Counting told the second one to finish
+/// that it was the head of the queue, so recording two notes and letting the
+/// shorter one land first delivered them in the wrong order, the position is
+/// taken when the send is made, and what arrives later only fills it.
 #[derive(Default)]
 struct Outbox {
-    /// How many staged sends have not yet been written.
-    holding: usize,
-    /// Serialized frames waiting for them, oldest first.
-    waiting: std::collections::VecDeque<Vec<u8>>,
+    /// Everything not yet written, in the order it was asked for.
+    slots: std::collections::VecDeque<Slot>,
+    /// The next ticket a staged send is given.
+    next_ticket: u64,
+}
+
+/// One place in the outbox.
+enum Slot {
+    /// A frame that could not go out because something ahead of it has not.
+    Ready(Vec<u8>),
+    /// A staged send whose payload is still crossing.
+    Awaiting(u64),
+}
+
+impl Outbox {
+    /// Claim a place for a send whose payload has not been staged yet.
+    fn claim(&mut self) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.slots.push_back(Slot::Awaiting(ticket));
+        ticket
+    }
+
+    /// Put a frame in the place this ticket claimed, or give the place up.
+    ///
+    /// Giving it up rather than filling it is what a staging that failed
+    /// does: the frame is never going to exist, and everything behind it is
+    /// still waiting.
+    fn fill(&mut self, ticket: u64, frame: Option<Vec<u8>>) {
+        let Some(at) = self
+            .slots
+            .iter()
+            .position(|slot| matches!(slot, Slot::Awaiting(held) if *held == ticket))
+        else {
+            return;
+        };
+        match frame {
+            Some(frame) => self.slots[at] = Slot::Ready(frame),
+            None => {
+                self.slots.remove(at);
+            }
+        }
+    }
+
+    /// Everything at the head that is ready to be written.
+    ///
+    /// Taken out under the lock and written outside it, because a write can
+    /// block and the lock is on the path of every other send.
+    fn drain_ready(&mut self) -> Vec<Vec<u8>> {
+        let mut ready = Vec::new();
+        while let Some(Slot::Ready(_)) = self.slots.front() {
+            let Some(Slot::Ready(frame)) = self.slots.pop_front() else {
+                break;
+            };
+            ready.push(frame);
+        }
+        ready
+    }
 }
 
 type Sending = Arc<Mutex<Outbox>>;
@@ -456,41 +517,6 @@ impl Session {
         &self.frames
     }
 
-    /// Report a send that failed before it ever left this process.
-    ///
-    /// The message is already on screen, so something has to move it off
-    /// `Pending`. `try_send` rather than a blocking one: this runs on the GPUI
-    /// executor, where blocking on a tokio channel is not allowed, and a queue
-    /// that full has bigger problems than one lost failure.
-    fn report_send_failed(&self, chat_jid: &str, local_id: &str, reason: String) {
-        error!("send failed before it left: {reason}");
-        self.events
-            .try_send(FromDaemon::Session(Box::new(UiEvent::SendFailed {
-                chat_jid: chat_jid.to_string(),
-                message_id: local_id.to_string(),
-                reason,
-            })));
-    }
-
-    /// Report a status view that never reached the daemon.
-    ///
-    /// `try_send` for the same reason as the one above: this runs on the GPUI
-    /// executor, which is what drains the queue, so blocking on it would park
-    /// the only thread that could empty it.
-    fn report_status_view_lost(&self, message_ids: Vec<String>, reason: &str) {
-        error!("a status view never left this process: {reason}");
-        self.events
-            .try_send(FromDaemon::StatusViewLost(message_ids));
-    }
-
-    /// Report a page request that never left this process.
-    ///
-    /// `try_send` for the same reason as the two above.
-    fn report_page_lost(&self, jid: Option<String>, reason: &str) {
-        error!("a page request never left this process: {reason}");
-        self.events.try_send(FromDaemon::PageLost { jid });
-    }
-
     /// Send a request nobody is waiting on an answer for.
     fn send(&self, request: ClientRequest) -> std::io::Result<()> {
         self.send_frame(&Request::bare(request))
@@ -601,11 +627,14 @@ impl Session {
             staged: Some(upload.clone()),
         });
         // Claimed before the upload begins, so anything sent while it runs
-        // queues behind it rather than overtaking it on the wire.
-        self.outbox
+        // queues behind it rather than overtaking it on the wire, and so
+        // that a second note claims the place *after* this one whichever
+        // upload lands first.
+        let ticket = self
+            .outbox
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .holding += 1;
+            .claim();
         let link = self.link.clone();
         let outbox = Arc::clone(&self.outbox);
         let pending = Arc::clone(&self.pending);
@@ -623,12 +652,12 @@ impl Session {
                     &media,
                     id,
                     request,
-                    Delivery::Staged,
+                    Delivery::Staged(ticket),
                 ),
                 Err(e) => {
                     // The queue behind this send is waiting on a frame that
                     // is never going to be written.
-                    let _ = release(&link, &outbox, None);
+                    let _ = release(&link, &outbox, ticket, None);
                     fail_reserved(
                         &pending,
                         &events,
@@ -886,39 +915,39 @@ impl Session {
 fn write_or_queue(link: &Link, outbox: &Sending, frame: Vec<u8>) -> std::io::Result<()> {
     {
         let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
-        if outbox.holding > 0 {
-            outbox.waiting.push_back(frame);
-            return Ok(());
+        if !outbox.slots.is_empty() {
+            outbox.slots.push_back(Slot::Ready(frame));
+            return flush(link, &mut outbox);
         }
     }
     link.send_line(&frame)
 }
 
-/// Write a staged send's frame and release whatever queued behind it.
+/// Write everything at the head of the outbox that is ready to go.
 ///
-/// The queue is drained after this frame and in order, which is the whole
-/// point; a write that fails takes the rest with it, because they were
-/// waiting on a connection that has gone.
-fn release(link: &Link, outbox: &Sending, frame: Option<Vec<u8>>) -> std::io::Result<()> {
-    let mut queued = {
-        let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
-        outbox.holding = outbox.holding.saturating_sub(1);
-        if outbox.holding > 0 {
-            // Another staged send is still ahead of the rest.
-            return frame.map_or(Ok(()), |frame| {
-                outbox.waiting.push_front(frame);
-                Ok(())
-            });
-        }
-        std::mem::take(&mut outbox.waiting)
-    };
-    if let Some(frame) = frame {
-        queued.push_front(frame);
-    }
-    for frame in queued {
+/// A write that fails takes the rest with it, because they were waiting on a
+/// connection that has gone.
+fn flush(link: &Link, outbox: &mut Outbox) -> std::io::Result<()> {
+    for frame in outbox.drain_ready() {
         link.send_line(&frame)?;
     }
     Ok(())
+}
+
+/// Fill a staged send's place in the outbox, and write what that unblocks.
+///
+/// The frame goes where the send was made, never at the head: another staged
+/// send can have been asked for first and still be crossing, and its place is
+/// ahead of this one whatever order the two uploads finished in.
+fn release(
+    link: &Link,
+    outbox: &Sending,
+    ticket: u64,
+    frame: Option<Vec<u8>>,
+) -> std::io::Result<()> {
+    let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
+    outbox.fill(ticket, frame);
+    flush(link, &mut outbox)
 }
 
 /// Whether this frame is the one the outbox is holding for.
@@ -928,7 +957,8 @@ fn release(link: &Link, outbox: &Sending, frame: Option<Vec<u8>>) -> std::io::Re
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Delivery {
     Ordinary,
-    Staged,
+    /// Filling the place this ticket claimed. See [`Outbox`].
+    Staged(u64),
 }
 
 /// Write a reserved request's frame, and answer for it if it will not go.
@@ -959,8 +989,8 @@ fn deliver(
         .contains_key(&id)
     {
         // Nothing to send, but the queue behind it is still waiting.
-        if how == Delivery::Staged {
-            let _ = release(link, outbox, None);
+        if let Delivery::Staged(ticket) = how {
+            let _ = release(link, outbox, ticket, None);
         }
         return;
     }
@@ -970,15 +1000,15 @@ fn deliver(
     }) {
         Ok(frame) => frame,
         Err(e) => {
-            if how == Delivery::Staged {
-                let _ = release(link, outbox, None);
+            if let Delivery::Staged(ticket) = how {
+                let _ = release(link, outbox, ticket, None);
             }
             fail_reserved(pending, events, media, id, format!("unserializable: {e}"));
             return;
         }
     };
     let written = match how {
-        Delivery::Staged => release(link, outbox, Some(frame)),
+        Delivery::Staged(ticket) => release(link, outbox, ticket, Some(frame)),
         Delivery::Ordinary => write_or_queue(link, outbox, frame),
     };
     if let Err(e) = written {
@@ -1075,26 +1105,23 @@ mod tests {
     /// recipient first.
     #[test]
     fn nothing_overtakes_a_send_that_is_still_staging() {
-        let outbox = Sending::default();
-        outbox.lock().expect("fresh lock").holding += 1;
+        let mut outbox = Outbox::default();
+        let note = outbox.claim();
 
-        // Two ordinary frames while the staging is in flight.
-        let mut held = outbox.lock().expect("fresh lock");
-        assert_eq!(held.holding, 1);
-        held.waiting.push_back(b"text-one".to_vec());
-        held.waiting.push_back(b"text-two".to_vec());
-        drop(held);
+        // Two ordinary frames while the staging is in flight. Neither may go
+        // out, because the note's place is ahead of both.
+        outbox.slots.push_back(Slot::Ready(b"text-one".to_vec()));
+        outbox.slots.push_back(Slot::Ready(b"text-two".to_vec()));
+        assert!(
+            outbox.drain_ready().is_empty(),
+            "the queue is closed while the note is staging"
+        );
 
         // The staged frame goes first, then the two in the order they were
         // asked for.
-        let mut released = {
-            let mut held = outbox.lock().expect("fresh lock");
-            held.holding -= 1;
-            std::mem::take(&mut held.waiting)
-        };
-        released.push_front(b"voice-note".to_vec());
+        outbox.fill(note, Some(b"voice-note".to_vec()));
         assert_eq!(
-            released.into_iter().collect::<Vec<_>>(),
+            outbox.drain_ready(),
             vec![
                 b"voice-note".to_vec(),
                 b"text-one".to_vec(),
@@ -1103,20 +1130,61 @@ mod tests {
         );
     }
 
-    /// A second staged send keeps the queue closed: releasing one of two must
+    /// A second staged send keeps the queue closed: filling one of two must
     /// not let the rest past the other.
     #[test]
     fn two_staged_sends_both_have_to_land_before_the_queue_drains() {
-        let outbox = Sending::default();
-        {
-            let mut held = outbox.lock().expect("fresh lock");
-            held.holding = 2;
-            held.waiting.push_back(b"text".to_vec());
-        }
-        let mut held = outbox.lock().expect("fresh lock");
-        held.holding -= 1;
-        assert_eq!(held.holding, 1, "one staged send is still outstanding");
-        assert_eq!(held.waiting.len(), 1, "so the queue stays closed");
+        let mut outbox = Outbox::default();
+        let first = outbox.claim();
+        let _second = outbox.claim();
+        outbox.slots.push_back(Slot::Ready(b"text".to_vec()));
+
+        outbox.fill(first, Some(b"note-one".to_vec()));
+        assert_eq!(
+            outbox.drain_ready(),
+            vec![b"note-one".to_vec()],
+            "only what the first note unblocked"
+        );
+        assert_eq!(outbox.slots.len(), 2, "the second note still closes it");
+    }
+
+    /// Two notes recorded in order arrive in that order, whichever upload
+    /// finishes first.
+    ///
+    /// The count-and-prepend version put each completion at the head, so the
+    /// shorter note, the one whose upload landed first, was written second
+    /// and read first.
+    #[test]
+    fn staged_sends_keep_the_order_they_were_made_in() {
+        let mut outbox = Outbox::default();
+        let first = outbox.claim();
+        let second = outbox.claim();
+
+        // The second note's payload is the one that crosses first.
+        outbox.fill(second, Some(b"note-two".to_vec()));
+        assert!(
+            outbox.drain_ready().is_empty(),
+            "nothing goes until the note in front of it does"
+        );
+
+        outbox.fill(first, Some(b"note-one".to_vec()));
+        assert_eq!(
+            outbox.drain_ready(),
+            vec![b"note-one".to_vec(), b"note-two".to_vec()]
+        );
+    }
+
+    /// A staging that failed gives its place up rather than holding the queue
+    /// shut for ever.
+    #[test]
+    fn a_staging_that_failed_releases_what_was_behind_it() {
+        let mut outbox = Outbox::default();
+        let note = outbox.claim();
+        outbox.slots.push_back(Slot::Ready(b"text".to_vec()));
+
+        outbox.fill(note, None);
+        assert_eq!(outbox.drain_ready(), vec![b"text".to_vec()]);
+        assert!(outbox.slots.is_empty());
     }
 
     /// The recording's key is a local id, which the front end composes; it

@@ -61,6 +61,14 @@ struct Slot {
     /// How many pictures have come out, which is how a caller waiting for the
     /// first one knows it has arrived.
     produced: u64,
+    /// The sequence number of the newest picture that was accepted.
+    ///
+    /// Reading the pixels out of a frame is asynchronous, so several copies
+    /// can be outstanding at once and they may resolve in any order. Without
+    /// this the last one to *finish* wins rather than the last one to be
+    /// decoded, which moves an attachment backwards a frame and puts a stale
+    /// picture on a call pane.
+    accepted: u64,
 }
 
 /// One decoded picture, in the form gpui draws.
@@ -75,6 +83,22 @@ pub struct Picture {
 pub struct Decoder {
     inner: web_sys::VideoDecoder,
     slot: Rc<RefCell<Slot>>,
+    /// The `avc1` string the decoder was configured with.
+    ///
+    /// Kept because `reset` has to configure it again: `VideoDecoder::reset`
+    /// leaves the decoder *unconfigured* by the WebCodecs specification, so a
+    /// reset that only cleared the slot left every later `decode` refused,
+    /// and the first refusal is sticky, so the picture never came back.
+    codec: String,
+    /// Which decoder generation the pictures now arriving belong to.
+    ///
+    /// Bumped by `reset`, and read by each copy as it completes: a copy
+    /// started before a seek resolves after it, and the picture it carries is
+    /// from a position nobody is looking at any more.
+    generation: Rc<Cell<u64>>,
+    /// How many frames have been handed to a copy, which is the order they
+    /// were decoded in. See [`Slot::accepted`].
+    submitted: Rc<Cell<u64>>,
     /// The rotation applied to pictures on the way out.
     ///
     /// A cell because a call's is per frame: a peer's orientation describes
@@ -141,16 +165,28 @@ impl Decoder {
         let slot = Rc::new(RefCell::new(Slot::default()));
         let rotation = Rc::new(Cell::new(rotation));
 
+        let generation = Rc::new(Cell::new(0u64));
+        let submitted = Rc::new(Cell::new(0u64));
+
         let on_frame = {
             let slot = Rc::clone(&slot);
             let rotation = Rc::clone(&rotation);
+            let generation = Rc::clone(&generation);
+            let submitted = Rc::clone(&submitted);
             Closure::<dyn FnMut(web_sys::VideoFrame)>::new(move |frame: web_sys::VideoFrame| {
+                let seq = submitted.get().wrapping_add(1);
+                submitted.set(seq);
                 read_frame(
                     frame,
                     rotation.get(),
                     max_pixels,
                     Rc::clone(&slot),
                     sink.clone(),
+                    Stamp {
+                        generation: Rc::clone(&generation),
+                        born: generation.get(),
+                        seq,
+                    },
                 );
             })
         };
@@ -181,6 +217,9 @@ impl Decoder {
         Ok(Self {
             inner,
             slot,
+            codec,
+            generation,
+            submitted,
             rotation,
             max_pixels,
             _on_frame: on_frame,
@@ -253,10 +292,46 @@ impl Decoder {
     /// reference chain, and feeding it units from the middle of one produces
     /// nothing until the next IDR.
     pub fn reset(&self) {
+        // Before anything else, so a copy already in flight is recognised as
+        // belonging to the stream that has just been left behind.
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.submitted.set(0);
+
         let _ = self.inner.reset();
+        {
+            let mut slot = self.slot.borrow_mut();
+            slot.newest = None;
+            slot.produced = 0;
+            slot.accepted = 0;
+        }
+
+        // `reset` returns the decoder to `unconfigured`, so this is not
+        // housekeeping: without it the next `decode` is refused, the refusal
+        // is sticky, and every frame after a seek is dropped before it
+        // reaches the browser.
+        let config = web_sys::VideoDecoderConfig::new(&self.codec);
         let mut slot = self.slot.borrow_mut();
-        slot.newest = None;
-        slot.produced = 0;
+        match self.inner.configure(&config) {
+            // Cleared only here: a decoder that has been configured again is
+            // one whose earlier failure has nothing left to say.
+            Ok(()) => slot.failed = None,
+            Err(e) => {
+                slot.failed = Some(format!(
+                    "the browser would not decode {} again: {e:?}",
+                    self.codec
+                ));
+            }
+        }
+    }
+
+    /// How many units the browser has taken and not yet decoded.
+    ///
+    /// The desktop path bounds its own queue at `QUEUE_DEPTH`; here the queue
+    /// is the browser's and the only thing this side can do about it is stop
+    /// feeding. A caller that outruns the decoder banks compressed units for
+    /// the length of a call, and draws a picture further behind with each one.
+    pub fn queued(&self) -> u32 {
+        self.inner.decode_queue_size()
     }
 
     /// Turn the next pictures a different way.
@@ -274,7 +349,30 @@ impl Drop for Decoder {
     /// It holds a hardware decode session, and a tab that opens one per video
     /// in a conversation runs out of them long before it runs out of memory.
     fn drop(&mut self) {
+        // A dropped decoder's copies are still outstanding, and its slot and
+        // its sink outlive it: a call replaces the decoder without replacing
+        // either, so a picture from the old one would land on the new stream.
+        self.generation.set(self.generation.get().wrapping_add(1));
         let _ = self.inner.close();
+    }
+}
+
+/// Which decoder generation a copy belongs to, and where it sits in it.
+///
+/// Carried into the asynchronous read so a picture can say whether it is
+/// still wanted by the time it is ready. See [`Slot::accepted`] and
+/// [`Decoder::generation`].
+struct Stamp {
+    generation: Rc<Cell<u64>>,
+    born: u64,
+    seq: u64,
+}
+
+impl Stamp {
+    /// Whether the decoder that produced this picture is still the one being
+    /// drawn from.
+    fn current(&self) -> bool {
+        self.generation.get() == self.born
     }
 }
 
@@ -289,6 +387,7 @@ fn read_frame(
     max_pixels: usize,
     slot: Rc<RefCell<Slot>>,
     sink: Option<Rc<dyn Fn(Picture)>>,
+    stamp: Stamp,
 ) {
     // The *visible* rectangle, not the coded one. `copyTo` copies the visible
     // region by default, and a coded frame is padded out to whole macroblocks
@@ -313,9 +412,11 @@ fn read_frame(
         frame_byte_len(width, height).filter(|_| width.saturating_mul(height) <= max_pixels)
     else {
         frame.close();
-        let mut slot = slot.borrow_mut();
-        if slot.failed.is_none() {
-            slot.failed = Some(format!("refusing a {width}x{height} video frame"));
+        if stamp.current() {
+            let mut slot = slot.borrow_mut();
+            if slot.failed.is_none() {
+                slot.failed = Some(format!("refusing a {width}x{height} video frame"));
+            }
         }
         return;
     };
@@ -334,11 +435,13 @@ fn read_frame(
         .map_or(byte_len, |size| size as usize);
     if needed > byte_len {
         frame.close();
-        let mut slot = slot.borrow_mut();
-        if slot.failed.is_none() {
-            slot.failed = Some(format!(
-                "a decoded frame wanted {needed} bytes, past the budget"
-            ));
+        if stamp.current() {
+            let mut slot = slot.borrow_mut();
+            if slot.failed.is_none() {
+                slot.failed = Some(format!(
+                    "a decoded frame wanted {needed} bytes, past the budget"
+                ));
+            }
         }
         return;
     }
@@ -354,10 +457,19 @@ fn read_frame(
         // holds is the decoder's, not ours.
         frame.close();
         if let Err(e) = read {
-            let mut slot = slot.borrow_mut();
-            if slot.failed.is_none() {
-                slot.failed = Some(format!("could not read a decoded frame: {e:?}"));
+            if stamp.current() {
+                let mut slot = slot.borrow_mut();
+                if slot.failed.is_none() {
+                    slot.failed = Some(format!("could not read a decoded frame: {e:?}"));
+                }
             }
+            return;
+        }
+        // The copy resolved, and the decoder it belongs to may have been
+        // reset or replaced while it was in flight. Checked before a pixel is
+        // laid out, since the work below is only worth doing for a picture
+        // somebody is still going to look at.
+        if !stamp.current() {
             return;
         }
 
@@ -383,6 +495,13 @@ fn read_frame(
         };
         {
             let mut slot = slot.borrow_mut();
+            // Copies resolve in whatever order the browser finishes them, so
+            // an older picture arriving late is not the newest one: dropped
+            // rather than allowed to overwrite what has already been shown.
+            if !stamp.current() || stamp.seq <= slot.accepted {
+                return;
+            }
+            slot.accepted = stamp.seq;
             slot.newest = Some(picture.clone());
             slot.produced += 1;
         }
