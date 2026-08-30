@@ -30,7 +30,7 @@ use media::{MediaProps, render_media_content};
 use quote::render_quote;
 use reactions::{render_hover_actions, render_reactions};
 
-use crate::app::{CopyMessage, ReplyToMessage, RetryMessage, WhatsAppApp};
+use crate::app::{BubbleIds, CopyMessage, ReplyToMessage, RetryMessage, WhatsAppApp};
 use crate::components::{bubble_status_ticks, render_rich_text};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
@@ -40,7 +40,12 @@ use oxidezap_core::ChatMessage;
 
 /// Everything one bubble needs, gathered by the list.
 pub struct BubbleProps {
-    pub message: ChatMessage,
+    /// This row's element ids, formatted when the timeline was built.
+    pub ids: BubbleIds,
+    /// Shared with the timeline's cache rather than copied out of it: a
+    /// `ChatMessage` is four `String`s, a reaction map, a quote and a media
+    /// handle, and the list builds one of these per visible row per frame.
+    pub message: Arc<ChatMessage>,
     pub playing_message_id: Option<String>,
     pub is_group: bool,
     /// Whether the conversation is with your own number, which is what makes
@@ -79,6 +84,7 @@ pub fn render_message_bubble(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = *layout.metrics();
+    let ids = props.ids;
     let message = props.message;
     // A row nobody typed belongs to the conversation, not to a side of it.
     if let Some(notice) = &message.system {
@@ -99,7 +105,7 @@ pub fn render_message_bubble(
     }
     let is_from_me = message.is_from_me;
     let message_id = message.id.clone();
-    let bubble_id: SharedString = format!("msg-{message_id}").into();
+    let bubble_id = ids.bubble.clone();
     let content: SharedString = message.content.clone().into();
     let time: SharedString = format_time_local(&message.timestamp).into();
     let status = message.delivery_in(props.is_own_number);
@@ -134,22 +140,19 @@ pub fn render_message_bubble(
     // Right-click anywhere on the row, which is what a desktop reader reaches
     // for and the only route to these commands that does not require finding a
     // control that is invisible until the pointer is already over it.
-    // Formatted once. It was built three times per bubble per frame (the
-    // group and both hover groups), and a `SharedString` clone is a refcount.
-    let group: SharedString = format!("bubble-{message_id}").into();
     let menu_id = message_id.clone();
     let menu_text = message.content.clone();
     let menu_failed = can_retry;
 
     div()
-        .id(SharedString::from(format!("row-{message_id}")))
+        .id(ids.row.clone())
         .w_full()
         // The row gives before the gutter does: a bubble at its maximum width
         // plus the action bar beside it is wider than a narrow pane, and
         // without this the overflow went out through the window's edge.
         .min_w_0()
         .flex()
-        .group(group.clone())
+        .group(ids.group.clone())
         .map(|el| {
             if is_from_me {
                 el.justify_end()
@@ -171,8 +174,9 @@ pub fn render_message_bubble(
                 div()
                     .flex_shrink_0()
                     .invisible()
-                    .group_hover(group.clone(), |s| s.visible())
+                    .group_hover(ids.group.clone(), |s| s.visible())
                     .child(render_hover_actions(
+                        &ids,
                         message_id.clone(),
                         message.content.clone(),
                         entity.clone(),
@@ -281,7 +285,7 @@ pub fn render_message_bubble(
                     // only be recoverable with a pointer.
                     el.child(
                         div().mt(metrics.space_xs()).child(
-                            Button::new(SharedString::from(format!("retry-{message_id}")))
+                            Button::new(ids.retry.clone())
                                 .label("Not sent · retry")
                                 .ghost()
                                 .danger()
@@ -309,8 +313,9 @@ pub fn render_message_bubble(
                 div()
                     .flex_shrink_0()
                     .invisible()
-                    .group_hover(group.clone(), |s| s.visible())
+                    .group_hover(ids.group.clone(), |s| s.visible())
                     .child(render_hover_actions(
+                        &ids,
                         message_id.clone(),
                         message.content.clone(),
                         entity,

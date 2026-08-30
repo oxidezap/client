@@ -461,7 +461,12 @@ impl WhatsAppApp {
             return;
         };
 
-        let Some(chat) = self.chats.iter_mut().find(|chat| chat.is_status) else {
+        let Some(chat) = self
+            .chats
+            .iter_mut()
+            .find(|chat| chat.is_status)
+            .map(std::sync::Arc::make_mut)
+        else {
             return;
         };
         let Some(message) = chat
@@ -543,7 +548,12 @@ impl WhatsAppApp {
         // watched is a set that only grows.
         self.watched_status.retain(|id| !agreed.contains(id));
         let watched = &self.watched_status;
-        let Some(chat) = self.chats.iter_mut().find(|chat| chat.is_status) else {
+        let Some(chat) = self
+            .chats
+            .iter_mut()
+            .find(|chat| chat.is_status)
+            .map(std::sync::Arc::make_mut)
+        else {
             return;
         };
         apply_watched(chat, watched);

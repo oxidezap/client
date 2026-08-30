@@ -2,12 +2,21 @@
 //!
 //! This module provides audio extraction functionality for MP4 video files.
 //! The video decoding is handled by StreamingVideoDecoder in streaming.rs.
-
-use std::io::Cursor;
-
-use mp4::{Mp4Reader, TrackType};
+//!
+//! [`VideoAudio`] is the whole module on the web: the player and the
+//! call's stub both name it, so the *type* is every target's. What is not is
+//! the extraction — `mp4` demuxes and `symphonia` decodes the AAC, and the
+//! only thing that calls it is `streaming.rs`, which a page does not build.
+//! Gated rather than left to the optimizer, which is the discipline
+//! `openh264` already follows two lines below it in the manifest: LTO does in
+//! fact remove all of it today (measured — `symphonia` and `mp4` are absent
+//! from the shipped module), but `get_probe()` builds its registry through
+//! trait objects, which is exactly the shape dead-code elimination is least
+//! reliable about. A page that stopped being able to prove it would gain a
+//! codec it cannot reach.
 
 /// ADTS sample rate to frequency index mapping
+#[cfg(not(target_family = "wasm"))]
 const ADTS_FREQ_TABLE: [(u32, u8); 13] = [
     (96000, 0),
     (88200, 1),
@@ -25,16 +34,26 @@ const ADTS_FREQ_TABLE: [(u32, u8); 13] = [
 ];
 
 /// Decoded audio data from video (always mono after conversion)
+///
+/// Shared rather than owned, because the play path hands this around: the
+/// player keeps one, a resume re-feeds one, and each of those used to be a
+/// copy of the whole track. Three minutes of mono at 44.1 kHz is 31 MB in
+/// `f32`, and on the web that is linear memory that never comes back.
 #[derive(Clone)]
 pub struct VideoAudio {
     /// PCM samples (f32, mono)
-    pub samples: Vec<f32>,
+    pub samples: std::sync::Arc<[f32]>,
     /// Sample rate in Hz
     pub sample_rate: u32,
 }
 
 /// Extract audio from MP4 using mp4 crate for demuxing and symphonia for AAC decoding
+#[cfg(not(target_family = "wasm"))]
 pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
+    use std::io::Cursor;
+
+    use mp4::{Mp4Reader, TrackType};
+
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::formats::FormatOptions;
@@ -190,7 +209,7 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
     );
 
     Some(VideoAudio {
-        samples: mono_samples,
+        samples: mono_samples.into(),
         sample_rate,
     })
 }

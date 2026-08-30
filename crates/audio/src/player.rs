@@ -204,7 +204,7 @@ mod cpal_output {
 
             info!("Decoded {} samples for playback", samples.len());
             let speed = self.speed;
-            self.play_at(samples, 48000, speed)
+            self.play_at(&samples, 48000, speed)
         }
 
         /// Play raw f32 PCM samples at the specified sample rate.
@@ -214,9 +214,14 @@ mod cpal_output {
         /// a 2× left over from a voice note made the sound race the picture and
         /// finish early. Enforced here rather than remembered at each call site,
         /// which is what it was.
+        ///
+        /// Borrowed, not owned: this is resampled into a buffer of its own
+        /// before anything plays, so taking the caller's `Vec` bought a copy
+        /// of the whole track and then dropped it. Three minutes of mono at
+        /// 44.1 kHz is 31 MB.
         pub fn play_samples(
             &mut self,
-            samples: Vec<f32>,
+            samples: &[f32],
             src_sample_rate: u32,
         ) -> Result<(), PlayerError> {
             self.play_at(samples, src_sample_rate, 1.0)
@@ -224,7 +229,7 @@ mod cpal_output {
 
         fn play_at(
             &mut self,
-            samples: Vec<f32>,
+            samples: &[f32],
             src_sample_rate: u32,
             speed: f32,
         ) -> Result<(), PlayerError> {
@@ -295,7 +300,7 @@ mod cpal_output {
             );
 
             let resampled =
-                resample_audio(&samples, src_sample_rate, self.sample_rate, output_channels);
+                resample_audio(samples, src_sample_rate, self.sample_rate, output_channels);
             let before = resampled.len();
             let resampled = crate::timescale::stretch(resampled, output_channels, speed);
             // The ratio achieved, not the one asked for. `stretch` returns a clip

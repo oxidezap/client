@@ -19,6 +19,7 @@ use gpui::{
 use gpui_component::ActiveTheme as _;
 use gpui_component::scroll::Scrollbar;
 
+use crate::app::BubbleIds;
 use crate::app::{MessageListCache, TimelineItem, WhatsAppApp};
 use crate::components::message_bubble::render_encryption_notice;
 use crate::components::message_bubble::{AudioProgress, BubbleProps};
@@ -81,6 +82,7 @@ pub fn render_message_list(
     }
 
     let messages = Arc::clone(&cache.messages);
+    let ids = Arc::clone(&cache.ids);
     let items = Arc::clone(&cache.items);
 
     let gutter = layout.conversation_padding();
@@ -107,6 +109,7 @@ pub fn render_message_list(
                     .child(render_row(
                         &items,
                         &messages,
+                        &ids,
                         ix,
                         &entity,
                         is_group,
@@ -143,7 +146,8 @@ pub fn render_message_list(
 #[allow(clippy::too_many_arguments)]
 fn render_row(
     items: &[TimelineItem],
-    messages: &[oxidezap_core::ChatMessage],
+    messages: &[Arc<oxidezap_core::ChatMessage>],
+    ids: &[BubbleIds],
     ix: usize,
     entity: &Entity<WhatsAppApp>,
     is_group: bool,
@@ -171,7 +175,10 @@ fn render_row(
             .child(render_encryption_notice(metrics, cx))
             .into_any_element(),
         TimelineItem::Message { ix, starts_run } => {
-            let Some(msg) = messages.get(*ix) else {
+            // `ids` is built from these same messages and indexed the same
+            // way, so the two are asked for together: a row that cannot find
+            // one cannot find the other either.
+            let (Some(msg), Some(ids)) = (messages.get(*ix), ids.get(*ix)) else {
                 return div().into_any_element();
             };
             let message_id = &msg.id;
@@ -192,7 +199,8 @@ fn render_row(
                 elapsed_secs: app.audio_elapsed_secs(),
             });
             let props = BubbleProps {
-                message: msg.clone(),
+                ids: ids.clone(),
+                message: Arc::clone(msg),
                 playing_message_id: app.playing_message_id().map(|s| s.to_string()),
                 is_group,
                 is_own_number,

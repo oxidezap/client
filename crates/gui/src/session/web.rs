@@ -171,7 +171,7 @@ const FRAME_MEDIA_BUDGET: std::time::Duration = std::time::Duration::from_secs(3
 /// because this heap is the one that runs out. What is left out is not lost:
 /// a key that was not fetched is drawn as an offer to download, which is what
 /// the renderer already does for media the daemon never cached.
-const FRAME_MEDIA_CEILING: u64 = 48 * 1024 * 1024;
+use oxidezap_core::WEB_MEDIA_BUDGET_BYTES as FRAME_MEDIA_CEILING;
 
 /// Pull down every payload this frame names.
 ///
