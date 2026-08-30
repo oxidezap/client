@@ -215,9 +215,13 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
 }
 
 /// The largest an ADTS frame may say it is: the length field is 13 bits.
+#[cfg(not(target_family = "wasm"))]
 const MAX_ADTS_FRAME: usize = (1 << 13) - 1;
 
 /// One AAC frame, headered, appended to the ADTS stream being built.
+///
+/// Beside the table it reads, which a page has no decoder to need.
+#[cfg(not(target_family = "wasm"))]
 fn push_adts_frame(adts: &mut Vec<u8>, frame: &[u8], sample_rate: u32, channels: u8) {
     // Map sample rate to ADTS frequency index using lookup table
     let freq_idx = ADTS_FREQ_TABLE
@@ -264,7 +268,7 @@ fn push_adts_frame(adts: &mut Vec<u8>, frame: &[u8], sample_rate: u32, channels:
 /// The extraction above streams straight into its buffer rather than
 /// collecting the frames first; this exists for the tests, which are about
 /// what one frame's header says.
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 fn wrap_aac_as_adts(frames: &[Vec<u8>], sample_rate: u32, channels: u8) -> Vec<u8> {
     let mut adts = Vec::new();
     for frame in frames {
@@ -273,7 +277,7 @@ fn wrap_aac_as_adts(frames: &[Vec<u8>], sample_rate: u32, channels: u8) -> Vec<u
     adts
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::{MAX_ADTS_FRAME, wrap_aac_as_adts};
 

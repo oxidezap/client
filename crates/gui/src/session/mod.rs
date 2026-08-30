@@ -322,6 +322,13 @@ pub struct Session {
     /// declaration order, so the write half is released with `link` before
     /// the hangup runs. Cancelling a pipe read disconnects nothing — the
     /// pipe breaks when the last handle to it closes.
+    ///
+    /// Held for its `Drop` and read by nobody, which on a page is the whole
+    /// of it: there is no reader thread to end.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "a page's socket goes with the page")
+    )]
     teardown: Teardown,
 }
 
