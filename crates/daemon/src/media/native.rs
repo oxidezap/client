@@ -81,15 +81,21 @@ pub fn put_evictable(key: &str, bytes: &[u8]) -> Result<String> {
 /// Returns the key, so a caller can hand it straight to the peer.
 pub fn put(key: &str, bytes: &[u8]) -> Result<String> {
     let path = oxidezap_ipc::media_path(key).context("no media cache to write into")?;
+    let dir = path.parent().context("media path has no parent")?;
+    // Before the hit below and not after it. `metadata` follows a symlink, and
+    // a key here is derived from content the account has already published, so
+    // a link of the right length planted under one while the directory was
+    // open answered "already cached" and the daemon then served its target as
+    // the account's own media -- returning before the sweep that exists to
+    // remove it had run at all.
+    prepare_dir(dir)?;
+
     // Content-addressed: the same key is the same bytes, so a file that is
     // already there is already right. Size-checked rather than trusted, so a
     // write cut short by a crash is redone rather than served truncated.
     if std::fs::metadata(&path).is_ok_and(|meta| meta.len() == bytes.len() as u64) {
         return Ok(key.to_string());
     }
-
-    let dir = path.parent().context("media path has no parent")?;
-    prepare_dir(dir)?;
 
     // Through a temporary and a rename: a reader that opens the key must
     // never see half a file, and the reader is another process racing this
@@ -354,5 +360,37 @@ mod tests {
             "and the directory was still tightened"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key here is derived from content the account has already published,
+    /// so it is predictable. A symlink of the right length planted under one
+    /// while the directory was open answered "already cached" before the
+    /// sweep that exists to remove it had run, and the daemon then served the
+    /// link's target as the account's own media.
+    #[test]
+    fn a_planted_link_is_not_a_cache_hit() {
+        let base = std::env::temp_dir().join(format!(
+            "oxidezap-media-plant-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("media");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let elsewhere = base.join("elsewhere");
+        std::fs::write(&elsewhere, b"not ours").unwrap();
+        let planted = dir.join("f-key");
+        std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        super::prepare_dir(&dir).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&planted).is_err(),
+            "the link is gone before anything asks whether it is a hit"
+        );
+        assert!(elsewhere.exists(), "and its target was never followed");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
