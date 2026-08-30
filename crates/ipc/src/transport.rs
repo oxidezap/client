@@ -216,6 +216,20 @@ pub fn state_dir() -> Option<PathBuf> {
     }
 }
 
+/// Longest single frame either side will read.
+///
+/// The daemon has always had one for a request (a megabyte, which is far past
+/// any legitimate one); this is the other direction, which had none at all. A
+/// frame there is a history load — a hundred chats with their newest rows —
+/// so the bound is far larger, and it is still a bound: without one, a frame
+/// with no newline in it is read until the process holding the interface and
+/// the video decoder runs out of memory.
+///
+/// Per frame rather than per connection, for the reason the daemon's own cap
+/// gives: a reader capped for its lifetime hands a long-lived front end an
+/// artificial end of stream once its legitimate frames have added up.
+pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 /// Where the daemon's startup lock lives.
 ///
 /// A file rather than the socket path with an extension, because on Windows

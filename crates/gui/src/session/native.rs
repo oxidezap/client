@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
 use log::info;
-use oxidezap_ipc::{ClientRequest, Endpoint, Link, PROTOCOL_VERSION};
+use oxidezap_ipc::{ClientRequest, Endpoint, Link, MAX_FRAME_BYTES, PROTOCOL_VERSION};
 
 use super::frames::Frames;
 use super::media::Directory;
@@ -69,13 +69,27 @@ fn read_frames(
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        // Bounded, like the daemon bounds what it reads from here. Without a
+        // cap, a frame with no newline in it — a daemon at the other end of a
+        // reused port, a truncated write, a set of plugin trees larger than
+        // anyone expected — is read until this process runs out of memory,
+        // and this process is the one holding the interface and the video
+        // decode.
+        let mut limited = std::io::Read::take(&mut reader, MAX_FRAME_BYTES as u64 + 1);
+        match limited.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
                 log::error!("lost the daemon connection: {e}");
                 break;
             }
+        }
+        if line.len() > MAX_FRAME_BYTES {
+            log::error!("the daemon sent a frame past {MAX_FRAME_BYTES} bytes");
+            frames.blame(format!(
+                "the background service sent a frame larger than {MAX_FRAME_BYTES} bytes"
+            ));
+            break;
         }
 
         if let Some(message) = super::frames::parse(&line)

@@ -39,6 +39,6 @@ pub use protocol::{
     StateSnapshot, StateVersion,
 };
 pub use transport::{
-    DEFAULT_WEB_PORT, PROTOCOL_VERSION, WEB_MEDIA_PATH, WEB_SOCKET_PATH, endpoint_path, lock_path,
-    media_dir, media_path, state_dir, web_token_path,
+    DEFAULT_WEB_PORT, MAX_FRAME_BYTES, PROTOCOL_VERSION, WEB_MEDIA_PATH, WEB_SOCKET_PATH,
+    endpoint_path, lock_path, media_dir, media_path, state_dir, web_token_path,
 };
