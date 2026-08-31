@@ -495,8 +495,12 @@ impl AudioPlayer {
         let buffer = context
             .create_buffer(1, frames, src_sample_rate as f32)
             .map_err(|e| PlayerError::DeviceError(format!("{e:?}")))?;
+        // JS-owned rather than a slice: `copyToChannel` takes a
+        // `Float32Array` that "must not be shared", and this module's heap is
+        // shared, so `copy_to_channel` refuses every buffer it is given. The
+        // call's playout hit the same wall; see AGENTS.md.
         buffer
-            .copy_to_channel(samples, 0)
+            .copy_to_channel_with_f32_array(&js_sys::Float32Array::from(samples), 0)
             .map_err(|e| PlayerError::DeviceError(format!("{e:?}")))?;
 
         {

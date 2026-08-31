@@ -18,6 +18,23 @@ disallowed-methods = [
     { path = "buffa::message::Message::decode_length_delimited", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the decode tree per crate)" },
     { path = "buffa::message::Message::encode_length_delimited", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the encode tree per crate)" },
     { path = "buffa::message::Message::encode_to_bytes", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the encode tree per crate)" },
+    # A browser API never gets a view into wasm memory. The web front end is
+    # built with `--shared-memory`, so every Rust slice is backed by a
+    # SharedArrayBuffer, and these methods take their buffer as a *view* over
+    # whatever they are handed. Their specifications refuse a shared one --
+    # "The provided ArrayBufferView value must not be shared" -- so the call
+    # throws at run time and compiles perfectly. It has cost this repository
+    # three separate outages (the socket, the call relay, and the peer's
+    # audio), each invisible because the thrower discards the error, so the
+    # spelling itself is banned. Copy into a JS-owned array first
+    # (`js_sys::Uint8Array::from(&data[..])` / `Float32Array::from`) and use
+    # the `*_with_*_array` binding beside each of these.
+    { path = "web_sys::AudioBuffer::copy_to_channel", reason = "shared view: copy first and use copy_to_channel_with_f32_array" },
+    { path = "web_sys::AudioBuffer::copy_to_channel_with_start_in_channel", reason = "shared view: copy first and use copy_to_channel_with_f32_array_and_start_in_channel" },
+    { path = "web_sys::AudioBuffer::copy_from_channel", reason = "shared view: use copy_from_channel_with_f32_array, or get_channel_data, which copies JS-to-wasm and is safe" },
+    { path = "web_sys::AudioBuffer::copy_from_channel_with_start_in_channel", reason = "shared view: use copy_from_channel_with_f32_array_and_start_in_channel" },
+    { path = "web_sys::RtcDataChannel::send_with_u8_array", reason = "shared view: copy with js_sys::Uint8Array::from and use send_with_array_buffer" },
+    { path = "web_sys::WebSocket::send_with_u8_array", reason = "shared view: copy with js_sys::Uint8Array::from and use send_with_array_buffer" },
 ]
 
 # 64-bit atomic *types*: 32-bit targets (Xtensa/ESP32) have no native AtomicU64/
