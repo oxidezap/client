@@ -451,7 +451,7 @@ impl Plugins {
     /// A host with nothing loaded, for a daemon built without a plugin
     /// directory to look in.
     #[must_use]
-    pub fn none(sink: Sink) -> Self {
+    pub fn none(sink: Sink, commands: Arc<dyn Commands>) -> Self {
         let approvals = Arc::new(Approvals::open(Arc::new(Nowhere)));
         Self {
             live: std::sync::RwLock::new(Arc::new(Live::empty(
@@ -463,9 +463,21 @@ impl Plugins {
             reload_again: AtomicBool::new(false),
             approving: Mutex::new(()),
             sink,
-            commands: Arc::new(NoCommands),
+            commands,
             approvals,
         }
+    }
+
+    /// The same, for a caller with no session to offer — a test, or a daemon
+    /// that has not built its bridge yet.
+    ///
+    /// Its own name rather than a `None` argument because of what a reload
+    /// made of it: this host can be given real plugins later, and one built
+    /// with no bridge would run them with every account command answering
+    /// `NoSession` — while reporting the reload as having worked.
+    #[must_use]
+    pub fn nothing_loaded(sink: Sink) -> Self {
+        Self::none(sink, Arc::new(NoCommands))
     }
 
     /// Whatever is loaded at this instant.

@@ -2155,7 +2155,9 @@ mod tests {
         // a host with nothing loaded keeps it that way.
         Bridge::new(
             StateHub::new(),
-            Arc::new(oxidezap_plugin_host::Plugins::none(Arc::new(|_| {}))),
+            Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+                |_| {},
+            ))),
         )
     }
 

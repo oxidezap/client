@@ -61,11 +61,20 @@ pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugin
         // the folder takes, before the daemon has bound anything. Awaited
         // rather than detached, because the session must not start until the
         // plugins subscribed to messages are there to receive them.
+        let fallback = (publishing_to(hub), commands.clone());
         tokio::task::spawn_blocking(move || start_here(sink, commands))
             .await
             .unwrap_or_else(|e| {
+                // With the daemon's own sink and bridge, not a discarding
+                // pair. This host used to be a dead end and is not one any
+                // more: a reload can put real plugins into it once whatever
+                // made the loader panic has been taken out of the folder, and
+                // one built to publish nowhere would run them with their
+                // interface discarded and every command answering
+                // `NoSession` — while reporting the reload as having worked.
                 log::error!("the plugin loader did not finish: {e}");
-                Arc::new(Plugins::none(publishing_to_nothing()))
+                let (sink, commands) = fallback;
+                Arc::new(Plugins::none(sink, Arc::new(Bridge { commands })))
             })
     }
 }
@@ -125,6 +134,32 @@ pub async fn reload(plugins: &Arc<Plugins>) -> usize {
     }
 }
 
+/// The same, off the caller's own task.
+///
+/// What the IPC server asks for, because the caller there is one connection's
+/// loop: awaiting a reload in it is a window served nothing for as long as the
+/// folder takes — no state, no session events, and no call video, which is
+/// eight frames deep and overflows in a fraction of a second. Nothing is
+/// waiting for the answer either; what came back is state, and every front end
+/// reads it in the same frame.
+///
+/// Two spawns rather than one, for the reason every split in this module
+/// exists: a page's tasks are not `Send` and there is no runtime to hand one
+/// to, so it goes on the loop it is already running on.
+pub fn reload_in_background(plugins: &Arc<Plugins>) {
+    let plugins = Arc::clone(plugins);
+    let work = async move {
+        let running = reload(&plugins).await;
+        log::info!("plugins reloaded: {running} running");
+    };
+
+    #[cfg(target_family = "wasm")]
+    wasm_bindgen_futures::spawn_local(work);
+
+    #[cfg(not(target_family = "wasm"))]
+    drop(tokio::spawn(work));
+}
+
 /// Record what somebody answered about a plugin's permissions.
 ///
 /// A platform split for one reason, and it is the reason every other one here
@@ -167,18 +202,12 @@ pub async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> 
     }
 }
 
-/// A sink for a set of plugins that will never publish anything.
-#[cfg(not(target_family = "wasm"))]
-fn publishing_to_nothing() -> Sink {
-    Arc::new(|_| {})
-}
-
 /// The half that needs a filesystem.
 #[cfg(not(target_family = "wasm"))]
 fn start_here(sink: Sink, commands: SessionCommands) -> Arc<Plugins> {
     let Some(dir) = oxidezap_plugin_host::default_dir() else {
         log::debug!("no per-user data directory, so no plugins");
-        return Arc::new(Plugins::none(sink));
+        return Arc::new(Plugins::none(sink, Arc::new(Bridge { commands })));
     };
     // Not the daemon's `state_dir`: that one prefers XDG_RUNTIME_DIR, which
     // is cleared on logout, and a permission answer that does not survive a

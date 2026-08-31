@@ -184,14 +184,14 @@ async fn a_name_that_is_not_an_id_is_refused() {
 /// worked, and nothing in the workspace could have said so, because the
 /// desktop has a pool and this file is the only place a page is ever run.
 ///
-/// `Plugins::none` is enough to say it. What panicked was the dispatch, not
+/// `Plugins::nothing_loaded` is enough to say it. What panicked was the dispatch, not
 /// the write, so a host with nothing loaded reproduces it exactly and needs
 /// no OPFS module, no session and no approval to record.
 #[wasm_bindgen_test]
 async fn approving_a_plugin_does_not_need_a_blocking_pool() {
-    let host = std::sync::Arc::new(oxidezap_plugin_host::Plugins::none(std::sync::Arc::new(
-        |_| {},
-    )));
+    let host = std::sync::Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(
+        std::sync::Arc::new(|_| {}),
+    ));
     assert!(
         super::super::approve(&host, "nothing-loaded".to_owned(), true).await,
         "a page records approvals inline"
@@ -208,9 +208,9 @@ async fn approving_a_plugin_does_not_need_a_blocking_pool() {
 #[wasm_bindgen_test]
 async fn a_page_reloads_its_plugins_from_its_own_folder() {
     empty_the_folder().await;
-    let host = std::sync::Arc::new(oxidezap_plugin_host::Plugins::none(std::sync::Arc::new(
-        |_| {},
-    )));
+    let host = std::sync::Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(
+        std::sync::Arc::new(|_| {}),
+    ));
     assert_eq!(
         super::super::reload(&host).await,
         0,

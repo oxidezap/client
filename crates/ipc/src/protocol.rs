@@ -691,9 +691,11 @@ pub enum ClientRequest {
     /// an identity, and the host retires the whole set before it loads the
     /// next. Reloading one of five therefore restarts five.
     ///
-    /// Acknowledged when the new set is running, not when the request is
-    /// taken: the acknowledgement is what a front end draws "done" from, and
-    /// the plugins that came back arrive in the state frame beside it.
+    /// Acknowledged when the daemon takes it, not when the new set is
+    /// running. The reload is the connection's loop otherwise, and a folder
+    /// that takes seconds is seconds in which that window is served no state,
+    /// no events and no call video. Nothing waits for it: what came back is
+    /// state, and every front end reads it in the same frame.
     ReloadPlugins,
     /// Stop the daemon: disconnect the session, close the store, exit.
     Shutdown,

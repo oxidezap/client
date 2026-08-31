@@ -1876,6 +1876,21 @@ by definition.
   of the threat this guards against — but it is a gap, and closing it means
   reading an ACL and deciding what "only this user" means when the answer is
   a list rather than three bits.
+- **A reload costs a page a plugin's last settings write, and that is the
+  stamp working rather than failing.** Taking a fresh storage handle retires
+  every older one, so a plugin whose key-value state is still dirty inside its
+  one-second write throttle loses it: the retired task reaches its final
+  `flush_settings` after the swap, and the new handle's stamp refuses it. A
+  desktop does not have this — `retire` joins the thread, so the write has
+  already happened. It is the same trade the stamp exists for, taken in the
+  same direction: the alternative to refusing that write is letting a departed
+  host's in-memory settings land on top of what the new one has already
+  written, which is worse and is what the stamp was added to stop. What is new
+  is only that a reload makes it reachable mid-session, where before it took a
+  tab reload. Ordering it properly means retiring and flushing the old tasks
+  *before* the handle is taken, which a page cannot do by waiting — it cannot
+  join a task on its own loop — so it is the worker-per-plugin item below
+  rather than something to bolt on here.
 - **A reload is the folder's, not one plugin's.** Reloading one of five
   restarts five, because an id is what an approval and a settings document are
   keyed on: two generations holding one id would be two plugins sharing an

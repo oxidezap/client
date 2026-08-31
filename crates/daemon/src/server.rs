@@ -1075,14 +1075,17 @@ async fn handle_request(
                 }))
             }
         }
-        // Answered when it has happened, not when it was taken: a front end
-        // draws "done" from the acknowledgement, and the set that came back
-        // travels beside it as ordinary state — every other window learns of
-        // it the same way, because a plugin's interface was always the
-        // daemon's rather than the asking window's.
+        // Taken, and answered now rather than when it finishes. Awaiting it
+        // here was wrong for one reason and it is not a small one: this is the
+        // connection's own loop, so a reload of a folder that takes seconds
+        // is seconds in which *that window* is served nothing — no state, no
+        // session events, no call video, which is eight frames deep and
+        // overflows almost at once. And nothing was waiting for the answer
+        // anyway: the set that comes back is state, and every window learns
+        // of it in the same frame, because a plugin's interface was always
+        // the daemon's rather than the asking window's.
         ClientRequest::ReloadPlugins => {
-            let running = crate::plugins::reload(plugins).await;
-            log::info!("plugins reloaded: {running} running");
+            crate::plugins::reload_in_background(plugins);
             acted(Ok(()))
         }
         // The acknowledgement goes out first; see the caller.
@@ -1349,7 +1352,9 @@ mod tests {
     /// A host with nothing loaded, for the requests that are not about
     /// plugins — which is every request but one.
     fn no_plugins() -> Arc<oxidezap_plugin_host::Plugins> {
-        Arc::new(oxidezap_plugin_host::Plugins::none(Arc::new(|_| {})))
+        Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+            |_| {},
+        )))
     }
 
     fn parse(frame: Option<String>) -> DaemonMessage {
