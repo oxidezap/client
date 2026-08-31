@@ -306,6 +306,14 @@ mod imp {
             }
             None => Vec::new(),
         };
+        // The write style is the environment's too. `parse_env`/`from_env`,
+        // which both startup paths used before this crate existed, read
+        // `RUST_LOG_STYLE` as well as `RUST_LOG` — so without this a person
+        // who had turned colour off, or forced it on through a pipe, quietly
+        // lost that when the filter moved in here.
+        if let Ok(style) = std::env::var("RUST_LOG_STYLE") {
+            builder.parse_write_style(&style);
+        }
         // And the global level is ours, not this filter's. That is the whole
         // reason there is a logger here rather than `env_logger::init`: a
         // filter built at startup answers with the level it was built with

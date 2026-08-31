@@ -193,19 +193,63 @@ impl WhatsAppApp {
     /// A store that will not take it is a notice rather than a refusal: the
     /// level *has* changed, and what failed is only the memory of it.
     pub fn set_log_level(&mut self, level: LogLevel, cx: &mut Context<Self>) {
-        let stored = oxidezap_logging::set(level);
+        // This process, first and synchronously: it is one atomic store and
+        // the point of the control.
+        oxidezap_logging::apply(level);
+        // Remembered as the window's own ask, so a reconnection can say it
+        // again. Not to have the window impose its level on every daemon it
+        // reaches — a fresh window at `info` must not quiet a daemon somebody
+        // else put at `debug` — but a level chosen while the daemon was
+        // unreachable, or chosen at all, is one the daemon never heard.
+        self.log_level_asked = Some(level);
         if let Some(client) = &self.client {
             client.set_log_level(level);
         }
-        if let Err(e) = stored {
-            log::warn!("the log level was changed but not stored: {e}");
-            self.notify_user(
-                "Logging at that level now, but the choice will not survive a restart.",
-                Tone::Problem,
-                cx,
-            );
-        }
+
+        // The write is a file created, flushed, renamed, and the directory
+        // flushed after it — on the thread that draws. A config directory on
+        // a slow or remote filesystem would freeze the window for as long as
+        // that takes, and the level is already in force by then, so nothing
+        // waits on this but the memory of it. `remember` writes the level
+        // *in force* rather than one passed in, so a second choice made
+        // while this is in flight is written by whichever finishes last
+        // rather than fighting it.
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            use gpui::AppContext as _;
+
+            let stored = cx
+                .background_spawn(async { oxidezap_logging::remember() })
+                .await;
+            if let Err(e) = stored {
+                log::warn!("the log level was changed but not stored: {e}");
+                let _ = entity.update(cx, |app, cx| {
+                    app.notify_user(
+                        "Logging at that level now, but the choice will not survive a restart.",
+                        Tone::Problem,
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
         cx.notify();
+    }
+
+    /// Say the level again to a daemon this window has just reached.
+    ///
+    /// Only the level somebody chose *here*, and only if they chose one: the
+    /// daemon reads the same stored answer this window does when it starts,
+    /// so replaying an untouched default would be this window quieting a
+    /// daemon another window had raised. What it covers is the ask that had
+    /// nowhere to go — Settings used while the daemon was unreachable, and
+    /// the daemon that restarted, or was never told, under a page whose own
+    /// choice lives in a browser store no daemon can read.
+    pub fn resend_log_level(&self) {
+        let (Some(level), Some(client)) = (self.log_level_asked, &self.client) else {
+            return;
+        };
+        client.set_log_level(level);
     }
 
     /// Delete the cached media and re-measure.

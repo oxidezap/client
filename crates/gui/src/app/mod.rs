@@ -775,6 +775,14 @@ pub struct WhatsAppApp {
     notices: Vec<notices::Notice>,
     /// Never reused, so a dismissal cannot land on a later notice.
     next_notice_id: u64,
+    /// The log level somebody chose in this window, if they chose one.
+    ///
+    /// Kept so a reconnection can say it again: an ask made while the daemon
+    /// was unreachable reached nobody, and one made before it restarted is
+    /// one it may not have read — a page keeps its choice in a browser store
+    /// no daemon can open. `None` is nobody having asked, which is not the
+    /// same as `info` and must not be sent as one.
+    log_level_asked: Option<oxidezap_core::LogLevel>,
     /// Expires them. Alive only while something is up.
     #[allow(dead_code)]
     notice_task: Option<Task<()>>,
@@ -1054,6 +1062,7 @@ impl WhatsAppApp {
             error_detail_open: false,
             notices: Vec::new(),
             next_notice_id: 0,
+            log_level_asked: None,
             notice_task: None,
             downloads_in_flight: std::collections::HashSet::new(),
             call_state: CallState::new(),
@@ -2331,6 +2340,10 @@ impl WhatsAppApp {
                     Ok((client, ui_rx)) => {
                         app.event_task = Some(Self::spawn_event_task(ui_rx, cx));
                         app.client = Some(client);
+                        // A level chosen while this was unreachable reached
+                        // nobody, and the daemon on the other end may be a
+                        // new one. Nothing is sent if nobody chose.
+                        app.resend_log_level();
                     }
                     Err(e) if Session::is_settled(&e) => {
                         // A refusal, not a failure to reach anything: this
