@@ -2036,8 +2036,15 @@ by definition.
   — release both ends at once in exactly the way a driver returning does, and
   that ordinary cancellation is not evidence about a driver there was none
   of. Which is why the handoff is marked after the `start()` that took the
-  endpoints and never before it: every exit on the way to one drops the
-  builder with them inside it. A local loss outranks that gate rather than
+  endpoints, and *before* the `start()` that takes them rather than after:
+  `start()` awaits and what it spawns is the driver, so on a page — one loop
+  for every task — a driver that takes the endpoints and returns while
+  `start()` is still pending drops them before a later mark could run, and
+  the ending would read as never handed over for exactly the call the flag
+  exists to explain. Where it sits is the real transfer: the builder holds
+  the endpoints, nothing above may return any more, and no `await` separates
+  it from the handover. Every exit before that drops the builder with them
+  inside it. A local loss outranks that gate rather than
   being filtered by it — a microphone unplugged while the *camera* is still
   opening has not been handed over and has not been cancelled either, and the
   device is the only evidence there is. It outranks the *arm* as well: a local

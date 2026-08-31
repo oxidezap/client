@@ -41,9 +41,15 @@ pub struct CallAudioFacts {
 impl CallAudioFacts {
     /// The engine has the endpoints; from here their release is its doing.
     ///
-    /// Marked by the caller the moment the engine has accepted them — after
-    /// a `start()` that returned, never before it, since a builder dropped on
-    /// the way to one takes the endpoints with it and no driver ever ran.
+    /// Marked at the point ownership really moves: the endpoints are in the
+    /// builder, no path above may return any more, and the very next thing is
+    /// the call that hands it over. Deliberately *before* that call rather
+    /// than after it — `start()` awaits, and what it spawns is the driver, so
+    /// a driver that takes the endpoints and returns while `start()` is still
+    /// pending drops them before a later mark could run. On a page that is
+    /// not a narrow race but the ordinary shape of the failure this exists to
+    /// describe, and a mark placed after the await would answer
+    /// `NeverHandedOver` for exactly the call it was added to explain.
     pub fn hand_to_engine(&self) {
         // One flag, no data published behind it, and nothing orders against
         // a second atomic: `Relaxed` is the whole requirement.
