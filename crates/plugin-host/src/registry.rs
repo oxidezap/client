@@ -40,7 +40,12 @@ pub struct Registry {
     entries: Mutex<BTreeMap<String, Entry>>,
     /// What the user has allowed. Held here because the surface has to say
     /// so, and because the answer outlives any one plugin thread.
-    approvals: Approvals,
+    /// Shared with every other generation, because an answer is the *host's*
+    /// and outlives any set of workers. A generation of its own would be a
+    /// second copy read before a reload and written after one, so a
+    /// revocation landing during a load would be undone by the set that
+    /// replaced it.
+    approvals: Arc<Approvals>,
     sink: Sink,
     /// Held across taking a snapshot *and* handing it to the sink.
     ///
@@ -61,18 +66,36 @@ pub struct Registry {
     /// One late `set_roots` from a plugin nobody is running would overwrite
     /// the whole live set with the one that is gone.
     retired: std::sync::atomic::AtomicBool,
+    /// Whether this set is still being built.
+    ///
+    /// A generation loaded by a reload is not the live one until the swap, so
+    /// a plugin inserted half way through a load must not reach a window: it
+    /// would draw a control whose press is routed against the *old* registry
+    /// and a queue that is already closed — accepted, validated and silently
+    /// dropped. Loading takes up to `MAX_LOAD_TIME`, so that is a real window
+    /// rather than an instant. The first load starts announcing, because
+    /// there is no other set for it to be confused with and a window
+    /// attaching mid-load is right to see what is already running.
+    silent: std::sync::atomic::AtomicBool,
 }
 
 impl Registry {
     #[must_use]
-    pub fn new(sink: Sink, approvals: Approvals) -> Self {
+    pub fn new(sink: Sink, approvals: Arc<Approvals>, silent: bool) -> Self {
         Self {
             entries: Mutex::new(BTreeMap::new()),
             approvals,
             sink,
             publishing: Mutex::new(()),
             retired: std::sync::atomic::AtomicBool::new(false),
+            silent: std::sync::atomic::AtomicBool::new(silent),
         }
+    }
+
+    /// Let this set publish. See [`Registry::silent`].
+    pub(crate) fn announce(&self) {
+        self.silent
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Stop this set from publishing anything, ever again.
@@ -223,7 +246,9 @@ impl Registry {
             .publishing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.retired.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.retired.load(std::sync::atomic::Ordering::Relaxed)
+            || self.silent.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         let surfaces = self.surfaces();
@@ -278,7 +303,8 @@ mod tests {
             }),
             // Nowhere to write: these tests are about what the registry
             // publishes, not about what survives a restart.
-            Approvals::open(Arc::new(crate::store::Nowhere)),
+            Arc::new(Approvals::open(Arc::new(crate::store::Nowhere))),
+            false,
         );
         (registry, log)
     }

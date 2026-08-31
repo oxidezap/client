@@ -82,14 +82,21 @@ pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugin
 pub async fn reload(plugins: &Arc<Plugins>) -> usize {
     #[cfg(target_family = "wasm")]
     {
-        // A fresh handle on the origin's storage, not the old one: the
-        // retiring generation's tasks are still on this loop with a settings
-        // write ahead of them, and taking a new stamp is what stops that
-        // write landing on top of the set that replaced it. The same reason
-        // `plugins::start` takes one.
-        let modules = web::installed().await;
+        // Handed over as a future rather than as values, and that is not
+        // style: `Origin::storage()` *stamps* the origin's storage, retiring
+        // every handle taken before it. `Plugins::reload` refuses a second
+        // reload while one is running, so gathering these eagerly would let a
+        // refused call retire the handle the surviving generation is about to
+        // be installed with — every approval and settings write refused
+        // afterwards, and a revoked grant left on disk to come back. A future
+        // does nothing until it is polled, which is after the reservation.
         plugins
-            .reload(modules, Arc::new(oxidezap_plugin_host::Origin::storage()))
+            .reload(async {
+                let modules = web::installed().await;
+                let state: Arc<dyn oxidezap_plugin_host::Backing> =
+                    Arc::new(oxidezap_plugin_host::Origin::storage());
+                (modules, state)
+            })
             .await
     }
 

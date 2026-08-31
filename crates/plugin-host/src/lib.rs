@@ -39,6 +39,7 @@ mod sched;
 mod store;
 
 use portable_atomic::AtomicI64;
+use std::future::Future;
 #[cfg(not(target_family = "wasm"))]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -233,6 +234,14 @@ pub struct Plugins {
     sink: Sink,
     /// What a plugin acts through, for the same reason.
     commands: Arc<dyn Commands>,
+    /// What the user has answered, kept by the host rather than by a
+    /// generation.
+    ///
+    /// An answer is about an id and a mask, both of which outlive any set of
+    /// workers — and one copy per generation is what let a revocation land on
+    /// the set being retired while the set replacing it was built from a
+    /// snapshot taken before it. One map, one document, one lock.
+    approvals: Arc<Approvals>,
 }
 
 /// One generation of loaded plugins.
@@ -245,6 +254,13 @@ pub struct Plugins {
 struct Live {
     registry: Arc<Registry>,
     workers: Vec<Worker>,
+    /// The storage this set was built against.
+    ///
+    /// Kept because the *approvals* have to be rebound to it when this
+    /// generation is installed: a page takes a fresh handle per reload and
+    /// the older ones are refused, so the host would otherwise go on writing
+    /// answers through a store it had itself retired.
+    state: Arc<dyn Backing>,
     /// Raised once, when this generation ends.
     ///
     /// Read by every worker before it takes another event, so a plugin with a
@@ -358,11 +374,13 @@ impl Plugins {
     /// is `daemon::plugins::reload`, which puts it where `load` goes.
     #[cfg(not(target_family = "wasm"))]
     pub fn reload_from_dir(&self, dir: &Path, state_dir: Option<&Path>) -> usize {
-        let state: Arc<dyn Backing> = match usable_state_dir(state_dir) {
-            Some(dir) => Arc::new(store::Files::at(dir)),
-            None => Arc::new(Nowhere),
-        };
-        futures_lite::future::block_on(self.reload(modules_in(dir), state))
+        futures_lite::future::block_on(self.reload(async move {
+            let state: Arc<dyn Backing> = match usable_state_dir(state_dir) {
+                Some(dir) => Arc::new(store::Files::at(dir)),
+                None => Arc::new(Nowhere),
+            };
+            (modules_in(dir), state)
+        }))
     }
 
     /// Run a set of modules somebody else found.
@@ -387,7 +405,20 @@ impl Plugins {
         commands: Arc<dyn Commands>,
         sink: Sink,
     ) -> Self {
-        let live = generation(modules, state, Arc::clone(&commands), Arc::clone(&sink)).await;
+        let approvals = Arc::new(Approvals::open(Arc::clone(&state)));
+        let live = generation(
+            modules,
+            state,
+            Arc::clone(&commands),
+            Arc::clone(&sink),
+            Arc::clone(&approvals),
+            // The first load has no other set to be confused with, and a
+            // window attaching part-way through is right to be shown what is
+            // already running.
+            Announce::Now,
+            None,
+        )
+        .await;
         Self {
             live: std::sync::RwLock::new(Arc::new(live)),
             retired: AtomicBool::new(false),
@@ -395,6 +426,7 @@ impl Plugins {
             approving: Mutex::new(()),
             sink,
             commands,
+            approvals,
         }
     }
 
@@ -402,13 +434,18 @@ impl Plugins {
     /// directory to look in.
     #[must_use]
     pub fn none(sink: Sink) -> Self {
+        let approvals = Arc::new(Approvals::open(Arc::new(Nowhere)));
         Self {
-            live: std::sync::RwLock::new(Arc::new(Live::empty(Arc::clone(&sink)))),
+            live: std::sync::RwLock::new(Arc::new(Live::empty(
+                Arc::clone(&sink),
+                Arc::clone(&approvals),
+            ))),
             retired: AtomicBool::new(false),
             reloading: AtomicBool::new(false),
             approving: Mutex::new(()),
             sink,
             commands: Arc::new(NoCommands),
+            approvals,
         }
     }
 
@@ -419,6 +456,20 @@ impl Plugins {
     fn live(&self) -> Arc<Live> {
         Arc::clone(&self.live.read().unwrap_or_else(PoisonError::into_inner))
     }
+}
+
+/// When a freshly loaded set may start telling front ends what it is.
+///
+/// The first load announces as it goes, because there is nothing else for a
+/// window to confuse it with. A reload's does not: until the swap, `self.live`
+/// is still the set being retired, so a control published early is drawn by a
+/// window and routed back against the old registry and a closed queue —
+/// accepted, validated and lost. `MAX_LOAD_TIME` says how wide that window
+/// can be.
+#[derive(Clone, Copy)]
+enum Announce {
+    Now,
+    OnInstall,
 }
 
 /// Every `.wasm` in `dir` that could be a plugin, as modules nobody has
@@ -458,9 +509,16 @@ async fn generation(
     state: Arc<dyn Backing>,
     commands: Arc<dyn Commands>,
     sink: Sink,
+    approvals: Arc<Approvals>,
+    announce: Announce,
+    abandon_if: Option<&AtomicBool>,
 ) -> Live {
     {
-        let registry = Arc::new(Registry::new(sink, Approvals::open(Arc::clone(&state))));
+        let registry = Arc::new(Registry::new(
+            sink,
+            approvals,
+            matches!(announce, Announce::OnInstall),
+        ));
         let stopping = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::new();
 
@@ -485,6 +543,18 @@ async fn generation(
                 log::warn!(
                     "plugins took longer than {MAX_LOAD_TIME:?} to load; the rest is skipped"
                 );
+                break;
+            }
+            // And the account going away, which is the other reason to stop
+            // part-way. A reload can be running when `ForgetSession` lands,
+            // and the set being built is not reachable from `shutdown` — it
+            // is a local until it is installed — so what bounds the workers
+            // still starting during a wipe is this check plus the retirement
+            // the caller does when it finds the host gone. Between modules,
+            // like the clock above and for the same reason: a module being
+            // loaded cannot be interrupted.
+            if abandon_if.is_some_and(|gone| gone.load(Ordering::Relaxed)) {
+                log::warn!("the host is shutting down; the rest of the folder is skipped");
                 break;
             }
             // Before the module is opened, so the turn falls between two
@@ -559,6 +629,7 @@ async fn generation(
         Live {
             registry,
             workers,
+            state,
             stopping,
         }
     }
@@ -566,10 +637,11 @@ async fn generation(
 
 impl Live {
     /// A generation with nothing in it.
-    fn empty(sink: Sink) -> Self {
+    fn empty(sink: Sink, approvals: Arc<Approvals>) -> Self {
         Self {
-            registry: Arc::new(Registry::new(sink, Approvals::open(Arc::new(Nowhere)))),
+            registry: Arc::new(Registry::new(sink, approvals, false)),
             workers: Vec::new(),
+            state: Arc::new(Nowhere),
             stopping: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -998,7 +1070,10 @@ impl Plugins {
     /// handle is stamped: taking a fresh one is what stops the retiring
     /// generation's last write from landing on top of the new one's. A
     /// desktop's is a path and rebuilding it costs nothing.
-    pub async fn reload(&self, modules: Vec<Module>, state: Arc<dyn Backing>) -> usize {
+    pub async fn reload(
+        &self,
+        what: impl Future<Output = (Vec<Module>, Arc<dyn Backing>)>,
+    ) -> usize {
         // The account has gone. A reload here would start plugins over a
         // session that is being forgotten, which is the same thing `approve`
         // refuses and for the same reason.
@@ -1006,10 +1081,18 @@ impl Plugins {
             log::warn!("refusing to reload plugins; the host has been shut down");
             return 0;
         }
+        // Before the modules and the storage are asked for, not after. A
+        // page's storage handle is *stamped*: taking one retires every older
+        // one, so a second reload that gathered its resources and was then
+        // turned away would have retired the handle the surviving generation
+        // is about to be installed with — leaving every later approval and
+        // settings write refused until some other reload happened to succeed.
+        // A future is lazy, so nothing it does has happened yet.
         if self.reloading.swap(true, Ordering::SeqCst) {
             log::warn!("refusing to reload plugins; one is already running");
             return 0;
         }
+        let (modules, state) = what.await;
 
         self.live().retire();
         let fresh = Arc::new(
@@ -1018,20 +1101,39 @@ impl Plugins {
                 state,
                 Arc::clone(&self.commands),
                 Arc::clone(&self.sink),
+                Arc::clone(&self.approvals),
+                Announce::OnInstall,
+                Some(&self.retired),
             )
             .await,
         );
 
-        // Under the lock a shutdown also takes, and reading the flag inside
-        // it. Loading takes seconds and `ForgetSession` can land in any of
-        // them: without this the new generation would be installed over a
-        // host that had already been told the account is gone, and its
-        // plugins would be running with nothing to stop them.
+        // Under the lock a shutdown and an approval both take, and reading
+        // the flag inside it. Loading takes seconds and anything can land in
+        // any of them: without this the new generation would be installed
+        // over a host already told the account is gone, and its plugins would
+        // be running with nothing to stop them.
         let installed = {
             let _order = lock(&self.approving);
             if self.retired.load(Ordering::Relaxed) {
                 false
             } else {
+                // The answers, re-applied to the workers that have just been
+                // built. Their masks were read when each was loaded, which is
+                // before any answer given during the load — and the answers
+                // themselves are the host's one map, so this is a read of the
+                // current truth rather than a merge of two. Under the lock,
+                // so no answer can land between the read and the store.
+                //
+                // And the store, because a page's fresh handle is the one an
+                // approval must now be written through: the old one was
+                // retired by the very generation being installed.
+                self.approvals.rebind(Arc::clone(&fresh.state));
+                for worker in &fresh.workers {
+                    worker
+                        .granted
+                        .store(self.approvals.approved(&worker.id), Ordering::Relaxed);
+                }
                 *self.live.write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&fresh);
                 true
             }
@@ -1042,10 +1144,11 @@ impl Plugins {
             fresh.retire();
             return 0;
         }
-        // Announced even when nothing loaded, which is the one publication a
-        // generation does not make for itself: `Registry::insert` publishes
-        // per plugin, so a reload that ends with an empty folder would leave
-        // every front end drawing the set that is no longer running.
+        // Now, and not before: the whole set at once, which is also the one
+        // publication a generation does not make for itself. `Registry::insert`
+        // publishes per plugin, so a reload ending with an empty folder would
+        // otherwise leave every front end drawing the set that is gone.
+        fresh.registry.announce();
         fresh.registry.publish();
         fresh.workers.len()
     }
@@ -1062,6 +1165,7 @@ impl Plugins {
         // Before the lock, so a reload between the two sees it and declines
         // to install what it has just finished building.
         self.retired.store(true, Ordering::Relaxed);
+        self.wait_for_any_reload();
         // Behind the same lock an answer is recorded under, so one already
         // part-way through finishes before the flag is anybody's answer —
         // and none can start after it. Taking it here is also what orders
@@ -1074,6 +1178,44 @@ impl Plugins {
         };
         live.retire();
     }
+
+    /// Wait for a reload that is part-way through, having already told it to
+    /// stop.
+    ///
+    /// A generation being built is a local until it is installed, so
+    /// `shutdown` cannot reach it — and on a desktop what happens next is the
+    /// account's data being deleted, with that set's workers alive and their
+    /// settings writes still to come. `retired` is raised before this, so the
+    /// loader abandons the rest of the folder at the next module boundary and
+    /// retires what it started; this is the wait for that to have happened.
+    ///
+    /// Polled rather than signalled, deliberately: this runs once in the life
+    /// of a process, has exactly one waiter, and is bounded by one module's
+    /// load — a condvar would be more machinery than the thing it waits for.
+    /// The deadline is `MAX_LOAD_TIME` because that is what bounds a load, and
+    /// giving up is said out loud rather than hung on.
+    #[cfg(not(target_family = "wasm"))]
+    fn wait_for_any_reload(&self) {
+        let deadline = Instant::now() + MAX_LOAD_TIME;
+        while self.reloading.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                log::warn!("a plugin reload did not stop in time; shutting down without it");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// A page has neither half of the problem this answers.
+    ///
+    /// Nothing here can block — everything is on one agent, so waiting for a
+    /// task that can only run when this returns is a hang rather than a wait
+    /// — and there is nothing to wait *for*: the wipe a desktop is racing is
+    /// a directory being deleted, and an origin's storage is ordered by the
+    /// stamp instead, which refuses a retired handle's writes outright.
+    #[cfg(target_family = "wasm")]
+    #[allow(clippy::unused_self)]
+    fn wait_for_any_reload(&self) {}
 }
 
 impl Drop for Plugins {

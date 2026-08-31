@@ -3362,3 +3362,110 @@ fn retiring_a_generation_takes_its_authority_away() {
         "a superseded worker may no longer touch the account"
     );
 }
+
+/// An answer given while a reload is loading reaches the set that replaces
+/// it.
+///
+/// The approvals used to be the *generation's*, read from disk when it was
+/// built — so a revocation landing during a load wrote the file and the
+/// retiring set's map, and the fresh set, built from a snapshot taken before
+/// it, was installed still holding the grant. Acknowledged, and undone.
+/// One map for the host is what closes it, and re-reading each worker's mask
+/// at the install is what carries it to the workers already built.
+#[test]
+fn a_revocation_during_a_reload_is_not_undone_by_it() {
+    let dir = TempDir::new("reload-revoke-during");
+    let state = TempDir::new("reload-revoke-during-state");
+    dir.plugin("racy", &draws());
+    let published = Published::default();
+    let commands = Recorder::new(Outcome::Accepted);
+    let plugins = Arc::new(Plugins::load(
+        &dir.0,
+        Some(&state.0),
+        Arc::new(Arc::clone(&commands)),
+        published.sink(),
+    ));
+    plugins.approve("racy", true);
+    published.settles("the grant", |set| {
+        set.iter().any(|p| p.id == "racy" && p.approved)
+    });
+
+    // The revocation lands while the reload is loading. Both are ordinary
+    // calls from two connections; the thread is what makes them overlap.
+    //
+    // Whether they *do* overlap on any given run is the scheduler's business,
+    // which is why what is asserted is the invariant rather than the race:
+    // after a reload, a worker's mask is what the answers say, whenever the
+    // answer was given. That holds on the runs where the two miss each other
+    // and is exactly what a generation carrying its own snapshot of the
+    // answers got wrong on the runs where they meet.
+    let revoking = Arc::clone(&plugins);
+    let revoke = std::thread::spawn(move || revoking.approve("racy", false));
+    assert_eq!(plugins.reload_from_dir(&dir.0, Some(&state.0)), 1);
+    revoke.join().expect("the revocation finished");
+
+    let live = plugins.live();
+    assert_eq!(
+        live.workers[0].granted.load(Ordering::Relaxed),
+        0,
+        "the reloaded worker holds the answer given during the load"
+    );
+    let set = published.latest();
+    assert!(
+        set.iter().any(|p| p.id == "racy" && !p.approved),
+        "and it is drawn as withdrawn"
+    );
+
+    // And the answer is the host's one map rather than a copy per
+    // generation, which is the half that can be asked outright: a grant made
+    // now reaches the worker this reload installed.
+    plugins.approve("racy", true);
+    assert_ne!(
+        live.workers[0].granted.load(Ordering::Relaxed),
+        0,
+        "an answer after the reload reaches the set the reload installed"
+    );
+}
+
+/// A set being loaded draws nothing until it is the set that is running.
+///
+/// `Registry::insert` publishes per plugin, so a reload used to put controls
+/// on screen while `live` was still the generation being retired — and a
+/// press on one of them was routed against that old registry and its closed
+/// queues: accepted, validated against the wrong tree, and silently dropped.
+/// `MAX_LOAD_TIME` is how wide that window can be.
+#[test]
+fn a_set_still_loading_publishes_nothing() {
+    let dir = TempDir::new("reload-quiet-until-live");
+    dir.plugin("quiet", &draws());
+    let published = Published::default();
+    // Bound rather than dropped: `Plugins` shuts its workers down on drop, so
+    // a host nobody holds is a host that has already gone.
+    let _running = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    published.settles("the first set", |set| set.len() == 1);
+
+    // What the *fresh* registry would publish, asked of the mechanism rather
+    // than of a race: a generation built to announce on install is one whose
+    // publications go nowhere until it does.
+    let quiet = Arc::new(crate::registry::Registry::new(
+        published.sink(),
+        Arc::new(crate::approvals::Approvals::open(Arc::new(
+            crate::store::Nowhere,
+        ))),
+        true,
+    ));
+    let before = published.latest();
+    quiet.insert("loading", "Loading".to_owned(), 0);
+    assert_eq!(
+        published.latest(),
+        before,
+        "a set that is still loading is not drawn"
+    );
+
+    quiet.announce();
+    quiet.publish();
+    assert!(
+        published.latest().iter().any(|p| p.id == "loading"),
+        "and it is drawn once it is the set that is running"
+    );
+}

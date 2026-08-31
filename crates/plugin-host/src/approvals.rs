@@ -53,7 +53,14 @@ pub const FILE_NAME: &str = "approvals.json";
 /// The approved mask per plugin id, mirrored to a document that outlives the
 /// process.
 pub struct Approvals {
-    store: Arc<dyn Backing>,
+    /// Where the answers are kept.
+    ///
+    /// Behind a lock because a reload replaces it: a page's storage handle is
+    /// stamped, and the generation that takes a fresh one retires the handle
+    /// this was opened with — so an approval written after a reload would be
+    /// refused by a store nobody had told about the swap. See
+    /// [`Approvals::rebind`].
+    store: Mutex<Arc<dyn Backing>>,
     granted: Mutex<BTreeMap<String, i64>>,
 }
 
@@ -79,9 +86,24 @@ impl Approvals {
             })
             .unwrap_or_default();
         Self {
-            store,
+            store: Mutex::new(store),
             granted: Mutex::new(granted),
         }
+    }
+
+    /// Point at a new store, keeping the answers already in hand.
+    ///
+    /// What a reload does at the moment it installs a generation. The map is
+    /// *not* re-read: this host is the only thing that ever writes the
+    /// document — a plugin that could write its own approval would have none
+    /// — so what is in memory is what is on disk, and re-reading would only
+    /// open a window for a stale file to undo an answer given during the
+    /// load.
+    pub fn rebind(&self, store: Arc<dyn Backing>) {
+        *self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = store;
     }
 
     /// What this plugin may actually do, given what it asked for.
@@ -153,7 +175,13 @@ impl Approvals {
         let Ok(json) = serde_json::to_vec(granted) else {
             return false;
         };
-        let Err(e) = self.store.write(FILE_NAME, &json) else {
+        let store = Arc::clone(
+            &self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let Err(e) = store.write(FILE_NAME, &json) else {
             return true;
         };
         // Fail closed. Leaving the previous document is the tempting answer
@@ -165,7 +193,7 @@ impl Approvals {
         // permission nobody agreed to.
         log::warn!(
             "cannot write {}: {e}. Every plugin permission will be asked for again.",
-            self.store.describe(FILE_NAME)
+            store.describe(FILE_NAME)
         );
         // And say so when even that does not land. It is the whole of what
         // this branch is for: the caller keeps a withdrawal's in-memory
@@ -173,11 +201,11 @@ impl Approvals {
         // would leave the plugin drawn as revoked here and granted again on
         // the next start. Nothing can undo the revocation — that would be the
         // worse answer — so what is left is saying it out loud.
-        if let Err(e) = self.store.remove(FILE_NAME) {
+        if let Err(e) = store.remove(FILE_NAME) {
             log::error!(
                 "and {} could not be removed either ({e}); a permission withdrawn now may be \
                  granted again on the next start",
-                self.store.describe(FILE_NAME)
+                store.describe(FILE_NAME)
             );
         }
         false
