@@ -254,7 +254,9 @@ fn dwarf_index(html: &str) -> Result<String> {
     let opt = "data-wasm-opt=\"z\"";
     if !html.contains(opt) {
         return Err(err!(
-            "web/index.html no longer carries {opt}, which is what this build              has to turn off. `dwarf_index` in xtask/src/web.rs is what has to              learn the new spelling."
+            "web/index.html no longer carries {opt}, which is what this build \
+             has to turn off. `dwarf_index` in xtask/src/web.rs is what has to \
+             learn the new spelling."
         ));
     }
     let generated = html.replace(opt, "data-wasm-opt=\"0\"\n      data-keep-debug");

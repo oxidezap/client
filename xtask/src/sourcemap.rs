@@ -186,14 +186,20 @@ impl<'a> Module<'a> {
                     let mut inner = Cursor::new(bytes, start);
                     let n = inner.uleb()? as usize;
                     let at = inner.pos();
-                    let name = std::str::from_utf8(bytes.get(at..at + n).ok_or_else(|| {
-                        err!("a custom section's name runs past the end of the module")
-                    })?)
-                    .map_err(|_| err!("a custom section's name is not utf-8"))?;
+                    // Bounded by the *section* and not only by the file: a
+                    // length larger than the section is what would otherwise
+                    // record a payload starting past its own end, and slicing
+                    // that later is a panic rather than an error.
+                    let after = at
+                        .checked_add(n)
+                        .filter(|e| *e <= end)
+                        .ok_or_else(|| err!("a custom section's name runs past its own end"))?;
+                    let name = std::str::from_utf8(&bytes[at..after])
+                        .map_err(|_| err!("a custom section's name is not utf-8"))?;
                     if name == "sourceMappingURL" {
                         mapping.push((header, end));
                     }
-                    customs.push((name, at + n, end));
+                    customs.push((name, after, end));
                 }
                 10 => code_payload = Some(start),
                 _ => {}
@@ -575,6 +581,12 @@ fn run_program(
             0 => {
                 let len = r.uleb()? as usize;
                 let next = r.pos() + len;
+                // A length of zero declares no sub-opcode at all, so there is
+                // nothing here to interpret — and reading one anyway would be
+                // reading a byte this opcode does not claim.
+                if len == 0 {
+                    continue;
+                }
                 let sub = r.u8()?;
                 match sub {
                     // end_sequence
@@ -593,7 +605,14 @@ fn run_program(
                     }
                     // set_address
                     2 => {
-                        address = match len - 1 {
+                        // The declared length, less the sub-opcode. Zero is
+                        // not a shape any assembler emits and is exactly the
+                        // one this has to be told about rather than subtract
+                        // its way past.
+                        let operand = len
+                            .checked_sub(1)
+                            .ok_or_else(|| err!("a set_address carrying no address"))?;
+                        address = match operand {
                             4 => r.u32()? as u64,
                             8 => {
                                 let lo = r.u32()? as u64;
@@ -1425,6 +1444,45 @@ mod tests {
     /// mistake, so the old pointer comes off — and it comes off whole, since a
     /// custom section left behind in front of the code section would move
     /// every offset the next map is written against.
+    /// The contract this file's own doc comment states: bytes a compiler
+    /// wrote are walked, and a wrong turn is an error rather than an index
+    /// panic. Both of these were the second thing until a review noticed.
+    #[test]
+    fn a_malformed_module_is_an_error_rather_than_a_panic() {
+        // A custom section whose name is longer than the section holding it.
+        let bad = [
+            b"\0asm".as_slice(),
+            &[1, 0, 0, 0],
+            &[10, 1, 0],
+            // id 0, four bytes of payload, a name declared as sixty.
+            &[0, 4, 60],
+            b"abc",
+        ]
+        .concat();
+        let e = match Module::parse(&bad) {
+            Err(e) => e,
+            Ok(_) => panic!("a name past its own section should not parse"),
+        };
+        assert!(e.0.contains("past its own end"), "{}", e.0);
+
+        // An extended opcode declaring a length that leaves no room for the
+        // sub-opcode it would carry. Reading one anyway is what made
+        // `len - 1` a subtraction below zero.
+        let mut p = Program::new();
+        p.files = vec![("f.rs", 0)];
+        p.body = vec![0, 0];
+        assert!(
+            line_rows(&p.section(), &HashMap::new())
+                .expect("nothing declared is nothing to read")
+                .is_empty()
+        );
+
+        // And one that declares an address of a width this is not.
+        p.body = vec![0, 1, 2];
+        let e = line_rows(&p.section(), &HashMap::new()).expect_err("a set_address of no bytes");
+        assert!(e.0.contains("not wasm32"), "{}", e.0);
+    }
+
     #[test]
     fn a_module_that_was_mapped_before_has_its_pointer_taken_off() {
         let bare = [b"\0asm".as_slice(), &[1, 0, 0, 0], &[10, 1, 0]].concat();
