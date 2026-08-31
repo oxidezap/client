@@ -72,6 +72,21 @@ pub fn build() -> Result<()> {
     // from the build is a difference nobody sees until deploy.
     let action = env_or("TRUNK_ACTION", "build");
 
+    // The one combination that cannot mean what it says. A serve does not
+    // finish, so nothing after it runs and the map is never written; and
+    // a serve rebuilds the module whenever a file changes, so even a map
+    // written for the first artifact would describe a module that is no
+    // longer there — silently, since a stale map still parses. Refused by
+    // name rather than served unmapped.
+    if dwarf && action == "serve" {
+        return Err(err!(
+            "a dwarf build cannot be served: the map is written after the \
+             build, a serve never finishes, and a serve that rebuilt would \
+             leave the map describing a module that is gone. Build it and \
+             serve web/dist with any static server instead."
+        ));
+    }
+
     // Overridable, and split on whitespace so more than one flag fits; set it
     // to a single space to pass none.
     let profile_flags: Vec<String> = std::env::var("TRUNK_PROFILE")
@@ -126,8 +141,8 @@ pub fn build() -> Result<()> {
         .env("CARGO_UNSTABLE_BUILD_STD_FEATURES", "optimize_for_size")
         .run()?;
 
-    // A serve never finishes, so anything after the run is about a build.
-    if dwarf && action == "build" {
+    // A serve is refused above, so this is every dwarf build there is.
+    if dwarf {
         settle_index(&dist)?;
         map(&dist)?;
     }

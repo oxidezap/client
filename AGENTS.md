@@ -238,6 +238,12 @@ WEB_PROFILE=dwarf cargo xtask web build
 cargo xtask web map            # the map again, over a module already built
 ```
 
+`TRUNK_ACTION=serve` is refused for that profile rather than served unmapped:
+the map is written after the build, a serve never finishes, and a serve that
+rebuilt would leave the map describing a module that is gone — silently, since
+a stale map still parses. Build it and serve `web/dist` with any static
+server.
+
 The web half of the daemon — the OPFS folder a page installs plugins into —
 is `cfg`-gated to wasm, so `cargo test --workspace` compiles none of it. It
 has tests that run in a real browser instead, and CI runs them:
@@ -941,7 +947,18 @@ to the same problem. Nothing here needs it yet.
   is worse than one naming nothing, because nothing about it looks broken.
   And the rows the linker discarded are not removed but pointed at all-ones,
   so a generator that maps them puts every dead function's source lines over
-  whatever really is at the end of the module. Only sources under the
+  whatever really is at the end of the module.
+  Three smaller things the two formats disagree about, each of which is one
+  character or one function's worth of wrong and none of which looks wrong:
+  DWARF numbers columns from one and a source map from zero, and they agree
+  only about zero, which DWARF spends on "the left edge of the line"; where
+  several rows share an address it is the *last* that describes the code
+  starting there, the ones before it covering no bytes at all, so keeping the
+  first names the line before at every inlining boundary; and a sequence's
+  end row names no source on purpose — a source map's lookup takes the
+  segment at or before the offset, so the only way to end a range is to start
+  one that names nothing, and dropping those lets a function's closing line
+  answer for the padding and the function after it. Only sources under the
   checkout are embedded in the map: naming the standard library's files
   costs nothing and carrying `build-std`'s copy of them is most of a
   gigabyte of JSON to answer a question a file name has already answered.

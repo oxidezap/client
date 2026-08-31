@@ -63,16 +63,18 @@ pub struct Summary {
 /// JSON to answer a question a file name and a line number have already
 /// answered.
 pub fn write(wasm: &Path, root: &Path) -> Result<Summary> {
-    let bytes = fs::read(wasm).map_err(|e| err!("could not read {}: {e}", wasm.display()))?;
-    let module = Module::parse(&bytes)?;
-
-    if module.custom("sourceMappingURL").is_some() {
-        return Err(err!(
-            "{} already carries a sourceMappingURL section; this build has \
-             been mapped once already",
-            wasm.display()
-        ));
+    let mut bytes = fs::read(wasm).map_err(|e| err!("could not read {}: {e}", wasm.display()))?;
+    // A module this has already mapped is the ordinary case rather than an
+    // error: a `dwarf` build ends by mapping what it built, and `cargo xtask
+    // web map` over it again is the documented way to correct a map without
+    // paying for the build a second time. So the old pointer is taken off
+    // rather than refused — and taken off *before* anything is measured,
+    // because a custom section in front of the code section moves every offset
+    // the map is about to be written against.
+    if let Some(stripped) = without_mapping(&bytes)? {
+        bytes = stripped;
     }
+    let module = Module::parse(&bytes)?;
 
     let line = module.custom(".debug_line").ok_or_else(|| {
         err!(
@@ -120,6 +122,23 @@ pub fn write(wasm: &Path, root: &Path) -> Result<Summary> {
     })
 }
 
+/// The module without any `sourceMappingURL` section, or `None` if it had
+/// none to take off.
+fn without_mapping(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let spans = Module::parse(bytes)?.mapping;
+    if spans.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    for (start, end) in spans {
+        out.extend_from_slice(&bytes[at..start]);
+        at = end;
+    }
+    out.extend_from_slice(&bytes[at..]);
+    Ok(Some(out))
+}
+
 /// `foo_bg.wasm` -> `foo_bg.wasm.map`, which is the name the section carries
 /// and therefore a URL resolved against the module's own — so the two travel
 /// together whatever directory the bundle is unpacked into.
@@ -139,6 +158,9 @@ struct Module<'a> {
     /// are relative to.
     code_payload: usize,
     customs: Vec<(&'a str, usize, usize)>,
+    /// Whole spans, header included, of any `sourceMappingURL` section the
+    /// module already carries.
+    mapping: Vec<(usize, usize)>,
 }
 
 impl<'a> Module<'a> {
@@ -148,8 +170,10 @@ impl<'a> Module<'a> {
         }
         let mut r = Cursor::new(bytes, 8);
         let mut customs = Vec::new();
+        let mut mapping = Vec::new();
         let mut code_payload = None;
         while !r.done() {
+            let header = r.pos();
             let id = r.u8()?;
             let size = r.uleb()? as usize;
             let start = r.pos();
@@ -166,6 +190,9 @@ impl<'a> Module<'a> {
                         err!("a custom section's name runs past the end of the module")
                     })?)
                     .map_err(|_| err!("a custom section's name is not utf-8"))?;
+                    if name == "sourceMappingURL" {
+                        mapping.push((header, end));
+                    }
                     customs.push((name, at + n, end));
                 }
                 10 => code_payload = Some(start),
@@ -178,6 +205,7 @@ impl<'a> Module<'a> {
             code_payload: code_payload
                 .ok_or_else(|| err!("the module has no code section to map"))?,
             customs,
+            mapping,
         })
     }
 
@@ -371,6 +399,21 @@ impl<'a> Cursor<'a> {
 #[derive(Debug)]
 struct Row {
     offset: u64,
+    /// Where in the source this byte came from, and `None` for the row that
+    /// ends a sequence.
+    ///
+    /// A sequence's last row is one *past* the last byte the row before it
+    /// described, and it names no source. Dropping it would let a function's
+    /// closing line bleed forward over the padding and the function after it,
+    /// because a source map has no other way to say "nothing here": lookup
+    /// takes the segment at or before the offset asked about, so the only
+    /// way to end a range is to start one that names nothing.
+    at: Option<Where>,
+}
+
+/// A source position, as a source map spells one.
+#[derive(Debug)]
+struct Where {
     file: String,
     line: u32,
     column: u32,
@@ -503,9 +546,15 @@ fn run_program(
         let Some(name) = files.get(file) else { return };
         rows.push(Row {
             offset: address,
-            file: name.clone(),
-            line: line as u32,
-            column: column.min(u32::MAX as u64) as u32,
+            at: Some(Where {
+                file: name.clone(),
+                line: line as u32,
+                // DWARF numbers columns from one and keeps zero for "the left
+                // edge of the line"; a source map numbers them from zero. So
+                // the two meanings of zero coincide and everything else is one
+                // to the left, which is what saturating does here.
+                column: column.saturating_sub(1).min(u32::MAX as u64) as u32,
+            }),
         });
     };
 
@@ -530,6 +579,12 @@ fn run_program(
                 match sub {
                     // end_sequence
                     1 => {
+                        if !dropped {
+                            rows.push(Row {
+                                offset: address,
+                                at: None,
+                            });
+                        }
                         address = 0;
                         file = 1;
                         line = 1;
@@ -603,17 +658,37 @@ fn run_program(
 /// while ours come out under the checkout — the compiler remapped one and not
 /// the other, and this is not the place to have an opinion about that.
 fn resolve(comp_dir: &str, dir: Option<&str>, name: &str) -> String {
-    if name.starts_with('/') {
+    if absolute(name) {
         return name.to_string();
     }
     let path = match dir {
         Some(d) if !d.is_empty() => format!("{d}/{name}"),
         _ => name.to_string(),
     };
-    if path.starts_with('/') || comp_dir.is_empty() {
+    if absolute(&path) || comp_dir.is_empty() {
         return path;
     }
-    format!("{}/{path}", comp_dir.trim_end_matches('/'))
+    format!("{}/{path}", comp_dir.trim_end_matches(['/', '\\']))
+}
+
+/// Whether a path a compiler wrote is already rooted.
+///
+/// Asked of the string rather than of `std::path::Path`, because the answer
+/// has to be about the machine the module was *compiled* on rather than the
+/// one reading it. A Windows build writes `C:\repo\src\main.rs`, which
+/// `Path::is_absolute` on Linux calls relative — and what this answer decides
+/// is whether to put a compilation directory in front of the path, so getting
+/// it wrong builds one that is two roots long and matches nothing.
+fn absolute(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with('\\') {
+        return true;
+    }
+    // A drive letter, a colon, and a separator.
+    let mut chars = path.chars();
+    matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(c), Some(':'), Some('/' | '\\')) if c.is_ascii_alphabetic()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +898,9 @@ struct Rendered {
 /// anywhere in the string.
 fn render(rows: &[Row], module: &str, root: &Path) -> Rendered {
     let mut ordered: Vec<&Row> = rows.iter().collect();
+    // Stable, so rows at one address stay in the order the line program
+    // emitted them — which is what makes "the last one" a meaningful choice
+    // below rather than an arbitrary one.
     ordered.sort_by_key(|r| r.offset);
 
     let mut sources: Vec<String> = Vec::new();
@@ -831,39 +909,47 @@ fn render(rows: &[Row], module: &str, root: &Path) -> Rendered {
     let mut mappings = String::new();
     let (mut last_offset, mut last_source, mut last_line, mut last_column) =
         (0i64, 0i64, 0i64, 0i64);
-    let mut previous: Option<u64> = None;
     let mut emitted = 0usize;
 
-    for row in ordered {
-        // One mapping per byte. A row repeating an offset is the same
-        // instruction described twice, and the first description is the one
-        // the segment before it already carries.
-        if previous == Some(row.offset) {
+    for (i, row) in ordered.iter().enumerate() {
+        // One mapping per byte, and where several rows describe one address it
+        // is the *last* of them that describes the code starting there: the
+        // ones before it cover zero bytes each. Which is the opposite of what
+        // reads naturally, and it matters wherever a line program advances the
+        // line without advancing the address — an inlining boundary, a
+        // sequence ending exactly where the next one begins — because keeping
+        // the first names the line before.
+        if ordered.get(i + 1).map(|n| n.offset) == Some(row.offset) {
             continue;
         }
-        previous = Some(row.offset);
-
-        let source = *index.entry(row.file.as_str()).or_insert_with(|| {
-            sources.push(row.file.clone());
-            sources.len() - 1
-        }) as i64;
 
         let offset = row.offset as i64;
-        let line = row.line as i64 - 1;
-        let column = row.column as i64;
-
         if emitted > 0 {
             mappings.push(',');
         }
         vlq(&mut mappings, offset - last_offset);
+        last_offset = offset;
+        emitted += 1;
+
+        // A segment of one field is how a source map says "these bytes are
+        // nothing's": it names a generated column and no source at all, and it
+        // carries no state, so the next real segment's deltas are still
+        // against the last real one.
+        let Some(at) = &row.at else { continue };
+
+        let source = *index.entry(at.file.as_str()).or_insert_with(|| {
+            sources.push(at.file.clone());
+            sources.len() - 1
+        }) as i64;
+        let line = at.line as i64 - 1;
+        let column = at.column as i64;
+
         vlq(&mut mappings, source - last_source);
         vlq(&mut mappings, line - last_line);
         vlq(&mut mappings, column - last_column);
-        last_offset = offset;
         last_source = source;
         last_line = line;
         last_column = column;
-        emitted += 1;
     }
 
     let contents: Vec<Option<String>> = sources
@@ -1070,6 +1156,15 @@ mod tests {
         line_rows(&p.section(), &HashMap::new()).expect("a program this file assembled")
     }
 
+    /// The rows that name a source, as tuples. The boundary rows have a test
+    /// of their own.
+    fn mapped(p: &Program) -> Vec<(u64, String, u32, u32)> {
+        rows_of(p)
+            .into_iter()
+            .filter_map(|r| r.at.map(|at| (r.offset, at.file, at.line, at.column)))
+            .collect()
+    }
+
     #[test]
     fn a_program_of_standard_opcodes_reads_back_as_the_rows_it_describes() {
         let program = Program::new()
@@ -1088,14 +1183,14 @@ mod tests {
         p.files = vec![("main.rs", 1)];
         p.body = program.body;
 
-        let rows = rows_of(&p);
-        let seen: Vec<(u64, &str, u32, u32)> = rows
-            .iter()
-            .map(|r| (r.offset, r.file.as_str(), r.line, r.column))
-            .collect();
+        // The columns come back one lower than the program set them: DWARF
+        // numbers them from one and a source map from zero.
         assert_eq!(
-            seen,
-            vec![(0, "src/main.rs", 10, 4), (16, "src/main.rs", 11, 8)]
+            mapped(&p),
+            vec![
+                (0, "src/main.rs".to_string(), 10, 3),
+                (16, "src/main.rs".to_string(), 11, 7),
+            ]
         );
     }
 
@@ -1131,11 +1226,12 @@ mod tests {
             .set_address(64)
             .advance_line(2)
             .copy()
+            .advance_pc(4)
             .end_sequence()
             .body;
-        let rows = rows_of(&p);
+        let rows = mapped(&p);
         assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].offset, rows[0].line), (64, 3));
+        assert_eq!((rows[0].0, rows[0].2), (64, 3));
     }
 
     /// A special opcode is an address advance and a line advance in one byte,
@@ -1151,9 +1247,9 @@ mod tests {
         body.push(33);
         body.extend_from_slice(&[0, 1, 1]);
         p.body = body;
-        let rows = rows_of(&p);
+        let rows = mapped(&p);
         assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].offset, rows[0].line), (1, 2));
+        assert_eq!((rows[0].0, rows[0].2), (1, 2));
     }
 
     #[test]
@@ -1169,9 +1265,8 @@ mod tests {
             .copy()
             .end_sequence()
             .body;
-        let rows = rows_of(&p);
         assert_eq!(
-            rows.iter().map(|r| r.file.as_str()).collect::<Vec<_>>(),
+            mapped(&p).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
             vec!["a/one.rs", "b/two.rs"]
         );
     }
@@ -1183,6 +1278,25 @@ mod tests {
         section[4] = 5;
         let e = line_rows(&section, &HashMap::new()).expect_err("version 5");
         assert!(e.0.contains("version 5"), "{}", e.0);
+    }
+
+    /// A sequence's end is one past the last byte it described, and it names
+    /// no source. Without it the last line of a function is the answer for
+    /// every byte after it until the next function has something to say.
+    #[test]
+    fn the_end_of_a_sequence_is_a_row_that_names_nothing() {
+        let mut p = Program::new();
+        p.files = vec![("f.rs", 0)];
+        p.body = Program::new()
+            .set_address(0)
+            .copy()
+            .advance_pc(12)
+            .end_sequence()
+            .body;
+        let rows = rows_of(&p);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].at.is_some());
+        assert_eq!((rows[1].offset, rows[1].at.is_none()), (12, true));
     }
 
     #[test]
@@ -1203,6 +1317,20 @@ mod tests {
         assert_eq!(resolve("/repo", Some("src"), "/x/gen.rs"), "/x/gen.rs");
         // Nothing to resolve against leaves the path as the compiler wrote it.
         assert_eq!(resolve("", Some("src"), "main.rs"), "src/main.rs");
+        // A module compiled on Windows names its roots differently, and this
+        // runs wherever the build did.
+        assert_eq!(
+            resolve("C:\\repo", Some("src"), "main.rs"),
+            "C:\\repo/src/main.rs"
+        );
+        assert_eq!(
+            resolve("C:\\repo", Some("D:\\dep\\src"), "lib.rs"),
+            "D:\\dep\\src/lib.rs"
+        );
+        assert_eq!(
+            resolve("C:\\repo", Some("src"), "C:\\gen\\out.rs"),
+            "C:\\gen\\out.rs"
+        );
     }
 
     #[test]
@@ -1234,6 +1362,17 @@ mod tests {
         );
     }
 
+    fn row(offset: u64, file: &str, line: u32, column: u32) -> Row {
+        Row {
+            offset,
+            at: Some(Where {
+                file: file.to_string(),
+                line,
+                column,
+            }),
+        }
+    }
+
     /// The projection itself: sorted by offset, one segment per byte, deltas
     /// all the way down — and the source text of what is ours.
     #[test]
@@ -1242,43 +1381,62 @@ mod tests {
         let root = dir.path();
         let mine = root.join("mine.rs");
         fs::write(&mine, "fn main() {}\n").expect("write");
+        let mine = mine.to_string_lossy().into_owned();
 
         let rows = vec![
+            row(20, "/elsewhere/dep.rs", 7, 3),
+            row(10, &mine, 1, 0),
+            // The end of a sequence, and a row after it: what the row after
+            // proves is that a segment naming nothing carries no state, so its
+            // neighbours' deltas are still against each other.
             Row {
-                offset: 20,
-                file: "/elsewhere/dep.rs".to_string(),
-                line: 7,
-                column: 3,
+                offset: 30,
+                at: None,
             },
-            Row {
-                offset: 10,
-                file: mine.to_string_lossy().into_owned(),
-                line: 1,
-                column: 0,
-            },
-            // The same byte described twice, which a real table does at every
-            // inlining boundary.
-            Row {
-                offset: 10,
-                file: "/elsewhere/dep.rs".to_string(),
-                line: 9,
-                column: 0,
-            },
+            row(40, "/elsewhere/dep.rs", 7, 3),
         ];
 
         let out = render(&rows, "m_bg.wasm", root);
-        assert_eq!(out.rows, 2);
+        assert_eq!(out.rows, 4);
         assert_eq!(out.sources, 2);
         assert_eq!(out.embedded, 1);
-        // Offset 10 first, and the row that lost the tie is not in it.
         assert!(
-            out.text.contains("\"mappings\":\"UAAA,UCMG\""),
+            out.text.contains("\"mappings\":\"UAAA,UCMG,U,UAAA\""),
             "{}",
             out.text
         );
         assert!(out.text.contains("fn main() {}"));
         // A source outside the repository is named and not embedded.
         assert!(out.text.contains("null"));
+    }
+
+    /// Which of several rows at one address wins. The later one describes the
+    /// code that starts there; the ones before it describe no bytes at all.
+    #[test]
+    fn the_last_row_at_an_address_is_the_one_that_describes_it() {
+        let dir = TempDir::new("xtask-map").expect("a temporary directory");
+        let rows = vec![row(10, "/a.rs", 1, 0), row(10, "/b.rs", 2, 0)];
+        let out = render(&rows, "m_bg.wasm", dir.path());
+        assert_eq!(out.rows, 1);
+        assert!(out.text.contains("\"sources\":[\"/b.rs\"]"), "{}", out.text);
+    }
+
+    /// Mapping a module twice is the documented workflow rather than a
+    /// mistake, so the old pointer comes off — and it comes off whole, since a
+    /// custom section left behind in front of the code section would move
+    /// every offset the next map is written against.
+    #[test]
+    fn a_module_that_was_mapped_before_has_its_pointer_taken_off() {
+        let bare = [b"\0asm".as_slice(), &[1, 0, 0, 0], &[10, 1, 0]].concat();
+        let mut mapped = bare.clone();
+        append_custom(&mut mapped, "sourceMappingURL", &encode_name("m.map"));
+        assert_eq!(
+            without_mapping(&mapped).expect("a module this test assembled"),
+            Some(bare.clone())
+        );
+        // And a module with no pointer is left exactly as it is, rather than
+        // rewritten to the same bytes.
+        assert_eq!(without_mapping(&bare).expect("a bare module"), None);
     }
 
     #[test]
