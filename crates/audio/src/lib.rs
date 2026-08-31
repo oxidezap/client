@@ -18,6 +18,11 @@
 //! A caller sees one API either way. `oxidezap-gui` has no `cfg` in it about
 //! sound.
 
+/// How one call's audio endpoints ended, and on whose account: the engine
+/// releasing a half, a microphone that went on this side, or a call that was
+/// over before any engine received them. Portable: the rule is about channel
+/// ends, so it is stated and tested off the browser.
+pub mod call_ending;
 mod encoder;
 /// Opus packets, in the OGG stream WhatsApp expects. The container is not the
 /// codec, and only the codec was ever the problem here.

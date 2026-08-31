@@ -225,6 +225,7 @@ impl Drop for Wiring {
 pub async fn open_call_audio() -> Result<(
     async_channel::Receiver<Vec<i16>>,
     async_channel::Sender<Vec<i16>>,
+    crate::call_ending::CallAudioFacts,
 )> {
     let context = web_sys::AudioContext::new()
         .map_err(|e| anyhow!("this browser has no AudioContext: {}", describe(&e)))?;
@@ -244,7 +245,21 @@ pub async fn open_call_audio() -> Result<(
     // see `PLAYOUT_PRIME` for why it is not primed here.
     let playout: Rc<RefCell<VecDeque<f32>>> = Rc::new(RefCell::new(VecDeque::new()));
 
-    let graph = wire(&context, &stream, rate, mic_tx.clone(), Rc::clone(&playout))?;
+    // What the ending is read against: whether a track went on this side, and
+    // whether the engine ever received these endpoints at all. Both are
+    // answered outside this graph, and without them an unplugged microphone
+    // and an ordinary cancellation are both reported as the engine letting a
+    // call go. See `crate::call_ending`.
+    let facts = crate::call_ending::CallAudioFacts::default();
+
+    let graph = wire(
+        &context,
+        &stream,
+        rate,
+        mic_tx.clone(),
+        Rc::clone(&playout),
+        facts.clone(),
+    )?;
 
     // Awaited, and then checked. A context opens suspended when the page has
     // had no gesture yet, and `resume` is a promise that autoplay policy may
@@ -273,17 +288,26 @@ pub async fn open_call_audio() -> Result<(
     // One task owns the graph, and it ends when the call does. Both channels
     // are dropped together by the call's teardown, so whichever is noticed
     // first is the same ending.
+    let owned_facts = facts.clone();
     crate::web::spawn(async move {
         let graph = graph;
-        let fed = feed_playout(speaker_rx, rate, playout);
-        futures_lite::future::or(fed, async {
-            mic_tx.closed().await;
-        })
+        // Which half went is not a branch — the graph closes either way — it
+        // is the *name*, and the name is the whole diagnostic. An engine
+        // whose driver returns without ever using its transport releases both
+        // ends at the instant one that ran a whole conversation does, so the
+        // teardown looks identical from here and the log is the only place
+        // the difference can survive. See `crate::call_ending`.
+        let ending = crate::call_ending::ending(
+            feed_playout(speaker_rx, rate, playout),
+            mic_tx.closed(),
+            &owned_facts,
+        )
         .await;
+        debug!("the call's audio is ending: {}", ending.as_str());
         drop(graph);
     });
 
-    Ok((mic_rx, speaker_tx))
+    Ok((mic_rx, speaker_tx, facts))
 }
 
 /// Ask for the microphone, with the processing a call wants.
@@ -405,6 +429,7 @@ fn wire(
     rate: u32,
     mic: async_channel::Sender<Vec<i16>>,
     playout: Rc<RefCell<VecDeque<f32>>>,
+    facts: crate::call_ending::CallAudioFacts,
 ) -> Result<Graph> {
     // Taken before the capture callback moves the sender in; see the tracks'
     // `ended` handlers at the end of this function.
@@ -526,11 +551,29 @@ fn wire(
         .filter_map(|track| track.dyn_into::<web_sys::MediaStreamTrack>().ok())
         .map(|track| {
             let mic = ended_mic.clone();
+            let ended_locally = facts.clone();
+            let ended_locally_now = facts.clone();
             let ended = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
                 warn!("the call's microphone ended: its track stopped");
+                // Before the close, because closing is what wakes the arm
+                // that reads it.
+                ended_locally.capture_ended();
                 mic.close();
             });
             track.set_onended(Some(ended.as_ref().unchecked_ref()));
+            // Asked after the handler is installed, because an `ended` that
+            // has already been dispatched is not replayed for a handler
+            // attached afterwards. Belt-and-braces rather than a hole being
+            // closed: a track reaching `ended` any way but `stop()` fires the
+            // event from a queued task, which cannot run inside this
+            // synchronous block, and the only `stop()` is this graph's own
+            // teardown. What it costs is one property read, and what it buys
+            // is not having to rest a diagnostic on that argument.
+            if track.ready_state() == web_sys::MediaStreamTrackState::Ended {
+                warn!("the call's microphone had already ended when it was wired");
+                ended_locally_now.capture_ended();
+                ended_mic.close();
+            }
             ended
         })
         .collect();

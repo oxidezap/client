@@ -11,6 +11,10 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-channel = "2"
+# Portable, because `call_ending` is: the rule it states is about which half of
+# a call's audio the engine let go of, which is the same question on both
+# platforms even though only one of them has a device behind it.
+futures-lite = "2"
 log = { workspace = true }
 # The container, which is not the codec: `ogg` is plain Rust and builds for
 # every target here, so `ogg_opus` packages packets from libopus on a desktop
@@ -78,6 +82,7 @@ web-sys = { version = "0.3", features = [
     "MediaStreamConstraints",
     "Event",
     "MediaStreamTrack",
+    "MediaStreamTrackState",
     "Navigator",
     "ScriptProcessorNode",
     "Window",
@@ -85,7 +90,6 @@ web-sys = { version = "0.3", features = [
 ] }
 # Racing the call's teardown against its own playout drain. Same crate the
 # session uses for the same shape.
-futures-lite = "2"
 
 [lints]
 workspace = true

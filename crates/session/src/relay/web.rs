@@ -248,6 +248,8 @@ struct BrowserRelayChannel {
     congested: std::cell::Cell<bool>,
     /// Counted for that second line: how much media the ceiling has dropped.
     outbound_dropped: std::cell::Cell<u32>,
+    /// Whether anything has gone out yet; see [`RelayTransport::send`].
+    sent_any: std::cell::Cell<bool>,
 }
 
 /// Where an inbound packet goes, and what happens when there is no room.
@@ -365,9 +367,38 @@ impl RelayTransport for BrowserRelayChannel {
                 self.outbound_dropped.replace(0)
             );
         }
+        // Asked rather than inferred from the send returning. A channel that
+        // is `closing` or `closed` does not throw: the specification has the
+        // agent *buffer* the data, so a send onto a transport that will never
+        // deliver it comes back `Ok` — which is the one answer this marker
+        // may not take at face value, since its whole job is to say whether a
+        // packet reached the relay. An explicit error also names the state,
+        // where a `DOMException` string names the browser's wording for it.
+        //
+        // About *this packet* and never about the channel's history: a call
+        // that talked for a minute and then lost its transport takes this
+        // exit too, and a line here claiming nothing was carried would
+        // contradict the release line that correctly says it was.
+        if self.channel.ready_state() != web_sys::RtcDataChannelState::Open {
+            return Err(anyhow!(
+                "the relay channel is not open ({:?}); this packet was not sent",
+                self.channel.ready_state()
+            ));
+        }
         self.channel
             .send_with_u8_array(&data)
-            .map_err(|e| anyhow!("relay channel send failed: {}", describe(&e)))
+            .map_err(|e| anyhow!("relay channel send failed: {}", describe(&e)))?;
+        // Marked *here*, and nowhere earlier: the question this answers is
+        // whether the driver ever got a packet onto the transport, so a send
+        // the browser rejected and a packet this side dropped for congestion
+        // both have to leave it unset — either would otherwise let a channel
+        // that carried nothing be released claiming it had. The first one,
+        // and only the first: at a call's frame rate the rest is a line per
+        // 20ms.
+        if !self.sent_any.replace(true) {
+            debug!("voip: the relay channel carried its first outbound packet");
+        }
+        Ok(())
     }
 
     async fn disconnect(&self) {
@@ -393,6 +424,20 @@ impl Drop for BrowserRelayChannel {
         // early return below is what makes this the only safe place for it:
         // it skips the closes, and it must not skip this.
         detach(&self.channel);
+        // Paired with the first-send line: together they say whether the
+        // driver ever used this transport. Dropped having sent nothing means
+        // the call's driver returned without asking the relay for anything,
+        // which is a very different fault from one that sent and then lost
+        // the channel — and the two are indistinguishable from a teardown
+        // that reports neither.
+        debug!(
+            "voip: the relay channel is being released (it {} anything)",
+            if self.sent_any.get() {
+                "sent"
+            } else {
+                "never sent"
+            }
+        );
         if self.closed.replace(true) {
             return;
         }
@@ -583,6 +628,7 @@ async fn connect_peer_connection(
             closed: std::cell::Cell::new(false),
             congested: std::cell::Cell::new(false),
             outbound_dropped: std::cell::Cell::new(0),
+            sent_any: std::cell::Cell::new(false),
         }),
         events_rx,
     ))

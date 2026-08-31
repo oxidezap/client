@@ -2022,6 +2022,53 @@ by definition.
   everywhere, telling somebody to answer in the other tab while destroying
   the call they would have answered there.
 
+- **A call's devices are held open by the engine, so letting go of them is
+  evidence.** The two channel ends handed to the library — the receiver it
+  takes microphone frames from, the sender it plays the peer out of — are the
+  whole of what keeps a call's audio graph alive. An engine that runs a
+  conversation and stops releases both when its driver returns, and one whose
+  driver returns without ever using its transport releases them at the same
+  instant in the same way. From inside the graph the two are identical, which
+  is why a browser call that ended a moment after connecting produced three
+  reports with nothing in them. `audio::call_ending` names which half went and
+  the relay says whether it ever carried a packet; together they separate a
+  call that ended from one that never started, which no single line on either
+  side can. Portable and tested off the browser, because the rule is about
+  channel ends rather than about devices.
+  Two things keep that evidence honest, and both are the same mistake in
+  opposite directions: attributing to the far side something this side did.
+  A microphone unplugged or revoked is closed *here*, from the track's own
+  `ended` handler, and the sender closing is the same observation either way
+  — so the capture arm asks whether that happened and reports `CaptureLost`
+  rather than blaming the engine for a device that went away. And the relay's
+  first-packet marker is set after the browser has *accepted* a send, never
+  before: a rejected send and a packet dropped for congestion both return
+  early, and either would otherwise let a channel that carried nothing be
+  released claiming it had — nor from a send that *returned*, since a channel
+  that is `closing` or `closed` has the agent buffer the data rather than
+  throw, so `Ok` there is a packet that will never leave. `CallAudioFacts`
+  carries the third: endpoints dropped before any engine received them — a
+  call hung up while `getUserMedia` was still in front of a permission prompt
+  — release both ends at once in exactly the way a driver returning does, and
+  that ordinary cancellation is not evidence about a driver there was none
+  of. Which is why the handoff is marked after the `start()` that took the
+  endpoints, and *before* the `start()` that takes them rather than after:
+  `start()` awaits and what it spawns is the driver, so on a page — one loop
+  for every task — a driver that takes the endpoints and returns while
+  `start()` is still pending drops them before a later mark could run, and
+  the ending would read as never handed over for exactly the call the flag
+  exists to explain. Where it sits is the real transfer: the builder holds
+  the endpoints, nothing above may return any more, and no `await` separates
+  it from the handover. Every exit before that drops the builder with them
+  inside it. A local loss outranks that gate rather than
+  being filtered by it — a microphone unplugged while the *camera* is still
+  opening has not been handed over and has not been cancelled either, and the
+  device is the only evidence there is. It outranks the *arm* as well: a local
+  loss and an engine letting go leave both futures ready before the race is
+  polled, so what this side knows is read over which future won rather than
+  inside it. Safe to prefer because the teardown's own `stop()` does not fire
+  `ended` — nothing on the way out can set that flag.
+
 - **An abort drops a future where it stands, and an unpolled future leaves
   nothing behind.** The library ends work by aborting the handle its runtime
   handed back, and `set_media_task` uses that deliberately: a media task whose

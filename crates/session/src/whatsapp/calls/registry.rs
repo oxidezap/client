@@ -773,7 +773,7 @@ impl WhatsAppClient {
                 error!("Client not available for accepting call");
                 return;
             };
-            let (mic, speaker) = match open_call_audio().await {
+            let (mic, speaker, audio_facts) = match open_call_audio().await {
                 Ok(audio) => audio,
                 Err(err) => {
                     error!("Audio device setup failed: {err}");
@@ -845,6 +845,17 @@ impl WhatsAppClient {
                 Some(endpoints) => accept.video(endpoints.source, endpoints.sink),
                 None => accept,
             };
+            // Before the `start()`, not after it. `start()` awaits, and what
+            // it spawns is the driver — so on a page, where every task shares
+            // one loop, a driver that takes the endpoints and returns *while
+            // this is still pending* drops them before a mark placed after
+            // the await could run. That is precisely the failure being
+            // hunted, so a mark there would report `NeverHandedOver` for the
+            // one call it exists to describe. Here is where ownership really
+            // moves: the builder holds the endpoints, nothing above may
+            // return any more, and no `await` separates this from the call
+            // that hands it over.
+            audio_facts.hand_to_engine();
             match accept.start().await {
                 Ok(handle) => {
                     let handle = Arc::new(handle);
@@ -1354,7 +1365,7 @@ impl WhatsAppClient {
                 notify_failure("client not available".to_string()).await;
                 return;
             };
-            let (mic, speaker) = match open_call_audio().await {
+            let (mic, speaker, audio_facts) = match open_call_audio().await {
                 Ok(audio) => audio,
                 Err(err) => {
                     notify_failure(format!("audio device setup failed: {err}")).await;
@@ -1416,6 +1427,10 @@ impl WhatsAppClient {
                 return;
             }
 
+            // See the accept path for why this is before the await and not
+            // after it. The cancellation check above is the last exit, and it
+            // drops the builder with the endpoints inside it.
+            audio_facts.hand_to_engine();
             match outgoing.start().await {
                 Ok(handle) => {
                     let call_id = handle.call_id().to_string();
