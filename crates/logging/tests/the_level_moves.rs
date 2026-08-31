@@ -61,6 +61,15 @@ fn written() -> Vec<String> {
 
 #[test]
 fn a_level_raised_at_runtime_reaches_the_logger() {
+    // The environment is not this test's subject, and `apply` reads it: the
+    // maximum it sets clears anything `RUST_LOG` named a target for, so a
+    // shell with `RUST_LOG=oxidezap_session=trace` in it would raise the
+    // number this asserts on. Sound where it stands — the only test in this
+    // binary, before it has spawned anything.
+    unsafe {
+        std::env::remove_var("RUST_LOG");
+    }
+
     let recorder: &'static Recorder = Box::leak(Box::new(Recorder {
         quiet: &["noisy_renderer"],
     }));
@@ -83,8 +92,10 @@ fn a_level_raised_at_runtime_reaches_the_logger() {
 
     // And `log`'s own maximum moved with it. Without this the macro never
     // builds the record at all, so a logger that would have kept it never
-    // sees one.
-    assert_eq!(log::max_level(), log::LevelFilter::Debug);
+    // sees one. A floor rather than an equality: the maximum is also what
+    // clears a target `RUST_LOG` named, and this is a statement about the
+    // level being reachable rather than about nothing else raising it.
+    assert!(log::max_level() >= log::LevelFilter::Debug);
 
     // Down again, because "any level" includes the quiet ones — a person who
     // has finished debugging asks for silence, and `off` has to mean it.
