@@ -526,46 +526,6 @@ impl Plugins {
     /// running, records itself, and the reload it was counting on has already
     /// decided it is finished — and every arrangement of two atomics has that
     /// gap somewhere.
-    fn take_pending_reload(&self) -> bool {
-        loop {
-            // Giving it up is the compare-exchange, not a store: an ask that
-            // arrives one instruction later then finds the slot free and runs
-            // itself, and one that arrived one instruction earlier has
-            // already turned this into `OWED`, so the exchange fails and the
-            // branch below takes its pass. There is no order in which it is
-            // neither.
-            if self
-                .reload
-                .compare_exchange(
-                    reload::RUNNING,
-                    reload::IDLE,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-                .is_ok()
-            {
-                return false;
-            }
-            if self
-                .reload
-                .compare_exchange(
-                    reload::OWED,
-                    reload::RUNNING,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-                .is_ok()
-            {
-                return true;
-            }
-            // Neither, which means the word is `IDLE` and this caller does
-            // not own the slot at all. Nothing to give up and nothing owed.
-            if self.reload.load(Ordering::SeqCst) == reload::IDLE {
-                return false;
-            }
-        }
-    }
-
     /// Whether the account has gone and this host with it.
     ///
     /// Asked by a caller that has something irreversible to do between two of
@@ -601,11 +561,76 @@ mod reload {
 ///
 /// A guard rather than a store at each exit, for the one exit that cannot
 /// have a store: an unwind. See [`Plugins::reload`].
-struct Reservation<'a>(&'a AtomicU32);
+struct Reservation<'a> {
+    word: &'a AtomicU32,
+    /// Whether this reload still owns the slot.
+    ///
+    /// The guard cannot release unconditionally, and that was a real bug
+    /// rather than a tidiness point: once [`Reservation::another_pass`] has
+    /// handed the slot back, a *successor* may already have claimed it, and a
+    /// store of `IDLE` on the way out then takes it away from them — letting a
+    /// third reload build concurrently, and letting `wait_for_any_reload`
+    /// decide there is nothing in flight while a wipe proceeds.
+    ///
+    /// So releasing is something this guard does, once, and remembers.
+    held: AtomicBool,
+}
+
+impl Reservation<'_> {
+    fn new(word: &AtomicU32) -> Reservation<'_> {
+        Reservation {
+            word,
+            held: AtomicBool::new(true),
+        }
+    }
+
+    /// Finish a pass: take another if one is owed, or give the slot up.
+    ///
+    /// One `compare_exchange` per outcome and not a read followed by a store,
+    /// which is the whole reason the state is a word. Releasing the slot and
+    /// *then* looking for a pending ask leaves a gap an ask can land in — it
+    /// sees a reload running, records itself, and the reload it was counting
+    /// on has already decided it is finished — and every arrangement of two
+    /// atomics has that gap somewhere.
+    fn another_pass(&self) -> bool {
+        // Owed first. While this reload owns the slot the word is `RUNNING` or
+        // `OWED` and nothing else can change it, so exactly one of these two
+        // exchanges succeeds.
+        if self
+            .word
+            .compare_exchange(
+                reload::OWED,
+                reload::RUNNING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        // Given up. An ask arriving one instruction later finds the slot free
+        // and runs itself; one that arrived an instant earlier turned the word
+        // into `OWED` and was taken above.
+        let _ = self.word.compare_exchange(
+            reload::RUNNING,
+            reload::IDLE,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        self.held.store(false, Ordering::SeqCst);
+        false
+    }
+}
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.0.store(reload::IDLE, Ordering::SeqCst);
+        // Only what is still ours. On the ordinary path `another_pass` has
+        // already released it and said so; what is left here is the unwinding
+        // one, where the word is whatever this reload left it as and nobody
+        // else can have taken it.
+        if self.held.load(Ordering::SeqCst) {
+            self.word.store(reload::IDLE, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1284,7 +1309,7 @@ impl Plugins {
         // A pending ask goes with it. An unwind is not a reload that
         // finished, so nothing here can honour one, and leaving the word
         // saying "another is owed" would leave it owed to nobody.
-        let _slot = Reservation(&self.reload);
+        let slot = Reservation::new(&self.reload);
 
         loop {
             let Some((modules, state)) = what().await else {
@@ -1302,7 +1327,7 @@ impl Plugins {
                 // clears the flag as it takes it, so a folder that is still
                 // unreadable ends the second time with nothing pending rather
                 // than spinning on a storage error.
-                if self.take_pending_reload() {
+                if slot.another_pass() {
                     continue;
                 }
                 return self.live().workers.len();
@@ -1373,7 +1398,7 @@ impl Plugins {
             // finishing is the same decision: either this takes another pass
             // or it gives the slot up, in one step that nothing can land in
             // the middle of.
-            if self.take_pending_reload() {
+            if slot.another_pass() {
                 continue;
             }
             return running;
