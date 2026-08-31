@@ -90,12 +90,31 @@ The web half of the daemon — the OPFS folder a page installs plugins into —
 is `cfg`-gated to wasm, so `cargo test --workspace` compiles none of it. It
 has tests that run in a real browser instead, and CI runs them:
 
+These run on **stable** with the wasm target, which is a different toolchain
+from the web *bundle* above — that one needs nightly, this one does not. On a
+clean machine, provision what CI provisions first. The runner and the
+`wasm-bindgen` crate this workspace resolves are two halves of one version, so
+take the pin from `Cargo.lock` rather than from this line:
+
 ```bash
-# The driver must match the browser's major version. `RUSTFLAGS` here
-# *replaces* the root's wasm flags, which is deliberate: those are the web
-# front end's, and a shared memory would need headers this runner does not
-# serve. The Web Locks cfg is the one that has to stay.
-CHROMEDRIVER=$(which chromedriver) \
+rustup target add wasm32-unknown-unknown          # for stable, not nightly
+cargo install wasm-bindgen-cli --version 0.2.127  # must match Cargo.lock
+# Chrome and a matching chromedriver, however your platform supplies them.
+```
+
+```bash
+# The driver must match the browser's major version. `CHROMEWEBDRIVER`, when
+# the environment sets it, is the *directory* holding the driver, so join the
+# binary onto it and fall back to the path — `which chromedriver` alone comes
+# back empty whenever that directory is not itself on `PATH`. This is what CI
+# does.
+export CHROMEDRIVER="${CHROMEWEBDRIVER:-}/chromedriver"
+test -x "$CHROMEDRIVER" || CHROMEDRIVER=$(command -v chromedriver)
+
+# `RUSTFLAGS` here *replaces* the root's wasm flags, which is deliberate:
+# those are the web front end's, and a shared memory would need headers this
+# runner does not serve. The Web Locks cfg is the one that has to stay.
+CHROMEDRIVER="$CHROMEDRIVER" \
 RUSTFLAGS='--cfg web_sys_unstable_apis' \
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   cargo test -p oxidezap-daemon --lib --target wasm32-unknown-unknown

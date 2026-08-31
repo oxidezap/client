@@ -35,8 +35,13 @@ So the budget is a shared resource with a fixed size, and every `save-if` in
 these workflows is a claim on it. Two rules follow, and both are already in the
 files:
 
-- **Only `main` writes.** A pull request restores and never saves, or every
-  branch would push out the one entry every other branch restores from.
+- **Only `main` writes — with one exception worth knowing before you do the
+  arithmetic.** A pull request restores and never saves, or every branch would
+  push out the one entry every other branch restores from. The exception is
+  `web-bundle.yml`: its rust-cache step carries a `key` but no `save-if`, and
+  `release.yml` calls it on a tag, so a release writes an entry too. Count it
+  when sizing the budget, or release builds evict the `main` entries this
+  policy exists to protect.
 - **A job that is nobody's critical path does not cache a target directory.**
   The five entries the other workflows write come to 8 GB of the 10 —
   2.17 GB for the Linux `Check`, 2.07 for Windows, 1.64 for macOS, 0.87 for

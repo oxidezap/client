@@ -312,8 +312,11 @@ a keyframe, a gap makes it wait again, the peer's parameter set is read before
 the decoder is allowed to allocate from it, and their orientation is *undone*
 rather than repeated. What it does not have is the thread per direction, and
 does not need one: `VideoDecoder` is already asynchronous, so the work the
-thread was there to move off the caller happens off it anyway. It is only
-reachable attached to an `oxidezapd`, which is where calls happen at all.
+thread was there to move off the caller happens off it anyway. This was once
+reachable only attached to an `oxidezapd`, back when that was the only place
+calls happened; `video/call_unsupported.rs` takes a `CallVideoFrame` and builds
+a `webcodecs::Decoder` for it, so a page holding its own session decodes call
+video too.
 
 The video decoder is worth reading as the shape it is rather than as a
 backend swap. openh264 is *pulled* — hand it an access unit, get a picture on

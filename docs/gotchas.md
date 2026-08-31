@@ -2,9 +2,12 @@
 
 Non-obvious behaviour, and the reasoning behind it. Read the entry before changing the code it describes.
 
-- **The platform split lives in exactly two places.** `ipc/endpoint/` is the
-  client end and `daemon/listener/` is the server end; everything above them
-  — framing, requests, the whole protocol — is written once. A Unix socket is
+- **A *transport's* platform split lives in exactly two places.**
+  `ipc/endpoint/` is the client end and `daemon/listener/` is the server end;
+  everything above them — framing, requests, the whole protocol — is written
+  once. Transports only: a capability crate owns its own split, which is what
+  `audio/src/web/`, `video/src/web/` and `session/src/exec/` are, and a new
+  backend for one of those does not belong under ipc or daemon. A Unix socket is
   a filesystem entry that survives a crash and a named pipe is a name that
   does not, which is why reclaiming a stale endpoint exists on one and not the
   other — and why the Windows listener builds a security descriptor by hand,

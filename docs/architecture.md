@@ -141,13 +141,16 @@ moment it is dropped in the folder — and `autoreply/` is the same shape with
 something in it.
 
 `xtask/` is the repository's own tooling — the web build, the bundle checks,
-and the `gh-pages` publisher — and it is excluded from the workspace for a
-reason of its own rather than the plugins'. The Pages publish job holds
+and the `gh-pages` publisher — and it sits outside the workspace for a reason
+of its own rather than the plugins'. Not by way of `exclude`, which names only
+`examples`: it is simply not in `members`, and carries its own `[workspace]`. The Pages publish job holds
 `contents: write` and checks out one directory; a workspace member would make
 cargo resolve the whole graph, every git dependency among them, before it
 could compile a binary that needs none of it. So it carries its own
 `[workspace]`, takes no dependencies at all, and CI runs its tests against its
-own manifest the way it runs the example plugins'. What lives there was shell
+own manifest. The example plugins get no such job: **nothing in CI builds or
+tests either one**, and the test that loads a real module is `#[ignore]`d, so a
+change under `examples/` is checked by whoever makes it or not at all. What lives there was shell
 until it was not: a compare-and-swap against a branch, and a three-way "is
 this still wanted" whose one wrong reading — an operational failure collapsing
 into "stand down" — is a deployment that silently does not happen while the
