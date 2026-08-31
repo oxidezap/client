@@ -788,6 +788,13 @@ pub struct WhatsAppApp {
     /// there is one only this side can carry across a reload. It does not on
     /// a desktop, where the stored answer is the daemon's own file and the
     /// daemon read it before this window existed.
+    ///
+    /// And never where this run was given a level from outside. `?log=` wins
+    /// over the stored choice for the run it was given for, which is the
+    /// whole of the precedence — so seeding from the store there would send
+    /// the stored level at the first connection and, in the tab holding the
+    /// account, hand it to a daemon sharing this process's own logging
+    /// state: `?log=off` beside a stored `debug` would turn itself back on.
     log_level_asked: Option<oxidezap_core::LogLevel>,
     /// Expires them. Alive only while something is up.
     #[allow(dead_code)]
@@ -1068,9 +1075,10 @@ impl WhatsAppApp {
             error_detail_open: false,
             notices: Vec::new(),
             next_notice_id: 0,
-            log_level_asked: crate::platform::log_store::is_ours()
-                .then(oxidezap_logging::stored)
-                .flatten(),
+            log_level_asked: (crate::platform::log_store::is_ours()
+                && oxidezap_logging::forced().is_none())
+            .then(oxidezap_logging::stored)
+            .flatten(),
             notice_task: None,
             downloads_in_flight: std::collections::HashSet::new(),
             call_state: CallState::new(),
