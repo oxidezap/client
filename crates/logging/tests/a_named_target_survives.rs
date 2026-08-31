@@ -39,6 +39,13 @@ fn a_target_named_in_the_environment_is_heard_at_its_own_level() {
         assert!(!log::log_enabled!(target: "somebody_else", log::Level::Debug));
     }
 
+    // A prefix is a prefix, `::` or not: `env_filter` matches `a_named…`
+    // against `a_named_target_extra` too, and a gate that read the boundary
+    // more strictly than the filter it guards would refuse a line the
+    // environment asked for and the filter would have written.
+    assert!(log::log_enabled!(target: "a_named_target_extra", log::Level::Debug));
+    assert!(log::log_enabled!(target: "a_named_target::inner", log::Level::Debug));
+
     // The floors still hold: a directive raises what it names and nothing
     // else, whatever the process level is.
     oxidezap_logging::apply(LogLevel::Trace);

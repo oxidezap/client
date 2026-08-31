@@ -351,11 +351,18 @@ mod imp {
         /// directive for `oxidezap_session` and one for
         /// `oxidezap_session::whatsapp` are two answers about one record, and
         /// the more specific one is the one that was meant.
+        ///
+        /// A bare prefix and not one that has to end at a `::`, which is also
+        /// `env_filter`'s rule — `foo=debug` matches `foobar` there. Reading
+        /// it more strictly here is not a stricter policy but a dropped
+        /// record: this gate only decides what the inner filter is *allowed*
+        /// to answer about, and a target it accepts that this refuses is a
+        /// line the environment asked for and nothing writes.
         fn named(&self, metadata: &log::Metadata<'_>) -> bool {
             let target = metadata.target();
             self.named
                 .iter()
-                .filter(|(name, _)| target == name || target.starts_with(&format!("{name}::")))
+                .filter(|(name, _)| target.starts_with(name.as_str()))
                 .max_by_key(|(name, _)| name.len())
                 .is_some_and(|(_, level)| metadata.level() <= *level)
         }
