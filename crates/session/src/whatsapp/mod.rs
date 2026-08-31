@@ -528,7 +528,19 @@ impl WhatsAppClient {
         // what would make them smaller is moving the session off the window's
         // agent altogether. What this does is stop one freeze being the shape
         // of it, and name where a page's first second goes at all: the module
-        // is stripped, so a flame graph of it names nothing.
+        // is stripped, so a flame graph of it names nothing. A turn is an
+        // *opportunity* to draw rather than a promise of one — the browser
+        // decides whether a rendering pass fits between two tasks — which is
+        // the honest claim and still the difference between five chances and
+        // none.
+        //
+        // What a turn does not open is a teardown racing this. It lets the
+        // bridge's loop run, so a `ForgetSession` can be accepted while the
+        // store is still opening — but that was already true at `prepare`,
+        // which really does await the browser, and what would make it
+        // dangerous is ordered elsewhere: `close` raises the shutdown and
+        // *joins the executor*, so a wipe waits for this future to return and
+        // the forget path is gated on whether it did.
         let cold_start = wacore::time::Instant::now();
         // Whatever this platform has to do before a database can be opened
         // at all. Here rather than at the caller, because forgetting it is

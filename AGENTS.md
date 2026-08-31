@@ -1872,8 +1872,10 @@ by definition.
   the microtask it started in. `run_client` now breathes between the phases
   and times each one, which changes the shape and not the total: a `info` line
   says where a page's first second went, in a module whose symbols are
-  stripped and whose flame graph therefore names nothing. The total is still
-  the worker's to remove.
+  stripped and whose flame graph therefore names nothing. A turn is an
+  opportunity to draw rather than a promise of one — the browser decides
+  whether a rendering pass fits between two tasks — and the total is still the
+  worker's to remove.
 
 - **The session runs in the browser, and pairing is measured now.** A page
   with no daemon named starts its own, and the whole of it works against
