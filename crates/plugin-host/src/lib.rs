@@ -397,20 +397,27 @@ impl Plugins {
             // that was private at startup may not be now, and the answer to
             // that is the store the answers are then kept in — or refused,
             // which `rebind` turns into every plugin being unapproved again.
+            // The folder first, and the state directory only once there is
+            // going to be a reload. `None` here is a folder that could not be
+            // *read*, which leaves the running set alone rather than
+            // replacing it with an empty one — not the same as a folder that
+            // is absent, or one this host refuses to trust, both of which are
+            // answers a reload should act on.
+            //
+            // Asking in this order matters because the two questions are not
+            // independent. `usable_state_dir` is re-asked on every scan, and
+            // its refusal is meant to take effect — grants cleared, storage
+            // dropped — which only happens at the install. Deciding it first
+            // and then abandoning the reload left that refusal discovered and
+            // not applied, with the running generation carrying on through
+            // the very directory just declared unsafe. Nothing is asked about
+            // it unless the answer is going to be used.
+            let modules = modules_in(dir)?;
             let state: Arc<dyn Backing> = match usable_state_dir(state_dir) {
                 Some(dir) => Arc::new(store::Files::at(dir)),
                 None => Arc::new(Nowhere),
             };
-            // A directory that cannot be read at all is `discover`'s empty
-            // answer either way, which is the same thing it has always meant
-            // here: the desktop's scan cannot tell a missing folder from an
-            // unreadable one, and a missing folder is the ordinary machine.
-            // `None` where the folder could not be read, which leaves the
-            // running set alone rather than replacing it with an empty one.
-            // Not the same as a folder that is absent, or one this host
-            // refuses to trust: those are answers, and a reload finding
-            // either *should* stop what is running.
-            Some((modules_in(dir)?, state))
+            Some((modules, state))
         }))
     }
 
@@ -1327,6 +1334,17 @@ impl Plugins {
         // finished, so nothing here can honour one, and leaving the word
         // saying "another is owed" would leave it owed to nobody.
         let slot = Reservation::new(&self.reload);
+        // And asked again, now that the slot is held. The check above is
+        // outside it, so a shutdown landing between the two would set the
+        // flag, see an `IDLE` word, decide nothing is in flight and let the
+        // wipe proceed — and this reload would then build a generation over
+        // an account that has gone. Holding the slot first is what makes the
+        // question worth asking twice: from here on `shutdown` either sees
+        // this claim and waits, or has already raised the flag and is seen.
+        if self.retired.load(Ordering::Relaxed) {
+            log::warn!("refusing to reload plugins; the host has been shut down");
+            return 0;
+        }
 
         loop {
             let Some((modules, state)) = what().await else {
