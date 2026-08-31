@@ -213,8 +213,8 @@ async fn a_page_reloads_its_plugins_from_its_own_folder() {
     ));
     assert_eq!(
         super::super::reload(&host).await,
-        0,
-        "an empty folder runs nothing"
+        oxidezap_plugin_host::Reloaded::Ran(0),
+        "an empty folder runs nothing, and that is a reload that happened"
     );
 
     // Not a module that loads: the smallest parseable one exports no
@@ -225,6 +225,9 @@ async fn a_page_reloads_its_plugins_from_its_own_folder() {
     install("reloaded.wasm", MODULE.to_vec())
         .await
         .expect("a module is installed");
-    assert_eq!(super::super::reload(&host).await, 0);
+    assert_eq!(
+        super::super::reload(&host).await,
+        oxidezap_plugin_host::Reloaded::Ran(0)
+    );
     empty_the_folder().await;
 }
