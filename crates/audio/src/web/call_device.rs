@@ -132,6 +132,7 @@ impl Drop for Graph {
         let _ = self.capture.disconnect();
         let _ = self.playout.disconnect();
         let mut stopped = 0usize;
+        let mut still_live = 0usize;
         for track in self.stream.get_tracks().iter() {
             if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
                 // Before `stop`, and before the closures below are dropped
@@ -140,15 +141,48 @@ impl Drop for Graph {
                 // trap rather than a missed event, so nothing is left armed.
                 track.set_onended(None);
                 track.stop();
-                stopped += 1;
+                // Asked rather than assumed. `stop()` sets `readyState` to
+                // `ended` synchronously, so a track still live here is a
+                // device this teardown did not release — which is what a
+                // person reports as a tab that keeps its microphone, and it
+                // is precisely what a count of `stop()` *calls* cannot show.
+                if track.ready_state() == web_sys::MediaStreamTrackState::Ended {
+                    stopped += 1;
+                } else {
+                    still_live += 1;
+                }
             }
         }
-        let _ = self.context.close();
         // The count, because "the graph is closed" was a sentence this line
         // could print while releasing nothing: a stream whose tracks it could
         // not read looks exactly the same in a log as one it stopped. A zero
         // here is a microphone still running, and it names itself.
-        debug!("the call's audio graph is closed ({stopped} track(s) stopped)");
+        if still_live == 0 {
+            debug!("the call's audio graph is closed ({stopped} track(s) stopped)");
+        } else {
+            warn!(
+                "the call's audio graph is closed but {still_live} track(s) are still live                  ({stopped} stopped): this tab is still holding the microphone"
+            );
+        }
+        // Closing the context is the other half of letting the device go, and
+        // its answer used to be discarded twice over — the synchronous `Err`
+        // and the promise's rejection both. A context that will not close is
+        // a graph still reading the microphone while every line above says it
+        // was released, which is the one shape a log cannot be allowed to
+        // hide after a session spent hunting exactly that.
+        match self.context.close() {
+            Ok(closing) => {
+                crate::web::spawn(async move {
+                    if let Err(e) = wasm_bindgen_futures::JsFuture::from(closing).await {
+                        warn!("the call's audio context would not close: {}", describe(&e));
+                    }
+                });
+            }
+            Err(e) => warn!(
+                "the call's audio context refused to close: {}",
+                describe(&e)
+            ),
+        }
     }
 }
 

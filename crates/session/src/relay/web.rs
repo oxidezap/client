@@ -328,8 +328,8 @@ impl Inbound {
 #[async_trait(?Send)]
 impl RelayTransport for BrowserRelayChannel {
     async fn send(&self, data: Bytes) -> Result<()> {
-        // `send_with_u8_array` copies into the channel's own buffer and
-        // returns: it is not backpressure, and a channel configured
+        // `send` copies into the channel's own buffer and returns: it is not
+        // backpressure, and a channel configured
         // `maxRetransmits: 0` still queues locally when SCTP cannot get the
         // bytes out. So a congested path accumulates seconds of RTP that is
         // obsolete by the time it leaves — the exact thing the rest of this
@@ -385,8 +385,28 @@ impl RelayTransport for BrowserRelayChannel {
                 self.channel.ready_state()
             ));
         }
+        // Copied out of linear memory, not viewed into it — the same rule
+        // `net/web.rs` states for the socket, and for the same reason. This
+        // module is built with `--shared-memory`, so a `Uint8Array` over the
+        // wasm heap is a *shared* view, and `RTCDataChannel.send` refuses
+        // those exactly as `WebSocket.send` does. `send_with_u8_array` hands
+        // it one.
+        //
+        // What that cost was worth saying out loud: every relay send threw,
+        // the driver treats a failed send as terminal and tears the call down
+        // *publishing nothing*, so a call opened its relay and ended a moment
+        // later with no error anywhere. Not one browser call has ever carried
+        // a packet.
+        let bytes = js_sys::Uint8Array::from(&data[..]);
         self.channel
-            .send_with_u8_array(&data)
+            .send_with_array_buffer(&bytes.buffer())
+            .inspect_err(|e| {
+                // Said here because nowhere else will: the drive loop's
+                // in-flight send arm answers `Err` with `break 'drive` and
+                // discards the reason, so a transport that cannot write is
+                // otherwise a call that ends for no stated reason.
+                warn!("voip: the relay channel refused a packet: {}", describe(e));
+            })
             .map_err(|e| anyhow!("relay channel send failed: {}", describe(&e)))?;
         // Marked *here*, and nowhere earlier: the question this answers is
         // whether the driver ever got a packet onto the transport, so a send

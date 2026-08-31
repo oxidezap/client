@@ -428,6 +428,23 @@ to the same problem. Nothing here needs it yet.
   count, because a client costs the same descriptors and tasks however it
   arrived; the web one claims its slot at the upgrade rather than at accept,
   since the same port serves media and a photo is not a front end.
+- **A browser API never gets a view into wasm memory.** This module is built
+  with `--shared-memory`, so a `Uint8Array` over the linear memory is a
+  *shared* view — and the specifications refuse those: "The provided
+  ArrayBufferView value must not be shared." `WebSocket.send` refuses one and
+  so does `RTCDataChannel.send`, so anything crossing out is copied first
+  (`js_sys::Uint8Array::from(&data[..])`, then the buffer), never
+  `send_with_u8_array`. The socket learned this and wrote the rule down; the
+  relay was written afterwards and passed a view anyway, which is worth more
+  than the rule itself: **every** relay send threw, from the first browser
+  call ever placed, and the drive loop answers a failed send with
+  `break 'drive` while publishing nothing — so a call opened its relay,
+  released it, and ended with no error anywhere. Four production logs came
+  back empty because of it. What a transport may *not* do is stay quiet about
+  a refused write: the driver discards the reason, so this side logs it.
+  WebCodecs is the exception and by declaration rather than by luck — its
+  buffers are `AllowSharedBufferSource` in the IDL — which is why the video
+  path never hit this.
 - **An abort is something said, not something let go of.** The library's
   `AbortHandle` tells its two endings apart by whether it *calls* the closure
   it boxes — `abort()`, and `Drop`, call it; `detach()` drops it uncalled —
