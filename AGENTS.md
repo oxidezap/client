@@ -1870,7 +1870,7 @@ by definition.
   is ready when it is polled — the asynchrony belongs to the desktop's
   runtime, and SQLite in a page is synchronous, so nothing there ever leaves
   the microtask it started in. `run_client` now breathes between the phases
-  and times each one, which changes the shape and not the total: a `info` line
+  and times each one, which changes the shape and not the total: an `info` line
   says where a page's first second went, in a module whose symbols are
   stripped and whose flame graph therefore names nothing. A turn is an
   opportunity to draw rather than a promise of one — the browser decides
