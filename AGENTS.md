@@ -233,7 +233,9 @@ WEB_PROFILE=debug cargo xtask web build
 # to follow — and `cargo xtask web map` projects `.debug_line` into a source
 # map beside the module, pointing the module at it with a `sourceMappingURL`
 # section. DWARF is what an extension reads; the map is what DevTools reads on
-# its own, in every engine.
+# its own, in every engine. It is not the build to *profile*, though — a flame
+# chart reads the name section, which `debug` above already keeps, and this one
+# skips wasm-opt and so is a different code layout. See the gotcha.
 WEB_PROFILE=dwarf cargo xtask web build
 cargo xtask web map            # the map again, over a module already built
 ```
@@ -962,6 +964,23 @@ to the same problem. Nothing here needs it yet.
   checkout are embedded in the map: naming the standard library's files
   costs nothing and carrying `build-std`'s copy of them is most of a
   gigabyte of JSON to answer a question a file name has already answered.
+- **Names and lines are different sections, and profiling reads the first
+  one.** A flame chart names a wasm frame from the *name section* — that is
+  what the Rust and WebAssembly book's own profiling chapter says, and what
+  DevTools falls back through: the name section, then import and export paths,
+  then a `$func123` off the index. So `WEB_PROFILE=debug` is the profiling
+  build and always was, and the source map buys nothing there. What the map
+  buys is the Sources panel: a panic's stack trace naming a file and a line, a
+  breakpoint, a step. The one document that pairs source maps with a flame
+  chart is about *minified JavaScript* and never mentions wasm, and Chrome's
+  own wasm debugging page covers the Performance panel and the DWARF extension
+  without mentioning source maps at all — which leaves the negative unproven,
+  since nothing states that the Performance panel ignores a wasm map. The
+  advice rests on the mechanism rather than on a promise. `web-dwarf` keeps
+  the name section as well (`strip = "none"`, and no wasm-opt left to drop
+  it), so it can answer both questions; it is still the wrong build to time,
+  because skipping wasm-opt is a different code layout and a profile of it
+  measures a program nobody runs.
 - **A size override is worth what a crate weighs *after* LTO.** Which is not
   what it weighs in the sweep, and the two are not even correlated — so the
   order is measure, then decide, and `cargo bloat --crates` against a build
