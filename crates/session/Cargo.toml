@@ -87,6 +87,7 @@ web-sys = { version = "0.3", features = [
     "RtcDataChannel",
     "RtcDataChannelEvent",
     "RtcDataChannelInit",
+    "RtcDataChannelState",
     "RtcDataChannelType",
     "RtcPeerConnection",
     "RtcSdpType",

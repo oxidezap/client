@@ -55,10 +55,17 @@ fn default_config(
 pub async fn open_call_audio() -> Result<(
     async_channel::Receiver<Vec<i16>>,
     async_channel::Sender<Vec<i16>>,
+    crate::call_ending::CallAudioFacts,
 )> {
-    tokio::task::spawn_blocking(|| Ok((spawn_mic()?, spawn_speaker()?)))
-        .await
-        .map_err(|e| anyhow!("audio setup task failed: {e}"))?
+    // The facts travel on both platforms so the session marks the handoff
+    // once rather than under a `cfg`. Nothing here reads them back: a cpal
+    // stream ends when its channel end goes and says so through the device
+    // itself, where a browser's graph has only the channels to go on.
+    let (mic, speaker) =
+        tokio::task::spawn_blocking(|| -> Result<_> { Ok((spawn_mic()?, spawn_speaker()?)) })
+            .await
+            .map_err(|e| anyhow!("audio setup task failed: {e}"))??;
+    Ok((mic, speaker, crate::call_ending::CallAudioFacts::default()))
 }
 
 /// Open the default input device and stream 960-sample 16 kHz mono i16 frames over a channel.

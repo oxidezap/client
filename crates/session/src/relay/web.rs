@@ -367,6 +367,19 @@ impl RelayTransport for BrowserRelayChannel {
                 self.outbound_dropped.replace(0)
             );
         }
+        // Asked rather than inferred from the send returning. A channel that
+        // is `closing` or `closed` does not throw: the specification has the
+        // agent *buffer* the data, so a send onto a transport that will never
+        // deliver it comes back `Ok` — which is the one answer this marker
+        // may not take at face value, since its whole job is to say whether a
+        // packet reached the relay. An explicit error also names the state,
+        // where a `DOMException` string names the browser's wording for it.
+        if self.channel.ready_state() != web_sys::RtcDataChannelState::Open {
+            return Err(anyhow!(
+                "the relay channel is not open ({:?}); it carried nothing",
+                self.channel.ready_state()
+            ));
+        }
         self.channel
             .send_with_u8_array(&data)
             .map_err(|e| anyhow!("relay channel send failed: {}", describe(&e)))?;

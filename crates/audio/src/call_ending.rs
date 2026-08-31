@@ -20,6 +20,50 @@
 //! both platforms, so it is stated once and tested where `cargo test` already
 //! runs rather than only inside a browser.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// What this side knows about one call's audio when a channel end goes.
+///
+/// Shared with whoever hands the endpoints to the engine, because the two
+/// questions an ending turns on are both answered outside the graph: whether
+/// the engine ever received these channels, and whether the capture end was
+/// closed from here. Both are one bit, set once, read once.
+///
+/// Portable rather than a platform split: `Arc<AtomicBool>` is `Send` where a
+/// desktop call task needs it to be and costs a browser nothing.
+#[derive(Clone, Default, Debug)]
+pub struct CallAudioFacts {
+    handed_to_engine: Arc<AtomicBool>,
+    capture_ended_locally: Arc<AtomicBool>,
+}
+
+impl CallAudioFacts {
+    /// The engine has the endpoints; from here their release is its doing.
+    ///
+    /// Marked by the caller the moment the engine has accepted them — after
+    /// a `start()` that returned, never before it, since a builder dropped on
+    /// the way to one takes the endpoints with it and no driver ever ran.
+    pub fn hand_to_engine(&self) {
+        // One flag, no data published behind it, and nothing orders against
+        // a second atomic: `Relaxed` is the whole requirement.
+        self.handed_to_engine.store(true, Ordering::Relaxed);
+    }
+
+    /// This side is closing the capture channel because the track ended.
+    pub fn capture_ended(&self) {
+        self.capture_ended_locally.store(true, Ordering::Relaxed);
+    }
+
+    fn engine_has_them(&self) -> bool {
+        self.handed_to_engine.load(Ordering::Relaxed)
+    }
+
+    fn microphone_went(&self) -> bool {
+        self.capture_ended_locally.load(Ordering::Relaxed)
+    }
+}
+
 /// Why one call's audio graph is being torn down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallAudioEnding {
@@ -41,6 +85,15 @@ pub enum CallAudioEnding {
     /// *not* evidence about the driver, and naming it as one would put the
     /// blame for a local fault on the far side of the call.
     CaptureLost,
+    /// The endpoints were dropped before the engine ever received them.
+    ///
+    /// A call ended while its devices were opening — hung up here, hung up by
+    /// the caller, or answered on another device — takes this exit, and the
+    /// permission prompt in front of `getUserMedia` makes that window seconds
+    /// long rather than instants. Nothing here is evidence about a driver:
+    /// there was no driver. Naming it as one would put an ordinary
+    /// cancellation in the same log line as the failure being hunted.
+    NeverHandedOver,
 }
 
 impl CallAudioEnding {
@@ -51,6 +104,7 @@ impl CallAudioEnding {
             Self::PlayoutReleased => "the call engine let go of the speaker",
             Self::CaptureReleased => "the call engine let go of the microphone",
             Self::CaptureLost => "this microphone ended; the call engine did not release it",
+            Self::NeverHandedOver => "the call ended before its audio reached the engine",
         }
     }
 }
@@ -63,33 +117,47 @@ impl CallAudioEnding {
 /// its whole channel set at once and something has to be reported first;
 /// nothing downstream may depend on which of a simultaneous pair wins.
 ///
-/// `capture_ended_locally` is what keeps the capture arm honest. A microphone
-/// that is unplugged or revoked is closed *by this side*, from the track's
-/// own `ended` handler, and the sender closing is the same observation
-/// whichever end let go — so without asking, a local device fault is reported
-/// as the engine releasing the call, which is exactly the false evidence this
-/// module exists to stop producing. Asked only on that arm, and only once it
-/// has won.
+/// `facts` is what keeps the naming honest, and it answers two ways of
+/// attributing to the far side something this side did.
+///
+/// A microphone that is unplugged or revoked is closed *by this side*, from
+/// the track's own `ended` handler, and the sender closing is the same
+/// observation whichever end let go. And endpoints dropped before the engine
+/// received them — a call cancelled while its devices were opening — release
+/// both ends at once in exactly the way a driver returning does. Neither is
+/// evidence about a driver, and reporting either as one is the false
+/// evidence this module exists to stop producing.
+///
+/// Both are read once an arm has won, never before: what matters is what was
+/// true at the ending.
 pub async fn ending(
     playout_released: impl Future<Output = ()>,
     capture_released: impl Future<Output = ()>,
-    capture_ended_locally: impl Fn() -> bool,
+    facts: &CallAudioFacts,
 ) -> CallAudioEnding {
-    futures_lite::future::or(
+    let released = futures_lite::future::or(
         async {
             playout_released.await;
             CallAudioEnding::PlayoutReleased
         },
         async {
             capture_released.await;
-            if capture_ended_locally() {
+            if facts.microphone_went() {
                 CallAudioEnding::CaptureLost
             } else {
                 CallAudioEnding::CaptureReleased
             }
         },
     )
-    .await
+    .await;
+    // Asked over the arm rather than beside it: an ending with no engine
+    // behind it says nothing about which half went first, and answering that
+    // question anyway is what would make a cancellation read as a fault.
+    if facts.engine_has_them() {
+        released
+    } else {
+        CallAudioEnding::NeverHandedOver
+    }
 }
 
 #[cfg(test)]
@@ -107,6 +175,14 @@ mod tests {
         speaker_tx: async_channel::Sender<Vec<i16>>,
         /// Held here; the playout ring drains it.
         speaker_rx: async_channel::Receiver<Vec<i16>>,
+    }
+
+    /// A call whose endpoints reached the engine, which is every ending this
+    /// module is evidence about.
+    fn handed_over() -> CallAudioFacts {
+        let facts = CallAudioFacts::default();
+        facts.hand_to_engine();
+        facts
     }
 
     fn endpoints() -> Endpoints {
@@ -147,7 +223,7 @@ mod tests {
                 while speaker_rx.recv().await.is_ok() {}
             },
             mic_tx.closed(),
-            || false,
+            &handed_over(),
         ));
         assert_eq!(ending, CallAudioEnding::PlayoutReleased);
     }
@@ -167,7 +243,7 @@ mod tests {
         let ending = futures_lite::future::block_on(ending(
             async { while speaker_rx.recv().await.is_ok() {} },
             mic_tx.closed(),
-            || false,
+            &handed_over(),
         ));
         assert_eq!(ending, CallAudioEnding::CaptureReleased);
         // Held to the end, so the speaker arm could not have been what
@@ -191,15 +267,44 @@ mod tests {
         // The engine still holds both of its ends, exactly as it would with
         // the call running; what closed the channel is the track's `ended`
         // handler on this side.
+        let facts = handed_over();
+        facts.capture_ended();
         mic_tx.close();
 
         let ending = futures_lite::future::block_on(ending(
             async { while speaker_rx.recv().await.is_ok() {} },
             mic_tx.closed(),
-            || true,
+            &facts,
         ));
         assert_eq!(ending, CallAudioEnding::CaptureLost);
         drop((mic_rx, speaker_tx));
+    }
+
+    /// A call cancelled while its devices were opening drops the endpoints
+    /// with no engine anywhere behind them. Both ends go at once, exactly as
+    /// they do when a driver returns — and that is the whole hazard: an
+    /// ordinary cancellation would otherwise be logged as the engine
+    /// releasing a call it never held.
+    #[test]
+    fn endpoints_dropped_before_the_engine_saw_them_are_not_its_doing() {
+        let Endpoints {
+            mic_tx,
+            mic_rx,
+            speaker_tx,
+            speaker_rx,
+        } = endpoints();
+
+        // Never handed over: the caller hung up while `getUserMedia` was
+        // still in front of a permission prompt, so these are dropped on the
+        // way to a `start()` that never happened.
+        drop((mic_rx, speaker_tx));
+
+        let ending = futures_lite::future::block_on(ending(
+            async { while speaker_rx.recv().await.is_ok() {} },
+            mic_tx.closed(),
+            &CallAudioFacts::default(),
+        ));
+        assert_eq!(ending, CallAudioEnding::NeverHandedOver);
     }
 
     /// A call that is running holds both ends, and neither arm may resolve —
@@ -220,7 +325,7 @@ mod tests {
                     ending(
                         async { while speaker_rx.recv().await.is_ok() {} },
                         mic_tx.closed(),
-                        || false,
+                        &handed_over(),
                     )
                     .await,
                 )

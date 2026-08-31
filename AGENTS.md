@@ -2028,7 +2028,16 @@ by definition.
   first-packet marker is set after the browser has *accepted* a send, never
   before: a rejected send and a packet dropped for congestion both return
   early, and either would otherwise let a channel that carried nothing be
-  released claiming it had.
+  released claiming it had — nor from a send that *returned*, since a channel
+  that is `closing` or `closed` has the agent buffer the data rather than
+  throw, so `Ok` there is a packet that will never leave. `CallAudioFacts`
+  carries the third: endpoints dropped before any engine received them — a
+  call hung up while `getUserMedia` was still in front of a permission prompt
+  — release both ends at once in exactly the way a driver returning does, and
+  that ordinary cancellation is not evidence about a driver there was none
+  of. Which is why the handoff is marked after the `start()` that took the
+  endpoints and never before it: every exit on the way to one drops the
+  builder with them inside it.
 
 - **An abort drops a future where it stands, and an unpolled future leaves
   nothing behind.** The library ends work by aborting the handle its runtime

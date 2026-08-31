@@ -773,7 +773,7 @@ impl WhatsAppClient {
                 error!("Client not available for accepting call");
                 return;
             };
-            let (mic, speaker) = match open_call_audio().await {
+            let (mic, speaker, audio_facts) = match open_call_audio().await {
                 Ok(audio) => audio,
                 Err(err) => {
                     error!("Audio device setup failed: {err}");
@@ -847,6 +847,12 @@ impl WhatsAppClient {
             };
             match accept.start().await {
                 Ok(handle) => {
+                    // The engine has the endpoints, so from here their
+                    // release is its doing. Marked after the `start()` that
+                    // took them and before anything can await: every exit
+                    // above drops the builder with the endpoints inside it,
+                    // and no driver ever ran on those.
+                    audio_facts.hand_to_engine();
                     let handle = Arc::new(handle);
                     // Hung up while the camera was opening. Answering a video
                     // call waits on a device — and, the first time, on a
@@ -1354,7 +1360,7 @@ impl WhatsAppClient {
                 notify_failure("client not available".to_string()).await;
                 return;
             };
-            let (mic, speaker) = match open_call_audio().await {
+            let (mic, speaker, audio_facts) = match open_call_audio().await {
                 Ok(audio) => audio,
                 Err(err) => {
                     notify_failure(format!("audio device setup failed: {err}")).await;
@@ -1418,6 +1424,10 @@ impl WhatsAppClient {
 
             match outgoing.start().await {
                 Ok(handle) => {
+                    // See the accept path: the endpoints are the engine's
+                    // from here, and every exit before this dropped them
+                    // with no driver behind them.
+                    audio_facts.hand_to_engine();
                     let call_id = handle.call_id().to_string();
                     let handle = Arc::new(handle);
                     // Cancelled while still connecting: the UI only knew the
