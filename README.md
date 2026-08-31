@@ -201,11 +201,13 @@ history, which is what the in-app "pair again" action does.
 
 A plugin is a `.wasm` file dropped in `~/.local/share/oxidezap/plugins` — or,
 in a page running its own session, added under Settings → Plugins, which keeps
-it in the browser's own storage. Either way it runs inside the daemon, sees the
-account's events, and can declare a small interface — a button in a chat
-header, a section on the Settings screen — that the window draws in its own
-theme. Adding or removing one changes what the *next* load runs: a tab reload,
-or a daemon restart.
+it in the browser's own storage. Either way it runs inside the daemon — which
+for a page holding its own session is the page itself, so its plugins share
+that one agent instead of getting a thread each — and either way it sees the
+account's events and can declare a small interface, a button in a chat header
+or a section on the Settings screen, that the window draws in its own theme.
+Adding or removing one changes what the *next* load runs: a tab reload, or a
+daemon restart.
 
 There is no WASI: the `oxidezap` import module is a plugin's entire outside
 world, so a downloaded file cannot read the disk or open a socket because no
