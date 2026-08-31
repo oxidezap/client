@@ -56,7 +56,29 @@ impl Runtime for BrowserRuntime {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) -> AbortHandle {
         let (cancel, cancelled) = futures_channel::oneshot::channel::<()>();
         spawn_local(async move {
-            futures_lite::future::or(future, super::abort_requested(cancelled)).await;
+            // Which of the two ended it, said out loud. An abort here drops
+            // the future *where it was*, and for a future that has not been
+            // polled yet that means it never runs at all — no log, no error,
+            // nothing. The library leans on exactly that (`set_media_task`
+            // aborts a media task whose call is already gone, and the driver
+            // task is written so an abort before its first poll releases the
+            // call), so silence here is a call that disappears with no
+            // account of itself anywhere. It costs one line per aborted task
+            // and it is the difference between a report and a guess.
+            let aborted = futures_lite::future::or(
+                async {
+                    future.await;
+                    false
+                },
+                async {
+                    super::abort_requested(cancelled).await;
+                    true
+                },
+            )
+            .await;
+            if aborted {
+                log::debug!("a spawned task was aborted before it finished");
+            }
         });
 
         // No wrapper and no `unsafe`: `AbortHandle::new` wants a `Send`

@@ -1930,6 +1930,19 @@ by definition.
   everywhere, telling somebody to answer in the other tab while destroying
   the call they would have answered there.
 
+- **An abort drops a future where it stands, and an unpolled future leaves
+  nothing behind.** The library ends work by aborting the handle its runtime
+  handed back, and `set_media_task` uses that deliberately: a media task whose
+  call is already gone is aborted the moment it is handed over, and the driver
+  task is written so that even an abort before its first poll releases the
+  call — `_ended_guard` drops and notifies, the audio feeds drop and close the
+  device. Correct, and completely silent: no error, no event, no log, because
+  nothing failed. From a console it reads as a call that was offered and then
+  ended a moment later with nothing in between, which is exactly how it read.
+  So `BrowserRuntime::spawn` says which of the two endings happened. One line
+  per aborted task, against a class of failure that otherwise leaves a report
+  with no evidence in it.
+
 - **Which end a full queue drops from is a question about the payload, not
   about latency.** The microphone's queue evicts its oldest frame and the
   camera's refuses its newest, and the two look like the same decision made

@@ -102,6 +102,15 @@ const PLAYOUT_PRIME: usize = 60;
 struct Graph {
     context: web_sys::AudioContext,
     stream: web_sys::MediaStream,
+    /// The node the microphone feeds, held so it can be *disconnected*.
+    ///
+    /// It was a local in `wire` before, which left the only thing still
+    /// joined to the live stream as the one thing teardown could not reach:
+    /// dropping a `MediaStreamAudioSourceNode`'s Rust handle unwires nothing,
+    /// and a source still attached to a running context is a context still
+    /// reading the device. That is a tab whose microphone indicator stays lit
+    /// after a call that never connected.
+    source: web_sys::MediaStreamAudioSourceNode,
     capture: web_sys::ScriptProcessorNode,
     playout: web_sys::ScriptProcessorNode,
     _on_capture: Closure<dyn FnMut(web_sys::AudioProcessingEvent)>,
@@ -117,8 +126,12 @@ impl Drop for Graph {
         // called while the context closes, and `close` is asynchronous.
         self.capture.set_onaudioprocess(None);
         self.playout.set_onaudioprocess(None);
+        // The source first: it is what joins the device to the context, and
+        // the two nodes below are downstream of it.
+        let _ = self.source.disconnect();
         let _ = self.capture.disconnect();
         let _ = self.playout.disconnect();
+        let mut stopped = 0usize;
         for track in self.stream.get_tracks().iter() {
             if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
                 // Before `stop`, and before the closures below are dropped
@@ -127,10 +140,15 @@ impl Drop for Graph {
                 // trap rather than a missed event, so nothing is left armed.
                 track.set_onended(None);
                 track.stop();
+                stopped += 1;
             }
         }
         let _ = self.context.close();
-        debug!("the call's audio graph is closed");
+        // The count, because "the graph is closed" was a sentence this line
+        // could print while releasing nothing: a stream whose tracks it could
+        // not read looks exactly the same in a log as one it stopped. A zero
+        // here is a microphone still running, and it names itself.
+        debug!("the call's audio graph is closed ({stopped} track(s) stopped)");
     }
 }
 
@@ -523,6 +541,7 @@ fn wire(
     Ok(Graph {
         context: context.clone(),
         stream: stream.clone(),
+        source,
         capture,
         playout: playout_node,
         _on_capture: on_capture,
