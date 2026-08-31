@@ -613,3 +613,67 @@ opt-level = "z"
 # without it.
 [profile.web.package.tiny-skia-path]
 opt-level = "z"
+
+# The plugin interpreter, which is reachable on this target and was not when
+# the paragraph above was written. `oxidezap-plugin-host` depends on `wasmi`,
+# the daemon depends on the host, and a page depends on the daemon — so a
+# module that used to name `wasmi` among the crates LTO removes now carries
+# 333,158 bytes of it, with `wasmparser` a further 163,223 beside it.
+#
+# Cold in the strongest sense available here: a page's plugin folder is OPFS,
+# it starts empty, and nothing puts a module in it but the visitor. So for
+# anybody who has installed no plugin this is an interpreter that is linked,
+# downloaded, compiled by the browser and never asked to execute an
+# instruction — and for anybody who has, what "z" costs is interpretation
+# speed inside a call that fuel already bounds and `MAX_DUTY` already
+# throttles between calls.
+#
+# The desktop keeps it at "3" for the reason the whole split exists: there
+# the module is paid for once at build time, and a plugin's worker owns a
+# thread of its own rather than the loop the page draws on.
+#
+# Worth 79,146 bytes of the module on its own, measured against a build whose
+# only difference is these four entries.
+[profile.web.package.wasmi]
+opt-level = "z"
+[profile.web.package.wasmi_ir]
+opt-level = "z"
+[profile.web.package.wasmi_core]
+opt-level = "z"
+[profile.web.package.wasmi_collections]
+opt-level = "z"
+
+# Our own half of the tree that is not the window.
+#
+# The sweep above is about other people's crates, and this is the same
+# question asked of ours: 1,567,406 bytes of the code section are crates in
+# `crates/`, and the ones named here are 973,389 of it. None of them is on a
+# frame's path. `oxidezap-session` is the event pump, the hydration and the
+# paged reads — once per stanza; `oxidezap-chat-store` is the writer queue and
+# the queries behind it, bounded by SQLite rather than by this; the daemon is
+# the state hub and the bridge, once per request; `oxidezap-ipc` is the
+# framing around frames whose cost is `serde_json`, which stays at "s"; and
+# the plugin host is the loader and the ABI, which run when a plugin does.
+#
+# What is deliberately *not* here is the other 594,017 bytes. `oxidezap-gui`
+# itself draws, and `oxidezap-core` is what it draws — a `Chat`, a
+# `ChatMessage` and the `Arc`s the conversation pane clones per row per frame
+# — so both stay at this profile's "s". `oxidezap-audio` stays too: the
+# 63-tap resampler behind a voice note is hundreds of millions of operations
+# and is the one thing in our tree that really is arithmetic in a loop.
+#
+# The per-audio-frame arithmetic of a call is not here either, and that is not
+# an omission: it is `wacore`'s MLow codec, which this profile has already
+# taken to "z" a few entries above. This adds no new claim about it.
+#
+# 348,331 bytes of the module, measured on its own.
+[profile.web.package.oxidezap-session]
+opt-level = "z"
+[profile.web.package.oxidezap-chat-store]
+opt-level = "z"
+[profile.web.package.oxidezap-daemon]
+opt-level = "z"
+[profile.web.package.oxidezap-ipc]
+opt-level = "z"
+[profile.web.package.oxidezap-plugin-host]
+opt-level = "z"
