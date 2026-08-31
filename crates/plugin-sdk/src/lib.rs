@@ -751,7 +751,7 @@ impl Reaction<'_> {
     ///
     /// Empty when the reaction was *removed* — and, under the ABI's absence
     /// rule, also when the event carried no emoji at all. Those two are
-    /// deliberately indistinguishable here; see the note in `AGENTS.md`.
+    /// deliberately indistinguishable here; see the note in `docs/roadmap.md`.
     #[must_use]
     pub fn emoji(self) -> Text<32> {
         self.0.text(fields::EMOJI)

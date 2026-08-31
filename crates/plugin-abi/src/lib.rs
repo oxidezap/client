@@ -476,7 +476,7 @@ pub mod log {
 /// The daemon's own `CommandOutcome`, as an integer. A plugin learns this
 /// where a socket front end does not, because the call is synchronous and so
 /// needs no request id to correlate an answer with — see the note in
-/// `AGENTS.md` about a front end being unable to say what went wrong.
+/// `docs/roadmap.md` about a front end being unable to say what went wrong.
 pub mod outcome {
     /// The session took it. What the network makes of it arrives as an event.
     pub const ACCEPTED: i32 = 0;

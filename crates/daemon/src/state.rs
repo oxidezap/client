@@ -669,7 +669,7 @@ impl StateHub {
 
     /// A poisoned lock means a previous holder panicked mid-mutation.
     ///
-    /// Panicked on rather than recovered, which is the rule in AGENTS.md
+    /// Panicked on rather than recovered, which is the rule in docs/gotchas.md
     /// applied to what this lock covers: `Inner` holds the version, the
     /// connection, the calls and the chats together, and a holder that died
     /// between two of those left a state no frame should describe. The

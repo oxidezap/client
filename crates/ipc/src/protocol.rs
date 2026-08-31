@@ -173,7 +173,7 @@ impl ChatSummary {
     /// The status broadcast does not, and not merely because it is drawn
     /// elsewhere: watching an update is recorded on the message, so that
     /// chat's counter is never cleared by watching one (see the status notes
-    /// in AGENTS.md). Counted, it only ever grows — a tray tooltip claiming
+    /// in docs/gotchas.md). Counted, it only ever grows — a tray tooltip claiming
     /// unread messages over a chat list with nothing unread in it, for as
     /// long as the account keeps receiving updates.
     #[must_use]

@@ -98,7 +98,7 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         // raise itself from one: browsers grant that only under a transient
         // user activation, which a daemon-initiated frame is the opposite of.
         // Claiming it would leave Open doing nothing at all, which is exactly
-        // what the rule in AGENTS.md exists to prevent — a client that is not
+        // what the rule in docs/gotchas.md exists to prevent — a client that is
         // a window standing in for one that is not there.
         //
         // Saying no means Open launches the desktop window instead. That is

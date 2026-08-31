@@ -19,7 +19,7 @@
 //! *transferring* it, and `BroadcastChannel.postMessage` takes no transfer
 //! list — there is nowhere to put one. A `SharedWorker` could hand ports out,
 //! and is the shape this will eventually be, but it moves the session into
-//! another agent, which is the expensive change /AGENTS.md describes and not
+//! another agent, which is the expensive change docs/roadmap.md describes and
 //! this one.
 //!
 //! What is reachable is a second `BroadcastChannel` under a name only the two
