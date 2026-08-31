@@ -106,12 +106,11 @@ pub fn write(wasm: &Path, root: &Path) -> Result<Summary> {
         .to_string();
 
     let map = render(&rows, &module_name, root);
-    fs::write(&map_path, &map.text)
-        .map_err(|e| err!("could not write {}: {e}", map_path.display()))?;
+    replace(&map_path, map.text.as_bytes())?;
 
     let mut out = bytes;
     append_custom(&mut out, "sourceMappingURL", &encode_name(&map_name));
-    fs::write(wasm, &out).map_err(|e| err!("could not write {}: {e}", wasm.display()))?;
+    replace(wasm, &out)?;
 
     Ok(Summary {
         map: map_path,
@@ -119,6 +118,24 @@ pub fn write(wasm: &Path, root: &Path) -> Result<Summary> {
         embedded: map.embedded,
         rows: map.rows,
         bytes: map.text.len() as u64,
+    })
+}
+
+/// Write a file by writing another beside it and renaming it over the top.
+///
+/// The module is read, changed and written back in place, so a run
+/// interrupted during that write leaves a truncated `_bg.wasm` in `dist` —
+/// neither what trunk produced nor a mapped module, and nothing about it says
+/// so. A rename within one directory is the one step a filesystem will not do
+/// halfway.
+fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut scratch = path.as_os_str().to_os_string();
+    scratch.push(".new");
+    let scratch = PathBuf::from(scratch);
+    fs::write(&scratch, bytes).map_err(|e| err!("could not write {}: {e}", scratch.display()))?;
+    fs::rename(&scratch, path).map_err(|e| {
+        let _ = fs::remove_file(&scratch);
+        err!("could not put {} in place: {e}", path.display())
     })
 }
 
@@ -971,18 +988,12 @@ fn render(rows: &[Row], module: &str, root: &Path) -> Rendered {
         last_column = column;
     }
 
+    // Asked once, and fail closed: a root that cannot be resolved is one
+    // nothing can be proved to be under.
+    let root = fs::canonicalize(root).ok();
     let contents: Vec<Option<String>> = sources
         .iter()
-        .map(|s| {
-            let path = Path::new(s);
-            // Ours and only ours. `starts_with` is a path comparison rather
-            // than a string one, so `/home/me/oxidezap-notes` is not under
-            // `/home/me/oxidezap`.
-            if !path.is_absolute() || !path.starts_with(root) {
-                return None;
-            }
-            fs::read_to_string(path).ok()
-        })
+        .map(|s| root.as_deref().and_then(|root| embed(Path::new(s), root)))
         .collect();
 
     let mut text = String::from("{\"version\":3,\"file\":");
@@ -1014,6 +1025,30 @@ fn render(rows: &[Row], module: &str, root: &Path) -> Rendered {
         rows: emitted,
         text,
     }
+}
+
+/// The text of a source that really is under the checkout, and `None` for
+/// everything else.
+///
+/// "Under" is asked of the *resolved* path rather than of the one DWARF
+/// carries. `Path::starts_with` compares components and `..` is a component
+/// like any other, so `<root>/../../etc/passwd` starts with `<root>` by that
+/// test and would be read into a map that says it carries only our own
+/// sources; and a symlink under the checkout answers about where it points
+/// rather than about where it is. Both are the same question, and
+/// `canonicalize` is the same answer — it resolves the traversal and the
+/// link, and it refuses a path that is not there, which is what most of these
+/// are: the standard library's files are named `/rustc/<hash>/...` and exist
+/// on nobody's disk.
+fn embed(path: &Path, root: &Path) -> Option<String> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let real = fs::canonicalize(path).ok()?;
+    if !real.starts_with(root) {
+        return None;
+    }
+    fs::read_to_string(&real).ok()
 }
 
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1427,6 +1462,48 @@ mod tests {
         assert!(out.text.contains("fn main() {}"));
         // A source outside the repository is named and not embedded.
         assert!(out.text.contains("null"));
+    }
+
+    /// The claim the map makes about itself: that what it embeds is the
+    /// checkout's own. A path is not under a directory because it starts with
+    /// its components — `..` is a component like any other — and a link under
+    /// it is not under it either.
+    #[test]
+    fn a_source_reached_through_the_checkout_is_not_the_same_as_one_inside_it() {
+        let dir = TempDir::new("xtask-map").expect("a temporary directory");
+        let root = dir.path().join("repo");
+        fs::create_dir(&root).expect("a checkout");
+        let outside = dir.path().join("outside.rs");
+        fs::write(&outside, "the text of a file that is not ours\n").expect("write");
+        fs::write(root.join("ours.rs"), "ours\n").expect("write");
+
+        let mut rows = vec![
+            // Out of the checkout and back down, which `starts_with` reads as
+            // a path inside it.
+            row(
+                10,
+                &root.join("..").join("outside.rs").to_string_lossy(),
+                1,
+                0,
+            ),
+            row(20, &root.join("ours.rs").to_string_lossy(), 1, 0),
+        ];
+        // And through a link that lives inside it.
+        #[cfg(unix)]
+        {
+            let link = root.join("link.rs");
+            std::os::unix::fs::symlink(&outside, &link).expect("a symlink");
+            rows.push(row(30, &link.to_string_lossy(), 1, 0));
+        }
+
+        let out = render(&rows, "m_bg.wasm", &root);
+        assert_eq!(out.embedded, 1, "only the file really inside it");
+        assert!(out.text.contains("ours"));
+        assert!(
+            !out.text.contains("the text of a file that is not ours"),
+            "{}",
+            out.text
+        );
     }
 
     /// Which of several rows at one address wins. The later one describes the
