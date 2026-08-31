@@ -1931,15 +1931,32 @@ fn a_plugin_hammering_its_store_costs_one_write_and_keeps_running() {
     );
 
     plugins.observe(&message("a@s.whatsapp.net", "go"));
-    let surfaces = published.settles("the plugin to be listed", |s| !s.is_empty());
-    std::thread::sleep(Duration::from_millis(400));
+    published.settles("the plugin to be listed", |s| !s.is_empty());
+    // The write happens as the call returns, on the plugin's own thread —
+    // waited for with a deadline rather than slept over, which is what the
+    // rest of this file does and for the stated reason. Five hundred
+    // interpreted `oxi_kv_set` calls take a few milliseconds on a quiet
+    // machine and rather more on a loaded two-core runner, so a fixed wait
+    // is a test that passes here and fails there.
+    //
+    // It is also the proof that the event was picked up at all, which is
+    // what the shutdown below needs: a worker checks the stopping flag
+    // between events, so joining before the event is dequeued would abandon
+    // it and this would be a test of nothing.
+    until("the call to return and write what it kept", || {
+        state.join("kv-busy.json").exists()
+    });
+    // Joined, not glanced at. `deliver` commits the store even where the call
+    // trapped, and the worker stops the plugin *after* that — so a surface
+    // read between the two is the stale, still-running one, and a regression
+    // that killed the plugin here would pass. Shutting the host down joins
+    // every worker, which makes what is published afterwards settled rather
+    // than a race this test would lose quietly.
+    plugins.shutdown();
+    let surfaces = published.latest();
     assert!(
         surfaces[0].is_running(),
         "five hundred sets in one call is not a reason to stop it"
-    );
-    assert!(
-        state.join("kv-busy.json").exists(),
-        "and the call returning wrote what it kept"
     );
 }
 

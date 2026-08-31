@@ -19,6 +19,9 @@ log = { workspace = true }
 
 oxidezap-core = { workspace = true }
 oxidezap-ipc = { workspace = true }
+# The log level, which a front end can change while this process runs: the
+# same crate the window uses, so both read the one stored answer.
+oxidezap-logging = { workspace = true }
 oxidezap-plugin-host = { workspace = true }
 oxidezap-session = { workspace = true }
 portable-atomic = { workspace = true }
@@ -46,7 +49,6 @@ tokio = { workspace = true, features = ["fs", "net", "rt-multi-thread", "signal"
 # construction — it exists so a cache cannot complete a handshake it did not
 # understand — which is why SHA-1 is the right and only answer here.
 base64 = "0.23"
-env_logger = "0.11"
 # `SinkExt`/`StreamExt` over the WebSocket, which is a sink of messages
 # rather than a byte stream.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

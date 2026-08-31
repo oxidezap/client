@@ -40,6 +40,21 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   daemon is the side with thousands of things happening at once. The domain
   types in `oxidezap-core` *are* the wire format; this crate adds the framing
   around them.
+- **oxidezap-logging**: how much the client says about itself, and where that
+  answer is kept. A crate rather than a function in each binary for two
+  reasons. The level has to move while the process runs — `log`'s global
+  maximum already does, but an `env_logger` filter built from `RUST_LOG` at
+  startup does not, so a level raised in Settings was let through by the macro
+  and dropped by the logger underneath, which is a failure with no symptom
+  except silence. And both processes have to read one answer: the window and
+  `oxidezapd` log about one account, and a choice only the window remembered
+  would leave the process holding the session — where nearly everything worth
+  reading is written — at `info` for ever. So `env_logger` keeps the
+  formatting and the per-module floors and the global level is an atomic this
+  crate owns, the store is a config file on a desktop and `localStorage` in a
+  page, and the precedence is stated once: an explicit `RUST_LOG` (or `?log=`)
+  wins for the run it was given for, then the stored choice, then `info`.
+  Choosing a level at runtime always applies, whatever started the process.
 - **oxidezap-daemon**: a library and the binary `oxidezapd` around it. The
   library is everything the daemon *does* — the state every front end
   observes, the bridge that turns their requests into session calls, and the
@@ -264,10 +279,12 @@ profile here repeats it deliberately.
 
 A repository gets 10 GB of Actions cache, and GitHub evicts the least recently
 used entry to stay under it. That number, not any compiler setting, is what
-decides how long a pull request waits: a job that restores its cache spends a
-minute on the download and then a minute compiling, and the same job that finds
-nothing spends eight compiling from scratch. The Windows `Check` job has been
+decides how long a pull request waits: a job that restores its cache spends
+under a minute on the download and then compiles what changed, and the same
+job that finds nothing compiles the world. The Windows `Check` job has been
 observed at 3m49 with a cache and 12m26 without it, twenty minutes apart.
+With every entry restoring, a pull request's whole run lands around 6m20
+against the 12m45 it took when one of them was always missing.
 
 So the budget is a shared resource with a fixed size, and every `save-if` in
 these workflows is a claim on it. Two rules follow, and both are already in the
@@ -292,10 +309,40 @@ dependency compiles to rather than what our crates compile to. Dependencies
 carry no debug information (`[profile.dev.package."*"]`, and `build-override`
 for the host-compiled half of them, which is where the proc macros are), which
 is why they can: nobody sets a breakpoint in diesel, and `panic::Location` is
-compiled in regardless, so panics still name their file and line. It is a
-third off what CI compresses and a third off what it downloads, and it is not
-a trade against build time — DWARF is work to emit and work to link, so the
-cold local build got 12% faster too. The manifest carries the table.
+compiled in regardless, so panics still name their file and line.
+
+What that is worth turned out to be a question about the platform, and the
+first version of this paragraph got it wrong by answering it from one machine.
+Measured off each job's own upload log, before and after:
+
+  Check (Linux)     2.17 GB -> 1.72 GB   -21%
+  Check (Windows)   2.07 GB -> 1.95 GB    -6%
+  Check (macOS)     1.64 GB -> 1.58 GB    -4%
+
+The claim here used to be "a third off", extrapolated from a local Linux
+measurement that also excluded the GUI crate. It holds on Linux and nowhere
+else, which in hindsight is what should have been expected: DWARF is the
+format on one of these three platforms, and Windows puts debug information in
+PDBs while macOS leaves it in the object files. A number measured on one
+target is a number about that target.
+
+It is still not a trade against build time — emitting and linking debug
+information is work, so the cold local build got 12% faster as well, and the
+manifest carries that table.
+
+Which is also why every one of those caches keys on the root manifest's hash.
+rust-cache's automatic key hashes `Cargo.lock`, `.cargo/config.toml` and each
+*member* crate's manifest — not the root one, where the profiles live. A
+profile decides every dependency's fingerprint, so editing one leaves the key
+identical while making every cached artifact useless, and the failure is
+silent in the worst way: the restore reports a full match, cargo rebuilds all
+of it anyway, and rust-cache then declines to save ("Cache up-to-date."), so
+the stale entry is never replaced. That is not a slow first run; it is a cache
+that can no longer be refreshed. It was measured on `main`, where the Windows
+`Check` job went from 3m49 warm to 11m17 and stayed there until the key
+learned to name the file that had changed. `build.yml` is the one exception,
+and for the reason the rule exists: it stores `~/.cargo` alone, and a profile
+cannot make a downloaded `.crate` stale.
 
 Raising the 10 GB limit is possible on a paid plan and would be another answer
 to the same problem. Nothing here needs it yet.
@@ -399,6 +446,19 @@ to the same problem. Nothing here needs it yet.
   directory that cannot be made private at all is refused: `usable_state_dir`
   runs without one rather than trusting it.
 
+- **How loud the client is, is a setting rather than a launch argument.** The
+  two processes each apply the level to themselves and each write it down —
+  the window because it draws part of the log and a page with its own session
+  draws all of it, the daemon because it holds the session and because a page
+  keeps its choice in a browser store no daemon can read, so the next
+  `oxidezapd` would otherwise start back at `info`. `ClientRequest::SetLogLevel`
+  is the sentence between them, and it is applied *and* persisted where it
+  lands: a person raising the level is asking about the session that is
+  running, and the file is what keeps them from asking again after every
+  restart. A failed write is a notice, never a refusal — the level did change,
+  and what failed is only the memory of it. Which is also why the daemon is
+  the interesting half: restarting it to raise the level ends the very
+  connection being investigated.
 - **Nothing stops the daemon but `main`.** The tray's Quit and an IPC
   `Shutdown` ask through `shutdown::request`; ending the process from a D-Bus
   callback or a connection task would skip disconnecting the session and
@@ -860,13 +920,57 @@ to the same problem. Nothing here needs it yet.
   `--cargo-profile`. `opt-level = "s"` there was measured at 31% of the module
   — by a wide margin the largest single thing in it, larger than every crate
   gate put together. `gpui` is the one exception at 3: it draws every frame
-  and is the largest crate here. Package overrides do *not* inherit through
-  `inherits`, so the ones that reach this graph are repeated rather than
-  borrowed from the desktop sweep — which names `ureq`, `zbus`, `wayland-*`
-  and `libsqlite3-sys`, almost none of which are compiled for wasm at all.
+  and is the largest crate here — and it has to be named there, because a
+  profile replaces its parent's *base* setting, so a crate the sweep does not
+  mention is at "s" here and at "3" on the desktop. Package overrides, on the
+  other hand, **do** inherit through `inherits`: cargo merges the parent's
+  package table into the child's and lets the child's entries win. This file
+  and the manifest both said the opposite for a long time, and the table under
+  `[profile.web]` had grown to 46 entries of which 39 were repeating the
+  desktop sweep and doing nothing. Reproduced rather than reasoned about, on
+  cargo 1.98: `cargo build -p url --profile web --target
+  wasm32-unknown-unknown -v` compiles `url` at `z`, the level
+  `[profile.release.package.url]` names, under a profile whose own base is "s"
+  and whose table does not mention it. (`-p` takes any package in the resolve
+  graph, not only a workspace member, which is what makes that a two-second
+  check rather than a build of the window; it needs
+  `rustup target add wasm32-unknown-unknown` on whatever toolchain runs it.) So `[profile.web]` holds the
+  differences and nothing else, and the desktop sweep — `ureq`, `zbus`,
+  `wayland-*`, `libsqlite3-sys` — costs this graph nothing where it names
+  crates that are not compiled for wasm at all.
   Two ways in that look like they should work and do not:
   `CARGO_PROFILE_RELEASE_PACKAGE_<NAME>_OPT_LEVEL` is silently ignored, and
   `--config`, which is not, is not something trunk can forward.
+- **A size override is worth what a crate weighs *after* LTO.** Which is not
+  what it weighs in the sweep, and the two are not even correlated — so the
+  order is measure, then decide, and `cargo bloat --crates` against a build
+  with `CARGO_PROFILE_RELEASE_STRIP=none` is the whole of the first half.
+  Measured on this tree: taking every image format `gpui` turns on that
+  nothing here can hand it — EXR, TIFF, QOI and the colour management behind
+  them — from the profile's setting down to `z` was worth 43 KB of a 22 MB
+  module, because fat LTO had already removed nearly all of it and what is
+  left is *data* that no optimization level shrinks (`exr`'s DWA transfer
+  curve is 131,076 bytes of it, in the window's `.data`). Which format is
+  reachable is a question to answer from `utils::mime_to_image_format` rather
+  than from the crate's name: a decoder is *named* there, not sniffed for, and
+  GIF is one of the six names it can answer with — so `gif` belongs with the
+  codecs kept at `s`, and the first draft of this had it in the list above.
+  Which is the smaller half of the lesson. The larger one is that "only X
+  reaches this crate" is a claim about the dependency graph, and
+  `cargo tree -p <bin> -i <crate>` answers it in a second — where reading the
+  crate's name and imagining its callers gets it wrong about a third of the
+  time. Every "reached only by" in this manifest was written that way once,
+  and four were false: `gif` is decoded here; `rayon` is `sum_tree`'s as well
+  as the decoders'; `aho-corasick` is a *direct* dependency of `gpui-base`,
+  whose editor search builds one as a person types; and `moxcms` is reached
+  from `image` itself for any picture carrying an ICC profile. Ask the graph
+  before writing the sentence. Taking `waproto`
+  and `buffa` from `3` to `z` was worth 1.4 MB of the daemon, because
+  generated protobuf survives LTO in full: it is reachable, it is enormous —
+  four separate 72 KiB copies of `Message::clone` among the largest functions
+  in the binary — and none of it is in a loop. The cold-and-obvious crate is
+  usually already gone; the one worth finding is large, reachable, and
+  called once per stanza rather than once per frame.
 - **The page has a third heap, and it is the size of the account.** The
   relaxed-idb VFS holds `HashMap<usize, Uint8Array>` — the whole database,
   resident in the *JavaScript* heap, one 8 KiB page per entry, kept alive

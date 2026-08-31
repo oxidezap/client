@@ -951,6 +951,20 @@ impl Session {
         });
     }
 
+    /// Say how much the daemon should log, answered when it has been done.
+    ///
+    /// Answered rather than told, because on a desktop the daemon is also
+    /// the process that writes the choice down — it persists before it
+    /// acknowledges — so this receiver is how the window learns that
+    /// somebody remembered the level rather than merely that somebody was
+    /// handed it. A frame can sit in a full outbox, and a window that closed
+    /// while it sat there would leave nobody having written anything.
+    pub fn set_log_level(&self, level: oxidezap_core::LogLevel) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(ClientRequest::SetLogLevel { level }, Awaiting::Acted(tx));
+        rx
+    }
+
     /// Wipe the local store and pair again.
     ///
     /// The daemon owns that file and stops itself once it is gone, so this is
