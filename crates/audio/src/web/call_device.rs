@@ -552,6 +552,7 @@ fn wire(
         .map(|track| {
             let mic = ended_mic.clone();
             let ended_locally = facts.clone();
+            let ended_locally_now = facts.clone();
             let ended = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
                 warn!("the call's microphone ended: its track stopped");
                 // Before the close, because closing is what wakes the arm
@@ -560,6 +561,19 @@ fn wire(
                 mic.close();
             });
             track.set_onended(Some(ended.as_ref().unchecked_ref()));
+            // Asked after the handler is installed, because an `ended` that
+            // has already been dispatched is not replayed for a handler
+            // attached afterwards. Belt-and-braces rather than a hole being
+            // closed: a track reaching `ended` any way but `stop()` fires the
+            // event from a queued task, which cannot run inside this
+            // synchronous block, and the only `stop()` is this graph's own
+            // teardown. What it costs is one property read, and what it buys
+            // is not having to rest a diagnostic on that argument.
+            if track.ready_state() == web_sys::MediaStreamTrackState::Ended {
+                warn!("the call's microphone had already ended when it was wired");
+                ended_locally_now.capture_ended();
+                ended_mic.close();
+            }
             ended
         })
         .collect();
