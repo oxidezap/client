@@ -15,6 +15,12 @@ log = { workspace = true }
 oxidezap-audio = { workspace = true }
 oxidezap-chat-store = { workspace = true, features = ["search"] }
 oxidezap-core = { workspace = true }
+# Both targets now. The camera and the encoder are a platform each — nokhwa is
+# V4L2, AVFoundation and Media Foundation, and OpenH264 is C — and a browser has
+# both too, through `getUserMedia` and `VideoEncoder`. That split lives inside
+# the crate, which is where the platform actually is, so the session names one
+# dependency and its video plane is written once.
+oxidezap-video = { workspace = true }
 # A 64-bit counter, through portable-atomic rather than std (see /clippy.toml).
 portable-atomic = { workspace = true }
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
@@ -29,16 +35,20 @@ tokio = { workspace = true, features = ["macros", "sync", "time"] }
 # takes none of them and supplies its own through the library's own plugin
 # traits.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-# The camera and the encoder, which are a platform each: nokhwa is V4L2,
-# AVFoundation and Media Foundation, and OpenH264 is C. A browser has a camera
-# too, and reaches it through `getUserMedia` and `VideoEncoder` — a binding
-# rather than a build, which is why this is not a feature flag on one crate.
-oxidezap-video = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 whatsapp-rust = { workspace = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false }
+# `voip-mlow` and not `voip`: the library's VoIP runtime is portable, and what
+# is not is the half that owns a UDP socket (`voip-relay-native`) and the half
+# that is C (`voip-libopus`). MLow is pure Rust and is the codec WhatsApp's own
+# clients negotiate, so a page has a codec -- which is the sentence this file
+# used to get wrong, and the reason a browser was told it had none. What it
+# supplies instead of the socket is a `RelayTransportProvider`; see
+# `src/relay/`.
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main", default-features = false, features = [
+    "voip-mlow",
+] }
 # Directly, because the library no longer re-exports it: `sqlite-storage` is
 # one of the defaults dropped above. Same crate the chat store opens, and
 # without the `bundled-sqlite` that wants a C toolchain — diesel supplies
@@ -70,6 +80,17 @@ web-sys = { version = "0.3", features = [
     "Request",
     "RequestInit",
     "Response",
+    # The relay media channel: an `RTCPeerConnection` is the DTLS, SCTP and
+    # DataChannel stack the native transport builds by hand, and the only one a
+    # page can reach. See `src/relay/`.
+    "RtcConfiguration",
+    "RtcDataChannel",
+    "RtcDataChannelEvent",
+    "RtcDataChannelInit",
+    "RtcDataChannelType",
+    "RtcPeerConnection",
+    "RtcSdpType",
+    "RtcSessionDescriptionInit",
     "StorageEstimate",
     "StorageManager",
     "WebSocket",

@@ -16,14 +16,7 @@ use openh264::formats::YUVSource;
 
 use crate::VideoQuality;
 
-/// One encoded access unit.
-pub struct EncodedFrame {
-    /// Annex-B, start codes included, exactly as the library's video source
-    /// wants it.
-    pub data: Vec<u8>,
-    /// Carries an IDR: a decoder may start here.
-    pub keyframe: bool,
-}
+use crate::EncodedFrame;
 
 /// The encoder, plus the one piece of state it does not keep itself: whether
 /// the next frame has been asked to be a keyframe.

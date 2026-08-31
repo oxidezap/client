@@ -27,8 +27,9 @@ use nokhwa::utils::{
 use portable_atomic::{AtomicBool, Ordering};
 use wacore::time::Instant;
 
+use crate::EncodedFrame;
 use crate::convert::{Frames, I420Buffer};
-use crate::encoder::{EncodedFrame, H264Encoder};
+use crate::encoder::H264Encoder;
 use crate::{VideoQuality, format_name};
 
 /// How many finished access units may wait for the call's media plane.
@@ -101,13 +102,26 @@ impl CameraStream {
         self.control.clone()
     }
 
+    /// Stop the camera, from an async caller.
+    ///
+    /// The signature the browser backend has to have, so the session's video
+    /// plane has one teardown rather than two. The blocking half is
+    /// [`Self::stop_now`], and it is where the wait actually happens.
+    pub async fn stop(self) {
+        // A capture thread asleep in `frame()` is exactly the thing that must
+        // not be waited on from a runtime thread.
+        if let Err(e) = tokio::task::spawn_blocking(move || self.stop_now()).await {
+            log::warn!("closing the camera failed: {e}");
+        }
+    }
+
     /// Stop the camera and wait for the device to be closed.
     ///
     /// Waited for rather than left to `Drop`: the next call opens the same
     /// device, and a capture backend that still holds it fails the open
     /// rather than queuing behind it. The wait is bounded by one frame — the
     /// thread is asleep in `frame()` and notices on the way out.
-    pub fn stop(mut self) {
+    pub fn stop_now(mut self) {
         self.shut_down();
     }
 

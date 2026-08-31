@@ -22,8 +22,17 @@ jobs:
     with:
       version: nightly
 
+  # The same client as a page, packaged so it can be hosted without being
+  # built. It is a separate workflow rather than a fourth matrix entry because
+  # nothing about it matches: a nightly toolchain, a rebuilt standard library,
+  # trunk, and one artifact rather than one per platform.
+  web:
+    uses: ./.github/workflows/web-bundle.yml
+    with:
+      version: nightly
+
   publish:
-    needs: build
+    needs: [build, web]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -54,6 +63,14 @@ jobs:
 
           On Windows, SmartScreen will object. All of this follows from the
           binaries being unsigned.
+
+          `oxidezap-nightly-web.zip` is the same client as a web page: the
+          bundle published to GitHub Pages, built to be served from anywhere
+          rather than from one directory. Unpack it and serve the files with
+          any static web server — over HTTPS or from `localhost`, and with
+          `coi-serviceworker.js` left beside `index.html`, which is what
+          obtains the cross-origin isolation the window needs. `README.md`
+          inside says the rest.
           NOTES
           echo "" >> notes.md
           echo "Built from \`$GITHUB_SHA\`." >> notes.md

@@ -1,23 +1,26 @@
-//! Voice calls, which are the one thing the session does that a page cannot.
+//! Voice and video calls.
 //!
-//! Their media stack is `whatsapp_rust::voip`, whose codec is C and does not
-//! build for `wasm32-unknown-unknown`. So this is the session's own platform
-//! split, and it is the same shape as every other one in this tree: one set
-//! of names, two implementations behind it, and no `cfg` in the session's
-//! logic above.
+//! One implementation, where there were two. The browser half used to be a
+//! set of refusals — "a call cannot be placed in a browser: there is no audio
+//! codec here" — and that sentence was wrong about which thing was missing.
+//! A page has a codec: MLow is pure Rust and lives in the library's own core,
+//! which is what WhatsApp's clients negotiate anyway. What a page does not
+//! have is a **UDP socket**, and that turned out to be the only thing in the
+//! way.
 //!
-//! The browser side is not a stub that panics. A page still hears a call
-//! ring — the signalling types are in `wacore` and arrive like any other
-//! event — so it still records the call in the conversation, and still shows
-//! it as missed when it stops ringing. What it cannot do is *answer*, and
-//! that is refused where it is asked for rather than somewhere further in.
+//! It supplies one now, in the shape a browser can: an `RTCPeerConnection` is
+//! the same DTLS, SCTP and pre-negotiated DataChannel the native relay
+//! transport assembles by hand, and the library takes it through
+//! `Client::set_relay_transport_provider` (see [`crate::relay`]). The devices
+//! came the same way — [`oxidezap_audio::open_call_audio`] and
+//! `oxidezap_video` each grew their browser backend — so what is left here is
+//! call logic, and call logic never had a platform in it.
+//!
+//! Two lines of this file's own are still the platform's, and both are about
+//! *where work runs* rather than what it does: the session's executor
+//! ([`crate::exec`]) rather than tokio's, since a page has no runtime to
+//! reach for.
 
-#[cfg(not(target_family = "wasm"))]
-mod native;
-#[cfg(not(target_family = "wasm"))]
-pub(super) use native::CallRegistry;
+mod registry;
 
-#[cfg(target_family = "wasm")]
-mod web;
-#[cfg(target_family = "wasm")]
-pub(super) use web::CallRegistry;
+pub(super) use registry::CallRegistry;

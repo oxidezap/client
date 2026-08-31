@@ -12,6 +12,32 @@
     <meta name="color-scheme" content="dark light" />
     <title>oxidezap</title>
 
+    <!-- Cross-origin isolation, which GitHub Pages cannot give us.
+         `gpui_web` runs its background executor on real workers, and workers
+         share memory through a `SharedArrayBuffer` — which a browser only
+         hands to a page that is cross-origin isolated, and that requires two
+         response headers a static host does not let us set. A service worker
+         can add them to its own responses, which is what this does: the
+         first load registers it and reloads once, and every load after that
+         is already isolated. It answers navigations and worker scripts and
+         passes everything else through, because those are the only responses
+         the two headers are read off — and a subresource answered by a
+         service worker is one the page's own preload can no longer be
+         matched against.
+
+         This is the only JavaScript in the build that is not wasm-bindgen's
+         own generated glue, and it is here because the alternative is a
+         header we have no way to send.
+
+         It is declared *before* the module, and that ordering is about
+         the first visit: registering and reloading is how the headers arrive,
+         and a reload that lands after the preload has begun throws away
+         however much of a twenty-megabyte module the browser had got. The
+         registration is asynchronous, so this narrows the window rather
+         than closing it — but the other order guarantees the waste. -->
+    <link data-trunk rel="copy-file" href="coi-serviceworker.js" />
+    <script src="coi-serviceworker.js"></script>
+
     <!-- The window itself. `data-bin` names the binary; wasm-bindgen turns
          its `main` into the module's start function.
 
@@ -41,7 +67,7 @@
          artifact lists exactly one custom section, `producers`, at 72 bytes.
          Which is the warning worth leaving — a DevTools flame graph of this
          page has no Rust symbols in it and never had.
-         `WEB_PROFILE=debug ./web/build.sh` is the build that does: it selects
+         `WEB_PROFILE=debug cargo xtask web build` is the build that does: it selects
          `[profile.web-debug]`, which is the same profile with `strip` off.
 
          `-g` is what carries that through to here. wasm-opt drops the name
@@ -75,24 +101,6 @@
       data-wasm-opt-params="-g --enable-bulk-memory --enable-threads --enable-mutable-globals --enable-nontrapping-float-to-int --enable-sign-ext"
     />
 
-    <!-- Cross-origin isolation, which GitHub Pages cannot give us.
-         `gpui_web` runs its background executor on real workers, and workers
-         share memory through a `SharedArrayBuffer` — which a browser only
-         hands to a page that is cross-origin isolated, and that requires two
-         response headers a static host does not let us set. A service worker
-         can add them to its own responses, which is what this does: the
-         first load registers it and reloads once, and every load after that
-         is already isolated. It answers navigations and worker scripts and
-         passes everything else through, because those are the only responses
-         the two headers are read off — and a subresource answered by a
-         service worker is one the page's own preload can no longer be
-         matched against.
-
-         This is the only JavaScript in the build that is not wasm-bindgen's
-         own generated glue, and it is here because the alternative is a
-         header we have no way to send. -->
-    <link data-trunk rel="copy-file" href="coi-serviceworker.js" />
-    <script src="coi-serviceworker.js"></script>
 
     <style>
       *,

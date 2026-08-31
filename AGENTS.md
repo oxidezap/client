@@ -7,9 +7,11 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
 - **oxidezap-core**: domain types (chats, messages, calls, UI events). No UI, no I/O.
 - **oxidezap-audio**: capture, playback, Opus encoding, waveforms. cpal; no UI.
   On the web the sound card and the codec are the browser's: playback is real
-  (`decodeAudioData` takes exactly the bytes the daemon sends) and so is
+  (`decodeAudioData` takes exactly the bytes the daemon sends), so is
   recording, through WebAudio for the capture and `AudioEncoder` for the
-  codec. `ogg_opus` is the container both platforms write, because only the
+  codec, and so is a call's mic and speaker — one `AudioContext` for both
+  directions, because the browser's echo canceller only subtracts what it
+  played itself. `ogg_opus` is the container both platforms write, because only the
   codec was ever missing — which is also why `MediaRecorder` is *not* the
   route in: it produces a container the browser picks (WebM on Chrome, MP4 on
   Safari) where a voice note is Opus in OGG, so it would have meant a demuxer
@@ -19,9 +21,12 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   consumes only the library's public event surface. Extracted from
   whatsapp-rust, where it was application logic living in a protocol repo.
 - **oxidezap-video**: camera capture and H.264 encoding for calls. cpal's
-  opposite number: a capture backend per platform behind one crate, and the
-  encoder the GUI already decodes with. No UI, and no decode — decoding
-  belongs to whoever draws.
+  opposite number, and now in both senses: a capture backend per platform
+  behind one crate — nokhwa and OpenH264 on a desktop, `getUserMedia` and
+  `VideoEncoder` in a browser — and the encoder the GUI already decodes with.
+  The browser encoder is configured `avc: { format: "annexb" }`, so what comes
+  out is what the library's video source already wants rather than AVCC to be
+  converted. No UI, and no decode — decoding belongs to whoever draws.
 - **oxidezap-session**: the WhatsApp connection: events, sends, store hydration.
   Knows nothing about how anything is drawn, and nothing about IPC either —
   the daemon translates requests onto its methods. Three of its modules are
@@ -120,6 +125,23 @@ the one to copy — it asks for nothing that touches the account, so it runs the
 moment it is dropped in the folder — and `autoreply/` is the same shape with
 something in it.
 
+`xtask/` is the repository's own tooling — the web build, the bundle checks,
+and the `gh-pages` publisher — and it is excluded from the workspace for a
+reason of its own rather than the plugins'. The Pages publish job holds
+`contents: write` and checks out one directory; a workspace member would make
+cargo resolve the whole graph, eight git dependencies among them, before it
+could compile a binary that needs none of it. So it carries its own
+`[workspace]`, takes no dependencies at all, and CI runs its tests against its
+own manifest the way it runs the example plugins'. What lives there was shell
+until it was not: a compare-and-swap against a branch, and a three-way "is
+this still wanted" whose one wrong reading — an operational failure collapsing
+into "stand down" — is a deployment that silently does not happen while the
+job reports success. Both now have tests, including one that drives the whole
+publish against a bare repository in a temporary directory. `curl` and `gzip`
+are the two things it still shells out to, and deliberately: a TLS client and
+a deflate implementation are the two dependencies that would cost this
+directory the property the sparse checkout depends on.
+
 `docs/plugin-abi.md` is the contract for anyone not using the SDK: the imports
 with their signatures, the field table by kind, the UI encoding, the outcome
 codes and every bound the host holds a plugin to. The SDK is a convenience
@@ -136,6 +158,13 @@ a copy is what lets the version literal in the snippet drift past
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings   # what CI enforces
 cargo test --workspace
+
+# The tooling is its own workspace (see `xtask/` above), so none of the three
+# lines above compiles a byte of it. CI has a job that does.
+cargo fmt --manifest-path xtask/Cargo.toml --all
+cargo clippy --manifest-path xtask/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path xtask/Cargo.toml
+cargo xtask help    # what there is to run; from the repository root
 
 # Running it: two binaries, and the window looks for the daemon beside itself.
 cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxidezap
@@ -168,9 +197,10 @@ cargo install trunk
 # Serves on http://127.0.0.1:8080 with the two isolation headers set. On
 # GitHub Pages a service worker adds them instead, because a static host has
 # no way to.
-# Through the script: trunk cannot forward arguments to cargo, so it is what
-# sets the toolchain and `CARGO_UNSTABLE_BUILD_STD`.
-TRUNK_ACTION=serve ./web/build.sh
+# Through the task: trunk cannot forward arguments to cargo, so it is what
+# sets the toolchain and `CARGO_UNSTABLE_BUILD_STD`. Run it from the root —
+# the alias in /.cargo/config.toml names a manifest path.
+TRUNK_ACTION=serve cargo xtask web build
 
 # And the daemon it attaches to. `--web` alone is loopback on the port the
 # page looks for; localhost is served without being named. It logs where the
@@ -184,7 +214,7 @@ cargo run --bin oxidezapd -- --web
 # `strip` off, so it is the build that misbehaved rather than a different one
 # — and `-g` in `data-wasm-opt-params` is what stops wasm-opt throwing the
 # name section away again.
-WEB_PROFILE=debug ./web/build.sh
+WEB_PROFILE=debug cargo xtask web build
 ```
 
 The web half of the daemon — the OPFS folder a page installs plugins into —
@@ -229,6 +259,46 @@ as "expected `Jid`, found `Jid`" and reads like a compiler bug.
 Because profile settings only apply from the workspace root, the per-package
 `opt-level` sweep in the library's own manifest is *not* inherited, so the release
 profile here repeats it deliberately.
+
+## What CI actually costs
+
+A repository gets 10 GB of Actions cache, and GitHub evicts the least recently
+used entry to stay under it. That number, not any compiler setting, is what
+decides how long a pull request waits: a job that restores its cache spends a
+minute on the download and then a minute compiling, and the same job that finds
+nothing spends eight compiling from scratch. The Windows `Check` job has been
+observed at 3m49 with a cache and 12m26 without it, twenty minutes apart.
+
+So the budget is a shared resource with a fixed size, and every `save-if` in
+these workflows is a claim on it. Two rules follow, and both are already in the
+files:
+
+- **Only `main` writes.** A pull request restores and never saves, or every
+  branch would push out the one entry every other branch restores from.
+- **A job that is nobody's critical path does not cache a target directory.**
+  The five entries the other workflows write come to 8 GB of the 10 —
+  2.17 GB for the Linux `Check`, 2.07 for Windows, 1.64 for macOS, 0.87 for
+  MSRV, 1.14 for `pages-wasm`, each read off its own upload log — and
+  `build.yml` wrote three more on top, one release target directory per
+  platform under fat LTO. There is no version of that which fits, so it keeps
+  the registry and the git checkouts (`cache-targets: false`) and recompiles
+  the rest. Its Windows job was spending 9m15 of a 17m45 run moving that cache
+  around (2m05 down, 7m10 up), which is the shape of the thing being given up.
+
+The other half is how big an entry is, because the download and the upload are
+themselves a minute each. What rust-cache stores is the *dependencies* — it
+prunes the workspace's own artifacts before saving — so the lever is what a
+dependency compiles to rather than what our crates compile to. Dependencies
+carry no debug information (`[profile.dev.package."*"]`, and `build-override`
+for the host-compiled half of them, which is where the proc macros are), which
+is why they can: nobody sets a breakpoint in diesel, and `panic::Location` is
+compiled in regardless, so panics still name their file and line. It is a
+third off what CI compresses and a third off what it downloads, and it is not
+a trade against build time — DWARF is work to emit and work to link, so the
+cold local build got 12% faster too. The manifest carries the table.
+
+Raising the 10 GB limit is possible on a paid plan and would be another answer
+to the same problem. Nothing here needs it yet.
 
 ## Gotchas
 
@@ -351,10 +421,18 @@ profile here repeats it deliberately.
   has to know is also the one thing worth overriding, so `OXIDEZAP_FRONT_END`
   names another — a TUI, a second GUI — and the shipped pair is only the
   default.
-- **Calls ring in the daemon.** `oxidezap-session` is what opens the mic and
-  speaker, so the process that owns the session owns the audio device. That
-  follows from the split rather than being chosen, and it is why a call still
-  works with the window closed.
+- **A call is held by whoever holds the session.** `oxidezap-session` is what
+  opens the mic, the speaker and the camera, so the process that owns the
+  session owns the devices. That follows from the split rather than being
+  chosen, and it is why a call still works with the window closed.
+  On a desktop that process is the daemon. On a page holding its own session
+  it is the page, which is the same sentence and not an exception to it — the
+  devices are WebAudio and `getUserMedia` there, and the media reaches the
+  relay through an `RTCPeerConnection` rather than a UDP socket (`session/
+  relay/`). What used to be written here is that a browser had no audio codec;
+  it was wrong about which thing was missing. MLow is pure Rust and is what
+  WhatsApp's own clients negotiate. What a page has no such thing as is a
+  socket.
 - **A plugin is a front end that does not draw, and it runs in the daemon.**
   It sees the account's events and acts through the same command channel a
   window's requests go onto, so it has no privileged path to the session. It
@@ -778,7 +856,7 @@ profile here repeats it deliberately.
   collected at every frame after; the web artifact is one module a visitor
   waits on before the first pixel and a browser then compiles, and its code
   section is 84% of it. Cargo has no per-target profiles, so `[profile.web]`
-  is the answer and `web/build.sh` selects it through trunk's
+  is the answer and `cargo xtask web build` selects it through trunk's
   `--cargo-profile`. `opt-level = "s"` there was measured at 31% of the module
   — by a wide margin the largest single thing in it, larger than every crate
   gate put together. `gpui` is the one exception at 3: it draws every frame
@@ -1219,6 +1297,17 @@ calls, keeps plugins, survives the tab and keeps the keys out of a browser's
 storage — but it no longer needs one. The export stays static either way: nothing here needs a
 server to be *hosted*. `.github/workflows/pages.yml` builds and publishes it.
 
+The same bundle ships in every release as `oxidezap-<version>-web.zip`, built
+by `.github/workflows/web-bundle.yml` — so hosting it somewhere else is
+unpacking a directory rather than installing a nightly toolchain and trunk.
+The one difference is the public URL: Pages knows its own directory and bakes
+it into the generated glue, and an archive cannot, so that build is told `./`
+and every asset is named relative to `index.html`. Which is why it is a second
+build rather than a copy of the Pages artifact, and why the workflow asserts
+the relocatability rather than trusting it — an asset named from the origin
+root is a bundle that only works unpacked at a domain's root, and that is the
+one way `--public-url` can silently come out wrong.
+
 The daemon a page runs is the daemon, minus the process:
 `daemon::embedded::start` assembles the state hub and the session bridge and
 hands the front end one end of a `tokio::io::duplex`, which `serve_client`
@@ -1363,6 +1452,16 @@ no HTTP endpoint, so the sideband is three more messages on the same channel,
 with the bytes crossing as a `Uint8Array` — one structured clone, where JSON
 would be a base64 round trip through a string twice the size.
 
+Both ends of it run in a browser under `cargo test`, and that is not
+belt-and-braces: the leader built its connection handler, held it for exactly
+the right lifetime, and never called `set_onmessage`. Everything compiled,
+every lint passed, and what a second tab got was a rendezvous answered
+perfectly followed by silence — `serve_client` waiting out its handshake
+window and refusing a hello it was never handed. The only error anywhere
+appeared in the *asking* tab, naming a frame it had sent correctly. Reading
+does not catch a call that is not there; running it does, which is what
+`listener::tab::tests` is for.
+
 **Queuing for the lock is now the right thing, and the reasoning that ruled it
 out has not been dropped so much as spent.** It said a queued tab looks like
 one that is starting and would silently take an account nobody was looking at.
@@ -1463,8 +1562,33 @@ desktop.
 
 So voice notes play and record, a video in a conversation decodes through the
 browser's own H.264 (`web_sys::VideoDecoder`, bound from Rust like every other
-browser API here), and plugins run; calls stay in the daemon, which is where
-the microphone already was.
+browser API here), plugins run, and calls are placed and answered — the
+microphone and speaker through WebAudio, the camera through `getUserMedia`,
+the picture encoded by `VideoEncoder` and the media carried to the relay by an
+`RTCPeerConnection`.
+
+The relay is the part worth stating precisely, because it reads like a second
+protocol and is not. The native transport dials UDP and runs DTLS, SCTP and a
+pre-negotiated `id=0` DataChannel over it — and its own comment calls that "the
+synthetic-SDP / wrtc dance" reduced to one layer. A browser does the dance
+instead: `session/relay/` writes the SDP answer describing the relay and hands
+it to a peer connection, which is the same stack with the browser assembling
+it. The library takes it through `Client::set_relay_transport_provider`, a seam
+that exists upstream for exactly this and answers with a factory per relay
+endpoint, since the server names the relay per call.
+
+One fact on that path is a captured constant rather than something the
+protocol carries. An SDP answer must name the certificate the far end presents
+and a browser enforces the match (RFC 8122); the native transport does not care
+and says the fingerprint "is fixed and cosmetic at this layer". *Fixed* is the
+operative word, and it is a claim that was checked rather than taken: read out
+of `chrome://webrtc-internals` during calls placed on WhatsApp Web itself, the
+remote certificate was the same across separate calls that reached *different*
+relay addresses, while each tab's own certificate differed. One value, two
+endpoints — that is what makes `RELAY_DTLS_FINGERPRINT` a constant and not a
+per-call secret. It is not in the `<relay>` block and there is nowhere else to
+get it, so a build that lost it would fail every handshake, which is what
+`the_fingerprint_is_thirty_two_hex_pairs` is there to notice early.
 
 Whether a page can record is a question about the *browser* rather than about
 the build, which is why `can_record()` is a function where `CAN_RECORD` was a
@@ -1720,6 +1844,56 @@ by definition.
   samples a presentation position depends on rather than a range. That is the
   timeline's indexing model rather than a patch to it, and verifying it wants
   a B-frame fixture this tree has none of.
+- **A follower tab cannot place a call, and the reason is which document owns
+  the devices.** A tab that lost the claim holds no session, so its Place or
+  Accept is executed by the tab that does — and `getUserMedia` and
+  `AudioContext::resume` then run in *that* document. The microphone, the
+  speakers and the permission prompt would all be the leader's, in a tab the
+  person pressing the button is not looking at and has not gestured in, so
+  the call would be held by a tab that did not ask for it and heard there
+  too. `calls_unavailable` refuses it and says which tab to use. It is the
+  one place a follower differs from a desktop window talking to an
+  `oxidezapd`, and the contrast is what makes it right: there the devices are
+  the daemon's by design and nobody expects the window to hold them, while
+  here both tabs are windows and the wrong one would. Fixing it properly
+  means the follower opening the devices and handing them across, which is a
+  change to the tab protocol rather than a check.
+  It is a *separate* question from `calls_unavailable`, and folding the two
+  together was a bug rather than a tidy-up: a window that cannot carry a call
+  owes the caller an answer and declines, while a window that is merely the
+  wrong one owes them nothing — the call is answerable in the tab beside it,
+  and declining would send `Decline` to the leader and clear the offer
+  everywhere, telling somebody to answer in the other tab while destroying
+  the call they would have answered there.
+
+- **Which end a full queue drops from is a question about the payload, not
+  about latency.** The microphone's queue evicts its oldest frame and the
+  camera's refuses its newest, and the two look like the same decision made
+  inconsistently. They are not: a PCM frame stands on its own, so dropping an
+  older one costs exactly that frame and the newest speech is the only speech
+  worth having. An H.264 picture is referenced by the ones behind it, so
+  evicting the oldest does not free a slot — it makes everything still queued
+  undecodable and then sends it, and the peer receives two corrupt pictures
+  where refusing the new one sends two good ones and a gap. The camera is
+  staler by two frames, 66 ms at 30 fps, and that is the whole price of
+  keeping what is delivered decodable. Both ask for a keyframe on the drop,
+  because the gap is real either way.
+
+- **A dropped access unit is a frame of RTP time that goes unspent.** The
+  library's `VideoSource` advertises one `rtp_timestamp_stride` and advances
+  by exactly that per unit delivered, and `EncodedFrame` carries no timestamp
+  — so the stream's clock counts *units*, not elapsed time. Everything on this
+  path drops on purpose (the encoder's own queue, the plane's, and the web
+  timer's backpressure skip), and each drop is therefore a frame's worth of
+  time the video clock never advances through: under sustained loss the
+  picture's timestamps fall behind the audio's, by the length of what was
+  dropped. Predates the browser backend and is identical on the desktop —
+  `camera.rs`'s `try_send` and `plane.rs`'s both drop into the same
+  fixed-stride source. Closing it means a timestamp on `EncodedFrame` and a
+  `VideoSource` that reads one, which is a change to `whatsapp-rust` rather
+  than to anything here; the alternative — not dropping — is the one thing
+  this path exists to do.
+
 - **Group video is drawn but not reachable.** `call_card/video.rs` carries a
   participant grid the library's group calls would fill; 1:1 is what the card
   routes to today.
@@ -1732,7 +1906,13 @@ by definition.
   What still does not is anything the *daemon* refused: a front end learns
   only `Accepted`, and a refusal reaching the window would need a field on the
   wire. `SendFailed` is the one exception, and it is against a chat rather
-  than against the request.
+  than against the request. `CallMediaFailed` is the second, and it was added
+  after a browser call that dialled no relay read in the console as an offer,
+  an ending, and not one line between them: the library publishes
+  `MediaSetupFailed` with the reason and the event pump's catch-all was
+  throwing it away, so the one event carrying the explanation was the one
+  nothing listened to. A call that ends a moment after it is placed has to
+  say why, or every report of it is a bug report with no evidence in it.
 - **A promised file is not a held file, once the reader is a browser.** The
   daemon's media cache is files and no index — the front end it was written
   for opens them itself, so `claim` can be `has` and there is no window

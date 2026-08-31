@@ -9,8 +9,7 @@ use anyhow::{Result, anyhow};
 use log::{error, info, warn};
 use portable_atomic::AtomicU64;
 
-const FRAME_SAMPLES: usize = 960; // 60 ms @ 16 kHz
-const WA_RATE: u32 = 16_000;
+use crate::{CALL_FRAME_SAMPLES as FRAME_SAMPLES, CALL_RATE as WA_RATE};
 /// Ceiling on the device-open handshake. Build and play are near-instant on a
 /// healthy device, but a wedged driver would otherwise park call setup forever
 /// on a barrier that never answers.
@@ -20,119 +19,6 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{I24, Sample, SampleFormat, U24};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer as _, Producer as _, Split as _};
-
-/// Linear resampler that carries a fractional read cursor across calls so block
-/// boundaries don't click.
-///
-/// When downsampling it first runs a windowed-sinc low-pass at the source rate.
-/// Linear interpolation alone does not attenuate anything above the destination
-/// Nyquist, so a 48 -> 16 kHz pull is effectively "take every third sample" and
-/// folds everything above 8 kHz back into the voice band as aliasing.
-/// Upsampling needs no such filter: interpolation cannot create content above
-/// the source Nyquist.
-struct Resampler {
-    src_rate: u32,
-    dst_rate: u32,
-    /// Fractional index into a virtual stream, carried across blocks.
-    pos: f64,
-    /// Empty when not downsampling.
-    taps: Vec<f32>,
-    /// `taps.len() - 1` samples of the previous block, so the filter has
-    /// history at a block boundary instead of ringing from zeros.
-    history: Vec<f32>,
-    /// Scratch for the filtered block; reused to keep the drain allocation-free.
-    filtered: Vec<f32>,
-}
-
-impl Resampler {
-    fn new(src_rate: u32, dst_rate: u32) -> Self {
-        let taps = if src_rate > dst_rate {
-            // 0.45 rather than 0.5 of the destination Nyquist: leaves a
-            // transition band so the passband edge is not already rolling off.
-            crate::resample::lowpass_taps(0.45 * dst_rate as f32 / src_rate as f32)
-        } else {
-            Vec::new()
-        };
-        let history = vec![0.0; taps.len().saturating_sub(1)];
-        Self {
-            src_rate,
-            dst_rate,
-            pos: 0.0,
-            taps,
-            history,
-            filtered: Vec::new(),
-        }
-    }
-
-    /// Resample `src` into `out`. Allocation-free past the warmup.
-    fn process(&mut self, src: &[i16], out: &mut Vec<i16>) {
-        if src.is_empty() {
-            return;
-        }
-        let step = self.src_rate as f64 / self.dst_rate as f64;
-
-        // Band-limit at the source rate before the cursor decimates.
-        let filtered: &[f32] = if self.taps.is_empty() {
-            self.filtered.clear();
-            self.filtered.extend(src.iter().map(|&s| s as f32));
-            &self.filtered
-        } else {
-            self.filtered.clear();
-            self.filtered.reserve(src.len());
-            let hist = self.history.len();
-            for i in 0..src.len() {
-                let mut acc = 0.0f32;
-                for (k, &tap) in self.taps.iter().enumerate() {
-                    // Tap k reads k samples back; anything before this block
-                    // comes out of the carried history.
-                    let idx = i as isize - k as isize;
-                    let sample = if idx >= 0 {
-                        src[idx as usize] as f32
-                    } else {
-                        let h = hist as isize + idx;
-                        if h >= 0 {
-                            self.history[h as usize]
-                        } else {
-                            0.0
-                        }
-                    };
-                    acc += tap * sample;
-                }
-                self.filtered.push(acc);
-            }
-            // Carry this block's tail as the next block's history.
-            if hist > 0 {
-                let keep = hist.min(src.len());
-                self.history.rotate_left(keep);
-                let start = self.history.len() - keep;
-                for (slot, &s) in self.history[start..]
-                    .iter_mut()
-                    .zip(&src[src.len() - keep..])
-                {
-                    *slot = s as f32;
-                }
-            }
-            &self.filtered
-        };
-
-        let mut p = self.pos;
-        while p < filtered.len() as f64 {
-            let i = p as usize;
-            let frac = (p - i as f64) as f32;
-            let a = filtered[i];
-            let b = if i + 1 < filtered.len() {
-                filtered[i + 1]
-            } else {
-                a
-            };
-            out.push((a + (b - a) * frac).round().clamp(-32768.0, 32767.0) as i16);
-            p += step;
-        }
-        // Carry the leftover fraction (relative to the next block's start) so
-        // the next call continues smoothly instead of restarting at 0.
-        self.pos = p - filtered.len() as f64;
-    }
-}
 
 /// Pick the device's default config and an i16-friendly stream config.
 fn default_config(
@@ -147,6 +33,32 @@ fn default_config(
     .map_err(|e| anyhow!("default config: {e}"))?;
     let format = supported.sample_format();
     Ok((supported.into(), format))
+}
+
+/// Open both ends of a call's audio, off the caller's thread.
+///
+/// The pair rather than two calls, and async rather than blocking, because
+/// that is the shape the *other* backend has to have: `getUserMedia` is a
+/// permission prompt, and no amount of arranging makes it answer inline. With
+/// one signature the session's call path is written once; with two it would
+/// grow a `cfg` at the only place a call is set up.
+///
+/// cpal's own setup is blocking and can take a noticeable moment on a cold
+/// audio stack, which is a moment the session would otherwise spend not
+/// answering anything else.
+///
+/// # Errors
+///
+/// If either device will not open. Answered before the offer or the accept
+/// goes out, so a machine with no microphone places a call that was never
+/// claimed to carry one rather than one that silently does not.
+pub async fn open_call_audio() -> Result<(
+    async_channel::Receiver<Vec<i16>>,
+    async_channel::Sender<Vec<i16>>,
+)> {
+    tokio::task::spawn_blocking(|| Ok((spawn_mic()?, spawn_speaker()?)))
+        .await
+        .map_err(|e| anyhow!("audio setup task failed: {e}"))?
 }
 
 /// Open the default input device and stream 960-sample 16 kHz mono i16 frames over a channel.
@@ -240,7 +152,7 @@ pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
         tokio::spawn(async move {
             let mut pop_buf = vec![0i16; (src_rate as usize / 4).max(FRAME_SAMPLES)];
             let mut acc: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
-            let mut resampler = Resampler::new(src_rate, WA_RATE);
+            let mut resampler = crate::resample::Stream::new(src_rate, WA_RATE);
             loop {
                 if !alive.load(Ordering::Relaxed) || tx_drain.is_closed() {
                     break;
@@ -482,7 +394,7 @@ pub fn spawn_speaker() -> Result<async_channel::Sender<Vec<i16>>> {
     // Async drain: channel -> resample -> ring. Owns the ring producer.
     tokio::spawn(async move {
         let mut resampled: Vec<i16> = Vec::with_capacity(4096);
-        let mut resampler = Resampler::new(WA_RATE, dst_rate);
+        let mut resampler = crate::resample::Stream::new(WA_RATE, dst_rate);
         while let Ok(frame) = rx.recv().await {
             resampled.clear();
             resampler.process(&frame, &mut resampled);
@@ -654,11 +566,11 @@ mod tests {
     /// nearly full amplitude instead of being attenuated.
     #[test]
     fn downsampling_rejects_content_above_destination_nyquist() {
-        let mut passband = Resampler::new(48_000, WA_RATE);
+        let mut passband = crate::resample::Stream::new(48_000, WA_RATE);
         let mut out_pass = Vec::new();
         passband.process(&tone(1_000.0, 48_000, 4_800), &mut out_pass);
 
-        let mut stopband = Resampler::new(48_000, WA_RATE);
+        let mut stopband = crate::resample::Stream::new(48_000, WA_RATE);
         let mut out_stop = Vec::new();
         stopband.process(&tone(15_000.0, 48_000, 4_800), &mut out_stop);
 
@@ -677,11 +589,11 @@ mod tests {
     fn block_boundaries_match_a_single_pass() {
         let src = tone(1_000.0, 48_000, 4_800);
 
-        let mut whole = Resampler::new(48_000, WA_RATE);
+        let mut whole = crate::resample::Stream::new(48_000, WA_RATE);
         let mut out_whole = Vec::new();
         whole.process(&src, &mut out_whole);
 
-        let mut chunked = Resampler::new(48_000, WA_RATE);
+        let mut chunked = crate::resample::Stream::new(48_000, WA_RATE);
         let mut out_chunked = Vec::new();
         for block in src.chunks(480) {
             chunked.process(block, &mut out_chunked);
@@ -699,7 +611,7 @@ mod tests {
     /// Upsampling takes the no-filter path; it must still be continuous.
     #[test]
     fn upsampling_preserves_the_tone() {
-        let mut rs = Resampler::new(WA_RATE, 48_000);
+        let mut rs = crate::resample::Stream::new(WA_RATE, 48_000);
         let mut out = Vec::new();
         rs.process(&tone(1_000.0, WA_RATE, 1_600), &mut out);
         assert!(out.len() > 4_000, "expected ~3x samples, got {}", out.len());

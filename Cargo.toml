@@ -105,6 +105,13 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 # and no two crates can drift onto incompatible revisions. The exact commit is
 # pinned in the committed Cargo.lock.
 #
+# `main` carries the VoIP split this front end needs as of
+# oxidezap/whatsapp-rust#1364: the library's portable VoIP runtime is separate
+# from its native UDP relay dialler, and `Client::set_relay_transport_provider`
+# is the seam a page reaches a call through. Every entry moves together, which
+# is the rule this block exists for -- a per-crate `rev` is what produces
+# "expected `Jid`, found `Jid`".
+#
 # `whatsapp-rust` re-exports wacore, wacore-binary and waproto wholesale, so
 # anything already depending on it reaches them through that and does not
 # declare them here. The satellites below stay because `oxidezap-core`,
@@ -118,9 +125,52 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "m
 whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 
 [profile.dev]
-# gpui is unusably slow unoptimized; match zed's own dev profile for it.
+# Dependencies carry no debug information. Nobody here steps into diesel, and
+# what a dependency's DWARF costs is paid three times over: rustc emits it,
+# the linker copies it into every binary that touches the crate, and CI then
+# compresses the whole target directory into a cache entry the next run has to
+# download again.
+#
+# Measured on this workspace from cold, `cargo test --workspace --exclude
+# oxidezap-gui --all-features --no-run`, four cores:
+#
+#                                    build   target/debug   zstd -3
+#   as a developer builds it         188 s        7.87 GB   1.74 GB
+#   the same, dependencies bare      165 s        4.54 GB   1.09 GB
+#   as CI builds it                  150 s        3.27 GB    756 MB
+#   the same, dependencies bare      146 s        2.21 GB    556 MB
+#
+# The compressed column is the one CI pays twice for, once on the download and
+# once on the upload. Nothing got slower: emitting and linking DWARF is work,
+# so not emitting it is 12% off a cold local build as well.
+#
+# `panic::Location` is compiled in regardless, so `#[track_caller]`, `assert!`
+# and every panic message still name the file and line they came from; what is
+# lost is stepping through a dependency's source and reading its locals, which
+# is a debugger session somebody can turn back on for the crate they are
+# actually chasing. Our own crates are untouched and keep full debug info
+# locally — CI narrows those to line tables through
+# `CARGO_PROFILE_DEV_DEBUG`, where nothing attaches a debugger.
+[profile.dev.package."*"]
+debug = false
+
+# gpui is unusably slow unoptimized; match zed's own dev profile for it. Its
+# debug info is stated here rather than left to the glob above: a named
+# package override and `"*"` both apply to gpui, and which of the two answers
+# for a setting the named one does not mention is a question this file should
+# not be asking about the largest dependency in the tree.
 [profile.dev.package.gpui]
 opt-level = 3
+debug = false
+
+# Build scripts and proc macros, which the glob above does not reach: cargo
+# gives a host-compiled unit its `build-override` settings rather than the
+# package's, so `serde_derive`, `thiserror-impl` and `prost-build` were the
+# one part of the dependency graph still emitting DWARF nobody reads. Nothing
+# steps through a build script; when one misbehaves it is read by what it
+# printed.
+[profile.dev.build-override]
+debug = false
 
 [profile.release]
 opt-level = 3
@@ -255,7 +305,7 @@ opt-level = "s"
 # artifact is one 28 MiB module a visitor waits on before the first pixel and
 # a browser then has to compile, so the same setting is the wrong one — and
 # cargo has no per-target profiles, which is why this is a profile of its own
-# rather than a `cfg`. `web/build.sh` selects it through trunk's
+# rather than a `cfg`. `cargo xtask web build` selects it through trunk's
 # `--cargo-profile`; nothing else uses it, and the desktop build is untouched.
 #
 # The measurements are at the rustc stage on this tree, against `release`
@@ -290,7 +340,7 @@ opt-level = "z"
 [profile.web.package.buffa]
 opt-level = "z"
 
-# The same bundle with its symbols, which `WEB_PROFILE=debug ./web/build.sh`
+# The same bundle with its symbols, which `WEB_PROFILE=debug cargo xtask web build`
 # selects. It inherits `web` rather than `release` deliberately: a build you
 # are diagnosing should be the build that misbehaved, so the only difference
 # is that the names survive.

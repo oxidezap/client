@@ -34,11 +34,24 @@ mod waveform;
 mod timescale;
 
 /// The cpal mic/speaker bridge for calls. The process that owns the session
-/// owns the audio device, and that is never the page.
+/// owns the audio device -- which on the web is the page itself when it holds
+/// no daemon, so `web::call_device` is the same bridge over WebAudio rather
+/// than the refusal it used to be.
 #[cfg(not(target_family = "wasm"))]
 mod call_device;
 #[cfg(target_family = "wasm")]
 mod web;
+
+/// What a call's audio is, in one place.
+///
+/// 16 kHz mono, 60 ms a frame, which is what the library's media plane takes
+/// and hands back. No sound card runs at it -- cpal answers 44.1 or 48 and a
+/// browser's `AudioContext` answers whatever the machine does -- so both
+/// backends resample around these two numbers, and having them written twice
+/// is how one backend ends up a frame out from the other.
+pub(crate) const CALL_RATE: u32 = 16_000;
+/// 60 ms at [`CALL_RATE`].
+pub(crate) const CALL_FRAME_SAMPLES: usize = 960;
 
 /// Whether a voice note can be recorded here.
 ///
@@ -69,11 +82,11 @@ pub use recorder::{EncodedNote, RecordedAudio, RecorderError, Recording, TARGET_
 pub use waveform::{WAVEFORM_SAMPLES, generate_waveform};
 
 #[cfg(not(target_family = "wasm"))]
-pub use call_device::{spawn_mic, spawn_speaker};
+pub use call_device::{open_call_audio, spawn_mic, spawn_speaker};
 #[cfg(not(target_family = "wasm"))]
 pub use player::AudioPlayer;
 #[cfg(not(target_family = "wasm"))]
 pub use recorder::AudioRecorder;
 
 #[cfg(target_family = "wasm")]
-pub use web::{AudioPlayer, AudioRecorder, spawn_mic, spawn_speaker};
+pub use web::{AudioPlayer, AudioRecorder, open_call_audio};
