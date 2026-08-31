@@ -250,6 +250,16 @@ struct BrowserRelayChannel {
     outbound_dropped: std::cell::Cell<u32>,
     /// Whether anything has gone out yet; see [`RelayTransport::send`].
     sent_any: std::cell::Cell<bool>,
+    /// Whether anything has come *in* yet, raised by the message callback.
+    ///
+    /// The mirror of `sent_any`, and it exists for the same reason that one
+    /// does: a call whose relay opens, sends, and hears nothing back is
+    /// indistinguishable — from this side and from every log — from one whose
+    /// peer simply said nothing. It has already happened once in production,
+    /// where the first call of a session carried not one inbound packet while
+    /// the second carried thousands, and there was no line anywhere to say
+    /// which half of the path was silent.
+    received_any: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 /// Where an inbound packet goes, and what happens when there is no room.
@@ -261,10 +271,18 @@ struct Inbound {
     /// drop is indistinguishable from a peer who stopped sending — which is
     /// the ambiguity `RelayTransportEvent::InboundDropped` exists to close.
     dropped: std::cell::Cell<u32>,
+    /// Raised on the first packet the relay delivers; see `received_any`.
+    received_any: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl Inbound {
     fn deliver(&self, packet: Bytes) {
+        // Before anything that can drop it: the question this answers is
+        // whether the relay ever spoke to us, which a full queue does not
+        // change.
+        if !self.received_any.replace(true) {
+            debug!("voip: the relay channel received its first inbound packet");
+        }
         let pending = self.dropped.get();
         if pending > 0
             && let Ok(()) = self
@@ -450,12 +468,21 @@ impl Drop for BrowserRelayChannel {
         // which is a very different fault from one that sent and then lost
         // the channel — and the two are indistinguishable from a teardown
         // that reports neither.
+        // Both directions, because either one being silent is a different
+        // fault and a call is only working when neither is. "Sent, received
+        // nothing" is a relay that took our media and bridged none back,
+        // which is the shape the first call of a session took in production.
         debug!(
-            "voip: the relay channel is being released (it {} anything)",
+            "voip: the relay channel is being released (it {} outbound and {} inbound)",
             if self.sent_any.get() {
-                "sent"
+                "carried"
             } else {
-                "never sent"
+                "never carried"
+            },
+            if self.received_any.get() {
+                "carried"
+            } else {
+                "never carried"
             }
         );
         if self.closed.replace(true) {
@@ -513,9 +540,11 @@ async fn connect_peer_connection(
     channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
     let (events_tx, events_rx) = async_channel::bounded(INBOUND_DEPTH);
+    let received_any = std::rc::Rc::new(std::cell::Cell::new(false));
     let inbound = Rc::new(Inbound {
         events: events_tx.clone(),
         dropped: std::cell::Cell::new(0),
+        received_any: std::rc::Rc::clone(&received_any),
     });
 
     // Opened before the SDP exchange, so a channel that opens between the two
@@ -649,6 +678,7 @@ async fn connect_peer_connection(
             congested: std::cell::Cell::new(false),
             outbound_dropped: std::cell::Cell::new(0),
             sent_any: std::cell::Cell::new(false),
+            received_any,
         }),
         events_rx,
     ))

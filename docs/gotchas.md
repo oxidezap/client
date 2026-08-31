@@ -93,6 +93,14 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   refuse a shared view, and a `ScriptProcessorNode` with zero input channels
   fires perfectly well, which is what the evidence first pointed at and is not
   what was wrong.
+  What a transport may *not* do is stay quiet about either direction, which
+  is why the relay accounts for both: a channel that opens, carries our media
+  and is released having received nothing is a different fault from a peer
+  who said nothing, and the two read identically in a log that reports
+  neither. The first call of a production session was exactly that — not one
+  inbound packet in twenty-one seconds, while the second call carried
+  thousands — and nothing anywhere could say whether the relay never spoke or
+  the drive loop never listened.
   Three outages was enough, so the spelling is now banned rather than
   remembered: `clippy.toml` lists the `&[u8]`/`&[f32]` bindings under
   `disallowed-methods` with the copying replacement in the reason, and CI's
@@ -174,6 +182,16 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   has to know is also the one thing worth overriding, so `OXIDEZAP_FRONT_END`
   names another — a TUI, a second GUI — and the shipped pair is only the
   default.
+- **An ending is announced by whoever was watching it.** A call with a live
+  handle has `watch_call_end` parked on `wait_ended`, and that is what
+  publishes `UiEvent::CallEnded`; a peer's `<terminate>` or `<reject>` is the
+  thing that *makes* it resolve, so an arm that also announces the ending says
+  it twice — which is what a production log showed, two `CallEnded` for one
+  hangup. `ended_remotely` answers whether there was a handle, which is the
+  same question as "will the watcher say it", and only the no-handle case is
+  the caller's to announce. `CallEndedElsewhere` is not that duplicate and
+  stays unconditional: it says *where* the call went, which is a second
+  sentence rather than the same one.
 - **A call is held by whoever holds the session.** `oxidezap-session` is what
   opens the mic, the speaker and the camera, so the process that owns the
   session owns the devices. That follows from the split rather than being

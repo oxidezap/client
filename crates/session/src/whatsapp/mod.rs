@@ -907,13 +907,23 @@ impl WhatsAppClient {
                 }
                 CallAction::Reject { call_id, .. } => {
                     info!("Call {} rejected by peer", call_id);
-                    calls.ended_remotely(call_id);
-                    let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
+                    // Only when nothing else will say it. A call with a live
+                    // handle has a watcher that publishes `CallEnded` when the
+                    // hangup this triggers resolves; announcing it here too is
+                    // the same ending twice.
+                    if !calls.ended_remotely(call_id) {
+                        let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
+                    }
                 }
                 CallAction::Terminate { call_id, .. } => {
                     info!("Call {} terminated by peer", call_id);
-                    calls.ended_remotely(call_id);
-                    let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
+                    // Only when nothing else will say it. A call with a live
+                    // handle has a watcher that publishes `CallEnded` when the
+                    // hangup this triggers resolves; announcing it here too is
+                    // the same ending twice.
+                    if !calls.ended_remotely(call_id) {
+                        let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
+                    }
                 }
                 _ => {}
             },
@@ -923,11 +933,17 @@ impl WhatsAppClient {
                     missed.call_id,
                     missed.from.observe()
                 );
-                calls.ended_remotely(&missed.call_id);
-                let _ = ui_tx.send(UiEvent::CallEnded(missed.call_id.clone()));
+                // See the terminate arm: the watcher owns the announcement
+                // wherever there is a handle to watch.
+                if !calls.ended_remotely(&missed.call_id) {
+                    let _ = ui_tx.send(UiEvent::CallEnded(missed.call_id.clone()));
+                }
             }
             Event::CallEndedElsewhere(ended) => {
                 info!("Call {} handled on another device", ended.call_id);
+                // Unconditional, unlike the arms above: this is a different
+                // sentence from the watcher's `CallEnded` — it says *where* the
+                // call went — so it is not the same news said twice.
                 calls.ended_remotely(&ended.call_id);
                 let _ = ui_tx.send(UiEvent::CallEndedElsewhere(ended.call_id.clone()));
             }

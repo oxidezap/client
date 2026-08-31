@@ -328,7 +328,15 @@ impl CallRegistry {
     /// an accept still opening its microphone would file a live handle behind
     /// a card every window had already cleared, leaving audible call with
     /// nothing to end it.
-    pub(in crate::whatsapp) fn ended_remotely(&self, call_id: &str) {
+    /// Answers whether the call had a live handle, which is the same question
+    /// as "will its watcher announce this ending". `watch_call_end` is
+    /// spawned for every handle and publishes `CallEnded` when `wait_ended`
+    /// resolves — which the `hangup_local` below is what makes happen — so a
+    /// caller that announces the ending itself as well says it twice. That is
+    /// what a peer's `<terminate>` did: two `CallEnded` for one hangup, both
+    /// visible in a production log. Only the no-handle case is the caller's
+    /// to announce, because there is no watcher to do it.
+    pub(in crate::whatsapp) fn ended_remotely(&self, call_id: &str) -> bool {
         let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.pending.remove(call_id);
         if let Some(handle) = calls.active.remove(call_id) {
@@ -339,11 +347,12 @@ impl CallRegistry {
             drop(crate::exec::spawn(
                 async move { handle.hangup_local().await },
             ));
-            return;
+            return true;
         }
         if calls.in_flight.contains(call_id) {
             calls.cancelled.insert(call_id.to_string(), Ending::Remote);
         }
+        false
     }
 
     /// Ask for a live call without taking it.
