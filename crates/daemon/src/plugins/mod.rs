@@ -344,7 +344,7 @@ impl Commands for Bridge {
             // so the quote bar the peer sees carries the reply's linkage and
             // an empty body, and in a group it names no author. Filling that
             // in means a lookup the daemon has no store to make; see the
-            // note in AGENTS.md under "Still to do".
+            // note in docs/roadmap.md.
             quoted: quoted.map(|id| oxidezap_core::QuotedMessage {
                 message_id: id.to_owned(),
                 sender: String::new(),

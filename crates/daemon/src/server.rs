@@ -1220,7 +1220,7 @@ fn answer(id: Option<RequestId>, result: Result<(), ProtocolError>) -> Option<St
 /// everything else on this side goes out of its way not to do. Fixing it
 /// properly means an async usage query through `session/store/`, and that is
 /// a wider change than a number in a settings pane is worth today. Recorded
-/// in `AGENTS.md` under what is left.
+/// in `docs/roadmap.md`.
 fn database_bytes() -> u64 {
     let base = oxidezap_session::resolve_database_path();
     ["", "-wal", "-shm"]
