@@ -7,10 +7,15 @@
 
 - **Spacing is still absolute.** There are `px(...)` literals where the guides
   want the rem scale (`p_2`, `gap_3`), so that part of the UI does not respond
-  to base-font zoom. Count them before planning the work rather than trusting a
-  number here — `grep -ro 'px(' --include='*.rs' crates/gui/src | wc -l` is the
-  ceiling, and the legitimate uses are the ones inside `theme/`, which is where
-  the scale is defined.
+  to base-font zoom. Survey them before planning the work rather than trusting a
+  number here, but do not take a raw `px(` count for the size of the debt: it
+  also matches GPUI's `.px(...)` padding method, which is correct when it is
+  passed a metric (`.px(metrics.space_xl())`), and bare `px()` is the right
+  conversion for an intrinsic size that is genuinely in device pixels — decoded
+  media geometry, for one. What counts is a `px()` around a *literal*, outside
+  `theme/` (where the scale is defined) and outside test modules. Read the
+  matches; the ones that need changing are the ones naming a number nobody
+  derived.
 - **`WhatsAppApp` still owns all state**, though it is now split across
   `app/{events,recording,calls_ctl,media_ctl}.rs` rather than one file. The
   guides want per-feature entities; that is a bigger change than moving code.

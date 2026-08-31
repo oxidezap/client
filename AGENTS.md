@@ -42,11 +42,13 @@ says what that one is for. Read those; do not trust a table for it. Note that a
 directory name and a package name differ in at least one place.
 
 Two directories sit outside the workspace on purpose, each carrying its own
-`[workspace]` table and its own CI job: `examples/` (plugins link imports only
-the daemon provides, so a host build fails at every `oxi_*` symbol) and `xtask/`
-(it takes no dependencies at all, so the Pages job can compile it from a sparse
-checkout). Only the first is in `exclude`; the second is simply not a member.
-The reasoning is commented at both.
+`[workspace]` table: `examples/` (plugins link imports only the daemon provides,
+so a host build fails at every `oxi_*` symbol) and `xtask/` (it takes no
+dependencies at all, so the Pages job can compile it from a sparse checkout).
+Only the first is in `exclude`; the second is simply not a member. The reasoning
+is commented at both. `xtask/` has its own CI job; **`examples/` has none, and
+nothing in CI builds either plugin** — the one test that loads a built module is
+`#[ignore]`d, so a change there is checked by whoever makes it or not at all.
 
 ## Build & verify
 
@@ -97,11 +99,13 @@ which is why they are here and the inventories are not.
 - **The store is one file.** Device identity, Signal state and chat history
   share a database keyed by device id, so a partial wipe orphans everything
   behind the new device; the wipe deletes the file and its `-wal`/`-shm`.
-- **A platform split lives in exactly two places** — the endpoint side under
-  `crates/ipc/src/endpoint/` and the listener side under
+- **A *transport's* platform split lives in exactly two places** — the endpoint
+  side under `crates/ipc/src/endpoint/` and the listener side under
   `crates/daemon/src/listener/`. A new transport is added *there*; everything
-  above them — framing, requests, the protocol — is written once. The module
-  headers in both say so.
+  above them — framing, requests, the protocol — is written once, and the module
+  headers in both say so. This is the rule for transports only: a capability
+  crate owns its own split, which is why `audio/src/web/`, `video/src/web/` and
+  `session/src/exec/` are where they are and not under ipc or daemon.
 - **A page has no threads, and several std/tokio APIs compile for it and fail at
   run time** — `std::thread::spawn`, `tokio::time`, `spawn_blocking`. The
   session's `exec/` module is the seam that answers them; go through it rather
