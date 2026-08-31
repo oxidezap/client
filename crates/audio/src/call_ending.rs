@@ -142,29 +142,30 @@ pub async fn ending(
         },
         async {
             capture_released.await;
-            if facts.microphone_went() {
-                CallAudioEnding::CaptureLost
-            } else {
-                CallAudioEnding::CaptureReleased
-            }
+            CallAudioEnding::CaptureReleased
         },
     )
     .await;
-    match released {
-        // A device that went on this side is a fact about this side, and it
-        // holds whether or not an engine ever had the endpoints. A microphone
-        // unplugged while the *camera* was still opening is exactly that: the
-        // call was not cancelled, the registry may go on to `start()`, and
-        // the local loss is the only evidence there is. Letting the handoff
-        // gate overwrite it would throw the specific answer away for a vaguer
-        // one that is also wrong.
-        CallAudioEnding::CaptureLost => CallAudioEnding::CaptureLost,
-        // The rest name the engine, so they are asked over the arm rather
-        // than beside it: an ending with no engine behind it says nothing
-        // about which half went first, and answering that question anyway is
-        // what would make a cancellation read as a fault.
-        named if facts.engine_has_them() => named,
-        _ => CallAudioEnding::NeverHandedOver,
+    // Asked over the arm rather than inside it, because the arm that won is
+    // not the whole story: a microphone lost locally *and* an engine that
+    // released its playout leave both futures ready before this is next
+    // polled, and the bias then answers `PlayoutReleased` for a teardown
+    // whose cause this side already knows. A device that went here is a fact
+    // about here — it holds whichever half was noticed first, and whether or
+    // not any engine ever had the endpoints. Safe to prefer, because the only
+    // `stop()` in this crate is the teardown's own and `stop()` does not fire
+    // `ended`: nothing this side does on the way out can set it.
+    if facts.microphone_went() {
+        return CallAudioEnding::CaptureLost;
+    }
+    // What is left names the engine, so it is qualified by whether there was
+    // one: an ending with no engine behind it says nothing about which half
+    // went first, and answering that question anyway is what would make an
+    // ordinary cancellation read as a fault.
+    if facts.engine_has_them() {
+        released
+    } else {
+        CallAudioEnding::NeverHandedOver
     }
 }
 
@@ -342,6 +343,34 @@ mod tests {
         ));
         assert_eq!(ending, CallAudioEnding::CaptureLost);
         drop((mic_rx, speaker_tx));
+    }
+
+    /// A microphone lost locally at the moment the engine also let go leaves
+    /// both arms ready, and the bias then names the playout. What this side
+    /// *knows* outranks which future was polled first: the device went here,
+    /// and no poll order changes that.
+    #[test]
+    fn a_local_loss_outranks_a_playout_release_that_landed_with_it() {
+        let Endpoints {
+            mic_tx,
+            mic_rx,
+            speaker_tx,
+            speaker_rx,
+        } = endpoints();
+
+        let facts = handed_over();
+        facts.capture_ended();
+        mic_tx.close();
+        // And the engine lets go of everything in the same breath, so both
+        // arms are ready before the race is first polled.
+        drop((mic_rx, speaker_tx));
+
+        let ending = futures_lite::future::block_on(ending(
+            async { while speaker_rx.recv().await.is_ok() {} },
+            mic_tx.closed(),
+            &facts,
+        ));
+        assert_eq!(ending, CallAudioEnding::CaptureLost);
     }
 
     /// A call that is running holds both ends, and neither arm may resolve —

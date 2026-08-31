@@ -2040,7 +2040,11 @@ by definition.
   builder with them inside it. A local loss outranks that gate rather than
   being filtered by it — a microphone unplugged while the *camera* is still
   opening has not been handed over and has not been cancelled either, and the
-  device is the only evidence there is.
+  device is the only evidence there is. It outranks the *arm* as well: a local
+  loss and an engine letting go leave both futures ready before the race is
+  polled, so what this side knows is read over which future won rather than
+  inside it. Safe to prefer because the teardown's own `stop()` does not fire
+  `ended` — nothing on the way out can set that flag.
 
 - **An abort drops a future where it stands, and an unpolled future leaves
   nothing behind.** The library ends work by aborting the handle its runtime
