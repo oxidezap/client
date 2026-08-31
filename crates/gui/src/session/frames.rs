@@ -283,7 +283,7 @@ impl<'a> Frames<'a> {
             // daemon already holds whole.
             DaemonMessage::Update {
                 version,
-                event: DaemonEvent::PluginsChanged(plugins),
+                event: DaemonEvent::PluginsChanged { plugins },
             } => {
                 self.applied = version;
                 self.publish(FromDaemon::Plugins(plugins))?;

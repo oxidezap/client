@@ -1229,6 +1229,22 @@ to the same problem. Nothing here needs it yet.
   unchanged is a remeasure, never nothing, and an unchanged build is the frame
   that keeps the diff off the hot path.
   Only another conversation resets.
+- **A tagged enum has no room for an array, and it says so at run time.**
+  Every enum on this wire is internally tagged, so a variant is written as a
+  map with the tag beside its fields — which means a newtype variant is only
+  writable when its payload is *itself* a map. `PluginsChanged(Vec<_>)` was
+  not: serde refuses a tagged newtype variant containing a sequence, so every
+  one of those frames failed at `to_string` and the daemon dropped it with a
+  log line, from the version that introduced plugins until the one that
+  fixed it. Nothing in the type system has anything to say about this, which
+  is half of why it shipped; the other half is the snapshot, which carries
+  the same set and so made a window attaching *after* a change look right,
+  losing only a change made while it watched. What that is, exactly, is
+  somebody approving a plugin: the answer was recorded, the set republished,
+  nothing drawn, and the switch flipped back. So a variant carrying a list
+  takes a named field, and `every_daemon_event_survives_the_wire` is the
+  question asked of every variant by serializing it — exhaustively matched,
+  so the next one added cannot skip it.
 - **What a frame leaves out, its reader fills in.** The wire is
   newline-delimited JSON and a history load is a hundred chats of fifty rows,
   most of whose fields are empty — no reaction, no quote, no media, nothing

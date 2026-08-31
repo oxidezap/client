@@ -5,6 +5,19 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 22: `DaemonEvent::PluginsChanged` carries its set in a named field. It
+/// was a newtype variant holding a `Vec`, and this enum is internally
+/// tagged — serde cannot write a tag beside a JSON array, so every one of
+/// these frames failed at `to_string` and the daemon dropped it, from v19
+/// until here. Nothing ever reached a client, which is why this is a shape
+/// no peer has seen rather than one an older peer would misread; the bump is
+/// for the direction that *is* real, a v21 window reading a v22 daemon's
+/// frame and failing to parse it. What made it survivable, and invisible, is
+/// that the snapshot carries the same set: a window attaching after a change
+/// saw the truth, and only a change made while it watched was lost — so
+/// approving a plugin recorded the answer, republished the set, drew nothing,
+/// and the switch flipped back.
+///
 /// 21: `ClientRequest::ReloadPlugins`. The daemon retires what it is running
 /// and loads the folder again, so a plugin installed, updated or removed
 /// takes effect without restarting the process holding the account. A v20
@@ -133,7 +146,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///
