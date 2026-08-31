@@ -12,6 +12,7 @@ pub mod download;
 pub mod identity;
 pub mod launch;
 pub mod lifecycle;
+pub mod log_store;
 pub mod plugins;
 pub mod prefs;
 pub mod startup;

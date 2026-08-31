@@ -202,26 +202,27 @@ impl WhatsAppApp {
         // else put at `debug` — but a level chosen while the daemon was
         // unreachable, or chosen at all, is one the daemon never heard.
         self.log_level_asked = Some(level);
-        if let Some(client) = &self.client {
-            client.set_log_level(level);
-        }
+        let told_the_daemon = self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.set_log_level(level));
 
-        // The write is a file created, flushed, renamed, and the directory
-        // flushed after it — on the thread that draws. A config directory on
-        // a slow or remote filesystem would freeze the window for as long as
-        // that takes, and the level is already in force by then, so nothing
-        // waits on this but the memory of it. `remember` writes the level
-        // *in force* rather than one passed in, so a second choice made
-        // while this is in flight is written by whichever finishes last
-        // rather than fighting it.
+        // And written down by whoever keeps a store of their own. On a
+        // desktop that is the daemon, which was just told and writes the very
+        // file this window would have written — so a window with a daemon
+        // writes nothing, and two windows choosing at once cannot leave the
+        // next start at the earlier answer. With no daemon to tell, nothing
+        // else will remember. See `platform::log_store`, which also decides
+        // the thread: the desktop write is a file flushed and renamed and
+        // belongs off the one that draws, and a page's is `localStorage`,
+        // which exists on the window global and on no worker.
+        if told_the_daemon && !crate::platform::log_store::is_ours() {
+            cx.notify();
+            return;
+        }
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
-            use gpui::AppContext as _;
-
-            let stored = cx
-                .background_spawn(async { oxidezap_logging::remember() })
-                .await;
-            if let Err(e) = stored {
+            if let Err(e) = crate::platform::log_store::remember(cx).await {
                 log::warn!("the log level was changed but not stored: {e}");
                 let _ = entity.update(cx, |app, cx| {
                     app.notify_user(
@@ -249,7 +250,7 @@ impl WhatsAppApp {
         let (Some(level), Some(client)) = (self.log_level_asked, &self.client) else {
             return;
         };
-        client.set_log_level(level);
+        let _ = client.set_log_level(level);
     }
 
     /// Delete the cached media and re-measure.

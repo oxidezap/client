@@ -940,14 +940,21 @@ impl Session {
         });
     }
 
-    /// Say how much the daemon should log.
+    /// Say how much the daemon should log, answering whether it was said.
     ///
-    /// Fire and forget: the level in *this* process is changed by the caller
-    /// before this is sent, and what comes back would only say that the
-    /// daemon heard. A daemon that is not there is a daemon writing no logs
-    /// to raise the level of.
-    pub fn set_log_level(&self, level: oxidezap_core::LogLevel) {
-        self.tell(ClientRequest::SetLogLevel { level });
+    /// Fire and forget as to the *outcome* — what comes back would only say
+    /// that the daemon heard — but not as to whether the request went out at
+    /// all, because the daemon is also the process that writes the choice
+    /// down on a desktop. A window that could not reach it is the only thing
+    /// left to remember the level, and has to know that.
+    pub fn set_log_level(&self, level: oxidezap_core::LogLevel) -> bool {
+        match self.send(ClientRequest::SetLogLevel { level }) {
+            Ok(()) => true,
+            Err(e) => {
+                error!("could not reach the daemon: {e}");
+                false
+            }
+        }
     }
 
     /// Wipe the local store and pair again.
