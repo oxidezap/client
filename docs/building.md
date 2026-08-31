@@ -72,7 +72,8 @@ WEB_PROFILE=debug cargo xtask web build
 # section. DWARF is what an extension reads; the map is what DevTools reads on
 # its own, in every engine. It is not the build to *profile*, though — a flame
 # chart reads the name section, which `debug` above already keeps, and this one
-# skips wasm-opt and so is a different code layout. See the gotcha.
+# skips wasm-opt and so is a different code layout. See docs/gotchas.md, on
+# names and lines being different sections.
 WEB_PROFILE=dwarf cargo xtask web build
 cargo xtask web map            # the map again, over a module already built
 ```

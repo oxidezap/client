@@ -148,7 +148,7 @@ whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rus
 #
 # That is one Linux machine, and DWARF is the format on one of the three
 # platforms CI builds. What the same change is worth on each of them was
-# measured separately and is in AGENTS.md; it is much less on Windows and
+# measured separately and is in docs/ci.md; it is much less on Windows and
 # macOS, and this table should not be read as speaking for them.
 #
 # `panic::Location` is compiled in regardless, so `#[track_caller]`, `assert!`
@@ -590,7 +590,7 @@ debug = "full"
 # under a profile whose own base is "s" and whose table does not mention it.
 # The parent's package table is merged in and the child's entries win.
 #
-# Which is the rule AGENTS.md already states about comments like the one
+# Which is the rule docs/web.md already states about comments like the one
 # that was here: reproduce the impossibility before believing it. Thirty-nine
 # entries were doing nothing.
 #

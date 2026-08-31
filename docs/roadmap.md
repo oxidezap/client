@@ -72,7 +72,8 @@
   succeeds from a page served off `https://oxidezap.github.io`, which is a
   public origin and not WhatsApp's own — a WebSocket upgrade is not subject to
   the same-origin policy, and the server declines to make it one.
-  What stood between the handshake and the QR was `AbortHandle`, above, and it
+  What stood between the handshake and the QR was `AbortHandle` — the entry in
+  docs/gotchas.md on an abort being something said — and it
   is worth remembering how it looked: everything a log could show was working.
   The socket opened, the handshake completed, the server's `<pair-device>`
   arrived and was acked. Only the ack is inline; the six refs are rotated by a
@@ -432,7 +433,7 @@
   odd part: its call is synchronous, so there is nothing to correlate.
 - **A plugin cannot reach the network or the disk, and half the interesting
   ones want to.** A translator, a webhook bridge, a conversation export. Each
-  is one import, and each turns the categorical sentence in the gotchas above
+  is one import, and each turns the categorical sentence in docs/gotchas.md
   into a policy — so it wants a declared destination, a prompt at enable time,
   and a decision of its own.
 - **A plugin's tree is state, and state frames are the ring's to hold.** Every

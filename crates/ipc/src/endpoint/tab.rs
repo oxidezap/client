@@ -798,7 +798,7 @@ impl Drop for Timer {
 
 /// Race a future against a timer, and say which won.
 ///
-/// `tokio::time` is the row in /AGENTS.md that says compiling is not the
+/// `tokio::time` is the row in docs/web.md that says compiling is not the
 /// question: its clock is `Instant::now()`, which traps on this target. The
 /// browser's own timer is the clock a page has, and it is armed through the
 /// global rather than through `window`, so that this works unchanged in the

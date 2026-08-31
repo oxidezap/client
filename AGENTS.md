@@ -1,8 +1,11 @@
 # oxidezap
 
 Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust).
-Rust, stable toolchain, GPUI front end. The same tree builds a desktop app and a
-web front end for `wasm32-unknown-unknown`.
+GPUI front end. The same tree builds a desktop app and a web front end for
+`wasm32-unknown-unknown`. **The desktop build is stable Rust; the web build
+needs nightly**, because `-Z build-std` is nightly-only and the standard
+library has to be rebuilt with the atomics feature on — see
+[docs/building.md](docs/building.md) before provisioning a toolchain.
 
 **This file holds decisions, not inventories.** Anything countable — which
 crates exist, which dependency does a job, what a command's flags are, what the

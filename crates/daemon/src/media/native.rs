@@ -61,7 +61,7 @@ const SWEEP_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
 /// download. What it costs is one refetch: the renderer draws media it does
 /// not have as an offer to download, which is what it already does for
 /// anything the daemon never cached. Closing it means giving this cache the
-/// index its first line says it does not have; see AGENTS.md.
+/// index its first line says it does not have; see docs/roadmap.md.
 pub fn claim(key: &str) -> bool {
     has(key)
 }

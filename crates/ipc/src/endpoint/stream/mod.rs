@@ -44,7 +44,7 @@ pub struct Writer(Inner);
 /// and a handful of network blips fills its admission count for good.
 ///
 /// The two platforms end that wait differently and this is where the
-/// difference lives — see /AGENTS.md. A Unix socket is shut down, which is a
+/// difference lives — see docs/gotchas.md. A Unix socket is shut down, which is
 /// thing said about the socket and is seen through every descriptor naming
 /// it. A named pipe has no equivalent, so the read is made to wait on the
 /// pipe *and* on an event, and this signals the event.
