@@ -6,7 +6,10 @@ name = "template"
 description = "Starting point for an oxidezap plugin"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+# The SDK's own floor, which a plugin inherits by depending on it: the
+# workspace this example is copied out of is pinned to 1.95, so anything
+# lower here is a promise cargo refuses on the first build.
+rust-version = "1.95"
 license = "MIT"
 publish = false
 

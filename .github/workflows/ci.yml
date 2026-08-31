@@ -250,6 +250,11 @@ jobs:
   # protocol, which a front end outside this workspace compiles against. The
   # GUI is deliberately excluded: it tracks gpui's git HEAD, which has no MSRV
   # to promise. Keep this toolchain and workspace.package.rust-version in step.
+  #
+  # Which is why this job is not what decides the number. These three crates
+  # build on less than they declare; the figure is the one the GUI forces on
+  # the workspace it shares, and what this job proves is that the crates an
+  # embedder compiles against still build at the version the manifest names.
   msrv:
     name: MSRV (library crates)
     runs-on: ubuntu-latest
@@ -259,7 +264,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
       - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: protoc

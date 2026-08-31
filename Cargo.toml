@@ -27,7 +27,17 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+# 1.95 because the GUI cannot be built with less: gpui calls
+# `std::hint::cold_path`, stable since 1.95, and this crate tracks that
+# repository's git HEAD rather than a release. The number is therefore a
+# floor the *window* imposes on everything beside it — the library crates
+# below it compile on 1.94 and say 1.95 anyway, which is the price of one
+# figure for one workspace. What it buys is a manifest that does not lie:
+# `rust-version` is inherited by every member, so a GUI declaring 1.94 was
+# telling cargo something no toolchain could honour. It moves again when
+# gpui does, which is the cost of tracking a git HEAD rather than of this
+# figure.
+rust-version = "1.95"
 license = "MIT"
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 repository = "https://github.com/oxidezap/client"
