@@ -144,6 +144,11 @@ whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rus
 # once on the upload. Nothing got slower: emitting and linking DWARF is work,
 # so not emitting it is 12% off a cold local build as well.
 #
+# That is one Linux machine, and DWARF is the format on one of the three
+# platforms CI builds. What the same change is worth on each of them was
+# measured separately and is in AGENTS.md; it is much less on Windows and
+# macOS, and this table should not be read as speaking for them.
+#
 # `panic::Location` is compiled in regardless, so `#[track_caller]`, `assert!`
 # and every panic message still name the file and line they came from; what is
 # lost is stepping through a dependency's source and reading its locals, which
