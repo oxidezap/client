@@ -846,10 +846,21 @@ to the same problem. Nothing here needs it yet.
   `--cargo-profile`. `opt-level = "s"` there was measured at 31% of the module
   — by a wide margin the largest single thing in it, larger than every crate
   gate put together. `gpui` is the one exception at 3: it draws every frame
-  and is the largest crate here. Package overrides do *not* inherit through
-  `inherits`, so the ones that reach this graph are repeated rather than
-  borrowed from the desktop sweep — which names `ureq`, `zbus`, `wayland-*`
-  and `libsqlite3-sys`, almost none of which are compiled for wasm at all.
+  and is the largest crate here — and it has to be named there, because a
+  profile replaces its parent's *base* setting, so a crate the sweep does not
+  mention is at "s" here and at "3" on the desktop. Package overrides, on the
+  other hand, **do** inherit through `inherits`: cargo merges the parent's
+  package table into the child's and lets the child's entries win. This file
+  and the manifest both said the opposite for a long time, and the table under
+  `[profile.web]` had grown to 46 entries of which 39 were repeating the
+  desktop sweep and doing nothing. Reproduced rather than reasoned about, on
+  cargo 1.98: `cargo build -p url --profile web --target
+  wasm32-unknown-unknown -v` compiles `url` at `z`, the level
+  `[profile.release.package.url]` names, under a profile whose own base is "s"
+  and whose table does not mention it. So `[profile.web]` holds the
+  differences and nothing else, and the desktop sweep — `ureq`, `zbus`,
+  `wayland-*`, `libsqlite3-sys` — costs this graph nothing where it names
+  crates that are not compiled for wasm at all.
   Two ways in that look like they should work and do not:
   `CARGO_PROFILE_RELEASE_PACKAGE_<NAME>_OPT_LEVEL` is silently ignored, and
   `--config`, which is not, is not something trunk can forward.

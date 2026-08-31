@@ -497,41 +497,77 @@ opt-level = "s"
 #   opt-level = "s"                     -11,196,329   (-31.3%)
 #   waproto + buffa at "z"               -1,237,629    (-3.5%)
 #
-# The package overrides are not inherited from `release` — cargo copies the
-# base settings and not the per-package table — so the ones that matter to
-# *this* graph are repeated here. That is a much shorter list than the sweep
-# above, which names the desktop: `ureq`, `zbus`, `accesskit_*`, `wayland-*`,
-# `usvg`, `notify-rust` and `libsqlite3-sys` are not compiled for wasm at all
-# (there it is `sqlite-wasm-rs`), so the sweep's coverage of this artifact was
-# close to nil.
+# The package overrides above *are* inherited, which this file said for a long
+# time that they were not. Cargo merges the parent profile's package table
+# into the child's and lets the child's entries win, so the whole desktop
+# sweep reaches this profile on its own and only the differences belong below.
+# The measurement is under that table.
+#
+# What does not carry over is the base setting, because this profile replaces
+# it: a crate the sweep does not name is at "s" here and at "3" there.
 [profile.web]
 inherits = "release"
 opt-level = "s"
 
-# The exception, and the only one. `gpui` draws every frame, it is the largest
-# single crate in the shipped module at 10.6% of its code, and it is the one
-# place where "fast" is worth more than "small".
+# The same bundle with its symbols, which `WEB_PROFILE=debug cargo xtask web build`
+# selects. It inherits `web` rather than `release` deliberately: a build you
+# are diagnosing should be the build that misbehaved, so the only difference
+# is that the names survive.
+#
+# `strip` and not `debug`: what a wasm flame graph and a panic trace read is
+# the *name section*, which rustc emits unless it is stripped — and which
+# `strip = true` removes before wasm-opt ever sees the module, which is why
+# there are no Rust symbols in a profile of the published page and never were.
+# Full DWARF would add source lines and tens of megabytes; the names are what
+# was promised.
+# And it really is only that. A review of this change asked whether the
+# per-package table survives the `inherits`, since a debug module compiled at
+# the profile-wide "s" would not be the build that misbehaved; it does, by the
+# same measurement as the note under `[profile.web]`, and `gpui` is at 3 here
+# too.
+[profile.web-debug]
+inherits = "web"
+strip = "none"
+
+# What is left of this table, now that the sentence it was built on turned
+# out to be false.
+#
+# It said package overrides are not inherited through `inherits`, so every
+# entry in the desktop sweep that also reaches wasm had to be repeated here.
+# That is not what cargo does. Measured on this manifest with cargo 1.98,
+# `cargo build -p url --profile web --target wasm32-unknown-unknown -v`
+# compiles `url` at `z` — the level `[profile.release.package.url]` names,
+# under a profile whose own base is "s" and whose table does not mention it.
+# The parent's package table is merged in and the child's entries win.
+#
+# Which is the rule AGENTS.md already states about comments like the one
+# that was here: reproduce the impossibility before believing it. Thirty-nine
+# entries were doing nothing.
+#
+# So what stays is only what genuinely differs from what this profile would
+# inherit — the desktop's whole sweep reaches wasm on its own, and repeating
+# any of it here is dead configuration that reads as a decision.
+
+# `gpui` draws every frame, it is the largest single crate in the shipped
+# module at 10.6% of its code, and it is the one place where "fast" is worth
+# more than "small". Needed here precisely because the desktop leaves it to
+# the base setting, and this profile's base is "s".
 [profile.web.package.gpui]
 opt-level = 3
 
-# z = the protocol. `waproto` is generated from a 590 KB descriptor and is the
-# second-largest crate here; `buffa` is its encoder. Both are per message
-# rather than per frame, and the manifest above deliberately keeps them at 3
-# for the desktop — which is the right answer there and not here.
-[profile.web.package.waproto]
-opt-level = "z"
-[profile.web.package.buffa]
-opt-level = "z"
-
-# And the rest of the protocol, for the same reason and only here. A page's
+# The protocol, for the reason `[profile.web]` exists at all. A page's
 # scarcest resource is the bytes a visitor waits on before the first pixel,
-# which is exactly the trade `opt-level = "s"` above this makes for the whole
-# graph; these are the crates where the difference is worth naming, because
-# they are large and because what they do is one pass over one stanza rather
-# than anything in a loop. The desktop keeps them at "3": there the module is
-# paid for once at build time.
+# which is exactly the trade `opt-level = "s"` makes for the whole graph;
+# these are the crates where it is worth going a step further, because they
+# are large and because what they do is one pass over one stanza rather than
+# anything in a loop. The desktop keeps them at "3": there the module is paid
+# for once at build time.
 #
-# The ciphers are deliberately not in this list. `aes`, `sha2`, `hmac` and
+# `waproto` and `buffa` are *not* in this list any more, and that is the
+# change rather than an omission: the desktop sweep now takes them to "z" as
+# well, so naming them here would be repeating it.
+#
+# The ciphers are deliberately absent too. `aes`, `sha2`, `hmac` and
 # `curve25519-dalek` are separate crates and are left alone — a ratchet step
 # is the one part of this that really is arithmetic in a loop.
 [profile.web.package.wacore]
@@ -545,116 +581,9 @@ opt-level = "z"
 [profile.web.package.whatsapp-rust]
 opt-level = "z"
 
-# The same bundle with its symbols, which `WEB_PROFILE=debug cargo xtask web build`
-# selects. It inherits `web` rather than `release` deliberately: a build you
-# are diagnosing should be the build that misbehaved, so the only difference
-# is that the names survive.
-#
-# `strip` and not `debug`: what a wasm flame graph and a panic trace read is
-# the *name section*, which rustc emits unless it is stripped — and which
-# `strip = true` removes before wasm-opt ever sees the module, which is why
-# there are no Rust symbols in a profile of the published page and never were.
-# Full DWARF would add source lines and tens of megabytes; the names are what
-# was promised.
-[profile.web-debug]
-inherits = "web"
-strip = "none"
-
-# z = persistence and the one-shot subsystems, mirroring the sweep above for
-# the members of it that actually reach this target.
-[profile.web.package.diesel]
-opt-level = "z"
-[profile.web.package.diesel_migrations]
-opt-level = "z"
-[profile.web.package.whatsapp-rust-sqlite-storage]
-opt-level = "z"
-[profile.web.package.naga]
-opt-level = "z"
-[profile.web.package.regex]
-opt-level = "z"
-[profile.web.package.regex-automata]
-opt-level = "z"
-[profile.web.package.markdown]
-opt-level = "z"
-[profile.web.package.html5ever]
-opt-level = "z"
-[profile.web.package.markup5ever]
-opt-level = "z"
-[profile.web.package.markup5ever_rcdom]
-opt-level = "z"
-[profile.web.package.encoding_rs]
-opt-level = "z"
-[profile.web.package.syntect]
-opt-level = "z"
-[profile.web.package.fancy-regex]
-opt-level = "z"
-
-# The same image formats the desktop sweep names above, for the same reason:
-# `gpui` turns the crate's whole default set on and a page decodes exactly
-# three of them. `image` itself stays at the profile's "s" — a photo in a
-# conversation goes through it.
-[profile.web.package.exr]
-opt-level = "z"
-[profile.web.package.tiff]
-opt-level = "z"
-[profile.web.package.gif]
-opt-level = "z"
-[profile.web.package.qoi]
-opt-level = "z"
-[profile.web.package.color_quant]
-opt-level = "z"
-[profile.web.package.moxcms]
-opt-level = "z"
-[profile.web.package.zune-inflate]
-opt-level = "z"
-[profile.web.package.rayon]
-opt-level = "z"
-[profile.web.package.rayon-core]
-opt-level = "z"
-
-# The SVG icon path, which a page walks once per icon and then never again.
-# None of these five were reached by the desktop sweep's copies — package
-# overrides are not inherited through `inherits`, which is the whole reason
-# this list exists — and all five are compiled for wasm.
-[profile.web.package.usvg]
-opt-level = "z"
-[profile.web.package.resvg]
-opt-level = "z"
-[profile.web.package.tiny-skia]
-opt-level = "z"
+# `tiny-skia`'s path module, which the desktop sweep names the rasterizer but
+# not this. One icon's worth of work on either target; it is here rather than
+# up there only because the desktop's figures in this file were measured
+# without it.
 [profile.web.package.tiny-skia-path]
 opt-level = "z"
-[profile.web.package.rustybuzz]
-opt-level = "z"
-[profile.web.package.lyon_tessellation]
-opt-level = "z"
-[profile.web.package.lyon_path]
-opt-level = "z"
-[profile.web.package.lyon_geom]
-opt-level = "z"
-[profile.web.package.lyon_algorithms]
-opt-level = "z"
-
-# A plugin's module is validated once, at load. `wasmi` interprets it
-# afterwards and stays at the profile's "s" — on a page it shares the one
-# agent with the window, which is the argument for keeping it quick rather
-# than small.
-[profile.web.package.wasmparser]
-opt-level = "z"
-
-# The container and the audio codec behind a video attachment. Both are real
-# work a visitor waits on, so they stay at the profile's "s"; they are named
-# here only because the desktop's own entries for them do not reach this
-# graph.
-[profile.web.package.mp4]
-opt-level = "s"
-[profile.web.package.symphonia]
-opt-level = "s"
-[profile.web.package.symphonia-core]
-opt-level = "s"
-[profile.web.package.symphonia-format-isomp4]
-opt-level = "s"
-[profile.web.package.symphonia-codec-aac]
-opt-level = "s"
-[profile.web.package.symphonia-metadata]
-opt-level = "s"
