@@ -1672,6 +1672,22 @@ impl WhatsAppClient {
                     } if reports_video && feedback.iter().any(reports_loss) => {
                         calls.ask_for_keyframe(&call_id);
                     }
+                    // The reason the call is about to end, and the only
+                    // place it is ever said. `wait_ended` fires right behind
+                    // this, so a call whose media never came up otherwise
+                    // vanishes a moment after it was placed with nothing
+                    // anywhere saying why — which is exactly how a browser
+                    // call that dials no relay reads in a console: an offer,
+                    // then an ending, and not one line between them.
+                    CallEvent::MediaSetupFailed(reason) => {
+                        warn!("call {call_id} media setup failed: {reason}");
+                        if let Some(tx) = ui_sender.lock().await.as_ref() {
+                            let _ = tx.send(UiEvent::CallMediaFailed {
+                                call_id: call_id.clone(),
+                                reason,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }

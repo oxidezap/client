@@ -1767,7 +1767,13 @@ by definition.
   What still does not is anything the *daemon* refused: a front end learns
   only `Accepted`, and a refusal reaching the window would need a field on the
   wire. `SendFailed` is the one exception, and it is against a chat rather
-  than against the request.
+  than against the request. `CallMediaFailed` is the second, and it was added
+  after a browser call that dialled no relay read in the console as an offer,
+  an ending, and not one line between them: the library publishes
+  `MediaSetupFailed` with the reason and the event pump's catch-all was
+  throwing it away, so the one event carrying the explanation was the one
+  nothing listened to. A call that ends a moment after it is placed has to
+  say why, or every report of it is a bug report with no evidence in it.
 - **A promised file is not a held file, once the reader is a browser.** The
   daemon's media cache is files and no index — the front end it was written
   for opens them itself, so `claim` can be `has` and there is no window

@@ -144,6 +144,21 @@ pub enum UiEvent {
         call_id: CallId,
         is_video: bool,
     },
+    /// The media never came up, and why.
+    ///
+    /// The one thing a call's own event stream says that nothing else does:
+    /// a relay that would not dial, an engine that would not build, a
+    /// provider that refused. It is followed by the call ending, so without
+    /// it a call simply vanishes a moment after it was placed and the reason
+    /// — which the library took the trouble to publish — is thrown away.
+    ///
+    /// Not `OutgoingCallFailed`, which names a recipient and so can only
+    /// speak for a call that was placed: media is built on the accepting
+    /// side too, and this is the same failure there.
+    CallMediaFailed {
+        call_id: CallId,
+        reason: String,
+    },
     CallEnded(CallId),
     /// What the microphone really is, once the newest request has reached it.
     ///
