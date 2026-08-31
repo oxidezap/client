@@ -3592,6 +3592,13 @@ fn a_reload_onto_a_store_that_cannot_keep_answers_forgets_them() {
 /// for the life of the process — every later ask setting the flag and
 /// returning with no owner left to consume it — and `shutdown` waiting for a
 /// reload that had already unwound.
+///
+/// Without the guard this test does not fail, it *hangs*, and that is worth
+/// knowing before somebody runs it: dropping `Plugins` shuts the host down,
+/// and `wait_for_any_reload` has no deadline, so it waits forever on a slot
+/// nothing released. Which is the interaction itself — the wait is
+/// unbounded on purpose, and the guard is what makes that safe rather than
+/// merely correct.
 #[test]
 fn a_reload_that_panics_does_not_keep_the_slot() {
     let dir = TempDir::new("reload-unwinds");
