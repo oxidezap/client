@@ -1732,6 +1732,13 @@ by definition.
   here both tabs are windows and the wrong one would. Fixing it properly
   means the follower opening the devices and handing them across, which is a
   change to the tab protocol rather than a check.
+  It is a *separate* question from `calls_unavailable`, and folding the two
+  together was a bug rather than a tidy-up: a window that cannot carry a call
+  owes the caller an answer and declines, while a window that is merely the
+  wrong one owes them nothing — the call is answerable in the tab beside it,
+  and declining would send `Decline` to the leader and clear the offer
+  everywhere, telling somebody to answer in the other tab while destroying
+  the call they would have answered there.
 
 - **A dropped access unit is a frame of RTP time that goes unspent.** The
   library's `VideoSource` advertises one `rtp_timestamp_stride` and advances

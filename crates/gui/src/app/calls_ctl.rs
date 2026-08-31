@@ -98,6 +98,17 @@ impl WhatsAppApp {
         // microphone, accept, and end the call at relay setup. Declined
         // rather than ignored — the caller is ringing, and the honest answer
         // is no rather than silence until their own timeout.
+        // Before the refusal below, and deliberately *not* folded into it:
+        // this window could carry a call perfectly well, it is simply the
+        // wrong one. Declining here would send `Decline` to the leader and
+        // clear the offer everywhere — telling somebody to answer in the
+        // other tab while destroying the call they would have answered. So
+        // the offer is left ringing, in this tab and in that one.
+        if let Some(reason) = crate::platform::calls_belong_to_another_tab() {
+            warn!("Not accepting here: {reason}");
+            self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
+            return;
+        }
         if let Some(reason) = crate::platform::calls_unavailable() {
             warn!("Cannot accept call: {reason}");
             self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
@@ -459,6 +470,15 @@ impl WhatsAppApp {
         // was never going to connect. Said out loud, because unlike the
         // microphone there is no control to draw disabled -- the call button
         // is worth keeping for the desktop this same view runs on.
+        // Nothing is ringing here, so this is the same refusal as the one
+        // below rather than a different kind of answer — but it is a
+        // different question, and keeping them apart is what stops the
+        // accept path from declining a call it should have left alone.
+        if let Some(reason) = crate::platform::calls_belong_to_another_tab() {
+            warn!("Cannot start call here: {reason}");
+            self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
+            return;
+        }
         if let Some(reason) = crate::platform::calls_unavailable() {
             warn!("Cannot start call: {reason}");
             self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
