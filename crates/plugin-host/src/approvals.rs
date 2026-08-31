@@ -127,7 +127,20 @@ impl Approvals {
             was
         };
         if keeps {
-            self.flush(&granted);
+            // And the write is *answered*, not merely attempted. A store that
+            // says it keeps answers can still refuse one — `localStorage`
+            // over quota or blocked outright — and ignoring that left the
+            // grants in memory for the install to copy straight onto the
+            // fresh workers: authorized, with nothing recording it, and gone
+            // at the next start. The same sentence `set` already lives by: a
+            // grant that could not be written down is not a grant.
+            if !self.flush(&granted) && !granted.is_empty() {
+                log::warn!(
+                    "plugin permissions could not be written to the new store; every plugin \
+                     is unapproved until it is allowed again"
+                );
+                granted.clear();
+            }
         } else if kept && !granted.is_empty() {
             // Only on the way *down*. What has to be forgotten is an answer
             // given against a directory that has since been refused — the
