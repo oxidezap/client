@@ -262,7 +262,7 @@ opt-level = "s"
 # artifact is one 28 MiB module a visitor waits on before the first pixel and
 # a browser then has to compile, so the same setting is the wrong one — and
 # cargo has no per-target profiles, which is why this is a profile of its own
-# rather than a `cfg`. `web/build.sh` selects it through trunk's
+# rather than a `cfg`. `cargo xtask web build` selects it through trunk's
 # `--cargo-profile`; nothing else uses it, and the desktop build is untouched.
 #
 # The measurements are at the rustc stage on this tree, against `release`
@@ -297,7 +297,7 @@ opt-level = "z"
 [profile.web.package.buffa]
 opt-level = "z"
 
-# The same bundle with its symbols, which `WEB_PROFILE=debug ./web/build.sh`
+# The same bundle with its symbols, which `WEB_PROFILE=debug cargo xtask web build`
 # selects. It inherits `web` rather than `release` deliberately: a build you
 # are diagnosing should be the build that misbehaved, so the only difference
 # is that the names survive.
