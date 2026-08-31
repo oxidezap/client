@@ -291,6 +291,20 @@ third off what CI compresses and a third off what it downloads, and it is not
 a trade against build time — DWARF is work to emit and work to link, so the
 cold local build got 12% faster too. The manifest carries the table.
 
+Which is also why every one of those caches keys on the root manifest's hash.
+rust-cache's automatic key hashes `Cargo.lock`, `.cargo/config.toml` and each
+*member* crate's manifest — not the root one, where the profiles live. A
+profile decides every dependency's fingerprint, so editing one leaves the key
+identical while making every cached artifact useless, and the failure is
+silent in the worst way: the restore reports a full match, cargo rebuilds all
+of it anyway, and rust-cache then declines to save ("Cache up-to-date."), so
+the stale entry is never replaced. That is not a slow first run; it is a cache
+that can no longer be refreshed. It was measured on `main`, where the Windows
+`Check` job went from 3m49 warm to 11m17 and stayed there until the key
+learned to name the file that had changed. `build.yml` is the one exception,
+and for the reason the rule exists: it stores `~/.cargo` alone, and a profile
+cannot make a downloaded `.crate` stale.
+
 Raising the 10 GB limit is possible on a paid plan and would be another answer
 to the same problem. Nothing here needs it yet.
 

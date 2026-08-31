@@ -118,6 +118,10 @@ jobs:
       # on the two platforms where a cold one costs eight minutes.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # The one cache in this repository whose key does not carry the
+          # root manifest's hash, and for the reason the others do: what is
+          # stored here is `~/.cargo` alone, which is downloaded crates rather
+          # than compiled ones. A profile cannot make a `.crate` file stale.
           key: ${{ matrix.target }}
           cache-targets: "false"
 
