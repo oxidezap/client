@@ -45,7 +45,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use anyhow::{Result, anyhow, bail};
-use log::{debug, warn};
+use log::{debug, error, warn};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 
@@ -172,10 +172,17 @@ impl Drop for Graph {
         // hide after a session spent hunting exactly that.
         match self.context.close() {
             Ok(closing) => {
+                let context = self.context.clone();
                 crate::web::spawn(async move {
                     if let Err(e) = wasm_bindgen_futures::JsFuture::from(closing).await {
                         warn!("the call's audio context would not close: {}", describe(&e));
+                        return;
                     }
+                    // Said even on success, because "no error" and "closed"
+                    // are not the same sentence and only the second one
+                    // answers somebody looking at a tab that still claims the
+                    // microphone.
+                    debug!("the call's audio context is {:?}", context.state());
                 });
             }
             Err(e) => warn!(
@@ -530,23 +537,49 @@ fn wire(
 
     let on_playout = {
         let playout = Rc::clone(&playout);
+        // Held across callbacks: this runs ~90 times a second and the block
+        // is the same size every time.
+        let mut scratch: Vec<f32> = Vec::new();
+        // Said once, not per block, for the same reason.
+        let reported = std::cell::Cell::new(false);
         Closure::<dyn FnMut(web_sys::AudioProcessingEvent)>::new(
             move |event: web_sys::AudioProcessingEvent| {
                 let Ok(buffer) = event.output_buffer() else {
                     return;
                 };
-                let Ok(mut channel) = buffer.get_channel_data(0) else {
-                    return;
-                };
-                let mut ring = playout.borrow_mut();
-                for slot in channel.iter_mut() {
+                let len = buffer.length() as usize;
+                scratch.clear();
+                scratch.reserve(len);
+                {
+                    let mut ring = playout.borrow_mut();
                     // An empty ring is a gap in the network, not an error:
                     // the peer stopped sending, or their packet is late.
                     // Silence is what a call sounds like there.
-                    *slot = ring.pop_front().unwrap_or(0.0);
+                    scratch.extend(
+                        std::iter::repeat_with(|| ring.pop_front().unwrap_or(0.0)).take(len),
+                    );
                 }
-                drop(ring);
-                let _ = buffer.copy_to_channel(&channel, 0);
+                // JS-owned, and that is the whole of this line. `copyToChannel`
+                // takes a `Float32Array` that "must not be shared", and every
+                // slice this module can hand it is a view over a wasm heap
+                // built with `--shared-memory` — so `copy_to_channel`, which
+                // takes `&[f32]`, threw on every block ever played. The peer's
+                // audio arrived, decoded, and was written nowhere.
+                //
+                // The same rule the socket and the relay learned, and the
+                // third crossing to learn it. See AGENTS.md.
+                let block = js_sys::Float32Array::from(&scratch[..]);
+                if let Err(e) = buffer.copy_to_channel_with_f32_array(&block, 0)
+                    && !reported.replace(true)
+                {
+                    // Never swallowed again: a discarded error here is a call
+                    // that connects, decodes the peer perfectly, and plays
+                    // silence with nothing anywhere saying why.
+                    error!(
+                        "the peer's audio could not be written to the speaker: {}",
+                        describe(&e)
+                    );
+                }
             },
         )
     };
