@@ -1058,12 +1058,20 @@ async fn handle_request(
                 // in the log rather than refused, because answering `Refused`
                 // to a request that was carried out is the worse lie of the
                 // two.
+                //
+                // At `error` rather than `warn`, which the plugin approval's
+                // failed record is written at for the same reason: this line
+                // is written *after* the level it reports on has taken
+                // effect, so somebody quieting the daemon to `error` would
+                // otherwise have the one thing worth telling them dropped by
+                // the level they just chose. At `off` it is dropped, and that
+                // is what `off` means.
                 Ok(Err(e)) => {
-                    log::warn!("the log level was changed but not stored: {e}");
+                    log::error!("the log level was changed but not stored: {e}");
                     acted(Ok(()))
                 }
                 Err(_) => {
-                    log::warn!("the log level was changed but the store was not reached");
+                    log::error!("the log level was changed but the store was not reached");
                     acted(Ok(()))
                 }
             }
