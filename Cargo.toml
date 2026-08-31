@@ -213,6 +213,155 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.html5ever]
 opt-level = "z"
+[profile.release.package.markup5ever]
+opt-level = "z"
+[profile.release.package.markup5ever_rcdom]
+opt-level = "z"
+# The charset tables `html5ever` decodes with. 130 KiB of Big5, GBK, JIS and
+# KSX ideograph maps in `.rodata` alone, on a path that begins with pasting
+# HTML into a message — which is to say, never in a frame.
+[profile.release.package.encoding_rs]
+opt-level = "z"
+
+# The image formats `gpui` turns on and this application never decodes.
+#
+# `image` is declared here with `png`, `jpeg` and `webp` — the three WhatsApp
+# actually sends — but features are additive and gpui takes the crate's whole
+# default set, so EXR, TIFF, GIF, QOI, PNM, TGA, DDS, farbfeld and the colour
+# management behind them are compiled in whatever this manifest asks for. They
+# cannot be removed (nothing here owns that dependency edge) and they cannot
+# be reached either: a decoder is selected by sniffing the bytes, and no byte
+# in this application's media path has ever been an OpenEXR header. What
+# `opt-level = "z"` costs is decode speed in a decoder that is never called.
+#
+# `exr` is also the largest single *datum* in the window: 131,076 bytes of
+# `to_linear_table::TABLE`, which is DWA compression's transfer curve. That is
+# not what this changes — a table is a table at every optimization level — but
+# it is the reason to look at the crate at all.
+[profile.release.package.exr]
+opt-level = "z"
+[profile.release.package.tiff]
+opt-level = "z"
+[profile.release.package.gif]
+opt-level = "z"
+[profile.release.package.qoi]
+opt-level = "z"
+[profile.release.package.color_quant]
+opt-level = "z"
+[profile.release.package.moxcms]
+opt-level = "z"
+[profile.release.package.zune-inflate]
+opt-level = "z"
+# Reached only by the parallel decoders above: `image`'s `rayon` feature is
+# gpui's too, and the formats it parallelizes are the ones nothing here opens.
+[profile.release.package.rayon]
+opt-level = "z"
+[profile.release.package.rayon-core]
+opt-level = "z"
+
+# Path tessellation for the SVG icons, beside the `usvg`/`resvg`/`tiny-skia`
+# entries above that were already here: it runs when an icon is first
+# rasterized and never again.
+[profile.release.package.lyon_tessellation]
+opt-level = "z"
+[profile.release.package.lyon_path]
+opt-level = "z"
+[profile.release.package.lyon_geom]
+opt-level = "z"
+[profile.release.package.lyon_algorithms]
+opt-level = "z"
+
+# Finding the fonts, which happens once at startup. Drawing with them does
+# not go through here — that is `swash`, `harfrust` and `skrifa`, which stay
+# where they are.
+[profile.release.package.fontdb]
+opt-level = "z"
+[profile.release.package.fontconfig-parser]
+opt-level = "z"
+
+# The X11 input method and the clipboard's X11 half: a keystroke's worth of
+# work, on the platform where a Wayland session does none of it.
+[profile.release.package.zed-xim]
+opt-level = "z"
+[profile.release.package.xim-ctext]
+opt-level = "z"
+[profile.release.package.xim-parser]
+opt-level = "z"
+[profile.release.package.x11-clipboard]
+opt-level = "z"
+
+# The tray, which is one icon and a menu of three items, redrawn when the
+# connection state changes. 263 KiB of the daemon before this.
+[profile.release.package.ksni]
+opt-level = "z"
+
+# The other two thirds of the regex engine the sweep already names. `regex`
+# and `regex-automata` have been at "z" here from the start; `regex-syntax` is
+# the parser that runs once per pattern and `aho-corasick` is the literal
+# prefilter built from it, and leaving the pair out left 288 KiB at "3"
+# underneath a "z" engine.
+[profile.release.package.regex-syntax]
+opt-level = "z"
+[profile.release.package.aho-corasick]
+opt-level = "z"
+
+# Parsing an icon: the XML reader and the SVG value grammar under `usvg`,
+# which has been at "z" since the sweep was written.
+[profile.release.package.roxmltree]
+opt-level = "z"
+[profile.release.package.svgtypes]
+opt-level = "z"
+# URL parsing, which happens when a message turns out to contain a link.
+[profile.release.package.url]
+opt-level = "z"
+# The bignum behind the keyring's RSA, on a path that runs when a secret is
+# read and never again.
+[profile.release.package.num-bigint-dig]
+opt-level = "z"
+
+# A plugin's module is *validated* once, at load, and then interpreted. Only
+# the validator is here: `wasmi` itself runs a plugin's instructions and stays
+# where it is.
+[profile.release.package.wasmparser]
+opt-level = "z"
+
+# The certificate work at connect: parsing a chain, checking a name, and the
+# self-signed pair a call's DTLS handshake generates. Once per connection and
+# once per call, against a TLS record path (`rustls`, `ring`) that is
+# untouched.
+[profile.release.package.x509-parser]
+opt-level = "z"
+[profile.release.package.rcgen]
+opt-level = "z"
+
+# A call's signalling transports, which are not its media. DTLS is a handshake
+# and then a key schedule nothing carries audio over, and SCTP is the data
+# channel beside the RTP that does. `rtc-shared` and `rtc-crypto` are
+# deliberately absent: SRTP protects every packet.
+[profile.release.package.rtc-dtls]
+opt-level = "z"
+[profile.release.package.rtc-sctp]
+opt-level = "z"
+
+# The wire format, which the web profile below has always had at "z" and the
+# desktop deliberately did not.
+#
+# What made the desktop different was the sentence that per-message code is
+# hot; the measurement is that it is not, and that it is expensive. `waproto`
+# is 2.3 MiB of the daemon's 19.1 MiB of `.text` — generated from a 590 KB
+# descriptor — and its four largest functions are `Message::write_to`,
+# `SyncActionValue::merge_to_limit`, `Message::compute_size` and four separate
+# 72 KiB copies of `Message::clone`. None of that is a loop: it is one pass
+# over one stanza, some hundreds of times a minute at the very busiest, and
+# what `opt-level = "z"` withholds from it is inlining and vectorization of
+# straight-line field dispatch. The one burst that is not per message — an
+# appstate or history sync — is bounded by the network and the store, not by
+# this.
+[profile.release.package.waproto]
+opt-level = "z"
+[profile.release.package.buffa]
+opt-level = "z"
+
 
 # s, not z: these sit on a path a user can feel, but not one that runs per
 # frame. Image decode happens once per attachment, the Wayland protocol
@@ -244,6 +393,40 @@ opt-level = "s"
 [profile.release.package.chrono]
 opt-level = "s"
 [profile.release.package.serde_json]
+opt-level = "s"
+# The container and the codec behind a video attachment's audio track: `mp4`
+# walks the boxes once, `symphonia` decodes AAC for as long as the video
+# plays. Real work, on a path a user waits on — so "s" rather than the "z"
+# above it.
+[profile.release.package.mp4]
+opt-level = "s"
+[profile.release.package.symphonia]
+opt-level = "s"
+[profile.release.package.symphonia-core]
+opt-level = "s"
+[profile.release.package.symphonia-format-isomp4]
+opt-level = "s"
+[profile.release.package.symphonia-codec-aac]
+opt-level = "s"
+[profile.release.package.symphonia-metadata]
+opt-level = "s"
+# X11's protocol marshalling, which is the same shape of work `wayland-client`
+# above is kept at "s" for, on the other of the two Linux backends.
+[profile.release.package.x11rb]
+opt-level = "s"
+[profile.release.package.x11rb-protocol]
+opt-level = "s"
+# The graphics API in front of Vulkan, which is not the drawing. What is in
+# these three is descriptor validation, resource tracking and the adapter
+# enumeration a window does once at startup — the pixels are the GPU's and the
+# shaders are `naga`'s, which this manifest has had at "z" all along. A frame
+# here is a handful of instanced draws, so "s" costs bookkeeping rather than
+# rendering; 1.1 MiB of the window sat at "3" for it.
+[profile.release.package.wgpu]
+opt-level = "s"
+[profile.release.package.wgpu-core]
+opt-level = "s"
+[profile.release.package.wgpu-hal]
 opt-level = "s"
 
 
@@ -290,6 +473,28 @@ opt-level = "z"
 [profile.web.package.buffa]
 opt-level = "z"
 
+# And the rest of the protocol, for the same reason and only here. A page's
+# scarcest resource is the bytes a visitor waits on before the first pixel,
+# which is exactly the trade `opt-level = "s"` above this makes for the whole
+# graph; these are the crates where the difference is worth naming, because
+# they are large and because what they do is one pass over one stanza rather
+# than anything in a loop. The desktop keeps them at "3": there the module is
+# paid for once at build time.
+#
+# The ciphers are deliberately not in this list. `aes`, `sha2`, `hmac` and
+# `curve25519-dalek` are separate crates and are left alone — a ratchet step
+# is the one part of this that really is arithmetic in a loop.
+[profile.web.package.wacore]
+opt-level = "z"
+[profile.web.package.wacore-binary]
+opt-level = "z"
+[profile.web.package.wacore-libsignal]
+opt-level = "z"
+[profile.web.package.wacore-noise]
+opt-level = "z"
+[profile.web.package.whatsapp-rust]
+opt-level = "z"
+
 # The same bundle with its symbols, which `WEB_PROFILE=debug ./web/build.sh`
 # selects. It inherits `web` rather than `release` deliberately: a build you
 # are diagnosing should be the build that misbehaved, so the only difference
@@ -323,3 +528,83 @@ opt-level = "z"
 opt-level = "z"
 [profile.web.package.html5ever]
 opt-level = "z"
+[profile.web.package.markup5ever]
+opt-level = "z"
+[profile.web.package.markup5ever_rcdom]
+opt-level = "z"
+[profile.web.package.encoding_rs]
+opt-level = "z"
+[profile.web.package.syntect]
+opt-level = "z"
+[profile.web.package.fancy-regex]
+opt-level = "z"
+
+# The same image formats the desktop sweep names above, for the same reason:
+# `gpui` turns the crate's whole default set on and a page decodes exactly
+# three of them. `image` itself stays at the profile's "s" — a photo in a
+# conversation goes through it.
+[profile.web.package.exr]
+opt-level = "z"
+[profile.web.package.tiff]
+opt-level = "z"
+[profile.web.package.gif]
+opt-level = "z"
+[profile.web.package.qoi]
+opt-level = "z"
+[profile.web.package.color_quant]
+opt-level = "z"
+[profile.web.package.moxcms]
+opt-level = "z"
+[profile.web.package.zune-inflate]
+opt-level = "z"
+[profile.web.package.rayon]
+opt-level = "z"
+[profile.web.package.rayon-core]
+opt-level = "z"
+
+# The SVG icon path, which a page walks once per icon and then never again.
+# None of these five were reached by the desktop sweep's copies — package
+# overrides are not inherited through `inherits`, which is the whole reason
+# this list exists — and all five are compiled for wasm.
+[profile.web.package.usvg]
+opt-level = "z"
+[profile.web.package.resvg]
+opt-level = "z"
+[profile.web.package.tiny-skia]
+opt-level = "z"
+[profile.web.package.tiny-skia-path]
+opt-level = "z"
+[profile.web.package.rustybuzz]
+opt-level = "z"
+[profile.web.package.lyon_tessellation]
+opt-level = "z"
+[profile.web.package.lyon_path]
+opt-level = "z"
+[profile.web.package.lyon_geom]
+opt-level = "z"
+[profile.web.package.lyon_algorithms]
+opt-level = "z"
+
+# A plugin's module is validated once, at load. `wasmi` interprets it
+# afterwards and stays at the profile's "s" — on a page it shares the one
+# agent with the window, which is the argument for keeping it quick rather
+# than small.
+[profile.web.package.wasmparser]
+opt-level = "z"
+
+# The container and the audio codec behind a video attachment. Both are real
+# work a visitor waits on, so they stay at the profile's "s"; they are named
+# here only because the desktop's own entries for them do not reach this
+# graph.
+[profile.web.package.mp4]
+opt-level = "s"
+[profile.web.package.symphonia]
+opt-level = "s"
+[profile.web.package.symphonia-core]
+opt-level = "s"
+[profile.web.package.symphonia-format-isomp4]
+opt-level = "s"
+[profile.web.package.symphonia-codec-aac]
+opt-level = "s"
+[profile.web.package.symphonia-metadata]
+opt-level = "s"

@@ -35,6 +35,15 @@
          wasm-bindgen output, trunk's release default produced 29,825,238
          bytes and `-Oz` produced 29,419,240.
 
+         `--converge` is the other half of that. `-Oz` is one run of the pass
+         pipeline, and a pass that shrinks the module hands the next one a
+         module it has not seen; `--converge` runs the pipeline again until a
+         round changes nothing. Measured on this module, on top of everything
+         else here: 22,280,415 bytes down to 21,976,566, which is 303,849 for
+         a setting whose whole cost is build time. Nothing about what the
+         module does changes — each iteration is the same set of passes that
+         produced the first one, and wasm-opt validates what it emits.
+
          Nothing here strips anything, because in the shipped build there is
          nothing left to strip: `strip = true` removes the name section before
          wasm-opt ever sees the module, and `wasm-objdump -h` on the published
@@ -72,7 +81,7 @@
       data-bindgen-target="web"
       data-integrity="none"
       data-wasm-opt="z"
-      data-wasm-opt-params="-g --enable-bulk-memory --enable-threads --enable-mutable-globals --enable-nontrapping-float-to-int --enable-sign-ext"
+      data-wasm-opt-params="-g --converge --enable-bulk-memory --enable-threads --enable-mutable-globals --enable-nontrapping-float-to-int --enable-sign-ext"
     />
 
     <!-- Cross-origin isolation, which GitHub Pages cannot give us.

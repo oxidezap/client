@@ -761,6 +761,22 @@ profile here repeats it deliberately.
   Two ways in that look like they should work and do not:
   `CARGO_PROFILE_RELEASE_PACKAGE_<NAME>_OPT_LEVEL` is silently ignored, and
   `--config`, which is not, is not something trunk can forward.
+- **A size override is worth what a crate weighs *after* LTO.** Which is not
+  what it weighs in the sweep, and the two are not even correlated — so the
+  order is measure, then decide, and `cargo bloat --crates` against a build
+  with `CARGO_PROFILE_RELEASE_STRIP=none` is the whole of the first half.
+  Measured on this tree: taking every image format `gpui` turns on and this
+  application never decodes — EXR, TIFF, GIF, QOI and the colour management
+  behind them — from the profile's setting down to `z` was worth 43 KB of a
+  22 MB module, because fat LTO had already removed nearly all of it and what
+  is left is *data* that no optimization level shrinks (`exr`'s DWA transfer
+  curve is 131,076 bytes of it, in the window's `.data`). Taking `waproto`
+  and `buffa` from `3` to `z` was worth 1.4 MB of the daemon, because
+  generated protobuf survives LTO in full: it is reachable, it is enormous —
+  four separate 72 KiB copies of `Message::clone` among the largest functions
+  in the binary — and none of it is in a loop. The cold-and-obvious crate is
+  usually already gone; the one worth finding is large, reachable, and
+  called once per stanza rather than once per frame.
 - **The page has a third heap, and it is the size of the account.** The
   relaxed-idb VFS holds `HashMap<usize, Uint8Array>` — the whole database,
   resident in the *JavaScript* heap, one 8 KiB page per entry, kept alive

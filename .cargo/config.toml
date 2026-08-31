@@ -55,6 +55,12 @@ rustflags = [
     # Drop the legacy SysV .hash section; glibc has preferred .gnu.hash since
     # 2.5 and lld emits both by default.
     "-Clink-arg=-Wl,--hash-style=gnu",
+    # lld's own optimization level, which is not the compiler's: at -O2 it
+    # tail-merges mergeable string sections, so a literal that is the suffix
+    # of another stops being stored twice. Nothing about the generated code
+    # changes — this is the linker deciding where bytes go — which is why it
+    # sits beside `--icf=all` rather than being weighed against it.
+    "-Clink-arg=-Wl,-O2",
 ]
 
 # The web front end. Everything here is what `gpui_web` requires of a page: it
