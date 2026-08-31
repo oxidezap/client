@@ -185,10 +185,10 @@ impl WhatsAppApp {
     /// This window applies it to itself immediately — a front end writes its
     /// own share of the log, and a page attached to no daemon writes all of
     /// it. The daemon is told, because it holds the session and so writes
-    /// nearly everything worth reading. And both sides write the choice down,
-    /// each where it keeps its own: on a desktop that is one file both
-    /// processes read, and for a page it is a browser store the daemon
-    /// cannot reach, which is exactly why the daemon remembers it too.
+    /// nearly everything worth reading. And the choice is written down by
+    /// whoever keeps a store of their own: the daemon's file on a desktop,
+    /// which both processes read, and additionally the page's own browser
+    /// store, which no daemon can reach.
     ///
     /// A store that will not take it is a notice rather than a refusal: the
     /// level *has* changed, and what failed is only the memory of it.
@@ -207,29 +207,34 @@ impl WhatsAppApp {
             .as_ref()
             .map(|client| client.set_log_level(level));
 
-        // And written down by whoever keeps a store of their own. On a
-        // desktop that is the daemon, which writes the very file this window
-        // would have written — so a window with a daemon writes nothing, and
-        // two windows choosing at once cannot leave the next start at the
-        // earlier answer. It is *waited for* rather than assumed, because a
-        // frame handed to a full outbox has been queued and not delivered:
-        // the daemon persists before it acknowledges, so its answer is what
-        // makes "somebody remembered this" true. Where it does not come, this
-        // window is the only thing left that can remember.
+        // And written down by whoever keeps a store of their own. See
+        // `platform::log_store`, which answers both halves of that: which
+        // store, and on which thread — the desktop write is a file flushed
+        // and renamed and belongs off the one that draws, and a page's is
+        // `localStorage`, which exists on the window global and on no worker.
         //
-        // See `platform::log_store`, which also decides the thread: the
-        // desktop write is a file flushed and renamed and belongs off the one
-        // that draws, and a page's is `localStorage`, which exists on the
-        // window global and on no worker.
+        // Where the store is this front end's own, nothing is waited for:
+        // no daemon writes it, and an answer that stalled — or a page
+        // reloaded during the round trip — would take the choice with it.
+        // Where it is not, the daemon writes the very file this window would
+        // have, so the window writes nothing and two windows choosing at once
+        // cannot leave the next start at the earlier answer. That is *waited
+        // for* rather than assumed, because a frame handed to a full outbox
+        // has been queued and not delivered: the daemon persists before it
+        // acknowledges, so its answer is what makes "somebody remembered
+        // this" true, and where it does not come this window is the only
+        // thing left that can.
         let keeps_its_own = crate::platform::log_store::is_ours();
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
-            let daemon_answered = match told_the_daemon {
-                Some(answer) => answer.await.is_ok(),
-                None => false,
-            };
-            if daemon_answered && !keeps_its_own {
-                return;
+            if !keeps_its_own {
+                let daemon_answered = match told_the_daemon {
+                    Some(answer) => answer.await.is_ok(),
+                    None => false,
+                };
+                if daemon_answered {
+                    return;
+                }
             }
             if let Err(e) = crate::platform::log_store::remember(cx).await {
                 log::warn!("the log level was changed but not stored: {e}");
