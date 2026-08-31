@@ -4,8 +4,8 @@
 # the result; `index.html` names the binary. Everything that is *not* trunk's
 # business — the atomics and shared-memory link flags gpui_web needs, and the
 # `build-std` that goes with them — lives in /.cargo/config.toml and in
-# `build.sh` beside this file, so `trunk build` and the Pages workflow are
-# running the same thing.
+# `cargo xtask web build` (/xtask/src/web.rs), so `trunk build` and the Pages
+# workflow are running the same thing.
 
 [build]
 target = "index.html"

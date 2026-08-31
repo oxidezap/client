@@ -236,9 +236,19 @@ fn accept(
     // Everything the browser must not collect while the connection is open,
     // and the one place that lets go of it. The liveness watch below is what
     // clears it; nothing else here holds a strong reference.
+    //
+    // Installed, and that is the whole of what was missing: this handler was
+    // built and held and never put on the channel, so the tab this side had
+    // just agreed to serve wrote its hello into a channel nobody was
+    // listening on. `serve_client` waited out its handshake window and
+    // refused the connection, which is the one symptom that reached a
+    // console — from the *asking* tab, naming a frame it had sent perfectly
+    // well. Nothing about it pointed here.
+    let handling = handler(&frames, &requests, &staged);
+    frames.set_onmessage(Some(handling.as_ref().unchecked_ref()));
     let open = Rc::new(RefCell::new(Some(Connection {
         channel: frames.clone(),
-        _handler: handler(&frames, &requests, &staged),
+        _handler: handling,
     })));
 
     // Reading the pipe and posting what comes out. Ends when `serve_client`
@@ -490,4 +500,143 @@ fn post_failure(
     set(&message, "id", &(id as f64).into())?;
     set(&message, "e", &why.into())?;
     frames.post_message(&message)
+}
+
+/// Both ends of this transport, in a browser.
+///
+/// The parent module is `web_sys` against a real `BroadcastChannel` and a real
+/// `LockManager`, so `cargo test` on the host does not compile a line of it —
+/// and the cost of that gap was not theoretical. [`accept`] built its
+/// connection handler, held it, and never put it on the channel. Every check
+/// in the repository passed: it compiles, it is `#[must_use]`-free, the type
+/// is held for exactly as long as it should be, and the only thing wrong is a
+/// call that is not there.
+///
+/// What it did in a browser was serve the rendezvous perfectly — a second tab
+/// asked, was answered, and reported itself attached — and then hear nothing
+/// the tab said. `serve_client` waited out its handshake window and refused
+/// the connection, so the only error anywhere appeared in the *asking* tab's
+/// console, naming a hello it had sent correctly. Three rounds of review and
+/// two rounds of automated review read this file without seeing it, because
+/// reading is not what catches a missing call; running it is.
+///
+/// ```bash
+/// # Chromium and its driver are what the runner needs; `RUSTFLAGS` is reset
+/// # for the reason `examples/` resets it — the root's wasm flags are the web
+/// # *front end's*, and a shared memory here would need isolation headers
+/// # this runner does not serve.
+/// CHROMEDRIVER=$(which chromedriver) \
+/// RUSTFLAGS='--cfg web_sys_unstable_apis' \
+/// CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+///   cargo test -p oxidezap-daemon --lib --target wasm32-unknown-unknown
+/// ```
+///
+/// One agent runs both ends here, which is exactly what a `BroadcastChannel`
+/// allows: it does not deliver to the object that posted, and every other
+/// object of that name hears it — including one in this same page. So the
+/// leader and the follower are the real `serve` and the real
+/// `oxidezap_ipc::tab::connect`, talking over the real transport, with
+/// nothing standing in for either side.
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use oxidezap_ipc::tab::FromTab;
+    use oxidezap_ipc::{ClientRequest, DaemonMessage, PROTOCOL_VERSION, Request};
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use super::serve;
+    use crate::state::StateHub;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// A daemon with nothing in it, and something to answer its commands.
+    ///
+    /// The stand-in bridge is not decoration. A front end that says it has a
+    /// window is asked for a keyframe the moment its handshake lands, and
+    /// `serve_client` *awaits that answer* — so a test that only held the
+    /// receiver open would hang exactly where a real daemon would have
+    /// replied. It answers everything the same way; nothing here asks a
+    /// second thing.
+    fn a_daemon() -> (
+        Arc<StateHub>,
+        Arc<oxidezap_plugin_host::Plugins>,
+        crate::session_bridge::Commands,
+    ) {
+        let (commands, mut asked) = tokio::sync::mpsc::channel::<
+            crate::session_bridge::SessionCommand,
+        >(crate::server::MAX_CLIENTS);
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(command) = asked.recv().await {
+                let _ = command
+                    .reply
+                    .send(crate::session_bridge::CommandOutcome::Accepted);
+            }
+        });
+        (
+            StateHub::new(),
+            Arc::new(oxidezap_plugin_host::Plugins::none(Arc::new(|_| {}))),
+            commands,
+        )
+    }
+
+    /// How long the whole exchange may take before it is a failure.
+    ///
+    /// Bounded because the failure this test exists for is a *silence*: the
+    /// leader hearing nothing and answering nothing. Left unbounded, that
+    /// reads as the runner giving up on a test it cannot see the end of,
+    /// which says nothing about what went wrong — and it is the first thing
+    /// this test did when its own stand-in bridge was missing.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// A tab that asks for the account is served, and what it says is heard.
+    ///
+    /// The regression test, and the assertion that matters is the second one.
+    /// Being *answered* was never broken — the rendezvous handler has always
+    /// been installed — so a test that stopped at "it attached" would have
+    /// passed against the bug this exists for. What the bug ate was the first
+    /// thing the attached tab said, and a snapshot coming back is the proof
+    /// that the leader heard it: `serve_client` sends one only after it has
+    /// read and accepted a hello.
+    #[wasm_bindgen_test]
+    async fn a_served_tab_is_heard_as_well_as_answered() {
+        let (hub, plugins, commands) = a_daemon();
+        let _serving = serve(&hub, &plugins, &commands).expect("the rendezvous opens");
+
+        let mut tab = oxidezap_ipc::tab::connect()
+            .await
+            .expect("the tab holding the account answers");
+
+        let hello = serde_json::to_vec(&Request::bare(ClientRequest::Hello {
+            protocol: PROTOCOL_VERSION,
+            session_events: true,
+            has_window: true,
+        }))
+        .expect("a hello serializes");
+        tab.link.send_line(&hello).expect("and goes out");
+
+        let answer = oxidezap_session::with_timeout(tab.incoming.recv(), PATIENCE)
+            .await
+            .expect("the leader answers a hello it heard, well inside the handshake window");
+        match answer {
+            Some(FromTab::Line(line)) => {
+                let frame: DaemonMessage =
+                    serde_json::from_str(&line).expect("the daemon speaks this protocol");
+                // `Hello` is the daemon's own first frame, carrying the
+                // snapshot, and `serve_client` writes it only once it has read
+                // and accepted the client's. Against the bug this exists for
+                // the frame that arrives here instead is an `Error` — "no
+                // hello within the handshake window" — which is the leader
+                // saying it heard nothing at all.
+                assert!(
+                    matches!(frame, DaemonMessage::Hello { .. }),
+                    "a hello that was heard is answered with a snapshot, not {frame:?}"
+                );
+            }
+            // The other shape of the same failure: refused and closed before
+            // this side was told anything it could parse.
+            Some(FromTab::Closed(why)) => panic!("the connection ended instead: {why}"),
+            None => panic!("the connection ended without a word"),
+        }
+    }
 }

@@ -119,6 +119,23 @@ the one to copy — it asks for nothing that touches the account, so it runs the
 moment it is dropped in the folder — and `autoreply/` is the same shape with
 something in it.
 
+`xtask/` is the repository's own tooling — the web build, the bundle checks,
+and the `gh-pages` publisher — and it is excluded from the workspace for a
+reason of its own rather than the plugins'. The Pages publish job holds
+`contents: write` and checks out one directory; a workspace member would make
+cargo resolve the whole graph, eight git dependencies among them, before it
+could compile a binary that needs none of it. So it carries its own
+`[workspace]`, takes no dependencies at all, and CI runs its tests against its
+own manifest the way it runs the example plugins'. What lives there was shell
+until it was not: a compare-and-swap against a branch, and a three-way "is
+this still wanted" whose one wrong reading — an operational failure collapsing
+into "stand down" — is a deployment that silently does not happen while the
+job reports success. Both now have tests, including one that drives the whole
+publish against a bare repository in a temporary directory. `curl` and `gzip`
+are the two things it still shells out to, and deliberately: a TLS client and
+a deflate implementation are the two dependencies that would cost this
+directory the property the sparse checkout depends on.
+
 `docs/plugin-abi.md` is the contract for anyone not using the SDK: the imports
 with their signatures, the field table by kind, the UI encoding, the outcome
 codes and every bound the host holds a plugin to. The SDK is a convenience
@@ -135,6 +152,13 @@ a copy is what lets the version literal in the snippet drift past
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings   # what CI enforces
 cargo test --workspace
+
+# The tooling is its own workspace (see `xtask/` above), so none of the three
+# lines above compiles a byte of it. CI has a job that does.
+cargo fmt --manifest-path xtask/Cargo.toml --all
+cargo clippy --manifest-path xtask/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path xtask/Cargo.toml
+cargo xtask help    # what there is to run; from the repository root
 
 # Running it: two binaries, and the window looks for the daemon beside itself.
 cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxidezap
@@ -167,9 +191,10 @@ cargo install trunk
 # Serves on http://127.0.0.1:8080 with the two isolation headers set. On
 # GitHub Pages a service worker adds them instead, because a static host has
 # no way to.
-# Through the script: trunk cannot forward arguments to cargo, so it is what
-# sets the toolchain and `CARGO_UNSTABLE_BUILD_STD`.
-TRUNK_ACTION=serve ./web/build.sh
+# Through the task: trunk cannot forward arguments to cargo, so it is what
+# sets the toolchain and `CARGO_UNSTABLE_BUILD_STD`. Run it from the root —
+# the alias in /.cargo/config.toml names a manifest path.
+TRUNK_ACTION=serve cargo xtask web build
 
 # And the daemon it attaches to. `--web` alone is loopback on the port the
 # page looks for; localhost is served without being named. It logs where the
@@ -183,7 +208,7 @@ cargo run --bin oxidezapd -- --web
 # `strip` off, so it is the build that misbehaved rather than a different one
 # — and `-g` in `data-wasm-opt-params` is what stops wasm-opt throwing the
 # name section away again.
-WEB_PROFILE=debug ./web/build.sh
+WEB_PROFILE=debug cargo xtask web build
 ```
 
 The web half of the daemon — the OPFS folder a page installs plugins into —
@@ -763,7 +788,7 @@ profile here repeats it deliberately.
   collected at every frame after; the web artifact is one module a visitor
   waits on before the first pixel and a browser then compiles, and its code
   section is 84% of it. Cargo has no per-target profiles, so `[profile.web]`
-  is the answer and `web/build.sh` selects it through trunk's
+  is the answer and `cargo xtask web build` selects it through trunk's
   `--cargo-profile`. `opt-level = "s"` there was measured at 31% of the module
   — by a wide margin the largest single thing in it, larger than every crate
   gate put together. `gpui` is the one exception at 3: it draws every frame
@@ -1204,6 +1229,17 @@ calls, keeps plugins, survives the tab and keeps the keys out of a browser's
 storage — but it no longer needs one. The export stays static either way: nothing here needs a
 server to be *hosted*. `.github/workflows/pages.yml` builds and publishes it.
 
+The same bundle ships in every release as `oxidezap-<version>-web.zip`, built
+by `.github/workflows/web-bundle.yml` — so hosting it somewhere else is
+unpacking a directory rather than installing a nightly toolchain and trunk.
+The one difference is the public URL: Pages knows its own directory and bakes
+it into the generated glue, and an archive cannot, so that build is told `./`
+and every asset is named relative to `index.html`. Which is why it is a second
+build rather than a copy of the Pages artifact, and why the workflow asserts
+the relocatability rather than trusting it — an asset named from the origin
+root is a bundle that only works unpacked at a domain's root, and that is the
+one way `--public-url` can silently come out wrong.
+
 The daemon a page runs is the daemon, minus the process:
 `daemon::embedded::start` assembles the state hub and the session bridge and
 hands the front end one end of a `tokio::io::duplex`, which `serve_client`
@@ -1347,6 +1383,16 @@ Media does not travel as a frame there either. A follower has no media map and
 no HTTP endpoint, so the sideband is three more messages on the same channel,
 with the bytes crossing as a `Uint8Array` — one structured clone, where JSON
 would be a base64 round trip through a string twice the size.
+
+Both ends of it run in a browser under `cargo test`, and that is not
+belt-and-braces: the leader built its connection handler, held it for exactly
+the right lifetime, and never called `set_onmessage`. Everything compiled,
+every lint passed, and what a second tab got was a rendezvous answered
+perfectly followed by silence — `serve_client` waiting out its handshake
+window and refusing a hello it was never handed. The only error anywhere
+appeared in the *asking* tab, naming a frame it had sent correctly. Reading
+does not catch a call that is not there; running it does, which is what
+`listener::tab::tests` is for.
 
 **Queuing for the lock is now the right thing, and the reasoning that ruled it
 out has not been dropped so much as spent.** It said a queued tab looks like

@@ -67,7 +67,7 @@
          artifact lists exactly one custom section, `producers`, at 72 bytes.
          Which is the warning worth leaving — a DevTools flame graph of this
          page has no Rust symbols in it and never had.
-         `WEB_PROFILE=debug ./web/build.sh` is the build that does: it selects
+         `WEB_PROFILE=debug cargo xtask web build` is the build that does: it selects
          `[profile.web-debug]`, which is the same profile with `strip` off.
 
          `-g` is what carries that through to here. wasm-opt drops the name

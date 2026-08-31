@@ -50,6 +50,9 @@ cd oxidezap-nightly-linux-x86_64
 ./oxidezap
 ```
 
+The web front end ships beside them as `oxidezap-<version>-web.zip`: static
+files to serve from any web server, with hosting notes in the archive.
+
 The binaries are unsigned, so macOS Gatekeeper and Windows SmartScreen will
 object. On macOS, clear the quarantine flag before the first run:
 
@@ -97,9 +100,9 @@ Building and serving it locally:
 rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown
 cargo install trunk
 
-# Through the script: trunk cannot forward arguments to cargo, so this is what
+# Through the task: trunk cannot forward arguments to cargo, so this is what
 # sets the toolchain and `CARGO_UNSTABLE_BUILD_STD`.
-TRUNK_ACTION=serve ./web/build.sh
+TRUNK_ACTION=serve cargo xtask web build
 ```
 
 ### Attaching to a daemon instead

@@ -1,0 +1,33 @@
+# The repository's own tooling, as a program rather than as shell.
+#
+# Its own workspace, and excluded from the root one, for the same reason
+# `examples/` is: this has to build in a job that checks out *only this
+# directory*. A member of the root workspace makes cargo resolve the whole
+# graph — eight git dependencies among them — before it can compile a binary
+# that needs none of it, which is minutes of network in a job whose whole
+# purpose is a `git push`. Its tests are run by CI against this manifest, the
+# same way the example plugins' are.
+#
+# No dependencies at all, deliberately. What is left of these tasks after the
+# process plumbing is text, files and exit codes, and a lockfile that never
+# moves is what keeps this directory buildable on its own.
+[workspace]
+
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# `[lints] workspace = true` is deliberately absent: the root denies
+# `print_stdout` and `print_stderr` because diagnostics in a daemon belong in
+# `log`, and this is a command-line tool whose entire output is those two
+# streams.
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 1
