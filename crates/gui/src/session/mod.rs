@@ -940,21 +940,18 @@ impl Session {
         });
     }
 
-    /// Say how much the daemon should log, answering whether it was said.
+    /// Say how much the daemon should log, answered when it has been done.
     ///
-    /// Fire and forget as to the *outcome* — what comes back would only say
-    /// that the daemon heard — but not as to whether the request went out at
-    /// all, because the daemon is also the process that writes the choice
-    /// down on a desktop. A window that could not reach it is the only thing
-    /// left to remember the level, and has to know that.
-    pub fn set_log_level(&self, level: oxidezap_core::LogLevel) -> bool {
-        match self.send(ClientRequest::SetLogLevel { level }) {
-            Ok(()) => true,
-            Err(e) => {
-                error!("could not reach the daemon: {e}");
-                false
-            }
-        }
+    /// Answered rather than told, because on a desktop the daemon is also
+    /// the process that writes the choice down — it persists before it
+    /// acknowledges — so this receiver is how the window learns that
+    /// somebody remembered the level rather than merely that somebody was
+    /// handed it. A frame can sit in a full outbox, and a window that closed
+    /// while it sat there would leave nobody having written anything.
+    pub fn set_log_level(&self, level: oxidezap_core::LogLevel) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(ClientRequest::SetLogLevel { level }, Awaiting::Acted(tx));
+        rx
     }
 
     /// Wipe the local store and pair again.

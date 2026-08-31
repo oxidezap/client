@@ -205,23 +205,32 @@ impl WhatsAppApp {
         let told_the_daemon = self
             .client
             .as_ref()
-            .is_some_and(|client| client.set_log_level(level));
+            .map(|client| client.set_log_level(level));
 
         // And written down by whoever keeps a store of their own. On a
-        // desktop that is the daemon, which was just told and writes the very
-        // file this window would have written — so a window with a daemon
-        // writes nothing, and two windows choosing at once cannot leave the
-        // next start at the earlier answer. With no daemon to tell, nothing
-        // else will remember. See `platform::log_store`, which also decides
-        // the thread: the desktop write is a file flushed and renamed and
-        // belongs off the one that draws, and a page's is `localStorage`,
-        // which exists on the window global and on no worker.
-        if told_the_daemon && !crate::platform::log_store::is_ours() {
-            cx.notify();
-            return;
-        }
+        // desktop that is the daemon, which writes the very file this window
+        // would have written — so a window with a daemon writes nothing, and
+        // two windows choosing at once cannot leave the next start at the
+        // earlier answer. It is *waited for* rather than assumed, because a
+        // frame handed to a full outbox has been queued and not delivered:
+        // the daemon persists before it acknowledges, so its answer is what
+        // makes "somebody remembered this" true. Where it does not come, this
+        // window is the only thing left that can remember.
+        //
+        // See `platform::log_store`, which also decides the thread: the
+        // desktop write is a file flushed and renamed and belongs off the one
+        // that draws, and a page's is `localStorage`, which exists on the
+        // window global and on no worker.
+        let keeps_its_own = crate::platform::log_store::is_ours();
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
+            let daemon_answered = match told_the_daemon {
+                Some(answer) => answer.await.is_ok(),
+                None => false,
+            };
+            if daemon_answered && !keeps_its_own {
+                return;
+            }
             if let Err(e) = crate::platform::log_store::remember(cx).await {
                 log::warn!("the log level was changed but not stored: {e}");
                 let _ = entity.update(cx, |app, cx| {
@@ -250,7 +259,10 @@ impl WhatsAppApp {
         let (Some(level), Some(client)) = (self.log_level_asked, &self.client) else {
             return;
         };
-        let _ = client.set_log_level(level);
+        // The answer is nobody's to wait for here: this is the window
+        // repeating itself to a daemon it has just reached, and what it
+        // wanted was for the level to arrive.
+        let _answered = client.set_log_level(level);
     }
 
     /// Delete the cached media and re-measure.

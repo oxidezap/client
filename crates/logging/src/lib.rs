@@ -201,6 +201,8 @@ mod imp {
     /// - `RUST_LOG=oxidezap_session` — a bare word that is not a level names
     ///   a *target*, at `trace`.
     /// - `RUST_LOG=oxidezap_session=` — an empty level does the same.
+    /// - `RUST_LOG==debug` — an empty *target* is a prefix that matches
+    ///   every target, so it reads as a global level in all but name.
     /// - `RUST_LOG=debug/stanza` — the `/` and everything after it is a
     ///   regular expression over the message, applied by the logger. It is
     ///   not part of the last directive's level, and reading it as one loses
@@ -226,7 +228,12 @@ mod imp {
                     } else {
                         level.parse().ok()?
                     };
-                    (!target.is_empty()).then(|| (Some(target.to_string()), level))
+                    // An empty target is kept rather than dropped: `=debug`
+                    // is a prefix that matches everything, which is what
+                    // `env_filter` makes of it and so what the inner filter
+                    // will answer. Dropping it left the gate refusing records
+                    // that filter accepts.
+                    Some((Some(target.to_string()), level))
                 }
                 // A bare word is a level if it reads as one, and a target at
                 // its loudest otherwise.
@@ -438,6 +445,12 @@ mod imp {
             // A bare level names nothing, and neither does an unreadable one.
             assert!(named_targets("debug").is_empty());
             assert!(named_targets("gpui=verbose").is_empty());
+            // An empty target is a prefix that matches everything, which is
+            // what `env_filter` makes of it.
+            assert_eq!(
+                named_targets("=debug"),
+                vec![(String::new(), log::LevelFilter::Debug)]
+            );
         }
 
         /// `env_filter`'s shorthands, which are the forms most likely to be
