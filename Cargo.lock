@@ -6227,6 +6227,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "gpui_wgpu",
  "image",
  "indexmap",
  "js-sys",

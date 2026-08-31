@@ -47,6 +47,9 @@ fn main() {
 
 fn open_the_window() {
     let launch = |cx: &mut App| {
+        // Before anything asks for one: a page's text system starts empty and
+        // resolving a font it has not been given is a panic, not a fallback.
+        crate::platform::fonts(cx);
         gpui_component::init(cx);
         // Reads ~/.config/oxidezap/theme.json over a preset. Cannot fail: a
         // missing or malformed file resolves to the product default and

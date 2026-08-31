@@ -154,5 +154,12 @@ web-sys = { version = "0.3", features = [
     "DomException",
 ] }
 
+# The page's text system, on the host. `gpui_web` builds its own over
+# `CosmicTextSystem::new_without_system_fonts`, so `platform/fonts.rs` can
+# hold a browser-only failure under `cargo test` by building the same thing —
+# the crate is already in the graph on every platform, and this only names it.
+[dev-dependencies]
+gpui_wgpu = { git = "https://github.com/zed-industries/zed", package = "gpui_wgpu" }
+
 [lints]
 workspace = true

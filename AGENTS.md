@@ -969,6 +969,32 @@ to the same problem. Nothing here needs it yet.
   call that has ended would put the last person's face on this one, and a
   frame for a direction just turned off would light a pane nothing will come
   to clear again.
+- **A page has no fonts but the ones it embeds, and the failure is a panic.**
+  A desktop's text system reads the system's families through font-kit; the
+  web backend builds `CosmicTextSystem::new_without_system_fonts`, and a
+  browser hands wasm no font files, so the database starts empty. `gpui_web`
+  used to fill it — it bundled IBM Plex Sans and Lilex and added them as it
+  built the platform — and a revision bump took that out with the note that
+  applications must add their own before opening a window.
+  `platform/fonts.rs` is that answered, and the two families are decided
+  upstream rather than by taste: `font_name_with_fallbacks` maps `.ZedSans` to
+  "IBM Plex Sans" and `.ZedMono` to "Lilex", and the web platform passes "IBM
+  Plex Sans" as what `.SystemUIFont` resolves to.
+  What it looks like when it is missing is worth remembering, because none of
+  it names a font. `resolve_font` *panics* when neither the family nor a
+  fallback resolves, so the first frame traps — and a wasm trap unwinds
+  nothing, so every `RefCell` gpui held across that frame stays borrowed for
+  the life of the page. The console fills with "RefCell already borrowed" from
+  gpui's own window and async context, at a rate of several a second, while
+  the session behind it connects, hydrates, authenticates and syncs perfectly.
+  One panic naming a font, then hundreds naming a cell.
+  It is held by `cargo test` rather than by a browser, and honestly: the tests
+  in that module build a `gpui::TextSystem` over the very same
+  `new_without_system_fonts` with the very same system-font name, so a family
+  a page cannot resolve is one they cannot resolve either — including the one
+  that proves the *fallback* still lands, since gpui-component's default mono
+  family here is "DejaVu Sans Mono" and no page has that either.
+
 - **The web build is a profile, not a `cfg`.** `[profile.release]` is
   calibrated for the binary, where an optimization is paid for once and
   collected at every frame after; the web artifact is one module a visitor
