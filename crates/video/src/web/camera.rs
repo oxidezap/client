@@ -359,24 +359,28 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
                 }
                 let keyframe = chunk.type_() == web_sys::EncodedVideoChunkType::Key;
                 // Something is dropped when this queue is full, and *which*
-                // is the whole question. `try_send` refuses the unit just
-                // encoded and keeps the two before it, which is this queue's
-                // stated policy exactly backwards: after a scheduling or
-                // encoder burst the session is handed a stale picture, then
-                // another, before it ever reaches the current scene. The
-                // newest frame is the only one worth having — that is what
-                // the depth of two is for — so the oldest is evicted instead.
-                // The microphone's queue makes the same call one crate over.
+                // is the whole question — with the opposite answer to the
+                // microphone's, which evicts its oldest frame. The difference
+                // is that PCM frames are independent and H.264 pictures are
+                // not: a queued P-frame references the one in front of it, so
+                // evicting the oldest here does not free a slot, it makes
+                // everything still queued undecodable and then sends it. The
+                // peer would receive two corrupt pictures where refusing the
+                // new one sends two good ones and a gap.
                 //
-                // The keyframe is asked for *here*, and not left to the
-                // session: a unit dropped at this queue never reaches the
-                // session at all, so its own "my send failed" path cannot see
-                // the gap, and every P-frame after this one references a
-                // picture the peer will never hold. Asked whenever something
-                // was evicted, which `force_send` reports as `Ok(Some(_))`; a
-                // closed channel means the call is over and nothing wants a
-                // picture.
-                if let Ok(Some(_)) = tx.force_send(EncodedFrame { data, keyframe }) {
+                // So the newest is refused. It is the staler choice by two
+                // frames — 66 ms at 30 fps — and that is the whole cost of
+                // keeping what is delivered decodable.
+                //
+                // The keyframe is asked for *here* either way, and not left
+                // to the session: a unit dropped at this queue never reaches
+                // the session at all, so its own "my send failed" path cannot
+                // see the gap, and every P-frame after this one references a
+                // picture the peer will never hold. Only on `Full` — a closed
+                // channel means the call is over and nothing wants a picture.
+                if let Err(async_channel::TrySendError::Full(_)) =
+                    tx.try_send(EncodedFrame { data, keyframe })
+                {
                     control.request_keyframe();
                 }
             },

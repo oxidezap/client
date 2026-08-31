@@ -434,6 +434,12 @@ fn wire(
                     // same rate. Evicting the oldest is what the rest of this
                     // path does. A closed channel is the call ending, which
                     // the owning task notices for itself.
+                    //
+                    // Safe here and *not* on the camera's queue, which refuses
+                    // its newest instead: a PCM frame stands on its own, so
+                    // dropping an older one costs exactly that frame, while an
+                    // H.264 picture is referenced by the ones behind it and
+                    // evicting one makes the rest undecodable.
                     let _ = mic.force_send(frame);
                 }
             },

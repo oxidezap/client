@@ -1740,6 +1740,19 @@ by definition.
   everywhere, telling somebody to answer in the other tab while destroying
   the call they would have answered there.
 
+- **Which end a full queue drops from is a question about the payload, not
+  about latency.** The microphone's queue evicts its oldest frame and the
+  camera's refuses its newest, and the two look like the same decision made
+  inconsistently. They are not: a PCM frame stands on its own, so dropping an
+  older one costs exactly that frame and the newest speech is the only speech
+  worth having. An H.264 picture is referenced by the ones behind it, so
+  evicting the oldest does not free a slot — it makes everything still queued
+  undecodable and then sends it, and the peer receives two corrupt pictures
+  where refusing the new one sends two good ones and a gap. The camera is
+  staler by two frames, 66 ms at 30 fps, and that is the whole price of
+  keeping what is delivered decodable. Both ask for a keyframe on the drop,
+  because the gap is real either way.
+
 - **A dropped access unit is a frame of RTP time that goes unspent.** The
   library's `VideoSource` advertises one `rtp_timestamp_stride` and advances
   by exactly that per unit delivered, and `EncodedFrame` carries no timestamp
