@@ -86,7 +86,7 @@ jobs:
       - name: Build the bundle
         env:
           PUBLIC_URL: ./
-        run: ./web/build.sh
+        run: cargo xtask web build
 
       # Two things, and the second is the one this archive exists for.
       #
@@ -94,36 +94,14 @@ jobs:
       # mismatch is a blank page rather than a failed build — the same check
       # `pages.yml` makes.
       #
-      # And *relocatable*: an asset named `/oxidezap-abc123.js` is one this
-      # bundle would fetch from the origin root wherever it was unpacked,
-      # which is the single way a relative build can silently come out
-      # non-relative. Asserted rather than assumed, because it is a property
-      # of trunk's handling of `--public-url` and trunk is not pinned here.
+      # And *relocatable*, which is `--relocatable` and is the half only this
+      # build may ask: an asset named `/oxidezap-abc123.js` is one this bundle
+      # would fetch from the origin root wherever it was unpacked, which is
+      # the single way a relative build can silently come out non-relative.
+      # Asserted rather than assumed, because it is a property of trunk's
+      # handling of `--public-url` and trunk is not pinned here.
       - name: Check the bundle is complete and relocatable
-        run: |
-          set -eu
-          test -f web/dist/index.html || { echo "no index.html"; exit 1; }
-          test -f web/dist/coi-serviceworker.js || {
-            echo "the service worker is missing: the page will load without"
-            echo "cross-origin isolation and the window will have no executor"
-            exit 1
-          }
-          for asset in $(grep -oE '(href|src)="[^"]*"' web/dist/index.html |
-                         sed -E 's/.*="([^"]*)"/\1/' |
-                         grep -vE '^(https?:)?//'); do
-            case "$asset" in
-              /*)
-                echo "index.html names $asset from the origin root, so this"
-                echo "bundle would only work unpacked at a domain's root."
-                echo "The build did not honour PUBLIC_URL=./"
-                exit 1
-                ;;
-            esac
-            file="web/dist/$(basename "$asset")"
-            test -f "$file" || { echo "index.html references $asset, which is not in dist"; exit 1; }
-          done
-          echo "bundle contents:"
-          ls -lh web/dist
+        run: cargo xtask bundle check web/dist --relocatable
 
       # What somebody unpacking this needs to know, and all of it is about the
       # two response headers: the page needs a `SharedArrayBuffer`, the

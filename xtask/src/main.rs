@@ -15,7 +15,7 @@
 //! under it.
 //!
 //!     cargo xtask web build
-//!     cargo xtask bundle check [dir]
+//!     cargo xtask bundle check [dir] [--relocatable]
 //!     cargo xtask bundle size  [dir]
 //!     cargo xtask pages where
 //!     cargo xtask pages publish       --target <t> --ordinal <n> [--check <c>]
@@ -62,7 +62,10 @@ const USAGE: &str = "\
 usage: cargo xtask <task>
 
   web build                      build the web front end into web/dist
-  bundle check [dir]             check the bundle is complete
+  bundle check [dir] [--relocatable]
+                                 check the bundle is complete, and — for the
+                                 archive a release carries — that nothing in
+                                 it is named from the origin root
   bundle size  [dir]             measure it, and say so in the step summary
   pages where                    work out where this run publishes to
   pages publish --target <t> --ordinal <n> [--check <c>] [--bundle <dir>]
@@ -74,7 +77,10 @@ usage: cargo xtask <task>
 fn dispatch(args: &[&str]) -> Result<()> {
     match args {
         ["web", "build"] => web::build(),
-        ["bundle", "check", rest @ ..] => bundle::check(&dist_of(rest)),
+        ["bundle", "check", rest @ ..] => {
+            let (rest, relocatable) = relocatable_flag(rest)?;
+            bundle::check(&dist_of(&rest), relocatable)
+        }
         ["bundle", "size", rest @ ..] => bundle::size(&dist_of(rest)),
         ["pages", "where"] => where_this_goes(),
         ["pages", verb @ ("publish" | "remove"), rest @ ..] => {
@@ -92,6 +98,25 @@ fn dispatch(args: &[&str]) -> Result<()> {
         }
         other => Err(err!("unknown task `{}`\n\n{USAGE}", other.join(" "))),
     }
+}
+
+/// `--relocatable`, in either position, taken off the arguments so what is
+/// left is the directory. A flag rather than a second task, because it is one
+/// more question about the same bundle and the answer to the rest of them is
+/// identical.
+fn relocatable_flag<'a>(args: &[&'a str]) -> Result<(Vec<&'a str>, bool)> {
+    let mut rest = Vec::new();
+    let mut relocatable = false;
+    for arg in args {
+        if *arg == "--relocatable" {
+            relocatable = true;
+        } else if arg.starts_with("--") {
+            return Err(err!("unexpected argument `{arg}`\n\n{USAGE}"));
+        } else {
+            rest.push(*arg);
+        }
+    }
+    Ok((rest, relocatable))
 }
 
 fn dist_of(rest: &[&str]) -> PathBuf {

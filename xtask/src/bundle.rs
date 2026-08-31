@@ -16,7 +16,16 @@ use crate::{err, say};
 /// Proof the artifact is the one the page will ask for: trunk rewrites
 /// `index.html` to point at hashed file names, and a mismatch is a blank page
 /// rather than a failed build.
-pub fn check(dist: &Path) -> Result<()> {
+///
+/// `relocatable` is the archive's extra question, and it is one the Pages
+/// build must not ask: a deployment knows its own directory and names its
+/// assets from the origin root, while a bundle somebody unpacks into whatever
+/// hosting they have cannot. An asset named `/oxidezap-abc123.js` is one that
+/// build would fetch from a domain's root wherever it was put, which is the
+/// single way a `--public-url=./` build can silently come out non-relative.
+/// Asserted rather than assumed, because it is a property of trunk's handling
+/// of that flag and trunk is not pinned in the job that asks.
+pub fn check(dist: &Path, relocatable: bool) -> Result<()> {
     let index = dist.join("index.html");
     if !index.is_file() {
         return Err(err!("no index.html in {}", dist.display()));
@@ -31,6 +40,13 @@ pub fn check(dist: &Path) -> Result<()> {
     let html =
         fs::read_to_string(&index).map_err(|e| err!("could not read {}: {e}", index.display()))?;
     for asset in local_assets(&html) {
+        if relocatable && asset.starts_with('/') {
+            return Err(err!(
+                "index.html names {asset} from the origin root, so this bundle \
+                 would only work unpacked at a domain's root. The build did not \
+                 honour PUBLIC_URL=./"
+            ));
+        }
         // Trunk emits everything flat, so the reference's last segment is the
         // file — which is also what makes a query string or a fragment on it
         // harmless to strip.
@@ -147,7 +163,48 @@ fn basename(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{basename, local_assets, mib};
+    use std::fs;
+
+    use super::{basename, check, local_assets, mib};
+
+    /// A bundle on disk: `index.html` naming one asset, the asset, and the
+    /// service worker `check` refuses to be without.
+    fn bundle(dir: &std::path::Path, asset: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("index.html"),
+            format!("<script src=\"{asset}\"></script>"),
+        )
+        .unwrap();
+        fs::write(dir.join(super::basename(asset)), "").unwrap();
+        fs::write(dir.join("coi-serviceworker.js"), "").unwrap();
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xtask-bundle-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn an_asset_named_from_the_origin_root_is_only_refused_for_an_archive() {
+        let dir = scratch("absolute");
+        bundle(&dir, "/client/oxidezap-abc123.js");
+        // The Pages build names them this way on purpose.
+        check(&dir, false).unwrap();
+        let refused = check(&dir, true).unwrap_err().to_string();
+        assert!(refused.contains("origin root"), "{refused}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_relative_bundle_passes_both_questions() {
+        let dir = scratch("relative");
+        bundle(&dir, "./oxidezap-abc123.js");
+        check(&dir, false).unwrap();
+        check(&dir, true).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn only_the_bundle_s_own_references_are_collected() {
