@@ -176,8 +176,8 @@
   browsers with no Opus encoder. The same module answers for video, and there
   the ordering is the point: a decoder is built from the parameter sets, so a
   browser with no `VideoDecoder` was otherwise found out only after the whole
-  attachment had been fetched and demuxed, and the bubble draws that as Retry
- , every press paying the download again to reach the same permanent answer.
+  attachment had been fetched and demuxed, and the bubble draws that as Retry,
+  every press paying the download again to reach the same permanent answer.
 - **A page prepares a recording on the window's own thread.** `app/recording.rs`
   hands the desktop's waveform and encode to `cx.background_spawn`, which is
   where work measured in hundreds of millions of operations belongs. The web

@@ -1,13 +1,15 @@
 # Building & verifying
 
 ```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings   # what CI enforces
-cargo test --workspace
+# These mirror `.github/workflows/ci.yml`, which is the authority: check the
+# flags there rather than copying them from here.
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 
-# The tooling is its own workspace (see `xtask/` above), so none of the three
-# lines above compiles a byte of it. CI has a job that does.
-cargo fmt --manifest-path xtask/Cargo.toml --all
+# The tooling is its own workspace (see docs/architecture.md), so none of the
+# three lines above compiles a byte of it. CI has a job that does.
+cargo fmt --manifest-path xtask/Cargo.toml --all -- --check
 cargo clippy --manifest-path xtask/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path xtask/Cargo.toml
 cargo xtask help    # what there is to run; from the repository root

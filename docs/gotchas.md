@@ -315,7 +315,8 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   is stronger and costs a prompt per release. It is also why nothing loads
   out of a place another local account can write
   (`only_this_user_can_write`: owner *and* mode, the directory and every
-  module in it) — and a symlink is refused rather than followed, since
+  module in it — a POSIX sentence, and docs/roadmap.md carries what stands in
+  for it on Windows) — and a symlink is refused rather than followed, since
   following one answers about the target and says nothing about who may put a
   different file there: a target this user owns, `0600`, in a directory
   somebody else may write is a file they can unlink and replace, and the

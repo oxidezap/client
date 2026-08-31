@@ -326,10 +326,13 @@ decoders share, which is everything except the decode — the pixel budget, the
 rotation, the channel order, the container walk — because a second copy of
 those is a second set of answers to drift apart.
 
-Declining is the exception, and the exception is instructive. A page cannot
-answer a call, but it *does* tell the caller to stop ringing: `client.voip()`
-and `reject` carry no `cfg` — their stanza builders live in `wacore` — so
-what the `voip` feature gates is the media stack and never the signalling.
+Declining was the exception, back when a page could not answer at all, and the
+exception is still instructive. Even then it *did* tell the caller to stop
+ringing: `client.voip()` and `reject` carry no `cfg` — their stanza builders
+live in `wacore` — so what the `voip` feature gates is the media stack and
+never the signalling. Which is why declining kept working while answering did
+not, and why `platform::capabilities::calls_unavailable` is now the honest
+answer to both: it refuses only a browser with no `RTCPeerConnection`.
 This module concluded the opposite for a long time, from a real measurement
 of the wrong question: enabling the feature for wasm does pull mio and fail
 exactly as its comment described, which says nothing about a function that
