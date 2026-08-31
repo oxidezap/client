@@ -3226,7 +3226,7 @@ fn a_reload_runs_what_is_in_the_folder_now() {
     dir.plugin("second", &draws());
     std::fs::remove_file(dir.0.join("first.wasm")).expect("removable");
 
-    assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(1));
     assert_eq!(plugins.ids(), vec!["second".to_owned()]);
     published.settles("the new set to be published", |set| {
         set.len() == 1 && set[0].id == "second"
@@ -3248,7 +3248,7 @@ fn a_reload_that_finds_nothing_publishes_the_empty_set() {
     published.settles("something to be drawn", |set| set.len() == 1);
 
     std::fs::remove_file(dir.0.join("only.wasm")).expect("removable");
-    assert_eq!(plugins.reload_from_dir(&dir.0, None), 0);
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(0));
     assert!(plugins.ids().is_empty());
     assert!(
         published.latest().is_empty(),
@@ -3280,7 +3280,10 @@ fn an_approval_survives_a_reload() {
         set.iter().any(|p| p.id == "keeps" && p.approved)
     });
 
-    assert_eq!(plugins.reload_from_dir(&dir.0, Some(&state.0)), 1);
+    assert_eq!(
+        plugins.reload_from_dir(&dir.0, Some(&state.0)),
+        Reloaded::Ran(1)
+    );
     let set = published.settles("the reloaded plugin", |set| {
         set.iter().any(|p| p.id == "keeps")
     });
@@ -3319,7 +3322,7 @@ fn a_retired_set_cannot_draw_over_the_one_that_replaced_it() {
     published.settles("its interface", |set| set.len() == 1);
 
     let previous = plugins.live();
-    assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(1));
     let after = published.latest();
 
     previous.registry.set_roots("stale", Vec::new());
@@ -3350,7 +3353,11 @@ fn a_shut_down_host_does_not_reload() {
     // and the process ending, which is the shape of the thing being refused:
     // the reload has a folder to read and would have something to run.
     dir.plugin("late", &draws());
-    assert_eq!(plugins.reload_from_dir(&dir.0, None), 0);
+    assert_eq!(
+        plugins.reload_from_dir(&dir.0, None),
+        Reloaded::Failed,
+        "and it says so, rather than reporting a reload that installed nothing"
+    );
     assert!(
         Arc::ptr_eq(&stopped, &plugins.live()),
         "nothing is installed over a host that has been shut down"
@@ -3379,7 +3386,7 @@ fn retiring_a_generation_takes_its_authority_away() {
         "it was approved to begin with, or this proves nothing"
     );
 
-    assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(1));
     assert_eq!(
         previous.workers[0].granted.load(Ordering::Relaxed),
         0,
@@ -3425,7 +3432,10 @@ fn a_revocation_during_a_reload_is_not_undone_by_it() {
     // answers got wrong on the runs where they meet.
     let revoking = Arc::clone(&plugins);
     let revoke = std::thread::spawn(move || revoking.approve("racy", false));
-    assert_eq!(plugins.reload_from_dir(&dir.0, Some(&state.0)), 1);
+    assert_eq!(
+        plugins.reload_from_dir(&dir.0, Some(&state.0)),
+        Reloaded::Ran(1)
+    );
     revoke.join().expect("the revocation finished");
 
     let live = plugins.live();
@@ -3510,8 +3520,12 @@ fn a_reload_that_cannot_read_the_folder_changes_nothing() {
     let before = published.settles("its interface", |set| set.len() == 1);
     let live = plugins.live();
 
-    let running = futures_lite::future::block_on(plugins.reload(|| async { None }));
-    assert_eq!(running, 1, "what is running is still running");
+    let outcome = futures_lite::future::block_on(plugins.reload(|| async { None }));
+    assert_eq!(
+        outcome,
+        Reloaded::Kept(1),
+        "what is running is still running, and nothing was installed"
+    );
     assert!(
         Arc::ptr_eq(&live, &plugins.live()),
         "and it is the same set, not a fresh one that happens to match"
@@ -3540,7 +3554,7 @@ fn an_ask_during_a_reload_is_not_lost() {
     let scans = std::sync::atomic::AtomicUsize::new(0);
     let folder = &dir;
     let host = &plugins;
-    let running = futures_lite::future::block_on(plugins.reload(|| {
+    let outcome = futures_lite::future::block_on(plugins.reload(|| {
         let round = scans.fetch_add(1, Ordering::SeqCst);
         async move {
             if round == 0 {
@@ -3560,7 +3574,7 @@ fn an_ask_during_a_reload_is_not_lost() {
     }));
 
     assert_eq!(scans.load(Ordering::SeqCst), 2, "the folder is read again");
-    assert_eq!(running, 2);
+    assert_eq!(outcome, Reloaded::Ran(2));
     let mut ids = plugins.ids();
     ids.sort();
     assert_eq!(ids, vec!["first".to_owned(), "second".to_owned()]);
@@ -3594,7 +3608,7 @@ fn a_reload_onto_a_store_that_cannot_keep_answers_forgets_them() {
 
     // The directory is gone by the time the reload asks for it, which is what
     // `usable_state_dir` refusing looks like from in here.
-    assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(1));
 
     let live = plugins.live();
     assert_eq!(
@@ -3641,7 +3655,7 @@ fn a_reload_that_panics_does_not_keep_the_slot() {
 
     // And the host is usable: this reload runs rather than being refused by a
     // slot nobody released.
-    assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(1));
     assert_eq!(plugins.ids(), vec!["survivor".to_owned()]);
 }
 

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use oxidezap_plugin_host::{Commands, Outcome, Plugins, Sink};
+use oxidezap_plugin_host::{Commands, Outcome, Plugins, Reloaded, Sink};
 
 #[cfg(target_family = "wasm")]
 pub mod web;
@@ -87,8 +87,10 @@ pub async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugin
 /// a blocking thread; a page's modules come out of OPFS and its host runs on
 /// the page's own loop, so it is awaited here.
 ///
-/// Answers how many plugins are running afterwards.
-pub async fn reload(plugins: &Arc<Plugins>) -> usize {
+/// Answers what the reload did, rather than a count: three of the four
+/// outcomes are zero plugins installed and mean different things, and the
+/// count is what gets written to the log.
+pub async fn reload(plugins: &Arc<Plugins>) -> Reloaded {
     #[cfg(target_family = "wasm")]
     {
         // Handed over as a future rather than as values, and that is not
@@ -135,15 +137,20 @@ pub async fn reload(plugins: &Arc<Plugins>) -> usize {
     {
         let Some(dir) = oxidezap_plugin_host::default_dir() else {
             log::debug!("no per-user data directory, so nothing to reload");
-            return 0;
+            return Reloaded::Kept(0);
         };
         let state_dir = oxidezap_plugin_host::default_state_dir();
         let plugins = Arc::clone(plugins);
         tokio::task::spawn_blocking(move || plugins.reload_from_dir(&dir, state_dir.as_deref()))
             .await
             .unwrap_or_else(|e| {
+                // Not a reload that installed nothing: a reload that did not
+                // happen. The live set is whatever it was — the reservation
+                // guard gives the slot back however the loader ends — and
+                // saying "0 running" here put a successful-looking count
+                // directly under the error.
                 log::error!("the plugin loader did not finish: {e}");
-                0
+                Reloaded::Failed
             })
     }
 }
@@ -163,8 +170,20 @@ pub async fn reload(plugins: &Arc<Plugins>) -> usize {
 pub fn reload_in_background(plugins: &Arc<Plugins>) {
     let plugins = Arc::clone(plugins);
     let work = async move {
-        let running = reload(&plugins).await;
-        log::info!("plugins reloaded: {running} running");
+        // Said as what it was. A deferred pass and a loader that fell over
+        // both installed nothing, and both used to be reported as a reload
+        // that finished with none running — over a folder of five healthy
+        // plugins, in the first case, all of them still going.
+        match reload(&plugins).await {
+            Reloaded::Ran(running) => log::info!("plugins reloaded: {running} running"),
+            Reloaded::Deferred => {
+                log::info!("a plugin reload is already running; it will cover this one");
+            }
+            Reloaded::Kept(running) => {
+                log::warn!("plugins not reloaded; the {running} that were running still are");
+            }
+            Reloaded::Failed => log::warn!("plugins were not reloaded"),
+        }
     };
 
     #[cfg(target_family = "wasm")]

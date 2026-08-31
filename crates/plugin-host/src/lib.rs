@@ -342,6 +342,31 @@ pub struct Module {
     pub open: Box<dyn FnOnce() -> anyhow::Result<Vec<u8>> + Send>,
 }
 
+/// What one call to [`Plugins::reload`] did.
+///
+/// Four outcomes rather than a count, because three of them are a count of
+/// zero and mean entirely different things — and the count is what the daemon
+/// writes to its log. "plugins reloaded: 0 running" over a folder of five
+/// healthy plugins is what a deferred pass used to say, and the same line
+/// followed a loader that had just panicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Reloaded {
+    /// A generation was installed by this call, and this many plugins are
+    /// running in it.
+    Ran(usize),
+    /// Another reload owns the slot and one more pass is owed. Nothing was
+    /// installed here; that pass covers this ask, so what is running is
+    /// whatever it leaves.
+    Deferred,
+    /// Nothing was installed and what was running still is — the folder could
+    /// not be read.
+    Kept(usize),
+    /// Nothing was installed and nothing will be: the host has shut down, or
+    /// the loader did not finish.
+    Failed,
+}
+
 impl Plugins {
     /// Load every `.wasm` in `dir`.
     ///
@@ -391,7 +416,7 @@ impl Plugins {
     /// Blocking: it reads every module and runs each `oxi_init`. The caller
     /// is `daemon::plugins::reload`, which puts it where `load` goes.
     #[cfg(not(target_family = "wasm"))]
-    pub fn reload_from_dir(&self, dir: &Path, state_dir: Option<&Path>) -> usize {
+    pub fn reload_from_dir(&self, dir: &Path, state_dir: Option<&Path>) -> Reloaded {
         futures_lite::future::block_on(self.reload(|| async move {
             // Asked again on every scan rather than settled once: a directory
             // that was private at startup may not be now, and the answer to
@@ -1292,7 +1317,7 @@ impl Plugins {
     /// handle is stamped: taking a fresh one is what stops the retiring
     /// generation's last write from landing on top of the new one's. A
     /// desktop's is a path and rebuilding it costs nothing.
-    pub async fn reload<Fut>(&self, what: impl Fn() -> Fut) -> usize
+    pub async fn reload<Fut>(&self, what: impl Fn() -> Fut) -> Reloaded
     where
         Fut: Future<Output = Option<(Vec<Module>, Arc<dyn Backing>)>>,
     {
@@ -1301,7 +1326,7 @@ impl Plugins {
         // refuses and for the same reason.
         if self.retired.load(Ordering::Relaxed) {
             log::warn!("refusing to reload plugins; the host has been shut down");
-            return 0;
+            return Reloaded::Failed;
         }
         // Before the modules and the storage are asked for, not after. A
         // page's storage handle is *stamped*: taking one retires every older
@@ -1320,7 +1345,7 @@ impl Plugins {
             // during it, however many there were, because what they all want
             // is the folder as it is now.
             log::debug!("a plugin reload is already running; another will follow it");
-            return 0;
+            return Reloaded::Deferred;
         }
         // And released by a guard from here on. Every ordinary exit could put
         // the slot back itself; an unwinding one could not — and a loader
@@ -1341,9 +1366,11 @@ impl Plugins {
         // an account that has gone. Holding the slot first is what makes the
         // question worth asking twice: from here on `shutdown` either sees
         // this claim and waits, or has already raised the flag and is seen.
-        if self.retired.load(Ordering::Relaxed) {
+        // `SeqCst` for that second half: see `shutdown`, where the store is
+        // its pair — relaxed here would let both sides miss each other.
+        if self.retired.load(Ordering::SeqCst) {
             log::warn!("refusing to reload plugins; the host has been shut down");
-            return 0;
+            return Reloaded::Failed;
         }
 
         loop {
@@ -1365,7 +1392,7 @@ impl Plugins {
                 if slot.another_pass() {
                     continue;
                 }
-                return self.live().workers.len();
+                return Reloaded::Kept(self.live().workers.len());
             };
 
             self.live().retire();
@@ -1418,7 +1445,7 @@ impl Plugins {
 
             if !installed {
                 fresh.retire();
-                return 0;
+                return Reloaded::Failed;
             }
             // Now, and not before: the whole set at once, which is also the
             // one publication a generation does not make for itself.
@@ -1436,7 +1463,7 @@ impl Plugins {
             if slot.another_pass() {
                 continue;
             }
-            return running;
+            return Reloaded::Ran(running);
         }
     }
 
@@ -1451,7 +1478,17 @@ impl Plugins {
     pub fn shutdown(&self) {
         // Before the lock, so a reload between the two sees it and declines
         // to install what it has just finished building.
-        self.retired.store(true, Ordering::Relaxed);
+        //
+        // `SeqCst`, and paired with the `SeqCst` load a reload makes once it
+        // holds the slot. Relaxed on both sides is the store-buffer shape and
+        // the memory model allows both to miss: this store can sit unobserved
+        // while `wait_for_any_reload` below reads an `IDLE` word, and the
+        // reload that claimed it a moment later reads `false` — so shutdown
+        // returns without waiting and the wipe runs beside a generation being
+        // built. The `SeqCst` operations on `reload` order nothing about a
+        // *different* atomic; putting both flags in the total order is what
+        // makes at least one of the two see the other.
+        self.retired.store(true, Ordering::SeqCst);
         self.wait_for_any_reload();
         // Behind the same lock an answer is recorded under, so one already
         // part-way through finishes before the flag is anybody's answer —
@@ -1913,8 +1950,21 @@ fn discover(dir: &Path) -> Option<Vec<PathBuf>> {
             return None;
         }
     };
+    // Every entry, or none of them. `filter_map(Result::ok)` here was the
+    // same conflation the `read_dir` above stopped making one level up: an
+    // entry this host could not read is not an entry that is not there, and a
+    // reload that took a short listing for the folder would retire a healthy
+    // plugin over a transient error, with nothing removed and nothing to put
+    // it back.
+    let entries: Vec<std::fs::DirEntry> = match entries.collect::<Result<_, _>>() {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("cannot read an entry of {}: {e}", dir.display());
+            return None;
+        }
+    };
     let mut found: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
+        .into_iter()
         .map(|e| e.path())
         .filter(|p| {
             p.extension()

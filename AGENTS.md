@@ -713,6 +713,27 @@ to the same problem. Nothing here needs it yet.
   make — one that may no longer touch the account. It is the same zero a
   withdrawal writes, so it is one mechanism aimed at a generation rather than
   a second one.
+  What orders a reload against `shutdown` is two atomics rather than one, and
+  they have to be in the same total order. A reload asks whether the host has
+  been retired *after* it holds the reload slot, and `shutdown` raises that
+  flag *before* it waits on the slot — which is the store-buffer shape, so
+  relaxed on both sides lets each miss the other: the wait reads an idle slot
+  while the claim that has just been made reads a flag that is not yet set,
+  and the wipe then runs beside a generation being built. Both are `SeqCst`
+  for that reason, and neither is on a path anything measures. Being
+  `SeqCst` on the *slot* buys nothing here: an ordering on one atomic says
+  nothing about another.
+  A per-entry read failure is not a folder that cannot be read. The folder is
+  answered with three outcomes — absent, refused, unreadable — because a
+  reload that took "unreadable" for "empty" would retire every healthy
+  plugin; a single module that will not open stops that plugin and no other,
+  on both platforms, which is what a desktop *has* to do since its `open`
+  runs after the old generation is already gone. What a reload answers with
+  is therefore an outcome rather than a count (`Reloaded`): three of the four
+  are zero plugins installed and mean entirely different things, and the
+  count is what the daemon writes to its log — a deferred pass reporting
+  "plugins reloaded: 0 running" over five healthy plugins still running is
+  the line that made this an enum.
 - **Stopping a plugin is dropping its channel, never queueing a message.** A
   stop message has to *fit*, and the plugin that most needs stopping is the
   one whose queue is full — `try_send` there drops the request on the floor
