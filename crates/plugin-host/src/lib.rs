@@ -38,7 +38,7 @@ mod runtime;
 mod sched;
 mod store;
 
-use portable_atomic::AtomicI64;
+use portable_atomic::{AtomicI64, AtomicU32};
 use std::future::Future;
 #[cfg(not(target_family = "wasm"))]
 use std::path::{Path, PathBuf};
@@ -218,21 +218,25 @@ pub struct Plugins {
     /// account going away. What this refuses is an approval — and a reload —
     /// arriving after the session has been told to forget everything.
     retired: AtomicBool,
-    /// Whether a reload is already under way.
+    /// Whether a reload is under way, and whether another is owed.
     ///
-    /// Loading is slow enough to press a button twice during, and two of them
-    /// interleaved would stop each other's freshly started plugins.
-    reloading: AtomicBool,
-    /// Whether one was asked for while that was running.
+    /// One word rather than two flags, and that is the whole reason it is a
+    /// word. Loading is slow enough to press a button twice during, and two
+    /// reloads interleaved would stop each other's freshly started plugins —
+    /// so the second is not run but *remembered*: the scan already going may
+    /// have read the folder before somebody's install landed, and refusing
+    /// outright loses exactly the change that was asked for while the request
+    /// is acknowledged as done. One more scan afterwards covers every ask
+    /// that arrived during the first, however many, because what all of them
+    /// want is the folder as it is now.
     ///
-    /// Refusing the second outright loses the change it was asked for: the
-    /// scan already running may have read the folder before somebody's
-    /// install landed, so the module they added would never start and the
-    /// request that should have started it was acknowledged as done. One more
-    /// scan afterwards covers every ask that arrived during the first,
-    /// however many, because what all of them want is the folder as it is
-    /// now.
-    reload_again: AtomicBool,
+    /// Two flags could not express the *handoff*. Releasing one and then
+    /// reading the other is two steps, and an ask landing between them is an
+    /// ask nobody owns: it sees a reload running, records itself, and the
+    /// reload it was counting on has already decided it is finished. Every
+    /// arrangement of two atomics has that seam somewhere. Here the release
+    /// and the check are one `compare_exchange`, so there is no between.
+    reload: AtomicU32,
     /// Held across a whole answer: the registry mutation, its persistence and
     /// the shared mask a plugin's own thread reads. Also across the moment a
     /// reload installs a generation, so it cannot install one over a host
@@ -439,8 +443,7 @@ impl Plugins {
         Self {
             live: std::sync::RwLock::new(Arc::new(live)),
             retired: AtomicBool::new(false),
-            reloading: AtomicBool::new(false),
-            reload_again: AtomicBool::new(false),
+            reload: AtomicU32::new(reload::IDLE),
             approving: Mutex::new(()),
             sink,
             commands,
@@ -459,8 +462,7 @@ impl Plugins {
                 Arc::clone(&approvals),
             ))),
             retired: AtomicBool::new(false),
-            reloading: AtomicBool::new(false),
-            reload_again: AtomicBool::new(false),
+            reload: AtomicU32::new(reload::IDLE),
             approving: Mutex::new(()),
             sink,
             commands,
@@ -478,6 +480,80 @@ impl Plugins {
     #[must_use]
     pub fn nothing_loaded(sink: Sink) -> Self {
         Self::none(sink, Arc::new(NoCommands))
+    }
+
+    /// Take the reload slot, or record that another reload is owed.
+    ///
+    /// `true` means this caller now owns it and must run the reload. `false`
+    /// means somebody else does, and has been told to scan once more when
+    /// they are done — so the ask is deferred rather than refused.
+    fn claim_reload(&self) -> bool {
+        loop {
+            let state = self.reload.load(Ordering::SeqCst);
+            let wanted = match state {
+                reload::IDLE => reload::RUNNING,
+                // Already owed. Nothing to add: one more scan covers every
+                // ask that arrived during this one, because what all of them
+                // want is the folder as it is now.
+                reload::OWED => return false,
+                _ => reload::OWED,
+            };
+            if self
+                .reload
+                .compare_exchange(state, wanted, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return state == reload::IDLE;
+            }
+        }
+    }
+
+    /// Finish a pass: take another if one is owed, or give the slot up.
+    ///
+    /// One `compare_exchange` and not two steps, which is the whole point of
+    /// the state being a word. Releasing the slot and *then* looking for a
+    /// pending ask leaves a gap an ask can land in — it sees a reload
+    /// running, records itself, and the reload it was counting on has already
+    /// decided it is finished — and every arrangement of two atomics has that
+    /// gap somewhere.
+    fn take_pending_reload(&self) -> bool {
+        loop {
+            // Giving it up is the compare-exchange, not a store: an ask that
+            // arrives one instruction later then finds the slot free and runs
+            // itself, and one that arrived one instruction earlier has
+            // already turned this into `OWED`, so the exchange fails and the
+            // branch below takes its pass. There is no order in which it is
+            // neither.
+            if self
+                .reload
+                .compare_exchange(
+                    reload::RUNNING,
+                    reload::IDLE,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return false;
+            }
+            if self
+                .reload
+                .compare_exchange(
+                    reload::OWED,
+                    reload::RUNNING,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+            // Neither, which means the word is `IDLE` and this caller does
+            // not own the slot at all. Nothing to give up and nothing owed.
+            if self.reload.load(Ordering::SeqCst) == reload::IDLE {
+                return false;
+            }
+        }
     }
 
     /// Whether the account has gone and this host with it.
@@ -499,15 +575,27 @@ impl Plugins {
     }
 }
 
+/// What the one reload slot can be.
+///
+/// Three states rather than two booleans, because the transition that matters
+/// is between the last two: see [`Plugins::reload`].
+mod reload {
+    pub const IDLE: u32 = 0;
+    /// Somebody is reloading.
+    pub const RUNNING: u32 = 1;
+    /// Somebody is reloading, and another ask arrived while they were.
+    pub const OWED: u32 = 2;
+}
+
 /// Holds the one reload slot, and gives it back however the reload ends.
 ///
 /// A guard rather than a store at each exit, for the one exit that cannot
 /// have a store: an unwind. See [`Plugins::reload`].
-struct Reservation<'a>(&'a AtomicBool);
+struct Reservation<'a>(&'a AtomicU32);
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.store(reload::IDLE, Ordering::SeqCst);
     }
 }
 
@@ -1161,7 +1249,7 @@ impl Plugins {
         // is about to be installed with — leaving every later approval and
         // settings write refused until some other reload happened to succeed.
         // A closure is not called until it is called.
-        if self.reloading.swap(true, Ordering::SeqCst) {
+        if !self.claim_reload() {
             // And it is not dropped either. The ask that arrives during a
             // reload is somebody who has just installed or removed something,
             // and the scan already running may well have read the folder
@@ -1170,7 +1258,6 @@ impl Plugins {
             // done. One more scan after this one covers every ask that landed
             // during it, however many there were, because what they all want
             // is the folder as it is now.
-            self.reload_again.store(true, Ordering::SeqCst);
             log::debug!("a plugin reload is already running; another will follow it");
             return 0;
         }
@@ -1182,11 +1269,10 @@ impl Plugins {
         // restarting the daemon, and `wait_for_any_reload` would wait for a
         // reload that had already unwound.
         //
-        // `reload_again` is deliberately not part of it. It is a request
-        // somebody made, and the next reload consumes it at the end of its
-        // own pass; clearing it on the way out of a panic would lose the ask
-        // rather than defer it.
-        let _slot = Reservation(&self.reloading);
+        // A pending ask goes with it. An unwind is not a reload that
+        // finished, so nothing here can honour one, and leaving the word
+        // saying "another is owed" would leave it owed to nobody.
+        let _slot = Reservation(&self.reload);
 
         loop {
             let Some((modules, state)) = what().await else {
@@ -1204,7 +1290,7 @@ impl Plugins {
                 // clears the flag as it takes it, so a folder that is still
                 // unreadable ends the second time with nothing pending rather
                 // than spinning on a storage error.
-                if self.reload_again.swap(false, Ordering::SeqCst) {
+                if self.take_pending_reload() {
                     continue;
                 }
                 return self.live().workers.len();
@@ -1271,12 +1357,11 @@ impl Plugins {
             fresh.registry.publish();
             let running = fresh.workers.len();
 
-            // An ask that arrived during this pass gets one of its own. The
-            // slot is held across the check rather than released before it,
-            // which is what makes this simple: nobody else can take it, so
-            // there is no window in which a request is refused by a reload
-            // that has already decided it is finished.
-            if self.reload_again.swap(false, Ordering::SeqCst) {
+            // An ask that arrived during this pass gets one of its own, and
+            // finishing is the same decision: either this takes another pass
+            // or it gives the slot up, in one step that nothing can land in
+            // the middle of.
+            if self.take_pending_reload() {
                 continue;
             }
             return running;
@@ -1335,7 +1420,7 @@ impl Plugins {
     /// back however the reload ends, an unwinding loader included.
     #[cfg(not(target_family = "wasm"))]
     fn wait_for_any_reload(&self) {
-        while self.reloading.load(Ordering::SeqCst) {
+        while self.reload.load(Ordering::SeqCst) != reload::IDLE {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }

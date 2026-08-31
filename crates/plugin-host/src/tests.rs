@@ -3524,7 +3524,9 @@ fn an_ask_during_a_reload_is_not_lost() {
                 // reload holds the slot, which is what it looks like from in
                 // here: `reload` refused them and remembered.
                 folder.plugin("second", &draws());
-                host.reload_again.store(true, Ordering::SeqCst);
+                // Exactly what a second request does: it finds the slot
+                // taken, and is remembered rather than refused.
+                assert!(!host.claim_reload(), "the slot is already taken");
             }
             Some((
                 crate::modules_in(&folder.0),
