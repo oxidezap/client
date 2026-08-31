@@ -78,6 +78,26 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   WebCodecs is the exception and by declaration rather than by luck — its
   buffers are `AllowSharedBufferSource` in the IDL — which is why the video
   path never hit this.
+  Web Audio is the third crossing to learn it, and the one that hid longest:
+  `AudioBuffer.copyToChannel` takes a `Float32Array` that "must not be
+  shared", so `copy_to_channel`, which takes `&[f32]`, threw on every block a
+  call ever played — the peer's audio arrived, decoded to PCM and was written
+  nowhere. `copy_to_channel_with_f32_array` and a `js_sys::Float32Array` are
+  what it takes. The *read* direction is safe and that asymmetry is why only
+  one direction of a call was broken: `get_channel_data` copies JS-to-wasm and
+  the microphone worked throughout. Verified in a real cross-origin-isolated
+  page rather than reasoned about — `copyToChannel` and `copyFromChannel` both
+  refuse a shared view, and a `ScriptProcessorNode` with zero input channels
+  fires perfectly well, which is what the evidence first pointed at and is not
+  what was wrong.
+  Three outages was enough, so the spelling is now banned rather than
+  remembered: `clippy.toml` lists the `&[u8]`/`&[f32]` bindings under
+  `disallowed-methods` with the copying replacement in the reason, and CI's
+  `Test (web)` job runs that one rule against the wasm target — the only place
+  it *can* be run, since these crates' browser bindings compile for no other
+  target and the workspace `Check` job never sees a line of them. Only that
+  rule: neither crate has ever been clippy'd for wasm and both carry lints of
+  their own, and adopting that surface is a separate cleanup.
 - **An abort is something said, not something let go of.** The library's
   `AbortHandle` tells its two endings apart by whether it *calls* the closure
   it boxes — `abort()`, and `Drop`, call it; `detach()` drops it uncalled —

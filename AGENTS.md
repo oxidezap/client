@@ -113,8 +113,11 @@ which is why they are here and the inventories are not.
   *is*, not where the code lives.
 - **A browser API never gets a view into wasm memory.** The module is built with
   `--shared-memory`, so the specs refuse a shared `ArrayBufferView`: copy before
-  crossing out. There is a declared exception; the gotchas entry names it and
-  the reason.
+  crossing out. This cost three outages, so the spelling is now banned rather
+  than remembered — `clippy.toml` lists the offending bindings under
+  `disallowed-methods` with the copying replacement in the reason, and CI's
+  `Test (web)` job is what runs that rule against the wasm target. There is one
+  declared exception; the gotchas entry names it and the reason.
 - **A plugin declares its capabilities once, and declaring grants nothing.**
   Approval is recorded separately, read live, and nothing loads from a directory
   another local account can write.
