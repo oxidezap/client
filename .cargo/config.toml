@@ -1,3 +1,12 @@
+# `cargo xtask <task>` — the repository's own tooling, which used to be shell
+# scripts. `xtask/` carries its own `[workspace]` and is excluded from the root
+# one, exactly as `examples/` is, so that the Pages job which checks out that
+# one directory can build it without resolving this workspace's graph; that is
+# also why the alias names a manifest rather than a package, and why it wants
+# to be run from the repository root.
+[alias]
+xtask = ["run", "--quiet", "--manifest-path", "xtask/Cargo.toml", "--"]
+
 [env]
 # The C the wasm build links, which is SQLite's amalgamation.
 #
@@ -71,7 +80,7 @@ rustflags = [
 # links, loads, and then has no executor.
 #
 # `build-std` is deliberately NOT set here. It has to be passed on the command
-# line (`-Z build-std=std,panic_abort`, which `web/build.sh` and the Pages
+# line (`-Z build-std=std,panic_abort`, which `cargo xtask web build` and the Pages
 # workflow both do), because a `[unstable]` table in this file applies to
 # every build — including the native one, which is meant to stay on stable.
 [target.wasm32-unknown-unknown]

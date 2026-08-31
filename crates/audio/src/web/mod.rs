@@ -18,32 +18,27 @@
 //!   recipient gets come from one packager rather than two that would have to
 //!   agree. See [`recorder`] for why `MediaRecorder` is the wrong route.
 //!
-//! - **Call devices.** The process that owns the WhatsApp session owns the
-//!   microphone (see AGENTS.md), and on the web that process is the daemon.
-//!   A page never opens either end of a call's audio, so these exist to keep
-//!   one API across platforms and are never reached.
+//! - **Call devices**, which used to be the exception here and are not any
+//!   more. The sentence was that the process owning the session owns the
+//!   microphone and that process is the daemon — true of a page attached to
+//!   an `oxidezapd`, and not of a page holding the session itself, which is
+//!   the arrangement this build now has. See [`call_device`].
+//!
+//! What still does not survive is libopus, and nothing here needs it: a
+//! call's codec is MLow, which is pure Rust in the library's own core.
 
+mod call_device;
 mod player;
 mod recorder;
 
+pub use call_device::open_call_audio;
 pub use player::AudioPlayer;
 pub use recorder::AudioRecorder;
 
-/// The mic half of a call.
+/// The page's event loop, which is the only executor there is here.
 ///
-/// # Errors
-///
-/// Always: calls are held by the process that owns the session, which is
-/// never the page.
-pub fn spawn_mic() -> anyhow::Result<async_channel::Receiver<Vec<i16>>> {
-    anyhow::bail!("a page does not hold the session, so it does not open the microphone")
-}
-
-/// The speaker half of a call.
-///
-/// # Errors
-///
-/// Always, for the same reason as [`spawn_mic`].
-pub fn spawn_speaker() -> anyhow::Result<async_channel::Sender<Vec<i16>>> {
-    anyhow::bail!("a page does not hold the session, so it does not open the speaker")
+/// Named once so the two modules that spawn do not each reach for
+/// `wasm_bindgen_futures` and drift on what they mean by it.
+pub(crate) fn spawn(future: impl std::future::Future<Output = ()> + 'static) {
+    wasm_bindgen_futures::spawn_local(future);
 }

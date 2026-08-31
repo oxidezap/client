@@ -31,7 +31,7 @@ use quote::render_quote;
 use reactions::{render_hover_actions, render_reactions};
 
 use crate::app::{BubbleIds, CopyMessage, ReplyToMessage, RetryMessage, WhatsAppApp};
-use crate::components::{bubble_status_ticks, render_rich_text};
+use crate::components::{BubbleText, bubble_status_ticks, render_rich_text};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use crate::utils::format_time_local;
@@ -42,6 +42,10 @@ use oxidezap_core::ChatMessage;
 pub struct BubbleProps {
     /// This row's element ids, formatted when the timeline was built.
     pub ids: BubbleIds,
+    /// This row's text, parsed when the timeline was built. Travels with the
+    /// row for the same reason the ids do: deriving it here is deriving it
+    /// per frame for text that cannot change without a rebuild.
+    pub text: BubbleText,
     /// Shared with the timeline's cache rather than copied out of it: a
     /// `ChatMessage` is four `String`s, a reaction map, a quote and a media
     /// handle, and the list builds one of these per visible row per frame.
@@ -106,7 +110,7 @@ pub fn render_message_bubble(
     let is_from_me = message.is_from_me;
     let message_id = message.id.clone();
     let bubble_id = ids.bubble.clone();
-    let content: SharedString = message.content.clone().into();
+    let content = &props.text;
     let time: SharedString = format_time_local(&message.timestamp).into();
     let status = message.delivery_in(props.is_own_number);
     let is_playing = props.playing_message_id.as_deref() == Some(message_id.as_str());
@@ -272,7 +276,7 @@ pub fn render_message_bubble(
                                                     .min_w_0()
                                                     .text_size(metrics.text_body())
                                                     .text_color(cx.theme().foreground)
-                                                    .child(render_rich_text(&content, cx)),
+                                                    .child(render_rich_text(content, cx)),
                                             )
                                         })
                                         .child(render_meta(time, status, is_from_me, metrics, cx)),

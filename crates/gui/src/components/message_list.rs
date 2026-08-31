@@ -23,7 +23,7 @@ use crate::app::BubbleIds;
 use crate::app::{MessageListCache, TimelineItem, WhatsAppApp};
 use crate::components::message_bubble::render_encryption_notice;
 use crate::components::message_bubble::{AudioProgress, BubbleProps};
-use crate::components::{Avatar, EmptyState, ProductIcon, render_message_bubble};
+use crate::components::{Avatar, BubbleText, EmptyState, ProductIcon, render_message_bubble};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use crate::utils::format_date_divider;
@@ -88,6 +88,7 @@ pub fn render_message_list(
 
     let messages = Arc::clone(&cache.messages);
     let ids = Arc::clone(&cache.ids);
+    let text = Arc::clone(&cache.text);
     let items = Arc::clone(&cache.items);
 
     let gutter = layout.conversation_padding();
@@ -115,6 +116,7 @@ pub fn render_message_list(
                         &items,
                         &messages,
                         &ids,
+                        &text,
                         ix,
                         &entity,
                         is_group,
@@ -153,6 +155,7 @@ fn render_row(
     items: &[TimelineItem],
     messages: &[Arc<oxidezap_core::ChatMessage>],
     ids: &[BubbleIds],
+    text: &[BubbleText],
     ix: usize,
     entity: &Entity<WhatsAppApp>,
     is_group: bool,
@@ -183,7 +186,9 @@ fn render_row(
             // `ids` is built from these same messages and indexed the same
             // way, so the two are asked for together: a row that cannot find
             // one cannot find the other either.
-            let (Some(msg), Some(ids)) = (messages.get(*ix), ids.get(*ix)) else {
+            let (Some(msg), Some(ids), Some(text)) =
+                (messages.get(*ix), ids.get(*ix), text.get(*ix))
+            else {
                 return div().into_any_element();
             };
             let message_id = &msg.id;
@@ -216,6 +221,7 @@ fn render_row(
             });
             let props = BubbleProps {
                 ids: ids.clone(),
+                text: text.clone(),
                 message: Arc::clone(msg),
                 playing_message_id: app.playing_message_id().map(|s| s.to_string()),
                 is_group,

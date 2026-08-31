@@ -303,6 +303,19 @@ impl WhatsAppApp {
                     if is_video { "video" } else { "voice" }
                 );
             }
+            // Said out loud *and* drawn: the call ends immediately behind
+            // this, so without a notice the person sees a call that appeared
+            // and vanished. The reason is the library's own words, which is
+            // the point — "the relay refused the answer" is something to act
+            // on, and a call that silently disappears is not.
+            UiEvent::CallMediaFailed { call_id, reason } => {
+                warn!("Call {call_id} could not bring up media: {reason}");
+                self.notify_user(
+                    format!("The call could not be connected: {reason}"),
+                    crate::app::notices::Tone::Problem,
+                    cx,
+                );
+            }
             UiEvent::CallEnded(call_id) => {
                 info!("Call {call_id} ended");
             }

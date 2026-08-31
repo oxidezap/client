@@ -100,9 +100,191 @@ pub(crate) fn filtered(samples: &[f32], taps: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// A resampler for a stream that arrives in blocks.
+///
+/// Shared rather than per-backend: a call is 16 kHz mono and no sound card is
+/// -- cpal answers 44.1 or 48, and a browser's `AudioContext` answers whatever
+/// the machine runs at -- so both ends of a call need this on both platforms.
+/// The whole-clip [`resample`] above cannot stand in: it restarts its cursor
+/// and its filter history at every call, which at a 20 ms block boundary is an
+/// audible click sixty times a second.
+///
+/// When downsampling it first runs a windowed-sinc low-pass at the source rate.
+/// Linear interpolation alone does not attenuate anything above the destination
+/// Nyquist, so a 48 -> 16 kHz pull is effectively "take every third sample" and
+/// folds everything above 8 kHz back into the voice band as aliasing.
+/// Upsampling needs no such filter: interpolation cannot create content above
+/// the source Nyquist.
+pub(crate) struct Stream {
+    src_rate: u32,
+    dst_rate: u32,
+    /// Fractional index into a virtual stream, carried across blocks.
+    pos: f64,
+    /// Empty when not downsampling.
+    taps: Vec<f32>,
+    /// `taps.len() - 1` samples of the previous block, so the filter has
+    /// history at a block boundary instead of ringing from zeros.
+    history: Vec<f32>,
+    /// Scratch for the filtered block; reused to keep the drain allocation-free.
+    filtered: Vec<f32>,
+    /// The last filtered sample of the previous block, prepended to this one.
+    ///
+    /// Interpolation needs a sample on each side of the cursor, and at the end
+    /// of a block the right-hand one has not arrived yet. Reusing the
+    /// left-hand sample for both -- which is what this did -- flattens the
+    /// final output of every block and then jumps when the next one lands, so
+    /// a call carries that discontinuity at every 60 ms frame boundary.
+    /// Carrying the sample across makes the blockwise result the same as one
+    /// pass over the whole stream, which is what
+    /// `blocks_match_a_single_pass` holds it to.
+    carry: Option<f32>,
+}
+
+impl Stream {
+    pub(crate) fn new(src_rate: u32, dst_rate: u32) -> Self {
+        let taps = if src_rate > dst_rate {
+            // 0.45 rather than 0.5 of the destination Nyquist: leaves a
+            // transition band so the passband edge is not already rolling off.
+            lowpass_taps(0.45 * dst_rate as f32 / src_rate as f32)
+        } else {
+            Vec::new()
+        };
+        let history = vec![0.0; taps.len().saturating_sub(1)];
+        Self {
+            src_rate,
+            dst_rate,
+            pos: 0.0,
+            taps,
+            history,
+            filtered: Vec::new(),
+            carry: None,
+        }
+    }
+
+    /// Resample `src` into `out`. Allocation-free past the warmup.
+    pub(crate) fn process(&mut self, src: &[i16], out: &mut Vec<i16>) {
+        if src.is_empty() {
+            return;
+        }
+        let step = self.src_rate as f64 / self.dst_rate as f64;
+
+        // Band-limit at the source rate before the cursor decimates.
+        let filtered: &[f32] = if self.taps.is_empty() {
+            self.filtered.clear();
+            self.filtered.extend(self.carry);
+            self.filtered.extend(src.iter().map(|&s| s as f32));
+            &self.filtered
+        } else {
+            self.filtered.clear();
+            self.filtered.reserve(src.len() + 1);
+            self.filtered.extend(self.carry);
+            let hist = self.history.len();
+            for i in 0..src.len() {
+                let mut acc = 0.0f32;
+                for (k, &tap) in self.taps.iter().enumerate() {
+                    // Tap k reads k samples back; anything before this block
+                    // comes out of the carried history.
+                    let idx = i as isize - k as isize;
+                    let sample = if idx >= 0 {
+                        src[idx as usize] as f32
+                    } else {
+                        let h = hist as isize + idx;
+                        if h >= 0 {
+                            self.history[h as usize]
+                        } else {
+                            0.0
+                        }
+                    };
+                    acc += tap * sample;
+                }
+                self.filtered.push(acc);
+            }
+            // Carry this block's tail as the next block's history.
+            if hist > 0 {
+                let keep = hist.min(src.len());
+                self.history.rotate_left(keep);
+                let start = self.history.len() - keep;
+                for (slot, &s) in self.history[start..]
+                    .iter_mut()
+                    .zip(&src[src.len() - keep..])
+                {
+                    *slot = s as f32;
+                }
+            }
+            &self.filtered
+        };
+
+        let mut p = self.pos;
+        // One short of the end: the sample at `len - 1` has no right-hand
+        // neighbour until the next block arrives, so it is carried rather
+        // than interpolated against itself.
+        let last = filtered.len().saturating_sub(1);
+        while p < last as f64 {
+            let i = p as usize;
+            let frac = (p - i as f64) as f32;
+            let a = filtered[i];
+            let b = filtered[i + 1];
+            out.push((a + (b - a) * frac).round().clamp(-32768.0, 32767.0) as i16);
+            p += step;
+        }
+        // That deferred sample becomes index 0 of the next block, so the
+        // cursor is carried relative to it rather than to the block's end.
+        self.carry = filtered.last().copied();
+        self.pos = p - last as f64;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feeding a stream in call-sized blocks must give the same samples as
+    /// feeding it in one, because a caller has no say in either.
+    ///
+    /// This is the boundary the interpolator used to flatten: at the end of a
+    /// block it had no right-hand sample, reused the left-hand one, and then
+    /// jumped when the next block arrived — a discontinuity at every 60 ms
+    /// frame of a call, in both directions. 44.1 kHz is deliberate: at an
+    /// integral ratio the cursor lands on whole samples and the bug is
+    /// invisible.
+    #[test]
+    fn blocks_match_a_single_pass() {
+        const SRC: u32 = 44_100;
+        const DST: u32 = 16_000;
+        let input: Vec<i16> = (0..SRC as usize / 4)
+            .map(|n| {
+                let t = n as f32 / SRC as f32;
+                ((std::f32::consts::TAU * 440.0 * t).sin() * 12_000.0) as i16
+            })
+            .collect();
+
+        let mut whole = Vec::new();
+        Stream::new(SRC, DST).process(&input, &mut whole);
+
+        let mut blocked = Vec::new();
+        let mut stream = Stream::new(SRC, DST);
+        for block in input.chunks(SRC as usize * 60 / 1000) {
+            stream.process(block, &mut blocked);
+        }
+
+        assert_eq!(
+            whole.len(),
+            blocked.len(),
+            "the same input must produce the same number of samples however it is fed"
+        );
+        // Exact but for rounding: both paths run the same filter over the same
+        // history and interpolate between the same neighbours.
+        let worst = whole
+            .iter()
+            .zip(&blocked)
+            .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            worst <= 1,
+            "a block boundary changed the waveform by {worst}, so the seam is audible"
+        );
+    }
 
     fn tone(rate: u32, hz: f32, secs: f32) -> Vec<f32> {
         let count = (rate as f32 * secs) as usize;

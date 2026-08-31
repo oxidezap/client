@@ -13,6 +13,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::link::Link;
 use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 
 use crate::app::{SettingsSection, WhatsAppApp};
@@ -25,6 +26,12 @@ use crate::theme::{ActiveProductTheme as _, Metrics};
 /// this binary was actually compiled against, which is the number that matters
 /// when someone reports a protocol bug.
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Where this client comes from, and the one place the address is written.
+///
+/// The footer draws the two lines below as links rather than as URLs, because
+/// a footer is three short lines and an address is longer than any of them.
+const REPOSITORY: &str = "https://github.com/oxidezap/client";
 
 pub fn render_settings_view(
     app: &mut WhatsAppApp,
@@ -334,8 +341,42 @@ fn render_versions(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
         .font_family(cx.theme().mono_font_family.clone())
         .text_size(metrics.text_micro())
         .text_color(subtle)
-        .child(format!("oxidezap {APP_VERSION}"))
+        // The version and the build it came from, on one line, because they
+        // answer one question. A nightly moves every push while the version
+        // does not, so the hash is what names *this* build — and it is a link
+        // to the commit, which is where somebody reading a bug report wants
+        // to end up.
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(metrics.space_xs())
+                .child(format!("oxidezap {APP_VERSION}"))
+                .children(build_revision().map(|rev| {
+                    Link::new("settings-revision")
+                        .href(format!("{REPOSITORY}/commit/{rev}"))
+                        .text_size(metrics.text_micro())
+                        .child(format!("({rev})"))
+                })),
+        )
         .child(format!("whatsapp-rust {}", library_version()))
+        .child(
+            Link::new("settings-repository")
+                .href(REPOSITORY)
+                .text_size(metrics.text_micro())
+                .child("github.com/oxidezap/client"),
+        )
+}
+
+/// The commit this binary was built from, if the build knew one.
+///
+/// `build.rs` sets it from the environment or from the checkout, and sets
+/// nothing where there is neither — a source archive unpacked with no `.git`
+/// around it. Absent rather than `unknown`, so the line simply does not
+/// appear.
+fn build_revision() -> Option<&'static str> {
+    option_env!("OXIDEZAP_REV").filter(|rev| !rev.is_empty())
 }
 
 /// The library revision this binary was built against.
