@@ -374,9 +374,14 @@ impl RelayTransport for BrowserRelayChannel {
         // may not take at face value, since its whole job is to say whether a
         // packet reached the relay. An explicit error also names the state,
         // where a `DOMException` string names the browser's wording for it.
+        //
+        // About *this packet* and never about the channel's history: a call
+        // that talked for a minute and then lost its transport takes this
+        // exit too, and a line here claiming nothing was carried would
+        // contradict the release line that correctly says it was.
         if self.channel.ready_state() != web_sys::RtcDataChannelState::Open {
             return Err(anyhow!(
-                "the relay channel is not open ({:?}); it carried nothing",
+                "the relay channel is not open ({:?}); this packet was not sent",
                 self.channel.ready_state()
             ));
         }
