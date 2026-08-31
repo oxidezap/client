@@ -868,12 +868,16 @@ to the same problem. Nothing here needs it yet.
   what it weighs in the sweep, and the two are not even correlated — so the
   order is measure, then decide, and `cargo bloat --crates` against a build
   with `CARGO_PROFILE_RELEASE_STRIP=none` is the whole of the first half.
-  Measured on this tree: taking every image format `gpui` turns on and this
-  application never decodes — EXR, TIFF, GIF, QOI and the colour management
-  behind them — from the profile's setting down to `z` was worth 43 KB of a
-  22 MB module, because fat LTO had already removed nearly all of it and what
-  is left is *data* that no optimization level shrinks (`exr`'s DWA transfer
-  curve is 131,076 bytes of it, in the window's `.data`). Taking `waproto`
+  Measured on this tree: taking every image format `gpui` turns on that
+  nothing here can hand it — EXR, TIFF, QOI and the colour management behind
+  them — from the profile's setting down to `z` was worth 43 KB of a 22 MB
+  module, because fat LTO had already removed nearly all of it and what is
+  left is *data* that no optimization level shrinks (`exr`'s DWA transfer
+  curve is 131,076 bytes of it, in the window's `.data`). Which format is
+  reachable is a question to answer from `utils::mime_to_image_format` rather
+  than from the crate's name: a decoder is *named* there, not sniffed for, and
+  GIF is one of the six names it can answer with — so `gif` belongs with the
+  codecs kept at `s`, and the first draft of this had it in the list above. Taking `waproto`
   and `buffa` from `3` to `z` was worth 1.4 MB of the daemon, because
   generated protobuf survives LTO in full: it is reachable, it is enormous —
   four separate 72 KiB copies of `Message::clone` among the largest functions

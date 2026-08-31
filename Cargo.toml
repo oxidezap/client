@@ -273,16 +273,24 @@ opt-level = "z"
 [profile.release.package.encoding_rs]
 opt-level = "z"
 
-# The image formats `gpui` turns on and this application never decodes.
+# The image formats `gpui` turns on that nothing here can hand it.
 #
-# `image` is declared here with `png`, `jpeg` and `webp` — the three WhatsApp
-# actually sends — but features are additive and gpui takes the crate's whole
-# default set, so EXR, TIFF, GIF, QOI, PNM, TGA, DDS, farbfeld and the colour
-# management behind them are compiled in whatever this manifest asks for. They
-# cannot be removed (nothing here owns that dependency edge) and they cannot
-# be reached either: a decoder is selected by sniffing the bytes, and no byte
-# in this application's media path has ever been an OpenEXR header. What
-# `opt-level = "z"` costs is decode speed in a decoder that is never called.
+# `image` is declared in `crates/gui` with `png`, `jpeg` and `webp`, but
+# features are additive and gpui takes the crate's whole default set, so EXR,
+# TIFF, QOI, PNM, TGA, DDS, farbfeld and the colour management behind them are
+# compiled in whatever this manifest asks for. They cannot be removed —
+# nothing here owns that dependency edge — and they cannot be reached either,
+# which is the part worth checking rather than assuming: a decoder is not
+# sniffed for, it is *named*, by `utils::mime_to_image_format`, and the six
+# names it can answer with are JPEG, PNG, GIF, WebP, BMP and a PNG guess for
+# any other `image/*`. Nothing in this application can ask for an OpenEXR
+# decoder, so what `opt-level = "z"` costs there is decode speed in a decoder
+# that is never called.
+#
+# GIF is on that list of six, which is why it is *not* in this block: see the
+# reachable codecs further down. `color_quant` is, because it is the GIF
+# encoder's quantizer and only the decoder is reachable; the LZW that decoding
+# really runs on is `weezl`, which this manifest does not touch.
 #
 # `exr` is also the largest single *datum* in the window: 131,076 bytes of
 # `to_linear_table::TABLE`, which is DWA compression's transfer curve. That is
@@ -291,8 +299,6 @@ opt-level = "z"
 [profile.release.package.exr]
 opt-level = "z"
 [profile.release.package.tiff]
-opt-level = "z"
-[profile.release.package.gif]
 opt-level = "z"
 [profile.release.package.qoi]
 opt-level = "z"
@@ -417,6 +423,13 @@ opt-level = "z"
 # frame. Image decode happens once per attachment, the Wayland protocol
 # marshals input events, and TLS runs at connect plus per record.
 [profile.release.package.image]
+opt-level = "s"
+# GIF decodes here like the other three. `mime_to_image_format` answers
+# `ImageFormat::Gif` for an `image/gif` attachment and `message_bubble::media`
+# hands those bytes to `Image::from_bytes`, so this is a path a user waits on
+# rather than a format nothing opens — which is what the block above claimed
+# about it until a review pointed at the mapping.
+[profile.release.package.gif]
 opt-level = "s"
 [profile.release.package.zune-jpeg]
 opt-level = "s"
