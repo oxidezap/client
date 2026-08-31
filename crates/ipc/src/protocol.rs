@@ -917,6 +917,66 @@ mod tests {
         }
     }
 
+    /// A stopwatch, not an assertion: what a page pays to hand a history load
+    /// from its own daemon to its own window.
+    ///
+    /// On a desktop this codec is the price of a socket, which there is
+    /// nothing to compare it to. In a page both ends are the same wasm heap
+    /// and the "connection" is a `tokio::io::duplex`, so every byte here is
+    /// written and parsed by one agent on one thread — which is the thread
+    /// that draws.
+    ///
+    /// Native release, for the shape rather than the figure: a hundred chats
+    /// of fifty rows is 1.1 MB of JSON, 2.9ms to write and 8.0ms to read.
+    /// It scales with the account and it is paid on every history load, so it
+    /// is worth knowing; it is also an order of magnitude under the blocks
+    /// around it at startup, so it is not where a page's first second goes.
+    ///
+    /// `cargo test -p oxidezap-ipc -- --ignored --nocapture in_process_frame_costs`
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn in_process_frame_costs() {
+        use oxidezap_core::{Chat, ChatMessage, UiEvent};
+        use wacore::time::Instant;
+
+        for (chats_n, msgs_n) in [(20usize, 50usize), (100, 50), (200, 50)] {
+            let mut chats = Vec::with_capacity(chats_n);
+            for c in 0..chats_n {
+                let jid = format!("55119000{c:05}@s.whatsapp.net");
+                let mut chat = Chat::new(jid.clone());
+                for m in 0..msgs_n {
+                    chat.messages.push(ChatMessage::new_incoming(
+                        format!("M-{c}-{m}"),
+                        jid.clone(),
+                        "uma mensagem de tamanho bastante comum, com algum texto".to_string(),
+                    ));
+                }
+                chats.push(chat);
+            }
+            let frame = DaemonMessage::Session {
+                event: Box::new(UiEvent::HistoryLoaded {
+                    chats,
+                    complete: true,
+                    next: None,
+                }),
+            };
+
+            let started = Instant::now();
+            let line = serde_json::to_string(&frame).unwrap();
+            let write = started.elapsed();
+            let started = Instant::now();
+            let back: DaemonMessage = serde_json::from_str(&line).unwrap();
+            let read = started.elapsed();
+            std::hint::black_box(&back);
+            println!(
+                "{chats_n} chats x {msgs_n} messages: {} bytes of JSON, \
+                 serialize {write:?} + parse {read:?} = {:?}",
+                line.len(),
+                write + read
+            );
+        }
+    }
+
     /// A page is asked for with a cursor and answered with the next one, and
     /// both directions have to survive the wire: a cursor that came back
     /// changed would page from somewhere the daemon never was.
