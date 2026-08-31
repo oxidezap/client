@@ -479,18 +479,6 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.x11rb-protocol]
 opt-level = "s"
-# The graphics API in front of Vulkan, which is not the drawing. What is in
-# these three is descriptor validation, resource tracking and the adapter
-# enumeration a window does once at startup — the pixels are the GPU's and the
-# shaders are `naga`'s, which this manifest has had at "z" all along. A frame
-# here is a handful of instanced draws, so "s" costs bookkeeping rather than
-# rendering; 1.1 MiB of the window sat at "3" for it.
-[profile.release.package.wgpu]
-opt-level = "s"
-[profile.release.package.wgpu-core]
-opt-level = "s"
-[profile.release.package.wgpu-hal]
-opt-level = "s"
 
 
 
