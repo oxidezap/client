@@ -575,7 +575,9 @@ mod tests {
         });
         (
             StateHub::new(),
-            Arc::new(oxidezap_plugin_host::Plugins::none(Arc::new(|_| {}))),
+            Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+                |_| {},
+            ))),
             commands,
         )
     }
