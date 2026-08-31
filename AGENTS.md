@@ -230,7 +230,27 @@ cargo run --bin oxidezapd -- --web
 # — and `-g` in `data-wasm-opt-params` is what stops wasm-opt throwing the
 # name section away again.
 WEB_PROFILE=debug cargo xtask web build
+
+# And the same again with its source *lines*, which is what a browser needs to
+# say `crates/gui/src/app.rs:412` rather than a function name. Three things
+# make that work and the task does all three: `[profile.web-dwarf]` keeps the
+# DWARF, the build skips wasm-opt — which moves the code the line table
+# describes, and rewrites the table only for the transformations it knows how
+# to follow — and `cargo xtask web map` projects `.debug_line` into a source
+# map beside the module, pointing the module at it with a `sourceMappingURL`
+# section. DWARF is what an extension reads; the map is what DevTools reads on
+# its own, in every engine. It is not the build to *profile*, though — a flame
+# chart reads the name section, which `debug` above already keeps, and this one
+# skips wasm-opt and so is a different code layout. See the gotcha.
+WEB_PROFILE=dwarf cargo xtask web build
+cargo xtask web map            # the map again, over a module already built
 ```
+
+`TRUNK_ACTION=serve` is refused for that profile rather than served unmapped:
+the map is written after the build, a serve never finishes, and a serve that
+rebuilt would leave the map describing a module that is gone — silently, since
+a stale map still parses. Build it and serve `web/dist` with any static
+server.
 
 The web half of the daemon — the OPFS folder a page installs plugins into —
 is `cfg`-gated to wasm, so `cargo test --workspace` compiles none of it. It
@@ -962,6 +982,54 @@ to the same problem. Nothing here needs it yet.
   Two ways in that look like they should work and do not:
   `CARGO_PROFILE_RELEASE_PACKAGE_<NAME>_OPT_LEVEL` is silently ignored, and
   `--config`, which is not, is not something trunk can forward.
+- **A source map for wasm is a projection of DWARF, and its columns are file
+  offsets.** The module is treated as a single line of text whose columns are
+  its bytes, so `xtask/src/sourcemap.rs` sorts `.debug_line` by address and
+  emits one segment per byte. The one adjustment in it that no specification
+  states is that DWARF's addresses are relative to the *code section's
+  payload* rather than to the file, so every offset has that section's start
+  added to it — measured against a module built for the purpose, where the
+  single function's first instruction is at file offset 110 and DWARF calls
+  it 3, against a payload beginning at 107. Two more things are load-bearing
+  and neither is obvious. The build may not be run through wasm-opt: it moves
+  code, and it updates the line table only for the transformations it knows
+  how to follow, so `-Oz` produces a table that still parses and no longer
+  describes the module — a debugger confidently naming the wrong line, which
+  is worse than one naming nothing, because nothing about it looks broken.
+  And the rows the linker discarded are not removed but pointed at all-ones,
+  so a generator that maps them puts every dead function's source lines over
+  whatever really is at the end of the module.
+  Three smaller things the two formats disagree about, each of which is one
+  character or one function's worth of wrong and none of which looks wrong:
+  DWARF numbers columns from one and a source map from zero, and they agree
+  only about zero, which DWARF spends on "the left edge of the line"; where
+  several rows share an address it is the *last* that describes the code
+  starting there, the ones before it covering no bytes at all, so keeping the
+  first names the line before at every inlining boundary; and a sequence's
+  end row names no source on purpose — a source map's lookup takes the
+  segment at or before the offset, so the only way to end a range is to start
+  one that names nothing, and dropping those lets a function's closing line
+  answer for the padding and the function after it. Only sources under the
+  checkout are embedded in the map: naming the standard library's files
+  costs nothing and carrying `build-std`'s copy of them is most of a
+  gigabyte of JSON to answer a question a file name has already answered.
+- **Names and lines are different sections, and profiling reads the first
+  one.** A flame chart names a wasm frame from the *name section* — that is
+  what the Rust and WebAssembly book's own profiling chapter says, and what
+  DevTools falls back through: the name section, then import and export paths,
+  then a `$func123` off the index. So `WEB_PROFILE=debug` is the profiling
+  build and always was, and the source map buys nothing there. What the map
+  buys is the Sources panel: a panic's stack trace naming a file and a line, a
+  breakpoint, a step. The one document that pairs source maps with a flame
+  chart is about *minified JavaScript* and never mentions wasm, and Chrome's
+  own wasm debugging page covers the Performance panel and the DWARF extension
+  without mentioning source maps at all — which leaves the negative unproven,
+  since nothing states that the Performance panel ignores a wasm map. The
+  advice rests on the mechanism rather than on a promise. `web-dwarf` keeps
+  the name section as well (`strip = "none"`, and no wasm-opt left to drop
+  it), so it can answer both questions; it is still the wrong build to time,
+  because skipping wasm-opt is a different code layout and a profile of it
+  measures a program nobody runs.
 - **A size override is worth what a crate weighs *after* LTO.** Which is not
   what it weighs in the sweep, and the two are not even correlated — so the
   order is measure, then decide, and `cargo bloat --crates` against a build

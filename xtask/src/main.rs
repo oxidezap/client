@@ -15,6 +15,7 @@
 //! under it.
 //!
 //!     cargo xtask web build
+//!     cargo xtask web map [dist]
 //!     cargo xtask bundle check [dir] [--relocatable]
 //!     cargo xtask bundle size  [dir]
 //!     cargo xtask pages where
@@ -26,6 +27,7 @@ mod bundle;
 mod check;
 mod json;
 mod pages;
+mod sourcemap;
 mod util;
 mod web;
 
@@ -62,6 +64,9 @@ const USAGE: &str = "\
 usage: cargo xtask <task>
 
   web build                      build the web front end into web/dist
+  web map [dir]                  write a source map beside the module in it,
+                                 out of the DWARF a `WEB_PROFILE=dwarf` build
+                                 left in the module
   bundle check [dir] [--relocatable]
                                  check the bundle is complete, and — for the
                                  archive a release carries — that nothing in
@@ -77,6 +82,7 @@ usage: cargo xtask <task>
 fn dispatch(args: &[&str]) -> Result<()> {
     match args {
         ["web", "build"] => web::build(),
+        ["web", "map", rest @ ..] => web::map(&dist_of(rest)),
         ["bundle", "check", rest @ ..] => {
             let (rest, relocatable) = relocatable_flag(rest)?;
             bundle::check(&dist_of(&rest), relocatable)

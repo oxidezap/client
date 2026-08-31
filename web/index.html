@@ -79,6 +79,17 @@
          `WEB_PROFILE=debug cargo xtask web build` is the build that does: it selects
          `[profile.web-debug]`, which is the same profile with `strip` off.
 
+         A third build goes further than either: `WEB_PROFILE=dwarf` keeps
+         the *line table* as well, and a browser that has one can name the
+         file and the line rather than only the function. It is not built
+         from this document — it cannot be, because it needs
+         `data-wasm-opt="0"` and `data-keep-debug` and trunk reads both off
+         the link here rather than from a flag. So `cargo xtask web build`
+         derives a document from this one per build; if these attributes are
+         ever respelled, `dwarf_index` in xtask/src/web.rs is what has to
+         learn the new spelling, and it has a test that fails when it does
+         not.
+
          `-g` is what carries that through to here. wasm-opt drops the name
          section unless asked to keep it, so without this the debug profile
          would produce a module whose symbols rustc emitted and this step
