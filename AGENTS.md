@@ -877,7 +877,17 @@ to the same problem. Nothing here needs it yet.
   reachable is a question to answer from `utils::mime_to_image_format` rather
   than from the crate's name: a decoder is *named* there, not sniffed for, and
   GIF is one of the six names it can answer with — so `gif` belongs with the
-  codecs kept at `s`, and the first draft of this had it in the list above. Taking `waproto`
+  codecs kept at `s`, and the first draft of this had it in the list above.
+  Which is the smaller half of the lesson. The larger one is that "only X
+  reaches this crate" is a claim about the dependency graph, and
+  `cargo tree -p <bin> -i <crate>` answers it in a second — where reading the
+  crate's name and imagining its callers gets it wrong about a third of the
+  time. Every "reached only by" in this manifest was written that way once,
+  and four were false: `gif` is decoded here; `rayon` is `sum_tree`'s as well
+  as the decoders'; `aho-corasick` is a *direct* dependency of `gpui-base`,
+  whose editor search builds one as a person types; and `moxcms` is reached
+  from `image` itself for any picture carrying an ICC profile. Ask the graph
+  before writing the sentence. Taking `waproto`
   and `buffa` from `3` to `z` was worth 1.4 MB of the daemon, because
   generated protobuf survives LTO in full: it is reachable, it is enormous —
   four separate 72 KiB copies of `Message::clone` among the largest functions

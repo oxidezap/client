@@ -267,9 +267,11 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.markup5ever_rcdom]
 opt-level = "z"
-# The charset tables `html5ever` decodes with. 130 KiB of Big5, GBK, JIS and
-# KSX ideograph maps in `.rodata` alone, on a path that begins with pasting
-# HTML into a message — which is to say, never in a frame.
+# The charset tables, which two cold things reach: `html5ever`, on a path that
+# begins with pasting HTML into a message, and `xim-ctext`, which converts the
+# X11 input method's compound text when a composition is committed. 130 KiB of
+# Big5, GBK, JIS and KSX ideograph maps in `.rodata` alone, and neither caller
+# is in a frame.
 [profile.release.package.encoding_rs]
 opt-level = "z"
 
@@ -289,8 +291,10 @@ opt-level = "z"
 #
 # GIF is on that list of six, which is why it is *not* in this block: see the
 # reachable codecs further down. `color_quant` is, because it is the GIF
-# encoder's quantizer and only the decoder is reachable; the LZW that decoding
-# really runs on is `weezl`, which this manifest does not touch.
+# encoder's quantizer — reached through `gif` and through `image`, and nothing
+# here encodes one; the LZW that decoding really runs on is `weezl`, which
+# this manifest does not touch. `moxcms` is not, because `image` reaches it
+# for any picture carrying an ICC profile.
 #
 # `exr` is also the largest single *datum* in the window: 131,076 bytes of
 # `to_linear_table::TABLE`, which is DWA compression's transfer curve. That is
@@ -304,15 +308,7 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.color_quant]
 opt-level = "z"
-[profile.release.package.moxcms]
-opt-level = "z"
 [profile.release.package.zune-inflate]
-opt-level = "z"
-# Reached only by the parallel decoders above: `image`'s `rayon` feature is
-# gpui's too, and the formats it parallelizes are the ones nothing here opens.
-[profile.release.package.rayon]
-opt-level = "z"
-[profile.release.package.rayon-core]
 opt-level = "z"
 
 # Path tessellation for the SVG icons, beside the `usvg`/`resvg`/`tiny-skia`
@@ -327,9 +323,11 @@ opt-level = "z"
 [profile.release.package.lyon_algorithms]
 opt-level = "z"
 
-# Finding the fonts, which happens once at startup. Drawing with them does
-# not go through here — that is `swash`, `harfrust` and `skrifa`, which stay
-# where they are.
+# Finding the fonts. `fontconfig-parser` reads the system configuration at
+# startup; `fontdb` is the database `usvg` and `cosmic-text` match a family
+# against, which is a lookup per family and style rather than per glyph, and
+# cached above. Drawing with them does not go through here — that is `swash`,
+# `harfrust` and `skrifa`, which stay where they are.
 [profile.release.package.fontdb]
 opt-level = "z"
 [profile.release.package.fontconfig-parser]
@@ -351,14 +349,15 @@ opt-level = "z"
 [profile.release.package.ksni]
 opt-level = "z"
 
-# The other two thirds of the regex engine the sweep already names. `regex`
-# and `regex-automata` have been at "z" here from the start; `regex-syntax` is
-# the parser that runs once per pattern and `aho-corasick` is the literal
-# prefilter built from it, and leaving the pair out left 288 KiB at "3"
-# underneath a "z" engine.
+# The pattern parser under the regex engine the sweep already names. `regex`
+# and `regex-automata` have been at "z" here from the start, and this runs
+# once per pattern compiled, never per match.
+#
+# `aho-corasick` is deliberately not beside it, though it looks like the same
+# entry: as well as being regex's literal prefilter it is a *direct*
+# dependency of `gpui-base`, whose `input/editor/search.rs` builds one — which
+# is a person typing into a search field rather than anything cold.
 [profile.release.package.regex-syntax]
-opt-level = "z"
-[profile.release.package.aho-corasick]
 opt-level = "z"
 
 # Parsing an icon: the XML reader and the SVG value grammar under `usvg`,
@@ -367,7 +366,9 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.svgtypes]
 opt-level = "z"
-# URL parsing, which happens when a message turns out to contain a link.
+# URL parsing. Three callers and all of them one-shot: `gpui` and `gpui_linux`
+# open a link, `http_client` builds a request, and `rtc-shared` reads a
+# candidate while a call is being set up.
 [profile.release.package.url]
 opt-level = "z"
 # The bignum behind the keyring's RSA, on a path that runs when a secret is
@@ -430,6 +431,10 @@ opt-level = "s"
 # rather than a format nothing opens — which is what the block above claimed
 # about it until a review pointed at the mapping.
 [profile.release.package.gif]
+opt-level = "s"
+# And the colour management under all of them: `moxcms` is reached from
+# `image` itself, so an ICC profile on an ordinary photo goes through it.
+[profile.release.package.moxcms]
 opt-level = "s"
 [profile.release.package.zune-jpeg]
 opt-level = "s"
