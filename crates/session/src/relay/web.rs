@@ -248,6 +248,8 @@ struct BrowserRelayChannel {
     congested: std::cell::Cell<bool>,
     /// Counted for that second line: how much media the ceiling has dropped.
     outbound_dropped: std::cell::Cell<u32>,
+    /// Whether anything has gone out yet; see [`RelayTransport::send`].
+    sent_any: std::cell::Cell<bool>,
 }
 
 /// Where an inbound packet goes, and what happens when there is no room.
@@ -326,6 +328,14 @@ impl Inbound {
 #[async_trait(?Send)]
 impl RelayTransport for BrowserRelayChannel {
     async fn send(&self, data: Bytes) -> Result<()> {
+        // The first one, and only the first: whether the driver ever reached
+        // the transport is the question a teardown with no error in it turns
+        // on. A call that opens its relay and then ends without a single
+        // outbound packet did not lose its media — it never started, and the
+        // driver returned before asking the transport for anything.
+        if !self.sent_any.replace(true) {
+            debug!("voip: the relay channel carried its first outbound packet");
+        }
         // `send_with_u8_array` copies into the channel's own buffer and
         // returns: it is not backpressure, and a channel configured
         // `maxRetransmits: 0` still queues locally when SCTP cannot get the
@@ -393,6 +403,20 @@ impl Drop for BrowserRelayChannel {
         // early return below is what makes this the only safe place for it:
         // it skips the closes, and it must not skip this.
         detach(&self.channel);
+        // Paired with the first-send line: together they say whether the
+        // driver ever used this transport. Dropped having sent nothing means
+        // the call's driver returned without asking the relay for anything,
+        // which is a very different fault from one that sent and then lost
+        // the channel — and the two are indistinguishable from a teardown
+        // that reports neither.
+        debug!(
+            "voip: the relay channel is being released (it {} anything)",
+            if self.sent_any.get() {
+                "sent"
+            } else {
+                "never sent"
+            }
+        );
         if self.closed.replace(true) {
             return;
         }
@@ -583,6 +607,7 @@ async fn connect_peer_connection(
             closed: std::cell::Cell::new(false),
             congested: std::cell::Cell::new(false),
             outbound_dropped: std::cell::Cell::new(0),
+            sent_any: std::cell::Cell::new(false),
         }),
         events_rx,
     ))

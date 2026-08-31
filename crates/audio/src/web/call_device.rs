@@ -275,11 +275,16 @@ pub async fn open_call_audio() -> Result<(
     // first is the same ending.
     crate::web::spawn(async move {
         let graph = graph;
-        let fed = feed_playout(speaker_rx, rate, playout);
-        futures_lite::future::or(fed, async {
-            mic_tx.closed().await;
-        })
-        .await;
+        // Which half went is not a branch — the graph closes either way — it
+        // is the *name*, and the name is the whole diagnostic. An engine
+        // whose driver returns without ever using its transport releases both
+        // ends at the instant one that ran a whole conversation does, so the
+        // teardown looks identical from here and the log is the only place
+        // the difference can survive. See `crate::call_ending`.
+        let ending =
+            crate::call_ending::ending(feed_playout(speaker_rx, rate, playout), mic_tx.closed())
+                .await;
+        debug!("the call's audio is ending: {}", ending.as_str());
         drop(graph);
     });
 

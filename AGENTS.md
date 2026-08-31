@@ -2006,6 +2006,20 @@ by definition.
   everywhere, telling somebody to answer in the other tab while destroying
   the call they would have answered there.
 
+- **A call's devices are held open by the engine, so letting go of them is
+  evidence.** The two channel ends handed to the library — the receiver it
+  takes microphone frames from, the sender it plays the peer out of — are the
+  whole of what keeps a call's audio graph alive. An engine that runs a
+  conversation and stops releases both when its driver returns, and one whose
+  driver returns without ever using its transport releases them at the same
+  instant in the same way. From inside the graph the two are identical, which
+  is why a browser call that ended a moment after connecting produced three
+  reports with nothing in them. `audio::call_ending` names which half went and
+  the relay says whether it ever carried a packet; together they separate a
+  call that ended from one that never started, which no single line on either
+  side can. Portable and tested off the browser, because the rule is about
+  channel ends rather than about devices.
+
 - **An abort drops a future where it stands, and an unpolled future leaves
   nothing behind.** The library ends work by aborting the handle its runtime
   handed back, and `set_media_task` uses that deliberately: a media task whose
