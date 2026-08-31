@@ -1,0 +1,217 @@
+# The web front end, packaged as an archive a release can carry.
+#
+# The same bundle `pages.yml` publishes, built once more with one thing
+# different: where it is served from. A Pages deployment knows its own
+# directory (`/client/`), and a person unpacking this into whatever hosting
+# they have does not — so this build is told `./`, and every asset in
+# `index.html` is then named relative to the document rather than to the
+# origin root. That is what makes the archive work unpacked at a domain's
+# root, under a path, or behind a reverse proxy, without rebuilding anything.
+#
+# It is a build rather than a copy of the Pages artifact for exactly that
+# reason: the public URL is baked into `index.html`, so a bundle built for
+# `/client/` asks for its module under `/client/` wherever it is put.
+name: Web bundle
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version string embedded in the archive name
+        required: true
+        type: string
+      ref:
+        description: >
+          Revision to build. Empty means the one the run was started from.
+          A manual release names an existing tag while being launched from a
+          branch, and a bundle built from that branch would be published as
+          the tag's.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  bundle:
+    name: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Empty is the ref the run was started from, which is what a push
+          # to `main` wants.
+          ref: ${{ inputs.ref }}
+
+      # Nightly, and not by preference — the same three reasons `pages.yml`
+      # gives: `-Z build-std` is nightly-only, the standard library has to be
+      # rebuilt with the atomics target feature on for `gpui_web`'s executor,
+      # and `rust-src` is what build-std compiles from.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly
+          targets: wasm32-unknown-unknown
+          components: rust-src
+
+      # Host builds even though the artifact is wasm: the build script that
+      # embeds gpui-component's icons runs on the host, and `waproto`
+      # generates code with protoc.
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
+        with:
+          tool: protoc,trunk
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Its own, and not shareable with the Pages build however alike the
+          # two are: `key` is *added to* rust-cache's automatic job-based key
+          # rather than replacing it, so a cache written by one job is never
+          # read by another. Only `shared-key` does that, and taking it would
+          # mean both jobs writing one entry — a release build and a preview
+          # build racing to save the same key, for a compilation neither of
+          # them shortens for the other.
+          key: web-bundle
+          cache-on-failure: "true"
+
+      # `./`, which is the whole point of this archive. Trunk rewrites
+      # `index.html` to name the hashed files under the public URL, and a
+      # relative one resolves against the document — so the same directory
+      # serves from `https://example.com/`, from `https://example.com/chat/`
+      # and from a subdirectory of somebody's existing site.
+      - name: Build the bundle
+        env:
+          PUBLIC_URL: ./
+        run: ./web/build.sh
+
+      # Two things, and the second is the one this archive exists for.
+      #
+      # Complete: trunk points `index.html` at hashed file names, and a
+      # mismatch is a blank page rather than a failed build — the same check
+      # `pages.yml` makes.
+      #
+      # And *relocatable*: an asset named `/oxidezap-abc123.js` is one this
+      # bundle would fetch from the origin root wherever it was unpacked,
+      # which is the single way a relative build can silently come out
+      # non-relative. Asserted rather than assumed, because it is a property
+      # of trunk's handling of `--public-url` and trunk is not pinned here.
+      - name: Check the bundle is complete and relocatable
+        run: |
+          set -eu
+          test -f web/dist/index.html || { echo "no index.html"; exit 1; }
+          test -f web/dist/coi-serviceworker.js || {
+            echo "the service worker is missing: the page will load without"
+            echo "cross-origin isolation and the window will have no executor"
+            exit 1
+          }
+          for asset in $(grep -oE '(href|src)="[^"]*"' web/dist/index.html |
+                         sed -E 's/.*="([^"]*)"/\1/' |
+                         grep -vE '^(https?:)?//'); do
+            case "$asset" in
+              /*)
+                echo "index.html names $asset from the origin root, so this"
+                echo "bundle would only work unpacked at a domain's root."
+                echo "The build did not honour PUBLIC_URL=./"
+                exit 1
+                ;;
+            esac
+            file="web/dist/$(basename "$asset")"
+            test -f "$file" || { echo "index.html references $asset, which is not in dist"; exit 1; }
+          done
+          echo "bundle contents:"
+          ls -lh web/dist
+
+      # What somebody unpacking this needs to know, and all of it is about the
+      # two response headers: the page needs a `SharedArrayBuffer`, the
+      # service worker beside it is what obtains one on a host that will not
+      # set headers, and a service worker needs a secure context. Everything
+      # else is "copy the directory".
+      - name: Write the hosting notes
+        run: |
+          set -eu
+          cat > web/dist/README.md <<'DOC'
+          # oxidezap — the web front end
+
+          Static files. Serve this directory with any web server; there is
+          nothing to install, configure or run beside it, and no back end.
+
+          Two requirements, and both come from the same place.
+
+          **Serve it over HTTPS**, or from `localhost`. The page registers a
+          service worker, and a browser only allows that in a secure context.
+
+          **Leave `coi-serviceworker.js` where it is.** The window runs its
+          background executor on real workers, which share memory through a
+          `SharedArrayBuffer` — and a browser hands one out only to a page
+          that is cross-origin isolated, which takes two response headers:
+
+              Cross-Origin-Opener-Policy: same-origin
+              Cross-Origin-Embedder-Policy: require-corp
+
+          The service worker adds them to its own responses, which is what
+          makes this work on a host that cannot set headers (GitHub Pages,
+          object storage, somebody else's CDN). If your server *can* set
+          them, set them: the worker then finds the page already isolated and
+          does nothing, and the first visit skips a reload.
+
+          The bundle is relocatable: assets are named relative to
+          `index.html`, so it works at a domain's root, under a path, or in a
+          subdirectory of an existing site. The one thing relative names ask
+          of a server is that a directory URL ends in a slash — `/chat/`
+          rather than `/chat` — which is what every static server already
+          redirects to before serving the `index.html` inside.
+
+          ## What it is
+
+          The page runs the whole client — the WhatsApp session, the store
+          and the window — in the visitor's browser, under their account and
+          nobody else's. Nothing reaches the server that hosts these files.
+
+          It can attach to an `oxidezapd` the visitor runs on their own
+          machine instead, which is worth preferring: a desktop daemon holds
+          calls, keeps plugins, survives the tab, and keeps the keys out of a
+          browser's storage. Point the page at one with
+          `#daemon=ws://…` — after a `#`, so the token in it stays in the
+          browser rather than reaching whoever served the page.
+
+          ## Updating
+
+          Replace the directory. The file names carry content hashes, so a
+          new bundle is never served out of a cache of the old one — but the
+          *document* can be, and it is the document that names the hashed
+          files. A visitor who sees a stale page after an update should
+          hard-reload once; the service worker answers navigations, which is
+          the response their browser cached.
+          DOC
+
+      - name: Package the bundle
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          # Validated as well as quoted: `release.yml` takes a tag from
+          # `workflow_dispatch`, and this value becomes a file name.
+          case "$VERSION" in
+            *[!A-Za-z0-9._-]* | "" | -* | .*)
+              echo "refusing a version that is not a plain name: $VERSION" >&2
+              exit 1
+              ;;
+          esac
+          # A directory inside the archive, matching the platform archives:
+          # unpacking one in a downloads folder should leave one thing behind
+          # rather than twenty hashed files.
+          out="oxidezap-$VERSION-web"
+          mv web/dist "$out"
+          zip -qr "$out.zip" "$out"
+          echo "ASSET=$out.zip" >> "$GITHUB_ENV"
+          ls -lh "$out.zip"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oxidezap-web
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
