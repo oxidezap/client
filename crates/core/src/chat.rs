@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wacore::download::{Downloadable, MediaType as DownloadMediaType};
-use wacore_binary::jid::{Jid, JidExt, Server};
+use wacore_binary::jid::{Jid, JidExt};
 
 use crate::message_status::MessageStatus;
 use crate::quoted::QuotedMessage;
@@ -36,9 +36,7 @@ pub fn fallback_chat_name(jid: &Jid) -> String {
         "Channel".to_string()
     } else if jid.server.is_lid_family() {
         "Unknown contact".to_string()
-    } else if (jid.server.is_pn_family() || jid.server == Server::Legacy)
-        && jid.user_base().chars().all(|c| c.is_ascii_digit())
-    {
+    } else if jid.server.is_pn_family() && jid.user_base().chars().all(|c| c.is_ascii_digit()) {
         format!("+{}", jid.user_base())
     } else {
         "Unknown chat".to_string()
