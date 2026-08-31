@@ -2224,7 +2224,12 @@ fn time_owed_is_not_forgiven_when_the_window_turns_over() {
 fn a_directory_that_is_not_there_is_simply_empty() {
     let dir = TempDir::new("absent-plugins");
     let missing = dir.0.join("nothing-here");
-    assert!(crate::discover(&missing).is_empty());
+    assert!(
+        crate::discover(&missing)
+            .expect("an absent folder is an answer")
+            .is_empty(),
+        "a folder that is not there is no plugins, not a failure"
+    );
 }
 
 /// Stores one setting on its first message and never asks for anything else.
@@ -2452,7 +2457,9 @@ fn a_directory_of_plugins_is_bounded_by_how_many_will_run() {
         broken.plugin(&format!("p{i:03}"), "(module)");
     }
     assert_eq!(
-        crate::discover(&broken.0).len(),
+        crate::discover(&broken.0)
+            .expect("the folder is readable")
+            .len(),
         crate::MAX_PLUGINS,
         "the list stops at the cap however few of them would load"
     );
@@ -3529,7 +3536,7 @@ fn an_ask_during_a_reload_is_not_lost() {
                 assert!(!host.claim_reload(), "the slot is already taken");
             }
             Some((
-                crate::modules_in(&folder.0),
+                crate::modules_in(&folder.0).expect("the folder is readable"),
                 Arc::new(crate::store::Nowhere) as Arc<dyn Backing>,
             ))
         }

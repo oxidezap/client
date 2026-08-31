@@ -367,7 +367,12 @@ impl Plugins {
             Some(dir) => Arc::new(store::Files::at(dir)),
             None => Arc::new(Nowhere),
         };
-        let modules = modules_in(dir);
+        // At the first load an unreadable folder is no plugins, which is what
+        // it has always been: nothing is running to lose, and a daemon that
+        // would not come up over a directory is a daemon that would not come
+        // up. A *reload* asks the same function and treats `None` differently,
+        // which is the whole reason it answers one.
+        let modules = modules_in(dir).unwrap_or_default();
         // Driven here rather than propagated: a desktop's loader owns the
         // thread it runs on — `plugins::start` puts it on `spawn_blocking` —
         // so there is nothing for it to yield to and `breathe` is a no-op.
@@ -400,7 +405,12 @@ impl Plugins {
             // answer either way, which is the same thing it has always meant
             // here: the desktop's scan cannot tell a missing folder from an
             // unreadable one, and a missing folder is the ordinary machine.
-            Some((modules_in(dir), state))
+            // `None` where the folder could not be read, which leaves the
+            // running set alone rather than replacing it with an empty one.
+            // Not the same as a folder that is absent, or one this host
+            // refuses to trust: those are answers, and a reload finding
+            // either *should* stop what is running.
+            Some((modules_in(dir)?, state))
         }))
     }
 
@@ -621,23 +631,25 @@ enum Announce {
 /// taken, which is exactly the kind of disagreement `MAX_PLUGINS` truncating
 /// a folder makes visible.
 #[cfg(not(target_family = "wasm"))]
-fn modules_in(dir: &Path) -> Vec<Module> {
-    discover(dir)
-        .into_iter()
-        .filter_map(|path| {
-            let Some(id) = plugin_id(&path) else {
-                log::warn!(
-                    "skipping {}: its name is not a usable plugin id",
-                    path.display()
-                );
-                return None;
-            };
-            Some(Module {
-                id,
-                open: Box::new(move || read_module(&path)),
+fn modules_in(dir: &Path) -> Option<Vec<Module>> {
+    Some(
+        discover(dir)?
+            .into_iter()
+            .filter_map(|path| {
+                let Some(id) = plugin_id(&path) else {
+                    log::warn!(
+                        "skipping {}: its name is not a usable plugin id",
+                        path.display()
+                    );
+                    return None;
+                };
+                Some(Module {
+                    id,
+                    open: Box::new(move || read_module(&path)),
+                })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 /// Load a set of modules into one generation.
@@ -1788,7 +1800,7 @@ async fn take(
 /// buttons are drawn in, and a set that reshuffled between two starts would
 /// move a control under somebody's hand.
 #[cfg(not(target_family = "wasm"))]
-fn discover(dir: &Path) -> Vec<PathBuf> {
+fn discover(dir: &Path) -> Option<Vec<PathBuf>> {
     // A directory anybody else can write is one where the file that runs
     // tomorrow is not the file that was approved today. Approval is recorded
     // against a plugin's id and mask rather than its bytes — deliberately, so
@@ -1804,7 +1816,7 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
     // below cannot tell the two apart on its own — it reads metadata, and a
     // directory that is not there has none.
     if !dir.exists() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     if !only_this_user_can_write(dir) {
         log::warn!(
@@ -1813,10 +1825,22 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
              its contents",
             dir.display()
         );
-        return Vec::new();
+        // An answer, not a failure: a directory somebody else can write is
+        // one whose plugins this host will not run, and a reload finding that
+        // *should* stop them.
+        return Some(Vec::new());
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // Said, and told apart from the two answers above. A directory
+            // that is not there and one this host refuses to trust are both
+            // "no plugins", deliberately; one it cannot *read* is not an
+            // answer at all, and a reload that took it for one would retire
+            // every healthy plugin over a transient error.
+            log::warn!("cannot read {}: {e}", dir.display());
+            return None;
+        }
     };
     let mut found: Vec<PathBuf> = entries
         .filter_map(Result::ok)
@@ -1848,7 +1872,7 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
     // ones run is the answer discovery always gives: the first `MAX_PLUGINS`
     // by name.
     found.truncate(MAX_PLUGINS);
-    found
+    Some(found)
 }
 
 /// One module's bytes, bounded before the file is opened.
