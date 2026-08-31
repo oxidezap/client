@@ -1,10 +1,19 @@
 # CI & dependencies
 
+> **Every figure below is a measurement, each read off one job's own upload log
+> at one commit.** They are evidence for the rules, not facts to plan against —
+> and the cache ceiling is GitHub's number, not ours, so check the current one
+> before doing arithmetic with it. `.github/workflows/` is the authority for
+> what is actually cached and by which job; the rules here are what survive a
+> re-measurement.
+
 ## The library dependency
 
-All eight `whatsapp-rust` crates resolve from one git source on one branch, so
+Every `whatsapp-rust` crate resolves from one git source on one branch, so
 `cargo update` moves them together and no two can land on incompatible
-revisions. Never pin them individually by `rev`: the resulting mismatch surfaces
+revisions. `Cargo.toml` is the list — some are declared directly and others
+arrive transitively, and the profile table names more of them than the
+dependency table does, so count them there rather than here. Never pin them individually by `rev`: the resulting mismatch surfaces
 as "expected `Jid`, found `Jid`" and reads like a compiler bug.
 
 Because profile settings only apply from the workspace root, the per-package

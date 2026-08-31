@@ -1,12 +1,23 @@
 # Still to do
 
-- **Spacing is still absolute.** ~28 `px(...)` literals where the guides want
-  the rem scale (`p_2`, `gap_3`), so the UI does not respond to base-font zoom.
+> Known gaps and why each is still open. **Confirm a gap is still a gap before
+> acting on it** — some of these describe upstream behaviour that may have been
+> fixed, and any count or file size here is from the commit that wrote the
+> entry. The reasoning is the durable half.
+
+- **Spacing is still absolute.** There are `px(...)` literals where the guides
+  want the rem scale (`p_2`, `gap_3`), so that part of the UI does not respond
+  to base-font zoom. Count them before planning the work rather than trusting a
+  number here — `grep -ro 'px(' --include='*.rs' crates/gui/src | wc -l` is the
+  ceiling, and the legitimate uses are the ones inside `theme/`, which is where
+  the scale is defined.
 - **`WhatsAppApp` still owns all state**, though it is now split across
   `app/{events,recording,calls_ctl,media_ctl}.rs` rather than one file. The
   guides want per-feature entities; that is a bigger change than moving code.
-- **Two large files outside the GUI**: `session/whatsapp/mod.rs` (~3.7k) and
-  `chat-store/store.rs` (~3.2k). The calls came out of the first one and the
+- **Two large files outside the GUI**: `crates/session/src/whatsapp/mod.rs` and
+  `crates/chat-store/src/store.rs`, both a few thousand lines — `wc -l` them
+  rather than trusting a figure here, since both have grown since this was
+  written. The calls came out of the first one and the
   video plane never went in, so what is left is the event pump, hydration and
   the paged reads — three things rather than one file.
 - **The session still runs on the window's own thread.** Two of the three

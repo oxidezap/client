@@ -144,7 +144,7 @@ something in it.
 and the `gh-pages` publisher — and it is excluded from the workspace for a
 reason of its own rather than the plugins'. The Pages publish job holds
 `contents: write` and checks out one directory; a workspace member would make
-cargo resolve the whole graph, eight git dependencies among them, before it
+cargo resolve the whole graph, every git dependency among them, before it
 could compile a binary that needs none of it. So it carries its own
 `[workspace]`, takes no dependencies at all, and CI runs its tests against its
 own manifest the way it runs the example plugins'. What lives there was shell
