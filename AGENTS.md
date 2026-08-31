@@ -2179,8 +2179,13 @@ by definition.
   `url`, `idna` and the `icu` crates under them — so the sentence was not
   wrong when it was written, it was *stale*, which is the failure mode a
   measured claim has and a reasoned one does not.
-  What the sweep does not reach is the data section, which is 21.7% of the
-  module and grew six points while the code was being cut twice. An
+  What the sweep does not reach is the data section, and its share has moved
+  from 15.1% to 21.7% — which is a sentence about the code rather than about
+  the data, and worth saying carefully because the percentage invites the
+  other reading. In bytes the data went from ~4.50 MB to 4,755,861 while the
+  code went from ~25.2 MB to 17,039,072: the sweep took a third off one of
+  them and essentially nothing off the other, so what changed is what the
+  remaining bytes are *made of*. An
   optimization level does not move a table, and almost nothing in there is
   ours: of 4.59 MB, only ~737 KB is even identifiable as text — a 166 KB WGSL
   shader with its debugging comments intact, 65 KB of HTML named character
