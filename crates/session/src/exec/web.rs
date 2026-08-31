@@ -6,7 +6,7 @@
 //! that spawned it, and the `web-sys` objects the session's transport holds
 //! could not survive being moved anyway.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -194,17 +194,125 @@ impl Timers {
 
 /// Give the page's loop a turn.
 ///
-/// A zero-length `setTimeout` rather than a bare yield, because what has to
-/// run in the gap is the browser's own work — a frame, an input event — and
-/// not merely another Rust task on the same tick. An `.await` on a future
-/// that is already ready does not leave the microtask it is in, which is the
-/// whole reason a sequence of them can freeze a page: the awaits are there
-/// for the desktop's runtime, and on this target they cost nothing and yield
-/// nothing.
+/// What has to run in the gap is the browser's own work — a frame, an input
+/// event — and not merely another Rust task on the same tick, so this has to
+/// reach a *task* boundary. An `.await` on a future that is already ready
+/// does not leave the microtask it is in, which is the whole reason a
+/// sequence of them can freeze a page: the awaits are there for the desktop's
+/// runtime, and on this target they cost nothing and yield nothing.
 ///
-/// The same function, and the same sentence, as `plugin_host::sched::breathe`.
+/// A `MessageChannel` rather than a zero-length `setTimeout`, and the
+/// difference is the tab nobody is looking at. A browser clamps timers in a
+/// hidden document to about a second, and the tab holding the account is
+/// routinely the hidden one — that is the whole of `ipc::tab`, where one tab
+/// serves the others. Five of these in a row on the cold-start path is then
+/// five seconds before the account comes up in the tab somebody *is* looking
+/// at, and five seconds is exactly `SHUTDOWN_GRACE`: a stop arriving mid-start
+/// would spend the whole grace waiting for this to reach the select that
+/// answers it. A port's message is a task like a timer's callback is a task,
+/// with the same rendering opportunity behind it, and no clamp on either the
+/// hidden document or the nesting depth.
+///
+/// Parks forever where no channel can be built, for the reason [`sleep`]
+/// does: every caller is a loop, and returning at once turns one into a spin
+/// that never yields.
 pub async fn breathe() {
-    sleep(Duration::ZERO).await;
+    let armed = PUMP.with(|pump| {
+        let woken = Rc::new(Turn::default());
+        pump.as_ref().map(|pump| {
+            pump.waiting.borrow_mut().push_back(Rc::clone(&woken));
+            // The message is the wake. Which port it goes out of does not
+            // matter — the other end is the one listening — and a failure to
+            // post is a queue entry nothing will ever reach, so it is taken
+            // back rather than left to park forever.
+            if pump
+                .send
+                .post_message(&wasm_bindgen::JsValue::UNDEFINED)
+                .is_err()
+            {
+                pump.waiting.borrow_mut().pop_back();
+                return None;
+            }
+            Some(woken)
+        })
+    });
+    let Some(Some(woken)) = armed else {
+        log::error!("this agent cannot yield; the loop that was waiting on a turn stops here");
+        std::future::pending::<()>().await;
+        return;
+    };
+    std::future::poll_fn(|cx| {
+        if woken.done.get() {
+            Poll::Ready(())
+        } else {
+            *woken.waker.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+/// One `breathe` waiting for its turn.
+#[derive(Default)]
+struct Turn {
+    done: Cell<bool>,
+    waker: RefCell<Option<std::task::Waker>>,
+}
+
+/// The channel every [`breathe`] on this agent posts through.
+///
+/// One rather than one per call: a `MessageChannel` is two objects and a
+/// listener, and this is on a path that runs per phase of every start. The
+/// queue is what keeps the pairing honest — messages arrive in the order they
+/// were posted, so the front of the queue is whose turn this is.
+struct Pump {
+    send: web_sys::MessagePort,
+    waiting: Rc<RefCell<std::collections::VecDeque<Rc<Turn>>>>,
+    /// Held for the life of the agent. A port whose handler has been freed
+    /// delivers into nothing, which here would be every `breathe` after it
+    /// parking forever.
+    _receive: web_sys::MessagePort,
+    _on_message: Closure<dyn FnMut(web_sys::MessageEvent)>,
+}
+
+impl Pump {
+    fn new() -> Option<Self> {
+        let channel = web_sys::MessageChannel::new().ok()?;
+        let send = channel.port2();
+        let receive = channel.port1();
+        let waiting: Rc<RefCell<std::collections::VecDeque<Rc<Turn>>>> = Rc::default();
+        let queue = Rc::clone(&waiting);
+        let on_message =
+            Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_: web_sys::MessageEvent| {
+                // One message, one turn, and the waker is taken before it is
+                // called: waking can poll straight back into `breathe`, and a
+                // borrow still held there is a panic rather than a wakeup.
+                let turn = queue.borrow_mut().pop_front();
+                if let Some(turn) = turn {
+                    turn.done.set(true);
+                    let waker = turn.waker.borrow_mut().take();
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                }
+            });
+        // Setting the handler is what starts the port; nothing is delivered
+        // before it, which is why the handler is installed before anything
+        // can post.
+        receive.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        Some(Self {
+            send,
+            waiting,
+            _receive: receive,
+            _on_message: on_message,
+        })
+    }
+}
+
+thread_local! {
+    /// Built once per agent, and never rebuilt: a page that cannot make a
+    /// `MessageChannel` will not make one later either.
+    static PUMP: Option<Pump> = Pump::new();
 }
 
 /// `setTimeout`, as a future.

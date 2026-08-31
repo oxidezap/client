@@ -1876,6 +1876,22 @@ by definition.
   opportunity to draw rather than a promise of one — the browser decides
   whether a rendering pass fits between two tasks — and the total is still the
   worker's to remove.
+  What a turn is *made of* is the part that took a second look. A zero-length
+  `setTimeout` is the obvious yield and is the wrong one here: a browser clamps
+  timers in a hidden document to about a second, and the tab holding the
+  account is routinely the hidden one — that is the whole of `ipc::tab`, where
+  one tab serves the others. Five yields on the cold-start path would then be
+  five seconds before the account came up in the tab somebody *is* looking at,
+  and five seconds is exactly `SHUTDOWN_GRACE`, so a stop arriving mid-start
+  would spend the whole grace waiting for the start to reach the select that
+  answers it. `exec::breathe` posts through a `MessageChannel` instead: a
+  port's message is a task like a timer's callback is a task, with the same
+  rendering opportunity behind it, and no clamp on the hidden document or on
+  the nesting depth. The other two yields in the tree —
+  `plugin_host::sched::breathe` and `gui/platform/clock.rs` — are still
+  timers, and are not on a path where five of them compound; the sentence they
+  share with this one is now about *why* a turn is a task, rather than about
+  which call makes it.
 
 - **The session runs in the browser, and pairing is measured now.** A page
   with no daemon named starts its own, and the whole of it works against
