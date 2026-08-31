@@ -575,9 +575,21 @@ strip = "none"
 # any of it here is dead configuration that reads as a decision.
 
 # `gpui` draws every frame, it is the largest single crate in the shipped
-# module at 10.6% of its code, and it is the one place where "fast" is worth
-# more than "small". Needed here precisely because the desktop leaves it to
-# the base setting, and this profile's base is "s".
+# module at 13.0% of its code (2,275,025 bytes of 17,484,579), and it is the
+# one place where "fast" is worth more than "small". Needed here precisely
+# because the desktop leaves it to the base setting, and this profile's base
+# is "s".
+#
+# What that costs is measured rather than assumed, because it is the largest
+# single lever in this file and somebody will reach for it: taking this one
+# entry to "s" is worth **684,650 bytes** of the module, 218,909 of them
+# gzipped — more than every other entry added by the last three size passes
+# put together. It is still not taken. Everything else the sweep touches is
+# reached once per stanza, once per attachment or once per plugin call; this
+# is reached sixty times a second, on the target with the slowest execution
+# and the least headroom, and a window that draws at half the rate is a
+# regression a visitor feels for the whole session rather than for the 80 ms
+# the bytes cost them once.
 [profile.web.package.gpui]
 opt-level = 3
 

@@ -2142,16 +2142,76 @@ by definition.
   that module opens by saying it does not have — worth it only if somebody
   meets it.
 - **What the module weighs is nobody's job to notice.** The Pages workflow
-  prints it now, and the numbers to compare against are: 29,825,238 bytes at
-  `17e6d4f`, of which the code section is 84.5% and the data section 15.1%,
-  with no name section at all (`strip = true` removes it before wasm-opt
-  sees the module — which is also why a DevTools flame graph of this page has
-  never had Rust symbols in it). By group, that code is 29% gpui and its
-  renderer, 21% the Rust standard library, 17% the WhatsApp protocol and
-  crypto, and 5% gpui-component. `wasmi`, `symphonia`, `mp4`, `opus`,
+  prints it, and the numbers to compare against are: **21,936,154 bytes**,
+  8,407,991 gzipped, of which the code section is 77.7% and the data section
+  21.7%, with no name section at all (`strip = true` removes it before
+  wasm-opt sees the module — which is also why a DevTools flame graph of this
+  page has never had Rust symbols in it). Measured against 22,358,204 bytes
+  at `3e1d63f`, which is what the two `[profile.web]` entries at the end of
+  the manifest took 422,050 bytes off.
+  The breakdown below is that 22,358,204-byte build, read out of a
+  `WEB_PROFILE=debug` module whose code section is within 0.12% of the
+  shipped one's — which is what makes the debug build a stand-in for it, and
+  the only way to attribute anything at all, since the shipped module has no
+  names in it. By group, of 17,484,579 bytes of code: 23% gpui and its
+  renderer (gpui 2,275,025, naga 550,473, wgpu and its halves 641,266, taffy
+  231,235), 15% the WhatsApp protocol and crypto, 11% the Rust standard
+  library, 9% **our own crates**, 7% media decode, 5% the store, 4%
+  gpui-component and 4% the plugin host.
+  Two of those are new since the last time this paragraph was written, and
+  both were new by *omission*: our own tree had never appeared here at all —
+  1,567,406 bytes, the fourth-largest group in the module, invisible because
+  every previous pass had gone looking at dependencies — and the plugin host
+  was listed as absent.
+  Which is the lesson worth keeping. **A list of what LTO removes is a claim
+  about the dependency graph on the day it was written, and nothing rechecks
+  it.** This paragraph used to end "`wasmi`, `symphonia`, `mp4`, `opus`,
   `openh264`, `tree_sitter`, `notify` and `tracing` are all absent: LTO
-  removes them, and the gates that exist for them are discipline rather than
-  bytes.
+  removes them". Three of those had stopped being true, and not one of them
+  by a change anybody would have thought to re-measure a bundle over.
+  `wasmi` became reachable when a page got its own plugin host — the host
+  depends on it, the daemon depends on the host, the page depends on the
+  daemon — and is 333,158 bytes, with `wasmparser` a further 163,223 beside
+  it. `symphonia` (208,913) and `mp4` (80,318) became reachable when the
+  video path moved out of the desktop-only dependency table for
+  `web_sys::VideoDecoder`, which `crates/gui/Cargo.toml` says in as many
+  words and this file went on denying. `syntect` really is zero, and so are
+  `url`, `idna` and the `icu` crates under them — so the sentence was not
+  wrong when it was written, it was *stale*, which is the failure mode a
+  measured claim has and a reasoned one does not.
+  What the sweep does not reach is the data section, which is 21.7% of the
+  module and grew six points while the code was being cut twice. An
+  optimization level does not move a table, and almost nothing in there is
+  ours: of 4.59 MB, only ~737 KB is even identifiable as text — a 166 KB WGSL
+  shader with its debugging comments intact, 65 KB of HTML named character
+  references, 72 KB of gpui-component theme JSON, 47 KB of SVG icons and
+  35 KB of our own SQL schema. Every one of the large ones belongs to a
+  dependency, and the rest is binary tables. Somebody who wants the next
+  megabyte should start there rather than in the sweep.
+- **The largest lever on the web build is not in the build.** The module is
+  8,407,991 bytes gzipped and 5,852,626 brotlied — so brotli is worth
+  **2,555,365 bytes, 30% of the transfer**, which is six times what the two
+  entries this file's sweep just added were worth, for no change to a byte of
+  Rust. GitHub Pages will not serve it: asked with `Accept-Encoding: br`
+  alone, the published module comes back *identity*, and asked with
+  `br, gzip` it comes back gzip. There is no way to force it — a
+  pre-compressed `.wasm.br` needs a `Content-Encoding` header the host will
+  not set, and `DecompressionStream` has no brotli for a page to do it
+  itself. So it is a hosting fact rather than a bug, and it is written down
+  here because it is the number any future size pass should be weighed
+  against: a week of crate-level work is worth a third of moving the bundle
+  to a host that sends brotli.
+  Two smaller things on the same path were checked and are *not* problems,
+  which is worth recording so nobody checks them again. The module is served
+  as `application/wasm`, so wasm-bindgen's `instantiateStreaming` compiles it
+  as it arrives rather than after. And the service worker passes subresources
+  through, so the preload is matched rather than refetched — that one was a
+  real bug once, and the fix has held.
+  The one thing that *is* slightly wrong is the figure this repository
+  quotes. `xtask bundle size` runs `gzip -9`; Fastly does not, and the
+  published module measured 8,641,423 bytes on the wire against the
+  8,546,362 the same build gzipped to locally. The workflow's number is a
+  trend line, not what a visitor waits on, and it understates it by about 1%.
 - **The page's media budgets are one number and three ceilings.**
   `WEB_MEDIA_BUDGET_BYTES` is what the daemon's cache and a frame's fetch each
   allow, and `DECODED_IMAGE_BUDGET_BYTES` is a quarter of it again on top — so
