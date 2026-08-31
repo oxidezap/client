@@ -857,7 +857,10 @@ to the same problem. Nothing here needs it yet.
   cargo 1.98: `cargo build -p url --profile web --target
   wasm32-unknown-unknown -v` compiles `url` at `z`, the level
   `[profile.release.package.url]` names, under a profile whose own base is "s"
-  and whose table does not mention it. So `[profile.web]` holds the
+  and whose table does not mention it. (`-p` takes any package in the resolve
+  graph, not only a workspace member, which is what makes that a two-second
+  check rather than a build of the window; it needs
+  `rustup target add wasm32-unknown-unknown` on whatever toolchain runs it.) So `[profile.web]` holds the
   differences and nothing else, and the desktop sweep — `ureq`, `zbus`,
   `wayland-*`, `libsqlite3-sys` — costs this graph nothing where it names
   crates that are not compiled for wasm at all.
