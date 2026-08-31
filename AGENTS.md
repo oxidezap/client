@@ -917,16 +917,18 @@ to the same problem. Nothing here needs it yet.
   what it weighs in the sweep, and the two are not even correlated — so the
   order is measure, then decide, and `cargo bloat --crates` against a build
   with `CARGO_PROFILE_RELEASE_STRIP=none` is the whole of the first half.
-  Measured on this tree: taking every image format `gpui` turns on that
-  nothing here can hand it — EXR, TIFF, QOI and the colour management behind
-  them — from the profile's setting down to `z` was worth 43 KB of a 22 MB
-  module, because fat LTO had already removed nearly all of it and what is
-  left is *data* that no optimization level shrinks (`exr`'s DWA transfer
-  curve is 131,076 bytes of it, in the window's `.data`). Which format is
-  reachable is a question to answer from `utils::mime_to_image_format` rather
-  than from the crate's name: a decoder is *named* there, not sniffed for, and
-  GIF is one of the six names it can answer with — so `gif` belongs with the
-  codecs kept at `s`, and the first draft of this had it in the list above.
+  Measured on this tree, each figure from a build whose only difference is
+  the entry being measured: taking the image formats `gpui` turns on that
+  nothing here can name — `exr`, `tiff`, `qoi`, `color_quant` and the
+  `zune-inflate` under `exr` — from the profile's setting down to `z` is
+  worth **32,494 bytes** of a 22.7 MB module, because fat LTO had already
+  removed nearly all of it and what is left is *data* that no optimization
+  level shrinks (`exr`'s DWA transfer curve is 131,076 bytes of it, in the
+  window's `.data`). Which format is reachable is a question to answer from
+  `utils::mime_to_image_format` rather than from the crate's name: a decoder
+  is *named* there, not sniffed for, and GIF is one of the six names it can
+  answer with — so `gif` belongs with the codecs kept at `s`, and the first
+  draft of this had it in the list above.
   Which is the smaller half of the lesson. The larger one is that "only X
   reaches this crate" is a claim about the dependency graph, and
   `cargo tree -p <bin> -i <crate>` answers it in a second — where reading the
@@ -936,13 +938,26 @@ to the same problem. Nothing here needs it yet.
   as the decoders'; `aho-corasick` is a *direct* dependency of `gpui-base`,
   whose editor search builds one as a person types; and `moxcms` is reached
   from `image` itself for any picture carrying an ICC profile. Ask the graph
-  before writing the sentence. Taking `waproto`
-  and `buffa` from `3` to `z` was worth 1.4 MB of the daemon, because
-  generated protobuf survives LTO in full: it is reachable, it is enormous —
-  four separate 72 KiB copies of `Message::clone` among the largest functions
-  in the binary — and none of it is in a loop. The cold-and-obvious crate is
+  before writing the sentence. Taking `waproto` and `buffa` from `3` to `z`
+  is worth **1,226,368 bytes** of the daemon, because generated protobuf
+  survives LTO in full: it is reachable, it is enormous — four separate
+  72 KiB copies of `Message::clone` among the largest functions in the
+  binary — and none of it is in a loop. The cold-and-obvious crate is
   usually already gone; the one worth finding is large, reachable, and
   called once per stanza rather than once per frame.
+
+  Both of those numbers were wrong when this paragraph was first written, and
+  wrong the same way: they were the totals of a change set in which a dozen
+  crates moved at once, written down as though they belonged to the one entry
+  the sentence was about. It read as 43 KB and 1.4 MB; isolated, it is 32 KB
+  and 1.17 MiB — the protobuf really is 82% of that sweep, and the image
+  formats really are nothing, so the story survived, which is exactly why
+  nobody would have gone back to check. **A number is about the difference
+  that produced it.** One build with one entry changed, or say out loud that
+  the figure is a total. The same trap has a second mouth: a "before" from an
+  older commit measures the intervening work as well, which is how this
+  branch once reported the module *growing* by 380 KB when it had shrunk by
+  662 KB.
 - **The page has a third heap, and it is the size of the account.** The
   relaxed-idb VFS holds `HashMap<usize, Uint8Array>` — the whole database,
   resident in the *JavaScript* heap, one 8 KiB page per entry, kept alive
