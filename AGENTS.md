@@ -1373,6 +1373,16 @@ no HTTP endpoint, so the sideband is three more messages on the same channel,
 with the bytes crossing as a `Uint8Array` — one structured clone, where JSON
 would be a base64 round trip through a string twice the size.
 
+Both ends of it run in a browser under `cargo test`, and that is not
+belt-and-braces: the leader built its connection handler, held it for exactly
+the right lifetime, and never called `set_onmessage`. Everything compiled,
+every lint passed, and what a second tab got was a rendezvous answered
+perfectly followed by silence — `serve_client` waiting out its handshake
+window and refusing a hello it was never handed. The only error anywhere
+appeared in the *asking* tab, naming a frame it had sent correctly. Reading
+does not catch a call that is not there; running it does, which is what
+`listener::tab::tests` is for.
+
 **Queuing for the lock is now the right thing, and the reasoning that ruled it
 out has not been dropped so much as spent.** It said a queued tab looks like
 one that is starting and would silently take an account nobody was looking at.
