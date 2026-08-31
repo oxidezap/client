@@ -33,6 +33,14 @@ pub enum CallAudioEnding {
     ///
     /// The engine dropped the receiver this side captures into.
     CaptureReleased,
+    /// The microphone itself ended, and this side closed the channel.
+    ///
+    /// Unplugged, revoked in the site settings, or taken by the operating
+    /// system. The engine may still be holding its end perfectly happily —
+    /// what went is the device — so this is the one capture ending that is
+    /// *not* evidence about the driver, and naming it as one would put the
+    /// blame for a local fault on the far side of the call.
+    CaptureLost,
 }
 
 impl CallAudioEnding {
@@ -42,6 +50,7 @@ impl CallAudioEnding {
         match self {
             Self::PlayoutReleased => "the call engine let go of the speaker",
             Self::CaptureReleased => "the call engine let go of the microphone",
+            Self::CaptureLost => "this microphone ended; the call engine did not release it",
         }
     }
 }
@@ -53,9 +62,18 @@ impl CallAudioEnding {
 /// control flow. `playout` is biased only because a driver that returns drops
 /// its whole channel set at once and something has to be reported first;
 /// nothing downstream may depend on which of a simultaneous pair wins.
+///
+/// `capture_ended_locally` is what keeps the capture arm honest. A microphone
+/// that is unplugged or revoked is closed *by this side*, from the track's
+/// own `ended` handler, and the sender closing is the same observation
+/// whichever end let go — so without asking, a local device fault is reported
+/// as the engine releasing the call, which is exactly the false evidence this
+/// module exists to stop producing. Asked only on that arm, and only once it
+/// has won.
 pub async fn ending(
     playout_released: impl Future<Output = ()>,
     capture_released: impl Future<Output = ()>,
+    capture_ended_locally: impl Fn() -> bool,
 ) -> CallAudioEnding {
     futures_lite::future::or(
         async {
@@ -64,7 +82,11 @@ pub async fn ending(
         },
         async {
             capture_released.await;
-            CallAudioEnding::CaptureReleased
+            if capture_ended_locally() {
+                CallAudioEnding::CaptureLost
+            } else {
+                CallAudioEnding::CaptureReleased
+            }
         },
     )
     .await
@@ -125,6 +147,7 @@ mod tests {
                 while speaker_rx.recv().await.is_ok() {}
             },
             mic_tx.closed(),
+            || false,
         ));
         assert_eq!(ending, CallAudioEnding::PlayoutReleased);
     }
@@ -144,11 +167,39 @@ mod tests {
         let ending = futures_lite::future::block_on(ending(
             async { while speaker_rx.recv().await.is_ok() {} },
             mic_tx.closed(),
+            || false,
         ));
         assert_eq!(ending, CallAudioEnding::CaptureReleased);
         // Held to the end, so the speaker arm could not have been what
         // resolved: a test that dropped it would pass for the wrong reason.
         drop(speaker_tx);
+    }
+
+    /// A microphone unplugged mid-call closes the channel from *this* side,
+    /// which is the same observation as the engine dropping its receiver. The
+    /// two must not read the same in a log: one is evidence about the driver
+    /// and the other is a device that went away.
+    #[test]
+    fn a_microphone_that_ended_locally_is_not_blamed_on_the_engine() {
+        let Endpoints {
+            mic_tx,
+            mic_rx,
+            speaker_tx,
+            speaker_rx,
+        } = endpoints();
+
+        // The engine still holds both of its ends, exactly as it would with
+        // the call running; what closed the channel is the track's `ended`
+        // handler on this side.
+        mic_tx.close();
+
+        let ending = futures_lite::future::block_on(ending(
+            async { while speaker_rx.recv().await.is_ok() {} },
+            mic_tx.closed(),
+            || true,
+        ));
+        assert_eq!(ending, CallAudioEnding::CaptureLost);
+        drop((mic_rx, speaker_tx));
     }
 
     /// A call that is running holds both ends, and neither arm may resolve —
@@ -169,6 +220,7 @@ mod tests {
                     ending(
                         async { while speaker_rx.recv().await.is_ok() {} },
                         mic_tx.closed(),
+                        || false,
                     )
                     .await,
                 )

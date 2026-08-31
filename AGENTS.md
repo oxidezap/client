@@ -2019,6 +2019,16 @@ by definition.
   call that ended from one that never started, which no single line on either
   side can. Portable and tested off the browser, because the rule is about
   channel ends rather than about devices.
+  Two things keep that evidence honest, and both are the same mistake in
+  opposite directions: attributing to the far side something this side did.
+  A microphone unplugged or revoked is closed *here*, from the track's own
+  `ended` handler, and the sender closing is the same observation either way
+  — so the capture arm asks whether that happened and reports `CaptureLost`
+  rather than blaming the engine for a device that went away. And the relay's
+  first-packet marker is set after the browser has *accepted* a send, never
+  before: a rejected send and a packet dropped for congestion both return
+  early, and either would otherwise let a channel that carried nothing be
+  released claiming it had.
 
 - **An abort drops a future where it stands, and an unpolled future leaves
   nothing behind.** The library ends work by aborting the handle its runtime

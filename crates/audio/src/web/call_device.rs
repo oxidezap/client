@@ -40,7 +40,7 @@
 //! same reason and drops from the *front*, since the oldest audio in a call
 //! is the audio nobody wants.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -244,7 +244,20 @@ pub async fn open_call_audio() -> Result<(
     // see `PLAYOUT_PRIME` for why it is not primed here.
     let playout: Rc<RefCell<VecDeque<f32>>> = Rc::new(RefCell::new(VecDeque::new()));
 
-    let graph = wire(&context, &stream, rate, mic_tx.clone(), Rc::clone(&playout))?;
+    // Raised by a track's own `ended` handler, and read by the owning task
+    // when the capture arm wins: this side closing the channel for a device
+    // that went away is otherwise indistinguishable from the engine letting
+    // the microphone go. See `crate::call_ending`.
+    let track_ended = Rc::new(Cell::new(false));
+
+    let graph = wire(
+        &context,
+        &stream,
+        rate,
+        mic_tx.clone(),
+        Rc::clone(&playout),
+        Rc::clone(&track_ended),
+    )?;
 
     // Awaited, and then checked. A context opens suspended when the page has
     // had no gesture yet, and `resume` is a promise that autoplay policy may
@@ -281,9 +294,12 @@ pub async fn open_call_audio() -> Result<(
         // ends at the instant one that ran a whole conversation does, so the
         // teardown looks identical from here and the log is the only place
         // the difference can survive. See `crate::call_ending`.
-        let ending =
-            crate::call_ending::ending(feed_playout(speaker_rx, rate, playout), mic_tx.closed())
-                .await;
+        let ending = crate::call_ending::ending(
+            feed_playout(speaker_rx, rate, playout),
+            mic_tx.closed(),
+            || track_ended.get(),
+        )
+        .await;
         debug!("the call's audio is ending: {}", ending.as_str());
         drop(graph);
     });
@@ -410,6 +426,7 @@ fn wire(
     rate: u32,
     mic: async_channel::Sender<Vec<i16>>,
     playout: Rc<RefCell<VecDeque<f32>>>,
+    track_ended: Rc<Cell<bool>>,
 ) -> Result<Graph> {
     // Taken before the capture callback moves the sender in; see the tracks'
     // `ended` handlers at the end of this function.
@@ -531,8 +548,12 @@ fn wire(
         .filter_map(|track| track.dyn_into::<web_sys::MediaStreamTrack>().ok())
         .map(|track| {
             let mic = ended_mic.clone();
+            let ended_locally = Rc::clone(&track_ended);
             let ended = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
                 warn!("the call's microphone ended: its track stopped");
+                // Before the close, because closing is what wakes the arm
+                // that reads it.
+                ended_locally.set(true);
                 mic.close();
             });
             track.set_onended(Some(ended.as_ref().unchecked_ref()));

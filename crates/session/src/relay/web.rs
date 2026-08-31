@@ -328,14 +328,6 @@ impl Inbound {
 #[async_trait(?Send)]
 impl RelayTransport for BrowserRelayChannel {
     async fn send(&self, data: Bytes) -> Result<()> {
-        // The first one, and only the first: whether the driver ever reached
-        // the transport is the question a teardown with no error in it turns
-        // on. A call that opens its relay and then ends without a single
-        // outbound packet did not lose its media — it never started, and the
-        // driver returned before asking the transport for anything.
-        if !self.sent_any.replace(true) {
-            debug!("voip: the relay channel carried its first outbound packet");
-        }
         // `send_with_u8_array` copies into the channel's own buffer and
         // returns: it is not backpressure, and a channel configured
         // `maxRetransmits: 0` still queues locally when SCTP cannot get the
@@ -377,7 +369,18 @@ impl RelayTransport for BrowserRelayChannel {
         }
         self.channel
             .send_with_u8_array(&data)
-            .map_err(|e| anyhow!("relay channel send failed: {}", describe(&e)))
+            .map_err(|e| anyhow!("relay channel send failed: {}", describe(&e)))?;
+        // Marked *here*, and nowhere earlier: the question this answers is
+        // whether the driver ever got a packet onto the transport, so a send
+        // the browser rejected and a packet this side dropped for congestion
+        // both have to leave it unset — either would otherwise let a channel
+        // that carried nothing be released claiming it had. The first one,
+        // and only the first: at a call's frame rate the rest is a line per
+        // 20ms.
+        if !self.sent_any.replace(true) {
+            debug!("voip: the relay channel carried its first outbound packet");
+        }
+        Ok(())
     }
 
     async fn disconnect(&self) {
