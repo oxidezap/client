@@ -254,6 +254,46 @@ Because profile settings only apply from the workspace root, the per-package
 `opt-level` sweep in the library's own manifest is *not* inherited, so the release
 profile here repeats it deliberately.
 
+## What CI actually costs
+
+A repository gets 10 GB of Actions cache, and GitHub evicts the least recently
+used entry to stay under it. That number, not any compiler setting, is what
+decides how long a pull request waits: a job that restores its cache spends a
+minute on the download and then a minute compiling, and the same job that finds
+nothing spends eight compiling from scratch. The Windows `Check` job has been
+observed at 3m49 with a cache and 12m26 without it, twenty minutes apart.
+
+So the budget is a shared resource with a fixed size, and every `save-if` in
+these workflows is a claim on it. Two rules follow, and both are already in the
+files:
+
+- **Only `main` writes.** A pull request restores and never saves, or every
+  branch would push out the one entry every other branch restores from.
+- **A job that is nobody's critical path does not cache a target directory.**
+  The five entries the other workflows write come to 8 GB of the 10 —
+  2.17 GB for the Linux `Check`, 2.07 for Windows, 1.64 for macOS, 0.87 for
+  MSRV, 1.14 for `pages-wasm`, each read off its own upload log — and
+  `build.yml` wrote three more on top, one release target directory per
+  platform under fat LTO. There is no version of that which fits, so it keeps
+  the registry and the git checkouts (`cache-targets: false`) and recompiles
+  the rest. Its Windows job was spending 9m15 of a 17m45 run moving that cache
+  around (2m05 down, 7m10 up), which is the shape of the thing being given up.
+
+The other half is how big an entry is, because the download and the upload are
+themselves a minute each. What rust-cache stores is the *dependencies* — it
+prunes the workspace's own artifacts before saving — so the lever is what a
+dependency compiles to rather than what our crates compile to. Dependencies
+carry no debug information (`[profile.dev.package."*"]`, and `build-override`
+for the host-compiled half of them, which is where the proc macros are), which
+is why they can: nobody sets a breakpoint in diesel, and `panic::Location` is
+compiled in regardless, so panics still name their file and line. It is a
+third off what CI compresses and a third off what it downloads, and it is not
+a trade against build time — DWARF is work to emit and work to link, so the
+cold local build got 12% faster too. The manifest carries the table.
+
+Raising the 10 GB limit is possible on a paid plan and would be another answer
+to the same problem. Nothing here needs it yet.
+
 ## Gotchas
 
 - **The platform split lives in exactly two places.** `ipc/endpoint/` is the

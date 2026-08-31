@@ -59,6 +59,24 @@ jobs:
     # take down.
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
+    # On this job and not on the workflow, which is the distinction the note
+    # over `publish` is about. Cancelling a *build* costs nothing anyone
+    # wanted: a second push to a branch has already made the first bundle
+    # obsolete, and the run that would have published it is one `publish`
+    # stands down from anyway, by asking whether the head has moved. What must
+    # never be cancelled is `take-down`, which a pull request fires exactly
+    # once and which is the only thing that removes a preview — and it does not
+    # depend on this job, so nothing here can reach it.
+    #
+    # Worth the guard rather than left to the still-current check downstream:
+    # this build is a nightly toolchain rebuilding `std` with `-Z build-std`
+    # and then optimizing a 28 MiB module, which is the longest single job in
+    # the repository. Finding out at the end that it was superseded four
+    # minutes in is a runner held for nothing, on the one job in this
+    # repository where "nothing" is measured in double-digit minutes.
+    concurrency:
+      group: pages-build-${{ github.ref }}
+      cancel-in-progress: true
     permissions:
       contents: read
     steps:

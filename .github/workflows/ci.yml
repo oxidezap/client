@@ -48,7 +48,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libxkbcommon-dev \
+          # `--no-install-recommends`: what these headers recommend is
+          # documentation and tooling nothing links against, and it is a
+          # download and an unpack on every run of every job that needs them.
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libwayland-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig1-dev libfreetype6-dev
