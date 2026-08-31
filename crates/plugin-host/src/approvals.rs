@@ -117,13 +117,26 @@ impl Approvals {
     pub fn rebind(&self, store: Arc<dyn Backing>) {
         let keeps = store.keeps_answers();
         let mut granted = self.lock();
-        *self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = store;
+        let kept = {
+            let mut held = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let was = held.keeps_answers();
+            *held = store;
+            was
+        };
         if keeps {
             self.flush(&granted);
-        } else if !granted.is_empty() {
+        } else if kept && !granted.is_empty() {
+            // Only on the way *down*. What has to be forgotten is an answer
+            // given against a directory that has since been refused — the
+            // grant outliving the trust it was recorded under. A host that
+            // never had a directory is a different sentence: it may still be
+            // told yes, and that answer holds for this session, which is
+            // exactly what the refusal promises. Clearing on every rebind
+            // took those away too, so a reload silently revoked everything
+            // somebody had allowed since the daemon started.
             log::warn!(
                 "plugin permissions can no longer be recorded; every plugin is unapproved \
                  until it is allowed again"

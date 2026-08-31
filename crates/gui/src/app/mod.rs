@@ -927,6 +927,19 @@ impl WhatsAppApp {
                     // both correct and no more work than merging.
                     FromDaemon::Plugins(plugins) => entity.update(cx, |app, cx| {
                         app.plugins = plugins;
+                        // And the folder, which this window only ever read
+                        // after its *own* install or removal. The set moving
+                        // is the one signal that somebody else changed it —
+                        // another tab of this origin, or a reload of a
+                        // desktop daemon's directory — and a listing captured
+                        // when Settings opened labels a plugin somebody just
+                        // added as "Removed" and leaves a phantom "Not
+                        // loaded" row where one was taken away. Cheap enough
+                        // to ask for: the daemon publishes nothing when the
+                        // set has not moved, so this is one read per real
+                        // change, and it answers `None` on a front end with
+                        // no folder of its own.
+                        app.refresh_installed_plugins(cx);
                         cx.notify();
                     }),
                     // Announced on connect, before this window existed, so it

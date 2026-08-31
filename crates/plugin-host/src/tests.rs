@@ -3584,3 +3584,30 @@ fn a_reload_onto_a_store_that_cannot_keep_answers_forgets_them() {
         "and it is drawn as waiting to be allowed again"
     );
 }
+
+/// A reload that unwinds gives the slot back.
+///
+/// Every ordinary exit could put it back itself; a panicking loader could
+/// not, and one that held it forever would leave the host unable to reload
+/// for the life of the process — every later ask setting the flag and
+/// returning with no owner left to consume it — and `shutdown` waiting for a
+/// reload that had already unwound.
+#[test]
+fn a_reload_that_panics_does_not_keep_the_slot() {
+    let dir = TempDir::new("reload-unwinds");
+    dir.plugin("survivor", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    let panicking = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        futures_lite::future::block_on(plugins.reload(|| async {
+            panic!("the loader fell over");
+        }))
+    }));
+    assert!(panicking.is_err(), "the panic is not swallowed");
+
+    // And the host is usable: this reload runs rather than being refused by a
+    // slot nobody released.
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
+    assert_eq!(plugins.ids(), vec!["survivor".to_owned()]);
+}

@@ -480,12 +480,34 @@ impl Plugins {
         Self::none(sink, Arc::new(NoCommands))
     }
 
+    /// Whether the account has gone and this host with it.
+    ///
+    /// Asked by a caller that has something irreversible to do between two of
+    /// its own awaits — a page taking a fresh storage handle, which retires
+    /// every older one — where `reload`'s own check comes too late to help.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Relaxed)
+    }
+
     /// Whatever is loaded at this instant.
     ///
     /// Cloned out from under the lock and never held across a call, for the
     /// reason [`Plugins::live`] states.
     fn live(&self) -> Arc<Live> {
         Arc::clone(&self.live.read().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// Holds the one reload slot, and gives it back however the reload ends.
+///
+/// A guard rather than a store at each exit, for the one exit that cannot
+/// have a store: an unwind. See [`Plugins::reload`].
+struct Reservation<'a>(&'a AtomicBool);
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -623,7 +645,20 @@ async fn generation(
                     continue;
                 }
             };
-            let granted = Arc::new(AtomicI64::new(registry.approved(&id)));
+            // A reload's workers start with nothing, and are handed the
+            // answers at the install. A worker begins running the moment it
+            // is loaded — its `oxi_init` may arm a timer — so one built from
+            // the mask as it stood when *it* was loaded could act on a grant
+            // withdrawn while a later module was still loading: the answer
+            // reaches the shared map and the live generation, and this set is
+            // neither until the swap. It costs nothing, because `oxi_init`
+            // may not touch the account at all — that is refused as `STATE`,
+            // not as `DENIED` — so the only calls this delays are the ones a
+            // timer makes before the install.
+            let granted = Arc::new(AtomicI64::new(match announce {
+                Announce::Now => registry.approved(&id),
+                Announce::OnInstall => 0,
+            }));
             match Runtime::load(
                 &bytes,
                 &id,
@@ -1139,6 +1174,19 @@ impl Plugins {
             log::debug!("a plugin reload is already running; another will follow it");
             return 0;
         }
+        // And released by a guard from here on. Every ordinary exit could put
+        // the slot back itself; an unwinding one could not — and a loader
+        // that panics would otherwise hold it for the life of the process:
+        // every later reload would set `reload_again` and return with no
+        // owner left to consume it, so plugins could not be recovered without
+        // restarting the daemon, and `wait_for_any_reload` would wait for a
+        // reload that had already unwound.
+        //
+        // `reload_again` is deliberately not part of it. It is a request
+        // somebody made, and the next reload consumes it at the end of its
+        // own pass; clearing it on the way out of a panic would lose the ask
+        // rather than defer it.
+        let _slot = Reservation(&self.reloading);
 
         loop {
             let Some((modules, state)) = what().await else {
@@ -1149,10 +1197,17 @@ impl Plugins {
                 // nothing having been removed and nothing to put it back.
                 // What is running stays running.
                 log::warn!("not reloading plugins: the folder could not be read");
-                let running = self.live().workers.len();
-                self.reload_again.store(false, Ordering::SeqCst);
-                self.reloading.store(false, Ordering::SeqCst);
-                return running;
+                // An ask that arrived during this scan is still owed one, and
+                // a scan that failed is not the scan it was promised. This
+                // was the one exit that dropped the flag instead of
+                // honouring it. Tried once more and no further: the retry
+                // clears the flag as it takes it, so a folder that is still
+                // unreadable ends the second time with nothing pending rather
+                // than spinning on a storage error.
+                if self.reload_again.swap(false, Ordering::SeqCst) {
+                    continue;
+                }
+                return self.live().workers.len();
             };
 
             self.live().retire();
@@ -1205,8 +1260,6 @@ impl Plugins {
 
             if !installed {
                 fresh.retire();
-                self.reload_again.store(false, Ordering::SeqCst);
-                self.reloading.store(false, Ordering::SeqCst);
                 return 0;
             }
             // Now, and not before: the whole set at once, which is also the
@@ -1218,17 +1271,12 @@ impl Plugins {
             fresh.registry.publish();
             let running = fresh.workers.len();
 
+            // An ask that arrived during this pass gets one of its own. The
+            // slot is held across the check rather than released before it,
+            // which is what makes this simple: nobody else can take it, so
+            // there is no window in which a request is refused by a reload
+            // that has already decided it is finished.
             if self.reload_again.swap(false, Ordering::SeqCst) {
-                continue;
-            }
-            self.reloading.store(false, Ordering::SeqCst);
-            // An ask that landed between those two lines set the flag and
-            // went away believing this reload would cover it. Take the slot
-            // back, unless somebody else already has — in which case theirs
-            // is the scan that covers it.
-            if self.reload_again.swap(false, Ordering::SeqCst)
-                && !self.reloading.swap(true, Ordering::SeqCst)
-            {
                 continue;
             }
             return running;
@@ -1274,16 +1322,20 @@ impl Plugins {
     /// Polled rather than signalled, deliberately: this runs once in the life
     /// of a process, has exactly one waiter, and is bounded by one module's
     /// load — a condvar would be more machinery than the thing it waits for.
-    /// The deadline is `MAX_LOAD_TIME` because that is what bounds a load, and
-    /// giving up is said out loud rather than hung on.
+    ///
+    /// And it does not give up. A deadline here was the wrong instinct twice
+    /// over: `MAX_LOAD_TIME` is checked *between* modules, so it does not
+    /// bound the open, the validation and the `oxi_init` this is most likely
+    /// to be waiting on, and returning early hands the wipe a set of workers
+    /// that are still running — which is the whole thing this exists to
+    /// prevent. It is also what the code beside it already does: `retire`
+    /// joins every worker's thread with no deadline either, because a
+    /// teardown that proceeds without them is worse than one that takes a
+    /// moment. What bounds it instead is `Reservation`, which gives the slot
+    /// back however the reload ends, an unwinding loader included.
     #[cfg(not(target_family = "wasm"))]
     fn wait_for_any_reload(&self) {
-        let deadline = Instant::now() + MAX_LOAD_TIME;
         while self.reloading.load(Ordering::SeqCst) {
-            if Instant::now() >= deadline {
-                log::warn!("a plugin reload did not stop in time; shutting down without it");
-                return;
-            }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }

@@ -99,6 +99,8 @@ pub async fn reload(plugins: &Arc<Plugins>) -> usize {
         // be installed with — every approval and settings write refused
         // afterwards, and a revoked grant left on disk to come back. A future
         // does nothing until it is polled, which is after the reservation.
+        let host = Arc::clone(plugins);
+        let plugins = &host;
         plugins
             .reload(|| async {
                 // `discover` and not `installed`: the fallible one. A folder
@@ -106,6 +108,18 @@ pub async fn reload(plugins: &Arc<Plugins>) -> usize {
                 // as one here would retire every healthy plugin and publish
                 // an empty set over a transient storage error.
                 let modules = web::discover().await.ok()?;
+                // And the host is still this account's. `ForgetSession` can
+                // land while that await is suspended, and a page rebuilds its
+                // whole service in the same agent — so by the time this
+                // resumes, a *replacement* host may already hold the newest
+                // storage handle. Taking one here would retire it, and every
+                // approval and settings write the new host makes would be
+                // refused until some later reload happened to succeed.
+                // `reload` rechecks too, but only after the stamp has moved,
+                // which is exactly too late.
+                if plugins.is_retired() {
+                    return None;
+                }
                 // And the fresh handle only once there is something to
                 // install with it: taking one retires every older handle, so
                 // a scan that failed would leave the running generation
