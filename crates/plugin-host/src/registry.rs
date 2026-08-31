@@ -135,13 +135,14 @@ impl Registry {
         self.approvals.approved(id)
     }
 
-    /// Record the user's answer and hand back the mask to give the plugin.
+    /// Record the user's answer and hand back the mask to give the plugin,
+    /// with whether it was written down.
     ///
     /// Does not publish: what a front end is shown has to follow the mask
     /// actually reaching the worker, or a window opens in which Settings says
     /// "allowed" over a plugin that would still refuse. The caller publishes
     /// once it has handed the mask over.
-    pub fn record(&self, id: &str, approved: bool) -> i64 {
+    pub fn record(&self, id: &str, approved: bool) -> (i64, bool) {
         let requested = self.lock().get(id).map_or(0, |e| e.requested);
         self.approvals.set(id, requested, approved)
     }
@@ -347,13 +348,13 @@ mod tests {
     fn approving_leaves_the_request_visible() {
         let (registry, _) = recorder();
         registry.insert("p", "p".into(), abi::caps::SEND);
-        assert_eq!(registry.record("p", true), abi::caps::SEND);
+        assert_eq!(registry.record("p", true), (abi::caps::SEND, true));
 
         let surface = registry.surfaces().remove(0);
         assert!(surface.approved);
         assert_eq!(surface.capabilities, vec!["send messages".to_string()]);
 
-        assert_eq!(registry.record("p", false), 0);
+        assert_eq!(registry.record("p", false), (0, true));
         assert!(!registry.surfaces()[0].approved);
     }
 

@@ -181,14 +181,23 @@ impl Approvals {
         self.lock().get(id).copied().unwrap_or(0)
     }
 
-    /// Record the user's answer, and return the mask to hand the plugin.
+    /// Record the user's answer, and return the mask to hand the plugin
+    /// along with whether it was written down.
+    ///
+    /// Both halves, because they can disagree and the caller is answering
+    /// somebody: a grant the store refused is rolled back and the plugin is
+    /// left unapproved, so acknowledging it as recorded tells a window that a
+    /// permission was given which nothing here holds and nothing will read
+    /// back. A withdrawal keeps its effect whatever the store did — that is
+    /// what failing closed means — and still answers `false`, because what
+    /// failed is the memory of it and the next start is where that shows.
     ///
     /// The lock is held across the change *and* the write, so what reaches
     /// the file is what was decided last. Releasing it in between let two
     /// clients' answers land out of order — an older grant finishing after a
     /// newer revocation would leave the running daemon revoked and the file
     /// saying the opposite, so the next start handed the capability back.
-    pub fn set(&self, id: &str, requested: i64, approved: bool) -> i64 {
+    pub fn set(&self, id: &str, requested: i64, approved: bool) -> (i64, bool) {
         let agreed = requested & abi::caps::NEEDS_APPROVAL;
         let mut granted = self.lock();
         let before = granted.get(id).copied();
@@ -197,7 +206,8 @@ impl Approvals {
         } else {
             granted.remove(id);
         }
-        if !self.flush(&granted) && approved {
+        let stored = self.flush(&granted);
+        if !stored && approved {
             // A grant that could not be written down is not a grant. The
             // caller hands this mask straight to the running plugin, so
             // returning it would show the capability as allowed while nothing
@@ -210,9 +220,9 @@ impl Approvals {
                 Some(mask) => granted.insert(id.to_owned(), mask),
                 None => granted.remove(id),
             };
-            return granted.get(id).copied().unwrap_or(0);
+            return (granted.get(id).copied().unwrap_or(0), false);
         }
-        granted.get(id).copied().unwrap_or(0)
+        (granted.get(id).copied().unwrap_or(0), stored)
     }
 
     /// Write the whole map out.
@@ -417,7 +427,12 @@ mod tests {
         // which is the shape of any write that fails at the last step.
         std::fs::remove_file(dir.0.join("approvals.json")).expect("writable");
         std::fs::create_dir(dir.0.join("approvals.json")).expect("writable");
-        a.set("autoreply", abi::caps::SEND, false);
+        let (mask, stored) = a.set("autoreply", abi::caps::SEND, false);
+        assert_eq!(mask, 0, "the withdrawal takes effect whatever the disk did");
+        assert!(
+            !stored,
+            "and is still answered as unrecorded: what failed is the memory of it"
+        );
 
         let reread = Approvals::open(files(&dir.0));
         assert_eq!(
@@ -439,8 +454,8 @@ mod tests {
 
         assert_eq!(
             a.set("autoreply", abi::caps::SEND, true),
-            0,
-            "nothing was recorded, so nothing is allowed"
+            (0, false),
+            "nothing was recorded, so nothing is allowed and the caller is told"
         );
         assert!(!a.is_approved("autoreply", abi::caps::SEND));
     }

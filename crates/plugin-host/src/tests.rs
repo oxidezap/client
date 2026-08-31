@@ -3256,6 +3256,47 @@ fn a_reload_that_finds_nothing_publishes_the_empty_set() {
     );
 }
 
+/// An answer nothing could write down is not an answer.
+///
+/// The caller is a front end waiting to be told whether the permission it
+/// asked for was given, and `Approvals::set` fails closed — a grant it cannot
+/// store is rolled back and the plugin is left unapproved. Reporting that as
+/// recorded acknowledges a permission nothing here holds and nothing will
+/// read back, which is the one direction this must never get wrong: a window
+/// that was told "yes" over a plugin that is still refusing.
+///
+/// Not a browser-only fact, which is where it was reported: the desktop half
+/// discarded the same answer, and this is the desktop half.
+#[test]
+fn a_grant_the_store_refuses_is_not_acknowledged() {
+    let dir = TempDir::new("grant-unrecordable");
+    let state = TempDir::new("grant-unrecordable-state");
+    dir.plugin("asks", &draws());
+    let published = Published::default();
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state.0),
+        Arc::new(Recorder::new(Outcome::Accepted)),
+        published.sink(),
+    );
+    published.settles("the plugin", |set| set.iter().any(|p| p.id == "asks"));
+
+    // A directory where the file has to go, so the rename at the end of the
+    // write cannot land — the shape of a quota, a read-only disk, or a
+    // browsing context with no storage at all.
+    std::fs::create_dir(state.0.join("approvals.json")).expect("writable");
+
+    assert!(
+        !plugins.approve("asks", true),
+        "a grant that could not be written down is not one to acknowledge"
+    );
+    let set = published.latest();
+    assert!(
+        set.iter().any(|p| p.id == "asks" && !p.approved),
+        "and it is still drawn as waiting to be allowed"
+    );
+}
+
 /// What the user answered is not a property of the plugin that was running.
 ///
 /// It is written down against the id and the mask, so the generation that

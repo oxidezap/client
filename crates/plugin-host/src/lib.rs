@@ -1083,9 +1083,12 @@ impl Live {
     /// Persisted before it is applied, because the answer has to survive a
     /// restart: a plugin re-granted on every start would be one whose
     /// permission prompt means nothing.
-    fn approve(&self, id: &str, approved: bool) {
+    fn approve(&self, id: &str, approved: bool) -> bool {
         let Some(worker) = self.workers.iter().find(|w| w.id == id) else {
-            return;
+            // Nothing to answer for. A module that failed to load has no
+            // worker, so an answer about it records nothing and is not one to
+            // acknowledge.
+            return false;
         };
         // One ordered step, because these are two answers to the same
         // question and they must not be able to disagree. Two clients acting
@@ -1100,10 +1103,10 @@ impl Live {
             // publishing first left a window in which a front end reacting to
             // its own frame could press a button the plugin would refuse,
             // because the mask reaching it is a separate step.
-            worker
-                .granted
-                .store(self.registry.record(id, true), Ordering::Relaxed);
+            let (mask, stored) = self.registry.record(id, true);
+            worker.granted.store(mask, Ordering::Relaxed);
             self.registry.publish();
+            stored
         } else {
             // A withdrawal is the other way round, and for the same reason:
             // fail closed. `Registry::approve` writes a file and publishes a
@@ -1113,8 +1116,9 @@ impl Live {
             // first costs nothing if the write then fails, because the write
             // failing removes the file rather than leaving the grant.
             worker.granted.store(0, Ordering::Relaxed);
-            self.registry.record(id, false);
+            let (_, stored) = self.registry.record(id, false);
             self.registry.publish();
+            stored
         }
     }
 
@@ -1261,7 +1265,9 @@ impl Plugins {
     /// longer running — leaving the shared map revoked and the live plugin
     /// still holding its grant, which is the failure this whole path exists
     /// to make impossible.
-    pub fn approve(&self, id: &str, approved: bool) {
+    /// Answers whether the answer was recorded — see [`Approvals::set`],
+    /// which is what can say no.
+    pub fn approve(&self, id: &str, approved: bool) -> bool {
         // Not once the host is going. The IPC server keeps answering requests
         // while the session tears down, so a `PluginApproval` arriving then
         // could write a fresh `approvals.json` *after* the account reset had
@@ -1270,7 +1276,7 @@ impl Plugins {
         // does anything else.
         if self.retired.load(Ordering::Relaxed) {
             log::warn!("plugin {id}: refusing an approval; the host is shutting down");
-            return;
+            return false;
         }
         let _order = lock(&self.approving);
         // And again, now that the lock is held. Reading it only before was a
@@ -1279,9 +1285,9 @@ impl Plugins {
         // approval the account reset had already declared gone.
         if self.retired.load(Ordering::Relaxed) {
             log::warn!("plugin {id}: refusing an approval; the host is shutting down");
-            return;
+            return false;
         }
-        self.live().approve(id, approved);
+        self.live().approve(id, approved)
     }
 
     /// Replace every running plugin with what `modules` holds now.

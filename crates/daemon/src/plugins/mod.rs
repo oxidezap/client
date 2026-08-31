@@ -203,9 +203,12 @@ pub fn reload_in_background(plugins: &Arc<Plugins>) {
 /// a panic — "there is no reactor running" — so approving a plugin in the
 /// browser has never once worked.
 ///
-/// Answers whether it was recorded. `false` is the thread that was writing it
-/// having panicked — the caller refuses the request rather than acknowledging
-/// a permission the disk never received.
+/// Answers whether it was recorded, and the caller refuses the request rather
+/// than acknowledging a permission nothing holds. Two ways to answer `false`,
+/// and neither used to be said: the store refusing the write — a quota, a
+/// browsing context with no `localStorage`, a disk — where a *grant* is then
+/// rolled back and the plugin is left unapproved, and the thread that was
+/// writing it having panicked.
 pub async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> bool {
     #[cfg(target_family = "wasm")]
     {
@@ -214,8 +217,7 @@ pub async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> 
         // it, since a browser agent is one thread. What this costs is the
         // write itself, which is a `localStorage` set: the same call a
         // plugin's own settings already make from inside a wasm call.
-        plugins.approve(&plugin, approved);
-        true
+        plugins.approve(&plugin, approved)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -226,7 +228,7 @@ pub async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> 
         // Settings drawing a state nothing had recorded and no line in the
         // log.
         match tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved)).await {
-            Ok(()) => true,
+            Ok(recorded) => recorded,
             Err(e) => {
                 log::error!("recording a plugin approval failed: {e}");
                 false
