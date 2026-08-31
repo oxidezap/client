@@ -874,13 +874,57 @@ to the same problem. Nothing here needs it yet.
   `--cargo-profile`. `opt-level = "s"` there was measured at 31% of the module
   — by a wide margin the largest single thing in it, larger than every crate
   gate put together. `gpui` is the one exception at 3: it draws every frame
-  and is the largest crate here. Package overrides do *not* inherit through
-  `inherits`, so the ones that reach this graph are repeated rather than
-  borrowed from the desktop sweep — which names `ureq`, `zbus`, `wayland-*`
-  and `libsqlite3-sys`, almost none of which are compiled for wasm at all.
+  and is the largest crate here — and it has to be named there, because a
+  profile replaces its parent's *base* setting, so a crate the sweep does not
+  mention is at "s" here and at "3" on the desktop. Package overrides, on the
+  other hand, **do** inherit through `inherits`: cargo merges the parent's
+  package table into the child's and lets the child's entries win. This file
+  and the manifest both said the opposite for a long time, and the table under
+  `[profile.web]` had grown to 46 entries of which 39 were repeating the
+  desktop sweep and doing nothing. Reproduced rather than reasoned about, on
+  cargo 1.98: `cargo build -p url --profile web --target
+  wasm32-unknown-unknown -v` compiles `url` at `z`, the level
+  `[profile.release.package.url]` names, under a profile whose own base is "s"
+  and whose table does not mention it. (`-p` takes any package in the resolve
+  graph, not only a workspace member, which is what makes that a two-second
+  check rather than a build of the window; it needs
+  `rustup target add wasm32-unknown-unknown` on whatever toolchain runs it.) So `[profile.web]` holds the
+  differences and nothing else, and the desktop sweep — `ureq`, `zbus`,
+  `wayland-*`, `libsqlite3-sys` — costs this graph nothing where it names
+  crates that are not compiled for wasm at all.
   Two ways in that look like they should work and do not:
   `CARGO_PROFILE_RELEASE_PACKAGE_<NAME>_OPT_LEVEL` is silently ignored, and
   `--config`, which is not, is not something trunk can forward.
+- **A size override is worth what a crate weighs *after* LTO.** Which is not
+  what it weighs in the sweep, and the two are not even correlated — so the
+  order is measure, then decide, and `cargo bloat --crates` against a build
+  with `CARGO_PROFILE_RELEASE_STRIP=none` is the whole of the first half.
+  Measured on this tree: taking every image format `gpui` turns on that
+  nothing here can hand it — EXR, TIFF, QOI and the colour management behind
+  them — from the profile's setting down to `z` was worth 43 KB of a 22 MB
+  module, because fat LTO had already removed nearly all of it and what is
+  left is *data* that no optimization level shrinks (`exr`'s DWA transfer
+  curve is 131,076 bytes of it, in the window's `.data`). Which format is
+  reachable is a question to answer from `utils::mime_to_image_format` rather
+  than from the crate's name: a decoder is *named* there, not sniffed for, and
+  GIF is one of the six names it can answer with — so `gif` belongs with the
+  codecs kept at `s`, and the first draft of this had it in the list above.
+  Which is the smaller half of the lesson. The larger one is that "only X
+  reaches this crate" is a claim about the dependency graph, and
+  `cargo tree -p <bin> -i <crate>` answers it in a second — where reading the
+  crate's name and imagining its callers gets it wrong about a third of the
+  time. Every "reached only by" in this manifest was written that way once,
+  and four were false: `gif` is decoded here; `rayon` is `sum_tree`'s as well
+  as the decoders'; `aho-corasick` is a *direct* dependency of `gpui-base`,
+  whose editor search builds one as a person types; and `moxcms` is reached
+  from `image` itself for any picture carrying an ICC profile. Ask the graph
+  before writing the sentence. Taking `waproto`
+  and `buffa` from `3` to `z` was worth 1.4 MB of the daemon, because
+  generated protobuf survives LTO in full: it is reachable, it is enormous —
+  four separate 72 KiB copies of `Message::clone` among the largest functions
+  in the binary — and none of it is in a loop. The cold-and-obvious crate is
+  usually already gone; the one worth finding is large, reachable, and
+  called once per stanza rather than once per frame.
 - **The page has a third heap, and it is the size of the account.** The
   relaxed-idb VFS holds `HashMap<usize, Uint8Array>` — the whole database,
   resident in the *JavaScript* heap, one 8 KiB page per entry, kept alive
