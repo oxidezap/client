@@ -187,14 +187,20 @@ async fn a_name_that_is_not_an_id_is_refused() {
 /// `Plugins::nothing_loaded` is enough to say it. What panicked was the dispatch, not
 /// the write, so a host with nothing loaded reproduces it exactly and needs
 /// no OPFS module, no session and no approval to record.
+///
+/// Which is also why the answer here is `false` rather than `true`, and why
+/// that is the same assertion: there is no plugin by that name, so nothing
+/// was recorded and nothing should be acknowledged. What is being pinned is
+/// that the call *returns at all* — it used to panic and take the connection
+/// with it — and a panic fails this test whatever it would have answered.
 #[wasm_bindgen_test]
 async fn approving_a_plugin_does_not_need_a_blocking_pool() {
     let host = std::sync::Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(
         std::sync::Arc::new(|_| {}),
     ));
     assert!(
-        super::super::approve(&host, "nothing-loaded".to_owned(), true).await,
-        "a page records approvals inline"
+        !super::super::approve(&host, "nothing-loaded".to_owned(), true).await,
+        "a page answers inline, and an answer about a plugin that is not there records nothing"
     );
 }
 
