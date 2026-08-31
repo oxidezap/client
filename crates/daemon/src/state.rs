@@ -405,7 +405,7 @@ impl StateHub {
         if unchanged {
             return;
         }
-        self.apply(Change::live(DaemonEvent::PluginsChanged(plugins)));
+        self.apply(Change::live(DaemonEvent::PluginsChanged { plugins }));
     }
 
     /// Change what is happening on the call front, and tell everyone.
@@ -616,7 +616,7 @@ impl StateHub {
                 DaemonEvent::AccountChanged(account) => {
                     inner.account = Some(account.clone());
                 }
-                DaemonEvent::PluginsChanged(plugins) => inner.plugins = plugins.clone(),
+                DaemonEvent::PluginsChanged { plugins } => inner.plugins = plugins.clone(),
             }
 
             let order = self

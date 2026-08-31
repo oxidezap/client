@@ -284,7 +284,21 @@ pub enum DaemonEvent {
     /// not a snapshot of the set, and a front end that had to merge deltas
     /// would be a second implementation of what the registry already holds.
     /// The set is small and changes when a person flips a toggle.
-    PluginsChanged(Vec<PluginSurface>),
+    ///
+    /// A named field rather than a newtype, and that is the whole of a bug
+    /// rather than a matter of taste: this enum is *internally tagged*, and
+    /// serde cannot write a tagged newtype variant whose payload is a
+    /// sequence — there is nowhere to put `"event"` beside a JSON array. So
+    /// every one of these frames failed at `to_string` and was dropped, from
+    /// the version that introduced plugins until this one. The other newtype
+    /// variants here are all structs, which serialize as maps and have a
+    /// place for the tag; a `Vec` is the one shape that does not. Adding a
+    /// variant to a tagged enum therefore asks a question that has to be
+    /// answered by serializing it, which is what
+    /// `every_daemon_event_survives_the_wire` now does for all of them.
+    PluginsChanged {
+        plugins: Vec<PluginSurface>,
+    },
 }
 
 /// A daemon-to-client frame.
@@ -820,6 +834,87 @@ mod tests {
             snapshot.chats[1].has_unread(),
             "the row itself still has one; it is drawn on its own screen"
         );
+    }
+
+    /// Every event, written and read back.
+    ///
+    /// The test that was missing, and the bug it exists for shipped: this
+    /// enum is internally tagged, and serde refuses a tagged newtype variant
+    /// whose payload is a sequence — so `PluginsChanged(Vec<_>)` failed at
+    /// `to_string` every single time and the daemon dropped the frame. What
+    /// made it invisible is that the type-checker has nothing to say about
+    /// it, the frame is built and dropped inside the hub with a log line
+    /// nobody reads, and the *snapshot* carries the same set — so a window
+    /// that attached after a change saw the right thing and only a change
+    /// made while it watched was lost. Which is exactly the case a person
+    /// hits: approving a plugin recorded the answer, republished the set,
+    /// and drew nothing, so the switch flipped back and the plugin could not
+    /// be enabled.
+    ///
+    /// Written as a match over a constructed value of every variant rather
+    /// than a list of samples, because the point is to fail when somebody
+    /// adds the next one: a new variant makes this stop compiling, and the
+    /// only way to satisfy it is to serialize the thing.
+    #[test]
+    fn every_daemon_event_survives_the_wire() {
+        let surface = PluginSurface {
+            id: "autoreply".into(),
+            name: "Autoreply".into(),
+            capabilities: vec!["send messages".into()],
+            gated: vec!["send messages".into()],
+            approved: false,
+            stopped: None,
+            roots: Vec::new(),
+        };
+        let events = vec![
+            DaemonEvent::ConnectionChanged(ConnectionState::Connected),
+            DaemonEvent::ChatUpdated(ChatSummary {
+                jid: "559900000001@s.whatsapp.net".into(),
+                name: "quem quer que seja".into(),
+                unread: 0,
+                manually_unread: false,
+                last_message: None,
+            }),
+            DaemonEvent::ChatRemoved {
+                jid: "559900000001@s.whatsapp.net".into(),
+            },
+            DaemonEvent::CallsChanged(CallState::default()),
+            DaemonEvent::AccountChanged(AccountIdentity::default()),
+            // The one that could not be written. Not an empty vector: an
+            // empty sequence is still a sequence, so it fails identically,
+            // but a set with something in it is what a front end has to be
+            // able to draw.
+            DaemonEvent::PluginsChanged {
+                plugins: vec![surface],
+            },
+        ];
+
+        // And the exhaustiveness, so a variant added later cannot skip this.
+        for event in &events {
+            match event {
+                DaemonEvent::ConnectionChanged(_)
+                | DaemonEvent::ChatUpdated(_)
+                | DaemonEvent::ChatRemoved { .. }
+                | DaemonEvent::CallsChanged(_)
+                | DaemonEvent::AccountChanged(_)
+                | DaemonEvent::PluginsChanged { .. } => {}
+            }
+        }
+
+        for event in events {
+            // Inside the frame it actually travels in, because that is one
+            // more tagged enum around it and the nesting is where this kind
+            // of refusal lives.
+            let frame = DaemonMessage::Update {
+                version: StateVersion::INITIAL,
+                event: event.clone(),
+            };
+            let line = serde_json::to_string(&frame)
+                .unwrap_or_else(|e| panic!("{event:?} cannot be written: {e}"));
+            let back: DaemonMessage = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("{event:?} cannot be read back: {e}"));
+            assert_eq!(back, frame, "{event:?} did not survive the round trip");
+        }
     }
 
     /// A page is asked for with a cursor and answered with the next one, and
