@@ -514,6 +514,34 @@ impl WhatsAppClient {
             shutdown,
             reload,
         } = shared;
+        // A cold start is the phases below, with an `.await` between each
+        // pair — and on a page that is not the pause it looks like. A future
+        // that is already ready resolves inside the microtask it was polled
+        // in, and every await here is ready on that target: the asynchrony is
+        // the desktop runtime's, and SQLite in a page is synchronous. So the
+        // whole run lands as *one* block on the thread that draws. Measured on
+        // the published page: 342ms with not one frame in it, between a window
+        // that was animating before it and animating after.
+        //
+        // Hence a turn for the loop between phases, and a stopwatch on each.
+        // Neither makes the work cheaper — the totals are the same totals, and
+        // what would make them smaller is moving the session off the window's
+        // agent altogether. What this does is stop one freeze being the shape
+        // of it, and name where a page's first second goes at all: the module
+        // is stripped, so a flame graph of it names nothing. A turn is an
+        // *opportunity* to draw rather than a promise of one — the browser
+        // decides whether a rendering pass fits between two tasks — which is
+        // the honest claim and still the difference between five chances and
+        // none.
+        //
+        // What a turn does not open is a teardown racing this. It lets the
+        // bridge's loop run, so a `ForgetSession` can be accepted while the
+        // store is still opening — but that was already true at `prepare`,
+        // which really does await the browser, and what would make it
+        // dangerous is ordered elsewhere: `close` raises the shutdown and
+        // *joins the executor*, so a wipe waits for this future to return and
+        // the forget path is gated on whether it did.
+        let cold_start = wacore::time::Instant::now();
         // Whatever this platform has to do before a database can be opened
         // at all. Here rather than at the caller, because forgetting it is
         // not a failure anybody would see: a browser without its VFS opens a
@@ -524,6 +552,8 @@ impl WhatsAppClient {
             let _ = ui_tx.send(UiEvent::Error(format!("Database error: {e}")));
             return;
         }
+        let prepared = cold_start.elapsed();
+        crate::exec::breathe().await;
         // Device store + durable chat history share one SQLite file (one pool,
         // one WAL writer).
         let db_path = match crate::exec::unblock(resolve_database_path).await {
@@ -534,7 +564,7 @@ impl WhatsAppClient {
                 return;
             }
         };
-        info!("Opening data database");
+        let opening = wacore::time::Instant::now();
         let backend = match SqliteStore::with_config(&db_path, store_settings()).await {
             Ok(store) => store,
             Err(e) => {
@@ -548,6 +578,10 @@ impl WhatsAppClient {
                 return;
             }
         };
+        let opened = opening.elapsed();
+        crate::exec::breathe().await;
+
+        let materializing = wacore::time::Instant::now();
         let chat_store = match ChatStore::new(&backend).await {
             Ok(store) => store,
             Err(e) => {
@@ -556,11 +590,11 @@ impl WhatsAppClient {
                 return;
             }
         };
+        let materialized = materializing.elapsed();
         {
             let mut guard = chat_store_handle.lock().await;
             *guard = Some(chat_store.clone());
         }
-        info!("SQLite backend + chat store initialized.");
 
         // One book for the whole session, so a live bubble, the row it lands
         // in and the typing line above it are all naming the same person from
@@ -572,6 +606,11 @@ impl WhatsAppClient {
             let mut guard = names_handle.lock().await;
             *guard = Some(names.clone());
         }
+        // After *both* handles, not between them. A yield is a place other
+        // tasks run, and a paged read is one of them: it wants the store and
+        // the book together, and the gap that publishing them either side of
+        // a yield would open is the one thing this change must not add.
+        crate::exec::breathe().await;
 
         // Transport, HTTP client and runtime come from whichever platform
         // this is: the library's default features on a desktop, `web-sys`
@@ -587,6 +626,7 @@ impl WhatsAppClient {
         // worse than redundant: `with_version` is an override, and an
         // override makes the library skip its own resolution *and* the
         // day-long cache stamp behind it.
+        let building = wacore::time::Instant::now();
         let builder = crate::net::with_platform_plugins(Bot::builder()).with_backend(backend);
         let bot = match builder.build().await {
             Ok(bot) => bot,
@@ -601,21 +641,35 @@ impl WhatsAppClient {
         // anything can ring. Nothing on a desktop, where the library's own UDP
         // dialler is the default and is right; on a page it is the whole
         // reason a call can be placed at all. See `crate::relay`.
+        let built = building.elapsed();
+        crate::exec::breathe().await;
+
         crate::relay::install(&bot.client());
 
         // Hydrate the UI from durable history before the network is even up
         // (bot.run() is what connects). The client is needed here so hydrated
         // JIDs normalize through the same PN->LID mapping live events use.
+        let hydrating = wacore::time::Instant::now();
+        let mut hydrated = 0;
         match Self::load_history(&chat_store, &bot.client(), &names).await {
             Ok(loaded) if !loaded.chats.is_empty() => {
-                // The one hydration worth an info line: the reloads that
-                // follow are routine and say so at debug.
-                info!("Hydrated {} chats from durable history", loaded.chats.len());
+                hydrated = loaded.chats.len();
                 let _ = ui_tx.send(loaded.into_event());
             }
             Ok(_) => {}
             Err(e) => warn!("Failed to load chat history: {e}"),
         }
+        // One line rather than five, and at `info` because a cold start
+        // happens once: this is the only place the page's first second is
+        // attributable at all, and the numbers are what any change to it has
+        // to be argued against.
+        info!(
+            "cold start: store {prepared:?}, sqlite {opened:?}, chats {materialized:?}, \
+             client {built:?}, hydration {:?} ({hydrated} chats) — {:?} in total",
+            hydrating.elapsed(),
+            cold_start.elapsed(),
+        );
+        crate::exec::breathe().await;
 
         // The chat store materializes history straight off the event bus.
         // detach: the store materializes for the whole session, so the

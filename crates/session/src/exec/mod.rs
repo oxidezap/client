@@ -34,7 +34,9 @@ mod platform;
 /// platform". That the crate *compiles* for the target says nothing about the
 /// timer running on it — a distinction only running the page can make, and it
 /// made it.
-pub use platform::{Executor, Task, let_go, sleep, spawn, spawn_owned, unblock, with_timeout};
+pub use platform::{
+    Executor, Task, breathe, let_go, sleep, spawn, spawn_owned, unblock, with_timeout,
+};
 
 /// [`Send`], where the platform's executor asks for it.
 ///

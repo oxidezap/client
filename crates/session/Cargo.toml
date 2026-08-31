@@ -11,6 +11,11 @@ repository.workspace = true
 [dependencies]
 async-channel = "2"
 log = { workspace = true }
+# The clock, for the cold-start stopwatch in `whatsapp::run_client`. Already
+# in this graph through `whatsapp-rust`; named here because `clippy.toml`
+# disallows `std::time::Instant::now`, and rightly — it does not exist on the
+# target that measurement is about.
+wacore = { workspace = true }
 
 oxidezap-audio = { workspace = true }
 oxidezap-chat-store = { workspace = true, features = ["search"] }
@@ -75,7 +80,9 @@ web-sys = { version = "0.3", features = [
     "CloseEvent",
     "Event",
     "Headers",
+    "MessageChannel",
     "MessageEvent",
+    "MessagePort",
     "Navigator",
     "Request",
     "RequestInit",
