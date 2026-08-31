@@ -75,12 +75,21 @@ const MIC_DEPTH: usize = 4;
 /// into audio arriving from the past.
 const PLAYOUT_CEILING: usize = 24_000;
 
-/// How much silence the ring is primed with before playout starts.
+/// How much silence is put in front of the peer's first frame.
 ///
 /// The callback runs on a strict clock and the network does not, so a ring
 /// that starts empty emits a gap on its very first callback and then again on
 /// every packet that is a moment late. 60 ms is one frame of headroom, paid
 /// once.
+///
+/// Added when that first frame arrives rather than when the graph is built,
+/// and the difference is the whole of the headroom. `resume` happens here;
+/// signalling and relay setup happen after, and they take far longer than
+/// 60 ms — so a ring primed at construction is one the callback has already
+/// drained to nothing by the time there is anything to play, leaving the
+/// first real frames with exactly the margin this exists to give them. An
+/// empty ring in the meantime costs nothing: the callback writes silence for
+/// a missing sample, which is what a call with no audio yet sounds like.
 const PLAYOUT_PRIME: usize = 60;
 
 /// What one call's audio graph keeps alive, released together.
@@ -213,12 +222,9 @@ pub async fn open_call_audio() -> Result<(
 
     let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(MIC_DEPTH);
     let (speaker_tx, speaker_rx) = async_channel::bounded::<Vec<i16>>(MIC_DEPTH * 4);
-    // Primed with one frame of silence; see `PLAYOUT_PRIME`.
-    let playout: Rc<RefCell<VecDeque<f32>>> = Rc::new(RefCell::new(VecDeque::from(vec![
-        0.0;
-        rate as usize * PLAYOUT_PRIME
-            / 1000
-    ])));
+    // Empty, and primed by `feed_playout` when the peer's first frame lands;
+    // see `PLAYOUT_PRIME` for why it is not primed here.
+    let playout: Rc<RefCell<VecDeque<f32>>> = Rc::new(RefCell::new(VecDeque::new()));
 
     let graph = wire(&context, &stream, rate, mic_tx.clone(), Rc::clone(&playout))?;
 
@@ -428,6 +434,12 @@ fn wire(
                     // same rate. Evicting the oldest is what the rest of this
                     // path does. A closed channel is the call ending, which
                     // the owning task notices for itself.
+                    //
+                    // Safe here and *not* on the camera's queue, which refuses
+                    // its newest instead: a PCM frame stands on its own, so
+                    // dropping an older one costs exactly that frame, while an
+                    // H.264 picture is referenced by the ones behind it and
+                    // evicting one makes the rest undecodable.
                     let _ = mic.force_send(frame);
                 }
             },
@@ -530,10 +542,20 @@ async fn feed_playout(
     let mut up = crate::resample::Stream::new(CALL_RATE, rate);
     let mut scratch: Vec<i16> = Vec::new();
     let mut overran = false;
+    let mut primed = false;
     while let Ok(frame) = frames.recv().await {
         scratch.clear();
         up.process(&frame, &mut scratch);
         let mut ring = playout.borrow_mut();
+        if !primed {
+            // In front of the first frame, so the headroom is there when the
+            // audio is. See `PLAYOUT_PRIME`.
+            primed = true;
+            ring.extend(std::iter::repeat_n(
+                0.0,
+                rate as usize * PLAYOUT_PRIME / 1000,
+            ));
+        }
         ring.extend(scratch.iter().map(|&s| f32::from(s) / 32768.0));
         if ring.len() > PLAYOUT_CEILING {
             // The callback is not draining — a suspended context, or a tab

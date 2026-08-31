@@ -1764,6 +1764,41 @@ by definition.
   samples a presentation position depends on rather than a range. That is the
   timeline's indexing model rather than a patch to it, and verifying it wants
   a B-frame fixture this tree has none of.
+- **A follower tab cannot place a call, and the reason is which document owns
+  the devices.** A tab that lost the claim holds no session, so its Place or
+  Accept is executed by the tab that does — and `getUserMedia` and
+  `AudioContext::resume` then run in *that* document. The microphone, the
+  speakers and the permission prompt would all be the leader's, in a tab the
+  person pressing the button is not looking at and has not gestured in, so
+  the call would be held by a tab that did not ask for it and heard there
+  too. `calls_unavailable` refuses it and says which tab to use. It is the
+  one place a follower differs from a desktop window talking to an
+  `oxidezapd`, and the contrast is what makes it right: there the devices are
+  the daemon's by design and nobody expects the window to hold them, while
+  here both tabs are windows and the wrong one would. Fixing it properly
+  means the follower opening the devices and handing them across, which is a
+  change to the tab protocol rather than a check.
+  It is a *separate* question from `calls_unavailable`, and folding the two
+  together was a bug rather than a tidy-up: a window that cannot carry a call
+  owes the caller an answer and declines, while a window that is merely the
+  wrong one owes them nothing — the call is answerable in the tab beside it,
+  and declining would send `Decline` to the leader and clear the offer
+  everywhere, telling somebody to answer in the other tab while destroying
+  the call they would have answered there.
+
+- **Which end a full queue drops from is a question about the payload, not
+  about latency.** The microphone's queue evicts its oldest frame and the
+  camera's refuses its newest, and the two look like the same decision made
+  inconsistently. They are not: a PCM frame stands on its own, so dropping an
+  older one costs exactly that frame and the newest speech is the only speech
+  worth having. An H.264 picture is referenced by the ones behind it, so
+  evicting the oldest does not free a slot — it makes everything still queued
+  undecodable and then sends it, and the peer receives two corrupt pictures
+  where refusing the new one sends two good ones and a gap. The camera is
+  staler by two frames, 66 ms at 30 fps, and that is the whole price of
+  keeping what is delivered decodable. Both ask for a keyframe on the drop,
+  because the gap is real either way.
+
 - **A dropped access unit is a frame of RTP time that goes unspent.** The
   library's `VideoSource` advertises one `rtp_timestamp_stride` and advances
   by exactly that per unit delivered, and `EncodedFrame` carries no timestamp
@@ -1791,7 +1826,13 @@ by definition.
   What still does not is anything the *daemon* refused: a front end learns
   only `Accepted`, and a refusal reaching the window would need a field on the
   wire. `SendFailed` is the one exception, and it is against a chat rather
-  than against the request.
+  than against the request. `CallMediaFailed` is the second, and it was added
+  after a browser call that dialled no relay read in the console as an offer,
+  an ending, and not one line between them: the library publishes
+  `MediaSetupFailed` with the reason and the event pump's catch-all was
+  throwing it away, so the one event carrying the explanation was the one
+  nothing listened to. A call that ends a moment after it is placed has to
+  say why, or every report of it is a bug report with no evidence in it.
 - **A promised file is not a held file, once the reader is a browser.** The
   daemon's media cache is files and no index — the front end it was written
   for opens them itself, so `claim` can be `has` and there is no window

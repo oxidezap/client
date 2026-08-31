@@ -108,6 +108,25 @@ mod video {
     }
 }
 
+/// # A call from the wrong tab
+///
+/// Why a call cannot be *started here*, though this front end could carry
+/// one, or `None` if this is the right window to start it in.
+///
+/// Asked separately from [`calls_unavailable`] and never folded into it,
+/// because the two want opposite things done about a ringing call. A window
+/// that cannot carry a call at all owes the caller an answer, so it declines.
+/// A window that is merely the wrong one owes them nothing: the call is
+/// perfectly answerable in the tab beside it, and declining here would send
+/// `Decline` to the leader and clear the offer *everywhere* — telling somebody
+/// to use the other tab while destroying the call they would have used it for.
+///
+/// So this one leaves the offer ringing and says where to answer it.
+#[must_use]
+pub fn calls_belong_to_another_tab() -> Option<&'static str> {
+    calls::calls_belong_to_another_tab()
+}
+
 /// # Placing a call
 ///
 /// Why this front end cannot carry a call's media, or `None` if it can.
@@ -148,6 +167,11 @@ mod calls {
     pub fn calls_unavailable() -> Option<&'static str> {
         None
     }
+
+    /// There are no follower windows here: every one talks to the daemon.
+    pub fn calls_belong_to_another_tab() -> Option<&'static str> {
+        None
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -179,6 +203,39 @@ mod calls {
                  a call's media here.",
             ),
         }
+    }
+
+    /// A follower tab holds no session, so its Place or Accept is executed by
+    /// the tab that does — and that tab is where `getUserMedia` and
+    /// `AudioContext::resume` would run. The devices would be the *leader's*:
+    /// its microphone, its speakers, its permission prompt, in a document the
+    /// person pressing the button is not looking at and has not gestured in.
+    /// The prompt is the half that might work by luck, since permission is
+    /// per-origin; the speakers are the half that cannot, and a call heard in
+    /// a tab nobody is using is not a call.
+    ///
+    /// This is the one place a follower differs from a page attached to an
+    /// `oxidezapd`, which is allowed — and the contrast is what makes the
+    /// distinction right rather than arbitrary: there the devices are the
+    /// daemon's *by design* and nobody expects the window to hold them, while
+    /// here both tabs are windows and the wrong one would.
+    ///
+    /// Not a capability this window is missing, which is why it is not
+    /// `calls_unavailable`: it is which document owns the media, and moving
+    /// that means the follower opening the devices and handing them across —
+    /// a change to the tab protocol rather than a check.
+    pub fn calls_belong_to_another_tab() -> Option<&'static str> {
+        if matches!(
+            oxidezap_ipc::web::named_daemon(),
+            oxidezap_ipc::web::NamedDaemon::Named(_)
+        ) || crate::session::this_tab_holds_the_account()
+        {
+            return None;
+        }
+        Some(
+            "This tab is showing an account another tab is running, so a call \
+             would use that tab's microphone and speakers. Use that tab.",
+        )
     }
 
     /// Whether the agent this page runs in defines `RTCPeerConnection`.

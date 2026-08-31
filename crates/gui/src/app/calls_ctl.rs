@@ -88,16 +88,27 @@ impl WhatsAppApp {
     /// than waiting for an answer event that never arrives for an inbound
     /// call. That gap is what used to leave the audio running with no UI.
     pub fn accept_call(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = &self.client else {
+        if self.client.is_none() {
             warn!("Cannot accept call: client is unavailable");
             return;
-        };
+        }
         // The same question the outgoing path asks, and it has to be asked
         // here too: an offer arrives whatever this browser can carry, so a
         // page that cannot hold the media would otherwise open the
         // microphone, accept, and end the call at relay setup. Declined
         // rather than ignored — the caller is ringing, and the honest answer
         // is no rather than silence until their own timeout.
+        // Before the refusal below, and deliberately *not* folded into it:
+        // this window could carry a call perfectly well, it is simply the
+        // wrong one. Declining here would send `Decline` to the leader and
+        // clear the offer everywhere — telling somebody to answer in the
+        // other tab while destroying the call they would have answered. So
+        // the offer is left ringing, in this tab and in that one.
+        if let Some(reason) = crate::platform::calls_belong_to_another_tab() {
+            warn!("Not accepting here: {reason}");
+            self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
+            return;
+        }
         if let Some(reason) = crate::platform::calls_unavailable() {
             warn!("Cannot accept call: {reason}");
             self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
@@ -108,11 +119,39 @@ impl WhatsAppApp {
         let Some(call) = self.call_state.take_incoming() else {
             return;
         };
+        // A video offer this window cannot decode is still a call worth
+        // taking: the audio works, and the only thing missing is the picture.
+        //
+        // Said rather than acted on, because the two obvious actions are both
+        // worse and one of them is not ours to take. Declining throws away a
+        // conversation over a pane. Answering it as voice is the daemon's
+        // decision and deliberately not a front end's — it reads `is_video`
+        // off the ringing offer rather than taking our word, since the
+        // library refuses `.video()` on an audio offer — so there is no way
+        // from here to accept a video call as anything else. What is left,
+        // and what the person actually needs, is knowing why the picture
+        // never arrives instead of watching two panes wait forever.
+        if call.is_video
+            && let Some(reason) = crate::platform::video_decode_unavailable()
+        {
+            warn!("Accepting a video call this window cannot draw: {reason}");
+            self.notify_user(
+                "This browser cannot show video, so you will hear this call but not see it.",
+                crate::app::notices::Tone::Problem,
+                cx,
+            );
+        }
         info!(
             "Accepting call {} from {}",
             call.call_id,
             observe_str(&call.caller_jid)
         );
+        let Some(client) = &self.client else {
+            // Checked at the top; re-read here because the notice above needs
+            // `self`, and a borrow held across it would outlive it.
+            warn!("Cannot accept call: client is unavailable");
+            return;
+        };
         client.accept_call(call.call_id.as_str());
         self.call_state.connect_accepted(&call);
         self.ensure_tick(cx);
@@ -431,6 +470,15 @@ impl WhatsAppApp {
         // was never going to connect. Said out loud, because unlike the
         // microphone there is no control to draw disabled -- the call button
         // is worth keeping for the desktop this same view runs on.
+        // Nothing is ringing here, so this is the same refusal as the one
+        // below rather than a different kind of answer — but it is a
+        // different question, and keeping them apart is what stops the
+        // accept path from declining a call it should have left alone.
+        if let Some(reason) = crate::platform::calls_belong_to_another_tab() {
+            warn!("Cannot start call here: {reason}");
+            self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
+            return;
+        }
         if let Some(reason) = crate::platform::calls_unavailable() {
             warn!("Cannot start call: {reason}");
             self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
