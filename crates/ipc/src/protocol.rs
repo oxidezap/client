@@ -1,8 +1,8 @@
 //! Messages exchanged over the socket.
 
 use oxidezap_core::{
-    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, PluginAction, PluginSurface,
-    QuotedMessage, UiEvent,
+    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, LogLevel, PluginAction,
+    PluginSurface, QuotedMessage, UiEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -643,6 +643,24 @@ pub enum ClientRequest {
     /// and every message keeps its `downloadable`, so what this costs is a
     /// re-download of anything looked at again.
     ClearMediaCache,
+    /// Say how much the daemon should log, from now on and after a restart.
+    ///
+    /// The daemon is the process holding the session, so it is the one whose
+    /// `debug` is worth having — and it is also the one that cannot be
+    /// restarted to raise it without ending the connection somebody is
+    /// investigating. So the level moves while it runs.
+    ///
+    /// It is remembered as well as applied, in the daemon's own config file
+    /// rather than in the asking front end's: a page keeps its choice in a
+    /// browser store the daemon cannot read, and the next `oxidezapd` would
+    /// otherwise start back at `info`.
+    ///
+    /// Answered with [`DaemonMessage::Accepted`], which here means the level
+    /// changed — persisting it can still fail, and that is a fact about the
+    /// next start rather than about this one.
+    SetLogLevel {
+        level: LogLevel,
+    },
     /// Ask the daemon to bring a front end to the foreground, which is what
     /// the tray's "Open" item does.
     ///

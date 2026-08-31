@@ -1033,6 +1033,49 @@ async fn handle_request(
                 }),
             })
         }
+        // Applied here and now, and written down for the next start. Both,
+        // because they answer different questions: a person raising the
+        // level is asking about the session that is running, and the file is
+        // what keeps them from having to ask again after every restart.
+        //
+        // The write is off the runtime for the reason the plugin approval's
+        // is — it is a file created, flushed and renamed, which on a
+        // single-worker runtime stalls the session bridge and every other
+        // connection for as long as the disk takes. Awaited rather than
+        // spawned loose, so the acknowledgement means the choice is on disk.
+        ClientRequest::SetLogLevel { level } => {
+            oxidezap_logging::apply(level);
+            log::info!("logging at {level}, asked for by a front end");
+            // `remember` writes the level in force rather than this
+            // request's, and serializes the writes: two front ends can ask in
+            // the same moment and each is written on a thread of its own, so
+            // a write carrying its own level could land after a later one and
+            // leave the next start at the earlier answer.
+            let recorded = oxidezap_session::unblock(oxidezap_logging::remember).await;
+            match recorded {
+                Ok(Ok(())) => acted(Ok(())),
+                // The level *did* change; only the memory of it failed. Said
+                // in the log rather than refused, because answering `Refused`
+                // to a request that was carried out is the worse lie of the
+                // two.
+                //
+                // At `error` rather than `warn`, which the plugin approval's
+                // failed record is written at for the same reason: this line
+                // is written *after* the level it reports on has taken
+                // effect, so somebody quieting the daemon to `error` would
+                // otherwise have the one thing worth telling them dropped by
+                // the level they just chose. At `off` it is dropped, and that
+                // is what `off` means.
+                Ok(Err(e)) => {
+                    log::error!("the log level was changed but not stored: {e}");
+                    acted(Ok(()))
+                }
+                Err(_) => {
+                    log::error!("the log level was changed but the store was not reached");
+                    acted(Ok(()))
+                }
+            }
+        }
         // The daemon has no window of its own, so this is relayed rather than
         // acted on: whoever owns a window is the only one that can raise it.
         // Published to every client, including the one that asked, because a

@@ -775,6 +775,27 @@ pub struct WhatsAppApp {
     notices: Vec<notices::Notice>,
     /// Never reused, so a dismissal cannot land on a later notice.
     next_notice_id: u64,
+    /// The log level somebody chose in this front end, if they chose one.
+    ///
+    /// Kept so a reconnection can say it again: an ask made while the daemon
+    /// was unreachable reached nobody, and one made before it restarted is
+    /// one it may not have read. `None` is nobody having asked, which is not
+    /// the same as `info` and must not be sent as one — a fresh window at the
+    /// default must not quiet a daemon another window put at `debug`.
+    ///
+    /// It starts from the store where the store is this front end's own — a
+    /// page's `localStorage`, which no daemon can open, so a choice made
+    /// there is one only this side can carry across a reload. It does not on
+    /// a desktop, where the stored answer is the daemon's own file and the
+    /// daemon read it before this window existed.
+    ///
+    /// And never where this run was given a level from outside. `?log=` wins
+    /// over the stored choice for the run it was given for, which is the
+    /// whole of the precedence — so seeding from the store there would send
+    /// the stored level at the first connection and, in the tab holding the
+    /// account, hand it to a daemon sharing this process's own logging
+    /// state: `?log=off` beside a stored `debug` would turn itself back on.
+    log_level_asked: Option<oxidezap_core::LogLevel>,
     /// Expires them. Alive only while something is up.
     #[allow(dead_code)]
     notice_task: Option<Task<()>>,
@@ -1054,6 +1075,10 @@ impl WhatsAppApp {
             error_detail_open: false,
             notices: Vec::new(),
             next_notice_id: 0,
+            log_level_asked: (crate::platform::log_store::is_ours()
+                && oxidezap_logging::forced().is_none())
+            .then(oxidezap_logging::stored)
+            .flatten(),
             notice_task: None,
             downloads_in_flight: std::collections::HashSet::new(),
             call_state: CallState::new(),
@@ -2331,6 +2356,10 @@ impl WhatsAppApp {
                     Ok((client, ui_rx)) => {
                         app.event_task = Some(Self::spawn_event_task(ui_rx, cx));
                         app.client = Some(client);
+                        // A level chosen while this was unreachable reached
+                        // nobody, and the daemon on the other end may be a
+                        // new one. Nothing is sent if nobody chose.
+                        app.resend_log_level();
                     }
                     Err(e) if Session::is_settled(&e) => {
                         // A refusal, not a failure to reach anything: this

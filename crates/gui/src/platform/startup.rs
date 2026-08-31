@@ -51,29 +51,27 @@ mod imp {
     /// script produces a dozen. Turning `RUST_LOG=debug` on to look at *our* logs
     /// should not bury them.
     pub(super) fn logging() {
-        // An explicit `RUST_LOG` still wins: these are floors for modules the
-        // user did not ask about.
-        let mut logger = env_logger::Builder::new();
-        // Floors first, environment second. A later directive replaces an earlier
-        // one for the same target, so parsing `RUST_LOG` before these turned
-        // `RUST_LOG=cosmic_text=debug` back into `warn` — the one request that
-        // could only have been deliberate was the one that was ignored.
-        for quiet in [
-            "blade_graphics",
-            "naga",
-            "zbus",
-            "tracing",
-            "gpui",
-            "cosmic_text",
-            "wgpu_core",
-            "wgpu_hal",
-            "font_kit",
-        ] {
-            logger.filter_module(quiet, log::LevelFilter::Warn);
-        }
-        logger.parse_env(env_logger::Env::default().default_filter_or("info"));
-        logger.init();
+        // An explicit `RUST_LOG` still wins over the stored choice, and a
+        // module named in it wins over the floors below: see
+        // `oxidezap_logging`, which is where both rules are stated once for
+        // this process and the daemon alike.
+        oxidezap_logging::install(QUIET);
+        oxidezap_logging::activate();
     }
+
+    /// Crates that narrate, held at `warn` however loud the rest is asked to
+    /// be.
+    const QUIET: &[&str] = &[
+        "blade_graphics",
+        "naga",
+        "zbus",
+        "tracing",
+        "gpui",
+        "cosmic_text",
+        "wgpu_core",
+        "wgpu_hal",
+        "font_kit",
+    ];
 
     /// Nothing to install: `wacore` defaults to `chrono` here, which has a
     /// clock behind it.
@@ -94,43 +92,34 @@ mod imp {
 mod imp {
     /// The same, for a page.
     ///
-    /// There is no environment to read a filter out of and no stderr to write to,
-    /// so the level is fixed and the destination is the browser's console.
-    /// `web_init` also installs the panic hook that turns a Rust panic into a
-    /// readable trace rather than "unreachable executed".
+    /// There is no environment to read a filter out of and no stderr to write
+    /// to, so the level comes from `?log=` or from what was last chosen in
+    /// Settings, and the destination is the browser's console. `web_init`
+    /// also installs the panic hook that turns a Rust panic into a readable
+    /// trace rather than "unreachable executed".
     pub(super) fn logging() {
         // Ours first, and that order is the whole of it. `log` accepts one
         // logger, and `web_init` installs one — so registering after it fails
         // silently and leaves a logger with no module floors in force, which
-        // is exactly what makes `?log=debug` useless: gpui, wgpu and the text
-        // shaper narrate every frame, and the twenty lines worth reading
+        // is exactly what makes a raised level useless: gpui, wgpu and the
+        // text shaper narrate every frame, and the twenty lines worth reading
         // arrive buried in thousands that are not. Registering first makes
         // `web_init`'s own `set_logger` the one that fails, and it is written
         // to tolerate that (`.ok()`); the panic hook it installs — the thing
         // that turns a Rust panic into a trace rather than "unreachable
         // executed" — is what it is still called for.
-        log::set_logger(&CONSOLE).ok();
+        oxidezap_logging::install(QUIET);
         gpui_platform::web_init();
         // After `web_init`, never before: it sets a level of its own, so a
         // level set ahead of it is the one that gets overwritten.
-        let level = requested_level();
-        log::set_max_level(level);
-        if level > log::LevelFilter::Info {
-            log::info!("logging at {level}, asked for by the URL");
+        let level = oxidezap_logging::activate();
+        if level.filter() > log::LevelFilter::Info {
+            match oxidezap_logging::forced() {
+                Some(_) => log::info!("logging at {level}, asked for by the URL"),
+                None => log::info!("logging at {level}, the level this page was left at"),
+            }
         }
     }
-
-    /// The browser console, with the desktop's module floors.
-    static CONSOLE: Console = Console;
-
-    /// What a page has instead of stderr.
-    ///
-    /// The floors are the desktop's, for the desktop's reason: the renderer
-    /// and the text shaper narrate at debug about their own business, and
-    /// turning debug on to read *our* logs should not bury them. `log`'s
-    /// global level is one number with no per-target part, so a filter that
-    /// knows targets has to live in a logger.
-    struct Console;
 
     /// Crates that narrate, held at `warn` however loud the rest is asked to
     /// be. Named rather than derived, and the same list the desktop quiets.
@@ -144,66 +133,6 @@ mod imp {
         "wgpu_core",
         "wgpu_hal",
     ];
-
-    impl log::Log for Console {
-        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            let floor = QUIET
-                .iter()
-                .any(|quiet| {
-                    metadata.target() == *quiet
-                        || metadata.target().starts_with(&format!("{quiet}::"))
-                })
-                .then_some(log::Level::Warn);
-            match floor {
-                Some(floor) => metadata.level() <= floor,
-                None => true,
-            }
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            if !self.enabled(record.metadata()) {
-                return;
-            }
-            let line = wasm_bindgen::JsValue::from_str(&format!(
-                "[{}] {}: {}",
-                record.level(),
-                record.target(),
-                record.args()
-            ));
-            match record.level() {
-                log::Level::Error => web_sys::console::error_1(&line),
-                log::Level::Warn => web_sys::console::warn_1(&line),
-                log::Level::Info => web_sys::console::info_1(&line),
-                log::Level::Debug | log::Level::Trace => web_sys::console::log_1(&line),
-            }
-        }
-
-        fn flush(&self) {}
-    }
-
-    /// How much to say, which on a page is a question only the URL can answer.
-    ///
-    /// A desktop reads `RUST_LOG` and this is that: `?log=debug` for the
-    /// person who has hit something, `info` for everyone else. It exists
-    /// because the alternative is asking someone to run a debug build of a
-    /// wasm bundle to find out what happened, and because the interesting
-    /// half of a session — every stanza the library reads, every step of a
-    /// pairing — is written at `debug` and was unreachable from a browser at
-    /// any price.
-    ///
-    /// In the query rather than the fragment, beside `backend`: the fragment
-    /// is where the daemon token goes precisely because it never leaves the
-    /// browser, and a log level is not a secret. An unreadable value is the
-    /// default rather than an error — this runs before there is anywhere to
-    /// report one.
-    fn requested_level() -> log::LevelFilter {
-        let Some(asked) = parameter("log") else {
-            return log::LevelFilter::Info;
-        };
-        asked
-            .parse::<log::LevelFilter>()
-            .unwrap_or(log::LevelFilter::Info)
-    }
 
     /// One `name=value` out of the page's query string.
     fn parameter(name: &str) -> Option<String> {

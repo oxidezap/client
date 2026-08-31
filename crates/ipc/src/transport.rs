@@ -5,6 +5,12 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 20: `SetLogLevel`. How loud the daemon is is a setting rather than a
+/// launch argument: nearly everything worth reading about a session is
+/// written at `debug`, and restarting `oxidezapd` to see it ends the very
+/// connection being investigated. A v19 daemon does not recognise the
+/// request, so a v20 client asking one would be silently no louder.
+///
 /// 19: plugins. The snapshot carries a `PluginSurface` per loaded plugin —
 /// what it is called, what it asked to be allowed to do, whether that has
 /// been allowed, and the widgets it wants drawn — `DaemonEvent::PluginsChanged`
@@ -118,7 +124,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

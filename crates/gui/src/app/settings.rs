@@ -7,7 +7,10 @@
 
 use gpui::{Context, WeakEntity};
 
+use oxidezap_core::LogLevel;
+
 use crate::app::WhatsAppApp;
+use crate::app::notices::Tone;
 use crate::session::StorageUsage;
 use crate::theme::{ActiveProductTheme as _, ThemeSettings, config};
 
@@ -174,6 +177,97 @@ impl WhatsAppApp {
             });
         })
         .detach();
+    }
+
+    /// Change how much is logged, here and in the daemon, now and next time.
+    ///
+    /// Three things, and each is a different process or a different day.
+    /// This window applies it to itself immediately — a front end writes its
+    /// own share of the log, and a page attached to no daemon writes all of
+    /// it. The daemon is told, because it holds the session and so writes
+    /// nearly everything worth reading. And the choice is written down by
+    /// whoever keeps a store of their own: the daemon's file on a desktop,
+    /// which both processes read, and additionally the page's own browser
+    /// store, which no daemon can reach.
+    ///
+    /// A store that will not take it is a notice rather than a refusal: the
+    /// level *has* changed, and what failed is only the memory of it.
+    pub fn set_log_level(&mut self, level: LogLevel, cx: &mut Context<Self>) {
+        // This process, first and synchronously: it is one atomic store and
+        // the point of the control.
+        oxidezap_logging::apply(level);
+        // Remembered as the window's own ask, so a reconnection can say it
+        // again. Not to have the window impose its level on every daemon it
+        // reaches — a fresh window at `info` must not quiet a daemon somebody
+        // else put at `debug` — but a level chosen while the daemon was
+        // unreachable, or chosen at all, is one the daemon never heard.
+        self.log_level_asked = Some(level);
+        let told_the_daemon = self
+            .client
+            .as_ref()
+            .map(|client| client.set_log_level(level));
+
+        // And written down by whoever keeps a store of their own. See
+        // `platform::log_store`, which answers both halves of that: which
+        // store, and on which thread — the desktop write is a file flushed
+        // and renamed and belongs off the one that draws, and a page's is
+        // `localStorage`, which exists on the window global and on no worker.
+        //
+        // Where the store is this front end's own, nothing is waited for:
+        // no daemon writes it, and an answer that stalled — or a page
+        // reloaded during the round trip — would take the choice with it.
+        // Where it is not, the daemon writes the very file this window would
+        // have, so the window writes nothing and two windows choosing at once
+        // cannot leave the next start at the earlier answer. That is *waited
+        // for* rather than assumed, because a frame handed to a full outbox
+        // has been queued and not delivered: the daemon persists before it
+        // acknowledges, so its answer is what makes "somebody remembered
+        // this" true, and where it does not come this window is the only
+        // thing left that can.
+        let keeps_its_own = crate::platform::log_store::is_ours();
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            if !keeps_its_own {
+                let daemon_answered = match told_the_daemon {
+                    Some(answer) => answer.await.is_ok(),
+                    None => false,
+                };
+                if daemon_answered {
+                    return;
+                }
+            }
+            if let Err(e) = crate::platform::log_store::remember(cx).await {
+                log::warn!("the log level was changed but not stored: {e}");
+                let _ = entity.update(cx, |app, cx| {
+                    app.notify_user(
+                        "Logging at that level now, but the choice will not survive a restart.",
+                        Tone::Problem,
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Say the level again to a daemon this window has just reached.
+    ///
+    /// Only the level somebody chose *here*, and only if they chose one: the
+    /// daemon reads the same stored answer this window does when it starts,
+    /// so replaying an untouched default would be this window quieting a
+    /// daemon another window had raised. What it covers is the ask that had
+    /// nowhere to go — Settings used while the daemon was unreachable, and
+    /// the daemon that restarted, or was never told, under a page whose own
+    /// choice lives in a browser store no daemon can read.
+    pub fn resend_log_level(&self) {
+        let (Some(level), Some(client)) = (self.log_level_asked, &self.client) else {
+            return;
+        };
+        // The answer is nobody's to wait for here: this is the window
+        // repeating itself to a daemon it has just reached, and what it
+        // wanted was for the level to arrive.
+        let _answered = client.set_log_level(level);
     }
 
     /// Delete the cached media and re-measure.

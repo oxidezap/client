@@ -6,11 +6,14 @@
 //! worse answer than an honest note about what is missing.
 
 use gpui::{
-    AnyElement, App, Entity, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder as _,
+    AnyElement, App, Entity, IntoElement, ParentElement, SharedString, Styled, div,
+    prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
+use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
+
+use oxidezap_core::LogLevel;
 
 use crate::app::{SettingsSection, WhatsAppApp};
 use crate::components::ProductIcon;
@@ -29,7 +32,7 @@ pub fn render(
         SettingsSection::AudioVideo => audio_video(metrics, cx),
         SettingsSection::Privacy => privacy(entity.clone(), metrics, cx),
         SettingsSection::Storage => storage(app, entity, metrics, cx),
-        SettingsSection::Advanced => advanced(metrics, cx),
+        SettingsSection::Advanced => advanced(entity, metrics, cx),
         SettingsSection::Plugins => plugins(app, entity, metrics, cx),
         // Rendered by its own module.
         SettingsSection::Appearance => div().into_any_element(),
@@ -603,20 +606,82 @@ fn files(count: u64) -> String {
     }
 }
 
-fn advanced(metrics: Metrics, cx: &App) -> AnyElement {
+/// Diagnostics: how loud the client is, and what is drawing it.
+///
+/// The level is a control rather than a line of text, which is the whole of
+/// this section's reason to exist. It used to report `RUST_LOG` — a variable
+/// a person can only set by restarting the client from a terminal they may
+/// not have, and one a page has never had at all. What is drawn now takes
+/// effect in this window and in the daemon at once, and is remembered.
+fn advanced(entity: Entity<WhatsAppApp>, metrics: Metrics, cx: &App) -> AnyElement {
+    let active = oxidezap_logging::current();
+    // A level given for this run from outside — `RUST_LOG` on a desktop,
+    // `?log=` in a page — is what the process *started* at. Said rather than
+    // hidden: without it, a stored choice that a launch argument overrode
+    // looks like a control that did not work.
+    let forced = oxidezap_logging::forced();
+    let kept = oxidezap_logging::location();
+
     group(
         label("DIAGNOSTICS", metrics, cx),
-        card(
-            vec![
-                (
-                    "Log level".to_string(),
-                    std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-                ),
-                ("Renderer".to_string(), "GPUI".to_string()),
-            ],
-            metrics,
-            cx,
-        ),
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_lg())
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(metrics.space_md())
+                    // `Button`s rather than styled `div`s, for the reason the
+                    // density control uses them: picking a level changes
+                    // application state, and a `div` carries no focus handle
+                    // and no keyboard activation.
+                    .children(LogLevel::ALL.into_iter().map(|level| {
+                        let entity = entity.clone();
+                        Button::new(SharedString::from(format!("log-level-{}", level.id())))
+                            .label(level.label())
+                            .outline()
+                            .selected(level == active)
+                            .px(metrics.space_xl())
+                            .py(metrics.space_md())
+                            .rounded(metrics.radius_md())
+                            .text_size(metrics.text_small())
+                            .on_click(move |_, _window, cx| {
+                                entity.update(cx, |app, cx| app.set_log_level(level, cx));
+                            })
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(metrics.text_meta())
+                    .text_color(cx.theme().muted_foreground)
+                    .child(active.note()),
+            )
+            .child(card(
+                vec![
+                    ("Log level".to_string(), active.label().to_string()),
+                    (
+                        "Kept in".to_string(),
+                        kept.unwrap_or_else(|| "nowhere — it lasts for this run".to_string()),
+                    ),
+                    ("Renderer".to_string(), "GPUI".to_string()),
+                ],
+                metrics,
+                cx,
+            ))
+            .when_some(forced, |el, forced| {
+                el.child(
+                    div()
+                        .text_size(metrics.text_meta())
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} asked for {forced} when this started; the level above is \
+                             what is in force now.",
+                            oxidezap_logging::forced_by(),
+                        )),
+                )
+            }),
         metrics,
     )
     .into_any_element()

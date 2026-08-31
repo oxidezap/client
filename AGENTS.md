@@ -40,6 +40,21 @@ Unofficial WhatsApp client on top of [whatsapp-rust](https://github.com/oxidezap
   daemon is the side with thousands of things happening at once. The domain
   types in `oxidezap-core` *are* the wire format; this crate adds the framing
   around them.
+- **oxidezap-logging**: how much the client says about itself, and where that
+  answer is kept. A crate rather than a function in each binary for two
+  reasons. The level has to move while the process runs — `log`'s global
+  maximum already does, but an `env_logger` filter built from `RUST_LOG` at
+  startup does not, so a level raised in Settings was let through by the macro
+  and dropped by the logger underneath, which is a failure with no symptom
+  except silence. And both processes have to read one answer: the window and
+  `oxidezapd` log about one account, and a choice only the window remembered
+  would leave the process holding the session — where nearly everything worth
+  reading is written — at `info` for ever. So `env_logger` keeps the
+  formatting and the per-module floors and the global level is an atomic this
+  crate owns, the store is a config file on a desktop and `localStorage` in a
+  page, and the precedence is stated once: an explicit `RUST_LOG` (or `?log=`)
+  wins for the run it was given for, then the stored choice, then `info`.
+  Choosing a level at runtime always applies, whatever started the process.
 - **oxidezap-daemon**: a library and the binary `oxidezapd` around it. The
   library is everything the daemon *does* — the state every front end
   observes, the bridge that turns their requests into session calls, and the
@@ -407,6 +422,19 @@ to the same problem. Nothing here needs it yet.
   directory that cannot be made private at all is refused: `usable_state_dir`
   runs without one rather than trusting it.
 
+- **How loud the client is, is a setting rather than a launch argument.** The
+  two processes each apply the level to themselves and each write it down —
+  the window because it draws part of the log and a page with its own session
+  draws all of it, the daemon because it holds the session and because a page
+  keeps its choice in a browser store no daemon can read, so the next
+  `oxidezapd` would otherwise start back at `info`. `ClientRequest::SetLogLevel`
+  is the sentence between them, and it is applied *and* persisted where it
+  lands: a person raising the level is asking about the session that is
+  running, and the file is what keeps them from asking again after every
+  restart. A failed write is a notice, never a refusal — the level did change,
+  and what failed is only the memory of it. Which is also why the daemon is
+  the interesting half: restarting it to raise the level ends the very
+  connection being investigated.
 - **Nothing stops the daemon but `main`.** The tray's Quit and an IPC
   `Shutdown` ask through `shutdown::request`; ending the process from a D-Bus
   callback or a connection task would skip disconnecting the session and

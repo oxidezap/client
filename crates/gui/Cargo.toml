@@ -51,6 +51,9 @@ oxidezap-core = { workspace = true }
 # The daemon's protocol, not the session itself: this front end has not owned
 # a WhatsApp connection since the daemon took it over.
 oxidezap-ipc = { workspace = true }
+# The log level: one place decides where it is kept and how it is changed
+# while the process runs, because the daemon reads the same answer.
+oxidezap-logging = { workspace = true }
 portable-atomic = { workspace = true }
 qrcode = "0.14"
 # `include-exclude` is not a default feature, and the icon set is selected
@@ -81,10 +84,8 @@ wacore = { workspace = true }
 wacore-binary = { workspace = true }
 
 # The desktop window. Everything here needs an operating system underneath it:
-# a windowing system to draw on, a sound card to open, a C decoder to link, an
-# environment variable to read a log filter out of.
+# a windowing system to draw on, a sound card to open, a C decoder to link.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-env_logger = "0.11"
 # Timers, on a platform that has a reactor to run them on.
 smol = "2"
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
