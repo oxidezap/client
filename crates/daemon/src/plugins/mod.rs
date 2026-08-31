@@ -91,11 +91,19 @@ pub async fn reload(plugins: &Arc<Plugins>) -> usize {
         // afterwards, and a revoked grant left on disk to come back. A future
         // does nothing until it is polled, which is after the reservation.
         plugins
-            .reload(async {
-                let modules = web::installed().await;
+            .reload(|| async {
+                // `discover` and not `installed`: the fallible one. A folder
+                // that cannot be read is not an empty folder, and treating it
+                // as one here would retire every healthy plugin and publish
+                // an empty set over a transient storage error.
+                let modules = web::discover().await.ok()?;
+                // And the fresh handle only once there is something to
+                // install with it: taking one retires every older handle, so
+                // a scan that failed would leave the running generation
+                // writing through a store it no longer owns.
                 let state: Arc<dyn oxidezap_plugin_host::Backing> =
                     Arc::new(oxidezap_plugin_host::Origin::storage());
-                (modules, state)
+                Some((modules, state))
             })
             .await
     }

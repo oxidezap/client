@@ -91,19 +91,45 @@ impl Approvals {
         }
     }
 
-    /// Point at a new store, keeping the answers already in hand.
+    /// Point at a new store, and make sure it holds what is in hand.
     ///
-    /// What a reload does at the moment it installs a generation. The map is
-    /// *not* re-read: this host is the only thing that ever writes the
-    /// document — a plugin that could write its own approval would have none
-    /// — so what is in memory is what is on disk, and re-reading would only
+    /// What a reload does at the moment it installs a generation. Three
+    /// things, and each is a case that bites without it.
+    ///
+    /// The map is *not* re-read: this host is the only thing that ever writes
+    /// the document — a plugin that could write its own approval would have
+    /// none — so what is in memory is what is on disk, and re-reading would
     /// open a window for a stale file to undo an answer given during the
     /// load.
+    ///
+    /// A store that cannot keep answers clears them instead. A state
+    /// directory that was usable at startup and is refused now — replaced by
+    /// a symlink, or no longer private — must leave every plugin unapproved
+    /// until somebody says otherwise, which is the whole of what
+    /// `usable_state_dir` refusing is for; keeping the masks and writing them
+    /// nowhere would be the opposite of it.
+    ///
+    /// And what is in hand is written through the new store, because a page's
+    /// old handle went stale the moment the reload took a fresh one: an
+    /// answer given during the load changed the map and was refused by the
+    /// store it was written through, so without this the document still holds
+    /// the old grant and hands it back on the next start.
     pub fn rebind(&self, store: Arc<dyn Backing>) {
+        let keeps = store.keeps_answers();
+        let mut granted = self.lock();
         *self
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = store;
+        if keeps {
+            self.flush(&granted);
+        } else if !granted.is_empty() {
+            log::warn!(
+                "plugin permissions can no longer be recorded; every plugin is unapproved \
+                 until it is allowed again"
+            );
+            granted.clear();
+        }
     }
 
     /// What this plugin may actually do, given what it asked for.

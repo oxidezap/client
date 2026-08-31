@@ -3469,3 +3469,118 @@ fn a_set_still_loading_publishes_nothing() {
         "and it is drawn once it is the set that is running"
     );
 }
+
+/// A folder that cannot be read is not an empty folder.
+///
+/// The two are the same value on the way out of a scan, and treating them
+/// alike on a reload retires every healthy plugin and publishes an empty set
+/// — over a transient storage error, with nothing removed and nothing to put
+/// it back. `reload` takes an `Option` for exactly this, and answers a
+/// refusal by leaving what is running alone.
+#[test]
+fn a_reload_that_cannot_read_the_folder_changes_nothing() {
+    let dir = TempDir::new("reload-unreadable");
+    dir.plugin("kept", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    let before = published.settles("its interface", |set| set.len() == 1);
+    let live = plugins.live();
+
+    let running = futures_lite::future::block_on(plugins.reload(|| async { None }));
+    assert_eq!(running, 1, "what is running is still running");
+    assert!(
+        Arc::ptr_eq(&live, &plugins.live()),
+        "and it is the same set, not a fresh one that happens to match"
+    );
+    assert_eq!(published.latest(), before, "nothing was redrawn");
+}
+
+/// An ask that arrives during a reload gets a scan of its own.
+///
+/// Somebody who installs a plugin while a reload is running is the case: the
+/// scan already in flight may have read the folder before their file landed,
+/// so refusing them outright loses the very change they asked for — and the
+/// request is acknowledged as done. One more scan afterwards covers every ask
+/// that arrived during the first.
+#[test]
+fn an_ask_during_a_reload_is_not_lost() {
+    let dir = TempDir::new("reload-coalesce");
+    dir.plugin("first", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    // The second module appears part-way through the first scan, which is the
+    // ordering the coalescing exists for: the closure is what reads the
+    // folder, so a file written between two calls of it is a file the first
+    // did not see and the second does.
+    let scans = std::sync::atomic::AtomicUsize::new(0);
+    let folder = &dir;
+    let host = &plugins;
+    let running = futures_lite::future::block_on(plugins.reload(|| {
+        let round = scans.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if round == 0 {
+                // Somebody installs, and asks. The ask lands while this
+                // reload holds the slot, which is what it looks like from in
+                // here: `reload` refused them and remembered.
+                folder.plugin("second", &draws());
+                host.reload_again.store(true, Ordering::SeqCst);
+            }
+            Some((
+                crate::modules_in(&folder.0),
+                Arc::new(crate::store::Nowhere) as Arc<dyn Backing>,
+            ))
+        }
+    }));
+
+    assert_eq!(scans.load(Ordering::SeqCst), 2, "the folder is read again");
+    assert_eq!(running, 2);
+    let mut ids = plugins.ids();
+    ids.sort();
+    assert_eq!(ids, vec!["first".to_owned(), "second".to_owned()]);
+}
+
+/// A store that cannot keep answers is one where nothing is approved.
+///
+/// `usable_state_dir` refusing a directory means every plugin is unapproved
+/// until somebody says otherwise in this session — that is what makes
+/// refusing fail closed. Once the approvals became the host's they survived
+/// the swap, so a directory that was private at startup and is refused now
+/// would have left the replacement generation holding grants nothing could
+/// record. Clearing them is what puts that back.
+#[test]
+fn a_reload_onto_a_store_that_cannot_keep_answers_forgets_them() {
+    let dir = TempDir::new("reload-loses-state-dir");
+    let state = TempDir::new("reload-loses-state-dir-state");
+    dir.plugin("granted", &draws());
+    let published = Published::default();
+    let commands = Recorder::new(Outcome::Accepted);
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state.0),
+        Arc::new(Arc::clone(&commands)),
+        published.sink(),
+    );
+    plugins.approve("granted", true);
+    published.settles("the grant", |set| {
+        set.iter().any(|p| p.id == "granted" && p.approved)
+    });
+
+    // The directory is gone by the time the reload asks for it, which is what
+    // `usable_state_dir` refusing looks like from in here.
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
+
+    let live = plugins.live();
+    assert_eq!(
+        live.workers[0].granted.load(Ordering::Relaxed),
+        0,
+        "a grant nothing can record is not a grant"
+    );
+    let set = published.settles("the reloaded plugin", |set| {
+        set.iter().any(|p| p.id == "granted")
+    });
+    assert!(
+        set.iter().any(|p| p.id == "granted" && !p.approved),
+        "and it is drawn as waiting to be allowed again"
+    );
+}

@@ -74,26 +74,44 @@ const INSTALL_LOCK: &str = "oxidezap-plugins-install";
 /// refuses it still has an account to open, and a plugin folder is not worth
 /// the session.
 pub async fn installed() -> Vec<Module> {
+    // A page that cannot read its own storage starts with no plugins, which
+    // is the right answer at *start*: there is nothing running to lose, and a
+    // daemon that would not come up because a folder was unreadable is a
+    // daemon that would not come up. A reload asks the fallible one below,
+    // because there the same fact means something else entirely.
+    discover().await.unwrap_or_default()
+}
+
+/// The same, saying whether the folder could be read.
+///
+/// The distinction a reload lives on. `installed` turns an unreadable folder
+/// into an empty one, and on a reload that would retire every healthy plugin
+/// and publish an empty set — with nothing having been removed, nothing to
+/// put it back, and a transient storage error indistinguishable from somebody
+/// deleting everything.
+///
+/// # Errors
+///
+/// The origin's filesystem could not be opened, or the folder could not be
+/// listed. A folder that is simply *not there* is `Ok` and empty: nobody has
+/// installed anything, which is the ordinary page.
+pub async fn discover() -> Result<Vec<Module>, String> {
     let dir = match folder(false).await {
         Ok(Some(dir)) => dir,
         // No folder is the ordinary case: nobody has installed anything.
-        Ok(None) => return Vec::new(),
+        Ok(None) => return Ok(Vec::new()),
         Err(e) => {
-            log::warn!(
-                "no plugins: this page's storage is unreadable ({})",
-                described(e)
-            );
-            return Vec::new();
+            let why = described(e);
+            log::warn!("no plugins: this page's storage is unreadable ({why})");
+            return Err(why);
         }
     };
     let listed = match entries(&dir).await {
         Ok(names) => names,
         Err(e) => {
-            log::warn!(
-                "no plugins: cannot list this page's plugin folder ({})",
-                described(e)
-            );
-            return Vec::new();
+            let why = described(e);
+            log::warn!("no plugins: cannot list this page's plugin folder ({why})");
+            return Err(why);
         }
     };
     // Filtered, *then* truncated, which is the order the desktop's discovery
@@ -145,7 +163,7 @@ pub async fn installed() -> Vec<Module> {
             open: Box::new(move || Ok(bytes)),
         });
     }
-    modules
+    Ok(modules)
 }
 
 /// Put `bytes` in the folder under `file_name`, and answer the id it claimed.
