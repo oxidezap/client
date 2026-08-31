@@ -1857,8 +1857,19 @@ fn discover(dir: &Path) -> Option<Vec<PathBuf>> {
     // every start, to everyone who has never installed a plugin. The check
     // below cannot tell the two apart on its own — it reads metadata, and a
     // directory that is not there has none.
-    if !dir.exists() {
-        return Some(Vec::new());
+    match dir.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Some(Vec::new()),
+        Err(e) => {
+            // `exists()` folds this into `false`, which is the one answer it
+            // must not be: a parent directory that cannot be read, or any
+            // other metadata error, would be reported as a folder with no
+            // plugins in it — and a reload takes that for an answer and
+            // retires every healthy plugin. `try_exists` is the same question
+            // with the third outcome kept.
+            log::warn!("cannot tell whether {} is there: {e}", dir.display());
+            return None;
+        }
     }
     if !only_this_user_can_write(dir) {
         log::warn!(
