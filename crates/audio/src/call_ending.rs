@@ -150,13 +150,21 @@ pub async fn ending(
         },
     )
     .await;
-    // Asked over the arm rather than beside it: an ending with no engine
-    // behind it says nothing about which half went first, and answering that
-    // question anyway is what would make a cancellation read as a fault.
-    if facts.engine_has_them() {
-        released
-    } else {
-        CallAudioEnding::NeverHandedOver
+    match released {
+        // A device that went on this side is a fact about this side, and it
+        // holds whether or not an engine ever had the endpoints. A microphone
+        // unplugged while the *camera* was still opening is exactly that: the
+        // call was not cancelled, the registry may go on to `start()`, and
+        // the local loss is the only evidence there is. Letting the handoff
+        // gate overwrite it would throw the specific answer away for a vaguer
+        // one that is also wrong.
+        CallAudioEnding::CaptureLost => CallAudioEnding::CaptureLost,
+        // The rest name the engine, so they are asked over the arm rather
+        // than beside it: an ending with no engine behind it says nothing
+        // about which half went first, and answering that question anyway is
+        // what would make a cancellation read as a fault.
+        named if facts.engine_has_them() => named,
+        _ => CallAudioEnding::NeverHandedOver,
     }
 }
 
@@ -305,6 +313,35 @@ mod tests {
             &CallAudioFacts::default(),
         ));
         assert_eq!(ending, CallAudioEnding::NeverHandedOver);
+    }
+
+    /// A microphone lost while the camera was still opening is still a lost
+    /// microphone. The endpoints have not reached an engine yet, but nothing
+    /// was cancelled either — the call may go on to start — and the local
+    /// device is the only evidence there is, so the handoff gate may not
+    /// overwrite it with a vaguer answer that is also wrong.
+    #[test]
+    fn a_microphone_lost_before_the_handoff_is_still_a_lost_microphone() {
+        let Endpoints {
+            mic_tx,
+            mic_rx,
+            speaker_tx,
+            speaker_rx,
+        } = endpoints();
+
+        // Nothing has been handed over: the registry is still awaiting the
+        // camera. The track ends anyway.
+        let facts = CallAudioFacts::default();
+        facts.capture_ended();
+        mic_tx.close();
+
+        let ending = futures_lite::future::block_on(ending(
+            async { while speaker_rx.recv().await.is_ok() {} },
+            mic_tx.closed(),
+            &facts,
+        ));
+        assert_eq!(ending, CallAudioEnding::CaptureLost);
+        drop((mic_rx, speaker_tx));
     }
 
     /// A call that is running holds both ends, and neither arm may resolve —

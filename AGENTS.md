@@ -2037,7 +2037,10 @@ by definition.
   that ordinary cancellation is not evidence about a driver there was none
   of. Which is why the handoff is marked after the `start()` that took the
   endpoints and never before it: every exit on the way to one drops the
-  builder with them inside it.
+  builder with them inside it. A local loss outranks that gate rather than
+  being filtered by it — a microphone unplugged while the *camera* is still
+  opening has not been handed over and has not been cancelled either, and the
+  device is the only evidence there is.
 
 - **An abort drops a future where it stands, and an unpolled future leaves
   nothing behind.** The library ends work by aborting the handle its runtime
