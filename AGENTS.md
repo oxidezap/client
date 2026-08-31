@@ -2017,24 +2017,6 @@ by definition.
   the native cache keeping claims the way the page's does, which is the index
   that module opens by saying it does not have — worth it only if somebody
   meets it.
-- **An idle window wakes twenty times a second, and none of it is ours.** A
-  DevTools trace of the published page sitting with nothing happening —
-  no pointer, no message, no rAF at all, which is the part that is *right*:
-  the window does not repaint itself — still spends about 1% of a core, and
-  almost the whole of it is one `setTimeout(50ms)` re-armed 20 times a
-  second. It is `gpui_component::NotificationList::new`, which spawns
-  `loop { timer(50ms); advance() }` for the life of the app whether or not a
-  notification has ever been raised, and `Root::new` builds one
-  unconditionally. Nothing here can decline it: `Root`'s fields are
-  `pub(crate)`, so the layers we do use — the tooltip overlay and the context
-  menus — cannot be assembled without it, and every other repeating timer in
-  this tree already ends itself (the heartbeat stops when there is no
-  `theme.json` to watch, the typing monitor when the composing stops, the
-  playback ticks when nothing is playing). So it is upstream's to fix, and it
-  is worth knowing about before reading a flame graph of an idle page and
-  concluding the window is busy. Measured at `fbf286c`: 2 seconds of a
-  genuinely idle page is 23ms of main thread, 44 timer fires, 0 animation
-  frames.
 - **What the module weighs is nobody's job to notice.** The Pages workflow
   prints it now, and the numbers to compare against are: 29,825,238 bytes at
   `17e6d4f`, of which the code section is 84.5% and the data section 15.1%,
