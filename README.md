@@ -40,9 +40,9 @@ Prebuilt binaries for Linux, macOS and Windows are attached to each
 [release](https://github.com/oxidezap/client/releases). Builds of `main` are
 published continuously under the `nightly` tag.
 
-Each archive holds two binaries that belong together: `oxidezap` is the window
-and `oxidezapd` holds the session. Keep them in the same directory — the window
-looks for the daemon beside itself.
+Each platform archive holds two binaries that belong together: `oxidezap` is
+the window and `oxidezapd` holds the session. Keep them in the same directory
+— the window looks for the daemon beside itself.
 
 ```bash
 tar -xzf oxidezap-nightly-linux-x86_64.tar.gz
