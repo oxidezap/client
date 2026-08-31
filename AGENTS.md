@@ -273,10 +273,12 @@ profile here repeats it deliberately.
 
 A repository gets 10 GB of Actions cache, and GitHub evicts the least recently
 used entry to stay under it. That number, not any compiler setting, is what
-decides how long a pull request waits: a job that restores its cache spends a
-minute on the download and then a minute compiling, and the same job that finds
-nothing spends eight compiling from scratch. The Windows `Check` job has been
+decides how long a pull request waits: a job that restores its cache spends
+under a minute on the download and then compiles what changed, and the same
+job that finds nothing compiles the world. The Windows `Check` job has been
 observed at 3m49 with a cache and 12m26 without it, twenty minutes apart.
+With every entry restoring, a pull request's whole run lands around 6m20
+against the 12m45 it took when one of them was always missing.
 
 So the budget is a shared resource with a fixed size, and every `save-if` in
 these workflows is a claim on it. Two rules follow, and both are already in the
@@ -301,10 +303,26 @@ dependency compiles to rather than what our crates compile to. Dependencies
 carry no debug information (`[profile.dev.package."*"]`, and `build-override`
 for the host-compiled half of them, which is where the proc macros are), which
 is why they can: nobody sets a breakpoint in diesel, and `panic::Location` is
-compiled in regardless, so panics still name their file and line. It is a
-third off what CI compresses and a third off what it downloads, and it is not
-a trade against build time — DWARF is work to emit and work to link, so the
-cold local build got 12% faster too. The manifest carries the table.
+compiled in regardless, so panics still name their file and line.
+
+What that is worth turned out to be a question about the platform, and the
+first version of this paragraph got it wrong by answering it from one machine.
+Measured off each job's own upload log, before and after:
+
+  Check (Linux)     2.17 GB -> 1.72 GB   -21%
+  Check (Windows)   2.07 GB -> 1.95 GB    -6%
+  Check (macOS)     1.64 GB -> 1.58 GB    -4%
+
+The claim here used to be "a third off", extrapolated from a local Linux
+measurement that also excluded the GUI crate. It holds on Linux and nowhere
+else, which in hindsight is what should have been expected: DWARF is the
+format on one of these three platforms, and Windows puts debug information in
+PDBs while macOS leaves it in the object files. A number measured on one
+target is a number about that target.
+
+It is still not a trade against build time — emitting and linking debug
+information is work, so the cold local build got 12% faster as well, and the
+manifest carries that table.
 
 Which is also why every one of those caches keys on the root manifest's hash.
 rust-cache's automatic key hashes `Cargo.lock`, `.cargo/config.toml` and each
