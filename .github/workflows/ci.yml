@@ -61,6 +61,24 @@ jobs:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # The manifest's hash belongs in the key, because a profile setting
+          # in it changes every dependency's fingerprint and rust-cache would
+          # otherwise never notice.
+          #
+          # Its automatic key hashes `Cargo.lock`, `.cargo/config.toml` and
+          # each *member* crate's manifest — not the root one, where the
+          # profiles live. So changing `[profile.dev]` used to leave the key
+          # identical while making every cached artifact useless: the restore
+          # was a full match, cargo rebuilt all of it anyway, and rust-cache
+          # then declined to save ("Cache up-to-date."), so the stale entry
+          # was never replaced. Measured on `main` after the profile change
+          # that introduced this: the Windows `Check` job went from 3m49 warm
+          # to 11m17, and stayed there.
+          #
+          # Naming the root manifest here is what makes the key say what it
+          # means. A `prefix-key` bump would fix today and leave the next
+          # profile edit to rediscover it.
+          key: ${{ hashFiles('Cargo.toml') }}
           # Keep the dependency build even when a lint or a test fails: the
           # failure is in our code, and throwing away everything it compiled
           # makes the next attempt pay for all of it again.
@@ -146,7 +164,11 @@ jobs:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: check-${{ matrix.name }}
+          # The root manifest's hash, for the reason spelled out over the
+          # `Check` job: the profiles live there, a profile decides every
+          # dependency's fingerprint, and rust-cache's automatic key does not
+          # hash that file.
+          key: check-${{ matrix.name }}-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # --all-targets so tests and benches are compiled too: a `cfg`-gated
@@ -195,7 +217,11 @@ jobs:
         with:
           # Its own cache: a different target shares nothing with the Linux
           # job's, and pages.yml's is a nightly with a rebuilt std.
-          key: web-test
+          # The root manifest's hash, for the reason spelled out over the
+          # `Check` job: the profiles live there, a profile decides every
+          # dependency's fingerprint, and rust-cache's automatic key does not
+          # hash that file.
+          key: web-test-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Chrome and its driver are on the image already. `CHROMEWEBDRIVER` is
@@ -239,7 +265,11 @@ jobs:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: msrv
+          # The root manifest's hash, for the reason spelled out over the
+          # `Check` job: the profiles live there, a profile decides every
+          # dependency's fingerprint, and rust-cache's automatic key does not
+          # hash that file.
+          key: msrv-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check -p oxidezap-chat-store -p oxidezap-core -p oxidezap-ipc --all-features

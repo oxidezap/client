@@ -75,7 +75,11 @@ jobs:
           # mean both jobs writing one entry — a release build and a preview
           # build racing to save the same key, for a compilation neither of
           # them shortens for the other.
-          key: web-bundle
+          # The root manifest's hash, for the reason spelled out over the
+          # `Check` job: the profiles live there, a profile decides every
+          # dependency's fingerprint, and rust-cache's automatic key does not
+          # hash that file.
+          key: web-bundle-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: "true"
 
       # `./`, which is the whole point of this archive. Trunk rewrites
