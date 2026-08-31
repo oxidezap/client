@@ -6346,6 +6346,7 @@ dependencies = [
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",
  "tokio",
+ "wacore",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

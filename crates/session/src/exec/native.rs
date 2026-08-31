@@ -183,6 +183,16 @@ pub async fn sleep(duration: std::time::Duration) {
     tokio::time::sleep(duration).await;
 }
 
+/// Give the runtime a turn.
+///
+/// The page's half of this exists to let the browser draw; there is no
+/// browser here and nothing to draw, but the runtime does have other tasks
+/// and a long sequence of ready futures is one that never lets them run. A
+/// yield is what that costs.
+pub async fn breathe() {
+    tokio::task::yield_now().await;
+}
+
 /// Whichever finishes first: the work, or the wait. `None` when the wait won.
 pub async fn with_timeout<T>(
     work: impl Future<Output = T>,

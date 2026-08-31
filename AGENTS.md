@@ -1860,6 +1860,20 @@ by definition.
   address space at once, and the page that works today is the thing at risk
   if it is got wrong. `wasm_thread` is already in the tree through gpui, so
   the spawn is not the obstacle; the restructuring is.
+  What it *costs* is measured now, which it was not when this was written. A
+  DevTools trace of a cold load of the published page puts 93% of the
+  window's whole main-thread CPU in the first three seconds, and the session's
+  share of that is two blocks: 129ms, then 342ms with not one animation frame
+  in it, ending at the `WebSocketCreate` that opens the socket. That second
+  one is the store's preload, SQLite, the migrations, the client and the
+  hydration, and it is one block because every `.await` between those phases
+  is ready when it is polled — the asynchrony belongs to the desktop's
+  runtime, and SQLite in a page is synchronous, so nothing there ever leaves
+  the microtask it started in. `run_client` now breathes between the phases
+  and times each one, which changes the shape and not the total: a `info` line
+  says where a page's first second went, in a module whose symbols are
+  stripped and whose flame graph therefore names nothing. The total is still
+  the worker's to remove.
 
 - **The session runs in the browser, and pairing is measured now.** A page
   with no daemon named starts its own, and the whole of it works against

@@ -192,6 +192,21 @@ impl Timers {
     }
 }
 
+/// Give the page's loop a turn.
+///
+/// A zero-length `setTimeout` rather than a bare yield, because what has to
+/// run in the gap is the browser's own work — a frame, an input event — and
+/// not merely another Rust task on the same tick. An `.await` on a future
+/// that is already ready does not leave the microtask it is in, which is the
+/// whole reason a sequence of them can freeze a page: the awaits are there
+/// for the desktop's runtime, and on this target they cost nothing and yield
+/// nothing.
+///
+/// The same function, and the same sentence, as `plugin_host::sched::breathe`.
+pub async fn breathe() {
+    sleep(Duration::ZERO).await;
+}
+
 /// `setTimeout`, as a future.
 ///
 /// Parks forever where no timer can be armed, which is what the window's own
