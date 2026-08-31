@@ -54,11 +54,33 @@ LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLI
 rustflags = [
     "-Clink-arg=-fuse-ld=lld",
     "-Clink-arg=-Wl,--icf=all",
-    # `panic = "abort"` stops unwinding, but rustc still emits unwind tables
-    # for every function: 2.6 MB of .eh_frame, .eh_frame_hdr and
-    # .gcc_except_table in this binary, 6% of it, that nothing can ever walk.
-    # Frame pointers keep a backtrace walkable without them, at the cost of one
-    # register. Technique and the pairing come from Bun's build.
+    # These two were written down as a pair that removes the unwind tables and
+    # pays a register to keep backtraces walkable without them. Measured, the
+    # pair does something else entirely, and both halves are worth stating
+    # because the conclusion is the same and the reasoning is not.
+    #
+    # `-Cforce-unwind-tables=no` removes nothing here. Under `panic = "abort"`
+    # rustc already answers no to "must emit unwind tables", so the flag has
+    # nothing left to turn off, and LLVM emits the CFI regardless: the window
+    # carries 1,149,608 bytes of `.eh_frame` and 219,404 of `.eh_frame_hdr`,
+    # and 27,467 FDEs cover 21,027,231 of its 21,152,913 bytes of `.text` —
+    # 99.4%. A probe built with the flag and without it is byte-identical. It
+    # stays because it is free and because a future rustc may honour it; what
+    # it is not is 2.6 MB.
+    #
+    # `-Cforce-frame-pointers=yes` is then not the price of that removal but
+    # what makes the tables that stayed cheap to encode. With `rbp` as the
+    # frame pointer a function's CFA is one rule for its whole body; without
+    # it the rule has to be re-expressed against a moving `rsp`. Dropping the
+    # flag was measured at **+703,616 bytes** on the window and **+443,136**
+    # on the daemon — `.eh_frame` +482,184 (+42%) and `.text` +221,280 — so
+    # it earns its register several times over.
+    #
+    # What would actually remove the tables is `objcopy` after the link, and
+    # it is not done: `RUST_BACKTRACE` walks them through `_Unwind_Backtrace`
+    # even under `panic = "abort"`, and frame pointers are not a substitute
+    # because std's backtrace does not read them. A crash report is worth
+    # more than 1.1 MB.
     "-Cforce-unwind-tables=no",
     "-Cforce-frame-pointers=yes",
     # Drop the legacy SysV .hash section; glibc has preferred .gnu.hash since

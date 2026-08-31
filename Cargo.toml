@@ -426,6 +426,19 @@ opt-level = "z"
 [profile.release.package.buffa]
 opt-level = "z"
 
+# The client above the wire format, for the same reason and one notch less
+# far. `whatsapp-rust` is 2.4 MiB of the daemon's `.text` — the stanza
+# handlers, the connection lifecycle, the send paths and the VoIP facade —
+# and every one of those runs once per stanza or once per call rather than in
+# a loop. "s" rather than "z" because it is the layer a message actually
+# passes through, where `waproto` is the encoder underneath it.
+#
+# `wacore` is deliberately not here despite being the next largest: it
+# carries the MLow codec, and `CelpEncoder::encode_subframe` is per audio
+# frame of a call. The ciphers are not here either.
+[profile.release.package.whatsapp-rust]
+opt-level = "s"
+
 
 # s, not z: these sit on a path a user can feel, but not one that runs per
 # frame. Image decode happens once per attachment, the Wayland protocol
