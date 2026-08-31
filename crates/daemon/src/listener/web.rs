@@ -1257,7 +1257,9 @@ mod tests {
         };
         let hub = StateHub::new();
         let (commands, _rx) = tokio::sync::mpsc::channel(1);
-        let plugins = Arc::new(oxidezap_plugin_host::Plugins::none(Arc::new(|_| {})));
+        let plugins = Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+            |_| {},
+        )));
         let refused = run(exposed, hub, plugins, commands, server::client_slots()).await;
         let message = refused
             .expect_err("a non-loopback bind is refused")

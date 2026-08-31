@@ -473,12 +473,7 @@ fn host(dir: &TempDir, commands: Arc<Recorder>, published: &Published) -> Plugin
     // what a plugin *does* has to say so first. Written out here rather than
     // hidden in the constructor: the gate is the point, and a helper that
     // silently opened it would make every test below prove nothing.
-    for id in plugins
-        .ids()
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>()
-    {
+    for id in plugins.ids() {
         plugins.approve(&id, true);
     }
     plugins
@@ -1183,12 +1178,13 @@ fn a_plugin_stopped_for_falling_behind_is_offered_nothing_more() {
     // memory and everything still queued go. Held open, a plugin that
     // overflowed — the one holding the most of all of that — kept it until
     // the daemon shut down.
+    let live = plugins.live();
     assert!(
-        crate::lock(&plugins.workers[0].queue).is_none(),
+        crate::lock(&live.workers[0].queue).is_none(),
         "a stopped plugin's queue is closed, not left standing"
     );
     assert!(
-        plugins.workers[0]
+        live.workers[0]
             .thread
             .lock()
             .unwrap_or_else(|held| held.into_inner())
@@ -2245,7 +2241,12 @@ fn time_owed_is_not_forgiven_when_the_window_turns_over() {
 fn a_directory_that_is_not_there_is_simply_empty() {
     let dir = TempDir::new("absent-plugins");
     let missing = dir.0.join("nothing-here");
-    assert!(crate::discover(&missing).is_empty());
+    assert!(
+        crate::discover(&missing)
+            .expect("an absent folder is an answer")
+            .is_empty(),
+        "a folder that is not there is no plugins, not a failure"
+    );
 }
 
 /// Stores one setting on its first message and never asks for anything else.
@@ -2473,7 +2474,9 @@ fn a_directory_of_plugins_is_bounded_by_how_many_will_run() {
         broken.plugin(&format!("p{i:03}"), "(module)");
     }
     assert_eq!(
-        crate::discover(&broken.0).len(),
+        crate::discover(&broken.0)
+            .expect("the folder is readable")
+            .len(),
         crate::MAX_PLUGINS,
         "the list stops at the cap however few of them would load"
     );
@@ -3204,4 +3207,569 @@ fn an_action_whose_chat_contradicts_its_slot_is_ignored() {
         widget: PluginWidget::Button,
     });
     until("the greeting", || commands.sent().len() == 1);
+}
+
+// ---- reloading -----------------------------------------------------------
+
+/// The plain case, and the whole point of it: the folder changed, and what is
+/// running changes with it — without the host, the daemon or the session
+/// going anywhere.
+#[test]
+fn a_reload_runs_what_is_in_the_folder_now() {
+    let dir = TempDir::new("reload-picks-up");
+    dir.plugin("first", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    assert_eq!(plugins.ids(), vec!["first".to_owned()]);
+
+    // One added, one taken away, which is every way a folder can differ.
+    dir.plugin("second", &draws());
+    std::fs::remove_file(dir.0.join("first.wasm")).expect("removable");
+
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(1));
+    assert_eq!(plugins.ids(), vec!["second".to_owned()]);
+    published.settles("the new set to be published", |set| {
+        set.len() == 1 && set[0].id == "second"
+    });
+}
+
+/// A reload that finds nothing still says so.
+///
+/// The one publication a generation cannot make for itself: surfaces are
+/// published per plugin as each is inserted, so a set with no plugins in it
+/// publishes nothing at all — and every window would go on drawing the set
+/// that is no longer running, with buttons that reach nobody.
+#[test]
+fn a_reload_that_finds_nothing_publishes_the_empty_set() {
+    let dir = TempDir::new("reload-to-empty");
+    dir.plugin("only", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    published.settles("something to be drawn", |set| set.len() == 1);
+
+    std::fs::remove_file(dir.0.join("only.wasm")).expect("removable");
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(0));
+    assert!(plugins.ids().is_empty());
+    assert!(
+        published.latest().is_empty(),
+        "an empty folder is drawn as an empty folder"
+    );
+}
+
+/// An answer nothing could write down is not an answer.
+///
+/// The caller is a front end waiting to be told whether the permission it
+/// asked for was given, and `Approvals::set` fails closed — a grant it cannot
+/// store is rolled back and the plugin is left unapproved. Reporting that as
+/// recorded acknowledges a permission nothing here holds and nothing will
+/// read back, which is the one direction this must never get wrong: a window
+/// that was told "yes" over a plugin that is still refusing.
+///
+/// Not a browser-only fact, which is where it was reported: the desktop half
+/// discarded the same answer, and this is the desktop half.
+#[test]
+fn a_grant_the_store_refuses_is_not_acknowledged() {
+    let dir = TempDir::new("grant-unrecordable");
+    let state = TempDir::new("grant-unrecordable-state");
+    dir.plugin("asks", &draws());
+    let published = Published::default();
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state.0),
+        Arc::new(Recorder::new(Outcome::Accepted)),
+        published.sink(),
+    );
+    published.settles("the plugin", |set| set.iter().any(|p| p.id == "asks"));
+
+    // A directory where the file has to go, so the rename at the end of the
+    // write cannot land — the shape of a quota, a read-only disk, or a
+    // browsing context with no storage at all.
+    std::fs::create_dir(state.0.join("approvals.json")).expect("writable");
+
+    assert!(
+        !plugins.approve("asks", true),
+        "a grant that could not be written down is not one to acknowledge"
+    );
+    let set = published.latest();
+    assert!(
+        set.iter().any(|p| p.id == "asks" && !p.approved),
+        "and it is still drawn as waiting to be allowed"
+    );
+}
+
+/// What the user answered is not a property of the plugin that was running.
+///
+/// It is written down against the id and the mask, so the generation that
+/// replaces it reads the same answer back — otherwise every reload would be a
+/// permission prompt, which is the surest way to teach somebody to dismiss
+/// one.
+#[test]
+fn an_approval_survives_a_reload() {
+    let dir = TempDir::new("reload-approval");
+    let state = TempDir::new("reload-approval-state");
+    dir.plugin("keeps", &draws());
+    let published = Published::default();
+    let commands = Recorder::new(Outcome::Accepted);
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state.0),
+        Arc::new(Arc::clone(&commands)),
+        published.sink(),
+    );
+    plugins.approve("keeps", true);
+    published.settles("the grant", |set| {
+        set.iter().any(|p| p.id == "keeps" && p.approved)
+    });
+
+    assert_eq!(
+        plugins.reload_from_dir(&dir.0, Some(&state.0)),
+        Reloaded::Ran(1)
+    );
+    let set = published.settles("the reloaded plugin", |set| {
+        set.iter().any(|p| p.id == "keeps")
+    });
+    assert!(
+        set.iter().any(|p| p.id == "keeps" && p.approved),
+        "the answer was recorded against the id, not against the worker"
+    );
+
+    // And it is not merely drawn as approved: the new worker holds the mask,
+    // so it can act. Nothing else grants it — `host` is not used here
+    // precisely so that nothing approves the second generation.
+    plugins.act(&PluginAction {
+        plugin: "keeps".into(),
+        action: "greet".into(),
+        value: None,
+        chat_jid: Some("a@s.whatsapp.net".into()),
+        slot: PluginSlot::ChatHeader,
+        widget: PluginWidget::Button,
+    });
+    until("the reloaded plugin to act", || commands.sent().len() == 1);
+}
+
+/// A superseded generation may not publish, and the reason it must not is
+/// that on a page nothing can wait for it.
+///
+/// A desktop joins every worker, so the case is hard to reach there — which
+/// is exactly why it is asserted against the mechanism rather than against a
+/// race: `retire` is what a reload calls, and a registry it has retired is
+/// one whose publications go nowhere.
+#[test]
+fn a_retired_set_cannot_draw_over_the_one_that_replaced_it() {
+    let dir = TempDir::new("reload-stale-publish");
+    dir.plugin("stale", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    published.settles("its interface", |set| set.len() == 1);
+
+    let previous = plugins.live();
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(1));
+    let after = published.latest();
+
+    previous.registry.set_roots("stale", Vec::new());
+    previous.registry.publish();
+    assert_eq!(
+        published.latest(),
+        after,
+        "a generation nobody is running publishes nothing"
+    );
+}
+
+/// Reloading is not a way back in after the account has gone.
+///
+/// `shutdown` is what runs before the store is wiped, and a reload arriving
+/// then would start plugins over a session that is being forgotten — the same
+/// thing an approval is refused for, and for the same reason.
+#[test]
+fn a_shut_down_host_does_not_reload() {
+    let dir = TempDir::new("reload-after-shutdown");
+    dir.plugin("gone", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    let stopped = plugins.live();
+    plugins.shutdown();
+
+    // A file appears in the folder in the window between the wipe starting
+    // and the process ending, which is the shape of the thing being refused:
+    // the reload has a folder to read and would have something to run.
+    dir.plugin("late", &draws());
+    assert_eq!(
+        plugins.reload_from_dir(&dir.0, None),
+        Reloaded::Failed,
+        "and it says so, rather than reporting a reload that installed nothing"
+    );
+    assert!(
+        Arc::ptr_eq(&stopped, &plugins.live()),
+        "nothing is installed over a host that has been shut down"
+    );
+    assert!(
+        !plugins.ids().iter().any(|id| id == "late"),
+        "and the module that appeared is not running"
+    );
+}
+
+/// A plugin the reload retired cannot act, even before its thread has ended.
+///
+/// On a desktop the join covers this; a page cannot join anything, so the
+/// mask is what covers both. It is the same zero a withdrawal writes, which
+/// is why this is one mechanism rather than two.
+#[test]
+fn retiring_a_generation_takes_its_authority_away() {
+    let dir = TempDir::new("reload-authority");
+    dir.plugin("armed", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    let previous = plugins.live();
+    assert_ne!(
+        previous.workers[0].granted.load(Ordering::Relaxed),
+        0,
+        "it was approved to begin with, or this proves nothing"
+    );
+
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(1));
+    assert_eq!(
+        previous.workers[0].granted.load(Ordering::Relaxed),
+        0,
+        "a superseded worker may no longer touch the account"
+    );
+}
+
+/// An answer given while a reload is loading reaches the set that replaces
+/// it.
+///
+/// The approvals used to be the *generation's*, read from disk when it was
+/// built — so a revocation landing during a load wrote the file and the
+/// retiring set's map, and the fresh set, built from a snapshot taken before
+/// it, was installed still holding the grant. Acknowledged, and undone.
+/// One map for the host is what closes it, and re-reading each worker's mask
+/// at the install is what carries it to the workers already built.
+#[test]
+fn a_revocation_during_a_reload_is_not_undone_by_it() {
+    let dir = TempDir::new("reload-revoke-during");
+    let state = TempDir::new("reload-revoke-during-state");
+    dir.plugin("racy", &draws());
+    let published = Published::default();
+    let commands = Recorder::new(Outcome::Accepted);
+    let plugins = Arc::new(Plugins::load(
+        &dir.0,
+        Some(&state.0),
+        Arc::new(Arc::clone(&commands)),
+        published.sink(),
+    ));
+    plugins.approve("racy", true);
+    published.settles("the grant", |set| {
+        set.iter().any(|p| p.id == "racy" && p.approved)
+    });
+
+    // The revocation lands while the reload is loading. Both are ordinary
+    // calls from two connections; the thread is what makes them overlap.
+    //
+    // Whether they *do* overlap on any given run is the scheduler's business,
+    // which is why what is asserted is the invariant rather than the race:
+    // after a reload, a worker's mask is what the answers say, whenever the
+    // answer was given. That holds on the runs where the two miss each other
+    // and is exactly what a generation carrying its own snapshot of the
+    // answers got wrong on the runs where they meet.
+    let revoking = Arc::clone(&plugins);
+    let revoke = std::thread::spawn(move || revoking.approve("racy", false));
+    assert_eq!(
+        plugins.reload_from_dir(&dir.0, Some(&state.0)),
+        Reloaded::Ran(1)
+    );
+    revoke.join().expect("the revocation finished");
+
+    let live = plugins.live();
+    assert_eq!(
+        live.workers[0].granted.load(Ordering::Relaxed),
+        0,
+        "the reloaded worker holds the answer given during the load"
+    );
+    let set = published.latest();
+    assert!(
+        set.iter().any(|p| p.id == "racy" && !p.approved),
+        "and it is drawn as withdrawn"
+    );
+
+    // And the answer is the host's one map rather than a copy per
+    // generation, which is the half that can be asked outright: a grant made
+    // now reaches the worker this reload installed.
+    plugins.approve("racy", true);
+    assert_ne!(
+        live.workers[0].granted.load(Ordering::Relaxed),
+        0,
+        "an answer after the reload reaches the set the reload installed"
+    );
+}
+
+/// A set being loaded draws nothing until it is the set that is running.
+///
+/// `Registry::insert` publishes per plugin, so a reload used to put controls
+/// on screen while `live` was still the generation being retired — and a
+/// press on one of them was routed against that old registry and its closed
+/// queues: accepted, validated against the wrong tree, and silently dropped.
+/// `MAX_LOAD_TIME` is how wide that window can be.
+#[test]
+fn a_set_still_loading_publishes_nothing() {
+    let dir = TempDir::new("reload-quiet-until-live");
+    dir.plugin("quiet", &draws());
+    let published = Published::default();
+    // Bound rather than dropped: `Plugins` shuts its workers down on drop, so
+    // a host nobody holds is a host that has already gone.
+    let _running = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    published.settles("the first set", |set| set.len() == 1);
+
+    // What the *fresh* registry would publish, asked of the mechanism rather
+    // than of a race: a generation built to announce on install is one whose
+    // publications go nowhere until it does.
+    let quiet = Arc::new(crate::registry::Registry::new(
+        published.sink(),
+        Arc::new(crate::approvals::Approvals::open(Arc::new(
+            crate::store::Nowhere,
+        ))),
+        true,
+    ));
+    let before = published.latest();
+    quiet.insert("loading", "Loading".to_owned(), 0);
+    assert_eq!(
+        published.latest(),
+        before,
+        "a set that is still loading is not drawn"
+    );
+
+    quiet.announce();
+    quiet.publish();
+    assert!(
+        published.latest().iter().any(|p| p.id == "loading"),
+        "and it is drawn once it is the set that is running"
+    );
+}
+
+/// A folder that cannot be read is not an empty folder.
+///
+/// The two are the same value on the way out of a scan, and treating them
+/// alike on a reload retires every healthy plugin and publishes an empty set
+/// — over a transient storage error, with nothing removed and nothing to put
+/// it back. `reload` takes an `Option` for exactly this, and answers a
+/// refusal by leaving what is running alone.
+#[test]
+fn a_reload_that_cannot_read_the_folder_changes_nothing() {
+    let dir = TempDir::new("reload-unreadable");
+    dir.plugin("kept", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+    let before = published.settles("its interface", |set| set.len() == 1);
+    let live = plugins.live();
+
+    let outcome = futures_lite::future::block_on(plugins.reload(|| async { None }));
+    assert_eq!(
+        outcome,
+        Reloaded::Kept(1),
+        "what is running is still running, and nothing was installed"
+    );
+    assert!(
+        Arc::ptr_eq(&live, &plugins.live()),
+        "and it is the same set, not a fresh one that happens to match"
+    );
+    assert_eq!(published.latest(), before, "nothing was redrawn");
+}
+
+/// An ask that arrives during a reload gets a scan of its own.
+///
+/// Somebody who installs a plugin while a reload is running is the case: the
+/// scan already in flight may have read the folder before their file landed,
+/// so refusing them outright loses the very change they asked for — and the
+/// request is acknowledged as done. One more scan afterwards covers every ask
+/// that arrived during the first.
+#[test]
+fn an_ask_during_a_reload_is_not_lost() {
+    let dir = TempDir::new("reload-coalesce");
+    dir.plugin("first", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    // The second module appears part-way through the first scan, which is the
+    // ordering the coalescing exists for: the closure is what reads the
+    // folder, so a file written between two calls of it is a file the first
+    // did not see and the second does.
+    let scans = std::sync::atomic::AtomicUsize::new(0);
+    let folder = &dir;
+    let host = &plugins;
+    let outcome = futures_lite::future::block_on(plugins.reload(|| {
+        let round = scans.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if round == 0 {
+                // Somebody installs, and asks. The ask lands while this
+                // reload holds the slot, which is what it looks like from in
+                // here: `reload` refused them and remembered.
+                folder.plugin("second", &draws());
+                // Exactly what a second request does: it finds the slot
+                // taken, and is remembered rather than refused.
+                assert!(!host.claim_reload(), "the slot is already taken");
+            }
+            Some((
+                crate::modules_in(&folder.0).expect("the folder is readable"),
+                Arc::new(crate::store::Nowhere) as Arc<dyn Backing>,
+            ))
+        }
+    }));
+
+    assert_eq!(scans.load(Ordering::SeqCst), 2, "the folder is read again");
+    assert_eq!(outcome, Reloaded::Ran(2));
+    let mut ids = plugins.ids();
+    ids.sort();
+    assert_eq!(ids, vec!["first".to_owned(), "second".to_owned()]);
+}
+
+/// A store that cannot keep answers is one where nothing is approved.
+///
+/// `usable_state_dir` refusing a directory means every plugin is unapproved
+/// until somebody says otherwise in this session — that is what makes
+/// refusing fail closed. Once the approvals became the host's they survived
+/// the swap, so a directory that was private at startup and is refused now
+/// would have left the replacement generation holding grants nothing could
+/// record. Clearing them is what puts that back.
+#[test]
+fn a_reload_onto_a_store_that_cannot_keep_answers_forgets_them() {
+    let dir = TempDir::new("reload-loses-state-dir");
+    let state = TempDir::new("reload-loses-state-dir-state");
+    dir.plugin("granted", &draws());
+    let published = Published::default();
+    let commands = Recorder::new(Outcome::Accepted);
+    let plugins = Plugins::load(
+        &dir.0,
+        Some(&state.0),
+        Arc::new(Arc::clone(&commands)),
+        published.sink(),
+    );
+    plugins.approve("granted", true);
+    published.settles("the grant", |set| {
+        set.iter().any(|p| p.id == "granted" && p.approved)
+    });
+
+    // The directory is gone by the time the reload asks for it, which is what
+    // `usable_state_dir` refusing looks like from in here.
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(1));
+
+    let live = plugins.live();
+    assert_eq!(
+        live.workers[0].granted.load(Ordering::Relaxed),
+        0,
+        "a grant nothing can record is not a grant"
+    );
+    let set = published.settles("the reloaded plugin", |set| {
+        set.iter().any(|p| p.id == "granted")
+    });
+    assert!(
+        set.iter().any(|p| p.id == "granted" && !p.approved),
+        "and it is drawn as waiting to be allowed again"
+    );
+}
+
+/// A reload that unwinds gives the slot back.
+///
+/// Every ordinary exit could put it back itself; a panicking loader could
+/// not, and one that held it forever would leave the host unable to reload
+/// for the life of the process — every later ask setting the flag and
+/// returning with no owner left to consume it — and `shutdown` waiting for a
+/// reload that had already unwound.
+///
+/// Without the guard this test does not fail, it *hangs*, and that is worth
+/// knowing before somebody runs it: dropping `Plugins` shuts the host down,
+/// and `wait_for_any_reload` has no deadline, so it waits forever on a slot
+/// nothing released. Which is the interaction itself — the wait is
+/// unbounded on purpose, and the guard is what makes that safe rather than
+/// merely correct.
+#[test]
+fn a_reload_that_panics_does_not_keep_the_slot() {
+    let dir = TempDir::new("reload-unwinds");
+    dir.plugin("survivor", &draws());
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    let panicking = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        futures_lite::future::block_on(plugins.reload(|| async {
+            panic!("the loader fell over");
+        }))
+    }));
+    assert!(panicking.is_err(), "the panic is not swallowed");
+
+    // And the host is usable: this reload runs rather than being refused by a
+    // slot nobody released.
+    assert_eq!(plugins.reload_from_dir(&dir.0, None), Reloaded::Ran(1));
+    assert_eq!(plugins.ids(), vec!["survivor".to_owned()]);
+}
+
+/// The reload slot's transitions, asked directly.
+///
+/// This mechanism has produced four defects in a row — a lost handoff, a
+/// guard that released a successor's claim, and a pair of exchanges that
+/// could leave the word `OWED` with nobody to honour it — every one found by
+/// reading rather than by running. Three states is small enough to simply
+/// *ask*, so this asks.
+///
+/// What it does not cover, and the distinction matters: the interleavings.
+/// Each defect above needed another thread to act *between* two instructions
+/// of an owner, and nothing single-threaded can get in there — this test
+/// passes against the version whose release could strand the word at `OWED`,
+/// which I checked rather than assumed. What it pins is the sequence of
+/// states a caller walks through, which is what a later reader will change by
+/// accident; the races are still held by argument alone, and the argument is
+/// in `Reservation::another_pass`.
+#[test]
+fn the_reload_slot_hands_off_without_losing_or_stealing_it() {
+    let published = Published::default();
+    let plugins = Plugins::nothing_loaded(published.sink());
+    let word = &plugins.reload;
+
+    // Nobody holds it.
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::IDLE);
+
+    // One claim takes it; a second is deferred rather than refused.
+    assert!(plugins.claim_reload(), "an idle slot is taken");
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::RUNNING);
+    assert!(!plugins.claim_reload(), "a taken slot is not taken twice");
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::OWED);
+    assert!(
+        !plugins.claim_reload(),
+        "and a third ask adds nothing: one more scan covers them all"
+    );
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::OWED);
+
+    // The owner finishes a pass and takes the one that was owed.
+    let slot = crate::Reservation::new(word);
+    assert!(slot.another_pass(), "the owed pass is taken");
+    assert_eq!(
+        word.load(Ordering::SeqCst),
+        crate::reload::RUNNING,
+        "and the slot is still held"
+    );
+
+    // An ask arriving while the owner is between passes. Not the case that
+    // deadlocked — that one needs the claim *inside* `another_pass`, between
+    // its two exchanges, which is out of reach from here — but the ordinary
+    // shape of it, and the one a refactor is most likely to break.
+    assert!(!plugins.claim_reload());
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::OWED);
+    assert!(slot.another_pass(), "it retries rather than stalling");
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::RUNNING);
+
+    // Nothing owed now, so the pass gives the slot up — and the guard, having
+    // handed it over, must not take it back on the way out.
+    assert!(!slot.another_pass());
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::IDLE);
+    assert!(plugins.claim_reload(), "a successor can take it");
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::RUNNING);
+    drop(slot);
+    assert_eq!(
+        word.load(Ordering::SeqCst),
+        crate::reload::RUNNING,
+        "the successor still holds it"
+    );
+
+    // And put it back, because the successor here is imaginary. `shutdown`
+    // waits for an in-flight reload and this host is about to be dropped —
+    // which is the design working, and would hang this test on a reload
+    // nobody is running.
+    word.store(crate::reload::IDLE, Ordering::SeqCst);
 }

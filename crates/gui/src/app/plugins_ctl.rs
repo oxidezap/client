@@ -257,11 +257,13 @@ impl WhatsAppApp {
     /// control that calls this is drawn only where
     /// [`crate::platform::PluginHome::can_install`] says so.
     ///
-    /// It does not start the plugin. Loading happens once, before the session
-    /// does, and a plugin reloaded under itself mid-conversation is a
-    /// separate problem the daemon does not have an answer to either — so the
-    /// honest thing to say is that the next load runs it, which for a page is
-    /// a reload of the tab.
+    /// It also starts it, by asking the daemon to read the folder again. That
+    /// is one act from where somebody is standing — they chose a file in
+    /// order to run it — and two here, because the folder is this front end's
+    /// and the host is the daemon's. What the reload costs is every *other*
+    /// plugin restarting with it: the set is retired and loaded whole, since
+    /// an id is what an approval and a settings document are keyed on and two
+    /// generations holding one would be two plugins sharing an identity.
     pub fn install_plugin(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
             let outcome = crate::platform::plugins::install().await;
@@ -270,8 +272,9 @@ impl WhatsAppApp {
                 Ok(None) => {}
                 Ok(Some(id)) => {
                     app.refresh_installed_plugins(cx);
+                    app.reload_plugins(cx);
                     app.notify_user(
-                        format!("{id} installed. Reload this page to run it."),
+                        format!("{id} installed. Starting it…"),
                         super::notices::Tone::Info,
                         cx,
                     );
@@ -291,19 +294,22 @@ impl WhatsAppApp {
 
     /// Take one out of this front end's own plugin folder.
     ///
-    /// The running plugin is not stopped, for the reason above: what this
-    /// changes is what the next load finds. Its recorded permission stays
-    /// until it is withdrawn, which is deliberate — an id reinstalled later
-    /// is the same id, and the answer was given against the id and its mask
-    /// rather than against the bytes.
+    /// And stops it, by the same reload installing uses: taking a file out of
+    /// the folder and leaving its plugin running is the state somebody
+    /// pressing Remove least expects to be in.
+    ///
+    /// Its recorded permission stays until it is withdrawn, which is
+    /// deliberate — an id reinstalled later is the same id, and the answer
+    /// was given against the id and its mask rather than against the bytes.
     pub fn remove_plugin(&mut self, id: String, cx: &mut Context<Self>) {
         cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
             let outcome = crate::platform::plugins::uninstall(&id).await;
             let _ = entity.update(cx, |app, cx| match outcome {
                 Ok(()) => {
                     app.refresh_installed_plugins(cx);
+                    app.reload_plugins(cx);
                     app.notify_user(
-                        format!("{id} removed. It stops at the next reload."),
+                        format!("{id} removed. Stopping it…"),
                         super::notices::Tone::Info,
                         cx,
                     );
@@ -319,6 +325,25 @@ impl WhatsAppApp {
             });
         })
         .detach();
+    }
+
+    /// Ask the daemon to read its plugin folder again and run what is in it.
+    ///
+    /// Every front end may ask, and that is not a loose end: the folder is
+    /// the daemon's, so a desktop window asking is somebody who has just
+    /// dropped a `.wasm` beside `oxidezapd`, and a tab that holds no session
+    /// asking is somebody who installed one into an origin whose host is
+    /// another tab. Neither could do anything about it before but restart the
+    /// thing holding the account.
+    ///
+    /// Nothing is drawn optimistically. The set that comes back is state, so
+    /// it arrives in a frame like any other and every window sees the same
+    /// thing at the same time — including the windows that did not ask.
+    pub fn reload_plugins(&mut self, cx: &mut Context<Self>) {
+        if let Some(client) = self.client.as_ref() {
+            client.reload_plugins();
+        }
+        cx.notify();
     }
 
     /// Allow, or stop allowing, what a plugin asked to be able to do.

@@ -53,7 +53,14 @@ pub const FILE_NAME: &str = "approvals.json";
 /// The approved mask per plugin id, mirrored to a document that outlives the
 /// process.
 pub struct Approvals {
-    store: Arc<dyn Backing>,
+    /// Where the answers are kept.
+    ///
+    /// Behind a lock because a reload replaces it: a page's storage handle is
+    /// stamped, and the generation that takes a fresh one retires the handle
+    /// this was opened with — so an approval written after a reload would be
+    /// refused by a store nobody had told about the swap. See
+    /// [`Approvals::rebind`].
+    store: Mutex<Arc<dyn Backing>>,
     granted: Mutex<BTreeMap<String, i64>>,
 }
 
@@ -79,8 +86,75 @@ impl Approvals {
             })
             .unwrap_or_default();
         Self {
-            store,
+            store: Mutex::new(store),
             granted: Mutex::new(granted),
+        }
+    }
+
+    /// Point at a new store, and make sure it holds what is in hand.
+    ///
+    /// What a reload does at the moment it installs a generation. Three
+    /// things, and each is a case that bites without it.
+    ///
+    /// The map is *not* re-read: this host is the only thing that ever writes
+    /// the document — a plugin that could write its own approval would have
+    /// none — so what is in memory is what is on disk, and re-reading would
+    /// open a window for a stale file to undo an answer given during the
+    /// load.
+    ///
+    /// A store that cannot keep answers clears them instead. A state
+    /// directory that was usable at startup and is refused now — replaced by
+    /// a symlink, or no longer private — must leave every plugin unapproved
+    /// until somebody says otherwise, which is the whole of what
+    /// `usable_state_dir` refusing is for; keeping the masks and writing them
+    /// nowhere would be the opposite of it.
+    ///
+    /// And what is in hand is written through the new store, because a page's
+    /// old handle went stale the moment the reload took a fresh one: an
+    /// answer given during the load changed the map and was refused by the
+    /// store it was written through, so without this the document still holds
+    /// the old grant and hands it back on the next start.
+    pub fn rebind(&self, store: Arc<dyn Backing>) {
+        let keeps = store.keeps_answers();
+        let mut granted = self.lock();
+        let kept = {
+            let mut held = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let was = held.keeps_answers();
+            *held = store;
+            was
+        };
+        if keeps {
+            // And the write is *answered*, not merely attempted. A store that
+            // says it keeps answers can still refuse one — `localStorage`
+            // over quota or blocked outright — and ignoring that left the
+            // grants in memory for the install to copy straight onto the
+            // fresh workers: authorized, with nothing recording it, and gone
+            // at the next start. The same sentence `set` already lives by: a
+            // grant that could not be written down is not a grant.
+            if !self.flush(&granted) && !granted.is_empty() {
+                log::warn!(
+                    "plugin permissions could not be written to the new store; every plugin \
+                     is unapproved until it is allowed again"
+                );
+                granted.clear();
+            }
+        } else if kept && !granted.is_empty() {
+            // Only on the way *down*. What has to be forgotten is an answer
+            // given against a directory that has since been refused — the
+            // grant outliving the trust it was recorded under. A host that
+            // never had a directory is a different sentence: it may still be
+            // told yes, and that answer holds for this session, which is
+            // exactly what the refusal promises. Clearing on every rebind
+            // took those away too, so a reload silently revoked everything
+            // somebody had allowed since the daemon started.
+            log::warn!(
+                "plugin permissions can no longer be recorded; every plugin is unapproved \
+                 until it is allowed again"
+            );
+            granted.clear();
         }
     }
 
@@ -107,14 +181,23 @@ impl Approvals {
         self.lock().get(id).copied().unwrap_or(0)
     }
 
-    /// Record the user's answer, and return the mask to hand the plugin.
+    /// Record the user's answer, and return the mask to hand the plugin
+    /// along with whether it was written down.
+    ///
+    /// Both halves, because they can disagree and the caller is answering
+    /// somebody: a grant the store refused is rolled back and the plugin is
+    /// left unapproved, so acknowledging it as recorded tells a window that a
+    /// permission was given which nothing here holds and nothing will read
+    /// back. A withdrawal keeps its effect whatever the store did — that is
+    /// what failing closed means — and still answers `false`, because what
+    /// failed is the memory of it and the next start is where that shows.
     ///
     /// The lock is held across the change *and* the write, so what reaches
     /// the file is what was decided last. Releasing it in between let two
     /// clients' answers land out of order — an older grant finishing after a
     /// newer revocation would leave the running daemon revoked and the file
     /// saying the opposite, so the next start handed the capability back.
-    pub fn set(&self, id: &str, requested: i64, approved: bool) -> i64 {
+    pub fn set(&self, id: &str, requested: i64, approved: bool) -> (i64, bool) {
         let agreed = requested & abi::caps::NEEDS_APPROVAL;
         let mut granted = self.lock();
         let before = granted.get(id).copied();
@@ -123,7 +206,8 @@ impl Approvals {
         } else {
             granted.remove(id);
         }
-        if !self.flush(&granted) && approved {
+        let stored = self.flush(&granted);
+        if !stored && approved {
             // A grant that could not be written down is not a grant. The
             // caller hands this mask straight to the running plugin, so
             // returning it would show the capability as allowed while nothing
@@ -136,9 +220,9 @@ impl Approvals {
                 Some(mask) => granted.insert(id.to_owned(), mask),
                 None => granted.remove(id),
             };
-            return granted.get(id).copied().unwrap_or(0);
+            return (granted.get(id).copied().unwrap_or(0), false);
         }
-        granted.get(id).copied().unwrap_or(0)
+        (granted.get(id).copied().unwrap_or(0), stored)
     }
 
     /// Write the whole map out.
@@ -153,7 +237,13 @@ impl Approvals {
         let Ok(json) = serde_json::to_vec(granted) else {
             return false;
         };
-        let Err(e) = self.store.write(FILE_NAME, &json) else {
+        let store = Arc::clone(
+            &self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let Err(e) = store.write(FILE_NAME, &json) else {
             return true;
         };
         // Fail closed. Leaving the previous document is the tempting answer
@@ -165,7 +255,7 @@ impl Approvals {
         // permission nobody agreed to.
         log::warn!(
             "cannot write {}: {e}. Every plugin permission will be asked for again.",
-            self.store.describe(FILE_NAME)
+            store.describe(FILE_NAME)
         );
         // And say so when even that does not land. It is the whole of what
         // this branch is for: the caller keeps a withdrawal's in-memory
@@ -173,11 +263,11 @@ impl Approvals {
         // would leave the plugin drawn as revoked here and granted again on
         // the next start. Nothing can undo the revocation — that would be the
         // worse answer — so what is left is saying it out loud.
-        if let Err(e) = self.store.remove(FILE_NAME) {
+        if let Err(e) = store.remove(FILE_NAME) {
             log::error!(
                 "and {} could not be removed either ({e}); a permission withdrawn now may be \
                  granted again on the next start",
-                self.store.describe(FILE_NAME)
+                store.describe(FILE_NAME)
             );
         }
         false
@@ -337,7 +427,12 @@ mod tests {
         // which is the shape of any write that fails at the last step.
         std::fs::remove_file(dir.0.join("approvals.json")).expect("writable");
         std::fs::create_dir(dir.0.join("approvals.json")).expect("writable");
-        a.set("autoreply", abi::caps::SEND, false);
+        let (mask, stored) = a.set("autoreply", abi::caps::SEND, false);
+        assert_eq!(mask, 0, "the withdrawal takes effect whatever the disk did");
+        assert!(
+            !stored,
+            "and is still answered as unrecorded: what failed is the memory of it"
+        );
 
         let reread = Approvals::open(files(&dir.0));
         assert_eq!(
@@ -359,8 +454,8 @@ mod tests {
 
         assert_eq!(
             a.set("autoreply", abi::caps::SEND, true),
-            0,
-            "nothing was recorded, so nothing is allowed"
+            (0, false),
+            "nothing was recorded, so nothing is allowed and the caller is told"
         );
         assert!(!a.is_approved("autoreply", abi::caps::SEND));
     }

@@ -1102,27 +1102,34 @@ async fn handle_request(
         // with its new permissions is its own business and arrives as a
         // republished surface.
         ClientRequest::PluginApproval { plugin, approved } => {
-            // On a blocking thread, because answering one is a file written
-            // and renamed: on a single-worker runtime that stalls the session
-            // bridge and every other connection for as long as the disk takes,
-            // and on any runtime it spends a worker on I/O. Awaited rather
-            // than spawned loose, so the acknowledgement still means the
+            // Where it is recorded is `plugins::approve`, which is a platform
+            // split: a desktop writes and renames a file and so must leave the
+            // runtime's thread, and a page writes `localStorage` and has no
+            // blocking pool to leave for — `spawn_blocking` here panicked
+            // outright in a browser, so approving a plugin there never worked.
+            // Awaited either way, so the acknowledgement still means the
             // answer is recorded.
-            let plugins = Arc::clone(plugins);
-            // The answer is read, not dropped. `approve` takes a mutex and
-            // writes and renames a file; a panic in there left the client
-            // acknowledged for a permission the disk never received, with
-            // Settings drawing a state nothing had recorded and no line in
-            // the log.
-            match tokio::task::spawn_blocking(move || plugins.approve(&plugin, approved)).await {
-                Ok(()) => acted(Ok(())),
-                Err(e) => {
-                    log::error!("recording a plugin approval failed: {e}");
-                    acted(Err(ProtocolError::Refused {
-                        detail: "the approval could not be recorded".to_string(),
-                    }))
-                }
+            let recorded = crate::plugins::approve(plugins, plugin, approved).await;
+            if recorded {
+                acted(Ok(()))
+            } else {
+                acted(Err(ProtocolError::Refused {
+                    detail: "the approval could not be recorded".to_string(),
+                }))
             }
+        }
+        // Taken, and answered now rather than when it finishes. Awaiting it
+        // here was wrong for one reason and it is not a small one: this is the
+        // connection's own loop, so a reload of a folder that takes seconds
+        // is seconds in which *that window* is served nothing — no state, no
+        // session events, no call video, which is eight frames deep and
+        // overflows almost at once. And nothing was waiting for the answer
+        // anyway: the set that comes back is state, and every window learns
+        // of it in the same frame, because a plugin's interface was always
+        // the daemon's rather than the asking window's.
+        ClientRequest::ReloadPlugins => {
+            crate::plugins::reload_in_background(plugins);
+            acted(Ok(()))
         }
         // The acknowledgement goes out first; see the caller.
         ClientRequest::Shutdown => Answer {
@@ -1388,7 +1395,9 @@ mod tests {
     /// A host with nothing loaded, for the requests that are not about
     /// plugins — which is every request but one.
     fn no_plugins() -> Arc<oxidezap_plugin_host::Plugins> {
-        Arc::new(oxidezap_plugin_host::Plugins::none(Arc::new(|_| {})))
+        Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(Arc::new(
+            |_| {},
+        )))
     }
 
     fn parse(frame: Option<String>) -> DaemonMessage {

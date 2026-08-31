@@ -172,3 +172,68 @@ async fn a_name_that_is_not_an_id_is_refused() {
     assert!(install("../escape.wasm", MODULE.to_vec()).await.is_err());
     assert!(install("notwasm.txt", MODULE.to_vec()).await.is_err());
 }
+
+// ---- the host, in a page ---------------------------------------------------
+
+/// Recording an approval must not need a thread the page does not have.
+///
+/// `server.rs` handed this to `tokio::task::spawn_blocking`, which needs a
+/// blocking pool — and a browser agent is one thread, so a page's runtime has
+/// none. The call panicked outright ("there is no reactor running"), taking
+/// the connection with it: approving a plugin in the browser had never once
+/// worked, and nothing in the workspace could have said so, because the
+/// desktop has a pool and this file is the only place a page is ever run.
+///
+/// `Plugins::nothing_loaded` is enough to say it. What panicked was the dispatch, not
+/// the write, so a host with nothing loaded reproduces it exactly and needs
+/// no OPFS module, no session and no approval to record.
+///
+/// Which is also why the answer here is `false` rather than `true`, and why
+/// that is the same assertion: there is no plugin by that name, so nothing
+/// was recorded and nothing should be acknowledged. What is being pinned is
+/// that the call *returns at all* — it used to panic and take the connection
+/// with it — and a panic fails this test whatever it would have answered.
+#[wasm_bindgen_test]
+async fn approving_a_plugin_does_not_need_a_blocking_pool() {
+    let host = std::sync::Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(
+        std::sync::Arc::new(|_| {}),
+    ));
+    assert!(
+        !super::super::approve(&host, "nothing-loaded".to_owned(), true).await,
+        "a page answers inline, and an answer about a plugin that is not there records nothing"
+    );
+}
+
+/// And a reload runs on the page's own loop, for the same reason.
+///
+/// The same shape as the approval above and the same hazard: a desktop's
+/// loader goes to a blocking thread because it reads files and runs wasm, and
+/// a page has nowhere to send it. This also walks the whole web reload — the
+/// OPFS listing, the fresh storage handle, the generation swap — which is the
+/// half `plugin-host`'s own tests cannot reach, since they run on a desktop.
+#[wasm_bindgen_test]
+async fn a_page_reloads_its_plugins_from_its_own_folder() {
+    empty_the_folder().await;
+    let host = std::sync::Arc::new(oxidezap_plugin_host::Plugins::nothing_loaded(
+        std::sync::Arc::new(|_| {}),
+    ));
+    assert_eq!(
+        super::super::reload(&host).await,
+        oxidezap_plugin_host::Reloaded::Ran(0),
+        "an empty folder runs nothing, and that is a reload that happened"
+    );
+
+    // Not a module that loads: the smallest parseable one exports no
+    // `oxi_abi_version`, so the host turns it away — which is the right thing
+    // to assert here anyway. What is being pinned is that a page can *run*
+    // the reload at all; whether a given module loads is the host's own
+    // business and its own tests.
+    install("reloaded.wasm", MODULE.to_vec())
+        .await
+        .expect("a module is installed");
+    assert_eq!(
+        super::super::reload(&host).await,
+        oxidezap_plugin_host::Reloaded::Ran(0)
+    );
+    empty_the_folder().await;
+}

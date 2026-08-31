@@ -947,7 +947,34 @@ impl WhatsAppApp {
                     // nothing when the set has not moved, so replacing is
                     // both correct and no more work than merging.
                     FromDaemon::Plugins(plugins) => entity.update(cx, |app, cx| {
+                        // The folder is re-read when the *membership* moves,
+                        // and only then. Somebody else changing it — another
+                        // tab of this origin, a reload of a desktop daemon's
+                        // directory — is the one thing that makes this
+                        // window's listing wrong, and a listing captured when
+                        // Settings opened labels a plugin just added as
+                        // "Removed" and leaves a phantom "Not loaded" row
+                        // where one was taken away.
+                        //
+                        // Which is not the same as "the set was published". A
+                        // plugin republishes its whole tree whenever anything
+                        // in it changes — for one that redraws on every
+                        // message, that is most messages — so refreshing on
+                        // every frame would start an OPFS scan per redraw,
+                        // overlapping, with Settings very likely not even
+                        // open. Ids, in order, because the daemon publishes
+                        // them ordered and a set that reshuffled itself would
+                        // be a different bug.
+                        let moved = app.plugins.len() != plugins.len()
+                            || app
+                                .plugins
+                                .iter()
+                                .zip(&plugins)
+                                .any(|(had, now)| had.id != now.id);
                         app.plugins = plugins;
+                        if moved {
+                            app.refresh_installed_plugins(cx);
+                        }
                         cx.notify();
                     }),
                     // Announced on connect, before this window existed, so it

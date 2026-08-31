@@ -5,6 +5,15 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 21: `ClientRequest::ReloadPlugins`. The daemon retires what it is running
+/// and loads the folder again, so a plugin installed, updated or removed
+/// takes effect without restarting the process holding the account. A v20
+/// daemon does not know the request and refuses it as malformed — and the
+/// daemon is the half that deliberately outlives an upgrade, so without a
+/// version an upgraded window would offer Reload, and install plugins that
+/// silently never start, against a daemon that has been running since before
+/// the feature existed. Exactly the case v15 was bumped for.
+///
 /// 20: `SetLogLevel`. How loud the daemon is is a setting rather than a
 /// launch argument: nearly everything worth reading about a session is
 /// written at `debug`, and restarting `oxidezapd` to see it ends the very
@@ -124,7 +133,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

@@ -250,47 +250,208 @@ fn field_label(label: &str, metrics: Metrics, cx: &App) -> impl IntoElement + us
         .child(label.to_owned())
 }
 
+/// How a plugin is doing, in one word.
+///
+/// Three states and not two, because the folder holds more than the host
+/// runs: a module that fails to parse, answers the wrong ABI version or traps
+/// in `oxi_init` publishes no surface at all, and is exactly the file
+/// somebody most needs to find. Drawn in the same list as the rest rather
+/// than in a second one below it — two shapes for "a plugin in this folder"
+/// is what made this screen hard to read, and the difference between them is
+/// a word, not a layout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    Running,
+    Stopped,
+    NotLoaded,
+}
+
+impl Standing {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Stopped => "Stopped",
+            Self::NotLoaded => "Not loaded",
+        }
+    }
+}
+
+/// The frame every plugin is drawn in, whatever its standing.
+///
+/// One card per plugin and every control that acts on it *inside* it. Remove
+/// used to sit outside — a bare button in the gap between two cards, which
+/// with more than one plugin reads as belonging to the next one, and under a
+/// list of modules that did not load was a column of identical buttons with
+/// nothing saying which was which.
+fn entry(
+    heading: gpui::AnyElement,
+    body: Vec<gpui::AnyElement>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .rounded(metrics.radius_md())
+        .overflow_hidden()
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().border)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(metrics.space_md())
+                .p(metrics.space_lg())
+                .child(heading),
+        )
+        // Each section under its own rule, which is what tells "this is what
+        // the plugin is" apart from "this is the decision you are being
+        // asked for" and from the plugin's own controls. They were four
+        // paragraphs of grey text in one box, and the switch was one of them.
+        .children(body.into_iter().map(|section| {
+            div()
+                .w_full()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .p(metrics.space_lg())
+                .child(section)
+        }))
+}
+
+/// A plugin's name, its id and how it is doing, on one line with whatever
+/// acts on it.
+fn heading(
+    name: String,
+    id: &str,
+    standing: Standing,
+    remove: Option<gpui::AnyElement>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    // The colour says the same thing the word does, so nothing here depends
+    // on reading it: a legend nobody is given is a legend nobody has.
+    let tone = match standing {
+        Standing::Running => cx.theme().success,
+        Standing::Stopped => cx.theme().danger,
+        Standing::NotLoaded => cx.theme().warning,
+    };
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(metrics.space_md())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(metrics.space_xxs())
+                .child(
+                    div()
+                        .text_size(metrics.text_body())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(cx.theme().foreground)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(metrics.space_sm())
+                        .child(
+                            div()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(metrics.text_micro())
+                                .text_color(subtle)
+                                .child(id.to_owned()),
+                        )
+                        .child(
+                            div()
+                                .text_size(metrics.text_micro())
+                                .text_color(tone)
+                                .child(standing.word()),
+                        ),
+                ),
+        )
+        .children(remove)
+}
+
 /// One plugin's block on the Settings screen: what it is, what it may do, and
 /// whatever it drew for itself.
 ///
-/// The capability list is not decoration. It is the sentence a user consents
-/// to before running a file they downloaded, and the only place it appears.
+/// `remove` is drawn where the front end has a folder of its own to take it
+/// out of, and nowhere else — see `platform::plugins::Home`.
 pub fn settings_entry(
     surface: &PluginSurface,
     app: &WhatsAppApp,
     ctx: &PluginContext,
+    remove: Option<gpui::AnyElement>,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = ctx.metrics;
     let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let standing = if surface.stopped.is_some() {
+        Standing::Stopped
+    } else {
+        Standing::Running
+    };
+
+    // What it does to the *account*, which is the only part anybody is asked
+    // about. Phrased before the answer rather than after it: a plugin that
+    // has not been allowed is running and refused — it watches, and every
+    // gated command it issues comes back denied.
     let permissions = if surface.gated.is_empty() {
         "Watches only. It cannot act on your account.".to_string()
     } else if surface.approved {
         format!("Allowed to: {}", surface.gated.join(", "))
     } else {
-        // The sentence, before anything is granted rather than after. A
-        // plugin that has not been allowed is running and refused: it can
-        // watch, and every gated command it issues comes back denied.
         format!("Wants to: {}", surface.gated.join(", "))
     };
     // What it does only to itself, said plainly and never as a question. It
     // holds these by declaring them, so offering a switch over them would be
     // offering a choice that does not exist — but leaving them unsaid would
     // hide half of what a downloaded file is doing.
-    let own: Vec<&String> = surface
+    let own: Vec<&str> = surface
         .capabilities
         .iter()
         .filter(|c| !surface.gated.contains(c))
+        .map(String::as_str)
         .collect();
-    let own = (!own.is_empty()).then(|| {
-        format!(
-            "Also: {}",
-            own.iter()
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    });
+    let own = (!own.is_empty()).then(|| format!("Also: {}", own.join(", ")));
+
+    let mut body: Vec<gpui::AnyElement> = Vec::new();
+    body.push(
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_xs())
+            .child(
+                div()
+                    .text_size(metrics.text_small())
+                    .text_color(subtle)
+                    .child(permissions),
+            )
+            .children(own.map(|own| {
+                div()
+                    .text_size(metrics.text_small())
+                    .text_color(subtle)
+                    .child(own)
+            }))
+            // Why it stopped, where the widgets it left behind are. A plugin
+            // that simply disappeared would give nobody anything to act on.
+            .children(surface.stopped.as_ref().map(|reason| {
+                div()
+                    .text_size(metrics.text_small())
+                    .text_color(cx.theme().danger)
+                    .child(reason.clone())
+            }))
+            .into_any_element(),
+    );
+
     // Drawn by this window and not by the plugin, which is the whole point:
     // a widget id comes from the plugin's own tree, so a control it could
     // publish is a control it could disguise.
@@ -299,97 +460,94 @@ pub fn settings_entry(
     // to draw and keep its own settings holds those by declaring them, so a
     // switch over it could be turned off and would immediately read as on
     // again — a control that lies about what it does.
-    let approval = (!surface.gated.is_empty()).then(|| {
+    if !surface.gated.is_empty() {
         let id = surface.id.clone();
         let entity = ctx.entity.clone();
         let approved = surface.approved;
-        row_with_label(
-            if approved {
-                "Allowed"
-            } else {
-                "Not allowed yet"
-            },
-            Switch::new(SharedString::from(format!("plugin-allow-{}", surface.id)))
-                .checked(approved)
-                .on_click(move |now: &bool, _window, cx| {
-                    let id = id.clone();
-                    // The switch's own state, not the surface this was drawn
-                    // against. Nothing here updates optimistically — the
-                    // daemon republishes and that is the answer — so two
-                    // presses before the round trip both read the same stale
-                    // `approved` and sent `!approved` twice: a grant followed
-                    // immediately by a withdrawal sent two grants and left
-                    // the capability on.
-                    let allowed = *now;
-                    entity.update(cx, |app, cx| app.approve_plugin(&id, allowed, cx));
-                })
-                .into_any_element(),
-            metrics,
-            cx,
-        )
-    });
+        body.push(
+            row_with_label(
+                "Let it act on your account",
+                Switch::new(SharedString::from(format!("plugin-allow-{}", surface.id)))
+                    .checked(approved)
+                    .on_click(move |now: &bool, _window, cx| {
+                        let id = id.clone();
+                        // The switch's own state, not the surface this was
+                        // drawn against. Nothing here updates optimistically
+                        // — the daemon republishes and that is the answer —
+                        // so two presses before the round trip both read the
+                        // same stale `approved` and sent `!approved` twice: a
+                        // grant followed immediately by a withdrawal sent two
+                        // grants and left the capability on.
+                        let allowed = *now;
+                        entity.update(cx, |app, cx| app.approve_plugin(&id, allowed, cx));
+                    })
+                    .into_any_element(),
+                metrics,
+                cx,
+            )
+            .into_any_element(),
+        );
+    }
 
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(metrics.space_lg())
-        .p(metrics.space_lg())
-        .rounded(metrics.radius_md())
-        .bg(cx.theme().secondary)
-        .border_1()
-        .border_color(cx.theme().border)
-        .child(
+    let drawn: Vec<gpui::AnyElement> = surface
+        .roots_in(PluginSlot::Settings)
+        .map(|node| widget(surface, PluginSlot::Settings, node, app, ctx, cx).into_any_element())
+        .collect();
+    if !drawn.is_empty() {
+        body.push(
             div()
                 .flex()
                 .flex_col()
-                .gap(metrics.space_xxs())
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(metrics.space_md())
-                        .child(
-                            div()
-                                .text_size(metrics.text_body())
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(cx.theme().foreground)
-                                .child(surface.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .text_size(metrics.text_micro())
-                                .text_color(subtle)
-                                .child(surface.id.clone()),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_size(metrics.text_small())
-                        .text_color(subtle)
-                        .child(permissions),
-                )
-                .children(own.map(|own| {
-                    div()
-                        .text_size(metrics.text_small())
-                        .text_color(subtle)
-                        .child(own)
-                }))
-                // Why it stopped, where the widgets it left behind are. A
-                // plugin that simply disappeared would give nobody anything
-                // to act on.
-                .children(approval)
-                .children(surface.stopped.as_ref().map(|reason| {
-                    div()
-                        .text_size(metrics.text_small())
-                        .text_color(cx.theme().danger)
-                        .child(format!("Stopped: {reason}"))
-                })),
+                .gap(metrics.space_lg())
+                .children(drawn)
+                .into_any_element(),
+        );
+    }
+
+    entry(
+        heading(
+            surface.name.clone(),
+            &surface.id,
+            standing,
+            remove,
+            metrics,
+            cx,
         )
-        .children(
-            surface
-                .roots_in(PluginSlot::Settings)
-                .map(|node| widget(surface, PluginSlot::Settings, node, app, ctx, cx)),
-        )
+        .into_any_element(),
+        body,
+        metrics,
+        cx,
+    )
+}
+
+/// A file in the folder that the host could not run.
+///
+/// It has no surface, so there is no name, no permissions and nothing it
+/// drew — but it is in the folder, it spends the folder's budget at every
+/// load, and it is the one entry somebody is most likely to be looking for.
+/// Drawn in the same list and the same frame as the rest, with the one
+/// control it can have.
+pub fn unloaded_entry(
+    id: &str,
+    remove: Option<gpui::AnyElement>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    entry(
+        heading(id.to_owned(), id, Standing::NotLoaded, remove, metrics, cx).into_any_element(),
+        vec![
+            div()
+                .text_size(metrics.text_small())
+                .text_color(subtle)
+                .child(
+                    "It is in the plugins folder but the host would not run it. \
+                     Either it is not a plugin, or it was built against a different \
+                     version of the ABI.",
+                )
+                .into_any_element(),
+        ],
+        metrics,
+        cx,
+    )
 }

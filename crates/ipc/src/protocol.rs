@@ -696,6 +696,25 @@ pub enum ClientRequest {
         plugin: String,
         approved: bool,
     },
+    /// Read the plugin folder again and run what is in it now.
+    ///
+    /// The daemon is the only process that holds the plugins, so it is the
+    /// only one that can do this — and it does it without going anywhere: the
+    /// session stays connected, the store stays open, and every front end
+    /// keeps its connection. What changes is which modules are running.
+    ///
+    /// Named for the folder rather than for one plugin, because that is what
+    /// a reload is: an id is what an approval and a settings document are
+    /// keyed on, so two generations sharing one would be two plugins sharing
+    /// an identity, and the host retires the whole set before it loads the
+    /// next. Reloading one of five therefore restarts five.
+    ///
+    /// Acknowledged when the daemon takes it, not when the new set is
+    /// running. The reload is the connection's loop otherwise, and a folder
+    /// that takes seconds is seconds in which that window is served no state,
+    /// no events and no call video. Nothing waits for it: what came back is
+    /// state, and every front end reads it in the same frame.
+    ReloadPlugins,
     /// Stop the daemon: disconnect the session, close the store, exit.
     Shutdown,
 }

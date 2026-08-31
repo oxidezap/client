@@ -38,11 +38,12 @@ mod runtime;
 mod sched;
 mod store;
 
-use portable_atomic::AtomicI64;
+use portable_atomic::{AtomicI64, AtomicU32};
+use std::future::Future;
 #[cfg(not(target_family = "wasm"))]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use wacore::time::Instant;
 
 use oxidezap_core::{PluginAction, PluginSlot, PluginSurface, UiEvent};
@@ -191,18 +192,95 @@ pub trait Commands: Send + Sync + 'static {
 }
 
 /// Every loaded plugin, and the threads running them.
+///
+/// One generation of them, rather: what is loaded can be replaced without
+/// this handle changing, because everything in the daemon holds the *host*
+/// and not the plugins — a connection, the session bridge and the tab
+/// listener each clone this `Arc` and keep it for their own lifetime, so a
+/// reload that made a new `Plugins` would leave every one of them routing
+/// presses into a set nobody is running any more. The generation is
+/// [`Live`], behind one lock, and [`Plugins::reload`] is the only thing that
+/// swaps it.
 pub struct Plugins {
+    /// Whatever is loaded now.
+    ///
+    /// An `Arc` inside the lock rather than the value: a reader clones it and
+    /// drops the guard, so no call into a plugin's queue — or into the sink,
+    /// which reaches the daemon's hub — ever happens with this held. On a
+    /// page that is not merely tidiness: everything runs on one agent, so a
+    /// guard held across a call that came back round would be a deadlock
+    /// rather than a wait.
+    live: std::sync::RwLock<Arc<Live>>,
+    /// Raised once, by [`Plugins::shutdown`], and never lowered.
+    ///
+    /// The host's own ending, as against a generation's: a reload stops one
+    /// set of plugins and starts another, and neither may be mistaken for the
+    /// account going away. What this refuses is an approval — and a reload —
+    /// arriving after the session has been told to forget everything.
+    retired: AtomicBool,
+    /// Whether a reload is under way, and whether another is owed.
+    ///
+    /// One word rather than two flags, and that is the whole reason it is a
+    /// word. Loading is slow enough to press a button twice during, and two
+    /// reloads interleaved would stop each other's freshly started plugins —
+    /// so the second is not run but *remembered*: the scan already going may
+    /// have read the folder before somebody's install landed, and refusing
+    /// outright loses exactly the change that was asked for while the request
+    /// is acknowledged as done. One more scan afterwards covers every ask
+    /// that arrived during the first, however many, because what all of them
+    /// want is the folder as it is now.
+    ///
+    /// Two flags could not express the *handoff*. Releasing one and then
+    /// reading the other is two steps, and an ask landing between them is an
+    /// ask nobody owns: it sees a reload running, records itself, and the
+    /// reload it was counting on has already decided it is finished. Every
+    /// arrangement of two atomics has that seam somewhere. Here the release
+    /// and the check are one `compare_exchange`, so there is no between.
+    reload: AtomicU32,
+    /// Held across a whole answer: the registry mutation, its persistence and
+    /// the shared mask a plugin's own thread reads. Also across the moment a
+    /// reload installs a generation, so it cannot install one over a host
+    /// that has just been retired.
+    approving: Mutex<()>,
+    /// Where a generation publishes what it is. Kept because the next one
+    /// needs it too, and because it is the daemon's, not a plugin's.
+    sink: Sink,
+    /// What a plugin acts through, for the same reason.
+    commands: Arc<dyn Commands>,
+    /// What the user has answered, kept by the host rather than by a
+    /// generation.
+    ///
+    /// An answer is about an id and a mask, both of which outlive any set of
+    /// workers — and one copy per generation is what let a revocation land on
+    /// the set being retired while the set replacing it was built from a
+    /// snapshot taken before it. One map, one document, one lock.
+    approvals: Arc<Approvals>,
+}
+
+/// One generation of loaded plugins.
+///
+/// Whole rather than piecemeal: the registry, the workers and the stopping
+/// flag are one another's context — a worker reads that flag, publishes
+/// through that registry, and is the only thing that may — so replacing them
+/// together is what keeps a superseded plugin from writing into the set that
+/// replaced it.
+struct Live {
     registry: Arc<Registry>,
     workers: Vec<Worker>,
-    /// Raised once, by [`Plugins::shutdown`].
+    /// The storage this set was built against.
+    ///
+    /// Kept because the *approvals* have to be rebound to it when this
+    /// generation is installed: a page takes a fresh handle per reload and
+    /// the older ones are refused, so the host would otherwise go on writing
+    /// answers through a store it had itself retired.
+    state: Arc<dyn Backing>,
+    /// Raised once, when this generation ends.
     ///
     /// Read by every worker before it takes another event, so a plugin with a
     /// full queue abandons its backlog instead of grinding through five
-    /// hundred wasm calls while the daemon waits to exit.
+    /// hundred wasm calls while the daemon waits to exit — or waits to load
+    /// the set that replaces it.
     stopping: Arc<AtomicBool>,
-    /// Held across a whole answer: the registry mutation, its persistence and
-    /// the shared mask a plugin's own thread reads.
-    approving: Mutex<()>,
 }
 
 struct Worker {
@@ -264,6 +342,31 @@ pub struct Module {
     pub open: Box<dyn FnOnce() -> anyhow::Result<Vec<u8>> + Send>,
 }
 
+/// What one call to [`Plugins::reload`] did.
+///
+/// Four outcomes rather than a count, because three of them are a count of
+/// zero and mean entirely different things — and the count is what the daemon
+/// writes to its log. "plugins reloaded: 0 running" over a folder of five
+/// healthy plugins is what a deferred pass used to say, and the same line
+/// followed a loader that had just panicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Reloaded {
+    /// A generation was installed by this call, and this many plugins are
+    /// running in it.
+    Ran(usize),
+    /// Another reload owns the slot and one more pass is owed. Nothing was
+    /// installed here; that pass covers this ask, so what is running is
+    /// whatever it leaves.
+    Deferred,
+    /// Nothing was installed and what was running still is — the folder could
+    /// not be read.
+    Kept(usize),
+    /// Nothing was installed and nothing will be: the host has shut down, or
+    /// the loader did not finish.
+    Failed,
+}
+
 impl Plugins {
     /// Load every `.wasm` in `dir`.
     ///
@@ -289,28 +392,58 @@ impl Plugins {
             Some(dir) => Arc::new(store::Files::at(dir)),
             None => Arc::new(Nowhere),
         };
-        let modules = discover(dir)
-            .into_iter()
-            .filter_map(|path| {
-                let Some(id) = plugin_id(&path) else {
-                    log::warn!(
-                        "skipping {}: its name is not a usable plugin id",
-                        path.display()
-                    );
-                    return None;
-                };
-                Some(Module {
-                    id,
-                    open: Box::new(move || read_module(&path)),
-                })
-            })
-            .collect();
+        // At the first load an unreadable folder is no plugins, which is what
+        // it has always been: nothing is running to lose, and a daemon that
+        // would not come up over a directory is a daemon that would not come
+        // up. A *reload* asks the same function and treats `None` differently,
+        // which is the whole reason it answers one.
+        let modules = modules_in(dir).unwrap_or_default();
         // Driven here rather than propagated: a desktop's loader owns the
         // thread it runs on — `plugins::start` puts it on `spawn_blocking` —
         // so there is nothing for it to yield to and `breathe` is a no-op.
         // What the `async` shape buys is the page, where the same loop has to
         // hand the browser a turn between modules.
         futures_lite::future::block_on(Self::start(modules, state, commands, sink))
+    }
+
+    /// Read `dir` again and replace what is running with what is in it now.
+    ///
+    /// [`Plugins::reload`] above a filesystem, exactly as [`Plugins::load`]
+    /// is [`Plugins::start`] above one — the same scan, the same id rules,
+    /// the same backing rebuilt from the same path, so a reloaded folder and
+    /// a freshly started one cannot disagree about what they found.
+    ///
+    /// Blocking: it reads every module and runs each `oxi_init`. The caller
+    /// is `daemon::plugins::reload`, which puts it where `load` goes.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn reload_from_dir(&self, dir: &Path, state_dir: Option<&Path>) -> Reloaded {
+        futures_lite::future::block_on(self.reload(|| async move {
+            // Asked again on every scan rather than settled once: a directory
+            // that was private at startup may not be now, and the answer to
+            // that is the store the answers are then kept in — or refused,
+            // which `rebind` turns into every plugin being unapproved again.
+            // The folder first, and the state directory only once there is
+            // going to be a reload. `None` here is a folder that could not be
+            // *read*, which leaves the running set alone rather than
+            // replacing it with an empty one — not the same as a folder that
+            // is absent, or one this host refuses to trust, both of which are
+            // answers a reload should act on.
+            //
+            // Asking in this order matters because the two questions are not
+            // independent. `usable_state_dir` is re-asked on every scan, and
+            // its refusal is meant to take effect — grants cleared, storage
+            // dropped — which only happens at the install. Deciding it first
+            // and then abandoning the reload left that refusal discovered and
+            // not applied, with the running generation carrying on through
+            // the very directory just declared unsafe. Nothing is asked about
+            // it unless the answer is going to be used.
+            let modules = modules_in(dir)?;
+            let state: Arc<dyn Backing> = match usable_state_dir(state_dir) {
+                Some(dir) => Arc::new(store::Files::at(dir)),
+                None => Arc::new(Nowhere),
+            };
+            Some((modules, state))
+        }))
     }
 
     /// Run a set of modules somebody else found.
@@ -335,7 +468,284 @@ impl Plugins {
         commands: Arc<dyn Commands>,
         sink: Sink,
     ) -> Self {
-        let registry = Arc::new(Registry::new(sink, Approvals::open(Arc::clone(&state))));
+        let approvals = Arc::new(Approvals::open(Arc::clone(&state)));
+        let live = generation(
+            modules,
+            state,
+            Arc::clone(&commands),
+            Arc::clone(&sink),
+            Arc::clone(&approvals),
+            // The first load has no other set to be confused with, and a
+            // window attaching part-way through is right to be shown what is
+            // already running.
+            Announce::Now,
+            None,
+        )
+        .await;
+        Self {
+            live: std::sync::RwLock::new(Arc::new(live)),
+            retired: AtomicBool::new(false),
+            reload: AtomicU32::new(reload::IDLE),
+            approving: Mutex::new(()),
+            sink,
+            commands,
+            approvals,
+        }
+    }
+
+    /// A host with nothing loaded, for a daemon built without a plugin
+    /// directory to look in.
+    #[must_use]
+    pub fn none(sink: Sink, commands: Arc<dyn Commands>) -> Self {
+        let approvals = Arc::new(Approvals::open(Arc::new(Nowhere)));
+        Self {
+            live: std::sync::RwLock::new(Arc::new(Live::empty(
+                Arc::clone(&sink),
+                Arc::clone(&approvals),
+            ))),
+            retired: AtomicBool::new(false),
+            reload: AtomicU32::new(reload::IDLE),
+            approving: Mutex::new(()),
+            sink,
+            commands,
+            approvals,
+        }
+    }
+
+    /// The same, for a caller with no session to offer — a test, or a daemon
+    /// that has not built its bridge yet.
+    ///
+    /// Its own name rather than a `None` argument because of what a reload
+    /// made of it: this host can be given real plugins later, and one built
+    /// with no bridge would run them with every account command answering
+    /// `NoSession` — while reporting the reload as having worked.
+    #[must_use]
+    pub fn nothing_loaded(sink: Sink) -> Self {
+        Self::none(sink, Arc::new(NoCommands))
+    }
+
+    /// Take the reload slot, or record that another reload is owed.
+    ///
+    /// `true` means this caller now owns it and must run the reload. `false`
+    /// means somebody else does, and has been told to scan once more when
+    /// they are done — so the ask is deferred rather than refused.
+    fn claim_reload(&self) -> bool {
+        loop {
+            let state = self.reload.load(Ordering::SeqCst);
+            let wanted = match state {
+                reload::IDLE => reload::RUNNING,
+                // Already owed. Nothing to add: one more scan covers every
+                // ask that arrived during this one, because what all of them
+                // want is the folder as it is now.
+                reload::OWED => return false,
+                _ => reload::OWED,
+            };
+            if self
+                .reload
+                .compare_exchange(state, wanted, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return state == reload::IDLE;
+            }
+        }
+    }
+
+    /// Finish a pass: take another if one is owed, or give the slot up.
+    ///
+    /// One `compare_exchange` and not two steps, which is the whole point of
+    /// the state being a word. Releasing the slot and *then* looking for a
+    /// pending ask leaves a gap an ask can land in — it sees a reload
+    /// running, records itself, and the reload it was counting on has already
+    /// decided it is finished — and every arrangement of two atomics has that
+    /// gap somewhere.
+    /// Whether the account has gone and this host with it.
+    ///
+    /// Asked by a caller that has something irreversible to do between two of
+    /// its own awaits — a page taking a fresh storage handle, which retires
+    /// every older one — where `reload`'s own check comes too late to help.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Relaxed)
+    }
+
+    /// Whatever is loaded at this instant.
+    ///
+    /// Cloned out from under the lock and never held across a call, for the
+    /// reason [`Plugins::live`] states.
+    fn live(&self) -> Arc<Live> {
+        Arc::clone(&self.live.read().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// What the one reload slot can be.
+///
+/// Three states rather than two booleans, because the transition that matters
+/// is between the last two: see [`Plugins::reload`].
+mod reload {
+    pub const IDLE: u32 = 0;
+    /// Somebody is reloading.
+    pub const RUNNING: u32 = 1;
+    /// Somebody is reloading, and another ask arrived while they were.
+    pub const OWED: u32 = 2;
+}
+
+/// Holds the one reload slot, and gives it back however the reload ends.
+///
+/// A guard rather than a store at each exit, for the one exit that cannot
+/// have a store: an unwind. See [`Plugins::reload`].
+struct Reservation<'a> {
+    word: &'a AtomicU32,
+    /// Whether this reload still owns the slot.
+    ///
+    /// The guard cannot release unconditionally, and that was a real bug
+    /// rather than a tidiness point: once [`Reservation::another_pass`] has
+    /// handed the slot back, a *successor* may already have claimed it, and a
+    /// store of `IDLE` on the way out then takes it away from them — letting a
+    /// third reload build concurrently, and letting `wait_for_any_reload`
+    /// decide there is nothing in flight while a wipe proceeds.
+    ///
+    /// So releasing is something this guard does, once, and remembers.
+    held: AtomicBool,
+}
+
+impl Reservation<'_> {
+    fn new(word: &AtomicU32) -> Reservation<'_> {
+        Reservation {
+            word,
+            held: AtomicBool::new(true),
+        }
+    }
+
+    /// Finish a pass: take another if one is owed, or give the slot up.
+    ///
+    /// One `compare_exchange` per outcome and not a read followed by a store,
+    /// which is the whole reason the state is a word. Releasing the slot and
+    /// *then* looking for a pending ask leaves a gap an ask can land in — it
+    /// sees a reload running, records itself, and the reload it was counting
+    /// on has already decided it is finished — and every arrangement of two
+    /// atomics has that gap somewhere.
+    fn another_pass(&self) -> bool {
+        // Both outcomes are exchanges, and the loop is what makes the pair of
+        // them one decision. "While this reload owns the slot the word cannot
+        // change" is *false*: `claim_reload` turns `RUNNING` into `OWED`
+        // underneath, which is the whole point of it — and landing between
+        // these two exchanges left the first failing on `RUNNING`, the second
+        // failing on `OWED`, and the word stuck at `OWED` with no owner. Every
+        // later reload then defers to somebody who has gone, and
+        // `wait_for_any_reload` never returns.
+        //
+        // It goes round at most twice. The only write anyone else makes while
+        // this reload owns the slot is that one `RUNNING` -> `OWED`, and
+        // `claim_reload` leaves an already-`OWED` word alone, so after one
+        // turn the first exchange succeeds.
+        loop {
+            // Owed: keep the slot and take another pass.
+            if self
+                .word
+                .compare_exchange(
+                    reload::OWED,
+                    reload::RUNNING,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+            // Nothing owed: give it up. An ask arriving one instruction later
+            // finds the slot free and runs itself.
+            if self
+                .word
+                .compare_exchange(
+                    reload::RUNNING,
+                    reload::IDLE,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                self.held.store(false, Ordering::SeqCst);
+                return false;
+            }
+        }
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        // Only what is still ours. On the ordinary path `another_pass` has
+        // already released it and said so; what is left here is the unwinding
+        // one, where the word is whatever this reload left it as and nobody
+        // else can have taken it.
+        if self.held.load(Ordering::SeqCst) {
+            self.word.store(reload::IDLE, Ordering::SeqCst);
+        }
+    }
+}
+
+/// When a freshly loaded set may start telling front ends what it is.
+///
+/// The first load announces as it goes, because there is nothing else for a
+/// window to confuse it with. A reload's does not: until the swap, `self.live`
+/// is still the set being retired, so a control published early is drawn by a
+/// window and routed back against the old registry and a closed queue —
+/// accepted, validated and lost. `MAX_LOAD_TIME` says how wide that window
+/// can be.
+#[derive(Clone, Copy)]
+enum Announce {
+    Now,
+    OnInstall,
+}
+
+/// Every `.wasm` in `dir` that could be a plugin, as modules nobody has
+/// opened yet.
+///
+/// One scan, called by the first load and by every reload: a second one would
+/// be a second answer to which names are ids and in what order they are
+/// taken, which is exactly the kind of disagreement `MAX_PLUGINS` truncating
+/// a folder makes visible.
+#[cfg(not(target_family = "wasm"))]
+fn modules_in(dir: &Path) -> Option<Vec<Module>> {
+    Some(
+        discover(dir)?
+            .into_iter()
+            .filter_map(|path| {
+                let Some(id) = plugin_id(&path) else {
+                    log::warn!(
+                        "skipping {}: its name is not a usable plugin id",
+                        path.display()
+                    );
+                    return None;
+                };
+                Some(Module {
+                    id,
+                    open: Box::new(move || read_module(&path)),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Load a set of modules into one generation.
+///
+/// The whole of what `start` used to be, lifted out so a reload runs exactly
+/// the same code the first load does — a second loader would be a second set
+/// of answers to the id rules, the budgets and the order they are asked in.
+async fn generation(
+    modules: Vec<Module>,
+    state: Arc<dyn Backing>,
+    commands: Arc<dyn Commands>,
+    sink: Sink,
+    approvals: Arc<Approvals>,
+    announce: Announce,
+    abandon_if: Option<&AtomicBool>,
+) -> Live {
+    {
+        let registry = Arc::new(Registry::new(
+            sink,
+            approvals,
+            matches!(announce, Announce::OnInstall),
+        ));
         let stopping = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::new();
 
@@ -360,6 +770,18 @@ impl Plugins {
                 log::warn!(
                     "plugins took longer than {MAX_LOAD_TIME:?} to load; the rest is skipped"
                 );
+                break;
+            }
+            // And the account going away, which is the other reason to stop
+            // part-way. A reload can be running when `ForgetSession` lands,
+            // and the set being built is not reachable from `shutdown` — it
+            // is a local until it is installed — so what bounds the workers
+            // still starting during a wipe is this check plus the retirement
+            // the caller does when it finds the host gone. Between modules,
+            // like the clock above and for the same reason: a module being
+            // loaded cannot be interrupted.
+            if abandon_if.is_some_and(|gone| gone.load(Ordering::Relaxed)) {
+                log::warn!("the host is shutting down; the rest of the folder is skipped");
                 break;
             }
             // Before the module is opened, so the turn falls between two
@@ -397,7 +819,20 @@ impl Plugins {
                     continue;
                 }
             };
-            let granted = Arc::new(AtomicI64::new(registry.approved(&id)));
+            // A reload's workers start with nothing, and are handed the
+            // answers at the install. A worker begins running the moment it
+            // is loaded — its `oxi_init` may arm a timer — so one built from
+            // the mask as it stood when *it* was loaded could act on a grant
+            // withdrawn while a later module was still loading: the answer
+            // reaches the shared map and the live generation, and this set is
+            // neither until the swap. It costs nothing, because `oxi_init`
+            // may not touch the account at all — that is refused as `STATE`,
+            // not as `DENIED` — so the only calls this delays are the ones a
+            // timer makes before the install.
+            let granted = Arc::new(AtomicI64::new(match announce {
+                Announce::Now => registry.approved(&id),
+                Announce::OnInstall => 0,
+            }));
             match Runtime::load(
                 &bytes,
                 &id,
@@ -431,23 +866,62 @@ impl Plugins {
             );
         }
 
-        Self {
+        Live {
             registry,
             workers,
+            state,
             stopping,
-            approving: Mutex::new(()),
+        }
+    }
+}
+
+impl Live {
+    /// A generation with nothing in it.
+    fn empty(sink: Sink, approvals: Arc<Approvals>) -> Self {
+        Self {
+            registry: Arc::new(Registry::new(sink, approvals, false)),
+            workers: Vec::new(),
+            state: Arc::new(Nowhere),
+            stopping: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// A host with nothing loaded, for a daemon built without a plugin
-    /// directory to look in.
-    #[must_use]
-    pub fn none(sink: Sink) -> Self {
-        Self {
-            registry: Arc::new(Registry::new(sink, Approvals::open(Arc::new(Nowhere)))),
-            workers: Vec::new(),
-            stopping: Arc::new(AtomicBool::new(false)),
-            approving: Mutex::new(()),
+    /// End this generation: stop taking events, close every queue, wait for
+    /// the handler each plugin is in the middle of, and take its authority
+    /// away.
+    ///
+    /// The order is the whole of it. The flag first, so a worker part-way
+    /// through a backlog stops taking from it; then the sender, so one parked
+    /// in `recv` wakes up. Neither alone is enough: the flag is only read
+    /// between events, and a closed channel still hands over what is already
+    /// queued.
+    ///
+    /// The registry is retired *before* any of that, because a worker's last
+    /// act is often to publish — and a superseded generation publishing is
+    /// the set that replaced it being overwritten by the set that did not.
+    /// On a desktop the join would have covered it; a page cannot join
+    /// anything, so the flag in the registry is what covers both.
+    ///
+    /// And the masks are zeroed after the join, which is the same sentence in
+    /// the other direction: on a desktop the join has already let the handler
+    /// finish, so this changes nothing, and on a page the task is still on
+    /// the loop with a call left to make — one that may no longer touch the
+    /// account. A withdrawal is applied by writing this exact zero, so this
+    /// is not a new mechanism, only the existing one aimed at a generation.
+    fn retire(&self) {
+        self.registry.retire();
+        self.stopping.store(true, Ordering::Relaxed);
+        for worker in &self.workers {
+            drop(lock(&worker.queue).take());
+        }
+        for worker in &self.workers {
+            let running = lock(&worker.thread).take();
+            if let Some(running) = running
+                && !running.join()
+            {
+                log::warn!("plugin {}: it panicked on the way out", worker.id);
+            }
+            worker.granted.store(0, Ordering::Relaxed);
         }
     }
 
@@ -455,20 +929,12 @@ impl Plugins {
     ///
     /// Asked before an event is converted, because building one is work and
     /// the ordinary account has no plugins at all.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.workers.is_empty()
     }
 
-    /// The ids of every loaded plugin, for a caller reporting what is running.
-    #[must_use]
-    pub fn ids(&self) -> Vec<&str> {
-        self.workers.iter().map(|w| w.id.as_str()).collect()
-    }
-
     /// What every plugin currently is, for a snapshot.
-    #[must_use]
-    pub fn surfaces(&self) -> Vec<PluginSurface> {
+    fn surfaces(&self) -> Vec<PluginSurface> {
         self.registry.surfaces()
     }
 
@@ -479,8 +945,7 @@ impl Plugins {
     /// history load carries every chat with its messages. A message-only
     /// plugin would otherwise pay for every receipt in the account, and a
     /// stopped one for everything, since a stopped worker stays in the list.
-    #[must_use]
-    pub fn wants(&self, event: &UiEvent) -> bool {
+    fn wants(&self, event: &UiEvent) -> bool {
         let Some(kind) = event::kind_of(event) else {
             return false;
         };
@@ -494,7 +959,7 @@ impl Plugins {
     /// Converted once and shared: the cost of an event with five plugins
     /// attached is one conversion and five refcount bumps, not five
     /// conversions — and with none attached, nothing at all.
-    pub fn observe(&self, original: &UiEvent) {
+    fn observe(&self, original: &UiEvent) {
         if !self.wants(original) {
             return;
         }
@@ -517,7 +982,7 @@ impl Plugins {
     }
 
     /// Route a widget's use back to the plugin that drew it.
-    pub fn act(&self, action: &PluginAction) {
+    fn act(&self, action: &PluginAction) {
         let Some(worker) = self.workers.iter().find(|w| w.id == action.plugin) else {
             log::debug!("an action for {}, which is not loaded", action.plugin);
             return;
@@ -613,63 +1078,18 @@ impl Plugins {
         self.offer_refusable(worker, Job::Event(Arc::new(event)));
     }
 
-    /// Stop every plugin, waiting for the handler each is in the middle of.
-    ///
-    /// Called before the account's data is touched, for the same reason the
-    /// publish thread is joined there: a plugin's own settings file sits
-    /// beside the store, and one still writing it while the directory is
-    /// deleted recreates what the wipe just removed.
-    pub fn shutdown(&self) {
-        // The flag first, so a worker part-way through a backlog stops taking
-        // from it; then the sender, so one parked in `recv` wakes up. Neither
-        // alone is enough: the flag is only read between events, and a closed
-        // channel still hands over what is already queued.
-        self.stopping.store(true, Ordering::Relaxed);
-        // Behind the same lock an answer is recorded under, so one already
-        // part-way through finishes before the flag is anybody's answer —
-        // and none can start after it.
-        drop(lock(&self.approving));
-        for worker in &self.workers {
-            drop(lock(&worker.queue).take());
-        }
-        for worker in &self.workers {
-            let running = lock(&worker.thread).take();
-            if let Some(running) = running
-                && !running.join()
-            {
-                log::warn!("plugin {}: it panicked on the way out", worker.id);
-            }
-        }
-    }
-
     /// Grant or withhold what a plugin asked to be allowed to do.
     ///
     /// Persisted before it is applied, because the answer has to survive a
     /// restart: a plugin re-granted on every start would be one whose
     /// permission prompt means nothing.
-    pub fn approve(&self, id: &str, approved: bool) {
+    fn approve(&self, id: &str, approved: bool) -> bool {
         let Some(worker) = self.workers.iter().find(|w| w.id == id) else {
-            return;
+            // Nothing to answer for. A module that failed to load has no
+            // worker, so an answer about it records nothing and is not one to
+            // acknowledge.
+            return false;
         };
-        // Not once the host is going. The IPC server keeps answering requests
-        // while the session tears down, so a `PluginApproval` arriving then
-        // could write a fresh `approvals.json` *after* the account reset had
-        // retired it — and the next pairing would inherit a grant nobody gave
-        // it. Refusing here is the whole fix: shutdown raises this before it
-        // does anything else.
-        if self.stopping.load(Ordering::Relaxed) {
-            log::warn!("plugin {id}: refusing an approval; the host is shutting down");
-            return;
-        }
-        let _order = lock(&self.approving);
-        // And again, now that the lock is held. Reading it only before was a
-        // gap: this task could see `false`, pause, and resume after shutdown
-        // had raised the flag, taken this same lock and finished — writing an
-        // approval the account reset had already declared gone.
-        if self.stopping.load(Ordering::Relaxed) {
-            log::warn!("plugin {id}: refusing an approval; the host is shutting down");
-            return;
-        }
         // One ordered step, because these are two answers to the same
         // question and they must not be able to disagree. Two clients acting
         // at once would otherwise let a grant compute its mask, pause while a
@@ -683,10 +1103,10 @@ impl Plugins {
             // publishing first left a window in which a front end reacting to
             // its own frame could press a button the plugin would refuse,
             // because the mask reaching it is a separate step.
-            worker
-                .granted
-                .store(self.registry.record(id, true), Ordering::Relaxed);
+            let (mask, stored) = self.registry.record(id, true);
+            worker.granted.store(mask, Ordering::Relaxed);
             self.registry.publish();
+            stored
         } else {
             // A withdrawal is the other way round, and for the same reason:
             // fail closed. `Registry::approve` writes a file and publishes a
@@ -696,8 +1116,9 @@ impl Plugins {
             // first costs nothing if the write then fails, because the write
             // failing removes the file rather than leaving the grant.
             worker.granted.store(0, Ordering::Relaxed);
-            self.registry.record(id, false);
+            let (_, stored) = self.registry.record(id, false);
             self.registry.publish();
+            stored
         }
     }
 
@@ -772,6 +1193,363 @@ impl Plugins {
             Err(TrySend::Closed) => None,
         }
     }
+}
+
+/// What the host answers with when there is nothing loaded and so nothing
+/// that could ever ask.
+///
+/// [`Plugins::none`] has no session behind it and no worker to reach one;
+/// this exists so a reload of such a host is the ordinary path rather than a
+/// case, and every call on it is unreachable by construction.
+struct NoCommands;
+
+impl Commands for NoCommands {
+    fn send_text(&self, _jid: &str, _text: &str, _quoted: Option<&str>) -> Outcome {
+        Outcome::NoSession
+    }
+    fn mark_read(&self, _jid: &str, _message_id: Option<&str>) -> Outcome {
+        Outcome::NoSession
+    }
+    fn typing(&self, _jid: &str, _composing: bool) -> Outcome {
+        Outcome::NoSession
+    }
+}
+
+impl Plugins {
+    /// Whether anything is loaded. See [`Live::is_empty`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.live().is_empty()
+    }
+
+    /// The ids of every loaded plugin, for a caller reporting what is
+    /// running.
+    ///
+    /// Owned rather than borrowed, which the generation being replaceable
+    /// forces: the strings belong to whatever was loaded when this was asked,
+    /// and a reference into it would be a reference into a set the next
+    /// reload has already dropped.
+    #[must_use]
+    pub fn ids(&self) -> Vec<String> {
+        self.live().workers.iter().map(|w| w.id.clone()).collect()
+    }
+
+    /// What every plugin currently is, for a snapshot.
+    #[must_use]
+    pub fn surfaces(&self) -> Vec<PluginSurface> {
+        self.live().surfaces()
+    }
+
+    /// Whether any running plugin would be handed this event.
+    #[must_use]
+    pub fn wants(&self, event: &UiEvent) -> bool {
+        self.live().wants(event)
+    }
+
+    /// Hand a session event to whoever asked for its kind.
+    pub fn observe(&self, original: &UiEvent) {
+        self.live().observe(original);
+    }
+
+    /// Route a widget's use back to the plugin that drew it.
+    pub fn act(&self, action: &PluginAction) {
+        self.live().act(action);
+    }
+
+    /// Grant or withhold what a plugin asked to be allowed to do.
+    ///
+    /// Which set of workers the answer reaches is decided *inside* the lock,
+    /// and that is not a detail. A reload holds this same lock while it
+    /// installs, so an answer that chose its generation first could block
+    /// here, resume after the swap, and store the mask on a worker that is no
+    /// longer running — leaving the shared map revoked and the live plugin
+    /// still holding its grant, which is the failure this whole path exists
+    /// to make impossible.
+    /// Answers whether the answer was recorded — see [`Approvals::set`],
+    /// which is what can say no.
+    pub fn approve(&self, id: &str, approved: bool) -> bool {
+        // Not once the host is going. The IPC server keeps answering requests
+        // while the session tears down, so a `PluginApproval` arriving then
+        // could write a fresh `approvals.json` *after* the account reset had
+        // retired it — and the next pairing would inherit a grant nobody gave
+        // it. Refusing here is the whole fix: shutdown raises this before it
+        // does anything else.
+        if self.retired.load(Ordering::Relaxed) {
+            log::warn!("plugin {id}: refusing an approval; the host is shutting down");
+            return false;
+        }
+        let _order = lock(&self.approving);
+        // And again, now that the lock is held. Reading it only before was a
+        // gap: this task could see `false`, pause, and resume after shutdown
+        // had raised the flag, taken this same lock and finished — writing an
+        // approval the account reset had already declared gone.
+        if self.retired.load(Ordering::Relaxed) {
+            log::warn!("plugin {id}: refusing an approval; the host is shutting down");
+            return false;
+        }
+        self.live().approve(id, approved)
+    }
+
+    /// Replace every running plugin with what `modules` holds now.
+    ///
+    /// The point of this is that neither the daemon nor the account goes
+    /// anywhere: the session stays connected, the store stays open, every
+    /// front end keeps its connection, and what changes is which `.wasm`
+    /// files are running. A plugin somebody has just installed, updated or
+    /// removed is the whole use, and the alternative was restarting the
+    /// process that holds the account.
+    ///
+    /// Answers how many are running afterwards.
+    ///
+    /// # The order, which is the design
+    ///
+    /// The old generation is retired *before* the new one is built, and that
+    /// is deliberate against the obvious alternative of loading first to keep
+    /// the gap short. Two plugins claiming one id is the thing this host
+    /// refuses everywhere else — an id is what an approval, a settings
+    /// document and every action are keyed on, so two live workers under one
+    /// id means withdrawing a permission reaches one of them and leaves the
+    /// other acting. Loading first would create exactly that, for every id in
+    /// the folder, for the length of the load.
+    ///
+    /// What the gap costs is events: for as long as loading takes, nothing is
+    /// observing the account. That is a real cost and it is the honest one —
+    /// a reload is somebody deciding to change what is running, not a hiccup
+    /// — and it is bounded by `MAX_LOAD_TIME` like every other load. What is
+    /// *not* lost is anything a plugin had written down: its settings and its
+    /// approval are in storage, and the new generation reads them back.
+    ///
+    /// `state` is supplied rather than remembered because a page's storage
+    /// handle is stamped: taking a fresh one is what stops the retiring
+    /// generation's last write from landing on top of the new one's. A
+    /// desktop's is a path and rebuilding it costs nothing.
+    pub async fn reload<Fut>(&self, what: impl Fn() -> Fut) -> Reloaded
+    where
+        Fut: Future<Output = Option<(Vec<Module>, Arc<dyn Backing>)>>,
+    {
+        // The account has gone. A reload here would start plugins over a
+        // session that is being forgotten, which is the same thing `approve`
+        // refuses and for the same reason.
+        if self.retired.load(Ordering::Relaxed) {
+            log::warn!("refusing to reload plugins; the host has been shut down");
+            return Reloaded::Failed;
+        }
+        // Before the modules and the storage are asked for, not after. A
+        // page's storage handle is *stamped*: taking one retires every older
+        // one, so a second reload that gathered its resources and was then
+        // turned away would have retired the handle the surviving generation
+        // is about to be installed with — leaving every later approval and
+        // settings write refused until some other reload happened to succeed.
+        // A closure is not called until it is called.
+        if !self.claim_reload() {
+            // And it is not dropped either. The ask that arrives during a
+            // reload is somebody who has just installed or removed something,
+            // and the scan already running may well have read the folder
+            // before they touched it — so refusing outright loses exactly the
+            // change that was asked for, while the request is acknowledged as
+            // done. One more scan after this one covers every ask that landed
+            // during it, however many there were, because what they all want
+            // is the folder as it is now.
+            log::debug!("a plugin reload is already running; another will follow it");
+            return Reloaded::Deferred;
+        }
+        // And released by a guard from here on. Every ordinary exit could put
+        // the slot back itself; an unwinding one could not — and a loader
+        // that panics would otherwise hold it for the life of the process:
+        // every later reload would set `reload_again` and return with no
+        // owner left to consume it, so plugins could not be recovered without
+        // restarting the daemon, and `wait_for_any_reload` would wait for a
+        // reload that had already unwound.
+        //
+        // A pending ask goes with it. An unwind is not a reload that
+        // finished, so nothing here can honour one, and leaving the word
+        // saying "another is owed" would leave it owed to nobody.
+        let slot = Reservation::new(&self.reload);
+        // And asked again, now that the slot is held. The check above is
+        // outside it, so a shutdown landing between the two would set the
+        // flag, see an `IDLE` word, decide nothing is in flight and let the
+        // wipe proceed — and this reload would then build a generation over
+        // an account that has gone. Holding the slot first is what makes the
+        // question worth asking twice: from here on `shutdown` either sees
+        // this claim and waits, or has already raised the flag and is seen.
+        // `SeqCst` for that second half: see `shutdown`, where the store is
+        // its pair — relaxed here would let both sides miss each other.
+        if self.retired.load(Ordering::SeqCst) {
+            log::warn!("refusing to reload plugins; the host has been shut down");
+            return Reloaded::Failed;
+        }
+
+        loop {
+            let Some((modules, state)) = what().await else {
+                // The folder could not be read. Not the same fact as an empty
+                // folder, and telling them apart is the whole of why this is
+                // an `Option`: a transient storage failure would otherwise
+                // retire every healthy plugin and publish an empty set, with
+                // nothing having been removed and nothing to put it back.
+                // What is running stays running.
+                log::warn!("not reloading plugins: the folder could not be read");
+                // An ask that arrived during this scan is still owed one, and
+                // a scan that failed is not the scan it was promised. This
+                // was the one exit that dropped the flag instead of
+                // honouring it. Tried once more and no further: the retry
+                // clears the flag as it takes it, so a folder that is still
+                // unreadable ends the second time with nothing pending rather
+                // than spinning on a storage error.
+                if slot.another_pass() {
+                    continue;
+                }
+                return Reloaded::Kept(self.live().workers.len());
+            };
+
+            self.live().retire();
+            let fresh = Arc::new(
+                generation(
+                    modules,
+                    state,
+                    Arc::clone(&self.commands),
+                    Arc::clone(&self.sink),
+                    Arc::clone(&self.approvals),
+                    Announce::OnInstall,
+                    Some(&self.retired),
+                )
+                .await,
+            );
+
+            // Under the lock a shutdown and an approval both take, and
+            // reading the flag inside it. Loading takes seconds and anything
+            // can land in any of them: without this the new generation would
+            // be installed over a host already told the account is gone, and
+            // its plugins would be running with nothing to stop them.
+            let installed = {
+                let _order = lock(&self.approving);
+                if self.retired.load(Ordering::Relaxed) {
+                    false
+                } else {
+                    // The answers, re-applied to the workers that have just
+                    // been built. Their masks were read when each was loaded,
+                    // which is before any answer given during the load — and
+                    // the answers themselves are the host's one map, so this
+                    // is a read of the current truth rather than a merge of
+                    // two. Under the lock, so no answer can land between the
+                    // read and the store.
+                    //
+                    // `rebind` first, because it is what makes that map true:
+                    // it writes what is held through the store this
+                    // generation was built against — a page's older handle
+                    // having been retired by this very reload — and clears it
+                    // outright where that store cannot keep answers at all.
+                    self.approvals.rebind(Arc::clone(&fresh.state));
+                    for worker in &fresh.workers {
+                        worker
+                            .granted
+                            .store(self.approvals.approved(&worker.id), Ordering::Relaxed);
+                    }
+                    *self.live.write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&fresh);
+                    true
+                }
+            };
+
+            if !installed {
+                fresh.retire();
+                return Reloaded::Failed;
+            }
+            // Now, and not before: the whole set at once, which is also the
+            // one publication a generation does not make for itself.
+            // `Registry::insert` publishes per plugin, so a reload ending with
+            // an empty folder would otherwise leave every front end drawing
+            // the set that is gone.
+            fresh.registry.announce();
+            fresh.registry.publish();
+            let running = fresh.workers.len();
+
+            // An ask that arrived during this pass gets one of its own, and
+            // finishing is the same decision: either this takes another pass
+            // or it gives the slot up, in one step that nothing can land in
+            // the middle of.
+            if slot.another_pass() {
+                continue;
+            }
+            return Reloaded::Ran(running);
+        }
+    }
+
+    /// Stop every plugin, waiting for the handler each is in the middle of.
+    ///
+    /// Called before the account's data is touched, for the same reason the
+    /// publish thread is joined there: a plugin's own settings file sits
+    /// beside the store, and one still writing it while the directory is
+    /// deleted recreates what the wipe just removed.
+    ///
+    /// Permanent, unlike a reload: nothing starts again after this.
+    pub fn shutdown(&self) {
+        // Before the lock, so a reload between the two sees it and declines
+        // to install what it has just finished building.
+        //
+        // `SeqCst`, and paired with the `SeqCst` load a reload makes once it
+        // holds the slot. Relaxed on both sides is the store-buffer shape and
+        // the memory model allows both to miss: this store can sit unobserved
+        // while `wait_for_any_reload` below reads an `IDLE` word, and the
+        // reload that claimed it a moment later reads `false` — so shutdown
+        // returns without waiting and the wipe runs beside a generation being
+        // built. The `SeqCst` operations on `reload` order nothing about a
+        // *different* atomic; putting both flags in the total order is what
+        // makes at least one of the two see the other.
+        self.retired.store(true, Ordering::SeqCst);
+        self.wait_for_any_reload();
+        // Behind the same lock an answer is recorded under, so one already
+        // part-way through finishes before the flag is anybody's answer —
+        // and none can start after it. Taking it here is also what orders
+        // this against a reload's install: either that install has happened
+        // and the generation below is the new one, or it has not and it never
+        // will.
+        let live = {
+            let _order = lock(&self.approving);
+            self.live()
+        };
+        live.retire();
+    }
+
+    /// Wait for a reload that is part-way through, having already told it to
+    /// stop.
+    ///
+    /// A generation being built is a local until it is installed, so
+    /// `shutdown` cannot reach it — and on a desktop what happens next is the
+    /// account's data being deleted, with that set's workers alive and their
+    /// settings writes still to come. `retired` is raised before this, so the
+    /// loader abandons the rest of the folder at the next module boundary and
+    /// retires what it started; this is the wait for that to have happened.
+    ///
+    /// Polled rather than signalled, deliberately: this runs once in the life
+    /// of a process, has exactly one waiter, and is bounded by one module's
+    /// load — a condvar would be more machinery than the thing it waits for.
+    ///
+    /// And it does not give up. A deadline here was the wrong instinct twice
+    /// over: `MAX_LOAD_TIME` is checked *between* modules, so it does not
+    /// bound the open, the validation and the `oxi_init` this is most likely
+    /// to be waiting on, and returning early hands the wipe a set of workers
+    /// that are still running — which is the whole thing this exists to
+    /// prevent. It is also what the code beside it already does: `retire`
+    /// joins every worker's thread with no deadline either, because a
+    /// teardown that proceeds without them is worse than one that takes a
+    /// moment. What bounds it instead is `Reservation`, which gives the slot
+    /// back however the reload ends, an unwinding loader included.
+    #[cfg(not(target_family = "wasm"))]
+    fn wait_for_any_reload(&self) {
+        while self.reload.load(Ordering::SeqCst) != reload::IDLE {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// A page has neither half of the problem this answers.
+    ///
+    /// Nothing here can block — everything is on one agent, so waiting for a
+    /// task that can only run when this returns is a hang rather than a wait
+    /// — and there is nothing to wait *for*: the wipe a desktop is racing is
+    /// a directory being deleted, and an origin's storage is ordered by the
+    /// stamp instead, which refuses a retired handle's writes outright.
+    #[cfg(target_family = "wasm")]
+    #[allow(clippy::unused_self)]
+    fn wait_for_any_reload(&self) {}
 }
 
 impl Drop for Plugins {
@@ -1125,7 +1903,7 @@ async fn take(
 /// buttons are drawn in, and a set that reshuffled between two starts would
 /// move a control under somebody's hand.
 #[cfg(not(target_family = "wasm"))]
-fn discover(dir: &Path) -> Vec<PathBuf> {
+fn discover(dir: &Path) -> Option<Vec<PathBuf>> {
     // A directory anybody else can write is one where the file that runs
     // tomorrow is not the file that was approved today. Approval is recorded
     // against a plugin's id and mask rather than its bytes — deliberately, so
@@ -1140,8 +1918,19 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
     // every start, to everyone who has never installed a plugin. The check
     // below cannot tell the two apart on its own — it reads metadata, and a
     // directory that is not there has none.
-    if !dir.exists() {
-        return Vec::new();
+    match dir.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Some(Vec::new()),
+        Err(e) => {
+            // `exists()` folds this into `false`, which is the one answer it
+            // must not be: a parent directory that cannot be read, or any
+            // other metadata error, would be reported as a folder with no
+            // plugins in it — and a reload takes that for an answer and
+            // retires every healthy plugin. `try_exists` is the same question
+            // with the third outcome kept.
+            log::warn!("cannot tell whether {} is there: {e}", dir.display());
+            return None;
+        }
     }
     if !only_this_user_can_write(dir) {
         log::warn!(
@@ -1150,13 +1939,38 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
              its contents",
             dir.display()
         );
-        return Vec::new();
+        // An answer, not a failure: a directory somebody else can write is
+        // one whose plugins this host will not run, and a reload finding that
+        // *should* stop them.
+        return Some(Vec::new());
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // Said, and told apart from the two answers above. A directory
+            // that is not there and one this host refuses to trust are both
+            // "no plugins", deliberately; one it cannot *read* is not an
+            // answer at all, and a reload that took it for one would retire
+            // every healthy plugin over a transient error.
+            log::warn!("cannot read {}: {e}", dir.display());
+            return None;
+        }
+    };
+    // Every entry, or none of them. `filter_map(Result::ok)` here was the
+    // same conflation the `read_dir` above stopped making one level up: an
+    // entry this host could not read is not an entry that is not there, and a
+    // reload that took a short listing for the folder would retire a healthy
+    // plugin over a transient error, with nothing removed and nothing to put
+    // it back.
+    let entries: Vec<std::fs::DirEntry> = match entries.collect::<Result<_, _>>() {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("cannot read an entry of {}: {e}", dir.display());
+            return None;
+        }
     };
     let mut found: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
+        .into_iter()
         .map(|e| e.path())
         .filter(|p| {
             p.extension()
@@ -1185,7 +1999,7 @@ fn discover(dir: &Path) -> Vec<PathBuf> {
     // ones run is the answer discovery always gives: the first `MAX_PLUGINS`
     // by name.
     found.truncate(MAX_PLUGINS);
-    found
+    Some(found)
 }
 
 /// One module's bytes, bounded before the file is opened.

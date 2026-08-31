@@ -55,6 +55,21 @@ pub trait Backing: Send + Sync + 'static {
 
     /// What to call `name` in a log line: a path, or an origin's storage.
     fn describe(&self, name: &str) -> String;
+
+    /// Whether an answer written here will still be here next time.
+    ///
+    /// Asked of the store a reload installs, because the approvals are the
+    /// *host's* and survive the swap: a set loaded against a directory that
+    /// has since been refused would otherwise keep grants that nothing can
+    /// record, which is the one direction `usable_state_dir` exists to
+    /// prevent — it refuses rather than trusts, and refusing has to mean
+    /// every plugin is unapproved until somebody says so again.
+    ///
+    /// True by default: a store that cannot say otherwise is one that keeps
+    /// what it is given.
+    fn keeps_answers(&self) -> bool {
+        true
+    }
 }
 
 /// A store with nowhere to write.
@@ -80,6 +95,12 @@ impl Backing for Nowhere {
 
     fn describe(&self, name: &str) -> String {
         format!("{name} (kept in memory only)")
+    }
+
+    /// Nothing written here outlives the process, which is exactly what a
+    /// refused state directory means and what makes it fail closed.
+    fn keeps_answers(&self) -> bool {
+        false
     }
 }
 

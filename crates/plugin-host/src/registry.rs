@@ -40,7 +40,12 @@ pub struct Registry {
     entries: Mutex<BTreeMap<String, Entry>>,
     /// What the user has allowed. Held here because the surface has to say
     /// so, and because the answer outlives any one plugin thread.
-    approvals: Approvals,
+    /// Shared with every other generation, because an answer is the *host's*
+    /// and outlives any set of workers. A generation of its own would be a
+    /// second copy read before a reload and written after one, so a
+    /// revocation landing during a load would be undone by the set that
+    /// replaced it.
+    approvals: Arc<Approvals>,
     sink: Sink,
     /// Held across taking a snapshot *and* handing it to the sink.
     ///
@@ -51,17 +56,55 @@ pub struct Registry {
     /// has to be released before the sink is called, or a sink that reads
     /// back through the registry would deadlock.
     publishing: Mutex<()>,
+    /// Whether this set of plugins has been superseded.
+    ///
+    /// A retired registry publishes nothing, and that is what makes a reload
+    /// safe. A worker's last act is very often to publish — its tree, or the
+    /// reason it stopped — and on a page there is no way to wait for it: the
+    /// task is on the same loop the reload runs on, so it may not have taken
+    /// its turn until well after the generation that replaced it has drawn.
+    /// One late `set_roots` from a plugin nobody is running would overwrite
+    /// the whole live set with the one that is gone.
+    retired: std::sync::atomic::AtomicBool,
+    /// Whether this set is still being built.
+    ///
+    /// A generation loaded by a reload is not the live one until the swap, so
+    /// a plugin inserted half way through a load must not reach a window: it
+    /// would draw a control whose press is routed against the *old* registry
+    /// and a queue that is already closed — accepted, validated and silently
+    /// dropped. Loading takes up to `MAX_LOAD_TIME`, so that is a real window
+    /// rather than an instant. The first load starts announcing, because
+    /// there is no other set for it to be confused with and a window
+    /// attaching mid-load is right to see what is already running.
+    silent: std::sync::atomic::AtomicBool,
 }
 
 impl Registry {
     #[must_use]
-    pub fn new(sink: Sink, approvals: Approvals) -> Self {
+    pub fn new(sink: Sink, approvals: Arc<Approvals>, silent: bool) -> Self {
         Self {
             entries: Mutex::new(BTreeMap::new()),
             approvals,
             sink,
             publishing: Mutex::new(()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            silent: std::sync::atomic::AtomicBool::new(silent),
         }
+    }
+
+    /// Let this set publish. See [`Registry::silent`].
+    pub(crate) fn announce(&self) {
+        self.silent
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stop this set from publishing anything, ever again.
+    ///
+    /// Not a pause: a generation is retired exactly once, when it is
+    /// superseded or when the host shuts down, and neither has a way back.
+    pub(crate) fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record a plugin that has just been loaded, before it has drawn
@@ -92,13 +135,14 @@ impl Registry {
         self.approvals.approved(id)
     }
 
-    /// Record the user's answer and hand back the mask to give the plugin.
+    /// Record the user's answer and hand back the mask to give the plugin,
+    /// with whether it was written down.
     ///
     /// Does not publish: what a front end is shown has to follow the mask
     /// actually reaching the worker, or a window opens in which Settings says
     /// "allowed" over a plugin that would still refuse. The caller publishes
     /// once it has handed the mask over.
-    pub fn record(&self, id: &str, approved: bool) -> i64 {
+    pub fn record(&self, id: &str, approved: bool) -> (i64, bool) {
         let requested = self.lock().get(id).map_or(0, |e| e.requested);
         self.approvals.set(id, requested, approved)
     }
@@ -195,10 +239,19 @@ impl Registry {
     }
 
     pub(crate) fn publish(&self) {
+        // Asked under the same lock the snapshot is taken under, so a worker
+        // that reads `false` here cannot then publish after a retirement that
+        // began in between: `retire` cannot be observed as false by anything
+        // that goes on to hold this lock after it was set.
         let _order = self
             .publishing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.retired.load(std::sync::atomic::Ordering::Relaxed)
+            || self.silent.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         let surfaces = self.surfaces();
         (self.sink)(surfaces);
     }
@@ -251,7 +304,8 @@ mod tests {
             }),
             // Nowhere to write: these tests are about what the registry
             // publishes, not about what survives a restart.
-            Approvals::open(Arc::new(crate::store::Nowhere)),
+            Arc::new(Approvals::open(Arc::new(crate::store::Nowhere))),
+            false,
         );
         (registry, log)
     }
@@ -294,13 +348,13 @@ mod tests {
     fn approving_leaves_the_request_visible() {
         let (registry, _) = recorder();
         registry.insert("p", "p".into(), abi::caps::SEND);
-        assert_eq!(registry.record("p", true), abi::caps::SEND);
+        assert_eq!(registry.record("p", true), (abi::caps::SEND, true));
 
         let surface = registry.surfaces().remove(0);
         assert!(surface.approved);
         assert_eq!(surface.capabilities, vec!["send messages".to_string()]);
 
-        assert_eq!(registry.record("p", false), 0);
+        assert_eq!(registry.record("p", false), (0, true));
         assert!(!registry.surfaces()[0].approved);
     }
 
