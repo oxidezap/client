@@ -1,1 +1,6 @@
 dist/
+
+# The document `WEB_PROFILE=dwarf cargo xtask web build` derives from
+# `index.html`, rewritten per build. `dwarf_index` in xtask/src/web.rs is what
+# writes it, and why it is not a second file to keep in step by hand.
+index-dwarf.html

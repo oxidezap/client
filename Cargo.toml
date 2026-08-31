@@ -542,6 +542,30 @@ opt-level = "s"
 inherits = "web"
 strip = "none"
 
+# And the same again with the line table, which `WEB_PROFILE=dwarf cargo xtask
+# web build` selects. A third profile rather than a switch on the second,
+# because names and lines are different questions with different prices: the
+# name section is what rustc emits anyway and `web-debug` only declines to
+# throw away, while `debug = "full"` is DWARF the compiler would not otherwise
+# write — several times the module in `.debug_info`, `.debug_str` and
+# `.debug_line`, and `build-std` means the standard library pays it too.
+#
+# It is the input to `cargo xtask web map`, which turns `.debug_line` into a
+# source map beside the module: DWARF is what a browser extension reads, and a
+# source map is what DevTools itself reads in every engine with nothing
+# installed. Both come out of this profile because both are projections of the
+# same section.
+#
+# The build this selects is also the one build here that is *not* run through
+# wasm-opt — see `dwarf_index` in xtask/src/web.rs — so it is the slowest to
+# load and the largest of the three by a wide margin. That is the trade, and it
+# is a trade nobody makes by accident: none of it is reachable without naming
+# the profile.
+[profile.web-dwarf]
+inherits = "web"
+strip = "none"
+debug = "full"
+
 # What is left of this table, now that the sentence it was built on turned
 # out to be false.
 #

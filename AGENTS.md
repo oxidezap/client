@@ -224,6 +224,18 @@ cargo run --bin oxidezapd -- --web
 # — and `-g` in `data-wasm-opt-params` is what stops wasm-opt throwing the
 # name section away again.
 WEB_PROFILE=debug cargo xtask web build
+
+# And the same again with its source *lines*, which is what a browser needs to
+# say `crates/gui/src/app.rs:412` rather than a function name. Three things
+# make that work and the task does all three: `[profile.web-dwarf]` keeps the
+# DWARF, the build skips wasm-opt — which moves the code the line table
+# describes, and rewrites the table only for the transformations it knows how
+# to follow — and `cargo xtask web map` projects `.debug_line` into a source
+# map beside the module, pointing the module at it with a `sourceMappingURL`
+# section. DWARF is what an extension reads; the map is what DevTools reads on
+# its own, in every engine.
+WEB_PROFILE=dwarf cargo xtask web build
+cargo xtask web map            # the map again, over a module already built
 ```
 
 The web half of the daemon — the OPFS folder a page installs plugins into —
@@ -913,6 +925,26 @@ to the same problem. Nothing here needs it yet.
   Two ways in that look like they should work and do not:
   `CARGO_PROFILE_RELEASE_PACKAGE_<NAME>_OPT_LEVEL` is silently ignored, and
   `--config`, which is not, is not something trunk can forward.
+- **A source map for wasm is a projection of DWARF, and its columns are file
+  offsets.** The module is treated as a single line of text whose columns are
+  its bytes, so `xtask/src/sourcemap.rs` sorts `.debug_line` by address and
+  emits one segment per byte. The one adjustment in it that no specification
+  states is that DWARF's addresses are relative to the *code section's
+  payload* rather than to the file, so every offset has that section's start
+  added to it — measured against a module built for the purpose, where the
+  single function's first instruction is at file offset 110 and DWARF calls
+  it 3, against a payload beginning at 107. Two more things are load-bearing
+  and neither is obvious. The build may not be run through wasm-opt: it moves
+  code, and it updates the line table only for the transformations it knows
+  how to follow, so `-Oz` produces a table that still parses and no longer
+  describes the module — a debugger confidently naming the wrong line, which
+  is worse than one naming nothing, because nothing about it looks broken.
+  And the rows the linker discarded are not removed but pointed at all-ones,
+  so a generator that maps them puts every dead function's source lines over
+  whatever really is at the end of the module. Only sources under the
+  checkout are embedded in the map: naming the standard library's files
+  costs nothing and carrying `build-std`'s copy of them is most of a
+  gigabyte of JSON to answer a question a file name has already answered.
 - **A size override is worth what a crate weighs *after* LTO.** Which is not
   what it weighs in the sweep, and the two are not even correlated — so the
   order is measure, then decide, and `cargo bloat --crates` against a build
