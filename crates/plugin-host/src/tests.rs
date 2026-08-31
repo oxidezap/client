@@ -3627,3 +3627,77 @@ fn a_reload_that_panics_does_not_keep_the_slot() {
     assert_eq!(plugins.reload_from_dir(&dir.0, None), 1);
     assert_eq!(plugins.ids(), vec!["survivor".to_owned()]);
 }
+
+/// The reload slot's transitions, asked directly.
+///
+/// This mechanism has produced four defects in a row — a lost handoff, a
+/// guard that released a successor's claim, and a pair of exchanges that
+/// could leave the word `OWED` with nobody to honour it — every one found by
+/// reading rather than by running. Three states is small enough to simply
+/// *ask*, so this asks.
+///
+/// What it does not cover, and the distinction matters: the interleavings.
+/// Each defect above needed another thread to act *between* two instructions
+/// of an owner, and nothing single-threaded can get in there — this test
+/// passes against the version whose release could strand the word at `OWED`,
+/// which I checked rather than assumed. What it pins is the sequence of
+/// states a caller walks through, which is what a later reader will change by
+/// accident; the races are still held by argument alone, and the argument is
+/// in `Reservation::another_pass`.
+#[test]
+fn the_reload_slot_hands_off_without_losing_or_stealing_it() {
+    let published = Published::default();
+    let plugins = Plugins::nothing_loaded(published.sink());
+    let word = &plugins.reload;
+
+    // Nobody holds it.
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::IDLE);
+
+    // One claim takes it; a second is deferred rather than refused.
+    assert!(plugins.claim_reload(), "an idle slot is taken");
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::RUNNING);
+    assert!(!plugins.claim_reload(), "a taken slot is not taken twice");
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::OWED);
+    assert!(
+        !plugins.claim_reload(),
+        "and a third ask adds nothing: one more scan covers them all"
+    );
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::OWED);
+
+    // The owner finishes a pass and takes the one that was owed.
+    let slot = crate::Reservation::new(word);
+    assert!(slot.another_pass(), "the owed pass is taken");
+    assert_eq!(
+        word.load(Ordering::SeqCst),
+        crate::reload::RUNNING,
+        "and the slot is still held"
+    );
+
+    // An ask arriving while the owner is between passes. Not the case that
+    // deadlocked — that one needs the claim *inside* `another_pass`, between
+    // its two exchanges, which is out of reach from here — but the ordinary
+    // shape of it, and the one a refactor is most likely to break.
+    assert!(!plugins.claim_reload());
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::OWED);
+    assert!(slot.another_pass(), "it retries rather than stalling");
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::RUNNING);
+
+    // Nothing owed now, so the pass gives the slot up — and the guard, having
+    // handed it over, must not take it back on the way out.
+    assert!(!slot.another_pass());
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::IDLE);
+    assert!(plugins.claim_reload(), "a successor can take it");
+    assert_eq!(word.load(Ordering::SeqCst), crate::reload::RUNNING);
+    drop(slot);
+    assert_eq!(
+        word.load(Ordering::SeqCst),
+        crate::reload::RUNNING,
+        "the successor still holds it"
+    );
+
+    // And put it back, because the successor here is imaginary. `shutdown`
+    // waits for an in-flight reload and this host is about to be dropped —
+    // which is the design working, and would hang this test on a reload
+    // nobody is running.
+    word.store(crate::reload::IDLE, Ordering::SeqCst);
+}

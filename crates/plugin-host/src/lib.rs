@@ -593,32 +593,49 @@ impl Reservation<'_> {
     /// on has already decided it is finished — and every arrangement of two
     /// atomics has that gap somewhere.
     fn another_pass(&self) -> bool {
-        // Owed first. While this reload owns the slot the word is `RUNNING` or
-        // `OWED` and nothing else can change it, so exactly one of these two
-        // exchanges succeeds.
-        if self
-            .word
-            .compare_exchange(
-                reload::OWED,
-                reload::RUNNING,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            return true;
+        // Both outcomes are exchanges, and the loop is what makes the pair of
+        // them one decision. "While this reload owns the slot the word cannot
+        // change" is *false*: `claim_reload` turns `RUNNING` into `OWED`
+        // underneath, which is the whole point of it — and landing between
+        // these two exchanges left the first failing on `RUNNING`, the second
+        // failing on `OWED`, and the word stuck at `OWED` with no owner. Every
+        // later reload then defers to somebody who has gone, and
+        // `wait_for_any_reload` never returns.
+        //
+        // It goes round at most twice. The only write anyone else makes while
+        // this reload owns the slot is that one `RUNNING` -> `OWED`, and
+        // `claim_reload` leaves an already-`OWED` word alone, so after one
+        // turn the first exchange succeeds.
+        loop {
+            // Owed: keep the slot and take another pass.
+            if self
+                .word
+                .compare_exchange(
+                    reload::OWED,
+                    reload::RUNNING,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+            // Nothing owed: give it up. An ask arriving one instruction later
+            // finds the slot free and runs itself.
+            if self
+                .word
+                .compare_exchange(
+                    reload::RUNNING,
+                    reload::IDLE,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                self.held.store(false, Ordering::SeqCst);
+                return false;
+            }
         }
-        // Given up. An ask arriving one instruction later finds the slot free
-        // and runs itself; one that arrived an instant earlier turned the word
-        // into `OWED` and was taken above.
-        let _ = self.word.compare_exchange(
-            reload::RUNNING,
-            reload::IDLE,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
-        self.held.store(false, Ordering::SeqCst);
-        false
     }
 }
 
