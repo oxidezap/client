@@ -9,6 +9,7 @@
 mod capabilities;
 pub mod clock;
 pub mod download;
+pub mod fonts;
 pub mod identity;
 pub mod launch;
 pub mod lifecycle;
@@ -22,6 +23,7 @@ pub use capabilities::{
     video_decode_unavailable,
 };
 pub use clock::{sleep, with_timeout};
+pub use fonts::fonts;
 pub use identity::front_end_id;
 pub use launch::run;
 pub use lifecycle::watch_for_departure;
