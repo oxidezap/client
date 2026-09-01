@@ -115,9 +115,9 @@ impl MediaCache for Directory {
         let path = oxidezap_ipc::media_path(key)
             .ok_or_else(|| "no media cache to stage the recording".to_string())?;
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            make_private(dir).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&path, bytes).map_err(|e| e.to_string())
+        write_new(&path, bytes).map_err(|e| e.to_string())
     }
 
     fn discard(&self, key: &str) {
@@ -125,6 +125,80 @@ impl MediaCache for Directory {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// Make the cache directory, private from the moment it exists.
+///
+/// `create_dir_all` makes it at the umask's mode, and under a shared-group
+/// umask that is a directory another local account can write — where no name
+/// is a secret: a staged key is `u-` plus a local id built from this process's
+/// id, the millisecond and a counter, and the daemon's own keys are derived
+/// from content the account has already published. The daemon writes
+/// attachments into the same directory and serves them back as this account's
+/// media, so which of the two processes happened to create it must not decide
+/// whether it is private.
+///
+/// What this deliberately does *not* do is repair a directory that is already
+/// there. Deciding an existing one is ours — owner, mode, and then sweeping
+/// what somebody else left inside — is `oxidezap-daemon`'s `private_dir`, and
+/// the front end cannot call it: `gui` never depends on the daemon on a
+/// platform where there is a daemon process to depend on, which is the rule
+/// its manifest states. It is also the daemon's answer to give: the daemon
+/// prepares this directory at startup, before a front end has anything to
+/// stage, so the only case left here is the one where nothing has made it
+/// yet, and this makes that one `0700` instead of the umask's.
+#[cfg(not(target_family = "wasm"))]
+fn make_private(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        // The mode applies to what this creates and to nothing that is
+        // already there, which is the half above that belongs to the daemon.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        // Nothing to set: the directory is under the profile's own ACL. See
+        // docs/roadmap.md.
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Write `bytes` to a name nothing is already using, refusing what is there.
+///
+/// `std::fs::write` opens whatever the path resolves to and truncates it, and
+/// a staged key is nothing like a secret — `u-` plus a local id made of this
+/// process's id, the millisecond and a counter. Through a symlink planted
+/// under one, that is this front end filling somebody else's file as the user
+/// whose session it is. The daemon's own writers take the same care from
+/// their side of the filesystem the two share; `media::native::write_new` is
+/// where the argument for it was made.
+///
+/// The honest way to meet the name is a leftover from an earlier run whose
+/// send never happened, so the entry — the link, never its target — is
+/// unlinked once and the create tried again.
+#[cfg(not(target_family = "wasm"))]
+fn write_new(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    };
+    let mut file = match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            create()?
+        }
+        other => other?,
+    };
+    file.write_all(bytes)
 }
 
 /// What a page has already fetched, held until the frame that names it has
@@ -310,5 +384,65 @@ impl MediaCache for Fetched {
         wasm_bindgen_futures::spawn_local(async move {
             oxidezap_ipc::web::discard_media(&base, &key).await;
         });
+    }
+}
+
+/// The front end's half of the media directory's permissions. Unix only:
+/// what these set up and assert is a mode, and Windows has none — see
+/// docs/roadmap.md for the half that is still open there.
+#[cfg(all(test, unix, not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-gui-stage-{}-{:?}-{name}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The front end can be the one that creates the cache — it stages a
+    /// recording before the account has ever cached a download — and
+    /// `create_dir_all` made it at the umask's mode. Nothing on this side
+    /// ever tightened it afterwards.
+    #[test]
+    fn a_cache_this_front_end_creates_is_ours_alone() {
+        let dir = scratch("create").join("media");
+        make_private(&dir).expect("the cache is created");
+
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the cache was left reachable by other accounts on this machine"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// And the payload does not go through whatever is at the name. A staged
+    /// key is `u-` plus a local id — a process id, a millisecond and a
+    /// counter, none of them secret — so a link planted under one made this
+    /// write truncate and fill somebody else's file.
+    #[test]
+    fn staging_does_not_follow_a_planted_link() {
+        let dir = scratch("link");
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"somebody else's file").unwrap();
+        let staged = dir.join("u-audio_4242_1764000000000_0");
+        std::os::unix::fs::symlink(&victim, &staged).unwrap();
+
+        write_new(&staged, b"a voice note").expect("a leftover name is not a failure");
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"somebody else's file",
+            "the recording was written through the link"
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), b"a voice note");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
