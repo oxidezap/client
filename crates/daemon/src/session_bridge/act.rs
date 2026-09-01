@@ -335,7 +335,20 @@ impl Bridge {
                 // rather than read for the same reason: the client wrote it
                 // directly, so its bytes never counted toward the cache's own
                 // sweep and nothing else would ever remove it.
-                let Some(data) = crate::media::take(&upload) else {
+                //
+                // Off this thread, unlike a voice note, and the difference is
+                // the size: natively this is a `read` and a `remove_file` of
+                // whatever was staged, up to the protocol's whole ceiling, and
+                // a blocking read of sixty-four megabytes on a runtime worker
+                // stops far more than this loop. `unblock` is the seam that
+                // answers for both platforms — a thread pool on the desktop,
+                // and a call in a page, where the cache is a map in memory and
+                // there is neither a file to read nor anywhere to hand it.
+                let taken = {
+                    let upload = upload.clone();
+                    oxidezap_session::unblock(move || crate::media::take(&upload)).await
+                };
+                let Some(data) = taken.ok().flatten() else {
                     return CommandOutcome::Refused(format!(
                         "nothing cached under {upload}; stage it before sending"
                     ));

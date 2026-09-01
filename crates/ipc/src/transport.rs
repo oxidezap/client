@@ -301,6 +301,12 @@ pub fn media_path(key: &str) -> Option<PathBuf> {
 /// document, a clip. Not a film, which is a different design — the payload is
 /// read into the daemon's memory whole, because a partly staged file under a
 /// key a send is about to name is worse than a refused one.
+///
+/// Enforced in three places, which is not three rules: the daemon's write
+/// endpoint refuses a longer body because it must, a front end refuses a file
+/// at the chooser because that is where somebody can be told, and the one
+/// staging path every payload passes through refuses anything else because
+/// otherwise this sentence would be true of one transport and not the others.
 pub const MAX_STAGED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The prefix a front end's staged payload is filed under.

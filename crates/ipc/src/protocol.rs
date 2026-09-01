@@ -580,6 +580,16 @@ pub struct SendMedia {
     pub caption: Option<String>,
     /// The id to give the message until the server assigns a real one, as
     /// [`SendText::local_id`].
+    ///
+    /// `#[serde(default)]`, unlike [`SendAudio::local_id`] — and the
+    /// difference is that this payload is new rather than that the two want
+    /// different things. An `Option` alone does not make a key optional to
+    /// serde, so a frame that leaves the field out is malformed without this;
+    /// the daemon has always been able to make an id up for a client that
+    /// draws nothing, and there is no older reader whose expectations
+    /// widening this would break. The other one is left alone because
+    /// widening *it* is a protocol change with a changelog entry to write.
+    #[serde(default)]
     pub local_id: Option<String>,
     /// The message being replied to, when this is a reply. The same field
     /// [`SendText`] and [`SendAudio`] carry, for the same reason.
@@ -921,6 +931,22 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client that draws nothing has no local id to offer, and the daemon
+    /// makes one up for it — which it never gets the chance to do if serde
+    /// refuses the frame first. An `Option` is not an optional key.
+    #[test]
+    fn a_media_send_without_a_local_id_is_a_frame_rather_than_a_refusal() {
+        let frame = r#"{"request":"send_media","jid":"a@s.whatsapp.net","upload":"u-1","kind":"video","mime_type":"video/mp4","file_name":"clipe.mp4"}"#;
+        let parsed: ClientRequest =
+            serde_json::from_str(frame).expect("a frame without a local id");
+        let ClientRequest::SendMedia(media) = parsed else {
+            panic!("that is not a media send");
+        };
+        assert_eq!(media.local_id, None);
+        assert_eq!(media.caption, None);
+        assert_eq!(media.kind, OutgoingMedia::Video);
+    }
 
     /// One chat holds everybody's status updates, and watching one is
     /// recorded on the message rather than on that counter — so it never goes

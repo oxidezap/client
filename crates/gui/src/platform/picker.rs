@@ -134,6 +134,53 @@ pub fn mime_for_name(file_name: &str) -> &'static str {
     }
 }
 
+/// What one trip to the chooser may hold in memory at once.
+///
+/// The per-file ceiling bounds one payload; without this, nothing bounds the
+/// *selection*. A chooser hands back everything at once, so ten files just
+/// under the ceiling are two thirds of a gigabyte read and held before the
+/// first of them is staged — which on a page is the linear memory the whole
+/// interface is drawn out of, and on a desktop is still a process the person
+/// is using.
+///
+/// The same number rather than a second one, and that is the argument for it:
+/// a trip to the chooser may cost what one file may cost. Ten photos are a
+/// normal send and fit; ten films are not one act, and the files past the
+/// budget are refused by name rather than silently dropped.
+const SELECTION_BUDGET_BYTES: u64 = oxidezap_ipc::MAX_STAGED_BYTES;
+
+/// Tracks what a selection has read so far, and refuses what would not fit.
+///
+/// Held by each half of [`choose`] across its own loop, so the answer is one
+/// rule rather than two: the desktop reads files one at a time from paths and
+/// a page reads them one at a time from a `FileList`, and both ask this
+/// before they read rather than after.
+#[derive(Default)]
+struct Budget {
+    taken: u64,
+}
+
+impl Budget {
+    /// Why this file cannot join what is already read, or `None` if it can —
+    /// counting it when it can.
+    fn refuse(&mut self, file_name: &str, size: u64) -> Option<String> {
+        if let Some(refusal) = unsendable(file_name, size) {
+            return Some(refusal);
+        }
+        match self.taken.checked_add(size) {
+            Some(total) if total <= SELECTION_BUDGET_BYTES => {
+                self.taken = total;
+                None
+            }
+            _ => Some(format!(
+                "{file_name} did not fit: one trip to the file chooser can \
+                 carry {} in total. Send it on its own.",
+                in_mib(SELECTION_BUDGET_BYTES)
+            )),
+        }
+    }
+}
+
 /// Why a file of this size cannot be sent, or `None` if it can.
 ///
 /// A sentence, because it is drawn as one, and it names the file and both
@@ -161,13 +208,18 @@ pub fn unsendable(file_name: &str, size: u64) -> Option<String> {
 }
 
 /// A byte count as a person reads one.
+///
+/// MiB rather than MB, because the number above it is a power of two and the
+/// two are not the same: 64 MiB printed as "64.0 MB" understates the ceiling
+/// by three megabytes, which matters exactly when somebody is looking at this
+/// sentence to decide whether a file will fit.
 fn in_mib(bytes: u64) -> String {
     #[expect(
         clippy::cast_precision_loss,
         reason = "a figure printed to one decimal place; the exact byte count is not the point"
     )]
     let mib = bytes as f64 / (1024.0 * 1024.0);
-    format!("{mib:.1} MB")
+    format!("{mib:.1} MiB")
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -203,10 +255,14 @@ mod imp {
     }
 
     /// Read what was picked, keeping what can be sent and saying what cannot.
+    ///
+    /// One budget across the whole selection, asked before each read: four
+    /// photos are read and held together, and nothing else bounds that.
     fn read_all(paths: &[PathBuf]) -> Chosen {
         let mut chosen = Chosen::default();
+        let mut budget = super::Budget::default();
         for path in paths {
-            match read_one(path) {
+            match read_one(path, &mut budget) {
                 Ok(picked) => chosen.files.push(picked),
                 Err(refusal) => chosen.refused.push(refusal),
             }
@@ -215,7 +271,7 @@ mod imp {
     }
 
     /// One file, or the sentence to show instead.
-    fn read_one(path: &Path) -> Result<Picked, String> {
+    fn read_one(path: &Path, budget: &mut super::Budget) -> Result<Picked, String> {
         // The last component, and never the path: this becomes the name on
         // the message, and where the file was is nobody else's business.
         let file_name = path.file_name().map_or_else(
@@ -224,11 +280,12 @@ mod imp {
         );
 
         // Asked before the read, so an oversized file costs a `stat` rather
-        // than its own size in memory.
+        // than its own size in memory — and so does one the selection has no
+        // room left for.
         let size = std::fs::metadata(path)
             .map_err(|e| format!("{file_name} could not be opened: {e}"))?
             .len();
-        if let Some(refusal) = super::unsendable(&file_name, size) {
+        if let Some(refusal) = budget.refuse(&file_name, size) {
             return Err(refusal);
         }
 
@@ -269,6 +326,8 @@ mod imp {
             };
 
             let mut chosen = Chosen::default();
+            // One budget across the whole selection; see `Budget`.
+            let mut budget = super::Budget::default();
             for index in 0..files.length() {
                 let Some(file) = files.get(index) else {
                     continue;
@@ -284,7 +343,7 @@ mod imp {
                     reason = "`File.size` is a byte count: a non-negative integer in an f64"
                 )]
                 let size = file.size() as u64;
-                if let Some(refusal) = super::unsendable(&file_name, size) {
+                if let Some(refusal) = budget.refuse(&file_name, size) {
                     chosen.refused.push(refusal);
                     continue;
                 }
@@ -350,7 +409,7 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{mime_for_name, unsendable};
+    use super::{Budget, SELECTION_BUDGET_BYTES, mime_for_name, unsendable};
 
     /// The type decides what the message is sent *as*, so an extension nobody
     /// recognises has to land on the kind that promises nothing about its
@@ -383,7 +442,31 @@ mod tests {
         assert!(unsendable("clipe.mp4", ceiling).is_none());
         let refusal = unsendable("clipe.mp4", ceiling + 1).expect("past the ceiling");
         assert!(refusal.contains("clipe.mp4"), "{refusal}");
-        assert!(refusal.contains("64.0 MB"), "{refusal}");
+        assert!(refusal.contains("64.0 MiB"), "{refusal}");
+    }
+
+    /// A chooser hands back everything at once, so the *selection* needs a
+    /// bound of its own: without one, ten files just under the per-file
+    /// ceiling are read and held together. What is past the budget is refused
+    /// by name, not silently dropped.
+    #[test]
+    fn a_selection_is_bounded_as_well_as_each_file_in_it() {
+        let quarter = SELECTION_BUDGET_BYTES / 4;
+        let mut budget = Budget::default();
+        assert!(budget.refuse("um.jpg", quarter).is_none());
+        assert!(budget.refuse("dois.jpg", quarter).is_none());
+        // Half the budget is left, so the film does not fit — and it says so
+        // by name rather than being dropped.
+        let refusal = budget
+            .refuse("filme.mp4", quarter * 3)
+            .expect("past the budget");
+        assert!(refusal.contains("filme.mp4"), "{refusal}");
+        // And the photo after it still does: a refusal is about the file that
+        // did not fit, not the end of the selection.
+        assert!(budget.refuse("tres.jpg", quarter).is_none());
+        // Exactly full is not over.
+        assert!(budget.refuse("quatro.jpg", quarter).is_none());
+        assert!(budget.refuse("cinco.jpg", 1).is_some());
     }
 
     /// The other length that cannot become a message: a recipient handed an

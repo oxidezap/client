@@ -1449,7 +1449,7 @@ impl WhatsAppClient {
     pub fn send_media_message(
         &self,
         jid_str: &str,
-        mut file: OutgoingFile,
+        file: OutgoingFile,
         local_id: String,
         quoted: Option<oxidezap_core::QuotedMessage>,
     ) -> Task<()> {
@@ -1490,7 +1490,31 @@ impl WhatsAppClient {
             // decoded is still sent, and one that can costs a decode either
             // way — paying it first means a failed upload has not also been
             // paid for.
-            let shape = outgoing::Shape::of(&file);
+            //
+            // And off this thread. Shaping a picture is a decode and a
+            // scale-down of up to fifty megapixels, which is CPU-bound work
+            // measured in hundreds of millions of operations: run inline it
+            // holds a runtime worker — and in a page, the only thread there
+            // is — while every other connection and send waits. `unblock` is
+            // the seam that answers for both, a pool on the desktop and a
+            // call in a page, which is the honest answer where there is
+            // nowhere to hand work to.
+            //
+            // The file goes in and comes back out because the shaping only
+            // borrows it: moving it is free, and it is the alternative to
+            // cloning the bytes to look at them.
+            let (shape, mut file) =
+                match crate::exec::unblock(move || (outgoing::Shape::of(&file), file)).await {
+                    Ok(shaped) => shaped,
+                    Err(e) => {
+                        // The executor is going away, which is the session
+                        // shutting down. Reported rather than dropped: the bubble
+                        // is drawn and only an answer resolves it.
+                        error!("that file could not be prepared: {e}");
+                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                        return;
+                    }
+                };
 
             // Moved out rather than cloned: the upload takes the bytes and
             // everything after it wants only what the file *is*. A copy here

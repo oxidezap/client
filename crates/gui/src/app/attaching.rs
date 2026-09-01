@@ -80,7 +80,15 @@ impl WhatsAppApp {
         // The quote goes on the first file only. Attaching four photos to
         // answer one message is one answer, and quoting it four times is what
         // the recipient would see otherwise.
-        let mut quoted = self.take_reply_draft(reply, cx);
+        //
+        // And only where there is a first file: a trip that refused everything
+        // it was given sent nothing, so taking the draft there would clear the
+        // reply bar over a message the person is still composing an answer to.
+        let mut quoted = if chosen.files.is_empty() {
+            None
+        } else {
+            self.take_reply_draft(reply, cx)
+        };
         let mut drawn = false;
         for file in chosen.files {
             drawn |= self.send_attachment(jid, file, quoted.take(), cx);

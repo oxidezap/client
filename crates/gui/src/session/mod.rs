@@ -759,6 +759,41 @@ impl Session {
         // unique per send.
         let upload = oxidezap_ipc::staged_key(&sanitize(&local_id));
         let request = request(upload.clone(), local_id.clone());
+        // The ceiling, once, where every staged payload passes rather than in
+        // each of the four caches. Only one of those enforced it — the web
+        // bridge's `PUT`, which has to, because it reads the body into the
+        // process holding the account — so the same recording that a page
+        // could not stage went out from a desktop, and the sentence in
+        // `MAX_STAGED_BYTES` was true of one transport.
+        //
+        // A backstop rather than the check somebody sees: a file is refused at
+        // the chooser, by name and before it is read, and a voice note reaches
+        // this at about a megabyte per ten minutes. What it is here for is the
+        // path that grows a payload nobody measured.
+        let size = payload.len() as u64;
+        if size > oxidezap_ipc::MAX_STAGED_BYTES {
+            // Reserved and failed rather than dropped: the caller draws its
+            // bubble after this returns, and the failure travels the events
+            // channel, so it lands on a message that exists by then. Nothing
+            // is staged and no place is claimed in the outbox — there is no
+            // frame for anything to queue behind.
+            let id = self.reserve(Awaiting::Send {
+                chat_jid: jid.to_string(),
+                local_id,
+                staged: None,
+            });
+            fail_reserved(
+                &self.pending,
+                &self.events,
+                &self.media,
+                id,
+                format!(
+                    "{what} is {size} bytes, past the {} that can be staged",
+                    oxidezap_ipc::MAX_STAGED_BYTES
+                ),
+            );
+            return;
+        }
         // Reserved before the payload is staged and sent after it lands. The
         // id is taken in the order the person acted in, which a reservation
         // made later would not be; the *frame* waits, because the daemon
