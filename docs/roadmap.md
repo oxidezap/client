@@ -19,12 +19,11 @@
 - **`WhatsAppApp` still owns all state**, though it is now split across
   `app/{events,recording,calls_ctl,media_ctl}.rs` rather than one file. The
   guides want per-feature entities; that is a bigger change than moving code.
-- **Two large files outside the GUI**: `crates/session/src/whatsapp/mod.rs` and
-  `crates/chat-store/src/store.rs`, both a few thousand lines — `wc -l` them
-  rather than trusting a figure here, since both have grown since this was
-  written. The calls came out of the first one and the
-  video plane never went in, so what is left is the event pump, hydration and
-  the paged reads — three things rather than one file.
+- ~~**Two large files outside the GUI**~~ — done. `whatsapp/mod.rs` is now
+  `whatsapp/{media,history,paging,lanes,convert,tests}.rs` beside a `mod.rs`
+  holding the event pump, and `chat-store`'s `store.rs` is a `store/` split by
+  the event kind each function materializes. Both were moves: the bodies did
+  not change, which is what made them reviewable at that size.
 - **The session still runs on the window's own thread.** Two of the three
   things that wanted a dedicated worker are in place: `exec::sleep` arms its
   timer on a worker global as readily as on a window, and `store/web.rs` asks

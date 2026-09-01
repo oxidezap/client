@@ -853,7 +853,7 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   through wasm-bindgen's object table. A snapshot of a logged-in session
   showed 1,528 of them: 12 MiB of database beside 7.6 MiB of linear memory,
   under 32 MiB of V8-compiled module. So "the wasm heap" is not where the
-  store's memory is, the budgets in `media/web.rs` and `session/web.rs` do not
+  store's memory is, the budgets in `session/attach.rs` do not
   bound it, and it grows with history rather than with what is on screen.
   Another argument for OPFS in a worker, and a larger one than durability.
 - **A frame may not cost what the conversation costs.** The conversation pane

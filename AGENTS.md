@@ -105,12 +105,29 @@ which is why they are here and the inventories are not.
   above them — framing, requests, the protocol — is written once, and the module
   headers in both say so. This is the rule for transports only: a capability
   crate owns its own split, which is why `audio/src/web/`, `video/src/web/` and
-  `session/src/exec/` are where they are and not under ipc or daemon.
+  `session/src/exec/` are where they are and not under ipc or daemon. There are
+  about sixteen such split modules now, not the three named here — `find crates
+  -name web.rs` is the list, and the point of naming any is the rule, not the
+  inventory.
+- **A platform split is a module, not a `#[cfg]` per item.** One function the
+  caller names, two implementations behind it, and no `cfg` at the call. The
+  inner module is called `imp` — one word that compiles on both targets, where
+  `native::save(..)` would need a `#[cfg]` at every call site and so put back
+  exactly what the module removes. Small answers stay an inline `mod imp` pair
+  in the one file; a half earns its own file once it grows submodules or
+  outgrows the file. **`#[cfg_attr(path)] mod platform;` does not work when a
+  half has submodules** — rustfmt resolves a `#[path]` module's children against
+  the wrong directory and `cargo fmt --check` fails with "failed to resolve
+  mod". Use the `#[cfg] mod native; #[cfg] mod web;` pair there and say why;
+  `daemon/src/plugins/mod.rs` is the worked example.
 - **A page has no threads, and several std/tokio APIs compile for it and fail at
   run time** — `std::thread::spawn`, `tokio::time`, `spawn_blocking`. The
-  session's `exec/` module is the seam that answers them; go through it rather
-  than naming a clock or a pool. What decides where work goes is what the work
-  *is*, not where the code lives.
+  `oxidezap-platform` crate is the seam that answers them — it sits below
+  everything precisely so `plugin-host`, which must not depend on `session`, can
+  reach it too; that rule used to name the session's `exec/` and the tree had
+  quietly forked three copies of one browser timer because `plugin-host` could
+  not obey it. Go through it rather than naming a clock or a pool. What decides
+  where work goes is what the work *is*, not where the code lives.
 - **A browser API never gets a view into wasm memory.** The module is built with
   `--shared-memory`, so the specs refuse a shared `ArrayBufferView`: copy before
   crossing out. This cost three outages, so the spelling is now banned rather

@@ -279,6 +279,15 @@ mod imp {
         let revoke = Closure::once(move || {
             let _ = web_sys::Url::revoke_object_url(&url);
         });
+        // The declared exception to the timer ban in /clippy.toml. That rule is
+        // about a *wait* — something a future is parked on — and exists because
+        // three copies of one were written. This is a fire-and-forget cleanup
+        // nothing awaits, so routing it through `oxidezap_platform::sleep`
+        // would mean holding a task open for a minute to do nothing.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "not a wait: a one-shot cleanup callback with no future behind it"
+        )]
         if window
             .set_timeout_with_callback_and_timeout_and_arguments_0(
                 revoke.as_ref().unchecked_ref(),

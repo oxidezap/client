@@ -35,6 +35,20 @@ disallowed-methods = [
     { path = "web_sys::AudioBuffer::copy_from_channel_with_start_in_channel", reason = "shared view: use copy_from_channel_with_f32_array_and_start_in_channel" },
     { path = "web_sys::RtcDataChannel::send_with_u8_array", reason = "shared view: copy with js_sys::Uint8Array::from and use send_with_array_buffer" },
     { path = "web_sys::WebSocket::send_with_u8_array", reason = "shared view: copy with js_sys::Uint8Array::from and use send_with_array_buffer" },
+    # A wait is armed in one place. These are the spelling of a hand-rolled
+    # browser timer, and the tree carried *three* copies of one -- the session's
+    # `exec`, the plugin host's `sched`, and the window's `clock`, two of them
+    # byte-identical -- because the rule that said to share one named a module
+    # only some of them could depend on. `oxidezap-platform` is now the seam and
+    # sits below everything, so the rule is obeyable; this is what keeps a
+    # fourth copy from being written. Use `oxidezap_platform::{sleep,
+    # try_sleep, with_timeout}`.
+    #
+    # The exception is a fire-and-forget callback that nothing awaits, which is
+    # not a wait at all: `gui/src/platform/download.rs` revokes an object URL a
+    # minute after handing it over, and carries a scoped allow saying so.
+    { path = "web_sys::Window::set_timeout_with_callback_and_timeout_and_arguments_0", reason = "a wait is armed in one place: use oxidezap_platform::{sleep, try_sleep, with_timeout}" },
+    { path = "web_sys::WorkerGlobalScope::set_timeout_with_callback_and_timeout_and_arguments_0", reason = "a wait is armed in one place: use oxidezap_platform::{sleep, try_sleep, with_timeout}" },
 ]
 
 # 64-bit atomic *types*: 32-bit targets (Xtensa/ESP32) have no native AtomicU64/

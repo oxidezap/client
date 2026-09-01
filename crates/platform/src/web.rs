@@ -74,6 +74,15 @@ impl Timers {
             .map(Self::Worker)
     }
 
+    /// The one place a browser timer is armed.
+    ///
+    /// `/clippy.toml` bans this spelling everywhere else — three hand-rolled
+    /// copies of it existed before this crate did — so the rule has to be
+    /// lifted exactly here, in the seam that exists to be the only caller.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this is the one place the ban points callers at"
+    )]
     fn arm(&self, fire: &Closure<dyn FnMut()>, millis: i32) -> Result<i32, wasm_bindgen::JsValue> {
         match self {
             Self::Window(window) => window.set_timeout_with_callback_and_timeout_and_arguments_0(

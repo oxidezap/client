@@ -314,7 +314,7 @@ rather than repeated. What it does not have is the thread per direction, and
 does not need one: `VideoDecoder` is already asynchronous, so the work the
 thread was there to move off the caller happens off it anyway. This was once
 reachable only attached to an `oxidezapd`, back when that was the only place
-calls happened; `video/call_unsupported.rs` takes a `CallVideoFrame` and builds
+calls happened; `video/call_web.rs` takes a `CallVideoFrame` and builds
 a `webcodecs::Decoder` for it, so a page holding its own session decodes call
 video too.
 

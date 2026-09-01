@@ -9,3 +9,8 @@ target/
 # it — so it is a local answer rather than a shared one, and committing one
 # would point CI's driver at a binary that is not there.
 crates/daemon/webdriver.json
+
+# Agent worktrees created by Claude Code. Live `git worktree` checkouts of
+# this same repository, removed when the agent that owns one finishes; there
+# is nothing in here a commit should carry.
+.claude/

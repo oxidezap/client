@@ -10,6 +10,7 @@ use wasm_bindgen::prelude::Closure;
 
 use crate::EncodedFrame;
 use crate::VideoQuality;
+use std::time::Duration;
 
 /// H.264 Constrained Baseline, Level 3.1 — the profile a WhatsApp video call
 /// carries, and the one [`VideoQuality::checked`] bounds its numbers by.
@@ -616,7 +617,7 @@ async fn open_device(
     }
 
     let opened = wasm_bindgen_futures::JsFuture::from(asked);
-    let deadline = after(window, PERMISSION_CEILING_MS);
+    let deadline = oxidezap_platform::sleep(Duration::from_millis(PERMISSION_CEILING_MS as u64));
     let Some(opened) = futures_lite::future::or(async move { Some(opened.await) }, async move {
         deadline.await;
         None
@@ -640,29 +641,6 @@ async fn open_device(
 /// failure. Short enough that a prompt left on screen does not hold a call's
 /// microphone open indefinitely.
 const PERMISSION_CEILING_MS: i32 = 30_000;
-
-/// Resolve after `ms`, through the only clock this target has.
-///
-/// `tokio::time` links here and traps on the first await; the session says
-/// the same thing in `exec::sleep`, which this crate has no route to — it
-/// depends on nothing above `oxidezap-video`.
-async fn after(window: &web_sys::Window, ms: i32) {
-    let (tx, rx) = async_channel::bounded::<()>(1);
-    let fire = Closure::once_into_js(move || {
-        let _ = tx.try_send(());
-    });
-    if window
-        .set_timeout_with_callback_and_timeout_and_arguments_0(fire.unchecked_ref(), ms)
-        .is_err()
-    {
-        // No timer to arm means no ceiling to enforce; waiting forever on a
-        // channel nothing will send to is what leaves the other side of the
-        // race the only one that can finish, which is the behaviour this had
-        // before the ceiling existed.
-        warn!("no timer to bound the camera permission prompt with");
-    }
-    let _ = rx.recv().await;
-}
 
 /// A `<video>` playing the stream, so a `VideoFrame` can be taken from it.
 ///
@@ -751,7 +729,7 @@ async fn attach(
                 .map(|e| describe(&e))
         },
         async {
-            after(window, PLAYBACK_GRACE_MS).await;
+            oxidezap_platform::sleep(Duration::from_millis(PLAYBACK_GRACE_MS as u64)).await;
             None
         },
     )

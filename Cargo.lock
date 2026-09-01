@@ -6383,6 +6383,7 @@ dependencies = [
  "log",
  "nokhwa",
  "openh264",
+ "oxidezap-platform",
  "portable-atomic",
  "tokio",
  "wacore",

@@ -5,6 +5,13 @@ The crate map, the theme, and how the interface responds to viewport size.
 ## Crates
 
 - **oxidezap-core**: domain types (chats, messages, calls, UI events). No UI, no I/O.
+- **oxidezap-platform**: where a task runs and how it waits — spawning, sleeping,
+  racing a deadline, and whether a task may cross threads. Four things, and only
+  four. Deliberately the bottom of the workspace: the session's `exec/` was the
+  seam and the rule said to go through it, but `plugin-host` sits *beside* the
+  session and cannot depend on it, so it grew its own copy of the same
+  `setTimeout` and the window grew a third. A rule only one caller can obey is
+  not a rule.
 - **oxidezap-audio**: capture, playback, Opus encoding, waveforms. cpal; no UI.
   On the web the sound card and the codec are the browser's: playback is real
   (`decodeAudioData` takes exactly the bytes the daemon sends), so is
@@ -29,11 +36,13 @@ The crate map, the theme, and how the interface responds to viewport size.
   converted. No UI, and no decode — decoding belongs to whoever draws.
 - **oxidezap-session**: the WhatsApp connection: events, sends, store hydration.
   Knows nothing about how anything is drawn, and nothing about IPC either —
-  the daemon translates requests onto its methods. Three of its modules are
+  the daemon translates requests onto its methods. Four of its modules are
   platform splits rather than logic — `net/` is the transport and HTTP client
-  a page has to supply, `exec/` is where its tasks run, and `video/` is the
-  camera — and the calls are a fourth, in `whatsapp/calls/`. Above them the
-  session names no platform.
+  a page has to supply, `exec/` is where its tasks run, `store/` is where the
+  database lives, and `relay/` is a call's transport — and the calls are a
+  fifth, in `whatsapp/calls/`. Above them the session names no platform.
+  Not `video/`: that is the frame plane both targets share, and the camera
+  split it used to be named for lives in the `video` *crate*.
 - **oxidezap-ipc**: the wire protocol between the daemon and its front ends,
   plus the blocking client end of the transport (`Endpoint`). No runtime: a
   front end needs one thread to read and a lock to serialize writes, and the
@@ -78,8 +87,10 @@ The crate map, the theme, and how the interface responds to viewport size.
   page's own loop where there is not — `sched/` is that split and it is two
   files, because a wasm call is synchronous either way and the loop above it
   is written once. Where a plugin's approvals and its own settings are kept
-  is the other split (`store/`): files in a private directory, or the
-  origin's `localStorage`.
+  is the second split (`store/`, behind a `Backing` trait that earns its keep
+  on three impls): files in a private directory, or the origin's
+  `localStorage`. Finding the modules on disk is the third (`loader/`), and it
+  is native-only — a page installs into OPFS instead.
   What is loaded is a *generation* rather than the host itself, because
   everything in the daemon holds the host: a connection, the session bridge
   and the tab listener each keep an `Arc<Plugins>` for their own lifetime, so
