@@ -20,10 +20,18 @@ mod platform;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod http;
 
-/// The orphan sweep, called by the daemon at startup as well as from the
-/// repair below. Native only: a page has no directory to walk.
+/// The orphan sweep. Reached through [`prepare_cache_dir`] rather than
+/// called directly — preparing the directory is what every writer and the
+/// startup do, and one walk answers both questions. Native only: a page has
+/// no directory to walk.
 #[cfg(not(target_family = "wasm"))]
 pub use platform::reclaim_abandoned_writes;
+
+/// Make the cache directory this account's alone, before anything writes into
+/// it. Called at startup and by every writer; native only, for the reason the
+/// sweep above is.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use platform::prepare_dir as prepare_cache_dir;
 pub use platform::{cache_usage, claim, has, take};
 /// Read without removing, where the front end is this process. See `web.rs`.
 #[cfg(target_family = "wasm")]
