@@ -598,6 +598,32 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   every path out that is not a camera held withdraws it again, and the
   refusal's own teardown queues on the call's video lane behind the enable it
   is answering.
+- **The outbound video path accounts for every hop, because all five of its
+  failures are silence.** A call whose peer draws nothing can have stopped at
+  the capture tick (which declines for three separate reasons), at an encoder
+  that configures and then emits nothing, at the queue from the encoder to the
+  session, at the queue from the session to the media plane, or nowhere at all
+  — the frames went out and the peer could not decode them. Every one of those
+  read identically in a production log: not one line, with the camera
+  reporting itself open at 1280x720 the whole time, exactly as the relay read
+  before #62 and #70.
+  So each hop says its first — the first frame submitted, the first chunk out
+  of the encoder, the first frame reaching the session, the first handed to
+  the plane, the first drawn in the self-view — and the camera's close reports
+  the totals. Firsts and totals, never a line per frame: twenty a second is
+  not a log. The three tick refusals explain themselves once each and are
+  counted after that, for the same reason.
+  What the shape buys is a *bisection*. "First chunk" absent means the encoder
+  never answered. Present, with "handed to the plane" absent, means the
+  session threw it away. Both present and a peer with no picture means the
+  fault is downstream of everything this tree owns. Guessing between those
+  cost three changes on the relay before the marker was added, which is the
+  argument for adding it here before the fourth.
+  The self-view is on the same path and fails separately: `NoSubscriber` is
+  the ordinary state of a daemon with no window *and* the whole explanation
+  for a call that draws the peer and leaves this side blank. It is a front end
+  that did not subscribe, not a camera that failed, and now it says so.
+
 - **The browser's camera reaches WebCodecs through a `<video>`, and that
   element has to be in the document.** A hidden element plays the stream and
   every tick takes a `VideoFrame` from it. `MediaStreamTrackProcessor` would
