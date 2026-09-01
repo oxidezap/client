@@ -1862,7 +1862,7 @@ impl WhatsAppClient {
     /// Publish this call's ending, once.
     ///
     /// The claim lives *here* rather than at the call sites, because there
-    /// are five of them — the watcher, and four exits in the accept path —
+    /// are four of them — the watcher, and three exits in the accept path —
     /// and a guard that has to be remembered at each is one that will be
     /// forgotten at the next. A peer hanging up mid-acceptance reaches two of
     /// them for one hangup, which is the duplicate this exists to stop.

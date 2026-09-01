@@ -197,8 +197,8 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   taken it before the watcher runs. Either way one of them looks like the
   owner and the other announces regardless. So `announce_ending` is a claim
   that is true exactly once per call id and the first caller wins. It lives
-  inside `notify_call_ended` rather than at the call sites: there are five of
-  them — the watcher and four exits in the accept path — and a peer hanging up
+  inside `notify_call_ended` rather than at the call sites: there are four of
+  them — the watcher and three exits in the accept path — and a peer hanging up
   mid-acceptance reaches two for one hangup, so a guard that has to be
   remembered at each is one that will be forgotten at the next. The record is
   bounded against *concurrent teardowns* rather than time, since both
