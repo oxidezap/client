@@ -301,9 +301,15 @@ impl Inbound {
         // And separately whether the *peer* did. STUN comes back from the
         // relay itself, so it says only that the path to the relay works;
         // media is the half that says the call has two ends.
-        if matches!(classify_relay_packet(&packet), RelayPacketKind::Rtp)
-            && !self.seen.media.replace(true)
+        //
+        // The flag is read before the classifier runs, not after: this is the
+        // callback every inbound packet arrives on, fifty times a second for
+        // the length of a call, and the answer stops changing after the first
+        // one. Written the other way round it classifies for a question
+        // already answered.
+        if !self.seen.media.get() && matches!(classify_relay_packet(&packet), RelayPacketKind::Rtp)
         {
+            self.seen.media.set(true);
             debug!("voip: the relay channel received the peer's first media packet");
         }
         let pending = self.dropped.get();

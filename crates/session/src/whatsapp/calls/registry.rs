@@ -154,11 +154,21 @@ pub(in crate::whatsapp) enum Cancelled {
 /// Everything one lock covers.
 /// How many recent endings are remembered for the duplicate check.
 ///
-/// Small on purpose: the second announcement of an ending follows the first
-/// within the same teardown, so nothing older than the last few calls can
-/// still be a duplicate. This is a guard against saying a thing twice, not a
-/// history.
-const ANNOUNCED_ENDINGS: usize = 32;
+/// What has to fit is not a span of time but the calls that can be *tearing
+/// down at once*: both announcements of one ending come out of the same
+/// teardown, microseconds apart, so a claim is only evicted too early if this
+/// many other calls end in between. An account places one call at a time, so
+/// the real figure is one, and this is three orders of magnitude of headroom
+/// bought for a few short strings.
+///
+/// Not an invariant, and worth saying so rather than implying otherwise: a
+/// duplicate delayed past this many other endings — a `<terminate>` the
+/// server retransmits much later, say — would be announced a second time.
+/// The alternative is retention tied to the call's lifecycle, which needs a
+/// "no announcer can still fire" signal that does not exist: the watcher task
+/// and the signalling arms have no common end. A record that is never
+/// evicted, in a client that runs for days, is the worse trade.
+const ANNOUNCED_ENDINGS: usize = 256;
 
 #[derive(Default)]
 struct Calls {
@@ -372,10 +382,9 @@ impl CallRegistry {
     /// and the other announcing anyway.
     ///
     /// So ownership is claimed rather than inferred, and the first claim
-    /// wins whichever arrives first. Bounded because it must be: a call id is
-    /// finished forever once its ending is out, and the duplicate always
-    /// arrives moments behind the first, so only the most recent endings can
-    /// possibly be asked about again.
+    /// wins whichever arrives first. Bounded because it must be — see
+    /// [`ANNOUNCED_ENDINGS`] for what the bound is measured against, and for
+    /// the case it does not cover.
     pub(in crate::whatsapp) fn announce_ending(&self, call_id: &str) -> bool {
         let mut calls = self.calls.lock().expect("call registry poisoned");
         if calls.announced.contains(call_id) {
@@ -831,7 +840,7 @@ impl WhatsAppClient {
                             call_id, e
                         );
                     }
-                    Self::notify_call_ended(&ui_sender, &call_id).await;
+                    Self::notify_call_ended(&calls, &ui_sender, &call_id).await;
                     return;
                 }
             };
@@ -879,7 +888,7 @@ impl WhatsAppClient {
                         call_id, e
                     );
                 }
-                Self::notify_call_ended(&ui_sender, &call_id).await;
+                Self::notify_call_ended(&calls, &ui_sender, &call_id).await;
                 return;
             }
 
@@ -986,7 +995,7 @@ impl WhatsAppClient {
                     if let Some(local) = local {
                         local.stop().await;
                     }
-                    Self::notify_call_ended(&ui_sender, &call_id).await;
+                    Self::notify_call_ended(&calls, &ui_sender, &call_id).await;
                 }
             }
         });
@@ -1846,15 +1855,21 @@ impl WhatsAppClient {
             if let Some(camera) = calls.ended(&call_id) {
                 camera.stop().await;
             }
-            // Claimed rather than assumed: the peer's `<terminate>` may have
-            // been handled first and said it already.
-            if calls.announce_ending(&call_id) {
-                Self::notify_call_ended(&ui_sender, &call_id).await;
-            }
+            Self::notify_call_ended(&calls, &ui_sender, &call_id).await;
         });
     }
 
-    async fn notify_call_ended(ui_sender: &UiEventSender, call_id: &str) {
+    /// Publish this call's ending, once.
+    ///
+    /// The claim lives *here* rather than at the call sites, because there
+    /// are five of them — the watcher, and four exits in the accept path —
+    /// and a guard that has to be remembered at each is one that will be
+    /// forgotten at the next. A peer hanging up mid-acceptance reaches two of
+    /// them for one hangup, which is the duplicate this exists to stop.
+    async fn notify_call_ended(calls: &CallRegistry, ui_sender: &UiEventSender, call_id: &str) {
+        if !calls.announce_ending(call_id) {
+            return;
+        }
         if let Some(tx) = ui_sender.lock().await.as_ref() {
             let _ = tx.send(UiEvent::CallEnded(call_id.to_string()));
         }

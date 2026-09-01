@@ -196,9 +196,13 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   by the time the terminate is handled, and in the other the terminate has
   taken it before the watcher runs. Either way one of them looks like the
   owner and the other announces regardless. So `announce_ending` is a claim
-  that is true exactly once per call id and the first caller wins, and it is
-  bounded — a duplicate always follows within the same teardown, so only the
-  most recent endings can still be asked about. `CallEndedElsewhere` is not
+  that is true exactly once per call id and the first caller wins. It lives
+  inside `notify_call_ended` rather than at the call sites: there are five of
+  them — the watcher and four exits in the accept path — and a peer hanging up
+  mid-acceptance reaches two for one hangup, so a guard that has to be
+  remembered at each is one that will be forgotten at the next. The record is
+  bounded against *concurrent teardowns* rather than time, since both
+  announcements of one ending come out of the same one. `CallEndedElsewhere` is not
   that duplicate and stays unconditional: it says *where* the call went, a
   second sentence rather than the same one.
 - **A call is held by whoever holds the session.** `oxidezap-session` is what
