@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use wacore::time::Instant;
 
 use super::audio::VideoAudio;
-use super::streaming::StreamingVideoDecoder;
+use super::platform::StreamingVideoDecoder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoPlayerState {
