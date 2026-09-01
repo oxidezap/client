@@ -2339,7 +2339,7 @@ impl WhatsAppApp {
     pub fn reset_and_pair_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.app_state = AppState::Loading;
 
-        let dying = self.client.take().inspect(Session::forget_session);
+        let dying = self.client.take().inspect(|client| client.forget_session());
         // Before the connection goes, because dropping it waits for its
         // reader to leave and a reader parked for room in this queue is
         // waiting on the thread standing here.
