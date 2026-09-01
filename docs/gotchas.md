@@ -215,6 +215,16 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   dimensions, out of the decode the thumbnail was already paying for. What
   cannot be decoded goes out as it came, because bytes nothing here can read
   are bytes nothing here can improve.
+  Two smaller things fall out of having read the bytes at all. The message
+  states the type the *payload* is rather than the one it was picked as —
+  those are two different claims, and only one of them was read out of the
+  file, so a JPEG that arrives named `.png` no longer goes out saying so. And
+  transparency is *composited* rather than dropped: JPEG has no alpha channel,
+  and `to_rgb8` keeps whatever colour sits under a transparent pixel, which is
+  nobody's decision — an encoder may leave the last drawn colour or garbage,
+  and a logo drawn on nothing then arrives on a field of whatever that was. It
+  goes onto white, because a picture drawn with transparency is nearly always
+  drawn for a light ground.
   The thumbnail is not a nicety: WhatsApp draws it while the file downloads,
   and this tree draws it too — the store keeps what was sent and hydration
   reads a sent message back through the same `media_of` an arriving one goes

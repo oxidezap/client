@@ -166,17 +166,28 @@ pub(super) struct Shape {
 pub(super) fn prepare(mut file: OutgoingFile) -> (Shape, OutgoingFile) {
     match file.kind {
         OutgoingMedia::Image => {
-            let (shape, transcoded) = still(&file.data);
-            if let Some(jpeg) = transcoded {
-                info!(
-                    "re-encoded {} ({} bytes) as image/jpeg ({} bytes): a photo message \
-                     carries a photo format",
-                    file.mime_type,
-                    file.data.len(),
-                    jpeg.len()
-                );
-                file.data = jpeg;
-                file.mime_type = PHOTO_MIME.to_string();
+            let (shape, photo) = still(&file.data);
+            if let Some(Photo { data, mime }) = photo {
+                if let Some(jpeg) = data {
+                    info!(
+                        "re-encoded {} ({} bytes) as {mime} ({} bytes): a photo message \
+                         carries a photo format",
+                        file.mime_type,
+                        file.data.len(),
+                        jpeg.len()
+                    );
+                    file.data = jpeg;
+                } else if file.mime_type != mime {
+                    // Not a re-encode — a correction. What a file is called
+                    // and what it is are two different claims, and only one
+                    // of them was read out of the bytes.
+                    info!(
+                        "sending a {mime} that was picked as {}: the message says what the \
+                         bytes are",
+                        file.mime_type
+                    );
+                }
+                file.mime_type = mime.to_string();
             }
             (shape, file)
         }
@@ -215,12 +226,25 @@ fn draws_as_a_photo(format: image::ImageFormat) -> bool {
     matches!(format, image::ImageFormat::Jpeg | image::ImageFormat::Png)
 }
 
+/// What a picture turned out to be, once its bytes were read.
+///
+/// Absent where they could not be read at all, which is the one case where
+/// this side has nothing to say the picker did not already say.
+struct Photo {
+    /// The bytes to send, where they are not the ones handed in.
+    data: Option<Vec<u8>>,
+    /// What the payload *is*, which is not always what it was called: a file
+    /// is named by whoever saved it and typed by a table or a browser, and
+    /// neither of those read the bytes. This did.
+    mime: &'static str,
+}
+
 /// A picture: its dimensions from the header, its thumbnail from the pixels,
 /// and the bytes to send if the ones in hand will not do.
 ///
 /// The re-encode is free of any decode this was not going to pay anyway: a
 /// thumbnail needs the pixels, so the picture is decoded once and used twice.
-fn still(data: &[u8]) -> (Shape, Option<Vec<u8>>) {
+fn still(data: &[u8]) -> (Shape, Option<Photo>) {
     let reader = match image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format() {
         Ok(reader) => reader,
         Err(e) => {
@@ -280,21 +304,36 @@ fn still(data: &[u8]) -> (Shape, Option<Vec<u8>>) {
     let transcoded = (!draws_as_a_photo(format))
         .then(|| as_jpeg(&decoded, PHOTO_QUALITY))
         .flatten();
+    // The type the *bytes* are, either way. A re-encode is a JPEG and an
+    // untouched picture is whatever the header said it was — which is not
+    // necessarily what it was picked as, and the message is read by a client
+    // that has only what we tell it.
+    let mime = match &transcoded {
+        Some(_) => PHOTO_MIME,
+        None => format.to_mime_type(),
+    };
 
-    (Shape { thumbnail, ..shape }, transcoded)
+    (
+        Shape { thumbnail, ..shape },
+        Some(Photo {
+            data: transcoded,
+            mime,
+        }),
+    )
 }
 
 /// Encode a decoded picture as JPEG, or say why not.
 ///
 /// The one place that turns pixels into the format a photo message carries,
 /// so the thumbnail and the payload cannot disagree about how it is done —
-/// including the part that is easy to get wrong: JPEG has no alpha channel,
-/// and an RGBA image handed to the encoder without being told to drop it is
-/// an error rather than a wrong picture. Transparency therefore lands on
-/// black, which is what dropping alpha means and what WhatsApp does with a
-/// transparent PNG too.
+/// including the part that is easy to get wrong, which this got wrong first:
+/// JPEG has no alpha channel, and *dropping* one is not the same as removing
+/// it. `to_rgb8` keeps whatever colour is stored underneath a transparent
+/// pixel, and what is stored there is nobody's decision — an encoder may
+/// leave the last drawn colour, or garbage, and a logo drawn on nothing then
+/// arrives on a field of whatever that was.
 fn as_jpeg(image: &image::DynamicImage, quality: u8) -> Option<Vec<u8>> {
-    let rgb = image.to_rgb8();
+    let rgb = flattened(image);
     let mut bytes = Vec::new();
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality);
     match encoder.encode_image(&rgb) {
@@ -320,6 +359,51 @@ fn jpeg_thumbnail(image: &image::DynamicImage) -> Option<Vec<u8>> {
     let bytes = as_jpeg(&small, THUMBNAIL_QUALITY)?;
     debug!("thumbnail: {}x{} in {} bytes", width, height, bytes.len());
     Some(bytes)
+}
+
+/// A picture with no alpha channel, composited if it had one.
+///
+/// White, and it is a choice rather than a derivation: something has to be
+/// behind a transparent pixel once the channel is gone, and the alternative
+/// is not another colour — it is whatever the file happened to store there,
+/// which is the bug this exists to answer. White because a picture drawn with
+/// transparency is nearly always drawn for a light ground: a logo, a diagram,
+/// a screenshot with rounded corners. On black those go dark on dark.
+///
+/// Untouched where there is no alpha to composite, which is every photograph
+/// — so the common case pays a colour-type check and nothing else.
+fn flattened(image: &image::DynamicImage) -> image::RgbImage {
+    if !image.color().has_alpha() {
+        return image.to_rgb8();
+    }
+
+    /// What transparency is composited onto. See above.
+    const GROUND: u8 = 0xff;
+
+    let rgba = image.to_rgba8();
+    let mut flat = image::RgbImage::new(rgba.width(), rgba.height());
+    for (to, from) in flat.pixels_mut().zip(rgba.pixels()) {
+        let [red, green, blue, alpha] = from.0;
+        // `src * a + ground * (1 - a)`, in eighths of a byte rather than in
+        // floats: the rounding is invisible at this depth and the loop runs
+        // once per pixel of a picture that may be fifty megapixels.
+        let over = |channel: u8| {
+            let blended =
+                u32::from(channel) * u32::from(alpha) + u32::from(GROUND) * u32::from(255 - alpha);
+            // Rounded division by 255, which `+ 127 / 255` is not quite and
+            // this is: the exact form used by every compositor.
+            let rounded = blended + 128;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a weighted average of two bytes is a byte"
+            )]
+            {
+                ((rounded + (rounded >> 8)) >> 8) as u8
+            }
+        };
+        to.0 = [over(red), over(green), over(blue)];
+    }
+    flat
 }
 
 /// The largest box within `edge` that keeps the aspect ratio.
@@ -652,6 +736,63 @@ mod tests {
         // And nothing re-encoded it: a document's bytes are the point.
         assert_eq!(sent.data, png(64, 64));
         assert_eq!(sent.mime_type, "image/png");
+    }
+
+    /// What a file is called and what it is are two different claims, and only
+    /// one of them was read out of the bytes. A JPEG picked as `image/png` —
+    /// a renamed file, a browser guessing from an extension — went out saying
+    /// `image/png`, which is the same kind of lie about a payload that this
+    /// whole module exists to stop telling.
+    #[test]
+    fn the_message_says_what_the_bytes_are_rather_than_what_they_were_called() {
+        let jpeg = encoded(64, 48, image::ImageFormat::Jpeg);
+        let (_, sent) = prepared("image/png", jpeg.clone());
+        assert_eq!(sent.mime_type, "image/jpeg");
+        // Corrected, not re-encoded: a JPEG is already a format the other
+        // side draws, so the bytes are the ones that came in.
+        assert_eq!(sent.data, jpeg);
+    }
+
+    /// Transparency has to land somewhere once the alpha channel is gone, and
+    /// "wherever the encoder left it" is not somewhere. A pixel that is fully
+    /// transparent over red must come out white rather than red.
+    #[test]
+    fn transparency_is_composited_rather_than_dropped() {
+        let mut source = image::RgbaImage::new(2, 1);
+        // Invisible, and red underneath — which is what `to_rgb8` would have
+        // handed the encoder.
+        source.put_pixel(0, 0, image::Rgba([255, 0, 0, 0]));
+        source.put_pixel(1, 0, image::Rgba([0, 0, 255, 255]));
+
+        let flat = flattened(&image::DynamicImage::ImageRgba8(source));
+        assert_eq!(
+            flat.get_pixel(0, 0).0,
+            [255, 255, 255],
+            "the transparent one"
+        );
+        assert_eq!(flat.get_pixel(1, 0).0, [0, 0, 255], "and the opaque one");
+    }
+
+    /// Half-transparent is half-composited, and the arithmetic has to round
+    /// rather than drift: an eighth-of-a-byte blend that truncates turns a
+    /// flat grey wash into banding.
+    #[test]
+    fn a_half_transparent_pixel_lands_halfway() {
+        let mut source = image::RgbaImage::new(1, 1);
+        source.put_pixel(0, 0, image::Rgba([0, 0, 0, 128]));
+        let flat = flattened(&image::DynamicImage::ImageRgba8(source));
+        let [red, green, blue] = flat.get_pixel(0, 0).0;
+        // Black at just over half alpha over white: near the midpoint, and
+        // the same on every channel.
+        assert_eq!([red, green, blue], [127, 127, 127]);
+    }
+
+    /// A picture with no alpha is not walked pixel by pixel to learn that.
+    #[test]
+    fn a_picture_without_transparency_is_left_alone() {
+        let source = image::RgbImage::from_fn(4, 4, |x, _| image::Rgb([x as u8, 7, 9]));
+        let flat = flattened(&image::DynamicImage::ImageRgb8(source.clone()));
+        assert_eq!(flat, source);
     }
 
     /// The one that used to be a panic: JPEG has no alpha channel, and the
