@@ -65,6 +65,7 @@ use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 use whatsapp_rust::voip::RelayEndpointParams;
 use whatsapp_rust::wacore::voip::demux::{RelayPacketKind, classify_relay_packet};
+use whatsapp_rust::wacore::voip::rtp::RTP_PAYLOAD_TYPE_H264;
 use whatsapp_rust::wacore::voip::transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };
@@ -248,6 +249,11 @@ struct BrowserRelayChannel {
     congested: std::cell::Cell<bool>,
     /// Counted for that second line: how much media the ceiling has dropped.
     outbound_dropped: std::cell::Cell<u32>,
+    /// Where the outbound video stream is between access-unit boundaries.
+    ///
+    /// The ceiling may only be consulted at a boundary, so the verdict taken
+    /// at one has to survive until the next. See [`Outbound`].
+    au: std::cell::Cell<Outbound>,
     /// Whether anything has gone out yet; see [`RelayTransport::send`].
     sent_any: std::cell::Cell<bool>,
     /// What has come *in*, kept as two answers rather than one.
@@ -423,6 +429,83 @@ impl Inbound {
     }
 }
 
+/// What to do with an outbound packet, and with the rest of its access unit.
+///
+/// `Send`/`Drop` are the verdict for the packet in hand; the *stored* value is
+/// the commitment for the unit it belongs to, which is why this is a state and
+/// not a boolean answer computed per packet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outbound {
+    /// Not inside a video access unit: the next video packet decides afresh.
+    Between,
+    /// Inside one that is being sent; finish it whatever the ceiling says.
+    Send,
+    /// Inside one that was refused at its first packet; refuse the remainder,
+    /// since a fragment of an access unit is worth nothing to a decoder and
+    /// costs the peer the bytes anyway.
+    Drop,
+}
+
+impl BrowserRelayChannel {
+    /// Whether this packet goes out, holding the verdict across an access unit.
+    ///
+    /// Control traffic is never dropped: STUN keeps the relay binding alive
+    /// and RTCP carries the peer's keyframe requests, both are a handful of
+    /// bytes against a frame's thousands, and losing either while the queue is
+    /// deep is how a congested call becomes a dead one.
+    ///
+    /// Audio is decided per packet, because one packet *is* one frame there —
+    /// the unit logic below would be wrong for it, since Opus sets the marker
+    /// bit by its own rules rather than at frame ends.
+    fn au_verdict(&self, data: &[u8]) -> Outbound {
+        if matches!(
+            classify_relay_packet(data),
+            RelayPacketKind::Stun | RelayPacketKind::Rtcp
+        ) {
+            return Outbound::Send;
+        }
+        let over_ceiling = self.channel.buffered_amount() > OUTBOUND_CEILING;
+        // The payload type and the marker bit share RTP's second byte: the top
+        // bit is the marker, the low seven are the type. A packet too short to
+        // have one is not RTP and is treated as media by the ceiling alone.
+        let Some(second) = data.get(1) else {
+            return if over_ceiling {
+                Outbound::Drop
+            } else {
+                Outbound::Send
+            };
+        };
+        if second & 0x7f != RTP_PAYLOAD_TYPE_H264 {
+            return if over_ceiling {
+                Outbound::Drop
+            } else {
+                Outbound::Send
+            };
+        }
+        // The marker ends an access unit, so this packet is the last of one.
+        let ends_unit = second & 0x80 != 0;
+        let verdict = match self.au.get() {
+            // Mid-unit: the commitment already made, whatever the queue has
+            // done since.
+            committed @ (Outbound::Send | Outbound::Drop) => committed,
+            // A boundary, and the only place the ceiling gets a vote.
+            Outbound::Between => {
+                if over_ceiling {
+                    Outbound::Drop
+                } else {
+                    Outbound::Send
+                }
+            }
+        };
+        self.au.set(if ends_unit {
+            Outbound::Between
+        } else {
+            verdict
+        });
+        verdict
+    }
+}
+
 #[async_trait(?Send)]
 impl RelayTransport for BrowserRelayChannel {
     async fn send(&self, data: Bytes) -> Result<()> {
@@ -440,12 +523,24 @@ impl RelayTransport for BrowserRelayChannel {
         // against a frame's thousands, and losing either while the queue is
         // deep is how a congested call becomes a dead one. The same rule the
         // inbound queue holds, in the other direction.
-        if self.channel.buffered_amount() > OUTBOUND_CEILING
-            && !matches!(
-                classify_relay_packet(&data),
-                RelayPacketKind::Stun | RelayPacketKind::Rtcp
-            )
-        {
+        // Whole access units, never a piece of one. The ceiling used to be
+        // consulted per packet, which is right for audio and catastrophic for
+        // video: one Opus packet is one frame, but one H.264 access unit is
+        // tens of fragments, and a 720p IDR is large enough to cross the
+        // ceiling *while it is being written*. What reached the peer then was
+        // a keyframe with a hole in it — undecodable, and so was every frame
+        // that referenced it. Worse, this returns `Ok`, so the library
+        // believed all of it went out: its own per-unit shedding never ran,
+        // no gate closed, and nothing asked the encoder to try again. That is
+        // the difference between a call that loses a picture for a moment and
+        // one that never shows a picture at all.
+        //
+        // So the decision is taken once, at an access unit's first packet,
+        // and holds for the rest of it. A unit already begun is finished
+        // whatever the ceiling now says — the bytes are spent either way, and
+        // spending the remainder is what makes them worth anything.
+        let verdict = self.au_verdict(&data);
+        if verdict == Outbound::Drop {
             self.outbound_dropped
                 .set(self.outbound_dropped.get().saturating_add(1));
             // Said once per run of congestion rather than per packet: at a
@@ -758,6 +853,7 @@ async fn connect_peer_connection(
     wired.release();
     Ok((
         std::sync::Arc::new(BrowserRelayChannel {
+            au: std::cell::Cell::new(Outbound::Between),
             connection: connection.release(),
             channel,
             _wiring: Wiring {

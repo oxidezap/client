@@ -800,6 +800,11 @@ impl WhatsAppClient {
                     // unit alone references frames no decoder starting now
                     // has ever seen.
                     if calls.camera_became_drawable(call_id) {
+                        // And tell the peer, which nothing did for a call that
+                        // offered video from the start: the offer advertises a
+                        // capability, and the receiving side opens its pane off
+                        // the announcement. See `announce_our_video`.
+                        calls.announce_our_video(call_id).await;
                         let _ = ui_tx.send(UiEvent::CallVideoChanged {
                             call_id: call_id.clone(),
                             stream: VideoStream::Local,

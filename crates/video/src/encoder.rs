@@ -8,6 +8,8 @@
 //! that joins the stream late or loses a reference recovers without asking.
 
 use anyhow::{Context as _, Result};
+
+use crate::KEYFRAME_SECONDS;
 use openh264::encoder::{
     BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Level, Profile,
     RateControlMode, SpsPpsStrategy, UsageType,
@@ -101,11 +103,6 @@ impl H264Encoder {
         }))
     }
 }
-
-/// How often a keyframe goes out regardless of what anyone asked for. Long
-/// enough not to dominate the bitrate, short enough that a peer whose
-/// recovery request was lost is not left staring at a frozen frame.
-const KEYFRAME_SECONDS: u32 = 3;
 
 #[cfg(test)]
 mod tests {
