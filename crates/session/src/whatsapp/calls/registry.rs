@@ -152,8 +152,21 @@ pub(in crate::whatsapp) enum Cancelled {
 }
 
 /// Everything one lock covers.
+/// How many recent endings are remembered for the duplicate check.
+///
+/// Small on purpose: the second announcement of an ending follows the first
+/// within the same teardown, so nothing older than the last few calls can
+/// still be a duplicate. This is a guard against saying a thing twice, not a
+/// history.
+const ANNOUNCED_ENDINGS: usize = 32;
+
 #[derive(Default)]
 struct Calls {
+    /// Endings already published, so the same one is never published twice.
+    /// See [`CallRegistry::announce_ending`].
+    announced: HashSet<String>,
+    /// The order they were claimed in, so the set can be bounded.
+    announced_order: std::collections::VecDeque<String>,
     /// Ringing offers by call id, consumed by accept/decline.
     pending: HashMap<String, Arc<WaIncomingCall>>,
     /// Media-live calls by call id.
@@ -328,15 +341,7 @@ impl CallRegistry {
     /// an accept still opening its microphone would file a live handle behind
     /// a card every window had already cleared, leaving audible call with
     /// nothing to end it.
-    /// Answers whether the call had a live handle, which is the same question
-    /// as "will its watcher announce this ending". `watch_call_end` is
-    /// spawned for every handle and publishes `CallEnded` when `wait_ended`
-    /// resolves — which the `hangup_local` below is what makes happen — so a
-    /// caller that announces the ending itself as well says it twice. That is
-    /// what a peer's `<terminate>` did: two `CallEnded` for one hangup, both
-    /// visible in a production log. Only the no-handle case is the caller's
-    /// to announce, because there is no watcher to do it.
-    pub(in crate::whatsapp) fn ended_remotely(&self, call_id: &str) -> bool {
+    pub(in crate::whatsapp) fn ended_remotely(&self, call_id: &str) {
         let mut calls = self.calls.lock().expect("call registry poisoned");
         calls.pending.remove(call_id);
         if let Some(handle) = calls.active.remove(call_id) {
@@ -347,12 +352,43 @@ impl CallRegistry {
             drop(crate::exec::spawn(
                 async move { handle.hangup_local().await },
             ));
-            return true;
+            return;
         }
         if calls.in_flight.contains(call_id) {
             calls.cancelled.insert(call_id.to_string(), Ending::Remote);
         }
-        false
+    }
+
+    /// True exactly once per call id: the caller may announce this ending.
+    ///
+    /// A call's ending reaches two places that both want to publish it — the
+    /// signalling arm handling the peer's `<terminate>`, and the watcher
+    /// parked on `wait_ended` — and in a production log both did, twice per
+    /// hangup. Which of them is "the owner" cannot be read off the registry:
+    /// media can end before the stanza arrives, so by the time the terminate
+    /// is handled the watcher may already have removed the entry and
+    /// announced, and by the time the watcher runs the terminate may already
+    /// have taken it. Either order leaves one of them looking like the owner
+    /// and the other announcing anyway.
+    ///
+    /// So ownership is claimed rather than inferred, and the first claim
+    /// wins whichever arrives first. Bounded because it must be: a call id is
+    /// finished forever once its ending is out, and the duplicate always
+    /// arrives moments behind the first, so only the most recent endings can
+    /// possibly be asked about again.
+    pub(in crate::whatsapp) fn announce_ending(&self, call_id: &str) -> bool {
+        let mut calls = self.calls.lock().expect("call registry poisoned");
+        if calls.announced.contains(call_id) {
+            return false;
+        }
+        calls.announced.insert(call_id.to_string());
+        calls.announced_order.push_back(call_id.to_string());
+        while calls.announced_order.len() > ANNOUNCED_ENDINGS {
+            if let Some(oldest) = calls.announced_order.pop_front() {
+                calls.announced.remove(&oldest);
+            }
+        }
+        true
     }
 
     /// Ask for a live call without taking it.
@@ -1810,7 +1846,11 @@ impl WhatsAppClient {
             if let Some(camera) = calls.ended(&call_id) {
                 camera.stop().await;
             }
-            Self::notify_call_ended(&ui_sender, &call_id).await;
+            // Claimed rather than assumed: the peer's `<terminate>` may have
+            // been handled first and said it already.
+            if calls.announce_ending(&call_id) {
+                Self::notify_call_ended(&ui_sender, &call_id).await;
+            }
         });
     }
 
@@ -1964,6 +2004,51 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    /// One ending, one announcement, whichever side reaches it first.
+    ///
+    /// The peer's `<terminate>` arm and the watcher parked on `wait_ended`
+    /// both want to publish `CallEnded`, and in a production log both did —
+    /// two "Call ... ended" lines for every hangup. Neither can tell from the
+    /// registry whether the other has been there: media can end before the
+    /// stanza arrives or after it, so each order leaves one of them looking
+    /// like the owner.
+    #[test]
+    fn an_ending_is_announced_once_whichever_side_claims_it_first() {
+        let calls = CallRegistry::default();
+
+        assert!(
+            calls.announce_ending("call-1"),
+            "the first claim owns the announcement"
+        );
+        assert!(
+            !calls.announce_ending("call-1"),
+            "the second is the same ending said twice"
+        );
+        assert!(
+            calls.announce_ending("call-2"),
+            "a different call is a different ending"
+        );
+    }
+
+    /// The claim is bounded, because a call id is finished forever once its
+    /// ending is out and a duplicate always follows within the same teardown.
+    /// What must not happen is a session that ends calls all day growing a
+    /// set nothing ever removes from.
+    #[test]
+    fn the_announced_endings_do_not_grow_without_bound() {
+        let calls = CallRegistry::default();
+        for n in 0..(ANNOUNCED_ENDINGS * 3) {
+            assert!(calls.announce_ending(&format!("call-{n}")));
+        }
+        let held = calls
+            .calls
+            .lock()
+            .expect("call registry poisoned")
+            .announced
+            .len();
+        assert_eq!(held, ANNOUNCED_ENDINGS, "the record is capped");
     }
 
     /// The window between an offer leaving `pending` and a handle reaching

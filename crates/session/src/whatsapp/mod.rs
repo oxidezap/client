@@ -907,21 +907,23 @@ impl WhatsAppClient {
                 }
                 CallAction::Reject { call_id, .. } => {
                     info!("Call {} rejected by peer", call_id);
-                    // Only when nothing else will say it. A call with a live
-                    // handle has a watcher that publishes `CallEnded` when the
-                    // hangup this triggers resolves; announcing it here too is
-                    // the same ending twice.
-                    if !calls.ended_remotely(call_id) {
+                    calls.ended_remotely(call_id);
+                    // Claimed, not assumed. The watcher parked on this call's
+                    // `wait_ended` publishes the same event when the hangup
+                    // above resolves, and either of the two can get there
+                    // first; whichever does is the one that says it.
+                    if calls.announce_ending(call_id) {
                         let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                     }
                 }
                 CallAction::Terminate { call_id, .. } => {
                     info!("Call {} terminated by peer", call_id);
-                    // Only when nothing else will say it. A call with a live
-                    // handle has a watcher that publishes `CallEnded` when the
-                    // hangup this triggers resolves; announcing it here too is
-                    // the same ending twice.
-                    if !calls.ended_remotely(call_id) {
+                    calls.ended_remotely(call_id);
+                    // Claimed, not assumed. The watcher parked on this call's
+                    // `wait_ended` publishes the same event when the hangup
+                    // above resolves, and either of the two can get there
+                    // first; whichever does is the one that says it.
+                    if calls.announce_ending(call_id) {
                         let _ = ui_tx.send(UiEvent::CallEnded(call_id.clone()));
                     }
                 }
@@ -933,9 +935,9 @@ impl WhatsAppClient {
                     missed.call_id,
                     missed.from.observe()
                 );
-                // See the terminate arm: the watcher owns the announcement
-                // wherever there is a handle to watch.
-                if !calls.ended_remotely(&missed.call_id) {
+                calls.ended_remotely(&missed.call_id);
+                // See the terminate arm.
+                if calls.announce_ending(&missed.call_id) {
                     let _ = ui_tx.send(UiEvent::CallEnded(missed.call_id.clone()));
                 }
             }
