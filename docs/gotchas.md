@@ -1261,7 +1261,14 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   `session/names.rs` is that choice made once, in one order, for live
   messages, chat presence and hydration alike; `Chat::update_participant` is
   the one place a name enters a conversation and writes it onto the rows that
-  were waiting for it, and `Chat::author_name` is what every surface asks. A
+  were waiting for it, and `Chat::author_name` is what every surface asks —
+  the bar above a reply included, which is a surface and not a special case.
+  It had been left to the conversation alone: the participant map only holds
+  whoever has a row on the loaded page, so a reply to a message that was
+  never loaded read "Unknown contact" over a group whose bubbles from that
+  same person, named from the book, read fine. `hydrate_quoted_authors` asks
+  the book for the quote's author the way a bubble's is asked for, and leaves
+  this account alone so `Chat::quoted_author` can still say "You". A
   full history load is what re-reads the address book, so it is also what
   clears the book's memo. It decides the *key* as well as the label:
   `ChatIdentity::canonical_jid` is what a person is filed under, so a

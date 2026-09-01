@@ -38,6 +38,20 @@ pub fn fallback_chat_name(jid: &Jid) -> String {
     }
 }
 
+/// What to call whoever is at `sender` when nobody has a name for them.
+///
+/// The number where the address carries one, the generic label otherwise,
+/// and the string itself when it is not an address at all. Every surface
+/// that draws an unnamed author goes through this — a bubble, the bar above
+/// a reply — so the same stranger cannot be a number in one and "Unknown
+/// contact" in the other.
+pub fn fallback_sender_name(sender: &str) -> std::borrow::Cow<'_, str> {
+    match sender.parse::<Jid>() {
+        Ok(jid) => std::borrow::Cow::Owned(fallback_chat_name(&jid)),
+        Err(_) => std::borrow::Cow::Borrowed(sender),
+    }
+}
+
 /// The address every status update is addressed to.
 pub const STATUS_BROADCAST_JID: &str = "status@broadcast";
 
@@ -286,8 +300,10 @@ impl Chat {
             if original.is_from_me {
                 return Some("You".to_string());
             }
-            if let Some(name) = &original.sender_name {
-                return Some(name.clone());
+            // The same question a bubble asks, so the two cannot answer
+            // differently about the same row.
+            if let Some(name) = self.author_name(original) {
+                return Some(name.to_string());
             }
         }
         // No participant on the envelope and no loaded original: nobody here
@@ -303,12 +319,10 @@ impl Chat {
             Some(self.name.clone())
         } else {
             // Better than "Message": a number is at least *someone*, and the
-            // real name replaces it as soon as a push name arrives.
-            quoted
-                .sender
-                .parse::<Jid>()
-                .ok()
-                .map(|jid| fallback_chat_name(&jid))
+            // real name replaces it as soon as a push name arrives. Drawn
+            // from the same helper an unnamed bubble uses, so a stranger
+            // reads the same way in both.
+            Some(fallback_sender_name(&quoted.sender).into_owned())
         }
     }
 
@@ -394,6 +408,59 @@ mod tests {
         });
         // Assigned the way hydration assigns a page.
         chat.messages = vec![original, reply];
+
+        chat.name_quoted_authors();
+        assert_eq!(chat.messages[1].quoted.as_ref().unwrap().sender_name, "Ana");
+    }
+
+    /// The quote bar and the bubble are the same question about the same
+    /// person, so they take the same two answers: what this chat calls them,
+    /// and — when nobody does — the label an unnamed author is drawn with.
+    /// The bar used to know only the name stamped on the row, so a reply to
+    /// somebody the participant map had named still read as a stranger.
+    #[test]
+    fn a_quote_names_its_author_the_way_a_bubble_does() {
+        let mut chat = Chat::new("120363000000000001@g.us".to_string());
+        chat.is_group = true;
+
+        let original = ChatMessage::new_incoming("m1".into(), "a@lid".into(), "ping".into());
+        let mut reply = ChatMessage::new_incoming("m2".into(), "b@lid".into(), "pong".into());
+        reply.quoted = Some(crate::QuotedMessage {
+            message_id: "m1".into(),
+            sender: "a@lid".into(),
+            sender_name: String::new(),
+            preview: "ping".into(),
+            kind: None,
+        });
+        chat.messages = vec![original, reply];
+
+        // Nobody has named them yet: both surfaces say so the same way.
+        chat.name_quoted_authors();
+        assert_eq!(
+            chat.messages[1].quoted.as_ref().unwrap().sender_name,
+            chat.messages[0].author_label(),
+        );
+
+        // The map names them, and the bar takes it — the row itself carries
+        // no name, which is exactly the case the bar used to miss.
+        let mut chat = Chat::new("120363000000000001@g.us".to_string());
+        chat.is_group = true;
+        chat.messages = vec![
+            ChatMessage::new_incoming("m1".into(), "a@lid".into(), "ping".into()),
+            {
+                let mut reply =
+                    ChatMessage::new_incoming("m2".into(), "b@lid".into(), "pong".into());
+                reply.quoted = Some(crate::QuotedMessage {
+                    message_id: "m1".into(),
+                    sender: "a@lid".into(),
+                    sender_name: String::new(),
+                    preview: "ping".into(),
+                    kind: None,
+                });
+                reply
+            },
+        ];
+        chat.participants.insert("a@lid".into(), "Ana".into());
 
         chat.name_quoted_authors();
         assert_eq!(chat.messages[1].quoted.as_ref().unwrap().sender_name, "Ana");

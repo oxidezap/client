@@ -1882,7 +1882,9 @@ impl WhatsAppApp {
                     .map(str::to_owned)
                     .or_else(|| Some(chat.name.clone()))
             })
-            .unwrap_or_else(|| "Unknown contact".to_string())
+            // No chat to ask: the row still knows who wrote it, and answers
+            // the way its own bubble would.
+            .unwrap_or_else(|| message.author_label().into_owned())
     }
 
     pub fn selected_chat_data(&self) -> Option<&Arc<Chat>> {
