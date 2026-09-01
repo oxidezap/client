@@ -599,9 +599,11 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   refusal's own teardown queues on the call's video lane behind the enable it
   is answering.
 - **The browser's camera reaches WebCodecs through a `<video>`, and that
-  element has to be in the document.** There is no way to hand a
-  `MediaStreamTrack` to a `VideoEncoder` directly, so a hidden element plays
-  the stream and every tick takes a `VideoFrame` from it. It was written
+  element has to be in the document.** A hidden element plays the stream and
+  every tick takes a `VideoFrame` from it. `MediaStreamTrackProcessor` would
+  read frames off the track with no element at all and is the nicer shape, but
+  it is Chromium's and neither Firefox nor Safari has it — so the element path
+  has to exist regardless, and one path is better than two. It was written
   *detached*, on the reasoning that an element with no parent still decodes
   and an added one would draw the self-view twice. Production disagreed, on
   every camera a call ever opened: `play()` rejected with "The play() request
@@ -622,8 +624,12 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   because playback is a root: one merely dropped goes on being a sink on the
   camera's track for the life of the page. Six refused attempts in one call is
   six of them. Paused, unwired and removed, in that order, it holds nothing —
-  which is `release_element`, and it runs on the failure path as well as on
-  teardown.
+  which is `release_element`. Every exit reaches it: `attach` on its own
+  refusal, `Held` at the end of the call, and `ElementGuard` in between, since
+  the element is inserted and playing three fallible steps before `Held`
+  exists. That guard is the same shape as the camera's and the encoder's
+  beside it, and for the same reason — the leak is not on the path anyone
+  looks at.
 - **What a call turned out to be is said by the side that opened the
   device.** The kind is drawn from the offer, because that is all anyone
   knows when the call is placed or answered — and a camera that will not open
