@@ -84,9 +84,11 @@ pub trait MediaCache: Send + Sync {
     /// file that is not there yet.
     ///
     /// So the continuation belongs to the implementation rather than to the
-    /// caller. Where staging is synchronous this runs `then` before returning
-    /// and the ordering is exactly what it always was; where it is not, the
-    /// caller's frame is sent from the upload's own completion.
+    /// caller: the caller's frame is sent from the staging's own completion,
+    /// wherever and whenever that happens. The default runs `then` before
+    /// returning, which is right for an implementation that has nowhere else
+    /// to do the work — every one in this tree has somewhere, and each says
+    /// where.
     fn stage_then(&self, key: &str, bytes: Vec<u8>, then: StageThen) {
         then(self.stage(key, &bytes));
     }
@@ -120,10 +122,117 @@ impl MediaCache for Directory {
         std::fs::write(&path, bytes).map_err(|e| e.to_string())
     }
 
+    /// The write, off whichever thread asked for it.
+    ///
+    /// The default runs [`stage`](Self::stage) inline, and the thread that
+    /// asks for one here is the window's own: a send is started from the frame
+    /// the person pressed. A staged payload is up to
+    /// [`oxidezap_ipc::MAX_STAGED_BYTES`], so that default is sixty four
+    /// megabytes of `write` — plus a `create_dir_all` and whatever the disk is
+    /// doing — inside a frame, and the window draws nothing at all while it
+    /// runs. A page never had this problem: staging there is a `fetch` that
+    /// could not be awaited inline anyway, which is why only this half needed
+    /// saying.
+    ///
+    /// Not through `oxidezap_platform::spawn`, which is where the tree's rule
+    /// points and is the wrong tool exactly here: its desktop half is
+    /// `tokio::spawn`, and the window deliberately owns no Tokio runtime to
+    /// spawn onto — see the note beside `smol` in this crate's manifest. What
+    /// this needs is not a task but somewhere blocking is allowed, which on a
+    /// page is nowhere and on a desktop is a thread.
+    ///
+    /// One thread rather than one per send, and rather than a pool, so that
+    /// what one thread asks for happens in the order it asked: a
+    /// [`discard`](Self::discard) posted after a stage lands after it, and two
+    /// attachments are written one after the other rather than both at once
+    /// through one disk. What that does
+    /// *not* settle is two threads racing over one key — the reader thread
+    /// discards an abandoned send while the window thread stages it — which is
+    /// the race the web half keeps a map of in-flight uploads for and this
+    /// half has never had an answer to. It is no worse than it was: those two
+    /// calls raced on the same key before this, on their own threads.
+    ///
+    /// If there is nowhere to hand the work, the write happens here: a stalled
+    /// frame is what this cost before, and it is better than a send that never
+    /// goes out.
+    ///
+    /// The cost of the hand-off is the window closing on a queued write: the
+    /// worker is not drained at shutdown, so a send begun in the last moments
+    /// of a session can end with nothing staged and no frame delivered, where
+    /// the inline write had finished before the call returned. It is a
+    /// message the daemon never hears about rather than a broken one, and the
+    /// alternative was every attachment stalling the frame it was sent from.
+    fn stage_then(&self, key: &str, bytes: Vec<u8>, then: StageThen) {
+        let key = key.to_string();
+        writes::off_thread(Box::new(move || then(Directory.stage(&key, &bytes))));
+    }
+
+    /// Ordered behind whatever is already queued, and off the caller's thread
+    /// for the reason [`stage_then`](Self::stage_then) gives — the removal is
+    /// smaller than the write, but it is the same disk and the same frame.
     fn discard(&self, key: &str) {
-        if let Some(path) = oxidezap_ipc::media_path(key) {
-            let _ = std::fs::remove_file(path);
+        let key = key.to_string();
+        writes::off_thread(Box::new(move || {
+            if let Some(path) = oxidezap_ipc::media_path(&key) {
+                let _ = std::fs::remove_file(path);
+            }
+        }));
+    }
+}
+
+/// Somewhere blocking is allowed, for the one process that has one.
+///
+/// A single worker rather than a pool, because what it is for is ordering as
+/// much as it is for latency: the media cache is a directory, two of these
+/// naming the same key are a write and a delete, and the daemon reads whatever
+/// is there when it handles the frame.
+#[cfg(not(target_family = "wasm"))]
+mod writes {
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{Sender, channel};
+
+    /// One filesystem errand, made somewhere it may take its time.
+    type Errand = Box<dyn FnOnce() + Send + 'static>;
+
+    /// The worker's queue, or `None` where the thread could not be started.
+    ///
+    /// Started on the first errand rather than with the process: a front end
+    /// that never attaches anything never starts it, and every one of these
+    /// arrives on the thread that owns the window.
+    static WORKER: OnceLock<Option<Sender<Errand>>> = OnceLock::new();
+
+    /// Hand the errand over, or run it here if there is nobody to hand it to.
+    ///
+    /// Unbounded, and bounded in practice by what a person can ask for: one
+    /// errand per attachment, per voice note and per abandoned send. A bounded
+    /// queue would put the wait back on the thread this exists to keep free.
+    pub(super) fn off_thread(errand: Errand) {
+        let Some(worker) = WORKER.get_or_init(start) else {
+            errand();
+            return;
+        };
+        if let Err(unsent) = worker.send(errand) {
+            // The worker is gone — it only ends when this sender does, so this
+            // is a panic in an errand. Whatever this one is, it still has to
+            // happen: the continuation of a staged send is what releases that
+            // send's place in the outbox.
+            log::error!("the media cache's worker is gone; writing on the caller's thread");
+            (unsent.0)();
         }
+    }
+
+    fn start() -> Option<Sender<Errand>> {
+        let (tx, rx) = channel::<Errand>();
+        std::thread::Builder::new()
+            .name("oxidezap-media".to_string())
+            .spawn(move || {
+                for errand in rx {
+                    errand();
+                }
+            })
+            .map_err(|e| log::error!("no thread to write the media cache on: {e}"))
+            .ok()?;
+        Some(tx)
     }
 }
 
@@ -310,5 +419,52 @@ impl MediaCache for Fetched {
         wasm_bindgen_futures::spawn_local(async move {
             oxidezap_ipc::web::discard_media(&base, &key).await;
         });
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    use super::{Directory, MediaCache};
+
+    /// A staged payload is up to `MAX_STAGED_BYTES` and the thread that asks
+    /// for one is the thread drawing the window, so the write must not happen
+    /// under it — a frame that stalls for sixty four megabytes of `write` is a
+    /// window that draws nothing for as long as the disk takes.
+    ///
+    /// Asserted on *where* the continuation runs rather than on how long
+    /// anything took: the claim is that a frame is not the place for this, not
+    /// that a write is fast, and a timing assertion would be a different and
+    /// much worse test of it.
+    ///
+    /// The key is deliberately one `media_path` refuses, so this touches no
+    /// media directory belonging to whoever is running the suite. The answer
+    /// travels the same way whichever it is.
+    #[test]
+    fn a_staged_payload_is_written_off_the_calling_thread() {
+        let (tx, rx) = channel();
+        let here = std::thread::current().id();
+        Directory.stage_then(
+            "not a usable key/",
+            vec![1, 2, 3],
+            Box::new(move |staged| {
+                let _ = tx.send((std::thread::current().id(), staged));
+            }),
+        );
+        let (there, staged) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the continuation of a staged send has to run");
+        assert_ne!(
+            here, there,
+            "the payload was written on the thread that asked for it"
+        );
+        // And the continuation still carries the answer, which is what the
+        // send's place in the outbox is released on.
+        assert!(
+            staged.is_err(),
+            "a key the cache refuses cannot be staged: {staged:?}"
+        );
     }
 }

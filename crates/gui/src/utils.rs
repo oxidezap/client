@@ -146,6 +146,18 @@ const MAX_NAME_CHARS: usize = 64;
 /// Counted in `chars`, never in bytes: a name is somebody's, most of the
 /// world's are not ASCII, and cutting a UTF-8 sequence in half panics.
 /// Truncated here rather than only in the component, because the string is
+/// also measured, compared and put in tooltips.
+#[must_use]
+pub fn capped_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let head: String = chars.by_ref().take(MAX_NAME_CHARS).collect();
+    if chars.next().is_none() {
+        head
+    } else {
+        format!("{head}\u{2026}")
+    }
+}
+
 /// A byte count as a person reads one.
 ///
 /// MiB rather than MB, because every ceiling this is used on is a power of
@@ -163,18 +175,6 @@ pub fn format_size(bytes: u64) -> String {
     )]
     let mib = bytes as f64 / (1024.0 * 1024.0);
     format!("{mib:.1} MiB")
-}
-
-/// also measured, compared and put in tooltips.
-#[must_use]
-pub fn capped_name(name: &str) -> String {
-    let mut chars = name.chars();
-    let head: String = chars.by_ref().take(MAX_NAME_CHARS).collect();
-    if chars.next().is_none() {
-        head
-    } else {
-        format!("{head}\u{2026}")
-    }
 }
 
 /// Whether `haystack` contains `needle`, ignoring case, without allocating.
