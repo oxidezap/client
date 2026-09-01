@@ -19,7 +19,7 @@ path = "src/main.rs"
 [dependencies]
 # The video's own audio track: `mp4` demuxes the container and `symphonia`
 # decodes the AAC out of it. Both were desktop-only while the only caller was
-# `video/streaming.rs`, which needs openh264 and so was a desktop path from
+# `video/native.rs`, which needs openh264 and so was a desktop path from
 # end to end. That is the day the note beside them predicted: a page demuxes
 # for `web_sys::VideoDecoder` now, and the container was never the problem
 # there — the codec was. So they are shared, and they are real bytes in the

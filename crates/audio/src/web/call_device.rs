@@ -50,6 +50,7 @@ use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 
 use crate::{CALL_FRAME_SAMPLES, CALL_RATE};
+use std::time::Duration;
 
 /// How many samples a WebAudio callback carries at a time.
 ///
@@ -407,7 +408,7 @@ async fn open_microphone() -> Result<web_sys::MediaStream> {
 
     let opened = wasm_bindgen_futures::JsFuture::from(asked);
     let Some(opened) = futures_lite::future::or(async move { Some(opened.await) }, async {
-        after(PERMISSION_CEILING_MS).await;
+        oxidezap_platform::sleep(Duration::from_millis(PERMISSION_CEILING_MS as u64)).await;
         None
     })
     .await
@@ -429,30 +430,6 @@ async fn open_microphone() -> Result<web_sys::MediaStream> {
 /// enough that a prompt left on screen does not hold a call open with nothing
 /// happening at either end.
 const PERMISSION_CEILING_MS: i32 = 30_000;
-
-/// Resolve after `ms`, through the only clock this target has.
-///
-/// `tokio::time` links here and traps on the first await; the session says
-/// the same thing in `exec::sleep`, which this crate has no route to.
-async fn after(ms: i32) {
-    let (tx, rx) = async_channel::bounded::<()>(1);
-    let fire = Closure::once_into_js(move || {
-        let _ = tx.try_send(());
-    });
-    let armed = web_sys::window().and_then(|window| {
-        window
-            .set_timeout_with_callback_and_timeout_and_arguments_0(fire.unchecked_ref(), ms)
-            .ok()
-    });
-    if armed.is_none() {
-        // No timer to arm means no ceiling to enforce; waiting forever on a
-        // channel nothing will send to leaves the other side of the race the
-        // only one that can finish, which is how this behaved before the
-        // ceiling existed.
-        warn!("no timer to bound the microphone permission prompt with");
-    }
-    let _ = rx.recv().await;
-}
 
 /// The page's `navigator.mediaDevices`, from a window or a worker.
 fn media_devices() -> Result<web_sys::MediaDevices> {

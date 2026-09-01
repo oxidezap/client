@@ -35,6 +35,10 @@ openh264 = "0.9"
 tokio = { workspace = true, features = ["rt"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
+# The one place a browser timer is armed; `/clippy.toml` bans the spelling
+# everywhere else. This crate used to hand-roll its own because the seam was
+# the session's `exec`, which sits above it -- `oxidezap-platform` is below.
+oxidezap-platform = { workspace = true }
 # Not called from here; see the same note in `oxidezap-audio`.
 getrandom = { workspace = true }
 # Racing the camera permission prompt against a ceiling; see `after`.

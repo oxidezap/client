@@ -32,7 +32,12 @@ use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
 
-use crate::error::{ChatStoreError, Result, db_err};
+// `db_err` has one caller here and it is behind `search`, so an unfeatured
+// build would warn on the import. Every CI job runs `--all-features`, which is
+// why nothing caught it.
+#[cfg(feature = "search")]
+use crate::error::db_err;
+use crate::error::{ChatStoreError, Result};
 use crate::materialize::{extract_text, message_kind};
 use crate::types::StoreChange;
 
