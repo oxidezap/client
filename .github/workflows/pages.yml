@@ -34,6 +34,10 @@
 # replaces the whole site and there is no way to put a preview beside it. That
 # is a repository setting: Settings → Pages → Build and deployment → Deploy
 # from a branch → `gh-pages` / `(root)`.
+#
+# The branch is where the writing is decided; it is not where the *serving*
+# is. The publisher pushes and then sees the push through to what Pages
+# actually serves — see `--settle` and the note over `publish`.
 name: Pages
 
 on:
@@ -163,6 +167,20 @@ jobs:
   # it read, retried against the new one. Two publishes racing cost a
   # retry; none of them cost a lost update, and nothing is ever cancelled for
   # having waited.
+  #
+  # What that leaves — and what `--settle` below is about — is that a write to
+  # the branch is not a deployment. Every push starts a run of GitHub's own
+  # `pages build and deployment`, which is not in this repository and refuses
+  # to create a deployment while another is in flight ("Deployment request
+  # failed ... due to in progress deployment"). Two writers landing seconds
+  # apart is the ordinary case here — a pull request closing takes its preview
+  # down while the merge that closed it publishes the site — so the second one
+  # is refused, and the branch is then carrying a tree nothing will ever
+  # serve. Re-running that run does not put it right and makes the log worse:
+  # its build job uploads a second `github-pages` artifact into the same run
+  # and the deploy job then refuses with "Multiple artifacts named
+  # github-pages were unexpectedly found", one step removed from the collision
+  # underneath it.
   publish:
     name: Publish
     needs: build
@@ -177,8 +195,16 @@ jobs:
        github.event.pull_request.head.repo.full_name == github.repository) &&
       (github.event_name == 'pull_request' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    # `pages: write` on top of the push, and it is not a second way to
+    # deploy. A write to `gh-pages` is picked up by GitHub's own
+    # `pages build and deployment` run, which is not in this repository and
+    # refuses to create a deployment while another is in flight — the
+    # ordinary case here, since the lease is exactly what puts two writers'
+    # pushes seconds apart. This is what lets `--settle` ask that pipeline
+    # whether it served us, and ask it for a build when it did not.
     permissions:
       contents: write
+      pages: write
     steps:
       # From the revision being published, and pinning it to the base branch
       # would not buy what it looks like it buys.
@@ -240,7 +266,8 @@ jobs:
           cargo run --quiet --manifest-path xtask/Cargo.toml -- pages publish \
             --target '${{ steps.where.outputs.target }}' \
             --ordinal '${{ github.run_number }}' \
-            --check still-current
+            --check still-current \
+            --settle
 
       # If the pull request closed while we were publishing, undo it.
       #
@@ -269,7 +296,8 @@ jobs:
         run: |
           cargo run --quiet --manifest-path xtask/Cargo.toml -- pages undo-if-closed \
             --target '${{ steps.where.outputs.target }}' \
-            --ordinal '${{ github.run_number }}'
+            --ordinal '${{ github.run_number }}' \
+            --settle
 
       - name: Say where it is
         if: github.event_name == 'pull_request' && steps.undone.outputs.removed != 'true'
@@ -296,8 +324,13 @@ jobs:
       github.event.action == 'closed' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    # `pages: write` for the same reason as `publish`, and it matters most
+    # here: a pull request closes once. A removal whose deployment is refused
+    # has no second event to put it right, and the preview stays live for
+    # good — which is what `--settle` is for.
     permissions:
       contents: write
+      pages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -317,4 +350,5 @@ jobs:
           cargo run --quiet --manifest-path xtask/Cargo.toml -- pages remove \
             --target 'pr/${{ github.event.number }}' \
             --ordinal '${{ github.run_number }}' \
-            --check still-closed
+            --check still-closed \
+            --settle

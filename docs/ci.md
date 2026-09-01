@@ -97,3 +97,42 @@ cannot make a downloaded `.crate` stale.
 Raising the 10 GB limit is possible on a paid plan and would be another answer
 to the same problem. Nothing here needs it yet.
 
+
+## The one workflow this repository does not own
+
+`pages.yml` writes to `gh-pages`; it does not deploy. Every push to that
+branch starts a run of **`pages build and deployment`**, which GitHub
+generates, which is not a file in this tree, and which cannot be configured
+from one. That run is where a Pages site is actually served from, and it is
+the only piece of this pipeline nobody here can edit.
+
+Its one failure mode matters because the way `pages.yml` is designed makes it
+common. The deployment API refuses to create a deployment while another one is
+in flight:
+
+    Deployment request failed for <sha> due to in progress deployment.
+    Please cancel <other> first or wait for it to complete.
+
+Two writers landing seconds apart is the ordinary case, not a rare one — a
+pull request closing takes its preview down while the merge that closed it
+publishes the site — and it is a *consequence* of the lease in `xtask pages`,
+which is what makes both writes land rather than one silently replacing the
+other. The refused one then leaves the branch carrying a tree that nothing
+will serve: Pages deploys on a push, and the push has already happened. For a
+preview take-down that is the end of the line, because a pull request closes
+once and the preview stays live.
+
+Re-running the failed run is the wrong instinct and the reason the error
+people actually see is a different one. The built-in workflow's build job
+uploads its artifact again into the same run, and the deploy job then refuses
+with `Multiple artifacts named "github-pages" were unexpectedly found for this
+workflow run. Artifact count is 2.` — which reads like an artifact bug and is
+a collision one step underneath.
+
+So the push is not the end of the publisher's job. `xtask pages … --settle`
+(`xtask/src/deploy.rs`) asks Pages what it last built, and asks it for a build
+when the branch tip is not that — a convergence rather than a lock, for the
+same reason the branch write is one: a legacy Pages build takes the tip as it
+finds it, so any run that notices can fix it and a run that has been overtaken
+can stand down. It needs `pages: write` on the job, which is why `publish` and
+`take-down` carry it.

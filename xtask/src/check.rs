@@ -191,7 +191,50 @@ impl Api {
         Ok(&self.pr_number)
     }
 
-    /// One GET against the API.
+    /// One GET against the API, whose answer must be there.
+    fn get(&self, path: &str) -> Result<String> {
+        match self.request("GET", path)? {
+            Answer::Ok(body) => Ok(body),
+            Answer::Missing => Err(err!("the API has no {path}")),
+            Answer::Failed(code, body) => Err(err!(
+                "could not ask the API about {path}: it answered {code}: {}",
+                first_line(&body)
+            )),
+        }
+    }
+
+    /// The same, for a thing that legitimately may not exist yet — a Pages
+    /// site that has never built. `None` is an answer; anything else is the
+    /// question breaking, which is not one.
+    pub fn get_if_there(&self, path: &str) -> Result<Option<String>> {
+        match self.request("GET", path)? {
+            Answer::Ok(body) => Ok(Some(body)),
+            Answer::Missing => Ok(None),
+            Answer::Failed(code, body) => Err(err!(
+                "could not ask the API about {path}: it answered {code}: {}",
+                first_line(&body)
+            )),
+        }
+    }
+
+    /// One POST, for the request that asks Pages to build again.
+    ///
+    /// A 409 is an answer rather than a failure: it is the API saying there
+    /// is already a build for this, which is the thing being asked for. The
+    /// caller waits for that one instead of spending an attempt on a second.
+    pub fn post(&self, path: &str) -> Result<Posted> {
+        match self.request("POST", path)? {
+            Answer::Ok(_) => Ok(Posted::Queued),
+            Answer::Missing => Err(err!("the API has no {path} to post to")),
+            Answer::Failed(code, _) if code == "409" => Ok(Posted::AlreadyBusy),
+            Answer::Failed(code, body) => Err(err!(
+                "the API refused a POST to {path} with {code}: {}",
+                first_line(&body)
+            )),
+        }
+    }
+
+    /// One request against the API.
     ///
     /// Through `curl`, which is the one thing here that is still a program
     /// rather than a library: a TLS client is the largest dependency this
@@ -199,19 +242,74 @@ impl Api {
     /// the publish job a sparse checkout of one directory. `curl` is on every
     /// runner and on every machine anyone would drive this from by hand.
     ///
-    /// `-f` so an HTTP error is a non-zero exit rather than a body that
-    /// parses to nothing, and the token goes in a header rather than in the
-    /// URL — a URL is what appears in an error message.
-    fn get(&self, path: &str) -> Result<String> {
+    /// The status code is *read* rather than left to `-f`, which is the one
+    /// thing that changed when Pages joined the questions asked here: `-f`
+    /// turns every HTTP answer above 399 into the same exit code, and "this
+    /// site has never been built" (404) and "this token cannot see Pages"
+    /// (403) are not the same answer at all — reading them as one is how a
+    /// missing permission looks like a site that simply has nothing yet. So
+    /// the code comes back on its own line and the caller matches on it.
+    ///
+    /// The token goes in a header rather than in the URL — a URL is what
+    /// appears in an error message.
+    fn request(&self, method: &str, path: &str) -> Result<Answer> {
         let url = format!("https://api.github.com/repos/{}/{path}", self.repo);
-        Run::new("curl")
-            .args(["-fsSL", "-H"])
+        let out = Run::new("curl")
+            .args(["-sS", "-X", method])
+            .args(["-w", "\n%{http_code}"])
+            .args(["-H"])
             .arg(format!("Authorization: Bearer {}", self.token))
             .args(["-H", "Accept: application/vnd.github+json"])
             .args(["-H", "X-GitHub-Api-Version: 2022-11-28"])
             .arg(&url)
             .read()
-            .map_err(|e| err!("could not ask the API about {path}: {e}"))
+            .map_err(|e| err!("could not reach the API about {path}: {e}"))?;
+        Ok(Answer::read(&out))
+    }
+}
+
+/// What asking for a build came back as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Posted {
+    Queued,
+    /// There is already one, which is what was wanted.
+    AlreadyBusy,
+}
+
+/// What one request came back as. Three cases and not two: see `request`.
+enum Answer {
+    Ok(String),
+    /// 404. The caller decides whether that is an answer or a failure.
+    Missing,
+    Failed(String, String),
+}
+
+impl Answer {
+    /// The body and the status code `-w` appended to it, split back apart.
+    ///
+    /// An answer with no code on the end is `curl` having written something
+    /// other than what it was asked to — treated as a failure with no code,
+    /// because guessing 200 there is guessing success.
+    fn read(out: &str) -> Answer {
+        let (body, code) = match out.rsplit_once('\n') {
+            Some((body, code)) => (body.trim(), code.trim()),
+            None => ("", out.trim()),
+        };
+        match code {
+            "404" => Answer::Missing,
+            c if c.starts_with('2') => Answer::Ok(body.to_string()),
+            c => Answer::Failed(c.to_string(), body.to_string()),
+        }
+    }
+}
+
+/// Enough of an error body to be worth printing, and no more: the API's
+/// answers carry documentation URLs nobody reads out of a job log.
+fn first_line(body: &str) -> String {
+    let line = body.lines().next().unwrap_or("").trim();
+    match line.char_indices().nth(200) {
+        Some((at, _)) => format!("{}...", &line[..at]),
+        None => line.to_string(),
     }
 }
 
@@ -220,4 +318,42 @@ impl Api {
 fn field(body: &str, path: &str) -> Result<String> {
     json::string_at(body, path)
         .ok_or_else(|| Error(format!("the API answered with no `{path}` in it")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Answer, first_line};
+
+    /// 404 and 403 are not the same answer, and `-f` made them one.
+    ///
+    /// "This site has never been built" is something a caller can act on;
+    /// "this token cannot see Pages" is the question breaking. Collapsing the
+    /// second into the first is how a missing permission looks like a site
+    /// with nothing on it yet, and gets waited out rather than reported.
+    #[test]
+    fn a_missing_thing_and_a_refused_one_read_differently() {
+        assert!(matches!(
+            Answer::read("{\"status\":\"built\"}\n200"),
+            Answer::Ok(body) if body == "{\"status\":\"built\"}"
+        ));
+        assert!(matches!(
+            Answer::read("{\"message\":\"Not Found\"}\n404"),
+            Answer::Missing
+        ));
+        assert!(matches!(
+            Answer::read("{\"message\":\"Resource not accessible\"}\n403"),
+            Answer::Failed(code, _) if code == "403"
+        ));
+        assert!(matches!(Answer::read("\n201"), Answer::Ok(body) if body.is_empty()));
+        // Nothing but a code, and nothing at all: neither is success.
+        assert!(matches!(Answer::read("500"), Answer::Failed(code, _) if code == "500"));
+        assert!(matches!(Answer::read(""), Answer::Failed(code, _) if code.is_empty()));
+    }
+
+    #[test]
+    fn an_error_body_is_trimmed_to_something_a_log_can_hold() {
+        assert_eq!(first_line("one\ntwo"), "one");
+        let long = "x".repeat(500);
+        assert_eq!(first_line(&long).len(), 203);
+    }
 }

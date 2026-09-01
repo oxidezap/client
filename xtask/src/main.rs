@@ -19,12 +19,13 @@
 //!     cargo xtask bundle check [dir] [--relocatable]
 //!     cargo xtask bundle size  [dir]
 //!     cargo xtask pages where
-//!     cargo xtask pages publish       --target <t> --ordinal <n> [--check <c>]
-//!     cargo xtask pages remove        --target <t> --ordinal <n> [--check <c>]
-//!     cargo xtask pages undo-if-closed --target <t> --ordinal <n>
+//!     cargo xtask pages publish       --target <t> --ordinal <n> [--check <c>] [--settle]
+//!     cargo xtask pages remove        --target <t> --ordinal <n> [--check <c>] [--settle]
+//!     cargo xtask pages undo-if-closed --target <t> --ordinal <n> [--settle]
 
 mod bundle;
 mod check;
+mod deploy;
 mod json;
 mod pages;
 mod sourcemap;
@@ -73,11 +74,13 @@ usage: cargo xtask <task>
                                  it is named from the origin root
   bundle size  [dir]             measure it, and say so in the step summary
   pages where                    work out where this run publishes to
-  pages publish --target <t> --ordinal <n> [--check <c>] [--bundle <dir>]
-  pages remove  --target <t> --ordinal <n> [--check <c>]
-  pages undo-if-closed --target <t> --ordinal <n>
+  pages publish --target <t> --ordinal <n> [--check <c>] [--bundle <dir>] [--settle]
+  pages remove  --target <t> --ordinal <n> [--check <c>] [--settle]
+  pages undo-if-closed --target <t> --ordinal <n> [--settle]
 
-  <c> is one of: always, still-current, now-closed, still-closed";
+  <c> is one of: always, still-current, now-closed, still-closed
+  --settle waits for Pages to serve what was pushed, and asks for a build
+           when the push's own deployment was refused";
 
 fn dispatch(args: &[&str]) -> Result<()> {
     match args {
@@ -139,6 +142,7 @@ fn job(action: Action, args: &[&str]) -> Result<Job> {
     let mut ordinal = None;
     let mut check = None;
     let mut bundle = None;
+    let mut settle = false;
     let mut rest = args;
     while let [flag, tail @ ..] = rest {
         let value = || -> Result<&str> {
@@ -168,6 +172,12 @@ fn job(action: Action, args: &[&str]) -> Result<Job> {
                 bundle = Some(PathBuf::from(value()?));
                 rest = &tail[1..];
             }
+            // No value: a write to the branch either sees its deployment
+            // through or it does not.
+            "--settle" => {
+                settle = true;
+                rest = tail;
+            }
             other => return Err(err!("unexpected argument `{other}`\n\n{USAGE}")),
         }
     }
@@ -181,6 +191,7 @@ fn job(action: Action, args: &[&str]) -> Result<Job> {
             err!("--ordinal is required: without it there is no way to tell an older publish from a newer one")
         })?,
         check: check.unwrap_or(Precondition::Always),
+        settle,
         bundle: bundle.unwrap_or_else(|| PathBuf::from("bundle")),
     })
 }
