@@ -321,6 +321,45 @@ impl Bridge {
                 );
                 CommandOutcome::Accepted
             }
+            Action::SendMedia(oxidezap_ipc::SendMedia {
+                jid,
+                upload,
+                kind,
+                mime_type,
+                file_name,
+                caption,
+                local_id,
+                quoted,
+            }) => {
+                // Through the cache, exactly as a voice note is, and taken
+                // rather than read for the same reason: the client wrote it
+                // directly, so its bytes never counted toward the cache's own
+                // sweep and nothing else would ever remove it.
+                let Some(data) = crate::media::take(&upload) else {
+                    return CommandOutcome::Refused(format!(
+                        "nothing cached under {upload}; stage it before sending"
+                    ));
+                };
+                let Some(permit) = self.permit() else {
+                    return too_busy();
+                };
+                hold(
+                    permit,
+                    [client.send_media_message(
+                        &jid,
+                        oxidezap_session::OutgoingFile {
+                            data,
+                            kind,
+                            mime_type,
+                            file_name,
+                            caption,
+                        },
+                        local_id.unwrap_or_else(next_local_id),
+                        quoted,
+                    )],
+                );
+                CommandOutcome::Accepted
+            }
             Action::MarkRead(oxidezap_ipc::MarkRead {
                 jid,
                 through_message_id,

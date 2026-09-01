@@ -72,15 +72,7 @@ impl WhatsAppApp {
 
         // Refused where nothing can come of it. The composer already draws
         // the microphone disabled there, so this is the keyboard route and
-        // anything else that reaches the action directly. Both halves, for
-        // the reason the composer asks both: an encoder the browser does not
-        // have, and a session with nowhere to send what it encodes, are two
-        // ways for the same press to end in a recording that is lost.
-        if let Some(reason) = crate::platform::media_send_unavailable() {
-            warn!("this session cannot send a voice note: {reason}");
-            self.notify_user(reason.to_string(), crate::app::notices::Tone::Problem, cx);
-            return;
-        }
+        // anything else that reaches the action directly.
         if !oxidezap_audio::can_record() {
             warn!("this build cannot record a voice note");
             self.notify_user(

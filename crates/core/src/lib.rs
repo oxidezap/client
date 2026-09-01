@@ -39,7 +39,9 @@ pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
 pub use calls::{ActiveCall, Admission, CallState, Ending, Stage, WaitingCall};
 pub use chat::STATUS_BROADCAST_JID;
 pub use chat::fallback_chat_name;
-pub use chat::{Chat, ChatMessage, DownloadableMedia, MediaContent, MediaType, Resend};
+pub use chat::{
+    Chat, ChatMessage, DownloadableMedia, MediaContent, MediaType, OutgoingMedia, Resend,
+};
 pub use events::{ReceiptType, UiEvent};
 pub use log_level::{LogLevel, UnknownLogLevel};
 pub use media_budget::{DECODED_IMAGE_BUDGET_BYTES, WEB_MEDIA_BUDGET_BYTES};

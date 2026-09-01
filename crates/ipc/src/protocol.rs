@@ -1,8 +1,8 @@
 //! Messages exchanged over the socket.
 
 use oxidezap_core::{
-    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, LogLevel, PluginAction,
-    PluginSurface, QuotedMessage, UiEvent,
+    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, LogLevel, OutgoingMedia,
+    PluginAction, PluginSurface, QuotedMessage, UiEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -544,6 +544,44 @@ pub struct SendAudio {
     pub quoted: Option<QuotedMessage>,
 }
 
+/// Send a file the user chose. See [`ClientRequest::SendMedia`].
+///
+/// The twin of [`SendAudio`], and staged the same way: the bytes travel
+/// through the media cache under [`upload`](Self::upload) and this names it.
+/// What differs is everything a recording knows about itself and a file does
+/// not — a picked file has a name and a type, and its dimensions, duration
+/// and thumbnail are things the daemon works out from the bytes rather than
+/// facts the front end was handed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendMedia {
+    pub jid: String,
+    /// Cache key the client wrote the file under.
+    pub upload: String,
+    /// What it is sent as. See [`OutgoingMedia`].
+    pub kind: OutgoingMedia,
+    /// The type the file was picked as, for the message and for the
+    /// recipient's own decision about what to do with it.
+    pub mime_type: String,
+    /// What the file was called where it was picked.
+    ///
+    /// Carried for every kind and not only for a document, because it is what
+    /// a save on the other side names the file — and it is *only* a name: the
+    /// side that writes it is the one that sanitizes it, exactly as an
+    /// arriving name is sanitized here.
+    pub file_name: String,
+    /// The line typed beside it, if any. Images and videos draw it under the
+    /// media; a document carries it as its caption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// The id to give the message until the server assigns a real one, as
+    /// [`SendText::local_id`].
+    pub local_id: Option<String>,
+    /// The message being replied to, when this is a reply. The same field
+    /// [`SendText`] and [`SendAudio`] carry, for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted: Option<QuotedMessage>,
+}
+
 /// Whether we are typing at a peer. See [`ClientRequest::Typing`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Typing {
@@ -642,6 +680,14 @@ pub enum ClientRequest {
     /// is the one client-to-daemon payload big enough to matter, and the cache
     /// is a per-user directory both processes can already reach.
     SendAudio(SendAudio),
+    /// Send a file somebody picked: a photo, a video, a document.
+    ///
+    /// Through the media cache for the reason [`SendAudio`](Self::SendAudio)
+    /// is — it is the same sideband and a photo is larger than a voice note —
+    /// and separate from it because the two carry different facts: a
+    /// recording knows its length and its shape, and a file knows its name
+    /// and its type.
+    SendMedia(SendMedia),
     /// Tell the peer whether we are typing. One request rather than two,
     /// because it is one piece of state with two values.
     Typing(Typing),
@@ -1275,6 +1321,32 @@ mod tests {
                     quoted: Some(quoted),
                 }),
                 r#"{"request":"send_audio","jid":"559900000001@s.whatsapp.net","upload":"staged-local-1","duration_secs":3,"waveform":[7,8],"local_id":"local-1","quoted":{"message_id":"3EB0A","sender":"559900000001@s.whatsapp.net","sender_name":"quem quer que seja","preview":"a linha citada","kind":null}}"#.to_string(),
+            ),
+            (
+                ClientRequest::SendMedia(SendMedia {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    upload: "u-local-1".into(),
+                    kind: OutgoingMedia::Image,
+                    mime_type: "image/jpeg".into(),
+                    file_name: "praia.jpg".into(),
+                    caption: Some("olha isso".into()),
+                    local_id: Some("local-1".into()),
+                    quoted: None,
+                }),
+                r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-local-1","kind":"image","mime_type":"image/jpeg","file_name":"praia.jpg","caption":"olha isso","local_id":"local-1"}"#.to_string(),
+            ),
+            (
+                ClientRequest::SendMedia(SendMedia {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    upload: "u-local-2".into(),
+                    kind: OutgoingMedia::Document,
+                    mime_type: "application/pdf".into(),
+                    file_name: "nota.pdf".into(),
+                    caption: None,
+                    local_id: None,
+                    quoted: None,
+                }),
+                r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-local-2","kind":"document","mime_type":"application/pdf","file_name":"nota.pdf","local_id":null}"#.to_string(),
             ),
             (
                 ClientRequest::Typing(Typing {

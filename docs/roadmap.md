@@ -150,38 +150,48 @@
   truncates before it opens anything. A second plugin that fits alone and not beside the first would
   otherwise be written, reported as installed, and skipped at every load
   after.
-- **A page with its own session cannot send media, and the reason is upstream.**
-  `BrowserHttpClient` implements `execute` and nothing else, which the trait
-  allows: the streaming paths default to refusing. But the library's upload
-  never asks. `upload_media_with_retry` sends the body through a closure that
-  calls `execute_upload` unconditionally, and nothing anywhere reads
-  `supports_upload_streaming` except the ureq client that sets it. So a photo
-  or a voice note sent from a page's own session fails with "Upload streaming
-  not supported by this HTTP client", whatever this side does about staging.
-  A browser cannot answer `execute_upload` either: it is synchronous, must be
-  called from a blocking context, and `fetch` is neither. The fix is a
-  buffered fallback in the library, taken when the client declares no upload
-  streaming, and it is a change to `whatsapp-rust` rather than to anything
-  here. Attached to an `oxidezapd` the question does not arise, because the
-  daemon holds the ureq client and does the upload.
-
-- **A page's own session cannot send the media it can now record.** See the
-  upload note above: the recording, the staging and the container are all in
-  place, and `execute_upload` upstream is what a voice note from an
-  own-session page still runs into. Attached to an `oxidezapd` it goes.
-  Which is why the microphone is not offered there. `platform::capabilities`
-  is the twin of `platform::plugins` and answers the same shape of question:
-  each is `None` or the sentence to draw instead, and each is about the
-  platform and the session rather than about a file or a moment, which is what
-  makes it safe to ask *before* the control is offered. Asking early is the
-  whole value. A composer that drew the microphone on an own-session page let
-  somebody record a whole voice note and lose it at the send, which is the
-  worse of the two ways to learn this, and the file already said so about the
-  browsers with no Opus encoder. The same module answers for video, and there
-  the ordering is the point: a decoder is built from the parameter sets, so a
-  browser with no `VideoDecoder` was otherwise found out only after the whole
-  attachment had been fetched and demuxed, and the bubble draws that as Retry,
-  every press paying the download again to reach the same permanent answer.
+- ~~**A page with its own session cannot send media**~~ — it can, and this
+  entry was wrong about the library rather than out of date. `BrowserHttpClient`
+  implements `execute` and nothing else, which the trait allows; what this
+  entry claimed is that the upload path calls `execute_upload` regardless. It
+  does not, and at the pinned revision it never has: `execute_upload` is the
+  *streaming* path (`Client::upload_stream`), and `Client::upload` reaches the
+  CDN through the `send_body` closure, which is `execute` with a body on it.
+  So a photo or a voice note from a page's own session takes the same route
+  every other request from that page takes.
+  What that cost was not the sends — it was `platform::capabilities::media_send_unavailable`,
+  which withheld the microphone from an own-session page on the strength of
+  this paragraph. Both are gone. The lesson is the one at the top of this
+  file: an entry describing upstream behaviour is a claim about a revision,
+  and this one was never re-read against the revision the lockfile names.
+  What remains true is a cost rather than a limit: a page has one thread, so
+  the encryption before an upload runs on it.
+- ~~**A page's own session cannot send the media it can now record.**~~ See
+  above. `platform::capabilities` is still the twin of `platform::plugins` and
+  still answers the same shape of question — each is `None` or the sentence to
+  draw instead, and each is about the platform and the session rather than
+  about a file or a moment, which is what makes it safe to ask *before* the
+  control is offered. What it no longer answers is this one. The module
+  answers for video, and there the ordering is the point: a decoder is built
+  from the parameter sets, so a browser with no `VideoDecoder` was otherwise
+  found out only after the whole attachment had been fetched and demuxed, and
+  the bubble draws that as Retry, every press paying the download again to
+  reach the same permanent answer.
+- **An attachment is sent as it is, and without a caption.** Picking a file
+  sends it: there is no step between the chooser and the send for a caption to
+  be typed in, for a photo to be cropped, or for the kind to be overridden —
+  and the composer's own text stays a message of its own rather than becoming
+  one, because taking it at the press would lose it to a dismissed chooser and
+  taking it at the completion means reaching for a `Window` from inside an
+  async continuation. The protocol carries `caption` and `kind` per file
+  precisely so that step is a front-end change rather than a protocol one.
+  Two smaller gaps go with it. A video is sent without a poster frame: the
+  jpegThumbnail is what the recipient draws before downloading anything, and
+  producing one means decoding H.264 inside the process holding the account —
+  the decoder is in `oxidezap-video`, which the session already depends on, so
+  what is missing is a first-frame path rather than a decoder. And a picture
+  is uploaded at full size, where WhatsApp's own clients re-encode: sending a
+  12 MP photo over a phone connection is what that costs.
 - **A page prepares a recording on the window's own thread.** `app/recording.rs`
   hands the desktop's waveform and encode to `cx.background_spawn`, which is
   where work measured in hundreds of millions of operations belongs. The web

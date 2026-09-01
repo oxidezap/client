@@ -22,6 +22,12 @@ use crate::theme::{ActiveProductTheme as _, Metrics};
 pub enum InputAreaEvent {
     /// User wants to send the current message
     SendMessage(String),
+    /// User wants to attach files to this conversation.
+    ///
+    /// Carries nothing: which conversation is the app's to know, and the
+    /// files are chosen after the press — a dialog the composer neither owns
+    /// nor waits for.
+    AttachFiles,
     /// User started PTT recording
     StartRecording,
     /// User stopped PTT recording (send the audio)
@@ -152,14 +158,13 @@ impl InputAreaView {
             touch_target: None,
             typing_state: TypingState::default(),
             typing_monitor_task: None,
-            // Both halves of the journey, because either one failing makes
-            // the control a promise it cannot keep: the browser has to have
-            // an encoder, and the session has to have somewhere to send what
-            // it encodes. A page holding its own account has the first and
-            // not the second, and recording a whole voice note to lose it at
-            // the send is the worse of the two ways to find that out.
-            can_record: oxidezap_audio::can_record()
-                && crate::platform::media_send_unavailable().is_none(),
+            // Asked once rather than per frame: whether this build has an
+            // Opus encoder is not something a browser grows between the
+            // question and the press. Recording a whole voice note and losing
+            // it at the send is the outcome this exists to prevent, and where
+            // it *can* be sent is no longer a second question — see
+            // `platform::capabilities`.
+            can_record: oxidezap_audio::can_record(),
         }
     }
 
@@ -407,6 +412,7 @@ impl InputAreaView {
     ) -> impl IntoElement {
         let entity = cx.entity().clone();
         let record_entity = entity.clone();
+        let attach_entity = entity.clone();
         // Asked of the rope rather than of a copy of it. `text()` hands back
         // the document itself; `to_string` copied all of it, on every
         // keystroke, to answer whether the send button or the microphone
@@ -423,17 +429,15 @@ impl InputAreaView {
             .items_center()
             .gap(metrics.space_md())
             .child(
-                // Drawn, disabled, and saying so. The slot is part of what a
-                // composer *is* and should not appear the day sending files
-                // lands; a control that looks live and does nothing is worse
-                // than one that admits it.
                 parts::icon_button(
                     "attach",
                     Icon::new(ProductIcon::Paperclip),
-                    "Attaching files is not available yet",
+                    "Attach a photo, a video or a document",
                     control,
                 )
-                .disabled(true),
+                .on_click(move |_, _window, cx| {
+                    attach_entity.update(cx, |_view, cx| cx.emit(InputAreaEvent::AttachFiles));
+                }),
             )
             .child(
                 div()
@@ -478,11 +482,7 @@ impl InputAreaView {
                     .tooltip(if can_record {
                         "Hold to record a voice message"
                     } else {
-                        // Which half is missing, since the two have different
-                        // answers: one is the browser and the other is a
-                        // daemon this page could be pointed at.
-                        crate::platform::media_send_unavailable()
-                            .unwrap_or("Voice messages cannot be recorded in this browser")
+                        "Voice messages cannot be recorded in this browser"
                     })
                     .w(control)
                     .h(control)

@@ -25,6 +25,7 @@ use oxidezap_ipc::{CallAction, RequestId};
 pub enum Action {
     SendText(oxidezap_ipc::SendText),
     SendAudio(oxidezap_ipc::SendAudio),
+    SendMedia(oxidezap_ipc::SendMedia),
     MarkRead(oxidezap_ipc::MarkRead),
     MarkStatusWatched(oxidezap_ipc::MarkStatusWatched),
     Typing(oxidezap_ipc::Typing),

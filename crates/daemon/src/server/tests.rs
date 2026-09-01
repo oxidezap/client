@@ -203,6 +203,46 @@ async fn a_command_reaches_the_session_rather_than_being_refused() {
     ));
 }
 
+/// The payload moves rather than being unpacked and rebuilt, so what the
+/// session is handed is the struct the client sent. A field dropped between
+/// the two compiles and arrives as a document called "file" with no type on
+/// it, which is why this asserts on the fields rather than on the variant.
+#[tokio::test]
+async fn a_picked_file_reaches_the_session_as_it_was_described() {
+    let hub = connected_hub();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+
+    let request = bare(ClientRequest::SendMedia(oxidezap_ipc::SendMedia {
+        jid: "a@s.whatsapp.net".into(),
+        upload: "u-local-1".into(),
+        kind: oxidezap_core::OutgoingMedia::Image,
+        mime_type: "image/jpeg".into(),
+        file_name: "praia.jpg".into(),
+        caption: None,
+        local_id: Some("local-1".into()),
+        quoted: None,
+    }));
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Accepted { .. }
+    ));
+    assert!(matches!(
+        taken.await.unwrap(),
+        Some(Action::SendMedia(oxidezap_ipc::SendMedia {
+            jid,
+            upload,
+            kind: oxidezap_core::OutgoingMedia::Image,
+            mime_type,
+            file_name,
+            ..
+        })) if jid == "a@s.whatsapp.net"
+            && upload == "u-local-1"
+            && mime_type == "image/jpeg"
+            && file_name == "praia.jpg"
+    ));
+}
+
 /// `Accepted` has to mean the session took it, not that a queue did. The
 /// account can drop between the check at the door and the moment the
 /// bridge picks the command up, and a client told yes on admission alone

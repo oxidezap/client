@@ -36,6 +36,52 @@ impl MediaType {
     }
 }
 
+/// What a file the user picked is sent as. See `oxidezap_ipc::SendMedia`.
+///
+/// Three kinds and not five: a sticker is a pack's, not a file picker's, and
+/// a voice note is recorded rather than chosen — `SendAudio` carries that
+/// one, with the duration and the waveform a recording knows and a file does
+/// not. What is left is the set a person can point at a file and mean.
+///
+/// The kind decides the message the recipient receives, so it is chosen on
+/// this side rather than derived on the daemon's: a picture sent *as a
+/// document* keeps its bytes exactly, and that is a choice a front end is
+/// allowed to offer. [`Self::for_mime`] is the default it offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutgoingMedia {
+    Image,
+    Video,
+    Document,
+}
+
+impl OutgoingMedia {
+    /// What a file of this type is sent as unless somebody says otherwise.
+    ///
+    /// Only the two families WhatsApp draws inline are recognised, and
+    /// everything else is a document — which is the honest answer rather than
+    /// a fallback: a document is the one kind that promises nothing about
+    /// what is inside it, so a type nobody here knows arrives intact.
+    ///
+    /// The parameters are ignored (`image/jpeg; charset=binary` is an image),
+    /// and the comparison is case-insensitive, because both are things a
+    /// browser's `File.type` and an extension table can disagree about.
+    #[must_use]
+    pub fn for_mime(mime: &str) -> Self {
+        let family = mime
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        match family.split_once('/') {
+            Some(("image", _)) => Self::Image,
+            Some(("video", _)) => Self::Video,
+            _ => Self::Document,
+        }
+    }
+}
+
 /// Information needed to download encrypted media from WhatsApp servers.
 /// This is stored separately from the thumbnail/preview data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,5 +586,33 @@ mod tests {
             .unwrap(),
             r#"{"media_type":"Audio","mime_type":"audio/ogg"}"#
         );
+    }
+
+    /// What a picked file is sent as, from its type alone. The parameters are
+    /// not part of the answer and neither is the case: a browser's
+    /// `File.type` and an extension table disagree about both.
+    #[test]
+    fn a_file_is_sent_as_what_its_type_says_it_is() {
+        assert_eq!(OutgoingMedia::for_mime("image/jpeg"), OutgoingMedia::Image);
+        assert_eq!(
+            OutgoingMedia::for_mime("IMAGE/PNG; charset=binary"),
+            OutgoingMedia::Image
+        );
+        assert_eq!(OutgoingMedia::for_mime("video/mp4"), OutgoingMedia::Video);
+        // Everything else is a document, which is the kind that promises
+        // nothing about what is inside it — including a type nobody stated.
+        for other in [
+            "application/pdf",
+            "audio/ogg",
+            "text/plain",
+            "",
+            "not a mime type",
+        ] {
+            assert_eq!(
+                OutgoingMedia::for_mime(other),
+                OutgoingMedia::Document,
+                "{other:?}"
+            );
+        }
     }
 }

@@ -10,7 +10,7 @@ mod merge;
 mod message;
 mod reactions;
 
-pub use media::{DownloadableMedia, MediaContent, MediaType};
+pub use media::{DownloadableMedia, MediaContent, MediaType, OutgoingMedia};
 pub use message::{ChatMessage, Resend};
 
 use chrono::{DateTime, Utc};
