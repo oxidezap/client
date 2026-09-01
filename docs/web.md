@@ -95,6 +95,20 @@ directory. Installing *does* start it, by asking the daemon to reload — one
 act from where somebody is standing and two here, because the folder is the
 front end's and the host is the daemon's.
 
+**A page picks files the only way a page can.** There is no path to a
+filesystem and no `showOpenFilePicker` worth depending on — it is Chromium-only
+and wants a secure context a developer's `trunk serve` may not have — so
+`platform::picker` builds an `<input type=file>`, joins it to the document for
+the length of the gesture, and takes it out again: a detached input's `click()`
+is ignored outright by some engines, and one that stays is a control the page
+grew and never lost. It waits on `change` *and* `cancel`, because a browser has
+two ways of ending this and waiting only for the first leaves the task and its
+closures alive for the life of the page every time somebody changes their mind.
+The type comes from `File.type` where the agent recognised it and from an
+extension table where it did not, which is the same table the desktop half has
+nothing but. What comes back is bytes, on both platforms, because what happens
+next is a staged upload.
+
 **Media crosses the bridge in both directions.** The daemon's web endpoint
 served media and nothing else, so a page attached to an `oxidezapd` could read
 a photo and hand it nothing: `MediaCache::stage` refused, and a voice note

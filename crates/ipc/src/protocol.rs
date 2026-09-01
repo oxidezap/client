@@ -1,8 +1,8 @@
 //! Messages exchanged over the socket.
 
 use oxidezap_core::{
-    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, LogLevel, PluginAction,
-    PluginSurface, QuotedMessage, UiEvent,
+    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, LogLevel, OutgoingMedia,
+    PluginAction, PluginSurface, QuotedMessage, UiEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -533,7 +533,7 @@ pub struct SendAudio {
     /// serde's buffered `Content` rather than straight from the reader, and
     /// on that path a missing key for an `Option` field is `None` whether or
     /// not a default is declared. Both sends already accept a frame without
-    /// the key; `tests::either_send_may_leave_out_the_local_id` is what says
+    /// the key; `tests::every_send_may_leave_out_the_local_id` is what says
     /// so, and it is the thing to look at before adding the attribute to
     /// "fix" this — the change that would really alter the wire is giving
     /// this enum a different tag representation, and that test is what would
@@ -545,6 +545,52 @@ pub struct SendAudio {
     /// a way of answering, not a different kind of message. Without it a reply
     /// draft open when the user pressed the microphone was silently dropped —
     /// and worse, stayed armed and attached itself to whatever was typed next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted: Option<QuotedMessage>,
+}
+
+/// Send a file the user chose. See [`ClientRequest::SendMedia`].
+///
+/// The twin of [`SendAudio`], and staged the same way: the bytes travel
+/// through the media cache under [`upload`](Self::upload) and this names it.
+/// What differs is everything a recording knows about itself and a file does
+/// not — a picked file has a name and a type, and its dimensions, duration
+/// and thumbnail are things the daemon works out from the bytes rather than
+/// facts the front end was handed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendMedia {
+    pub jid: String,
+    /// Cache key the client wrote the file under.
+    pub upload: String,
+    /// What it is sent as. See [`OutgoingMedia`].
+    pub kind: OutgoingMedia,
+    /// The type the file was picked as, for the message and for the
+    /// recipient's own decision about what to do with it.
+    pub mime_type: String,
+    /// What the file was called where it was picked.
+    ///
+    /// Carried for every kind and not only for a document, because it is what
+    /// a save on the other side names the file — and it is *only* a name: the
+    /// side that writes it is the one that sanitizes it, exactly as an
+    /// arriving name is sanitized here.
+    pub file_name: String,
+    /// The line typed beside it, if any. Images and videos draw it under the
+    /// media; a document carries it as its caption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// The id to give the message until the server assigns a real one, as
+    /// [`SendText::local_id`].
+    ///
+    /// No `#[serde(default)]`, for the reason [`SendAudio::local_id`] does
+    /// not carry one either: it would not do anything. This enum is
+    /// internally tagged, so a missing key for an `Option` reads back as
+    /// `None` whichever way the field is declared, and a frame from a client
+    /// that draws nothing is one the daemon makes an id up for.
+    /// `tests::every_send_may_leave_out_the_local_id` is what says so, for
+    /// all three sends at once.
+    pub local_id: Option<String>,
+    /// The message being replied to, when this is a reply. The same field
+    /// [`SendText`] and [`SendAudio`] carry, for the same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quoted: Option<QuotedMessage>,
 }
@@ -647,6 +693,14 @@ pub enum ClientRequest {
     /// is the one client-to-daemon payload big enough to matter, and the cache
     /// is a per-user directory both processes can already reach.
     SendAudio(SendAudio),
+    /// Send a file somebody picked: a photo, a video, a document.
+    ///
+    /// Through the media cache for the reason [`SendAudio`](Self::SendAudio)
+    /// is — it is the same sideband and a photo is larger than a voice note —
+    /// and separate from it because the two carry different facts: a
+    /// recording knows its length and its shape, and a file knows its name
+    /// and its type.
+    SendMedia(SendMedia),
     /// Tell the peer whether we are typing. One request rather than two,
     /// because it is one piece of state with two values.
     Typing(Typing),
@@ -1282,6 +1336,32 @@ mod tests {
                 r#"{"request":"send_audio","jid":"559900000001@s.whatsapp.net","upload":"staged-local-1","duration_secs":3,"waveform":[7,8],"local_id":"local-1","quoted":{"message_id":"3EB0A","sender":"559900000001@s.whatsapp.net","sender_name":"quem quer que seja","preview":"a linha citada","kind":null}}"#.to_string(),
             ),
             (
+                ClientRequest::SendMedia(SendMedia {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    upload: "u-local-1".into(),
+                    kind: OutgoingMedia::Image,
+                    mime_type: "image/jpeg".into(),
+                    file_name: "praia.jpg".into(),
+                    caption: Some("olha isso".into()),
+                    local_id: Some("local-1".into()),
+                    quoted: None,
+                }),
+                r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-local-1","kind":"image","mime_type":"image/jpeg","file_name":"praia.jpg","caption":"olha isso","local_id":"local-1"}"#.to_string(),
+            ),
+            (
+                ClientRequest::SendMedia(SendMedia {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    upload: "u-local-2".into(),
+                    kind: OutgoingMedia::Document,
+                    mime_type: "application/pdf".into(),
+                    file_name: "nota.pdf".into(),
+                    caption: None,
+                    local_id: None,
+                    quoted: None,
+                }),
+                r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-local-2","kind":"document","mime_type":"application/pdf","file_name":"nota.pdf","local_id":null}"#.to_string(),
+            ),
+            (
                 ClientRequest::Typing(Typing {
                     jid: "559900000001@s.whatsapp.net".into(),
                     composing: true,
@@ -1360,10 +1440,11 @@ mod tests {
         }
     }
 
-    /// Both sends accept a frame that leaves `local_id` out.
+    /// Every send accepts a frame that leaves `local_id` out.
     ///
-    /// `SendText::local_id` declares `#[serde(default)]` and `SendAudio`'s
-    /// does not, which reads like the audio one being stricter. It is not:
+    /// `SendText::local_id` declares `#[serde(default)]` and neither
+    /// `SendAudio`'s nor `SendMedia`'s does, which reads like those two being
+    /// stricter. They are not:
     /// this enum is internally tagged, so a variant is deserialized through
     /// serde's buffered `Content`, and on that path a missing key for an
     /// `Option` is `None` with or without the attribute. The asymmetry is in
@@ -1376,9 +1457,10 @@ mod tests {
     /// externally or adjacently tagged and the audio arm starts refusing a
     /// frame the text arm accepts.
     #[test]
-    fn either_send_may_leave_out_the_local_id() {
+    fn every_send_may_leave_out_the_local_id() {
         let text = r#"{"request":"send_text","jid":"559900000001@s.whatsapp.net","text":"oi"}"#;
         let audio = r#"{"request":"send_audio","jid":"559900000001@s.whatsapp.net","upload":"staged-local-1","duration_secs":3,"waveform":[7,8]}"#;
+        let media = r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-1","kind":"video","mime_type":"video/mp4","file_name":"clipe.mp4"}"#;
 
         match serde_json::from_str::<ClientRequest>(text).unwrap() {
             ClientRequest::SendText(send) => assert_eq!(send.local_id, None),
@@ -1387,6 +1469,16 @@ mod tests {
         match serde_json::from_str::<ClientRequest>(audio).unwrap() {
             ClientRequest::SendAudio(send) => assert_eq!(send.local_id, None),
             other => panic!("not a send_audio: {other:?}"),
+        }
+        match serde_json::from_str::<ClientRequest>(media).unwrap() {
+            ClientRequest::SendMedia(send) => {
+                assert_eq!(send.local_id, None);
+                // The other two keys a media send may leave out, in the same
+                // frame: absent is `None` for these as well.
+                assert_eq!(send.caption, None);
+                assert_eq!(send.quoted, None);
+            }
+            other => panic!("not a send_media: {other:?}"),
         }
     }
 }

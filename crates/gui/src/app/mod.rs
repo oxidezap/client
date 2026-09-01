@@ -6,6 +6,7 @@
 //! - `messages`: Message list caching and height calculation
 //! - `calls`: Call state management (incoming/outgoing)
 
+mod attaching;
 mod calls;
 mod calls_ctl;
 pub mod chat_row;
@@ -2455,6 +2456,9 @@ impl WhatsAppApp {
         match event {
             InputAreaEvent::SendMessage(text) => {
                 self.send_message(text, cx);
+            }
+            InputAreaEvent::AttachFiles => {
+                self.attach_files(cx);
             }
             InputAreaEvent::StartRecording => {
                 self.start_recording(cx);

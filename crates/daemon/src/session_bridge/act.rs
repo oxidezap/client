@@ -321,6 +321,70 @@ impl Bridge {
                 );
                 CommandOutcome::Accepted
             }
+            Action::SendMedia(oxidezap_ipc::SendMedia {
+                jid,
+                upload,
+                kind,
+                mime_type,
+                file_name,
+                caption,
+                local_id,
+                quoted,
+            }) => {
+                // Through the cache, exactly as a voice note is, and taken
+                // rather than read for the same reason: the client wrote it
+                // directly, so its bytes never counted toward the cache's own
+                // sweep and nothing else would ever remove it.
+                //
+                // Off this thread, unlike a voice note, and the difference is
+                // the size: natively this is a `read` and a `remove_file` of
+                // whatever was staged, up to the protocol's whole ceiling, and
+                // a blocking read of sixty-four megabytes on a runtime worker
+                // stops far more than this loop. `unblock` is the seam that
+                // answers for both platforms — a thread pool on the desktop,
+                // and a call in a page, where the cache is a map in memory and
+                // there is neither a file to read nor anywhere to hand it.
+                let taken = {
+                    let upload = upload.clone();
+                    oxidezap_session::unblock(move || crate::media::take(&upload)).await
+                };
+                // Two answers, not one. A read that never ran — the worker
+                // panicked, or the runtime is going down — is not a payload
+                // nobody staged, and folding the two told a client that had
+                // just staged a file to stage it before sending.
+                let data = match taken {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        return CommandOutcome::Refused(format!(
+                            "nothing cached under {upload}; stage it before sending"
+                        ));
+                    }
+                    Err(e) => {
+                        return CommandOutcome::Refused(format!(
+                            "the payload staged under {upload} could not be read: {e}"
+                        ));
+                    }
+                };
+                let Some(permit) = self.permit() else {
+                    return too_busy();
+                };
+                hold(
+                    permit,
+                    [client.send_media_message(
+                        &jid,
+                        oxidezap_session::OutgoingFile {
+                            data,
+                            kind,
+                            mime_type,
+                            file_name,
+                            caption,
+                        },
+                        local_id.unwrap_or_else(next_local_id),
+                        quoted,
+                    )],
+                );
+                CommandOutcome::Accepted
+            }
             Action::MarkRead(oxidezap_ipc::MarkRead {
                 jid,
                 through_message_id,

@@ -85,7 +85,8 @@ use oxidezap_ipc::{CallAction, ClientRequest, Link, PageCursor, Request, Request
 // so `Typing` and `Download` read at the call site as what they are: the
 // request's own payload, built here and moved onto the wire unchanged.
 use oxidezap_ipc::{
-    Download, LoadChats, LoadMessages, MarkRead, MarkStatusWatched, SendAudio, SendText, Typing,
+    Download, LoadChats, LoadMessages, MarkRead, MarkStatusWatched, SendAudio, SendMedia, SendText,
+    Typing,
 };
 use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
@@ -100,6 +101,20 @@ pub struct StorageUsage {
     pub database_bytes: u64,
     pub media_bytes: u64,
     pub media_files: u64,
+}
+
+/// A file on its way out, as this side knows it.
+///
+/// What the picker read plus the two things the composer decides: what it is
+/// being sent *as*, and the line typed beside it. Everything else about the
+/// file — how big the picture is, what its thumbnail looks like — is worked
+/// out where the bytes end up, which is the daemon.
+pub struct Attachment {
+    pub bytes: Vec<u8>,
+    pub kind: oxidezap_core::OutgoingMedia,
+    pub mime_type: String,
+    pub file_name: String,
+    pub caption: Option<String>,
 }
 
 /// What the reader hands the front end.
@@ -676,18 +691,113 @@ impl Session {
         local_id: String,
         quoted: Option<QuotedMessage>,
     ) {
-        // Through the media cache: a voice note is the one thing this side
-        // sends that does not belong in a frame. The key is the local id,
-        // which is already unique per recording.
-        let upload = oxidezap_ipc::staged_key(&sanitize(&local_id));
-        let request = ClientRequest::SendAudio(SendAudio {
-            jid: jid.to_string(),
-            upload: upload.clone(),
-            duration_secs,
-            waveform,
-            local_id: Some(local_id.clone()),
-            quoted,
+        self.send_staged(jid, local_id, audio, "the recording", |upload, local_id| {
+            ClientRequest::SendAudio(SendAudio {
+                jid: jid.to_string(),
+                upload,
+                duration_secs,
+                waveform,
+                local_id: Some(local_id),
+                quoted,
+            })
         });
+    }
+
+    /// Send a file somebody picked, staged the way a recording is.
+    ///
+    /// The daemon is the side that works out what the file looks like — its
+    /// dimensions, its thumbnail — because it is the side holding the bytes
+    /// when the message is built. What travels here is what the *picker*
+    /// knew: what the file is called, what it is, and what it is being sent
+    /// as.
+    pub fn send_media_message(
+        &self,
+        jid: &str,
+        file: Attachment,
+        local_id: String,
+        quoted: Option<QuotedMessage>,
+    ) {
+        let Attachment {
+            bytes,
+            kind,
+            mime_type,
+            file_name,
+            caption,
+        } = file;
+        self.send_staged(jid, local_id, bytes, "that file", |upload, local_id| {
+            ClientRequest::SendMedia(SendMedia {
+                jid: jid.to_string(),
+                upload,
+                kind,
+                mime_type,
+                file_name,
+                caption,
+                local_id: Some(local_id),
+                quoted,
+            })
+        });
+    }
+
+    /// Send a request whose payload goes through the media cache.
+    ///
+    /// Both of the things this front end sends that are too big for a frame —
+    /// a recording and a picked file — and every ordering question they raise
+    /// is the same one, which is why they are one function. `what` names the
+    /// payload for the sentence a failed staging produces, because "the
+    /// recording could not be staged" is what somebody who pressed the
+    /// microphone needs to read and not what somebody who picked a file does.
+    fn send_staged(
+        &self,
+        jid: &str,
+        local_id: String,
+        payload: Vec<u8>,
+        what: &'static str,
+        request: impl FnOnce(String, String) -> ClientRequest,
+    ) {
+        // Through the media cache: these are the things this side sends that
+        // do not belong in a frame. The key is the local id, which is already
+        // unique per send.
+        let upload = oxidezap_ipc::staged_key(&sanitize(&local_id));
+        let request = request(upload.clone(), local_id.clone());
+        // The ceiling, once, where every staged payload passes rather than in
+        // each of the four caches. Only one of those enforced it — the web
+        // bridge's `PUT`, which has to, because it reads the body into the
+        // process holding the account — so the same recording that a page
+        // could not stage went out from a desktop, and the sentence in
+        // `MAX_STAGED_BYTES` was true of one transport.
+        //
+        // A backstop rather than the check somebody sees: a file is refused at
+        // the chooser, by name and before it is read, and a voice note reaches
+        // this at about a megabyte per ten minutes. What it is here for is the
+        // path that grows a payload nobody measured.
+        let size = payload.len() as u64;
+        if size > oxidezap_ipc::MAX_STAGED_BYTES {
+            // Reserved and failed rather than dropped: the caller draws its
+            // bubble after this returns, and the failure travels the events
+            // channel, so it lands on a message that exists by then. Nothing
+            // is staged and no place is claimed in the outbox — there is no
+            // frame for anything to queue behind.
+            let id = self.reserve(Awaiting::Send {
+                chat_jid: jid.to_string(),
+                local_id,
+                staged: None,
+            });
+            fail_reserved(
+                &self.pending,
+                &self.events,
+                &self.media,
+                id,
+                // The same two figures the file chooser prints, from the same
+                // formatter: a person who was told a file fits and then told
+                // it does not must not be reading two different numbers.
+                format!(
+                    "{what} could not be sent: it is {} and the most that can be staged is {}.",
+                    crate::utils::format_size(size),
+                    crate::utils::format_size(oxidezap_ipc::MAX_STAGED_BYTES)
+                ),
+            );
+            return;
+        }
         // Reserved before the payload is staged and sent after it lands. The
         // id is taken in the order the person acted in, which a reservation
         // made later would not be; the *frame* waits, because the daemon
@@ -701,7 +811,7 @@ impl Session {
         });
         // Claimed before the upload begins, so anything sent while it runs
         // queues behind it rather than overtaking it on the wire, and so
-        // that a second note claims the place *after* this one whichever
+        // that a second payload claims the place *after* this one whichever
         // upload lands first.
         let ticket = self
             .outbox
@@ -715,7 +825,7 @@ impl Session {
         let media = Arc::clone(&self.media);
         self.media.stage_then(
             &upload,
-            audio,
+            payload,
             Box::new(move |staged| match staged {
                 Ok(()) => deliver(
                     Wires {
@@ -755,7 +865,7 @@ impl Session {
                         &events,
                         &media,
                         id,
-                        format!("could not stage the recording: {e}"),
+                        format!("could not stage {what}: {e}"),
                     );
                 }
             }),

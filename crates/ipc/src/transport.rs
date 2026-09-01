@@ -5,6 +5,16 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 23: `ClientRequest::SendMedia`. A file the user picked — a photo, a
+/// video, a document — staged through the media cache and sent by the daemon,
+/// which is the half `SendAudio` already had and the composer's paperclip
+/// never did. A v22 daemon does not know the request and refuses it as
+/// malformed, and the daemon is the half that deliberately outlives an
+/// upgrade: without a version an upgraded window would offer the paperclip,
+/// stage every file the user picked, and have each send refused by a daemon
+/// that has been running since before the request existed. Exactly the case
+/// v15 and v21 were bumped for.
+///
 /// 22: `DaemonEvent::PluginsChanged` carries its set in a named field. It
 /// was a newtype variant holding a `Vec`, and this enum is internally
 /// tagged — serde cannot write a tag beside a JSON array, so every one of
@@ -146,7 +156,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///
@@ -277,6 +287,27 @@ pub fn media_path(key: &str) -> Option<PathBuf> {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
     sane.then(media_dir).flatten().map(|dir| dir.join(key))
 }
+
+/// The most a front end may stage in one payload.
+///
+/// Declared here rather than at either end, for the reason [`STAGED_PREFIX`]
+/// is: the two have to agree. The daemon's write endpoint refuses anything
+/// larger, and a front end that read a file first and learned the ceiling
+/// from a `413` would have spent the whole read — and, in a page, a copy of
+/// the file in a linear memory that has a ceiling of its own — to be told a
+/// number it could have asked for.
+///
+/// Sized for what actually goes through here: a voice note, a photo, a
+/// document, a clip. Not a film, which is a different design — the payload is
+/// read into the daemon's memory whole, because a partly staged file under a
+/// key a send is about to name is worse than a refused one.
+///
+/// Enforced in three places, which is not three rules: the daemon's write
+/// endpoint refuses a longer body because it must, a front end refuses a file
+/// at the chooser because that is where somebody can be told, and the one
+/// staging path every payload passes through refuses anything else because
+/// otherwise this sentence would be true of one transport and not the others.
+pub const MAX_STAGED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The prefix a front end's staged payload is filed under.
 ///

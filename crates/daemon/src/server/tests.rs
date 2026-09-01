@@ -203,6 +203,60 @@ async fn a_command_reaches_the_session_rather_than_being_refused() {
     ));
 }
 
+/// The payload moves rather than being unpacked and rebuilt, so what the
+/// session is handed is the struct the client sent. A field dropped between
+/// the two compiles and arrives as a document called "file" with no type on
+/// it, which is why this asserts on the fields rather than on the variant.
+#[tokio::test]
+async fn a_picked_file_reaches_the_session_as_it_was_described() {
+    let hub = connected_hub();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+
+    // Every optional field carries a value, because the ones that default to
+    // `None` are exactly the ones a handler can drop without failing anything.
+    let sent = oxidezap_ipc::SendMedia {
+        jid: "a@s.whatsapp.net".into(),
+        upload: "u-local-1".into(),
+        kind: oxidezap_core::OutgoingMedia::Image,
+        mime_type: "image/jpeg".into(),
+        file_name: "praia.jpg".into(),
+        caption: Some("olha isso".into()),
+        local_id: Some("local-1".into()),
+        quoted: Some(oxidezap_core::QuotedMessage {
+            message_id: "3EB0A".into(),
+            sender: "b@s.whatsapp.net".into(),
+            sender_name: "quem quer que seja".into(),
+            preview: "a linha citada".into(),
+            kind: None,
+        }),
+    };
+    let answer = handle_request(
+        bare(ClientRequest::SendMedia(sent.clone())),
+        &hub,
+        &no_plugins(),
+        &commands,
+        &outbox(),
+    )
+    .await;
+    assert!(matches!(
+        parse(answer.frame),
+        DaemonMessage::Accepted { .. }
+    ));
+    // Compared whole rather than field by field: the payload *moves*, so what
+    // this is really asserting is that nothing was rebuilt on the way — and a
+    // field added later is covered without anybody remembering to add it here.
+    assert_eq!(taken.await.unwrap().map(describe), Some(sent));
+}
+
+/// The media send inside an action, or nothing. A helper rather than a
+/// `matches!`, so the assertion above can be an equality.
+fn describe(action: Action) -> oxidezap_ipc::SendMedia {
+    match action {
+        Action::SendMedia(request) => request,
+        other => panic!("that is not a media send: {other:?}"),
+    }
+}
+
 /// `Accepted` has to mean the session took it, not that a queue did. The
 /// account can drop between the check at the door and the moment the
 /// bridge picks the command up, and a client told yes on admission alone

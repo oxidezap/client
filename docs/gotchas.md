@@ -187,6 +187,40 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   has to know is also the one thing worth overriding, so `OXIDEZAP_FRONT_END`
   names another — a TUI, a second GUI — and the shipped pair is only the
   default.
+- **What a file is sent as is decided in the front end; what it looks like is
+  worked out where the bytes land.** Two questions, and they are answered in
+  two places because they have two different pieces of evidence. The *kind* —
+  photo, video, document — follows the type the picker read, and it is a
+  choice rather than a derivation: a picture sent as a document keeps its bytes
+  exactly, which is a thing a front end is allowed to offer, so
+  `OutgoingMedia::for_mime` is the default and the field on the wire is the
+  answer. The *shape* — dimensions, duration, the small JPEG that rides on the
+  message — is read from the bytes by `session/whatsapp/outgoing.rs`, which is
+  the side holding them when the message is built. Deriving the shape in the
+  window instead would mean decoding every picture twice (once to draw the
+  bubble, once to describe it) and would put a thumbnail in a
+  newline-delimited JSON frame, which is the thing `staged_key` exists to
+  avoid.
+  The thumbnail is not a nicety: WhatsApp draws it while the file downloads,
+  and this tree draws it too — the store keeps what was sent and hydration
+  reads a sent message back through the same `media_of` an arriving one goes
+  through, so a message sent without one is a grey box on *both* sides. A
+  video has none, and that is the gap rather than a decision: producing one
+  means decoding H.264 where the account is held.
+  Nothing about the staging is new here. A picked file goes out exactly the
+  way a voice note does — `Session::send_staged` is the one path, and the four
+  media caches, the reservation order and the abandoned-upload race are all
+  the ones docs/web.md describes.
+- **A file's size is checked before its bytes are read, and the ceiling is the
+  protocol's.** `oxidezap_ipc::MAX_STAGED_BYTES`, named there rather than at
+  either end for the reason `STAGED_PREFIX` is: the daemon's write endpoint
+  refuses anything larger, and a front end that learned the number from a
+  `413` would have paid for the whole read — in a page, a copy of the file in
+  a linear memory with a ceiling — to be told something `metadata` and
+  `File.size` answer for nothing. Which is also why a chooser hands back two
+  lists rather than a `Result`: picking four photos and one film sends the
+  four and says what happened to the fifth.
+
 - **An ending is claimed, not owned.** Two places want to publish
   `UiEvent::CallEnded` — the arm handling the peer's `<terminate>`, and the
   watcher parked on `wait_ended` that the resulting hangup resolves — and in a

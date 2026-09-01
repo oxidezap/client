@@ -22,6 +22,12 @@ use crate::theme::{ActiveProductTheme as _, Metrics};
 pub enum InputAreaEvent {
     /// User wants to send the current message
     SendMessage(String),
+    /// User wants to attach files to this conversation.
+    ///
+    /// Carries nothing: which conversation is the app's to know, and the
+    /// files are chosen after the press — a dialog the composer neither owns
+    /// nor waits for.
+    AttachFiles,
     /// User started PTT recording
     StartRecording,
     /// User stopped PTT recording (send the audio)
@@ -405,6 +411,7 @@ impl InputAreaView {
     ) -> impl IntoElement + use<> {
         let entity = cx.entity().clone();
         let record_entity = entity.clone();
+        let attach_entity = entity.clone();
         // Asked of the rope rather than of a copy of it. `text()` hands back
         // the document itself; `to_string` copied all of it, on every
         // keystroke, to answer whether the send button or the microphone
@@ -421,17 +428,15 @@ impl InputAreaView {
             .items_center()
             .gap(metrics.space_md())
             .child(
-                // Drawn, disabled, and saying so. The slot is part of what a
-                // composer *is* and should not appear the day sending files
-                // lands; a control that looks live and does nothing is worse
-                // than one that admits it.
                 parts::icon_button(
                     "attach",
                     Icon::new(ProductIcon::Paperclip),
-                    "Attaching files is not available yet",
+                    "Attach a photo, a video or a document",
                     control,
                 )
-                .disabled(true),
+                .on_click(move |_, _window, cx| {
+                    attach_entity.update(cx, |_view, cx| cx.emit(InputAreaEvent::AttachFiles));
+                }),
             )
             .child(
                 div()

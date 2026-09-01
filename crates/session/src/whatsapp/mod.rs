@@ -15,6 +15,10 @@ mod lanes;
 /// What a message's media is, for both the roads it arrives on.
 mod media;
 
+/// What a picked file becomes on the wire: its shape, and the message that
+/// carries it.
+mod outgoing;
+
 /// Pages, their cursors, and where a read stops.
 mod paging;
 
@@ -28,6 +32,7 @@ use paging::{participant_keyed_chat, read_message_range};
 
 /// How far back a read receipt reaches: the last row a front end was shown,
 /// and the ids it is bounded by. Written in `paging`, beside the cursors.
+pub use outgoing::OutgoingFile;
 pub use paging::ReadBoundary;
 
 use std::collections::{HashMap, HashSet};
@@ -1425,6 +1430,131 @@ impl WhatsAppClient {
                     "client not available".to_string(),
                 )
                 .await;
+            }
+        })
+    }
+
+    /// Send a file somebody picked: a photo, a video, a document.
+    ///
+    /// The same three acts as [`Self::send_audio_message`] — upload, record,
+    /// send — and one more before them: a picked file is only bytes and a
+    /// name, so what the recipient needs in order to *draw* it before
+    /// downloading anything is worked out here. See [`outgoing`].
+    ///
+    /// Returns a handle the way every other send does, so a queue in front of
+    /// it stays a queue — and what the handle covers is the *ordering*, not
+    /// the work: the shaping goes to [`crate::exec::unblock`] because it is a
+    /// decode, and the upload is I/O. Neither runs on this task, and both are
+    /// awaited by it.
+    pub fn send_media_message(
+        &self,
+        jid_str: &str,
+        file: OutgoingFile,
+        local_id: String,
+        quoted: Option<oxidezap_core::QuotedMessage>,
+    ) -> Task<()> {
+        let chat_store = self.chat_store.clone();
+        let ui_sender = self.ui_sender.clone();
+        let client_handle = self.client_handle.clone();
+        let jid_str = jid_str.to_string();
+
+        self.exec.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(jid) => jid,
+                Err(e) => {
+                    error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    // The optimistic bubble still carries its local id;
+                    // without this it would sit unsent with no indicator.
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                    return;
+                }
+            };
+
+            // Clone the Arc and release the mutex: a slow network call
+            // here must not queue every other client action behind it.
+            let client = client_handle.lock().await.clone();
+            let Some(client) = client else {
+                error!("Client not available for sending media");
+                // The bubble still carries its local id (no rename ran).
+                notify_send_failed(
+                    &ui_sender,
+                    &jid_str,
+                    &local_id,
+                    "client not available".to_string(),
+                )
+                .await;
+                return;
+            };
+
+            // Before the upload, not after it: a picture that cannot be
+            // decoded is still sent, and one that can costs a decode either
+            // way — paying it first means a failed upload has not also been
+            // paid for.
+            //
+            // And off this thread. Shaping a picture is a decode and a
+            // scale-down of up to fifty megapixels, which is CPU-bound work
+            // measured in hundreds of millions of operations: run inline it
+            // holds a runtime worker — and in a page, the only thread there
+            // is — while every other connection and send waits. `unblock` is
+            // the seam that answers for both, a pool on the desktop and a
+            // call in a page, which is the honest answer where there is
+            // nowhere to hand work to.
+            //
+            // The file goes in and comes back out because the shaping only
+            // borrows it: moving it is free, and it is the alternative to
+            // cloning the bytes to look at them.
+            let (shape, mut file) =
+                match crate::exec::unblock(move || (outgoing::Shape::of(&file), file)).await {
+                    Ok(shaped) => shaped,
+                    Err(e) => {
+                        // The executor is going away, which is the session
+                        // shutting down. Reported rather than dropped: the bubble
+                        // is drawn and only an answer resolves it.
+                        error!("that file could not be prepared: {e}");
+                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                        return;
+                    }
+                };
+
+            // Moved out rather than cloned: the upload takes the bytes and
+            // everything after it wants only what the file *is*. A copy here
+            // would be a second whole file in the process holding the account,
+            // which in a page is a linear memory with a ceiling.
+            let data = std::mem::take(&mut file.data);
+            let (media_type, options) = file.upload_options();
+            let uploaded = match client.upload(data, media_type, options).await {
+                Ok(response) => outgoing::Uploaded::from(response),
+                Err(e) => {
+                    error!("Failed to upload {}: {}", file.mime_type, e);
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                    return;
+                }
+            };
+            info!(
+                "{} uploaded successfully ({} bytes)",
+                file.mime_type, uploaded.file_length
+            );
+
+            let message = outgoing::message(&file, shape, uploaded, quoted.as_ref());
+
+            // Same ordering as the text path: record before sending so
+            // the ack can't precede the row in the writer queue.
+            let msg_id = client.generate_message_id();
+            notify_message_id(&ui_sender, &jid_str, local_id, &msg_id).await;
+            record_outgoing(&chat_store, &jid, &msg_id, &message).await;
+            let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
+            match client
+                .send_message_with_options(jid.clone(), message, options)
+                .await
+            {
+                Ok(result) => {
+                    info!("Media message sent successfully: {}", result.message_id);
+                }
+                Err(e) => {
+                    error!("Failed to send media message {}: {}", msg_id, e);
+                    mark_send_failed(&chat_store, &jid, &msg_id).await;
+                    notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
+                }
             }
         })
     }

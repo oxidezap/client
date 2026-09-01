@@ -10,7 +10,23 @@ repository.workspace = true
 
 [dependencies]
 async-channel = "2"
+# What an outgoing picture says about itself: its dimensions, and the small
+# JPEG that rides on the message so the other side draws something before it
+# has downloaded anything. The formats a file picker actually hands over — the
+# defaults add a dozen decoders nothing here can be pointed at, and every one
+# of them is bytes in the page's bundle.
+image = { version = "0.25", default-features = false, features = [
+    "gif",
+    "jpeg",
+    "png",
+    "webp",
+] }
 log = { workspace = true }
+# The same, for a video: an ISO-MP4 knows its own dimensions and duration, and
+# a message that states them is one the recipient can lay out before the file
+# arrives. Demuxing only — nothing here decodes a frame.
+mp4 = "0.14"
+
 # The clock, for the cold-start stopwatch in `whatsapp::run_client`. Already
 # in this graph through `whatsapp-rust`; named here because `clippy.toml`
 # disallows `std::time::Instant::now`, and rightly — it does not exist on the

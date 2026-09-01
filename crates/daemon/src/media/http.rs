@@ -26,7 +26,12 @@ use crate::listener::web::http::{percent_decode, respond};
 /// send is about to name is worse than a refused one. So the ceiling is what
 /// keeps that from being unbounded, and it is sized for what actually goes
 /// through here — a voice note or a photo, never a film.
-const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
+///
+/// The number is the protocol's rather than this module's, because the front
+/// end has to know it before it reads a file: `oxidezap_ipc` is where the two
+/// ends meet, and a client that learned this from a `413` would have paid for
+/// the whole read to be told it.
+const MAX_UPLOAD_BYTES: u64 = oxidezap_ipc::MAX_STAGED_BYTES;
 
 /// How long a staged payload has to arrive once its head has been read.
 ///

@@ -167,6 +167,25 @@
   already encoded rather than re-recording them. Worth measuring against a
   real account before this line is deleted.
 
+- **An attachment is sent as it is, and without a caption.** Picking a file
+  sends it: there is no step between the chooser and the send for a caption to
+  be typed in, for a photo to be cropped, or for the kind to be overridden —
+  and the composer's own text stays a message of its own rather than becoming
+  one, because taking it at the press would lose it to a dismissed chooser and
+  taking it at the completion means reaching for a `Window` from inside an
+  async continuation. The protocol carries `caption` and `kind` per file
+  precisely so that step is a front-end change rather than a protocol one.
+  Two smaller gaps go with it. A video is sent without a poster frame: the
+  `jpegThumbnail` is what the recipient draws before downloading anything, and
+  producing one means decoding H.264 inside the process holding the account —
+  the decoder is in `oxidezap-video`, which the session already depends on, so
+  what is missing is a first-frame path rather than a decoder. And a picture
+  is uploaded at full size, where WhatsApp's own clients re-encode: sending a
+  12 MP photo over a phone connection is what that costs.
+  The preflight question above is this feature's too, and more so: a photo
+  from a page takes exactly the route a voice note takes, and there are more
+  of them.
+
 - **A video with B-frames is stamped in the wrong order.** `stamp_of` labels
   each access unit with its decode-order index, and `collect` reads that label
   back as the picture's position. The two agree exactly while decode order is
