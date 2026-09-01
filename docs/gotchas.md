@@ -598,6 +598,47 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   every path out that is not a camera held withdraws it again, and the
   refusal's own teardown queues on the call's video lane behind the enable it
   is answering.
+- **The browser's camera reaches WebCodecs through a `<video>`, and that
+  element has to be in the document.** A hidden element plays the stream and
+  every tick takes a `VideoFrame` from it. `MediaStreamTrackProcessor` would
+  read frames off the track with no element at all and is the nicer shape, but
+  it is not in every engine this has to run on — Firefox has none of it — so
+  the element path has to exist regardless, and one path is better than two.
+  Re-check the support table before concluding it still has to. It was written
+  *detached*, on the reasoning that an element with no parent still decodes
+  and an added one would draw the self-view twice. Production disagreed, on
+  every camera a call ever opened: `play()` rejected with "The play() request
+  was interrupted because the media was removed from the document." Blink
+  decides that on `InActiveDocument()`, which is `isConnected()` and an active
+  document — a never-inserted element fails it exactly like a removed one. So
+  the element is appended, one pixel of it, off screen and fully transparent.
+  Not `display: none`: a hidden element is entitled to stop rendering, and
+  this one exists to produce frames.
+  The second half is that `play()` is not the question — whether frames will
+  come is. The two came apart here: the promise was aborted for a lifecycle
+  reason while the element went on decoding, and treating the rejection as
+  fatal downgraded every video call to voice. The element is asked directly
+  instead, and asked whatever the promise did — a rejection, a resolution, and
+  a promise still pending when the grace expires all reach the same test,
+  since asking only on a rejection lets the one case that never answers
+  through untested. The test is `paused` first, then `readyState` and
+  `videoWidth`. `paused` is the
+  load-bearing half — a `MediaStream` reaches `HAVE_CURRENT_DATA` with a
+  nonzero `videoWidth` the moment the element is wired to it, whether or not
+  it was ever allowed to start, so readiness alone would pass a genuine
+  autoplay refusal and then feed the encoder one still picture for the length
+  of the call. Playing *and* showing something is the question; either half on
+  its own is not.
+  And a media element playing a `MediaStream` is rooted by the *browser*,
+  because playback is a root: one merely dropped goes on being a sink on the
+  camera's track for the life of the page. Six refused attempts in one call is
+  six of them. Paused, unwired and removed, in that order, it holds nothing —
+  which is `release_element`. Every exit reaches it: `attach` on its own
+  refusal, `Held` at the end of the call, and `ElementGuard` in between, since
+  the element is inserted and playing three fallible steps before `Held`
+  exists. That guard is the same shape as the camera's and the encoder's
+  beside it, and for the same reason — the leak is not on the path anyone
+  looks at.
 - **What a call turned out to be is said by the side that opened the
   device.** The kind is drawn from the offer, because that is all anyone
   knows when the call is placed or answered — and a camera that will not open
