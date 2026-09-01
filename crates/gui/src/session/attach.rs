@@ -23,21 +23,24 @@ use std::sync::Arc;
 use oxidezap_ipc::{ClientRequest, Link, PROTOCOL_VERSION};
 
 use super::media::MediaCache;
-use super::sink::{self, EventSink, Events};
+use super::sink::{self, Events, ReaderSink};
 use super::{Pending, Session};
 
 /// A connection, with everything its reader is going to need.
 ///
 /// The session is the caller's — a desktop one still has a teardown to hang
 /// on it — and the other four are what [`super::frames::Frames`] is built
-/// from, cloned here so the reader can own them wherever it runs.
+/// from, handed over so the reader can own them wherever it runs. The sink is
+/// *moved* rather than cloned, and cannot be otherwise: the end that may wait
+/// for room belongs to one reader, and [`sink::ReaderSink`] is not `Clone` so
+/// that there is no second holder to get it wrong.
 pub(super) struct Attached {
     /// The connection, for the front end.
     pub session: Session,
     /// The half the front end drains.
     pub events: Events,
     /// The half the reader publishes on.
-    pub sink: EventSink,
+    pub sink: ReaderSink,
     /// The request table, so the reader can answer what this side asked.
     pub pending: Pending,
     /// Where a decoded call picture goes.
@@ -67,7 +70,7 @@ pub(super) fn begin(
     has_window: bool,
 ) -> std::io::Result<Attached> {
     let (sink, events) = sink::channel();
-    let session = Session::new(link, sink.clone(), media);
+    let session = Session::new(link, sink.ui(), media);
     session.send(ClientRequest::Hello {
         protocol: PROTOCOL_VERSION,
         session_events: true,

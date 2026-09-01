@@ -92,8 +92,8 @@ use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
 
 use self::media::MediaCache;
-use self::sink::EventSink;
 pub use self::sink::Events;
+use self::sink::{ReaderSink, UiSink};
 
 /// What this account occupies on disk, as the daemon measured it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -259,7 +259,13 @@ impl Awaiting {
     /// is [`Session`] on the paths that run before a request leaves and the
     /// reader on the paths that run after. Both call [`Self::staged_key`]
     /// first.
-    fn failed(self, detail: &str, events: Option<&EventSink>) {
+    ///
+    /// Takes the *reader's* end of the queue, and so is only reachable from
+    /// the reader: publishing here waits for room, which is right on a thread
+    /// of its own and a deadlock on the executor that drains the queue. The
+    /// paths that run there pass `None` and answer through
+    /// [`fail_reserved`].
+    fn failed(self, detail: &str, events: Option<&ReaderSink>) {
         match self {
             Self::Download(tx) => {
                 let _ = tx.send(Err(detail.to_string()));
@@ -466,7 +472,7 @@ pub struct Session {
     /// could not be staged in the media cache — and the front end has already
     /// drawn the message. Without a way to say so from here those failures had
     /// nowhere to go, and the bubble sat pending for good with no retry.
-    events: EventSink,
+    events: UiSink,
     /// The newest decoded picture of each direction, written where the frames
     /// are read and taken by the window. See [`FromDaemon::CallFrames`].
     frames: crate::video::LatestFrames,
@@ -567,7 +573,7 @@ impl Session {
     }
 
     /// The parts every transport supplies, assembled.
-    fn new(link: Link, events: EventSink, media: Arc<dyn MediaCache>) -> Self {
+    fn new(link: Link, events: UiSink, media: Arc<dyn MediaCache>) -> Self {
         Self {
             link,
             pending: Pending::default(),
@@ -1266,7 +1272,7 @@ struct Wires<'a> {
     link: &'a Link,
     outbox: &'a Sending,
     pending: &'a Pending,
-    events: &'a EventSink,
+    events: &'a UiSink,
     media: &'a Arc<dyn MediaCache>,
 }
 
@@ -1338,7 +1344,7 @@ fn deliver(conn: Wires<'_>, id: RequestId, request: ClientRequest, how: Delivery
 /// to say so in the terms that request was made in.
 fn fail_reserved(
     pending: &Pending,
-    events: &EventSink,
+    events: &UiSink,
     media: &Arc<dyn MediaCache>,
     id: RequestId,
     detail: String,
@@ -1355,34 +1361,33 @@ fn fail_reserved(
     if let Some(key) = waiting.staged_key() {
         media.discard(key);
     }
+    // Answered here rather than through `Awaiting::failed`, which is the
+    // reader's version of this: that one publishes on a `ReaderSink` and is
+    // allowed to wait for room, and this runs on the GPUI executor — the
+    // thread that drains the queue. Holding a `UiSink` is what says so, and
+    // there is no waiting publish to reach from here.
     match waiting {
-        // This runs on the GPUI executor, and that executor is what drains
-        // this queue. `failed` publishes with the waiting variant of the
-        // send, so a full queue would park the only thread that could empty
-        // it — the window stops rather than saying the message did not go.
         Awaiting::Send {
             chat_jid, local_id, ..
         } => {
             error!("send failed before it left: {detail}");
-            events.try_send(FromDaemon::Session(Box::new(UiEvent::SendFailed {
+            let _ = events.try_send(FromDaemon::Session(Box::new(UiEvent::SendFailed {
                 chat_jid,
                 message_id: local_id,
                 reason: detail,
             })));
         }
-        // Same thread, same rule: `failed` would `blocking_send` on the queue
-        // this executor drains.
         Awaiting::StatusView { message_ids } => {
             error!("a status view never left this process: {detail}");
-            events.try_send(FromDaemon::StatusViewLost(message_ids));
+            let _ = events.try_send(FromDaemon::StatusViewLost(message_ids));
         }
-        // And the same rule again, for the same reason it is a rule: a view
-        // waiting on a page asks for nothing until it hears, so a request
-        // that never left has to say so — the reconnect keeps the chats and
-        // the paging state, and a list left `Loading` never asks again.
+        // A view waiting on a page asks for nothing until it hears, so a
+        // request that never left has to say so — the reconnect keeps the
+        // chats and the paging state, and a list left `Loading` never asks
+        // again.
         Awaiting::Page { jid } => {
             error!("a page request never left this process: {detail}");
-            events.try_send(FromDaemon::PageLost { jid });
+            let _ = events.try_send(FromDaemon::PageLost { jid });
         }
         waiting => waiting.failed(&detail, None),
     }
