@@ -632,6 +632,7 @@ impl WhatsAppClient {
                 // the per-event closure, and what this asks the client is the
                 // PN/LID pairing that decides the lane.
                 let dispatch_client = client.clone();
+                let dispatch_names = names.clone();
                 let mut lanes = EventLanes::new(
                     move |event| {
                         let client = client.clone();
@@ -664,7 +665,9 @@ impl WhatsAppClient {
                     // nothing to say — the arms below speak only for the
                     // variants they handle.
                     debug!("client event: {:?}", event.kind());
-                    lanes.dispatch(&dispatch_client, event).await;
+                    lanes
+                        .dispatch(&dispatch_client, &dispatch_names, event)
+                        .await;
                 }
             });
         }
@@ -773,7 +776,15 @@ impl WhatsAppClient {
                     info!("Incoming call from {}", call.from.observe());
                     let offer = Arc::new(call.clone());
                     calls.offer(call_id.clone(), offer.clone());
-                    let caller_jid = normalize_chat_jid(&client, &call.from.to_string()).await;
+                    // A call has to ring even when nobody can say which of
+                    // the caller's two addresses their chat is filed under:
+                    // the address as written is no worse than the one the
+                    // offer arrived under, and a card nobody sees is worse
+                    // than a card whose chat link misses.
+                    let caller_jid = names
+                        .chat_key(&client, &call.from)
+                        .await
+                        .unwrap_or_else(|| call.from.to_non_ad_string());
                     let caller_name = call
                         .notify
                         .as_deref()
@@ -903,12 +914,23 @@ impl WhatsAppClient {
                     receipt.source.chat.observe()
                 );
 
-                // Normalize the chat JID
-                let normalized_chat_jid =
-                    normalize_chat_jid(&client, &receipt.source.chat.to_string()).await;
+                // A receipt marks rows a front end already has. Published
+                // under a key nobody could confirm, it lands on a second,
+                // PN-keyed copy of a conversation whose messages live under
+                // the LID — a read mark on the wrong thread, or on none. Say
+                // so and drop it: the next read of the mapping settles the
+                // pair, and every later receipt for the chat is keyed by it.
+                let Some(chat_jid) = names.chat_key(&client, &receipt.source.chat).await else {
+                    warn!(
+                        "dropping {:?} receipt for {}: the PN/LID pair behind it could not be read",
+                        dominated_type,
+                        receipt.source.chat.observe()
+                    );
+                    return;
+                };
 
                 let _ = ui_tx.send(UiEvent::ReceiptReceived {
-                    chat_jid: normalized_chat_jid,
+                    chat_jid,
                     message_ids: receipt.message_ids.clone(),
                     receipt_type: dominated_type,
                 });
@@ -926,7 +948,16 @@ impl WhatsAppClient {
                     }),
                     WaChatPresence::Paused => None,
                 };
-                let chat_jid = normalize_chat_jid(&client, &update.source.chat.to_string()).await;
+                // Same rule as the receipt above: a typing line is drawn on
+                // a conversation somebody is looking at, and a guessed key
+                // draws it on a different one.
+                let Some(chat_jid) = names.chat_key(&client, &update.source.chat).await else {
+                    warn!(
+                        "dropping chat presence for {}: the PN/LID pair behind it could not be read",
+                        update.source.chat.observe()
+                    );
+                    return;
+                };
                 let sender = update.source.sender.clone();
                 // Keyed by the same JID whichever alias the event arrived
                 // under. The registry is a map, and `clear_composing` looks
@@ -958,11 +989,18 @@ impl WhatsAppClient {
                 } else {
                     Availability::Online
                 };
-                // Normalized like the receipt and chat-presence branches
-                // beside it: a chat whose JID was migrated from a phone
-                // number to a LID is keyed by the LID, so presence published
-                // under the PN alias would never reach it.
-                let jid = normalize_chat_jid(&client, &update.from.to_string()).await;
+                // Keyed like the receipt and chat-presence branches beside
+                // it: a chat whose JID was migrated from a phone number to a
+                // LID is keyed by the LID, so presence published under the PN
+                // alias would never reach it — and published under a key
+                // nobody could confirm it reaches a different chat instead.
+                let Some(jid) = names.chat_key(&client, &update.from).await else {
+                    warn!(
+                        "dropping presence for {}: the PN/LID pair behind it could not be read",
+                        update.from.observe()
+                    );
+                    return;
+                };
                 let _ = ui_tx.send(UiEvent::PresenceUpdated { jid, availability });
             }
             // Something happened *to* the group. Only the changes a member
@@ -1058,13 +1096,25 @@ impl WhatsAppClient {
                     target_id
                 );
 
-                // Use remote_jid from key if available, otherwise use chat from info
-                let chat_jid = key
+                // Use remote_jid from key if available, otherwise use chat
+                // from info. A `remote_jid` that will not even parse names no
+                // chat, so the envelope's own does.
+                let chat = key
                     .remote_jid
-                    .clone()
-                    .unwrap_or_else(|| info.source.chat.to_string());
+                    .as_deref()
+                    .and_then(|jid| jid.parse::<Jid>().ok())
+                    .unwrap_or_else(|| info.source.chat.clone());
 
-                let normalized_chat_jid = normalize_chat_jid(client, &chat_jid).await;
+                // A reaction hangs off a row somebody already has, so it is
+                // dropped rather than guessed at, like the receipt above.
+                let Some(chat_jid) = names.chat_key(client, &chat).await else {
+                    warn!(
+                        "dropping reaction on {} in {}: the PN/LID pair behind it could not be read",
+                        target_id,
+                        chat.observe()
+                    );
+                    return;
+                };
 
                 // One person, one reaction. `ChatMessage::add_reaction` keys
                 // by this string and enforces one per sender — and a removal
@@ -1075,7 +1125,7 @@ impl WhatsAppClient {
                 let reactor = names.identity(client, &info.source.sender).await;
 
                 let _ = ui_tx.send(UiEvent::ReactionReceived {
-                    chat_jid: normalized_chat_jid,
+                    chat_jid,
                     message_id: target_id.clone(),
                     sender: reactor.canonical_jid.clone(),
                     emoji,
@@ -1145,9 +1195,22 @@ impl WhatsAppClient {
 
         Self::hydrate_quoted_authors(client, names, std::slice::from_mut(&mut chat_message)).await;
 
-        // Normalize chat JID to LID if mapping exists, so the same user doesn't
-        // appear as two chats when messages come from PN vs LID.
-        let normalized_chat_jid = normalize_chat_jid(client, &info.source.chat.to_string()).await;
+        // Keyed by the LID where the pair is known, so the same user doesn't
+        // appear as two chats when messages come from PN vs LID. Unlike the
+        // annotations above, this bubble is the only place its content will
+        // ever appear: an unreadable mapping falls back to the address the
+        // message arrived under — which is the chat it would have been filed
+        // in before any of this existed — rather than dropping it.
+        let chat_jid = match names.chat_key(client, &info.source.chat).await {
+            Some(key) => key,
+            None => {
+                warn!(
+                    "filing a message in {} by the address it arrived under: the PN/LID pair behind it could not be read",
+                    info.source.chat.observe()
+                );
+                info.source.chat.to_non_ad_string()
+            }
+        };
 
         // One person, one row in the status feed. The broadcast is grouped by
         // sender, and the same contact reaches it under a phone number on
@@ -1182,7 +1245,7 @@ impl WhatsAppClient {
         };
 
         let _ = ui_tx.send(UiEvent::MessageReceived {
-            chat_jid: normalized_chat_jid,
+            chat_jid,
             message: Box::new(chat_message),
             sender_name,
         });
@@ -1839,21 +1902,6 @@ async fn mark_send_failed(chat_store: &ChatStoreHandle, jid: &Jid, message_id: &
         && let Err(e) = store.mark_send_failed(jid, message_id)
     {
         warn!("Failed to mark send {} as failed: {e}", message_id);
-    }
-}
-
-/// Map a PN chat JID to its LID form when a mapping is known, so the same user
-/// doesn't split into two chats (PN vs LID addressing).
-async fn normalize_chat_jid(client: &Client, jid_str: &str) -> String {
-    let Ok(jid) = jid_str.parse::<Jid>() else {
-        return jid_str.to_string();
-    };
-    if !jid.is_pn() {
-        return jid_str.to_string();
-    }
-    match client.get_lid_pn_entry(&jid).await {
-        Ok(Some(entry)) => format!("{}@lid", entry.lid),
-        _ => jid_str.to_string(),
     }
 }
 
