@@ -355,21 +355,12 @@ impl WhatsAppApp {
         let mut msg = ChatMessage::new_outgoing_with_media(
             local_id,
             String::new(),
-            MediaContent {
-                media_type: MediaType::Audio,
-                data: Arc::new(ogg_data),
-                cache_key: None,
-                mime_type: "audio/ogg; codecs=opus".to_string(),
-                width: None,
-                height: None,
-                caption: None,
-                file_name: None,
-                downloadable: None,
-                is_animated: false,
-                duration_secs: Some(duration_secs),
-                data_is_preview: false,
-                waveform: Some(envelope),
-            },
+            MediaContent::audio(
+                Arc::new(ogg_data),
+                "audio/ogg; codecs=opus".to_string(),
+                Some(duration_secs),
+                Some(envelope),
+            ),
         );
 
         // The bubble shows the quote too, or the sender sees a bare note

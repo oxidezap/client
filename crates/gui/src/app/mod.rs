@@ -347,9 +347,9 @@ use crate::views::{
 use oxidezap_audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
 use oxidezap_core::{
     ActiveCall, AppState, Availability, CachedQrCode, CallOutcome, CallRecord, CallState, Chat,
-    ChatMessage, ComposingKind, DownloadableMedia, Ending, Issued, MediaContent, MediaType,
-    MessageStatus, OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Resend, Stage,
-    SystemNotice, TypingSummary, UiEvent,
+    ChatMessage, ComposingKind, DownloadableMedia, Ending, Issued, MediaContent, MessageStatus,
+    OutgoingCall, PresenceRegistry, QuotedMessage, ReceiptType, Resend, Stage, SystemNotice,
+    TypingSummary, UiEvent,
 };
 
 // ChatListCache is now in chats.rs and re-exported above

@@ -264,19 +264,17 @@ fn build_items(messages: &[ChatMessage], typing: Option<TypingSummary>) -> Vec<T
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use oxidezap_core::Typist;
+    use oxidezap_core::{Typist, fixtures};
 
     fn at(day: u32, hour: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 3, day, hour, 0, 0).unwrap()
     }
 
     fn message(sender: &str, from_me: bool, when: DateTime<Utc>) -> ChatMessage {
-        let mut msg = ChatMessage::new_incoming(
-            format!("{sender}-{}", when.timestamp()),
-            sender.to_string(),
-            "hi".to_string(),
-        );
+        let mut msg = fixtures::message(&format!("{sender}-{}", when.timestamp()), sender, "hi");
         msg.is_from_me = from_me;
+        // Dated by the calendar rather than by an offset: what these tests are
+        // about is where the day dividers fall.
         msg.timestamp = when;
         msg
     }

@@ -14,7 +14,7 @@ use std::time::Duration;
 // a test that moves time has to move what these read.
 use wacore::time::Instant;
 
-use oxidezap_core::{ChatMessage, MessageStatus, PluginSlot, PluginWidget};
+use oxidezap_core::{MessageStatus, PluginSlot, PluginWidget, fixtures};
 
 use super::*;
 
@@ -152,24 +152,14 @@ impl Drop for TempDir {
 }
 
 fn message(chat: &str, text: &str) -> UiEvent {
+    // The sender is the chat, and the jids stay the callers' own rather than
+    // the shared ones: several of them are also spelled inside a `.wat`
+    // fixture below, byte length and all.
+    let mut message = fixtures::message("MSG1", chat, text);
+    message.status = MessageStatus::Delivered;
     UiEvent::MessageReceived {
         chat_jid: chat.into(),
-        message: Box::new(ChatMessage {
-            id: "MSG1".into(),
-            sender: chat.into(),
-            sender_name: None,
-            content: text.into(),
-            timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
-                .expect("a valid instant"),
-            is_from_me: false,
-            is_read: false,
-            media: None,
-            reactions: Default::default(),
-            status: MessageStatus::Delivered,
-            quoted: None,
-            revoked: false,
-            system: None,
-        }),
+        message: Box::new(message),
         sender_name: None,
     }
 }

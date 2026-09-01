@@ -126,23 +126,13 @@ fn matches(message: &ChatMessage, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
-
-    fn message(id: &str, content: &str) -> ChatMessage {
-        let mut message = ChatMessage::new_incoming(
-            id.to_string(),
-            "a@s.whatsapp.net".to_string(),
-            content.to_string(),
-        );
-        message.timestamp = DateTime::<Utc>::from_timestamp(0, 0).expect("epoch");
-        message
-    }
+    use oxidezap_core::fixtures;
 
     fn history() -> Vec<ChatMessage> {
         vec![
-            message("1", "the invoice is attached"),
-            message("2", "thanks"),
-            message("3", "Invoice again, sorry"),
+            fixtures::message("1", fixtures::PEER, "the invoice is attached"),
+            fixtures::message("2", fixtures::PEER, "thanks"),
+            fixtures::message("3", fixtures::PEER, "Invoice again, sorry"),
         ]
     }
 
