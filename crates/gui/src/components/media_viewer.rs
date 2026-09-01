@@ -17,7 +17,8 @@ use gpui_component::{Disableable as _, FocusTrapElement as _, Icon, IconName, Si
 
 use crate::app::{MediaViewer, VIEWER_CONTEXT, ViewerNext, ViewerPrev, WhatsAppApp};
 use crate::components::ProductIcon;
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::components::parts;
+use crate::theme::Metrics;
 use crate::utils::format_list_time;
 
 /// How much of a caption the viewer shows before it scrolls, in multiples of
@@ -94,7 +95,7 @@ pub fn render_media_viewer(
         .flex_col()
         // Nearly opaque rather than a light wash: the point is that nothing
         // else is competing with the picture.
-        .bg(cx.product().hsla(cx.product().palette.scrim).opacity(0.92))
+        .bg(parts::scrim(cx).opacity(0.92))
         .child(render_bar(
             props.author,
             when,
@@ -199,7 +200,7 @@ pub fn render_media_viewer(
                     div()
                         .max_w(metrics.reading_width())
                         .text_size(metrics.text_secondary())
-                        .text_color(cx.product().hsla(cx.product().palette.on_scrim))
+                        .text_color(parts::on_scrim(cx))
                         .child(caption),
                 )
         }))
@@ -227,7 +228,7 @@ fn render_bar(
     // *deepest* surface in a dark preset, which is near-black text on a
     // near-black scrim, and in the light preset it is white on white. The
     // viewer's ground is its own pair of tokens for exactly that reason.
-    let on_scrim = cx.product().hsla(cx.product().palette.on_scrim);
+    let on_scrim = parts::on_scrim(cx);
 
     div()
         .flex_shrink_0()
@@ -237,19 +238,12 @@ fn render_bar(
         .px(metrics.space_xxl())
         .py(metrics.space_lg())
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .child(
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_secondary())
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(on_scrim)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(author),
                 )
                 .child(
@@ -339,20 +333,12 @@ fn render_frame(
                 ProductIcon::Image
             })
             .size(metrics.icon())
-            .text_color(
-                cx.product()
-                    .hsla(cx.product().palette.on_scrim)
-                    .opacity(0.6),
-            ),
+            .text_color(parts::on_scrim(cx).opacity(0.6)),
         )
         .child(
             div()
                 .text_size(metrics.text_secondary())
-                .text_color(
-                    cx.product()
-                        .hsla(cx.product().palette.on_scrim)
-                        .opacity(0.6),
-                )
+                .text_color(parts::on_scrim(cx).opacity(0.6))
                 .child("This file cannot be shown here."),
         )
         .into_any_element()

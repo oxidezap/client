@@ -23,6 +23,7 @@ use crate::app::BubbleIds;
 use crate::app::{MessageListCache, TimelineItem, WhatsAppApp};
 use crate::components::message_bubble::render_encryption_notice;
 use crate::components::message_bubble::{AudioProgress, BubbleProps};
+use crate::components::parts;
 use crate::components::{Avatar, BubbleText, EmptyState, ProductIcon, render_message_bubble};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
@@ -246,7 +247,7 @@ fn render_date_divider(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
 
     div()
         .w_full()
@@ -293,7 +294,7 @@ fn render_typing(
     } else {
         cx.theme().muted_foreground
     };
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
 
     div()
         .w_full()

@@ -6,6 +6,7 @@ use gpui::{App, Image, ImageFormat, ImageSource, IntoElement, ParentElement, Sty
 use gpui_component::ActiveTheme as _;
 
 use super::centered_view;
+use crate::components::parts;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use oxidezap_core::{CachedQrCode, Issued, Lifetime};
 
@@ -107,7 +108,7 @@ fn render_steps(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
         "Go to Settings → Linked devices",
         "Tap Link a device and scan this code",
     ];
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
 
     div()
         .flex()
@@ -179,7 +180,7 @@ fn render_qr(
 
 /// The typed alternative, spaced so it can be read aloud or copied by eye.
 fn render_pair_code(code: String, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
 
     div()
         .flex()
@@ -222,7 +223,7 @@ fn render_expiry(
     let (left, remaining) = life
         .map(|life| life.left_at(wacore::time::now_utc()))
         .unwrap_or((0, 0.0));
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
     // Running out is worth noticing before it happens.
     let colour = if remaining < 0.25 {
         cx.theme().warning

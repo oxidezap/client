@@ -14,7 +14,7 @@ use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
 use oxidezap_core::{Availability, Chat, TypingSummary};
 
-use super::{Avatar, ProductIcon};
+use super::{Avatar, ProductIcon, parts};
 
 /// Only plain PN/LID user JIDs can receive a call (not groups, broadcast
 /// lists, status or newsletters).
@@ -172,33 +172,23 @@ fn render_identity(
                 .on(cx.theme().sidebar),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .gap(metrics.space_xxs())
                 .child(
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_strong())
                         .text_color(cx.theme().foreground)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(name),
                 )
                 .children(subtitle.map(|(text, is_typing)| {
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_small())
                         .text_color(if is_typing {
                             cx.theme().primary
                         } else {
                             cx.theme().muted_foreground
                         })
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(text)
                 })),
         )
@@ -231,13 +221,7 @@ fn render_actions(
     // does, so that what gives way on a narrow header is the plugins' region
     // rather than Call or the overflow menu.
     let action = |id: &'static str, icon: Icon, tip: &'static str| {
-        Button::new(id)
-            .icon(icon)
-            .ghost()
-            .flex_shrink_0()
-            .tooltip(tip)
-            .w(layout.icon_button_size())
-            .h(layout.icon_button_size())
+        parts::icon_button(id, icon, tip, layout.icon_button_size()).flex_shrink_0()
     };
 
     div()
@@ -316,49 +300,47 @@ fn render_overflow_menu(
     let video_entity = entity.clone();
     let call_entity = entity;
 
-    Button::new("chat-menu")
-        .icon(Icon::new(IconName::EllipsisVertical))
-        .ghost()
-        .tooltip("More")
-        .w(layout.icon_button_size())
-        .h(layout.icon_button_size())
-        .dropdown_menu(move |menu, _window, _cx| {
-            let search_entity = search_entity.clone();
-            let call_entity = call_entity.clone();
-            let video_entity = video_entity.clone();
-            let video_jid = jid.clone();
-            let jid = jid.clone();
+    parts::icon_button(
+        "chat-menu",
+        Icon::new(IconName::EllipsisVertical),
+        "More",
+        layout.icon_button_size(),
+    )
+    .dropdown_menu(move |menu, _window, _cx| {
+        let search_entity = search_entity.clone();
+        let call_entity = call_entity.clone();
+        let video_entity = video_entity.clone();
+        let video_jid = jid.clone();
+        let jid = jid.clone();
 
-            let menu = menu.item(
-                PopupMenuItem::new("Search in conversation")
-                    .icon(IconName::Search)
-                    .on_click(move |_, window, cx| {
-                        search_entity
-                            .update(cx, |app, cx| app.toggle_conversation_search(window, cx));
+        let menu = menu.item(
+            PopupMenuItem::new("Search in conversation")
+                .icon(IconName::Search)
+                .on_click(move |_, window, cx| {
+                    search_entity.update(cx, |app, cx| app.toggle_conversation_search(window, cx));
+                }),
+        );
+
+        if !callable {
+            return menu;
+        }
+        menu.separator()
+            .item(
+                PopupMenuItem::new("Voice call")
+                    .icon(Icon::from(ProductIcon::Phone))
+                    .on_click(move |_, _window, cx| {
+                        call_entity.update(cx, |app, cx| app.start_call(jid.clone(), false, cx));
                     }),
-            );
-
-            if !callable {
-                return menu;
-            }
-            menu.separator()
-                .item(
-                    PopupMenuItem::new("Voice call")
-                        .icon(Icon::from(ProductIcon::Phone))
-                        .on_click(move |_, _window, cx| {
-                            call_entity
-                                .update(cx, |app, cx| app.start_call(jid.clone(), false, cx));
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("Video call")
-                        .icon(Icon::from(ProductIcon::Video))
-                        .on_click(move |_, _window, cx| {
-                            video_entity
-                                .update(cx, |app, cx| app.start_call(video_jid.clone(), true, cx));
-                        }),
-                )
-        })
+            )
+            .item(
+                PopupMenuItem::new("Video call")
+                    .icon(Icon::from(ProductIcon::Video))
+                    .on_click(move |_, _window, cx| {
+                        video_entity
+                            .update(cx, |app, cx| app.start_call(video_jid.clone(), true, cx));
+                    }),
+            )
+    })
 }
 
 #[cfg(test)]

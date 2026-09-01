@@ -18,7 +18,8 @@ use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 
 use crate::app::{SettingsSection, WhatsAppApp};
 use crate::components::ProductIcon;
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::components::parts;
+use crate::theme::Metrics;
 
 /// Version strings for the sidebar footer.
 ///
@@ -66,11 +67,7 @@ pub fn render_settings_view(
             el.child(render_nav(section, entity.clone(), metrics, cx))
         })
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .child(render_header(
                     section,
                     is_mobile,
@@ -327,7 +324,7 @@ fn render_header(
 }
 
 fn render_versions(metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
 
     div()
         .flex_shrink_0()

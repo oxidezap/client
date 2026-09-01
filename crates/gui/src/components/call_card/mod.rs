@@ -22,8 +22,9 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Icon, IconName, Selectable as _, Sizable as _};
 
 use crate::app::{AcceptCall, CALL_CONTEXT, CallCard, DeclineCall, ToggleMute, WhatsAppApp};
+use crate::components::parts;
 use crate::responsive::ResponsiveLayout;
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::theme::Metrics;
 use gpui::AppContext as _;
 use oxidezap_core::{ActiveCall, CallState, Stage};
 
@@ -299,7 +300,7 @@ fn drag_handle(
     // and a pill when minimised.
     let viewport = layout.viewport();
     let inset = metrics.space_xxl();
-    let dot = cx.product().hsla(cx.product().palette.faint_foreground);
+    let dot = parts::faint(cx);
 
     div()
         .id("call-card-handle")
@@ -373,10 +374,7 @@ fn minimized_pill(
                 // included — off the left of the window.
                 .max_w(metrics.text_secondary() * 12.0)
                 .child(
-                    div()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
+                    parts::one_line()
                         .text_size(metrics.text_secondary())
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(cx.theme().foreground)
@@ -477,19 +475,12 @@ fn mobile_banner(
                 .on(cx.theme().secondary),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .child(
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_secondary())
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(cx.theme().foreground)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(name),
                 )
                 .child(

@@ -6,6 +6,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use oxidezap_core::{QuotedMessage, plain_message_text};
 
 use crate::app::WhatsAppApp;
+use crate::components::parts;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 
 /// The message being replied to, drawn inside the replying bubble.
@@ -50,11 +51,7 @@ pub fn render_quote(
                 .bg(hue),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .gap(metrics.space_xxs())
                 .child(
                     div()
@@ -64,12 +61,9 @@ pub fn render_quote(
                         .child(name),
                 )
                 .child(
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_secondary())
                         .text_color(cx.theme().muted_foreground)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(summary),
                 ),
         )

@@ -17,7 +17,7 @@ use oxidezap_core::{Fault, Recovery};
 
 use super::centered_view;
 use crate::app::WhatsAppApp;
-use crate::components::ProductIcon;
+use crate::components::{ProductIcon, parts};
 use crate::theme::{ActiveProductTheme as _, Metrics};
 
 pub fn render_error_view(
@@ -33,46 +33,16 @@ pub fn render_error_view(
     let detail = fault.detail.clone();
 
     centered_view("error-screen", metrics.space_xxl())
-        .child(
-            div()
-                .size(metrics.avatar_call())
-                .rounded_full()
-                .bg(cx.theme().secondary)
-                .border_1()
-                .border_color(cx.theme().border)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::new(ProductIcon::WifiOff)
-                        .size(metrics.icon())
-                        .text_color(cx.theme().warning),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(metrics.space_md())
-                .max_w(metrics.call_card_width_wide())
-                .text_center()
-                .child(
-                    div()
-                        .text_size(metrics.text_heading())
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(cx.theme().foreground)
-                        .child(fault.headline),
-                )
-                .child(
-                    div()
-                        .text_size(metrics.text_secondary())
-                        .text_color(cx.theme().muted_foreground)
-                        // What it means and what happens next, in the order a
-                        // reader needs them. Not the raw transport error.
-                        .child(fault.body),
-                ),
-        )
+        .child(parts::hero_icon(
+            Icon::new(ProductIcon::WifiOff),
+            metrics.avatar_call(),
+            metrics.icon(),
+            cx.theme().warning,
+            cx,
+        ))
+        // What it means and what happens next, in the order a reader needs
+        // them. Not the raw transport error, which is folded away below.
+        .child(parts::screen_message(fault.headline, fault.body, cx))
         .child(
             div()
                 .flex()
@@ -126,7 +96,7 @@ fn render_detail(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
 
     div()
         .flex()
@@ -198,48 +168,21 @@ pub fn render_refused_view(
     let detail = reason.to_string();
 
     centered_view("refused-screen", metrics.space_xxl())
-        .child(
-            div()
-                .size(metrics.avatar_call())
-                .rounded_full()
-                .bg(cx.theme().secondary)
-                .border_1()
-                .border_color(cx.theme().border)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::new(IconName::Info)
-                        .size(metrics.icon())
-                        .text_color(cx.theme().muted_foreground),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(metrics.space_md())
-                .max_w(metrics.call_card_width_wide())
-                .text_center()
-                .child(
-                    div()
-                        .text_size(metrics.text_heading())
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(cx.theme().foreground)
-                        .child("This window won't open the account"),
-                )
-                .child(
-                    div()
-                        .text_size(metrics.text_secondary())
-                        .text_color(cx.theme().muted_foreground)
-                        // The reason itself. It is written for a person —
-                        // that is the whole reason it travels as a sentence
-                        // rather than a code — so putting a headline in front
-                        // of it would only add a claim it does not make.
-                        .child(detail.clone()),
-                ),
-        )
+        .child(parts::hero_icon(
+            Icon::new(IconName::Info),
+            metrics.avatar_call(),
+            metrics.icon(),
+            cx.theme().muted_foreground,
+            cx,
+        ))
+        // The body is the reason itself. It is written for a person — that is
+        // the whole reason it travels as a sentence rather than a code — so
+        // the headline above it says only where the reason applies.
+        .child(parts::screen_message(
+            "This window won't open the account",
+            detail.clone(),
+            cx,
+        ))
         .child(
             Button::new("retry")
                 .label("Try again")

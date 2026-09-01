@@ -11,7 +11,8 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 
 use crate::app::{ConversationSearch, WhatsAppApp};
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::components::parts;
+use crate::theme::Metrics;
 
 pub fn render_conversation_search(
     search: &ConversationSearch,
@@ -25,7 +26,7 @@ pub fn render_conversation_search(
     let close_entity = entity;
     let status: Option<SharedString> = search.status().map(Into::into);
     let can_step = search.has_matches();
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
 
     div()
         .flex_shrink_0()

@@ -14,9 +14,9 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::Icon;
 
 use crate::app::{ChatOpen, ChatRow, Preview, PreviewGlyph, Unread, WhatsAppApp};
+use crate::components::parts;
 use crate::components::{ProductIcon, status_ticks};
 use crate::responsive::ResponsiveLayout;
-use crate::theme::ActiveProductTheme as _;
 use crate::utils::format_list_time;
 
 use super::Avatar;
@@ -85,11 +85,7 @@ pub fn render_chat_item(
                 .on(ground),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .gap(metrics.space_xs())
                 .overflow_hidden()
                 .child(render_name_row(&row, name, has_unread, metrics, cx))
@@ -110,15 +106,12 @@ fn render_name_row(
         .gap(metrics.space_md())
         .min_w_0()
         .child(
-            div()
+            parts::one_line()
                 .flex_1()
                 .min_w_0()
                 .text_size(metrics.text_body())
                 .text_color(cx.theme().foreground)
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
                 .child(name),
         )
         .children(row.timestamp.map(|timestamp| {
@@ -131,7 +124,7 @@ fn render_name_row(
                 .text_color(if has_unread {
                     cx.theme().primary
                 } else {
-                    cx.product().hsla(cx.product().palette.subtle_foreground)
+                    parts::subtle(cx)
                 })
                 .child(format_list_time(&timestamp))
         }))
@@ -158,7 +151,6 @@ fn render_preview(
     metrics: crate::theme::Metrics,
     cx: &App,
 ) -> AnyElement {
-    let product = cx.product();
     let line = || {
         div()
             .flex()
@@ -168,19 +160,11 @@ fn render_preview(
             .min_w_0()
             .text_size(metrics.text_secondary())
     };
-    let text = |content: String| {
-        div()
-            .flex_1()
-            .min_w_0()
-            .overflow_hidden()
-            .text_ellipsis()
-            .whitespace_nowrap()
-            .child(content)
-    };
+    let text = |content: String| parts::one_line().flex_1().min_w_0().child(content);
 
     match preview {
         Preview::Empty => line()
-            .text_color(product.hsla(product.palette.subtle_foreground))
+            .text_color(parts::subtle(cx))
             .italic()
             .child("No messages")
             .into_any_element(),
@@ -216,19 +200,16 @@ fn render_preview(
             // where the preview is squeezed to nothing and the message
             // disappears from the list.
             .children(prefix.as_ref().map(|prefix| {
-                div()
+                parts::one_line()
                     .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_color(product.hsla(product.palette.subtle_foreground))
+                    .text_color(parts::subtle(cx))
                     .child(format!("{prefix}:"))
             }))
             .children(glyph.map(|glyph| {
                 Icon::new(icon_for(glyph))
                     .size(metrics.icon_small())
                     .flex_shrink_0()
-                    .text_color(product.hsla(product.palette.subtle_foreground))
+                    .text_color(parts::subtle(cx))
             }))
             // Already one unstyled line with its markers taken out: the row
             // is built once per change and this runs per visible row per

@@ -12,6 +12,7 @@ use gpui_component::{Icon, IconName};
 
 use super::centered_view;
 use crate::app::WhatsAppApp;
+use crate::components::parts;
 use crate::theme::ActiveProductTheme as _;
 
 pub fn render_logged_out_view(
@@ -23,52 +24,27 @@ pub fn render_logged_out_view(
     let pair_entity = entity;
 
     centered_view("logged-out-screen", metrics.space_xxl())
+        .child(parts::hero_icon(
+            Icon::new(IconName::CircleX),
+            metrics.avatar_call(),
+            metrics.icon(),
+            cx.theme().danger,
+            cx,
+        ))
         .child(
-            div()
-                .size(metrics.avatar_call())
-                .rounded_full()
-                .bg(cx.theme().secondary)
-                .border_1()
-                .border_color(cx.theme().border)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::new(IconName::CircleX)
-                        .size(metrics.icon())
-                        .text_color(cx.theme().danger),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(metrics.space_md())
-                .max_w(metrics.call_card_width_wide())
-                .text_center()
-                .child(
-                    div()
-                        .text_size(metrics.text_heading())
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(cx.theme().foreground)
-                        .child("Session ended"),
-                )
-                .child(
-                    div()
-                        .text_size(metrics.text_secondary())
-                        .text_color(cx.theme().muted_foreground)
-                        .child(message.to_string()),
-                )
-                .child(
-                    div()
-                        .text_size(metrics.text_small())
-                        .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
-                        .child(
-                            "Pairing again clears this device's local data — messages, \
-                             contacts and keys — and starts a new link from the QR code.",
-                        ),
-                ),
+            // A third line under the headline and its body, which is why this
+            // is the one screen that keeps hold of the block: what pairing
+            // again costs belongs with the sentence explaining why it is the
+            // only way forward, not beside the button that does it.
+            parts::screen_message("Session ended", message.to_string(), cx).child(
+                div()
+                    .text_size(metrics.text_small())
+                    .text_color(parts::subtle(cx))
+                    .child(
+                        "Pairing again clears this device's local data — messages, \
+                         contacts and keys — and starts a new link from the QR code.",
+                    ),
+            ),
         )
         .child(
             div().flex().items_center().gap(metrics.space_lg()).child(

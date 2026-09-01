@@ -14,8 +14,9 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use oxidezap_core::{IncomingCall, OutgoingCall, OutgoingCallState};
 
 use crate::app::WhatsAppApp;
+use crate::components::parts;
 use crate::components::{Avatar, ProductIcon};
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::theme::Metrics;
 
 /// Somebody is calling.
 pub fn incoming(
@@ -204,6 +205,6 @@ fn hint(text: &str, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     div()
         .font_family(cx.theme().mono_font_family.clone())
         .text_size(metrics.text_micro())
-        .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+        .text_color(parts::subtle(cx))
         .child(text.to_string())
 }

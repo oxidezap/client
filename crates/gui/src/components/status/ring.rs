@@ -22,6 +22,7 @@ use gpui::{App, Hsla, IntoElement, ParentElement, Pixels, Styled, div, px};
 use gpui_component::ActiveTheme as _;
 
 use crate::components::Avatar;
+use crate::components::parts;
 use crate::theme::ActiveProductTheme as _;
 
 /// The number of waiting updates at which the ring is as loud as it gets.
@@ -56,7 +57,7 @@ pub fn status_ring(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let lit = cx.theme().primary;
-    let spent = cx.product().hsla(cx.product().palette.faint_foreground);
+    let spent = parts::faint(cx);
     let metrics = cx.product().metrics;
     let thickness = metrics.ring_thickness();
     let gap = metrics.ring_gap();

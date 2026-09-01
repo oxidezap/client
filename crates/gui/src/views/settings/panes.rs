@@ -17,7 +17,8 @@ use oxidezap_core::LogLevel;
 
 use crate::app::{SettingsSection, WhatsAppApp};
 use crate::components::ProductIcon;
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::components::parts;
+use crate::theme::Metrics;
 
 pub fn render(
     section: SettingsSection,
@@ -265,7 +266,7 @@ pub fn label(text: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement
     div()
         .font_family(cx.theme().mono_font_family.clone())
         .text_size(metrics.text_micro())
-        .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+        .text_color(parts::subtle(cx))
         .child(text)
 }
 
@@ -323,15 +324,12 @@ fn row(
         .child(
             // The value is the side that gives: a long push name or a path
             // should end in an ellipsis rather than push the label off screen.
-            div()
+            parts::one_line()
                 .flex_1()
                 .min_w_0()
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_size(metrics.text_meta())
                 .text_color(cx.theme().foreground)
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
                 .text_right()
                 .child(value),
         )
