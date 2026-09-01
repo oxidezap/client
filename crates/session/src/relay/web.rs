@@ -268,6 +268,49 @@ struct BrowserRelayChannel {
     inbound: std::rc::Rc<InboundSeen>,
 }
 
+/// The RTP payload types seen in one direction, in the order they appeared.
+///
+/// A call carries two streams and they are told apart by nothing else on this
+/// path: `RelayPacketKind::Rtp` says "media" and stops there, so a page
+/// sending only audio and a page sending audio and video are the same three
+/// words in a log. That mattered exactly once and it was expensive — every
+/// stage of the outbound video path was proven to work, right up to the media
+/// plane, while the peer drew nothing, and the one question left was whether
+/// the packets carrying it ever reached the wire. Nothing could answer it.
+///
+/// The payload type is one byte and stays fixed for a stream, so the *set* is
+/// the whole answer: one type outbound is one stream leaving.
+#[derive(Default)]
+struct PayloadTypes(RefCell<Vec<u8>>);
+
+impl PayloadTypes {
+    /// Record this packet's payload type if it is RTP and new.
+    ///
+    /// Cheap on the hot path by construction: RTP's payload type is the low
+    /// seven bits of the second byte, and a stream contributes exactly one
+    /// entry however many packets it sends.
+    fn note(&self, packet: &[u8]) {
+        let Some(pt) = packet.get(1).map(|b| b & 0x7f) else {
+            return;
+        };
+        let mut seen = self.0.borrow_mut();
+        if !seen.contains(&pt) {
+            seen.push(pt);
+        }
+    }
+
+    fn describe(&self) -> String {
+        let seen = self.0.borrow();
+        if seen.is_empty() {
+            return "none".to_string();
+        }
+        seen.iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// What the relay has actually delivered, by kind that matters.
 #[derive(Default)]
 struct InboundSeen {
@@ -276,6 +319,10 @@ struct InboundSeen {
     /// RTP: the *peer* is reaching us through it. The one that decides
     /// whether a silent call is their end or the path in between.
     media: std::cell::Cell<bool>,
+    /// The peer's RTP streams, by payload type. See [`PayloadTypes`].
+    inbound_types: PayloadTypes,
+    /// Ours, recorded on the way out for the same reason.
+    outbound_types: PayloadTypes,
 }
 
 /// Where an inbound packet goes, and what happens when there is no room.
@@ -307,10 +354,14 @@ impl Inbound {
         // the length of a call, and the answer stops changing after the first
         // one. Written the other way round it classifies for a question
         // already answered.
-        if !self.seen.media.get() && matches!(classify_relay_packet(&packet), RelayPacketKind::Rtp)
-        {
-            self.seen.media.set(true);
-            debug!("voip: the relay channel received the peer's first media packet");
+        if matches!(classify_relay_packet(&packet), RelayPacketKind::Rtp) {
+            if !self.seen.media.replace(true) {
+                debug!("voip: the relay channel received the peer's first media packet");
+            }
+            // Which streams, not just that there were some. The flag above
+            // stops changing after the first packet; this does not, because a
+            // peer that adds video mid-call adds a payload type mid-call.
+            self.seen.inbound_types.note(&packet);
         }
         let pending = self.dropped.get();
         if pending > 0
@@ -414,6 +465,13 @@ impl RelayTransport for BrowserRelayChannel {
                 self.outbound_dropped.replace(0)
             );
         }
+        // Recorded here, past the ceiling above: what this has to answer is
+        // which streams reached the wire, and a packet the ceiling refused
+        // did not. Both directions keep this, since "we sent one stream" and
+        // "they sent us two" are different sentences about the same call.
+        if matches!(classify_relay_packet(&data), RelayPacketKind::Rtp) {
+            self.inbound.outbound_types.note(&data);
+        }
         // Asked rather than inferred from the send returning. A channel that
         // is `closing` or `closed` does not throw: the specification has the
         // agent *buffer* the data, so a send onto a transport that will never
@@ -504,6 +562,15 @@ impl Drop for BrowserRelayChannel {
         // was never made — the shape the first call of a production session
         // took — and it reads identically to a working call unless the last
         // two are asked separately.
+        // The payload types alongside them, because "outbound: yes" counts a
+        // call's audio and says nothing about its video — which is the exact
+        // gap that left a proven-working camera and a peer with no picture
+        // with no next question to ask.
+        debug!(
+            "voip: the relay channel sent RTP stream(s) {} and received {}",
+            self.inbound.outbound_types.describe(),
+            self.inbound.inbound_types.describe()
+        );
         debug!(
             "voip: the relay channel is being released (outbound: {}, inbound: {}, peer media: {})",
             yes_no(self.sent_any.get()),

@@ -598,6 +598,19 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   every path out that is not a camera held withdraws it again, and the
   refusal's own teardown queues on the call's video lane behind the enable it
   is answering.
+- **The relay reports which RTP streams crossed it, not just that media
+  did.** `RelayPacketKind::Rtp` says "media" and stops there, so a call
+  sending audio alone and one sending audio and video produce the same three
+  words in a release line. That gap cost a whole round: the outbound video
+  path was instrumented end to end, every stage of it proved to work — 276
+  chunks encoded, 269 handed to the media plane — and the peer still drew
+  nothing, leaving exactly one question ("did those packets reach the wire?")
+  that nothing could answer. The payload type is the low seven bits of RTP's
+  second byte and is fixed for the life of a stream, so the *set* of them is
+  the entire answer and costs one comparison per packet. Kept for both
+  directions, because "we sent one stream" and "they sent us two" are
+  different sentences about the same call.
+
 - **The outbound video path accounts for every hop, because all five of its
   failures are silence.** A call whose peer draws nothing can have stopped at
   the capture tick (which declines for three separate reasons), at an encoder
