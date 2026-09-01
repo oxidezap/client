@@ -7,7 +7,7 @@ use diesel::prelude::*;
 
 use crate::schema;
 use crate::store::read_state::{
-    READ_EXTRA_IDS_CAP, RangeBound, ReadState, UNREAD_MARKER, count_unread, read_state,
+    RangeBound, ReadState, UNREAD_MARKER, cap_read_ids, count_unread, encode_read_ids, read_state,
 };
 
 /// When `msg_id` is the chat's most recent message, replace the denormalized
@@ -269,13 +269,8 @@ pub(crate) fn merge_chat_metadata(
             merged.extra_ids.push(id);
         }
     }
-    if merged.extra_ids.len() > READ_EXTRA_IDS_CAP {
-        let overflow = merged.extra_ids.len() - READ_EXTRA_IDS_CAP;
-        merged.extra_ids.drain(..overflow);
-    }
-    let ids_json = (!merged.extra_ids.is_empty())
-        .then(|| serde_json::to_string(&merged.extra_ids).ok())
-        .flatten();
+    cap_read_ids(&mut merged.extra_ids);
+    let ids_json = encode_read_ids(&merged.extra_ids);
 
     let unread = if src_row.1 == UNREAD_MARKER || dest_row.1 == UNREAD_MARKER {
         UNREAD_MARKER
@@ -310,52 +305,46 @@ pub(super) fn delete_chat_rows(
     bound: Option<&RangeBound>,
 ) -> QueryResult<()> {
     use schema::messages::dsl as m;
+    // Every branch below deletes from the same set — this chat's rows, minus
+    // the starred ones when they are spared — and differs only in the time
+    // window it adds. A boxed statement is consumed by `execute`, and the
+    // keyed branch needs two, so the set is built per statement rather than
+    // shared: same SQL, written once.
+    let victims = || {
+        let query = diesel::delete(
+            m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))),
+        )
+        .into_boxed();
+        match delete_starred {
+            true => query,
+            false => query.filter(m::starred.eq(false)),
+        }
+    };
     // A ranged action only covers messages up to its boundary; rows we
     // materialized after it (live/offline traffic) survive. With a keyed
     // boundary, same-second siblings the action does not name survive too.
     match bound {
         None => {
-            let mut query = diesel::delete(
-                m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))),
-            )
-            .into_boxed();
-            if !delete_starred {
-                query = query.filter(m::starred.eq(false));
-            }
-            query.execute(conn)?;
+            victims().execute(conn)?;
         }
-        Some(bound) => {
-            let mut query = diesel::delete(
-                m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))),
-            )
-            .into_boxed();
-            if !delete_starred {
-                query = query.filter(m::starred.eq(false));
+        Some(bound) => match &bound.keys {
+            None => {
+                victims()
+                    .filter(m::timestamp_ms.le(bound.second_end_ms))
+                    .execute(conn)?;
             }
-            match &bound.keys {
-                None => {
-                    query = query.filter(m::timestamp_ms.le(bound.second_end_ms));
-                    query.execute(conn)?;
-                }
-                Some(keys) => {
-                    // Everything strictly before the boundary second...
-                    query = query.filter(m::timestamp_ms.lt(bound.second_start_ms));
-                    query.execute(conn)?;
-                    // ...plus the boundary rows the action names explicitly.
-                    let mut keyed = diesel::delete(
-                        m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))),
-                    )
-                    .into_boxed();
-                    if !delete_starred {
-                        keyed = keyed.filter(m::starred.eq(false));
-                    }
-                    keyed
-                        .filter(m::timestamp_ms.le(bound.second_end_ms))
-                        .filter(m::msg_id.eq_any(keys))
-                        .execute(conn)?;
-                }
+            Some(keys) => {
+                // Everything strictly before the boundary second...
+                victims()
+                    .filter(m::timestamp_ms.lt(bound.second_start_ms))
+                    .execute(conn)?;
+                // ...plus the boundary rows the action names explicitly.
+                victims()
+                    .filter(m::timestamp_ms.le(bound.second_end_ms))
+                    .filter(m::msg_id.eq_any(keys))
+                    .execute(conn)?;
             }
-        }
+        },
     }
     // Satellites of messages that no longer exist.
     diesel::sql_query(

@@ -1,5 +1,13 @@
 //! Contact names, from wherever they arrive: push names riding on live
 //! messages, business verified names, and the app-state contact action.
+//!
+//! The three upserts below read as one function called three times, and are
+//! not: what differs between them is the column list, which is the whole of
+//! an upsert. One that took every name would write the columns its caller
+//! knows nothing about — a push name arriving on a message would blank the
+//! address-book name beside it, in the INSERT and again in the DO UPDATE —
+//! and a version that skipped them per call is a macro over diesel's typed
+//! values. `contact_key` is the part they genuinely share, so it is shared.
 
 use std::borrow::Cow;
 

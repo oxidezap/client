@@ -13,7 +13,7 @@ use crate::store::edit::apply_edit;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message};
 use crate::store::reaction::apply_reaction;
 use crate::store::revoke::apply_revoke;
-use crate::store::writer::ChangeSet;
+use crate::store::writer::{ChangeSet, route_chat};
 
 pub(super) fn apply_inbound(
     conn: &mut SqliteConnection,
@@ -22,11 +22,7 @@ pub(super) fn apply_inbound(
     cs: &mut ChangeSet,
 ) -> QueryResult<()> {
     let info = &inbound.info;
-    let wire = info.source.chat.to_string();
-    let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
-    if chat != wire {
-        cs.message_chats.insert(wire);
-    }
+    let chat = route_chat(conn, device_id, info.source.chat.to_string(), cs)?;
     let sender = info.source.sender.to_string();
     let ts_ms = info.timestamp.timestamp_millis();
 
