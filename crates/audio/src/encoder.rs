@@ -1,11 +1,14 @@
 //! Opus audio encoder for WhatsApp PTT messages.
 
-/// Turning captured samples into a voice note.
+/// Turning a prepared note into a voice note.
 ///
 /// Opus, in an OGG container, which is what WhatsApp expects — and libopus is
-/// C, so this whole module is absent from a build for the web. The web
-/// backend refuses to *record* for exactly this reason rather than capturing
-/// samples nothing could then encode; see `crate::web`.
+/// C, so this whole module is absent from a build for the web, where the
+/// browser's own encoder answers instead; see `crate::web::recorder`.
+///
+/// What arrives here is already resampled and already measured: the
+/// resampling and the envelope are [`crate::PreparedNote`], which both
+/// platforms share, so this module is the codec and nothing else.
 #[cfg(not(target_family = "wasm"))]
 mod opus_ogg {
     use log::info;
@@ -13,13 +16,13 @@ mod opus_ogg {
 
     use super::EncoderError;
     use crate::ogg_opus::{FRAME_SIZE_SAMPLES, SAMPLE_RATE, needs_trailing_silence, package};
-    use crate::recorder::RecordedAudio;
+    use crate::recorder::PreparedNote;
 
     const CHANNELS: Channels = Channels::Mono;
     const BITRATE: i32 = 16000;
 
-    pub fn encode_to_opus_ogg(audio: &RecordedAudio) -> Result<Vec<u8>, EncoderError> {
-        let samples = audio.resample_to_16khz();
+    pub fn encode_to_opus_ogg(note: &PreparedNote) -> Result<Vec<u8>, EncoderError> {
+        let samples = &note.samples;
         if samples.is_empty() {
             return Err(EncoderError::EmptyAudio);
         }
@@ -80,6 +83,8 @@ mod opus_ogg {
     mod tests {
         use super::*;
 
+        use crate::recorder::RecordedAudio;
+
         #[test]
         fn test_encode_simple_audio() {
             // Generate 1 second of silence
@@ -87,7 +92,8 @@ mod opus_ogg {
                 samples: vec![0.0f32; 16000],
                 sample_rate: 16000,
                 duration_secs: 1,
-            };
+            }
+            .prepare();
 
             let result = encode_to_opus_ogg(&audio);
             assert!(result.is_ok());
@@ -106,7 +112,8 @@ mod opus_ogg {
                 samples: vec![0.0f32; samples as usize],
                 sample_rate: 16000,
                 duration_secs: 1,
-            };
+            }
+            .prepare();
 
             let ogg_data = encode_to_opus_ogg(&audio).unwrap();
 
@@ -131,12 +138,11 @@ pub use opus_ogg::encode_to_opus_ogg;
 ///
 /// # Errors
 ///
-/// Always. Nothing reaches it: the web recorder refuses at `init`, so no
-/// samples ever exist to encode.
+/// Always. Nothing reaches it: a page's `stop` answers
+/// [`Recording::Pending`](crate::Recording::Pending), whose codec is the
+/// browser's, so no prepared note ever arrives here.
 #[cfg(target_family = "wasm")]
-pub fn encode_to_opus_ogg(
-    _audio: &crate::recorder::RecordedAudio,
-) -> Result<Vec<u8>, EncoderError> {
+pub fn encode_to_opus_ogg(_note: &crate::recorder::PreparedNote) -> Result<Vec<u8>, EncoderError> {
     Err(EncoderError::OpusError(
         "this build has no Opus encoder on the web".to_string(),
     ))

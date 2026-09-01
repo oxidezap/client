@@ -11,9 +11,9 @@
 //! WebAudio backend does compile, but libopus is C and `wasm32-unknown-unknown`
 //! has no C toolchain behind it. Rather than lose the crate on that platform,
 //! the parts that need an operating system are gathered behind `cfg` and a
-//! [`web`] backend answers in the same vocabulary — with playback genuinely
-//! implemented, because the browser decodes Opus itself, and recording
-//! refused up front, because nothing here could encode what it captured.
+//! [`web`] backend answers in the same vocabulary — genuinely, in every case:
+//! the browser decodes Opus itself and encodes it too, so a page plays and
+//! records voice notes rather than refusing them.
 //!
 //! A caller sees one API either way. `oxidezap-gui` has no `cfg` in it about
 //! sound.
@@ -83,7 +83,9 @@ pub fn can_record() -> bool {
 
 pub use encoder::{EncoderError, encode_to_opus_ogg};
 pub use player::PlayerError;
-pub use recorder::{EncodedNote, RecordedAudio, RecorderError, Recording, TARGET_SAMPLE_RATE};
+pub use recorder::{
+    EncodedNote, PreparedNote, RecordedAudio, RecorderError, Recording, TARGET_SAMPLE_RATE,
+};
 pub use waveform::{WAVEFORM_SAMPLES, generate_waveform};
 
 // The same three names on both, which is the claim the header makes. Kept

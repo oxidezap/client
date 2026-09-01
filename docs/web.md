@@ -304,7 +304,23 @@ Whether a page can record is a question about the *browser* rather than about
 the build, which is why `can_record()` is a function where `CAN_RECORD` was a
 constant: the encoder is `AudioEncoder`, and an older browser may not have it.
 Asked before the microphone is offered either way, because a control that is
-drawn and then always fails is worse than one that is not drawn.
+drawn and then always fails is worse than one that is not drawn. It is now the
+*only* thing asked. The composer used to withhold the microphone from a page
+holding its own session as well, on the ground that such a page could not
+upload what it recorded; the library's buffered `Client::upload` sends the
+body through `HttpClient::execute` these days, which is the one method
+`BrowserHttpClient` implements, so all three arrangements a page can be in —
+a daemon over the bridge, the tab holding the account, its own session — have
+somewhere to send a note.
+
+What `stop` hands back is the capture, not a note. Resampling to 16 kHz and
+measuring the envelope is the same pure Rust the desktop runs and the
+expensive half of the job, so it goes to `cx.background_spawn` on both
+platforms, which here is a real worker; only `AudioEncoder`, which belongs to
+the document that made it, is awaited on the window. `Recording::Pending` is
+that seam — the capture out, the prepared note in, the encoded note back —
+and it is why a page and a desktop reach `send_voice_note` through one
+`finish` with no `cfg` between them.
 
 A call's video decodes the same way, through the same module, and obeys the
 same stream rules the desktop path does — a decoder born mid-stream waits for

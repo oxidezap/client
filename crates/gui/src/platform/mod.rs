@@ -38,10 +38,7 @@ pub mod plugins;
 pub mod prefs;
 pub mod startup;
 
-pub use capabilities::{
-    calls_belong_to_another_tab, calls_unavailable, media_send_unavailable,
-    video_decode_unavailable,
-};
+pub use capabilities::{calls_belong_to_another_tab, calls_unavailable, video_decode_unavailable};
 pub use clock::{sleep, with_timeout};
 pub use fonts::fonts;
 pub use identity::front_end_id;
