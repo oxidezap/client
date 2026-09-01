@@ -465,17 +465,75 @@ impl Guest {
     }
 }
 
-/// Register every host function. This is the complete surface.
-pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
-    let m = abi::MODULE;
+/// Whether a plugin is inside `oxi_init`, which is when — and only when — it
+/// may declare itself.
+///
+/// Named rather than spelled out at each of the three imports that declare,
+/// because it is one rule and not three: the list a user is shown before
+/// enabling a plugin is what it asked for, and a declaration accepted a
+/// moment later is that sentence changing after the answer. `Phase::Loading`
+/// is not it either — a start section is code the loader has not accepted.
+fn declaring(c: &Caller<'_, Guest>) -> bool {
+    c.data().phase == Phase::Init
+}
 
-    // ---- declaration, init only ----
+/// What every account command answers before it does anything, in the one
+/// order it may be asked in.
+///
+/// The order *is* the authorisation decision rather than a detail of it. The
+/// moment first, because during `oxi_init` there is nobody to carry a command
+/// out and the honest answer is "too early" rather than "not allowed". Then
+/// the capability, read live so a withdrawal bites on this command rather
+/// than once a backlog has drained. And only then the allowance, because
+/// spending before the capability check would let a plugin nobody has agreed
+/// to anything for drain the budget an approved one is measured by — a
+/// refusal that costs somebody else's sends.
+///
+/// One function rather than the four identical copies it replaces: this is
+/// the whole of what stands between a `.wasm` somebody downloaded and the
+/// account, and four copies of a security decision are four chances for one
+/// of them to be edited alone.
+fn command_prologue(c: &mut Caller<'_, Guest>, cap: i64) -> Result<(), i32> {
+    if !c.data().acting() {
+        return Err(abi::outcome::STATE);
+    }
+    if !c.data().allows(cap) {
+        return Err(abi::outcome::DENIED);
+    }
+    if !c.data_mut().spend_command() {
+        // Refused rather than `STATE`: the moment is fine, the allowance is
+        // spent. `STATE` is "right call, wrong moment", which sends a plugin
+        // looking for a moment that never comes.
+        return Err(abi::outcome::REFUSED);
+    }
+    Ok(())
+}
+
+/// Register every host function. This is the complete surface.
+///
+/// Four groups, one function each, in the order the ABI document introduces
+/// them. Split for reading rather than for reuse — nothing calls one of them
+/// twice — because a plugin's entire outside world being one 600-line
+/// function made "which imports check what" a question nobody could answer
+/// by looking.
+pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
+    link_declaring(linker)?;
+    link_reading(linker)?;
+    link_acting(linker)?;
+    link_free(linker)?;
+    Ok(())
+}
+
+/// Declaring: what a plugin says about itself, and only from inside
+/// `oxi_init`.
+fn link_declaring(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
+    let m = abi::MODULE;
 
     linker.func_wrap(
         m,
         abi::imports::SUBSCRIBE,
         |mut c: Caller<'_, Guest>, mask: i64| {
-            if c.data().phase != Phase::Init {
+            if !declaring(&c) {
                 return;
             }
             // Refused, not masked. `kinds::COUNT`'s own documentation is the
@@ -516,7 +574,7 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         m,
         abi::imports::REQUEST_CAPS,
         |mut c: Caller<'_, Guest>, mask: i64| {
-            if c.data().phase != Phase::Init {
+            if !declaring(&c) {
                 return;
             }
             let guest = c.data_mut();
@@ -550,7 +608,7 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         m,
         abi::imports::SET_NAME,
         |mut c: Caller<'_, Guest>, ptr: i32, len: i32| -> i32 {
-            if c.data().phase != Phase::Init {
+            if !declaring(&c) {
                 return abi::outcome::STATE;
             }
             // Once, like the capability declaration and for the second of
@@ -597,7 +655,13 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         },
     )?;
 
-    // ---- reading the event ----
+    Ok(())
+}
+
+/// Reading the event being handled, through the handle `oxi_on_event` was
+/// given. No capability: a plugin is already holding the event.
+fn link_reading(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
+    let m = abi::MODULE;
 
     linker.func_wrap(
         m,
@@ -677,30 +741,29 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         },
     )?;
 
-    // ---- acting ----
+    Ok(())
+}
+
+/// Acting: everything that spends a capability. The four that act on the
+/// *account* — send, reply, mark read, typing — open with
+/// [`command_prologue`] and nothing else. The four a plugin does only to
+/// itself — publishing a tree, reading and writing its own settings, arming
+/// a timer — carry their own checks, which are deliberately not the same
+/// checks: they need nobody's yes, so what bounds them is a budget rather
+/// than an approval.
+fn link_acting(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
+    let m = abi::MODULE;
 
     linker.func_wrap(
         m,
         abi::imports::SEND_TEXT,
         |mut c: Caller<'_, Guest>, jid: i32, jid_len: i32, text: i32, text_len: i32| -> i32 {
-            if !c.data().acting() {
-                return abi::outcome::STATE;
+            if let Err(code) = command_prologue(&mut c, abi::caps::SEND) {
+                return code;
             }
-            if !c.data().allows(abi::caps::SEND) {
-                return abi::outcome::DENIED;
-            }
-            if !c.data_mut().spend_command() {
-                // Refused rather than `STATE`: the moment is fine, the
-                // allowance is spent. `STATE` is "right call, wrong moment",
-                // which sends a plugin looking for a moment that never comes.
-                return abi::outcome::REFUSED;
-            }
-            let (jid, text) = match (
-                read_str(&mut c, jid, jid_len),
-                read_str(&mut c, text, text_len),
-            ) {
-                (Ok(jid), Ok(text)) => (jid, text),
-                _ => return abi::outcome::INVALID,
+            let [jid, text] = match read_strs(&mut c, [(jid, jid_len), (text, text_len)]) {
+                Ok(read) => read,
+                Err(code) => return code,
             };
             if jid.is_empty() || text.is_empty() {
                 return abi::outcome::INVALID;
@@ -720,24 +783,15 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
          quoted: i32,
          quoted_len: i32|
          -> i32 {
-            if !c.data().acting() {
-                return abi::outcome::STATE;
+            if let Err(code) = command_prologue(&mut c, abi::caps::SEND) {
+                return code;
             }
-            if !c.data().allows(abi::caps::SEND) {
-                return abi::outcome::DENIED;
-            }
-            if !c.data_mut().spend_command() {
-                // Refused rather than `STATE`: the moment is fine, the
-                // allowance is spent. `STATE` is "right call, wrong moment",
-                // which sends a plugin looking for a moment that never comes.
-                return abi::outcome::REFUSED;
-            }
-            let (Ok(jid), Ok(text), Ok(quoted)) = (
-                read_str(&mut c, jid, jid_len),
-                read_str(&mut c, text, text_len),
-                read_str(&mut c, quoted, quoted_len),
-            ) else {
-                return abi::outcome::INVALID;
+            let [jid, text, quoted] = match read_strs(
+                &mut c,
+                [(jid, jid_len), (text, text_len), (quoted, quoted_len)],
+            ) {
+                Ok(read) => read,
+                Err(code) => return code,
             };
             if jid.is_empty() || text.is_empty() || quoted.is_empty() {
                 return abi::outcome::INVALID;
@@ -752,21 +806,12 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         m,
         abi::imports::MARK_READ,
         |mut c: Caller<'_, Guest>, jid: i32, jid_len: i32, id: i32, id_len: i32| -> i32 {
-            if !c.data().acting() {
-                return abi::outcome::STATE;
+            if let Err(code) = command_prologue(&mut c, abi::caps::MARK_READ) {
+                return code;
             }
-            if !c.data().allows(abi::caps::MARK_READ) {
-                return abi::outcome::DENIED;
-            }
-            if !c.data_mut().spend_command() {
-                // Refused rather than `STATE`: the moment is fine, the
-                // allowance is spent. `STATE` is "right call, wrong moment",
-                // which sends a plugin looking for a moment that never comes.
-                return abi::outcome::REFUSED;
-            }
-            let (Ok(jid), Ok(id)) = (read_str(&mut c, jid, jid_len), read_str(&mut c, id, id_len))
-            else {
-                return abi::outcome::INVALID;
+            let [jid, id] = match read_strs(&mut c, [(jid, jid_len), (id, id_len)]) {
+                Ok(read) => read,
+                Err(code) => return code,
             };
             if jid.is_empty() {
                 return abi::outcome::INVALID;
@@ -783,20 +828,12 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         m,
         abi::imports::TYPING,
         |mut c: Caller<'_, Guest>, jid: i32, jid_len: i32, composing: i32| -> i32 {
-            if !c.data().acting() {
-                return abi::outcome::STATE;
+            if let Err(code) = command_prologue(&mut c, abi::caps::TYPING) {
+                return code;
             }
-            if !c.data().allows(abi::caps::TYPING) {
-                return abi::outcome::DENIED;
-            }
-            if !c.data_mut().spend_command() {
-                // Refused rather than `STATE`: the moment is fine, the
-                // allowance is spent. `STATE` is "right call, wrong moment",
-                // which sends a plugin looking for a moment that never comes.
-                return abi::outcome::REFUSED;
-            }
-            let Ok(jid) = read_str(&mut c, jid, jid_len) else {
-                return abi::outcome::INVALID;
+            let [jid] = match read_strs(&mut c, [(jid, jid_len)]) {
+                Ok(read) => read,
+                Err(code) => return code,
             };
             if jid.is_empty() {
                 return abi::outcome::INVALID;
@@ -930,11 +967,9 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
                 return abi::outcome::REFUSED;
             }
             *spent += asked;
-            let (Ok(key), Ok(value)) = (
-                read_str(&mut c, key, key_len),
-                read_str(&mut c, val, val_len),
-            ) else {
-                return abi::outcome::INVALID;
+            let [key, value] = match read_strs(&mut c, [(key, key_len), (val, val_len)]) {
+                Ok(read) => read,
+                Err(code) => return code,
             };
             if c.data_mut().kv.set(&key, &value) {
                 abi::outcome::ACCEPTED
@@ -969,7 +1004,12 @@ pub fn link(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
         },
     )?;
 
-    // ---- free to everyone ----
+    Ok(())
+}
+
+/// What costs no capability at all: saying something, and asking the time.
+fn link_free(linker: &mut Linker<Guest>) -> Result<(), wasmi::Error> {
+    let m = abi::MODULE;
 
     linker.func_wrap(
         m,
@@ -1210,6 +1250,36 @@ fn escape_controls_within(line: &str, budget: usize) -> Option<std::borrow::Cow<
         }
     }
     Some(std::borrow::Cow::Owned(out))
+}
+
+/// Read several of the plugin's strings, or answer for the first that is
+/// not one.
+///
+/// An import takes its arguments as pointer-and-length pairs, and the five
+/// that answer `INVALID` for one that does not name a string answer it the
+/// same way whichever it was: a pointer outside memory, a length past what
+/// the host accepts, bytes that are not UTF-8. Asked together so that answer
+/// lives once, rather than in a tuple match written five times, each free to
+/// drift into answering something else.
+///
+/// `oxi_kv_get` is not one of them and must not be converted to this:
+/// it answers `ABSENT` for a key it cannot read, and the difference is
+/// load-bearing — a setting read as absent comes back as the plugin's
+/// default and is then written over the user's own. Its own comment says so.
+///
+/// Stops at the first refusal, where the tuple it replaces read all of them
+/// and then discarded the lot: the answer is the same and the command is
+/// refused whole either way, but the arguments behind a bad one are no longer
+/// copied out of guest memory to be thrown away.
+fn read_strs<const N: usize>(
+    caller: &mut Caller<'_, Guest>,
+    args: [(i32, i32); N],
+) -> Result<[String; N], i32> {
+    let mut read = [const { String::new() }; N];
+    for (slot, (ptr, len)) in read.iter_mut().zip(args) {
+        *slot = read_str(caller, ptr, len)?;
+    }
+    Ok(read)
 }
 
 fn read_str(caller: &mut Caller<'_, Guest>, ptr: i32, len: i32) -> Result<String, i32> {
