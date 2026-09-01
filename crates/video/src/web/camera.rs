@@ -704,9 +704,20 @@ async fn attach(
         "position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;\
          opacity:0;pointer-events:none",
     );
-    if let Some(body) = document.body() {
-        let _ = body.append_child(&element);
-    }
+    // Refused rather than skipped when there is nowhere to put it. Carrying
+    // on with a detached element is carrying on with the exact configuration
+    // this function exists to stop using, and its failure is six lines
+    // further down and reads like an autoplay refusal.
+    document
+        .body()
+        .ok_or_else(|| anyhow!("no document body to play the camera in"))?
+        .append_child(&element)
+        .map_err(|e| {
+            anyhow!(
+                "the camera's preview would not go in the document: {}",
+                describe(&e)
+            )
+        })?;
     element.set_src_object(Some(stream));
 
     // Awaited, because a refusal here is a camera that will produce nothing:

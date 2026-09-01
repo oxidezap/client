@@ -617,9 +617,13 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   come is. The two came apart here: the promise was aborted for a lifecycle
   reason while the element went on decoding, and treating the rejection as
   fatal downgraded every video call to voice. The element is asked directly
-  instead (`readyState` and `videoWidth`, the same question every capture tick
-  asks), which keeps a genuine autoplay refusal fatal — a refused element is
-  not ready and never becomes so.
+  instead: `paused` first, then `readyState` and `videoWidth`. `paused` is the
+  load-bearing half — a `MediaStream` reaches `HAVE_CURRENT_DATA` with a
+  nonzero `videoWidth` the moment the element is wired to it, whether or not
+  it was ever allowed to start, so readiness alone would pass a genuine
+  autoplay refusal and then feed the encoder one still picture for the length
+  of the call. Playing *and* showing something is the question; either half on
+  its own is not.
   And a media element playing a `MediaStream` is rooted by the *browser*,
   because playback is a root: one merely dropped goes on being a sink on the
   camera's track for the life of the page. Six refused attempts in one call is
