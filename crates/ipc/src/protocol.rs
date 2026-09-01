@@ -525,14 +525,19 @@ pub struct SendAudio {
     /// The id to give the note until the server assigns a real one, as
     /// [`SendText::local_id`].
     ///
-    /// Deliberately *not* `#[serde(default)]`, unlike that one, and the
-    /// difference is a fact about the wire rather than about this struct: an
-    /// `Option` alone does not make a key optional to serde, so a frame that
-    /// leaves `local_id` out is malformed here and merely `None` there. Every
-    /// client in this tree sends the key, so nothing depends on it either
-    /// way — but widening it is a protocol change and belongs in
-    /// `PROTOCOL_VERSION`'s changelog, not in the move that gave this payload
-    /// a name.
+    /// Carries no `#[serde(default)]`, unlike that one, and it reads like an
+    /// asymmetry that would make omitting the key malformed here and merely
+    /// `None` there. It is not one, and the reason is worth writing down
+    /// because the attribute looks load-bearing and is not: [`ClientRequest`]
+    /// is *internally tagged*, so every variant is deserialized through
+    /// serde's buffered `Content` rather than straight from the reader, and
+    /// on that path a missing key for an `Option` field is `None` whether or
+    /// not a default is declared. Both sends already accept a frame without
+    /// the key; `tests::either_send_may_leave_out_the_local_id` is what says
+    /// so, and it is the thing to look at before adding the attribute to
+    /// "fix" this — the change that would really alter the wire is giving
+    /// this enum a different tag representation, and that test is what would
+    /// notice.
     pub local_id: Option<String>,
     /// The message being replied to, when this is a reply.
     ///
@@ -1352,6 +1357,36 @@ mod tests {
                 serde_json::from_str::<ClientRequest>(&line).unwrap(),
                 request
             );
+        }
+    }
+
+    /// Both sends accept a frame that leaves `local_id` out.
+    ///
+    /// `SendText::local_id` declares `#[serde(default)]` and `SendAudio`'s
+    /// does not, which reads like the audio one being stricter. It is not:
+    /// this enum is internally tagged, so a variant is deserialized through
+    /// serde's buffered `Content`, and on that path a missing key for an
+    /// `Option` is `None` with or without the attribute. The asymmetry is in
+    /// the source, not on the wire.
+    ///
+    /// Asserted from literal JSON rather than by round-tripping a value,
+    /// because the frame this is about is the one where the key is *absent* —
+    /// exactly what a serializer never writes, and so what a round trip can
+    /// never reach. What it guards is the tag representation: make this enum
+    /// externally or adjacently tagged and the audio arm starts refusing a
+    /// frame the text arm accepts.
+    #[test]
+    fn either_send_may_leave_out_the_local_id() {
+        let text = r#"{"request":"send_text","jid":"559900000001@s.whatsapp.net","text":"oi"}"#;
+        let audio = r#"{"request":"send_audio","jid":"559900000001@s.whatsapp.net","upload":"staged-local-1","duration_secs":3,"waveform":[7,8]}"#;
+
+        match serde_json::from_str::<ClientRequest>(text).unwrap() {
+            ClientRequest::SendText(send) => assert_eq!(send.local_id, None),
+            other => panic!("not a send_text: {other:?}"),
+        }
+        match serde_json::from_str::<ClientRequest>(audio).unwrap() {
+            ClientRequest::SendAudio(send) => assert_eq!(send.local_id, None),
+            other => panic!("not a send_audio: {other:?}"),
         }
     }
 }

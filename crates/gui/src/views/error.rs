@@ -26,7 +26,7 @@ pub fn render_error_view(
     show_detail: bool,
     entity: Entity<WhatsAppApp>,
     cx: &App,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
     let retry_entity = entity.clone();
     let detail_entity = entity;
@@ -162,7 +162,7 @@ pub fn render_refused_view(
     show_detail: bool,
     entity: Entity<WhatsAppApp>,
     cx: &App,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
     let retry_entity = entity.clone();
     let detail = reason.to_string();

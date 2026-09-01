@@ -404,7 +404,7 @@ impl InputAreaView {
         control: gpui::Pixels,
         metrics: Metrics,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let entity = cx.entity().clone();
         let record_entity = entity.clone();
         // Asked of the rope rather than of a copy of it. `text()` hands back
@@ -505,7 +505,7 @@ impl InputAreaView {
         control: gpui::Pixels,
         metrics: Metrics,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let entity = cx.entity().clone();
         let cancel_entity = entity.clone();
 

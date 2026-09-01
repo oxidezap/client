@@ -49,11 +49,18 @@ pub fn render(
 }
 
 /// A titled block: a label, then its content.
-pub fn group(
-    heading: impl IntoElement,
-    content: impl IntoElement,
+///
+/// The two elements are named type parameters rather than `impl IntoElement`
+/// so that the return type can say `use<H, C>`. An argument-position `impl
+/// Trait` introduces a parameter with no name, and a `use<..>` list has to
+/// name every parameter it captures — so with them spelled that way the bound
+/// cannot be written at all, and the helper silently inherits `metrics`'s
+/// lifetime the way the rule exists to prevent.
+pub fn group<H: IntoElement, C: IntoElement>(
+    heading: H,
+    content: C,
     metrics: Metrics,
-) -> impl IntoElement {
+) -> impl IntoElement + use<H, C> {
     div()
         .flex()
         .flex_col()

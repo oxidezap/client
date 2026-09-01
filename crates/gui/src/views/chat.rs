@@ -24,7 +24,7 @@ pub fn render_connected_view(
     app: &mut WhatsAppApp,
     window: &mut Window,
     cx: &mut Context<WhatsAppApp>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     app.ensure_input_area(window, cx);
     app.ensure_chat_search_input(window, cx);
     // Before anything reads a plugin's tree: a field the plugin added this
@@ -377,7 +377,7 @@ fn render_chat_area(
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
     cx: &App,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let ChatAreaProps {
         selected_chat,
         message_cache,

@@ -47,7 +47,7 @@ pub fn render_pairing_view(
     qr_code: Option<&Issued<CachedQrCode>>,
     pair_code: Option<Issued<String>>,
     cx: &App,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
 
     centered_view("pairing-screen", metrics.space_xxl())

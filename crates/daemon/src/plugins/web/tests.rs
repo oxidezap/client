@@ -177,7 +177,7 @@ async fn a_name_that_is_not_an_id_is_refused() {
 
 /// Recording an approval must not need a thread the page does not have.
 ///
-/// `server.rs` handed this to `tokio::task::spawn_blocking`, which needs a
+/// The approval path handed this to `tokio::task::spawn_blocking`, which needs a
 /// blocking pool — and a browser agent is one thread, so a page's runtime has
 /// none. The call panicked outright ("there is no reactor running"), taking
 /// the connection with it: approving a plugin in the browser had never once
