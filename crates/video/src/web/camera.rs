@@ -167,14 +167,26 @@ impl CameraGuard {
 impl Drop for CameraGuard {
     fn drop(&mut self) {
         if let Some(stream) = self.0.take() {
-            stop_tracks(&stream);
-            debug!("the camera is closed again: it opened but its setup did not finish");
+            stop_tracks(
+                &stream,
+                "the camera is closed again: it opened but its setup did not finish",
+            );
         }
     }
 }
 
 /// End every track, which is what actually releases the device.
-fn stop_tracks(stream: &web_sys::MediaStream) {
+///
+/// Asked afterwards whether each one really reached `ended`, and says so when
+/// one did not. `stop()` sets `readyState` synchronously, so a track still
+/// live on the way out of this is a camera this teardown did not release —
+/// which is exactly what somebody reports as a tab whose camera light stays
+/// on, and precisely what a count of `stop()` *calls* cannot show. The audio
+/// graph learned this first; the camera printed "the camera is closed" over
+/// the same uncertainty.
+fn stop_tracks(stream: &web_sys::MediaStream, what: &str) {
+    let mut stopped = 0usize;
+    let mut still_live = 0usize;
     for track in stream.get_tracks().iter() {
         if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
             // Disarmed before it is stopped. `stop()` is specified not to fire
@@ -183,8 +195,35 @@ fn stop_tracks(stream: &web_sys::MediaStream) {
             // closures go with the `Held` that is dropping now.
             track.set_onended(None);
             track.stop();
+            if track.ready_state() == web_sys::MediaStreamTrackState::Ended {
+                stopped += 1;
+            } else {
+                still_live += 1;
+            }
         }
     }
+    if still_live == 0 {
+        debug!("{what} ({stopped} track(s) stopped)");
+    } else {
+        warn!(
+            "{what}, but {still_live} track(s) are still live ({stopped} stopped): \
+             this tab is still holding the camera"
+        );
+    }
+}
+
+/// Let go of a `<video>` that was wired to a stream.
+///
+/// Three steps, and the order is the point. A media element playing a
+/// `MediaStream` is kept alive by the browser rather than by anything holding
+/// it here — playback is a root — so an element merely dropped goes on being a
+/// sink on the camera's track for as long as the page lives. Six failed
+/// attempts in one call is six of them. Paused, unwired and removed, it is
+/// reachable from nothing and holding nothing.
+fn release_element(element: &web_sys::HtmlVideoElement) {
+    let _ = element.pause();
+    element.set_src_object(None);
+    element.remove();
 }
 
 /// Closes an encoder that was built but never handed to [`Held`].
@@ -245,9 +284,11 @@ impl Drop for Held {
         if self.encoder.state() != web_sys::CodecState::Closed {
             let _ = self.encoder.close();
         }
-        self.element.set_src_object(None);
-        stop_tracks(&self.stream);
-        debug!("the camera is closed");
+        // Paused, unwired and out of the document: it was put there to be
+        // allowed to play, so leaving it would accumulate one dead element
+        // per call — and a playing one is not garbage the page can collect.
+        release_element(&self.element);
+        stop_tracks(&self.stream, "the camera is closed");
     }
 }
 
@@ -538,7 +579,7 @@ async fn open_device(
             }
             if let Ok(stream) = value.dyn_into::<web_sys::MediaStream>() {
                 warn!("the camera opened after the call gave up waiting for it; closing it again");
-                stop_tracks(&stream);
+                stop_tracks(&stream, "the late camera is closed");
             }
         });
     }
@@ -594,11 +635,24 @@ async fn after(window: &web_sys::Window, ms: i32) {
 
 /// A `<video>` playing the stream, so a `VideoFrame` can be taken from it.
 ///
-/// Muted and `playsinline`, and never added to the document: an element with
-/// no parent still decodes, and one that were added would draw the self-view
-/// twice — once here and once wherever the front end puts the decoded frames.
-/// Muted also matters on its own, since autoplay of an unmuted element is
-/// refused.
+/// Muted and `playsinline`, and *in* the document — one pixel of it, moved off
+/// screen and fully transparent. It was written detached, on the reasoning
+/// that an element with no parent still decodes and an added one would draw
+/// the self-view twice; the second half is answered by the styling instead,
+/// and the first is what production disagreed with. Every camera a call tried
+/// to open failed with
+///
+/// > The play() request was interrupted because the media was removed from
+/// > the document.
+///
+/// which is Blink rejecting a pending play promise for a lifecycle reason,
+/// and the one thing it names is the document. `display: none` is not the way
+/// to hide it — a hidden element is entitled to stop rendering, and this one
+/// exists precisely to produce frames.
+///
+/// Removed again by [`Held`], and by this function on the way out of a
+/// failure: six failed attempts in one call is six elements, and a leak of
+/// them is a leak of the streams they hold.
 async fn attach(
     window: &web_sys::Window,
     stream: &web_sys::MediaStream,
@@ -613,6 +667,14 @@ async fn attach(
         .map_err(|_| anyhow!("the browser made something that is not a video element"))?;
     element.set_muted(true);
     let _ = element.set_attribute("playsinline", "");
+    let _ = element.set_attribute(
+        "style",
+        "position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;\
+         opacity:0;pointer-events:none",
+    );
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&element);
+    }
     element.set_src_object(Some(stream));
 
     // Awaited, because a refusal here is a camera that will produce nothing:
@@ -644,8 +706,20 @@ async fn attach(
         },
     )
     .await;
+    // A rejection is not the question; whether frames will come is. The two
+    // came apart in production: `play()` was aborted for a lifecycle reason
+    // while the element went on decoding perfectly well, and treating the
+    // promise as the answer downgraded every video call to voice. So the
+    // element is asked directly — which is the same question the capture tick
+    // asks before every frame, and the same one that makes a real autoplay
+    // refusal still fatal, because a refused element is not ready and never
+    // becomes so.
     if let Some(reason) = refused {
-        bail!("the browser would not play the camera's own stream: {reason}");
+        if element.ready_state() < 2 || element.video_width() == 0 {
+            release_element(&element);
+            bail!("the browser would not play the camera's own stream: {reason}");
+        }
+        warn!("the camera's preview reported {reason}, but it is playing; carrying on");
     }
     Ok(element)
 }

@@ -598,6 +598,32 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   every path out that is not a camera held withdraws it again, and the
   refusal's own teardown queues on the call's video lane behind the enable it
   is answering.
+- **The browser's camera reaches WebCodecs through a `<video>`, and that
+  element has to be in the document.** There is no way to hand a
+  `MediaStreamTrack` to a `VideoEncoder` directly, so a hidden element plays
+  the stream and every tick takes a `VideoFrame` from it. It was written
+  *detached*, on the reasoning that an element with no parent still decodes
+  and an added one would draw the self-view twice. Production disagreed, on
+  every camera a call ever opened: `play()` rejected with "The play() request
+  was interrupted because the media was removed from the document." Blink
+  decides that on `InActiveDocument()`, which is `isConnected()` and an active
+  document — a never-inserted element fails it exactly like a removed one. So
+  the element is appended, one pixel of it, off screen and fully transparent.
+  Not `display: none`: a hidden element is entitled to stop rendering, and
+  this one exists to produce frames.
+  The second half is that `play()` is not the question — whether frames will
+  come is. The two came apart here: the promise was aborted for a lifecycle
+  reason while the element went on decoding, and treating the rejection as
+  fatal downgraded every video call to voice. The element is asked directly
+  instead (`readyState` and `videoWidth`, the same question every capture tick
+  asks), which keeps a genuine autoplay refusal fatal — a refused element is
+  not ready and never becomes so.
+  And a media element playing a `MediaStream` is rooted by the *browser*,
+  because playback is a root: one merely dropped goes on being a sink on the
+  camera's track for the life of the page. Six refused attempts in one call is
+  six of them. Paused, unwired and removed, in that order, it holds nothing —
+  which is `release_element`, and it runs on the failure path as well as on
+  teardown.
 - **What a call turned out to be is said by the side that opened the
   device.** The kind is drawn from the offer, because that is all anyone
   knows when the call is placed or answered — and a camera that will not open
