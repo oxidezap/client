@@ -372,7 +372,7 @@ impl WhatsAppClient {
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
                 Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut msgs).await;
-                Self::canonicalize_quoted_authors(client, names, &mut msgs).await;
+                Self::hydrate_quoted_authors(client, names, &mut msgs).await;
                 // Groups *and* the status broadcast: both carry rows written
                 // by many people, and a hydrated row has no push name on it.
                 if existing.is_group || existing.is_status {
@@ -413,7 +413,7 @@ impl WhatsAppClient {
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_reactions(chat_store, client, names, &entry.jid, &mut chat.messages)
                 .await;
-            Self::canonicalize_quoted_authors(client, names, &mut chat.messages).await;
+            Self::hydrate_quoted_authors(client, names, &mut chat.messages).await;
             if chat.is_group || chat.is_status {
                 let is_status = chat.is_status;
                 Self::hydrate_sender_names(
@@ -601,7 +601,7 @@ impl WhatsAppClient {
     }
 
     /// File a quote's author under the identity their own bubbles are filed
-    /// under.
+    /// under, and name them from the same book those bubbles are named from.
     ///
     /// Every other sender field on a message goes through
     /// `identity.canonical_jid`; the one on a quote came straight off the
@@ -610,11 +610,22 @@ impl WhatsAppClient {
     /// looks a participant up by exact string, so the bar above a reply read
     /// "Unknown contact" — or a bare number — over bubbles from the same
     /// person, named from the address book, an inch above it.
-    pub(super) async fn canonicalize_quoted_authors(
+    ///
+    /// Canonical is not enough on its own: the participant map only holds
+    /// whoever has a row on the loaded page, so a reply to a message that
+    /// scrolled past — or was never loaded — still had nobody to be named by,
+    /// while the address book knew them all along. That book is what names a
+    /// bubble, so it is what names the bar above one.
+    ///
+    /// Whoever this account is stays unnamed here on purpose:
+    /// `Chat::quoted_author` calls them "You", which is the better answer and
+    /// the one a reader expects over their own message.
+    pub(super) async fn hydrate_quoted_authors(
         client: &Arc<Client>,
         names: &NameBook,
         msgs: &mut [ChatMessage],
     ) {
+        let me = own_jids(client);
         for msg in msgs.iter_mut() {
             let Some(quoted) = msg.quoted.as_mut() else {
                 continue;
@@ -622,9 +633,14 @@ impl WhatsAppClient {
             let Ok(jid) = quoted.sender.parse::<Jid>() else {
                 continue;
             };
-            quoted
-                .sender
-                .clone_from(&names.identity(client, &jid).await.canonical_jid);
+            let identity = names.identity(client, &jid).await;
+            quoted.sender.clone_from(&identity.canonical_jid);
+            if quoted.sender_name.is_empty()
+                && !me.iter().any(|own| *own == identity.canonical_jid)
+                && let Some(name) = names.known(client, &jid, None).await
+            {
+                quoted.sender_name = name;
+            }
         }
     }
 
@@ -666,12 +682,23 @@ impl WhatsAppClient {
             // arrives a second later, and the same person would read as a
             // number on their reloaded bubbles and by name on their new ones.
             // Drawing a number where nothing is known is the *renderer's* job.
-            msg.sender_name = match names.resolve(chat_store, &jid, None, &identity).await {
-                (_, crate::names::priority::NONE) => None,
-                (name, _) => Some(name),
-            };
+            msg.sender_name = names.named(chat_store, &jid, None, &identity).await;
         }
     }
+}
+
+/// Both addresses this account answers to, as they are written on a row.
+///
+/// A device that has paired but never synced has neither, which is the same
+/// as not recognising itself — and a message of one's own is labelled from
+/// its own `is_from_me` rather than from this, so nothing depends on it.
+fn own_jids(client: &Arc<Client>) -> Vec<String> {
+    let device = client.persistence_manager().get_device_snapshot();
+    [device.pn.as_ref(), device.lid.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|jid| jid.to_non_ad_string())
+        .collect()
 }
 
 /// The one chat nobody opens as a conversation.
