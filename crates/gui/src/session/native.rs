@@ -14,11 +14,12 @@ use std::io::BufReader;
 use std::sync::Arc;
 
 use log::info;
-use oxidezap_ipc::{ClientRequest, Endpoint, Link, PROTOCOL_VERSION};
+use oxidezap_ipc::{Endpoint, Link};
 
+use super::attach;
 use super::frames::Frames;
 use super::media::Directory;
-use super::sink::{self, EventSink, Events};
+use super::sink::{EventSink, Events};
 use super::{Pending, Session, Teardown};
 
 /// How long to give the reader to notice it has been hung up on.
@@ -41,27 +42,22 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
     // Taken before the reader is handed to its thread, because after that
     // there is nothing left to ask.
     let hangup = reader.hangup()?;
-    let (events, rx) = sink::channel();
 
-    let mut session = Session::new(
+    let attach::Attached {
+        mut session,
+        events,
+        sink,
+        pending,
+        pictures,
+    } = attach::begin(
         Link::over_stream(writer),
-        events.clone(),
         Arc::new(Directory),
-    );
-
-    // Before the reader starts, because the daemon serves nothing until it
-    // has one and answers it with the history this connection asked for.
-    session.send(ClientRequest::Hello {
-        protocol: PROTOCOL_VERSION,
-        session_events: true,
         // Said rather than left to the default: this is the client the
         // daemon's `ShowWindow` is for, and a front end that stays quiet
         // about it is one the daemon has to guess about.
-        has_window: true,
-    })?;
+        true,
+    )?;
 
-    let pending = Arc::clone(&session.pending);
-    let pictures = session.call_frames().clone();
     // Dropped when the thread ends, whichever way it ends, so the wait below
     // is over the thread's whole life rather than over a message it might
     // not reach.
@@ -70,7 +66,7 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
         .name("oxidezap-ipc".to_string())
         .spawn(move || {
             let _alive = alive;
-            read_frames(reader, &events, &pending, &pictures);
+            read_frames(reader, &sink, &pending, &pictures);
         })?;
 
     session.ends_with(Teardown::new(move || {
@@ -78,10 +74,16 @@ pub(super) fn connect() -> std::io::Result<(Session, Events)> {
         let _ = until_gone.recv_timeout(READER_PATIENCE);
     }));
 
-    Ok((session, rx))
+    Ok((session, events))
 }
 
 /// Read frames until the daemon goes away.
+///
+/// A loop of its own, and not [`super::attach::read_frames`]: that one is for
+/// a reader handed its frames on a task, and this one *is* the read — parked
+/// in a blocking call, framing the bytes itself, and wrapped in the
+/// `catch_unwind` a thread needs and a task does not. What the two share is
+/// [`Frames`], which is the whole of what a frame means.
 ///
 /// Whatever ends the loop, the reporting has to run: draining `pending` and
 /// failing every request in it, and telling the window the connection is

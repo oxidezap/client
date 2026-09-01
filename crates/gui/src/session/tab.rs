@@ -18,38 +18,20 @@
 //! Fetched with its frame and dropped after it, exactly as the WebSocket path
 //! does, and for the same reason: applying a frame is synchronous, so the
 //! bytes it names have to be here already. What differs is only the errand —
-//! three messages on the connection's own channel instead of an HTTP request.
+//! three messages on the connection's own channel instead of an HTTP request
+//! — so the pass itself, and the task the frames arrive on, are
+//! [`super::attach`] and this file supplies only that errand.
 
 use std::sync::Arc;
 
 use oxidezap_ipc::tab::{self, Ask, FromTab, Incoming, Media};
-use oxidezap_ipc::{ClientRequest, DaemonMessage, PROTOCOL_VERSION};
 use wasm_bindgen_futures::spawn_local;
 
 use super::Session;
-use super::frames::{self, Frames};
-use super::media::{MediaCache, StageThen};
-use super::sink::{self, Events};
-
-/// How many bytes of one frame's media may be held at once.
-///
-/// The same ceiling the socket path applies, and the arithmetic is if
-/// anything more pointed here: the payload exists in the other tab's heap and
-/// in this one, so a frame that names half the account's photos is two copies
-/// of them in one browser. What is left out is not lost — the renderer draws
-/// media it does not have as an offer to download.
-use oxidezap_core::WEB_MEDIA_BUDGET_BYTES as FRAME_MEDIA_CEILING;
-
-/// How long one frame's whole media sideband may take.
-///
-/// Per frame rather than per key, and it is the same bound the socket path
-/// applies for a reason that is sharper here: posting to a
-/// `BroadcastChannel` nobody is listening on *succeeds*, so a tab that has
-/// gone does not refuse a request, it simply never answers one. Without this,
-/// a history frame naming a hundred cached photos spends a hundred sequential
-/// deadlines discovering that, one after another — and the takeover queued
-/// behind that frame waits out every one of them.
-const FRAME_MEDIA_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+use super::attach;
+use super::frames::Frames;
+use super::media::{Held, MediaCache, StageThen};
+use super::sink::Events;
 
 /// Attach to the tab holding the account.
 ///
@@ -85,13 +67,17 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     // promise that reloading *this* tab starts it.
     super::note_account_is_here(false);
 
-    let (events, rx) = sink::channel();
-    let held = Arc::new(Fetched::new(media.clone()));
-    let cache: Arc<dyn MediaCache> = Arc::clone(&held) as Arc<_>;
-    let session = Session::new(link, events.clone(), cache);
-    session.send(ClientRequest::Hello {
-        protocol: PROTOCOL_VERSION,
-        session_events: true,
+    let fetched = Arc::new(Fetched::new(media.clone()));
+
+    let attach::Attached {
+        session,
+        events,
+        sink,
+        pending,
+        pictures,
+    } = attach::begin(
+        link,
+        Arc::clone(&fetched) as Arc<dyn MediaCache>,
         // Yes: this is a window, and the question `has_window` asks is
         // whether there is one for the daemon's Open to bring forward. A tab
         // cannot raise itself from an unsolicited frame — which is why the
@@ -100,8 +86,8 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         // answer decides that matters is the video path: a call's frames are
         // published to front ends that have somewhere to draw them, and this
         // one does.
-        has_window: true,
-    })?;
+        true,
+    )?;
 
     // The account, when it becomes this tab's.
     //
@@ -129,156 +115,70 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         }
     });
 
-    let pending = Arc::clone(&session.pending);
-    let pictures = session.call_frames().clone();
     spawn_local(async move {
         let mut incoming: Incoming = incoming;
-        let mut frames = Frames::new(&events, &pending, held.as_ref(), &pictures);
-        while let Some(message) = incoming.recv().await {
-            match message {
-                FromTab::Closed(reason) => {
-                    frames.blame(reason);
-                    break;
-                }
-                FromTab::Line(line) => {
-                    let Some(message) = frames::parse(&line) else {
-                        continue;
-                    };
-                    // Before the frame and not inside it: applying one is
-                    // synchronous, so what it will ask for has to be here.
-                    held.clear();
-                    gather(
-                        &message,
-                        &media,
-                        held.as_ref(),
-                        &pending,
-                        Ended {
-                            connection: incoming.connection_ended(),
-                            peer: incoming.peer_is_gone(),
-                        },
-                    )
-                    .await;
-                    if frames.apply(message).is_break() {
-                        break;
-                    }
-                }
-            }
-        }
-        frames.finish();
-    });
-
-    Ok((session, rx))
-}
-
-/// Pull every payload this frame names out of the tab that has them.
-///
-/// Sequentially, under a ceiling and under a clock — both, and neither is the
-/// other's substitute. The ceiling is memory: two tabs, each holding a frame's
-/// media, in one browser. The clock is the tab on the other end vanishing,
-/// which a per-request deadline bounds one request at a time and therefore
-/// does not bound at all across a frame naming a hundred keys.
-///
-/// A connection that has ended skips the optional half outright, exactly as
-/// the socket path does: the frames still queued are worth applying and the
-/// media they name is not worth waiting for — the renderer draws what is
-/// missing as an offer to download.
-///
-/// The requested half is where this stops copying the socket path, because
-/// the reason behind it does not carry. There the sideband is HTTP: a closed
-/// WebSocket says nothing about it, so a `Downloaded` frame is still fetched.
-/// Here both are one channel to one tab, so once *that tab* is the reason the
-/// connection ended, the request cannot be answered by anybody — and asking
-/// spends the whole download allowance finding out, with the takeover waiting
-/// behind it. An ending this side chose is different: the other tab is well,
-/// and its answer is worth having.
-async fn gather(
-    message: &DaemonMessage,
-    media: &Media,
-    into: &Fetched,
-    pending: &super::Pending,
-    ended: Ended,
-) {
-    // A download somebody asked for is not rationed and is one key; a frame's
-    // own media is both. The same division the socket path makes, made for
-    // the same reason: a `Downloaded` frame *is* somebody's answer, and
-    // skipping it would report a fetch that succeeded as one that failed.
-    let answering_a_request = matches!(message, DaemonMessage::Downloaded { .. });
-    if ended.connection && (!answering_a_request || ended.peer) {
-        return;
-    }
-    let ceiling = if answering_a_request {
-        u64::MAX
-    } else {
-        FRAME_MEDIA_CEILING
-    };
-    // A download somebody asked for gets the allowance it was promised, and
-    // that is the whole allowance rather than this path's own. `Downloaded`
-    // is the *answer* to a request the front end lets run for
-    // `DOWNLOAD_TIMEOUT_SECS`, so capping it at a frame's budget reports a
-    // document the daemon really fetched — and really handed over — as a
-    // failure, after the wait. The socket path draws the same distinction for
-    // the same reason.
-    let budget = if answering_a_request {
-        std::time::Duration::from_secs(crate::app::DOWNLOAD_TIMEOUT_SECS)
-    } else {
-        FRAME_MEDIA_BUDGET
-    };
-    // The per-request deadline as well as the one over the pass. Raising only
-    // the outer one leaves the inner one aborting the transfer anyway, which
-    // is the same failure wearing a different hat.
-    let within_ms = i32::try_from(budget.as_millis()).unwrap_or(i32::MAX);
-
-    let all = async {
-        let mut held: u64 = 0;
-        for key in frames::media_keys(message, pending) {
-            let Some(left) = ceiling.checked_sub(held).filter(|left| *left > 0) else {
-                log::debug!("this frame's media passed its size budget; the rest is on demand");
-                break;
-            };
-            // What is left rather than the whole ceiling, and sent *with* the
-            // request rather than checked on the answer: the other tab is the
-            // one that builds the array and the browser clones it from there,
-            // so a payload larger than the whole allowance is spent before
-            // anything here sees its length. A total consulted only between
-            // requests is one an oversized payload walks straight past.
-            //
-            // `once` on the frame that answers a request, which is what
-            // releases the other tab's claim on those bytes — the same two
-            // answers that tab gives itself, asked from one connection away.
-            match media
-                .read(
-                    &key,
-                    Ask {
-                        once: answering_a_request,
-                        most: left,
-                        within_ms,
+        let frames = Frames::new(&sink, &pending, fetched.as_ref(), &pictures);
+        attach::read_frames(
+            frames,
+            async || {
+                let arrived = incoming.recv().await?;
+                // Read here rather than where the media pass asks for it: the
+                // two are the same instant, and taking it now is what keeps
+                // the connection's borrow out of that pass.
+                let ended = attach::Ending {
+                    connection: incoming.connection_ended(),
+                    // Both halves are one channel to one tab, so once *that
+                    // tab* is the ending, nothing more will be answered by
+                    // anybody — not even a `Downloaded`, which the socket
+                    // path still fetches because its sideband is a separate
+                    // endpoint. Asking anyway would spend the whole download
+                    // allowance finding out, with the takeover waiting behind
+                    // it.
+                    peer: incoming.peer_is_gone(),
+                };
+                Some(match arrived {
+                    FromTab::Closed(reason) => attach::Arrival::Closed(reason),
+                    FromTab::Line(line) => attach::Arrival::Line { line, ended },
+                })
+            },
+            async |message, ended| {
+                fetched.held.clear();
+                attach::gather_media(
+                    message,
+                    &pending,
+                    ended,
+                    &fetched.held,
+                    async |key: &str, ration: attach::Ration| {
+                        // The ceiling travels *with* the request rather than
+                        // being checked on the answer: the other tab is the
+                        // one that builds the array and the browser clones it
+                        // from there, so a payload larger than the whole
+                        // allowance is spent before anything here sees its
+                        // length.
+                        //
+                        // `once` on the frame that answers a request, which is
+                        // what releases the other tab's claim on those bytes —
+                        // the same two answers that tab gives itself, asked
+                        // from one connection away.
+                        media
+                            .read(
+                                key,
+                                Ask {
+                                    once: ration.once,
+                                    most: ration.most,
+                                    within_ms: ration.within_ms,
+                                },
+                            )
+                            .await
                     },
                 )
-                .await
-            {
-                Ok(bytes) => {
-                    held = held.saturating_add(bytes.len() as u64);
-                    into.put(key, bytes);
-                }
-                Err(e) => log::debug!("media {key} is not available: {e}"),
-            }
-        }
-    };
-    if crate::platform::with_timeout(all, budget).await.is_none() {
-        log::debug!("this frame's media did not arrive within its budget");
-    }
-}
+                .await;
+            },
+        )
+        .await;
+    });
 
-/// How a connection ended, as the media pass has to ask it.
-///
-/// Two bits rather than one: what may still be *fetched* depends on whether
-/// the tab that would answer is the reason there is nothing to fetch from.
-#[derive(Clone, Copy)]
-struct Ended {
-    /// The connection is over, whoever ended it.
-    connection: bool,
-    /// And the other tab is why, so nothing more will be answered.
-    peer: bool,
+    Ok((session, events))
 }
 
 /// What the other tab has already handed over, held until the frame that
@@ -291,8 +191,13 @@ struct Ended {
 /// preserves its own order, so the race that shaped the other implementation
 /// does not exist and pretending it does would be a comment nobody could
 /// check.
+///
+/// The half that does *not* differ is the map, which is why that is
+/// [`Held`] and this is the two lines around it.
 struct Fetched {
-    bytes: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
+    /// The frame's own media, asked of the tab that has it.
+    held: Held,
+    /// The sideband it fills itself from, and stages back through.
     media: Media,
 }
 
@@ -300,51 +205,19 @@ impl Fetched {
     /// Empty, and holding the sideband it will fill itself from.
     fn new(media: Media) -> Self {
         Self {
-            bytes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            held: Held::default(),
             media,
         }
-    }
-
-    /// Hold bytes for the frame about to be applied.
-    fn put(&self, key: String, bytes: Vec<u8>) {
-        self.bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, Arc::new(bytes));
-    }
-
-    /// Forget whatever the last frame did not use.
-    fn clear(&self) {
-        self.bytes.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
 impl MediaCache for Fetched {
-    /// Read without consuming.
-    ///
-    /// One frame can name the same key on more than one message — media is
-    /// content-addressed, so a photo forwarded twice is one payload — and
-    /// taking it would leave every message after the first drawing a download
-    /// offer for bytes that are already here. `clear` is what bounds the map,
-    /// once per frame.
     fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
-        self.bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .map(Arc::clone)
-            .ok_or_else(|| format!("media {key} was not fetched with its frame"))
+        self.held.read(key)
     }
 
-    /// Moved out, not copied: this map is this tab's only copy, and a
-    /// document can be hundreds of megabytes in a linear memory that has a
-    /// ceiling. Nothing else is going to ask for the key a download answers.
     fn read_once(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
-        self.bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key)
-            .ok_or_else(|| format!("media {key} was not fetched with its frame"))
+        self.held.read_once(key)
     }
 
     /// Refused, because staging to another tab is not synchronous.
@@ -382,10 +255,7 @@ impl MediaCache for Fetched {
     /// because a `DELETE` and a `PUT` are two requests that can land the
     /// wrong way round.
     fn discard(&self, key: &str) {
-        self.bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
+        self.held.forget(key);
         if oxidezap_ipc::is_staged_key(key) {
             self.media.discard(key);
         }

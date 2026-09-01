@@ -16,11 +16,14 @@
 //! A page has no socket to open and no thread to park, so it reaches the same
 //! daemon over a WebSocket and reads it on a task. That difference is confined
 //! to [`native`] and [`web`], which are a thread and a callback around the same
-//! three things: [`frames`], which is what a frame *means*; [`sink`], which is
-//! where events go; and [`media`], which is where the bytes a frame only names
-//! come from. Everything a caller of this module touches — every method on
-//! [`Session`] — is written once and never learns which side it is on.
+//! four things: [`frames`], which is what a frame *means*; [`sink`], which is
+//! where events go; [`media`], which is where the bytes a frame only names come
+//! from; and [`attach`], which is the hello every transport says and the loop
+//! the ones that read on a task share. Everything a caller of this module
+//! touches — every method on [`Session`] — is written once and never learns
+//! which side it is on.
 
+mod attach;
 #[cfg(target_family = "wasm")]
 mod embedded;
 mod frames;

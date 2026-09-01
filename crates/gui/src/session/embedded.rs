@@ -19,14 +19,15 @@
 
 use std::sync::Arc;
 
-use oxidezap_ipc::{ClientRequest, Link, PROTOCOL_VERSION};
+use oxidezap_ipc::Link;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use wasm_bindgen_futures::spawn_local;
 
 use super::Session;
-use super::frames::{self, Frames};
+use super::attach;
+use super::frames::Frames;
 use super::media::MediaCache;
-use super::sink::{self, Events};
+use super::sink::Events;
 
 /// Start a session in this page, or attach to the tab that already has one.
 ///
@@ -78,12 +79,15 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         }
     });
 
-    let (events, rx) = sink::channel();
-    let cache: Arc<dyn MediaCache> = Arc::new(InProcess);
-    let session = Session::new(Link::over_pipe(outgoing), events.clone(), cache);
-    session.send(ClientRequest::Hello {
-        protocol: PROTOCOL_VERSION,
-        session_events: true,
+    let attach::Attached {
+        session,
+        events,
+        sink,
+        pending,
+        pictures,
+    } = attach::begin(
+        Link::over_pipe(outgoing),
+        Arc::new(InProcess) as Arc<dyn MediaCache>,
         // Yes, here. `has_window` answers "is there something the tray's Open
         // can bring forward", and over a socket the answer is no — a tab
         // cannot raise itself from an unsolicited frame. In this arrangement
@@ -92,36 +96,35 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         // have. Saying no would leave the daemon believing it has none and
         // reaching for a front end to start, which is the one thing a page
         // cannot do.
-        has_window: true,
-    })?;
+        true,
+    )?;
 
-    let pending = Arc::clone(&session.pending);
-    let pictures = session.call_frames().clone();
     spawn_local(async move {
         let cache = InProcess;
-        let mut frames = Frames::new(&events, &pending, &cache, &pictures);
+        let frames = Frames::new(&sink, &pending, &cache, &pictures);
         let mut lines = BufReader::new(reader).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    let Some(message) = frames::parse(&line) else {
-                        continue;
-                    };
-                    if frames.apply(message).is_break() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    frames.blame(format!("the session in this page stopped: {e}"));
-                    break;
-                }
-            }
-        }
-        frames.finish();
+        attach::read_frames(
+            frames,
+            async || match lines.next_line().await {
+                Ok(Some(line)) => Some(attach::Arrival::Line {
+                    line,
+                    // Nothing to skip and nothing to skip it for: the bytes a
+                    // frame names are already in this address space, so the
+                    // media pass below has no errand to run.
+                    ended: attach::Ending::default(),
+                }),
+                Ok(None) => None,
+                Err(e) => Some(attach::Arrival::Closed(format!(
+                    "the session in this page stopped: {e}"
+                ))),
+            },
+            // Media does not travel here; see the module header.
+            async |_, _| {},
+        )
+        .await;
     });
 
-    Ok((session, rx))
+    Ok((session, events))
 }
 
 /// How many times to go round the account before giving up on it.

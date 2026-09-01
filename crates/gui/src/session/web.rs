@@ -6,8 +6,11 @@
 //! names has to be fetched before the frame is applied rather than read
 //! inside it.
 //!
-//! Both of those are handled here and nowhere else. [`super::frames`] is the
-//! same code the desktop runs.
+//! What is this file's own is the *errand*: which URL to attach to, and an
+//! HTTP request for each key a frame names. The task the frames arrive on and
+//! the pass that fetches them are [`super::attach`], shared with the tab
+//! transport, which does the same two things by posting to another tab. And
+//! [`super::frames`] is the same code the desktop runs.
 //!
 //! # Why there is no "start one"
 //!
@@ -19,13 +22,13 @@
 use std::sync::Arc;
 
 use oxidezap_ipc::web::{self, FromSocket};
-use oxidezap_ipc::{ClientRequest, DaemonMessage, PROTOCOL_VERSION};
 use wasm_bindgen_futures::spawn_local;
 
 use super::Session;
-use super::frames::{self, Frames};
+use super::attach;
+use super::frames::Frames;
 use super::media::Fetched;
-use super::sink::{self, Events};
+use super::sink::Events;
 
 /// Attach to whichever daemon this page was pointed at.
 ///
@@ -82,14 +85,17 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
     log::info!("attaching to the daemon at {}", web::without_secrets(&url));
 
     let (link, mut socket) = web::connect(&url).map_err(std::io::Error::other)?;
-    let (events, rx) = sink::channel();
     let fetched = Arc::new(Fetched::default());
 
-    let cache: Arc<dyn super::media::MediaCache> = Arc::clone(&fetched) as Arc<_>;
-    let session = Session::new(link, events.clone(), cache);
-    session.send(ClientRequest::Hello {
-        protocol: PROTOCOL_VERSION,
-        session_events: true,
+    let attach::Attached {
+        session,
+        events,
+        sink,
+        pending,
+        pictures,
+    } = attach::begin(
+        link,
+        Arc::clone(&fetched) as Arc<dyn super::media::MediaCache>,
         // Not a window, whatever it looks like to the person reading it.
         //
         // `has_window` answers one question — is there something the tray's
@@ -104,162 +110,52 @@ pub(super) async fn connect() -> std::io::Result<(Session, Events)> {
         // Saying no means Open launches the desktop window instead. That is
         // the honest outcome: a second front end beside the tab, rather than
         // a tray menu item that silently fails.
-        has_window: false,
-    })?;
+        false,
+    )?;
 
-    let pending = Arc::clone(&session.pending);
-    let pictures = session.call_frames().clone();
     spawn_local(async move {
-        let mut frames = Frames::new(&events, &pending, fetched.as_ref(), &pictures);
-        while let Some(from_socket) = socket.recv().await {
-            match from_socket {
-                FromSocket::Open => log::info!("the daemon answered"),
-                FromSocket::Closed(reason) => {
-                    frames.blame(reason);
-                    break;
-                }
-                FromSocket::Line(line) => {
-                    let Some(message) = frames::parse(&line) else {
-                        continue;
-                    };
-                    // Before the frame, not inside it. Applying a frame is
-                    // synchronous — it is the same code the desktop runs on a
-                    // thread — so the bytes it will ask for have to be here
-                    // already. Everything the frame does not use is dropped
-                    // with the next one.
-                    fetched.clear();
-                    prefetch(
-                        &media_base,
-                        &message,
-                        fetched.as_ref(),
-                        &pending,
-                        socket.connection_ended(),
-                    )
-                    .await;
-                    if frames.apply(message).is_break() {
-                        break;
-                    }
-                }
-            }
-        }
-        frames.finish();
+        let frames = Frames::new(&sink, &pending, fetched.as_ref(), &pictures);
+        attach::read_frames(
+            frames,
+            async || {
+                let arrived = socket.recv().await?;
+                // Read here rather than where the media pass asks for it: the
+                // two are the same instant, and taking it now is what keeps
+                // the socket's borrow out of that pass.
+                let ended = attach::Ending {
+                    connection: socket.connection_ended(),
+                    // The sideband is HTTP, and a closed WebSocket says
+                    // nothing about it — an overflow close is one this page
+                    // made while the daemon was perfectly well — so a
+                    // `Downloaded` is still worth fetching after the socket
+                    // has gone.
+                    peer: false,
+                };
+                Some(match arrived {
+                    FromSocket::Open => attach::Arrival::Open,
+                    FromSocket::Closed(reason) => attach::Arrival::Closed(reason),
+                    FromSocket::Line(line) => attach::Arrival::Line { line, ended },
+                })
+            },
+            async |message, ended| {
+                // Everything the last frame did not use is dropped with this
+                // one; the decoded image cache above is what remembers media.
+                fetched.held.clear();
+                attach::gather_media(
+                    message,
+                    &pending,
+                    ended,
+                    &fetched.held,
+                    async |key: &str, ration: attach::Ration| {
+                        web::fetch_media_within(&media_base, key, ration.within_ms, ration.most)
+                            .await
+                    },
+                )
+                .await;
+            },
+        )
+        .await;
     });
 
-    Ok((session, rx))
-}
-
-/// How long a frame's whole media sideband may take.
-///
-/// Per frame rather than per key, which is the only bound that holds: each
-/// fetch carries a timeout of its own, and a history load names a hundred
-/// photos, so a stalled sideband would otherwise spend a hundred of those in
-/// a row — the better part of an hour with every state frame behind it
-/// waiting in the channel. What is not here by then is not lost, only late:
-/// the renderer offers the download instead.
-const FRAME_MEDIA_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// How many bytes of one frame's media may be held at once.
-///
-/// A time budget alone bounds the wrong thing. A history load names media
-/// across a hundred chats, the daemon it is attached to may hold 512 MiB of
-/// it, and every payload fetched stays in `Fetched` until the whole frame has
-/// been applied — after which applying it copies each one into the message it
-/// belongs to. Two of those at once, in a linear memory with a one-gigabyte
-/// ceiling, is a tab that stops rather than a page that is slow.
-///
-/// Sized against the *page's* own media budget rather than the daemon's,
-/// because this heap is the one that runs out. What is left out is not lost:
-/// a key that was not fetched is drawn as an offer to download, which is what
-/// the renderer already does for media the daemon never cached.
-use oxidezap_core::WEB_MEDIA_BUDGET_BYTES as FRAME_MEDIA_CEILING;
-
-/// Pull down every payload this frame names.
-///
-/// Sequentially, and deliberately: a history load names a hundred photos, and
-/// a hundred simultaneous fetches is a page that stalls on its own connection
-/// pool rather than one that draws sooner. A key that will not come is not an
-/// error — the renderer falls back to offering the download, which is what it
-/// does for media the daemon never cached either.
-///
-/// Under one deadline for all of them, so the sequence cannot multiply a
-/// stall by the number of keys; see [`FRAME_MEDIA_BUDGET`].
-///
-/// `after_close` skips the optional half. Once the socket has gone, the
-/// frames still queued behind it are worth applying and the media they name
-/// is not worth waiting for — a budget spent per frame is what would put an
-/// hour between the close and the reader reaching it, with every pending
-/// request unanswered until it did. It does not skip a `Downloaded`: that
-/// frame *is* somebody's answer, and the sideband is a different endpoint
-/// that a closed socket says nothing about — an overflow close is one this
-/// page made while the daemon was perfectly well. Skipping it would report a
-/// download that succeeded as one that failed.
-async fn prefetch(
-    base: &str,
-    message: &DaemonMessage,
-    into: &Fetched,
-    pending: &super::Pending,
-    after_close: bool,
-) {
-    // A download somebody asked for gets the allowance it was promised.
-    //
-    // [`FRAME_MEDIA_BUDGET`] is for the optional kind: a history load's
-    // thumbnails, where the whole point is that a stall must not hold the
-    // stream and a missing key is drawn as an offer to download. A
-    // `Downloaded` frame is the *answer* to a request that
-    // `download_with_timeout` allows a minute — capping it at half that meant
-    // a large document could never arrive, and would be reported as a failure
-    // by the very code waiting for it, after the daemon had already fetched
-    // and cached it.
-    //
-    // The reason the shared budget is short does not apply here either: it is
-    // there so a sequence of keys cannot multiply one stall, and this frame
-    // names exactly one.
-    let answering_a_request = matches!(message, DaemonMessage::Downloaded { .. });
-    if after_close && !answering_a_request {
-        return;
-    }
-    let budget = if answering_a_request {
-        std::time::Duration::from_secs(crate::app::DOWNLOAD_TIMEOUT_SECS)
-    } else {
-        FRAME_MEDIA_BUDGET
-    };
-    // The per-fetch deadline as well as the one over the sequence. Raising
-    // only the outer one left an inner thirty-second timer aborting the
-    // transfer anyway, which is the same failure wearing a different hat.
-    let each = i32::try_from(budget.as_millis()).unwrap_or(i32::MAX);
-
-    // A request somebody made is not optional and is one key, so it is not
-    // rationed; everything else is a frame's own media and is.
-    let ceiling = if answering_a_request {
-        u64::MAX
-    } else {
-        FRAME_MEDIA_CEILING
-    };
-
-    let all = async {
-        let mut held: u64 = 0;
-        for key in frames::media_keys(message, pending) {
-            let Some(left) = ceiling.checked_sub(held).filter(|left| *left > 0) else {
-                // Not an error, and not worth a per-key line: the renderer
-                // draws media it does not have as an offer to download, which
-                // is exactly what it does for media the daemon never cached.
-                log::debug!("this frame's media passed its size budget; the rest is on demand");
-                break;
-            };
-            // What is left rather than the whole ceiling, and checked against
-            // the response's own length before its body is read: a total that
-            // is only consulted between fetches is one an oversized payload
-            // walks straight past.
-            match web::fetch_media_within(base, &key, each, left).await {
-                Ok(bytes) => {
-                    held = held.saturating_add(bytes.len() as u64);
-                    into.put(key, bytes);
-                }
-                Err(e) => log::debug!("media {key} is not available: {e}"),
-            }
-        }
-    };
-    if crate::platform::with_timeout(all, budget).await.is_none() {
-        log::debug!("this frame's media did not arrive within its budget");
-    }
+    Ok((session, events))
 }
