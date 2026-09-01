@@ -1,9 +1,9 @@
 //! A live call's video, decoded by the browser.
 //!
-//! The same names as [`super::call`] and a different engine underneath, so
-//! nothing above learns which build it is in. What differs is not only the
-//! codec: the desktop gives each direction a thread and a short queue, and a
-//! page has neither to give. It does not need them — `VideoDecoder` is
+//! The same names as the desktop half beside it and a different engine
+//! underneath, so nothing above learns which build it is in. What differs is
+//! not only the codec: the desktop gives each direction a thread and a short
+//! queue, and a page has neither to give. It does not need them — `VideoDecoder` is
 //! already asynchronous, so the work a thread was there to move off the
 //! caller happens off it anyway.
 //!

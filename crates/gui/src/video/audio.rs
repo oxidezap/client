@@ -1,10 +1,11 @@
 //! Audio extraction from video files
 //!
 //! This module provides audio extraction functionality for MP4 video files.
-//! The video decoding is handled by StreamingVideoDecoder in streaming.rs.
+//! The video decoding is handled by StreamingVideoDecoder in `native.rs` and
+//! `web.rs`.
 //!
-//! The extraction was desktop-only while the only caller was `streaming.rs`,
-//! which a page did not build. It builds one now — `unsupported.rs` demuxes
+//! The extraction was desktop-only while the only caller was `native.rs`,
+//! which a page did not build. It builds one now — `web.rs` demuxes
 //! the same container for the browser's own decoder — so a video's sound
 //! plays on both, and `symphonia` and `mp4` are in the shipped module rather
 //! than removed from it by LTO. That is a real cost, paid for a real feature:
