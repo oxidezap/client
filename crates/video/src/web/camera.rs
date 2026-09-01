@@ -1,6 +1,7 @@
 //! One camera, opened and encoding, for as long as a call holds it.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use anyhow::{Result, anyhow, bail};
@@ -289,6 +290,9 @@ impl Drop for EncoderGuard {
 /// The closures are held because the browser calls into them; the element is
 /// held because a `<video>` removed from the document stops producing frames.
 struct Held {
+    /// What the outbound path did, reported once on the way out. See
+    /// [`Capture`].
+    capture: Rc<Capture>,
     stream: web_sys::MediaStream,
     element: web_sys::HtmlVideoElement,
     encoder: web_sys::VideoEncoder,
@@ -318,6 +322,10 @@ impl Drop for Held {
         // per call — and a playing one is not garbage the page can collect.
         release_element(&self.element);
         stop_tracks(&self.stream, "the camera is closed");
+        // After the device is released, because this is the sentence somebody
+        // reads when the picture never arrived and it should be the last word
+        // on the subject.
+        self.capture.report();
     }
 }
 
@@ -411,9 +419,11 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
     let control = CameraControl(Rc::new(Control {
         keyframe: Cell::new(true),
     }));
+    let capture = Rc::new(Capture::default());
     let on_chunk = {
         let tx = tx.clone();
         let control = control.clone();
+        let capture = Rc::clone(&capture);
         Closure::<dyn FnMut(web_sys::EncodedVideoChunk, wasm_bindgen::JsValue)>::new(
             move |chunk: web_sys::EncodedVideoChunk, _metadata: wasm_bindgen::JsValue| {
                 let mut data = vec![0u8; chunk.byte_length() as usize];
@@ -428,9 +438,28 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
                     // path it happens.
                     warn!("an encoded video chunk could not be read; asking for a keyframe");
                     control.0.keyframe.set(true);
+                    capture.dropped.set(capture.dropped.get().saturating_add(1));
                     return;
                 }
                 let keyframe = chunk.type_() == web_sys::EncodedVideoChunkType::Key;
+                let n = capture.chunks.get().saturating_add(1);
+                capture.chunks.set(n);
+                if n == 1 {
+                    // The one line that separates "the encoder never answered"
+                    // from every fault downstream of it. An encoder that
+                    // configures, accepts frames and emits nothing is a stream
+                    // that never existed, and it looks exactly like a stream
+                    // the session threw away.
+                    debug!(
+                        "the encoder produced its first chunk ({} bytes, {})",
+                        data.len(),
+                        if keyframe {
+                            "keyframe"
+                        } else {
+                            "not a keyframe"
+                        }
+                    );
+                }
                 // Something is dropped when this queue is full, and *which*
                 // is the whole question — with the opposite answer to the
                 // microphone's, which evicts its oldest frame. The difference
@@ -455,6 +484,11 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
                     tx.try_send(EncodedFrame { data, keyframe })
                 {
                     control.request_keyframe();
+                    let dropped = capture.dropped.get().saturating_add(1);
+                    capture.dropped.set(dropped);
+                    if dropped == 1 {
+                        debug!("an encoded video chunk was dropped: the session is not keeping up");
+                    }
                 }
             },
         )
@@ -494,7 +528,7 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
         )
     })?;
 
-    let on_tick = tick(&element, &encoder, &control, quality);
+    let on_tick = tick(&element, &encoder, &control, quality, &capture);
     let timer = window
         .set_interval_with_callback_and_timeout_and_arguments_0(
             on_tick.as_ref().unchecked_ref(),
@@ -539,6 +573,7 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
         quality,
         control,
         held: Some(Held {
+            capture,
             // Setup finished: the guard hands the camera to `Held`, which is
             // what closes it from here.
             stream: guard.release(),
@@ -779,15 +814,65 @@ async fn attach(
 const PLAYBACK_GRACE_MS: i32 = 2_000;
 
 /// One capture tick: take what the element is showing and encode it.
+/// What one camera's outbound path did, so a log can say where it stopped.
+///
+/// The relay learned this in #62 and #70 and it is the same lesson: a stage
+/// that fails by doing nothing is invisible, and four production logs went by
+/// before one said which stage. Outbound video has five places it can stop —
+/// the tick can decline to submit for three separate reasons, the encoder can
+/// emit nothing, and the queue to the session can refuse everything — and
+/// until now every one of them looked identical from a log: silence, with the
+/// camera reporting itself open the whole time.
+///
+/// Firsts and totals rather than a line per frame, for the same reason the
+/// relay reports firsts: twenty frames a second is not a log, and what has to
+/// be answerable is "did this stage ever happen", not "how is it doing now".
+#[derive(Default)]
+struct Capture {
+    submitted: Cell<u64>,
+    chunks: Cell<u64>,
+    /// Encoded units that never reached the session, at either hop.
+    dropped: Cell<u64>,
+    /// One per reason, so a reason is explained the first time it bites and
+    /// then only counted. A tick that skips twenty times a second would bury
+    /// the log it is supposed to be writing.
+    said: RefCell<HashSet<&'static str>>,
+}
+
+impl Capture {
+    /// Say `why` if this is the first time, and count it either way.
+    fn skipping(&self, why: &'static str) {
+        if self.said.borrow_mut().insert(why) {
+            debug!("the camera is not submitting frames: {why}");
+        }
+    }
+
+    /// One line naming every stage, said when the camera closes.
+    ///
+    /// A camera that submitted nothing, one whose encoder answered nothing,
+    /// and one whose frames were all refused by the session read identically
+    /// without this — and are three unrelated faults.
+    fn report(&self) {
+        debug!(
+            "the camera encoded {} chunk(s) from {} submitted frame(s), {} dropped on the way out",
+            self.chunks.get(),
+            self.submitted.get(),
+            self.dropped.get()
+        );
+    }
+}
+
 fn tick(
     element: &web_sys::HtmlVideoElement,
     encoder: &web_sys::VideoEncoder,
     control: &CameraControl,
     quality: VideoQuality,
+    capture: &Rc<Capture>,
 ) -> Closure<dyn FnMut()> {
     let element = element.clone();
     let encoder = encoder.clone();
     let control = control.clone();
+    let capture = Rc::clone(capture);
     // Counted rather than read off a clock: the timestamps have to advance by
     // exactly the stride the call negotiated, or the peer's playout drifts
     // against its own RTP timestamps. A wall clock would deliver the jitter
@@ -807,6 +892,7 @@ fn tick(
     let complained = Rc::new(RefCell::new(false));
     Closure::<dyn FnMut()>::new(move || {
         if encoder.state() != web_sys::CodecState::Configured {
+            capture.skipping("the encoder is no longer configured");
             return;
         }
         let now = monotonic_now();
@@ -826,12 +912,19 @@ fn tick(
         // unbounded backlog. Skipping is what the desktop's bounded channel
         // does one step later.
         if encoder.encode_queue_size() > 2 {
+            // Ordinary once in a while and a stopped stream if it never
+            // clears: an encoder that accepts frames and emits nothing wedges
+            // here permanently, which is silence indistinguishable from a
+            // camera that was never asked for anything.
+            capture.skipping("the encoder's queue is not draining");
             return;
         }
         if element.ready_state() < 2 || element.video_width() == 0 {
             // Nothing is playing yet: the element is still opening the
-            // stream. Not an error, and not worth a frame of duplicated
-            // black.
+            // stream. Not an error at the start of a call, and not worth a
+            // frame of duplicated black — but the same branch is also what a
+            // preview that stopped playing mid-call falls into forever.
+            capture.skipping("the preview has no frame to take yet");
             return;
         }
         let init = web_sys::VideoFrameInit::new();
@@ -877,6 +970,11 @@ fn tick(
         // them stops capturing within seconds.
         frame.close();
         frames.set(frames.get().saturating_add(1));
+        let n = capture.submitted.get().saturating_add(1);
+        capture.submitted.set(n);
+        if n == 1 {
+            debug!("the camera submitted its first frame to the encoder");
+        }
     })
 }
 

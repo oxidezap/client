@@ -436,12 +436,26 @@ async fn pump_local(pump: LocalPump) {
     // Set by a drop, spent on the next frame that gets through — the one
     // whose references are the ones missing. See `CallVideoFrame::gap`.
     let mut gap = false;
+    // Firsts and totals, for the reason the relay reports them: the two hops
+    // below fail by doing nothing, and a self-view nobody is drawing, a plane
+    // that refuses every unit, and an encoder that never produced one are the
+    // same silence in a log and three unrelated faults. See `Capture` in the
+    // video crate, which covers the hops upstream of this one.
+    let mut taken = 0u64;
+    let mut to_the_plane = 0u64;
+    let mut refused_by_the_plane = 0u64;
+    let mut drawn = 0u64;
+    let mut unwatched = false;
     while let Ok(EncodedFrame { data, keyframe }) = frames.recv().await {
+        taken += 1;
+        if taken == 1 {
+            debug!("the first encoded frame of local video reached the session");
+        }
         // Nothing is drawing a call that is still ringing. The camera runs
         // regardless — the offer said it would — but the picture goes
         // nowhere until there is somewhere to put it.
         if drawable.load(Ordering::Relaxed) {
-            let drawn = publish(&publisher, || {
+            let delivery = publish(&publisher, || {
                 CallVideoFrame::new(
                     read(&call_id),
                     VideoStream::Local,
@@ -456,14 +470,51 @@ async fn pump_local(pump: LocalPump) {
             // that emits one every few seconds anyway — against a self-view
             // frozen until the next, and the mark travels with the frame that
             // does arrive.
-            if drawn == Delivery::Dropped {
+            if delivery == Delivery::Dropped {
                 camera.request_keyframe();
             }
-            gap = drawn.still_owes_a_gap(gap);
+            match delivery {
+                Delivery::Sent => {
+                    drawn += 1;
+                    if drawn == 1 {
+                        debug!("the self-view drew its first frame");
+                    }
+                }
+                // Nobody is drawing this side. Ordinary for a daemon with no
+                // window, and the whole explanation for a call that shows the
+                // peer and a blank square where this side should be — which
+                // is a front end that did not subscribe, not a camera that
+                // failed. Said once; it does not change mid-call.
+                Delivery::NoSubscriber => {
+                    if !std::mem::replace(&mut unwatched, true) {
+                        debug!("the self-view has nobody drawing it; local video is not published");
+                    }
+                }
+                Delivery::Dropped => {}
+            }
+            gap = delivery.still_owes_a_gap(gap);
         }
-        if plane.try_send(data).is_err() {
+        let handed_over = plane.try_send(data);
+        if handed_over.is_ok() {
+            to_the_plane += 1;
+            if to_the_plane == 1 {
+                // The last hop this side owns. Past here the frame is the
+                // library's to packetise and send, so a call whose peer draws
+                // nothing while this line is present is a fault downstream of
+                // us — which is the distinction the log could not make.
+                debug!("the first frame of local video was handed to the media plane");
+            }
+        } else {
             if plane.is_closed() {
                 break;
+            }
+            refused_by_the_plane += 1;
+            if refused_by_the_plane == 1 {
+                // The peer sees nothing from here if this is every frame. The
+                // media plane draining slower than the camera fills it is the
+                // one hop between an encoder that works and a call with no
+                // outbound picture, and it had no line of its own.
+                warn!("the media plane refused a frame of local video; asking for a keyframe");
             }
             // The plane is behind. Whatever it sends next has to be
             // decodable on its own, since everything after a gap references
@@ -479,7 +530,10 @@ async fn pump_local(pump: LocalPump) {
     // registry tore down a call that was already ending. The plane going away
     // is the third way out, and that one is the call ending too.
     let call_id = read(&call_id);
-    debug!("local video for {call_id} ended");
+    debug!(
+        "local video for {call_id} ended ({taken} frame(s) taken, {to_the_plane} to the peer, \
+         {refused_by_the_plane} refused, {drawn} drawn here)"
+    );
     // Every way out, including the `break` above: the flag says this pump
     // produces no more, and a caller wiring the camera up reads it before the
     // report — which is what the registry is torn down by, and which finds
