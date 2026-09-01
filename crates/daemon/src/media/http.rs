@@ -247,13 +247,13 @@ pub(crate) async fn receive(
         .await;
     }
     log::debug!("staged {} bytes under {key}", body.len());
-    // Every staging is also an occasion to notice the ones nobody came back
-    // for. The cache sweep runs on a threshold of *cache* writes, which a
-    // staged upload does not advance, so without this the age rule that
-    // reclaims an orphan is only reachable through unrelated traffic.
-    if let Some(dir) = oxidezap_ipc::media_dir() {
-        super::reclaim_abandoned_writes(&dir);
-    }
+    // Nothing about orphans here, and that is a change: this used to walk the
+    // whole media directory before answering, so a send of ten files paid ten
+    // `read_dir`s plus a `stat` per cached file — on the reactor, with the
+    // front end waiting on each 204. The age rule that reclaims an abandoned
+    // upload now runs on a schedule of its own, which also covers the front
+    // end that stages by writing the file itself and never reaches this
+    // endpoint at all. See `media::reclaim_abandoned_writes_periodically`.
     respond(stream.get_mut(), 204, "text/plain", origin, b"").await
 }
 

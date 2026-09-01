@@ -20,10 +20,12 @@ mod platform;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod http;
 
-/// The orphan sweep, called by the daemon at startup as well as from the
-/// repair below. Native only: a page has no directory to walk.
+/// The orphan sweep, as the daemon runs it: once at startup and on a schedule
+/// after. Native only — a page has no directory to walk — and a task rather
+/// than a call, because it is a `stat` per cached file and none of the places
+/// an orphan is made can afford one.
 #[cfg(not(target_family = "wasm"))]
-pub use platform::reclaim_abandoned_writes;
+pub use platform::reclaim_abandoned_writes_periodically;
 pub use platform::{cache_usage, claim, has, take};
 /// Read without removing, where the front end is this process. See `web.rs`.
 #[cfg(target_family = "wasm")]
