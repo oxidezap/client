@@ -648,10 +648,6 @@ impl CallState {
         }
     }
 
-    /// End whatever call carries `call_id`.
-    ///
-    /// Returns whether anything changed, so an ack for a call already gone
-    /// does not buy a redraw.
     /// [`end`](Self::end), for a call another of this account's devices
     /// answered or refused.
     ///
@@ -701,6 +697,16 @@ impl CallState {
         matches!(self.ending_for(call_id), Some(Ending::Nothing))
     }
 
+    /// End whatever call carries `call_id`, wherever this state holds it.
+    ///
+    /// Returns whether anything changed, so an ack for a call already gone
+    /// does not buy a redraw.
+    ///
+    /// Named calls only, and the parked second offer counts as one: an id for
+    /// a call this state does not hold changes nothing. Ending the call on
+    /// the stage is a final removal, so whoever was waiting behind it comes
+    /// forward — the same rule `take` and `dismiss_incoming` follow, and the
+    /// reason an end here is not a bare `self.stage = None`.
     pub fn end(&mut self, call_id: &CallId) -> bool {
         if self
             .waiting

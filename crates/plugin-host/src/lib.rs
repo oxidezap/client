@@ -489,14 +489,6 @@ impl Plugins {
         }
     }
 
-    /// Finish a pass: take another if one is owed, or give the slot up.
-    ///
-    /// One `compare_exchange` and not two steps, which is the whole point of
-    /// the state being a word. Releasing the slot and *then* looking for a
-    /// pending ask leaves a gap an ask can land in — it sees a reload
-    /// running, records itself, and the reload it was counting on has already
-    /// decided it is finished — and every arrangement of two atomics has that
-    /// gap somewhere.
     /// Whether the account has gone and this host with it.
     ///
     /// Asked by a caller that has something irreversible to do between two of

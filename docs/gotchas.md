@@ -667,41 +667,6 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   the bytes are spent either way and spending the remainder is what makes them
   worth anything.
 
-- **A video call announces its direction; the offer only advertises the
-  capability.** A call placed as video enables its plane ungated, encodes and
-  packetises — and the peer shows nothing, because the receiving side brings
-  its video stream up off a `<video state="1">` *announcement*, not off the
-  offer. The official client's decoder is driven by `handle_peer_video_enabled`
-  and `update_video_info`, both fed by `<video state=...>`. Android says its
-  own direction (`state="11"`) and, when nothing answers for ours, gives up
-  (`state="0"`). A mid-call camera already announced, through `start_video`;
-  the from-start path was the one that never did.
-- **Neither encoder may go without a periodic IDR, and it is not a quality
-  setting.** The media plane drops every access unit that is not an IDR while
-  one of its keyframe gates is closed -- the engine's `keyframe_required` and
-  the driver's send gate -- and both close on ordinary events: shedding under
-  backpressure, a relay reconnect, an inbound PLI. The only notice either
-  gives is `CallEvent::VideoKeyframeNeeded`, which nothing here answered, and
-  the library's own retry logic is written against an encoder that produces an
-  IDR anyway. The desktop met that contract with openh264's three-second intra
-  period and so never showed the fault; the browser encoder emitted a keyframe
-  only when asked, so the first missed request stopped its video for the rest
-  of the call. `KEYFRAME_SECONDS` is now one number both backends read, and the
-  event is answered as well -- the cadence bounds the outage at three seconds,
-  the answer ends it in one frame.
-- **The outbound ceiling drops whole access units, never part of one.** The
-  browser relay's queue ceiling was applied per packet, which is right for
-  audio and ruinous for video: one Opus packet is one frame, but a 720p IDR is
-  tens of fragments and is itself large enough to cross the ceiling *while it
-  is being written*. What reached the peer was a keyframe with a hole in it,
-  and so was everything referencing it. Worse, the transport returns `Ok`, so
-  the library believed all of it went out -- its own per-unit shedding never
-  ran, no gate closed, nothing asked for a replacement. The verdict is taken
-  once now, at an access unit's first packet, and holds to its marker bit; a
-  unit already begun is finished whatever the queue has done since, because
-  the bytes are spent either way and spending the remainder is what makes them
-  worth anything.
-
 - **The relay reports which RTP streams crossed it, not just that media
   did.** `RelayPacketKind::Rtp` says "media" and stops there, so a call
   sending audio alone and one sending audio and video produce the same three
