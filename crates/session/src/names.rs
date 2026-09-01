@@ -137,13 +137,31 @@ impl NameBook {
         (identity.fallback_name.clone(), priority::NONE)
     }
 
-    /// What somebody is actually called, for the live paths — or `None` when
-    /// nobody has ever said.
+    /// [`resolve`](Self::resolve)'s answer, or `None` when nobody has ever
+    /// said.
     ///
-    /// The number is deliberately not an answer here. A live event names a
-    /// person *and* can name the conversation they are in, and a phone number
-    /// arriving as a name would displace one the history sync had already
-    /// found; the front ends already render a nameless JID themselves.
+    /// The number is deliberately not an answer: a label that only ever
+    /// gains a value can never be renamed by the push name arriving a second
+    /// later, so drawing a number where nothing is known is the front end's
+    /// job. Every caller that stamps a name onto a row goes through this, so
+    /// the bubble, the quote bar and the typing line cannot disagree about
+    /// when somebody is nameless.
+    pub(crate) async fn named(
+        &self,
+        store: &ChatStore,
+        jid: &Jid,
+        offered: Option<&str>,
+        identity: &ChatIdentity,
+    ) -> Option<String> {
+        match self.resolve(store, jid, offered, identity).await {
+            (_, priority::NONE) => None,
+            (name, _) => Some(name),
+        }
+    }
+
+    /// What somebody is actually called, for the paths that were not handed
+    /// the store — [`named`](Self::named) with the address book read off the
+    /// handle.
     ///
     /// While the store is still coming up there is no address book to ask, so
     /// what the envelope offered stands: an event can reach the loop before
@@ -160,10 +178,7 @@ impl NameBook {
                 .filter(|name| usable_name(name, identity.has_phone))
                 .map(str::to_owned);
         };
-        match self.resolve(&store, jid, offered, &identity).await {
-            (_, priority::NONE) => None,
-            (name, _) => Some(name),
-        }
+        self.named(&store, jid, offered, &identity).await
     }
 
     /// The address book's answer for one alias.

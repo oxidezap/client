@@ -3,10 +3,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use wacore_binary::jid::Jid;
 
 use super::media::{MediaContent, MediaType};
-use super::{fallback_chat_name, is_false};
+use super::{fallback_sender_name, is_false};
 use crate::message_status::MessageStatus;
 use crate::quoted::QuotedMessage;
 use crate::system_notice::SystemNotice;
@@ -77,12 +76,9 @@ impl ChatMessage {
     /// same person would read as a number on their reloaded bubbles and by
     /// name on their new ones.
     pub fn author_label(&self) -> std::borrow::Cow<'_, str> {
-        if let Some(name) = &self.sender_name {
-            return std::borrow::Cow::Borrowed(name);
-        }
-        match self.sender.parse::<Jid>() {
-            Ok(jid) => std::borrow::Cow::Owned(fallback_chat_name(&jid)),
-            Err(_) => std::borrow::Cow::Borrowed(&self.sender),
+        match &self.sender_name {
+            Some(name) => std::borrow::Cow::Borrowed(name),
+            None => fallback_sender_name(&self.sender),
         }
     }
 

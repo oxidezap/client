@@ -1143,8 +1143,7 @@ impl WhatsAppClient {
             chat_message.media = Some(media);
         }
 
-        Self::canonicalize_quoted_authors(client, names, std::slice::from_mut(&mut chat_message))
-            .await;
+        Self::hydrate_quoted_authors(client, names, std::slice::from_mut(&mut chat_message)).await;
 
         // Normalize chat JID to LID if mapping exists, so the same user doesn't
         // appear as two chats when messages come from PN vs LID.

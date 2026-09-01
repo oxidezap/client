@@ -158,7 +158,7 @@ impl WhatsAppClient {
         page.reverse(); // the store returns newest-first; a timeline is drawn the other way
         let mut messages: Vec<ChatMessage> = page.into_iter().map(stored_to_chat_message).collect();
         Self::hydrate_reactions(store, client, names, &chat, &mut messages).await;
-        Self::canonicalize_quoted_authors(client, names, &mut messages).await;
+        Self::hydrate_quoted_authors(client, names, &mut messages).await;
         if chat.is_group() || chat.is_status_broadcast() {
             Self::hydrate_sender_names(
                 store,

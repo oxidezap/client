@@ -24,6 +24,11 @@ fn book() -> NameBook {
     NameBook::new(Arc::new(super::Mutex::new(None)))
 }
 
+/// A name book that can reach the address book, the way the live paths do.
+fn book_with(store: &Arc<ChatStore>) -> NameBook {
+    NameBook::new(Arc::new(super::Mutex::new(Some(store.clone()))))
+}
+
 /// A store-hydrated chat list must label a photo the way the live path
 /// does. The store's preview column holds the newest message's TEXT, and a
 /// photo with no caption has none — the bubble does, and a row rendered
@@ -336,7 +341,138 @@ async fn a_quoted_author_is_filed_where_their_bubbles_are() {
     assert_eq!(quoted.sender, TEST_PEER);
 }
 
+/// Canonical is not enough on its own. The participant map only holds
+/// whoever has a row on the loaded page, so a reply to a message that was
+/// never loaded had nobody to be named by and the bar read "Unknown
+/// contact" — over a group whose bubbles from that same person, named from
+/// the address book, read fine.
+#[tokio::test]
+async fn a_quoted_author_is_named_from_the_book_their_bubbles_are() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    let (chat_store, client) = test_session("quoted-author-name").await;
+    // The author says who they are somewhere else entirely — that is all it
+    // takes for the address book to know them.
+    feed(
+        &chat_store,
+        from(
+            TEST_AUTHOR,
+            TEST_AUTHOR,
+            Some("Allyson"),
+            wa::Message {
+                conversation: Some("ping".to_string()),
+                ..Default::default()
+            },
+            "MSG-ORIGINAL",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    // Somebody else answers them in a group, and the answer is the only row
+    // that group has.
+    let reply = wa::Message {
+        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
+            text: Some("e o áudio?".to_string()),
+            context_info: buffa::MessageField::some(wa::ContextInfo {
+                stanza_id: Some("MSG-ORIGINAL".to_string()),
+                // As a sending device spells itself.
+                participant: Some(TEST_AUTHOR.replace('@', ":12@")),
+                quoted_message: buffa::MessageField::some(wa::Message {
+                    conversation: Some("ping".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        from(
+            TEST_GROUP,
+            TEST_PEER,
+            None,
+            reply,
+            "MSG-REPLY",
+            1_700_000_100,
+        ),
+    )
+    .await;
+
+    let page = WhatsAppClient::message_page(
+        &chat_store,
+        &client,
+        &book_with(&chat_store),
+        TEST_GROUP.to_string(),
+        None,
+        50,
+    )
+    .await
+    .expect("page loads");
+    let quoted = page.items[0].quoted.as_ref().expect("this is a reply");
+    assert_eq!(quoted.sender, TEST_AUTHOR);
+    assert_eq!(quoted.sender_name, "Allyson");
+}
+
+/// Your own message is quoted as "You", and a name off the book would
+/// displace it — this account is in the address book like anybody else,
+/// under whatever its owner saved their own number as. The hydration leaves
+/// it unnamed on purpose and lets `Chat::quoted_author` answer.
+#[tokio::test]
+async fn a_quote_of_your_own_message_is_left_for_the_chat_to_name() {
+    let (chat_store, client) = test_session("quoted-author-self").await;
+    let own: Jid = TEST_PEER.parse().expect("test JID");
+    client
+        .persistence_manager()
+        .modify_device(|device| device.pn = Some(own.clone()))
+        .await;
+    // The book would answer for this JID: it has a row, like any contact.
+    feed(
+        &chat_store,
+        from(
+            TEST_PEER,
+            TEST_PEER,
+            Some("Eu mesmo"),
+            wa::Message {
+                conversation: Some("ping".to_string()),
+                ..Default::default()
+            },
+            "MSG-ORIGINAL",
+            1_700_000_000,
+        ),
+    )
+    .await;
+    assert_eq!(
+        book_with(&chat_store)
+            .known(&client, &own, None)
+            .await
+            .as_deref(),
+        Some("Eu mesmo"),
+        "the premise: the book has a name for this account"
+    );
+
+    let mut message = ChatMessage::new_outgoing("MSG-REPLY".into(), "e o áudio?".into());
+    message.quoted = Some(oxidezap_core::QuotedMessage {
+        message_id: "MSG-ORIGINAL".to_string(),
+        sender_name: String::new(),
+        sender: TEST_PEER.to_string(),
+        preview: "ping".to_string(),
+        kind: None,
+    });
+    WhatsAppClient::hydrate_quoted_authors(
+        &client,
+        &book_with(&chat_store),
+        std::slice::from_mut(&mut message),
+    )
+    .await;
+    assert_eq!(message.quoted.expect("a reply").sender_name, "");
+}
+
 const TEST_PEER: &str = "559900000001@s.whatsapp.net";
+const TEST_AUTHOR: &str = "111222333444555@lid";
+const TEST_GROUP: &str = "120363000000000001@g.us";
 
 /// A chat store and a client over one in-memory database, with no network:
 /// `Bot::build` only opens the store, and `load_history` needs the client
@@ -362,6 +498,42 @@ fn incoming(
     ts_secs: i64,
 ) -> whatsapp_rust::wacore::types::events::Event {
     incoming_in(TEST_PEER, message, id, ts_secs)
+}
+
+/// One inbound message, spelled out: who it is addressed to, who wrote it,
+/// and what they call themselves — which is what puts them in the address
+/// book.
+fn from(
+    chat: &str,
+    sender: &str,
+    push_name: Option<&str>,
+    message: wa::Message,
+    id: &str,
+    ts_secs: i64,
+) -> whatsapp_rust::wacore::types::events::Event {
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, Event, InboundMessage, MessageBatch};
+    use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+
+    let info = MessageInfo {
+        source: MessageSource {
+            chat: chat.parse().expect("test JID"),
+            sender: sender.parse().expect("test JID"),
+            ..Default::default()
+        },
+        id: id.to_string(),
+        timestamp: whatsapp_rust::wacore::time::from_secs(ts_secs).expect("test timestamp"),
+        push_name: push_name.unwrap_or_default().to_string(),
+        ..Default::default()
+    };
+    Event::Messages(
+        MessageBatch::builder()
+            .messages(Arc::from([InboundMessage::builder()
+                .message(Arc::new(message))
+                .info(Arc::new(info))
+                .build()]))
+            .origin(BatchOrigin::Live)
+            .build(),
+    )
 }
 
 fn incoming_in(
