@@ -36,6 +36,23 @@ pub(super) struct ReadRecord {
     /// a genuinely unread message the read never covered — the ids are how it
     /// is told apart from the ones that were.
     ids: HashSet<String>,
+    /// Whether the whole second is covered, `ids` or not.
+    ///
+    /// The action clears a second — `last_message_timestamp` is what it
+    /// carries, and the ids ride along as its conflict resolution — so a read
+    /// issued from a boundary that had already dropped siblings still read
+    /// every one of them. Taking the capped list for the whole truth would
+    /// leave a dropped message looking unread here, and the first redelivery
+    /// or in-flight reload carrying one would spend the very override this
+    /// record exists to be.
+    ///
+    /// A boundary at its cap cannot tell whether it dropped anything, so this
+    /// is set on reaching it rather than on overflowing it. The cost of that
+    /// is a same-second arrival being taken as read for the grace, and it is
+    /// paid only by a chat that has just put [`MAX_BOUNDARY`] messages into
+    /// one second — which is a chat whose next arrival is a newer second, and
+    /// a newer second spends the override outright.
+    whole_second: bool,
     /// When this stops applying. See [`READ_OVERRIDE_GRACE_MS`].
     expires_at_ms: i64,
 }
@@ -45,6 +62,7 @@ impl ReadRecord {
         Self {
             secs,
             ids: boundary.iter().map(|(id, ..)| id.clone()).collect(),
+            whole_second: boundary.len() >= MAX_BOUNDARY,
             expires_at_ms: wacore::time::now_millis().saturating_add(READ_OVERRIDE_GRACE_MS),
         }
     }
@@ -57,7 +75,8 @@ impl ReadRecord {
     /// Whether this read already covered `message`.
     fn covers(&self, message: &ChatMessage) -> bool {
         let secs = message.timestamp.timestamp();
-        secs < self.secs || (secs == self.secs && self.ids.contains(&message.id))
+        secs < self.secs
+            || (secs == self.secs && (self.whole_second || self.ids.contains(&message.id)))
     }
 
     /// Whether `message` is a reason to stop trusting this read.
@@ -86,6 +105,32 @@ impl ReadRecord {
 /// most likely to care about survive.
 const MAX_TRACKED_UNREAD: usize = 512;
 
+/// Most messages the daemon will hold at a chat's boundary second.
+///
+/// The same rule as [`MAX_TRACKED_UNREAD`] — one chat must not be able to grow
+/// the daemon without bound — reaching the one place it did not: a boundary
+/// holds only the newest second, but WhatsApp stamps to the second, so a
+/// history page, an offline catch-up and a group everyone answers at once all
+/// fold arbitrarily many messages into that one second, and only a *newer*
+/// second empties it. A peer that keeps stamping the same second is then a
+/// conversation that grows forever.
+///
+/// Oldest arrival first, the way both queues beside it drop theirs, and
+/// deliberately *not* by id: a front end orders its rows by the whole
+/// timestamp before the id and its own sends carry the milliseconds the
+/// daemon's whole seconds do not, so the row a window echoes in `MarkRead` is
+/// not the highest id at the second. Arrival keeps what a window that is up to
+/// date has most recently been handed.
+///
+/// What a dropped entry costs, since it is not nothing: a requester naming one
+/// is refused — the id is no longer one the daemon can place at the second —
+/// and it clears its badge locally over a read that never happened. It does
+/// not cost a receipt (those are owed from `unread`, which is its own queue)
+/// and it does not narrow the read itself, which clears the second whole. And
+/// it heals on the next message: any newer second empties the boundary, which
+/// a chat busy enough to overflow one produces almost at once.
+const MAX_BOUNDARY: usize = 512;
+
 /// What `MarkRead` needs and a [`oxidezap_ipc::ChatSummary`] cannot carry.
 ///
 /// A summary is a badge and a preview. Turning the sender's ticks blue needs
@@ -97,8 +142,15 @@ const MAX_TRACKED_UNREAD: usize = 512;
 struct ChatReads {
     /// Newest message timestamp seen, in whole seconds.
     newest_secs: i64,
-    /// Every message at `newest_secs`, shaped as `mark_chat_read` wants them.
-    boundary: Vec<(String, bool, Option<String>)>,
+    /// Every message at `newest_secs`, oldest arrival first, shaped as
+    /// `mark_chat_read` wants them. Bounded; see [`MAX_BOUNDARY`].
+    boundary: VecDeque<(String, bool, Option<String>)>,
+    /// The ids in `boundary`, so recognising a redelivery is a lookup.
+    ///
+    /// A burst is the shape that fills a boundary, and asking the list itself
+    /// cost a pass per arrival: folding a same-second burst of n messages was
+    /// n² comparisons, inside the lock a read action holds.
+    boundary_ids: HashSet<String>,
     /// Incoming messages still unread, shaped as `send_read_receipts` wants
     /// them.
     unread: VecDeque<(String, String)>,
@@ -138,13 +190,19 @@ impl ChatReads {
         if secs > self.newest_secs {
             self.newest_secs = secs;
             self.boundary.clear();
+            self.boundary_ids.clear();
         }
-        if secs == self.newest_secs && !self.boundary.iter().any(|(id, ..)| *id == message.id) {
-            self.boundary.push((
+        if secs == self.newest_secs && self.boundary_ids.insert(message.id.clone()) {
+            self.boundary.push_back((
                 message.id.clone(),
                 message.is_from_me,
                 (!message.is_from_me).then(|| message.sender.clone()),
             ));
+            if self.boundary.len() > MAX_BOUNDARY
+                && let Some((dropped, ..)) = self.boundary.pop_front()
+            {
+                self.boundary_ids.remove(&dropped);
+            }
         }
 
         if message.is_from_me || self.seen.iter().any(|id| *id == message.id) {
@@ -168,7 +226,8 @@ impl ChatReads {
     }
 
     fn boundary(&self) -> Option<ReadBoundary> {
-        (!self.boundary.is_empty()).then(|| (self.newest_secs, self.boundary.clone()))
+        (!self.boundary.is_empty())
+            .then(|| (self.newest_secs, self.boundary.iter().cloned().collect()))
     }
 }
 
@@ -793,6 +852,90 @@ mod tests {
         let unread = bridge.reads().take_receipts("1@s.whatsapp.net");
         assert_eq!(unread.len(), MAX_TRACKED_UNREAD);
         assert_eq!(unread.first().unwrap().0, "m5", "the oldest went first");
+    }
+
+    /// The boundary holds one second, and one second is not a small number of
+    /// messages: WhatsApp stamps to the second, so a history page, an offline
+    /// catch-up or a busy group folds a whole burst into it, and only a newer
+    /// second ever empties it. Uncapped, the largest burst an account has ever
+    /// seen was the daemon's per-chat footprint for that chat.
+    ///
+    /// Which entries survive is the half that has to be right, and it is
+    /// arrival rather than id: a front end sorts its rows by the whole
+    /// timestamp before the id, so the row it echoes is the newest one it
+    /// holds and not the highest id at the second.
+    #[test]
+    fn a_one_second_burst_is_capped_at_what_a_window_last_saw() {
+        let mut bridge = bridge();
+        let burst = MAX_BOUNDARY + 64;
+        let id = |i: usize| format!("m{i:05}");
+        // Arrival order against id order, which is the case the two disagree
+        // about and the only one that tells the two policies apart.
+        for i in (0..burst).rev() {
+            bridge.observe(received(
+                "1@s.whatsapp.net",
+                message(&id(i), "1@s.whatsapp.net", 20, false, false),
+                None,
+            ));
+        }
+
+        let (secs, ids) = bridge
+            .reads()
+            .boundary("1@s.whatsapp.net")
+            .expect("a chat with messages has a boundary");
+        assert_eq!(secs, 20);
+        assert_eq!(ids.len(), MAX_BOUNDARY, "one second, one bounded footprint");
+        assert!(
+            ids.iter().all(|(kept, ..)| *kept < id(MAX_BOUNDARY)),
+            "the first arrivals went, whatever their ids sorted like"
+        );
+
+        assert!(
+            bridge.read_plan("1@s.whatsapp.net", Some(&id(0))).is_ok(),
+            "the message a window at the end of the burst is looking at is \
+             still one this read covers"
+        );
+        // The other side of the cap, said out loud: an entry that was dropped
+        // is one the daemon can no longer place at the second, so a requester
+        // naming it is refused exactly as one that has fallen behind is. It
+        // heals on the next message, which empties the boundary.
+        let refusal = bridge
+            .read_plan("1@s.whatsapp.net", Some(&id(burst - 1)))
+            .expect_err("a dropped id is one the daemon cannot vouch for");
+        assert!(refusal.contains("does not cover"), "{refusal}");
+    }
+
+    /// A read clears the second, not the list of ids that rides along with it.
+    /// Remembering only the capped list left the siblings it had dropped
+    /// looking unread, so the reload already in flight — the one the override
+    /// exists to outlive — spent it and put the badge straight back.
+    #[test]
+    fn a_read_of_a_capped_burst_covers_the_siblings_it_could_not_name() {
+        let mut bridge = bridge();
+        let burst = MAX_BOUNDARY + 64;
+        let id = |i: usize| format!("m{i:05}");
+        let msg = |i: usize| message(&id(i), "1@s.whatsapp.net", 20, false, false);
+        for i in 0..burst {
+            bridge.observe(received("1@s.whatsapp.net", msg(i), None));
+        }
+
+        let (_, read) = bridge
+            .read_plan("1@s.whatsapp.net", Some(&id(burst - 1)))
+            .expect("the newest arrival is one the boundary still holds");
+        bridge.reads().record_read("1@s.whatsapp.net", read);
+
+        // The reload the burst itself scheduled, carrying an arrival the
+        // boundary had already dropped.
+        bridge.observe(loaded(vec![stored_chat(
+            "1@s.whatsapp.net",
+            1,
+            vec![msg(0), msg(burst - 1)],
+        )]));
+        assert_eq!(
+            bridge.hub.chat("1@s.whatsapp.net").unwrap().unread,
+            0,
+            "the read cleared the whole second, the dropped siblings included"
+        );
     }
 
     /// A store reload is the store's answer for that chat: a message it now
