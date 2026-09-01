@@ -326,38 +326,29 @@ fn is_group(jid: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxidezap_core::{ChatMessage, MessageStatus};
+    use oxidezap_core::{MessageStatus, fixtures};
 
+    /// The sender is the peer whatever `chat` is, so the group case below has
+    /// a sender that is not the chat — which is the only case that maps one.
     fn message(chat: &str, text: &str, from_me: bool) -> UiEvent {
+        let mut message = fixtures::message("MSG1", fixtures::PEER, text);
+        message.sender_name = Some("Ana".into());
+        message.is_from_me = from_me;
+        message.status = MessageStatus::Delivered;
         UiEvent::MessageReceived {
             chat_jid: chat.into(),
-            message: Box::new(ChatMessage {
-                id: "MSG1".into(),
-                sender: "5511999@s.whatsapp.net".into(),
-                sender_name: Some("Ana".into()),
-                content: text.into(),
-                timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
-                    .expect("a valid instant"),
-                is_from_me: from_me,
-                is_read: false,
-                media: None,
-                reactions: Default::default(),
-                status: MessageStatus::Delivered,
-                quoted: None,
-                revoked: false,
-                system: None,
-            }),
+            message: Box::new(message),
             sender_name: None,
         }
     }
 
     #[test]
     fn a_message_carries_what_a_filter_needs() {
-        let ev = from_session(&message("5511999@s.whatsapp.net", "ping", false)).expect("mapped");
+        let ev = from_session(&message(fixtures::PEER, "ping", false)).expect("mapped");
         assert_eq!(ev.kind, abi::kinds::MESSAGE);
         assert_eq!(
             ev.get(fields::CHAT_JID),
-            Some(&Value::Str("5511999@s.whatsapp.net".into()))
+            Some(&Value::Str(fixtures::PEER.into()))
         );
         assert_eq!(ev.get(fields::TEXT), Some(&Value::Str("ping".into())));
         assert_eq!(
@@ -371,7 +362,7 @@ mod tests {
     /// default" — which is exactly the guarantee the ABI makes.
     #[test]
     fn a_default_is_not_stored() {
-        let ev = from_session(&message("5511999@s.whatsapp.net", "ping", false)).expect("mapped");
+        let ev = from_session(&message(fixtures::PEER, "ping", false)).expect("mapped");
         assert_eq!(ev.get(fields::FROM_ME), None);
         assert_eq!(ev.get(fields::REVOKED), None);
         assert_eq!(ev.get(fields::MEDIA_KIND), None);
@@ -383,11 +374,11 @@ mod tests {
 
     #[test]
     fn a_group_names_its_sender() {
-        let ev = from_session(&message("120363@g.us", "hi", false)).expect("mapped");
+        let ev = from_session(&message(fixtures::GROUP, "hi", false)).expect("mapped");
         assert_eq!(ev.get(fields::IS_GROUP), Some(&Value::Int(1)));
         assert_eq!(
             ev.get(fields::SENDER_JID),
-            Some(&Value::Str("5511999@s.whatsapp.net".into()))
+            Some(&Value::Str(fixtures::PEER.into()))
         );
     }
 
@@ -395,7 +386,7 @@ mod tests {
     /// not have to know that `*ping*` is the same word.
     #[test]
     fn text_arrives_without_its_markup() {
-        let ev = from_session(&message("a@s.whatsapp.net", "*ping* me", false)).expect("mapped");
+        let ev = from_session(&message(fixtures::PEER, "*ping* me", false)).expect("mapped");
         assert_eq!(ev.get(fields::TEXT), Some(&Value::Str("ping me".into())));
     }
 

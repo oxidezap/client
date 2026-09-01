@@ -10,6 +10,14 @@ use crate::store::message_rows::message_row;
 /// Tombstone the target row. A revoke arriving before its content (offline
 /// drain reordering) inserts the tombstone up front, so the content's later
 /// arrival can't resurrect it. Returns whether the chat-list preview changed.
+///
+/// Deliberately not shared with `apply_edit`, which traces the same route —
+/// update, else insert a placeholder — and agrees with it on nothing along the
+/// way. This update takes every row an edit's monotonicity and tombstone
+/// filters refuse, sets three columns where the edit sets four, leaves the
+/// placeholder's `status` to the column default where the edit picks one by
+/// authorship, and previews as nothing rather than as new text. What is left
+/// to share is the `bump_chat` call, which is already a function.
 pub(super) fn apply_revoke(
     conn: &mut SqliteConnection,
     device_id: i32,

@@ -212,15 +212,25 @@ impl WhatsAppApp {
     }
     /// Turn a stopped recording into the note that gets sent.
     ///
-    /// The two arms are the two platforms, and the difference is *when* the
-    /// encode happens rather than what it produces. A desktop hands back samples
-    /// and this encodes them on the background pool, which is real work and
-    /// belongs off the UI thread. A browser encoded as it captured, so there is
-    /// nothing to do but wait for the last packets to flush.
+    /// Preparing it — the resample to 16 kHz and the envelope — is the same
+    /// pure Rust on both platforms and the expensive half, so on both it goes
+    /// to the background executor. On a page that is a `wasm_thread` worker
+    /// where the browser gives `gpui_web` the shared memory to make one, and
+    /// a `setTimeout(0)` back onto the loop where it does not — a yield
+    /// rather than a worker, which is still not the window's current frame.
+    /// What the two arms disagree about is only where the *codec* lives: a
+    /// desktop's is libopus and follows the preparation onto the same worker,
+    /// while a browser's is an `AudioEncoder` that cannot leave the window,
+    /// so the prepared note goes back to it and the encoded one is awaited
+    /// here.
     ///
-    /// The minimum-duration guard lives here rather than before the stop, because
-    /// only one of the two knows how long the recording was without waiting for
-    /// it.
+    /// The minimum-duration guard stays at the end rather than moving up in
+    /// front of the encode, though both arms now know the length before they
+    /// start. A recording the browser refused arrives here as a capture of no
+    /// length *and* a reason, and the reason is the one worth drawing — so
+    /// asking about the length first would answer "too short" to a microphone
+    /// that was denied. What it would have saved is the encode of a note
+    /// under a second long.
     async fn finish(
         cx: &mut gpui::AsyncApp,
         recording: oxidezap_audio::Recording,
@@ -228,17 +238,28 @@ impl WhatsAppApp {
         use gpui::AppContext as _;
 
         let (bytes, waveform, duration_secs) = match recording {
-            oxidezap_audio::Recording::Samples(recorded) => {
+            oxidezap_audio::Recording::Samples(captured) => {
                 cx.background_spawn(async move {
-                    let waveform = generate_waveform(&recorded.samples);
-                    encode_to_opus_ogg(&recorded)
-                        .map(|ogg| (ogg, waveform, recorded.duration_secs))
+                    let prepared = captured.prepare();
+                    encode_to_opus_ogg(&prepared)
+                        .map(|ogg| (ogg, prepared.waveform, prepared.duration_secs))
                         .map_err(|error| error.to_string())
                 })
                 .await?
             }
-            oxidezap_audio::Recording::Pending(pending) => {
-                let note = pending
+            oxidezap_audio::Recording::Pending {
+                captured,
+                prepared,
+                note,
+            } => {
+                let ready = cx.background_spawn(async move { captured.prepare() }).await;
+                // The recorder's task is gone only if the page is; nothing
+                // else drops that receiver. Said rather than swallowed,
+                // because the person watched themselves record this.
+                if prepared.send(ready).is_err() {
+                    return Err("the recording ended before it was encoded".to_string());
+                }
+                let note = note
                     .await
                     .map_err(|_| "the recording ended before it was encoded".to_string())?
                     .map_err(|e| e.to_string())?;
@@ -347,21 +368,12 @@ impl WhatsAppApp {
         let mut msg = ChatMessage::new_outgoing_with_media(
             local_id,
             String::new(),
-            MediaContent {
-                media_type: MediaType::Audio,
-                data: Arc::new(ogg_data),
-                cache_key: None,
-                mime_type: "audio/ogg; codecs=opus".to_string(),
-                width: None,
-                height: None,
-                caption: None,
-                file_name: None,
-                downloadable: None,
-                is_animated: false,
-                duration_secs: Some(duration_secs),
-                data_is_preview: false,
-                waveform: Some(envelope),
-            },
+            MediaContent::audio(
+                Arc::new(ogg_data),
+                "audio/ogg; codecs=opus".to_string(),
+                Some(duration_secs),
+                Some(envelope),
+            ),
         );
 
         // The bubble shows the quote too, or the sender sees a bare note

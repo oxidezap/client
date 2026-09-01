@@ -237,45 +237,38 @@ fn single_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxidezap_core::{ComposingKind, MediaContent, Typist};
+    use oxidezap_core::{ComposingKind, MediaContent, Typist, fixtures};
     use std::sync::Arc;
 
+    /// The shared chat, under a name of its own: every assertion below is
+    /// about the preview rather than about what the row is called, and a
+    /// derived name would make the "(You)" test say two things at once.
     fn chat(is_group: bool) -> Chat {
-        let mut chat = Chat::new(if is_group {
-            "group@g.us".to_string()
-        } else {
-            "5521999999999@s.whatsapp.net".to_string()
-        });
+        let mut chat = fixtures::chat(
+            if is_group {
+                fixtures::GROUP
+            } else {
+                fixtures::PEER
+            },
+            0,
+        );
         chat.name = "Test".to_string();
         chat
     }
 
     fn message(from_me: bool, content: &str) -> ChatMessage {
-        let mut msg = ChatMessage::new_incoming(
-            "ID".to_string(),
-            "a@s.whatsapp.net".to_string(),
-            content.to_string(),
-        );
+        let mut msg = fixtures::message("ID", fixtures::PEER, content);
         msg.is_from_me = from_me;
         msg
     }
 
     fn audio(duration_secs: Option<u32>) -> MediaContent {
-        MediaContent {
-            media_type: MediaType::Audio,
-            data: Arc::new(Vec::new()),
-            cache_key: None,
-            mime_type: "audio/ogg".to_string(),
-            width: None,
-            height: None,
-            caption: None,
-            file_name: None,
-            downloadable: None,
-            is_animated: false,
+        MediaContent::audio(
+            Arc::new(Vec::new()),
+            "audio/ogg".to_string(),
             duration_secs,
-            data_is_preview: false,
-            waveform: None,
-        }
+            None,
+        )
     }
 
     fn typing(name: &str) -> TypingSummary {

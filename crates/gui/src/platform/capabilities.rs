@@ -8,31 +8,14 @@
 //! both cases is a control that is offered, acted on, and then fails the same
 //! way every time.
 //!
-//! # Sending media, and why it is not asked about here
-//!
-//! It was, and it should not have been. This module used to withhold the
-//! microphone from a page holding its own session, on the ground that the
-//! library's upload went through `execute_upload` — which a browser cannot
-//! implement, being synchronous — so every media send from such a page would
-//! fail at the same place however many times it was tried.
-//!
-//! That is not what the library does, and at the revision the lockfile names
-//! it never was: `execute_upload` is the *streaming* path
-//! (`Client::upload_stream`), and `Client::upload` reaches the CDN through
-//! `HttpClient::execute` with a body on it — which is exactly the one method
-//! `BrowserHttpClient` implements. So both halves of the journey exist on
-//! both platforms, and the question is gone rather than answered `None`
-//! everywhere: a capability that is never missing is not a capability, and
-//! one kept "just in case" is a branch nobody can test.
-//!
-//! The lesson is about the rest of this file rather than about this entry. An
-//! answer here is a claim about somebody else's code, and this one was
-//! written from a reading and never re-read against the revision it was
-//! about — for long enough that a working feature was withheld by it.
-//!
-//! What remains true is the *cost*: a page has one thread, so encrypting a
-//! large file happens on it. That is a delay, not an impossibility, and the
-//! send reports its own failures.
+//! There used to be a third question here, about sending media at all: a
+//! page holding its own session could not upload a payload, because the
+//! library's upload reached for `execute_upload` and a browser cannot answer
+//! it. That is gone rather than moved — `whatsapp-rust`'s buffered `upload`
+//! now sends the body through `HttpClient::execute`, which is the one method
+//! `BrowserHttpClient` implements — so the microphone is offered wherever the
+//! browser has an encoder, and the question this module would have asked has
+//! no `Some` arm left to return.
 
 /// # Decoding video
 ///
@@ -137,7 +120,7 @@ mod imp {
         }
     }
 
-    /// Asked of the *session* first, not of the build — which this answered
+    /// Asked of the *session* first, not of the build, which this answered
     /// wrongly at first by looking only at the page.
     ///
     /// A page attached to a real daemon does not place its call in the

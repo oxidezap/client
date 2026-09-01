@@ -65,6 +65,7 @@ use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 use whatsapp_rust::voip::RelayEndpointParams;
 use whatsapp_rust::wacore::voip::demux::{RelayPacketKind, classify_relay_packet};
+use whatsapp_rust::wacore::voip::rtp::RTP_PAYLOAD_TYPE_H264;
 use whatsapp_rust::wacore::voip::transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };
@@ -248,6 +249,11 @@ struct BrowserRelayChannel {
     congested: std::cell::Cell<bool>,
     /// Counted for that second line: how much media the ceiling has dropped.
     outbound_dropped: std::cell::Cell<u32>,
+    /// Where the outbound video stream is between access-unit boundaries.
+    ///
+    /// The ceiling may only be consulted at a boundary, so the verdict taken
+    /// at one has to survive until the next. See [`Outbound`].
+    au: std::cell::Cell<Outbound>,
     /// Whether anything has gone out yet; see [`RelayTransport::send`].
     sent_any: std::cell::Cell<bool>,
     /// What has come *in*, kept as two answers rather than one.
@@ -268,6 +274,49 @@ struct BrowserRelayChannel {
     inbound: std::rc::Rc<InboundSeen>,
 }
 
+/// The RTP payload types seen in one direction, in the order they appeared.
+///
+/// A call carries two streams and they are told apart by nothing else on this
+/// path: `RelayPacketKind::Rtp` says "media" and stops there, so a page
+/// sending only audio and a page sending audio and video are the same three
+/// words in a log. That mattered exactly once and it was expensive — every
+/// stage of the outbound video path was proven to work, right up to the media
+/// plane, while the peer drew nothing, and the one question left was whether
+/// the packets carrying it ever reached the wire. Nothing could answer it.
+///
+/// The payload type is one byte and stays fixed for a stream, so the *set* is
+/// the whole answer: one type outbound is one stream leaving.
+#[derive(Default)]
+struct PayloadTypes(RefCell<Vec<u8>>);
+
+impl PayloadTypes {
+    /// Record this packet's payload type if it is RTP and new.
+    ///
+    /// Cheap on the hot path by construction: RTP's payload type is the low
+    /// seven bits of the second byte, and a stream contributes exactly one
+    /// entry however many packets it sends.
+    fn note(&self, packet: &[u8]) {
+        let Some(pt) = packet.get(1).map(|b| b & 0x7f) else {
+            return;
+        };
+        let mut seen = self.0.borrow_mut();
+        if !seen.contains(&pt) {
+            seen.push(pt);
+        }
+    }
+
+    fn describe(&self) -> String {
+        let seen = self.0.borrow();
+        if seen.is_empty() {
+            return "none".to_string();
+        }
+        seen.iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// What the relay has actually delivered, by kind that matters.
 #[derive(Default)]
 struct InboundSeen {
@@ -276,6 +325,10 @@ struct InboundSeen {
     /// RTP: the *peer* is reaching us through it. The one that decides
     /// whether a silent call is their end or the path in between.
     media: std::cell::Cell<bool>,
+    /// The peer's RTP streams, by payload type. See [`PayloadTypes`].
+    inbound_types: PayloadTypes,
+    /// Ours, recorded on the way out for the same reason.
+    outbound_types: PayloadTypes,
 }
 
 /// Where an inbound packet goes, and what happens when there is no room.
@@ -307,10 +360,14 @@ impl Inbound {
         // the length of a call, and the answer stops changing after the first
         // one. Written the other way round it classifies for a question
         // already answered.
-        if !self.seen.media.get() && matches!(classify_relay_packet(&packet), RelayPacketKind::Rtp)
-        {
-            self.seen.media.set(true);
-            debug!("voip: the relay channel received the peer's first media packet");
+        if matches!(classify_relay_packet(&packet), RelayPacketKind::Rtp) {
+            if !self.seen.media.replace(true) {
+                debug!("voip: the relay channel received the peer's first media packet");
+            }
+            // Which streams, not just that there were some. The flag above
+            // stops changing after the first packet; this does not, because a
+            // peer that adds video mid-call adds a payload type mid-call.
+            self.seen.inbound_types.note(&packet);
         }
         let pending = self.dropped.get();
         if pending > 0
@@ -372,6 +429,83 @@ impl Inbound {
     }
 }
 
+/// What to do with an outbound packet, and with the rest of its access unit.
+///
+/// `Send`/`Drop` are the verdict for the packet in hand; the *stored* value is
+/// the commitment for the unit it belongs to, which is why this is a state and
+/// not a boolean answer computed per packet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outbound {
+    /// Not inside a video access unit: the next video packet decides afresh.
+    Between,
+    /// Inside one that is being sent; finish it whatever the ceiling says.
+    Send,
+    /// Inside one that was refused at its first packet; refuse the remainder,
+    /// since a fragment of an access unit is worth nothing to a decoder and
+    /// costs the peer the bytes anyway.
+    Drop,
+}
+
+impl BrowserRelayChannel {
+    /// Whether this packet goes out, holding the verdict across an access unit.
+    ///
+    /// Control traffic is never dropped: STUN keeps the relay binding alive
+    /// and RTCP carries the peer's keyframe requests, both are a handful of
+    /// bytes against a frame's thousands, and losing either while the queue is
+    /// deep is how a congested call becomes a dead one.
+    ///
+    /// Audio is decided per packet, because one packet *is* one frame there —
+    /// the unit logic below would be wrong for it, since Opus sets the marker
+    /// bit by its own rules rather than at frame ends.
+    fn au_verdict(&self, data: &[u8]) -> Outbound {
+        if matches!(
+            classify_relay_packet(data),
+            RelayPacketKind::Stun | RelayPacketKind::Rtcp
+        ) {
+            return Outbound::Send;
+        }
+        let over_ceiling = self.channel.buffered_amount() > OUTBOUND_CEILING;
+        // The payload type and the marker bit share RTP's second byte: the top
+        // bit is the marker, the low seven are the type. A packet too short to
+        // have one is not RTP and is treated as media by the ceiling alone.
+        let Some(second) = data.get(1) else {
+            return if over_ceiling {
+                Outbound::Drop
+            } else {
+                Outbound::Send
+            };
+        };
+        if second & 0x7f != RTP_PAYLOAD_TYPE_H264 {
+            return if over_ceiling {
+                Outbound::Drop
+            } else {
+                Outbound::Send
+            };
+        }
+        // The marker ends an access unit, so this packet is the last of one.
+        let ends_unit = second & 0x80 != 0;
+        let verdict = match self.au.get() {
+            // Mid-unit: the commitment already made, whatever the queue has
+            // done since.
+            committed @ (Outbound::Send | Outbound::Drop) => committed,
+            // A boundary, and the only place the ceiling gets a vote.
+            Outbound::Between => {
+                if over_ceiling {
+                    Outbound::Drop
+                } else {
+                    Outbound::Send
+                }
+            }
+        };
+        self.au.set(if ends_unit {
+            Outbound::Between
+        } else {
+            verdict
+        });
+        verdict
+    }
+}
+
 #[async_trait(?Send)]
 impl RelayTransport for BrowserRelayChannel {
     async fn send(&self, data: Bytes) -> Result<()> {
@@ -389,12 +523,24 @@ impl RelayTransport for BrowserRelayChannel {
         // against a frame's thousands, and losing either while the queue is
         // deep is how a congested call becomes a dead one. The same rule the
         // inbound queue holds, in the other direction.
-        if self.channel.buffered_amount() > OUTBOUND_CEILING
-            && !matches!(
-                classify_relay_packet(&data),
-                RelayPacketKind::Stun | RelayPacketKind::Rtcp
-            )
-        {
+        // Whole access units, never a piece of one. The ceiling used to be
+        // consulted per packet, which is right for audio and catastrophic for
+        // video: one Opus packet is one frame, but one H.264 access unit is
+        // tens of fragments, and a 720p IDR is large enough to cross the
+        // ceiling *while it is being written*. What reached the peer then was
+        // a keyframe with a hole in it — undecodable, and so was every frame
+        // that referenced it. Worse, this returns `Ok`, so the library
+        // believed all of it went out: its own per-unit shedding never ran,
+        // no gate closed, and nothing asked the encoder to try again. That is
+        // the difference between a call that loses a picture for a moment and
+        // one that never shows a picture at all.
+        //
+        // So the decision is taken once, at an access unit's first packet,
+        // and holds for the rest of it. A unit already begun is finished
+        // whatever the ceiling now says — the bytes are spent either way, and
+        // spending the remainder is what makes them worth anything.
+        let verdict = self.au_verdict(&data);
+        if verdict == Outbound::Drop {
             self.outbound_dropped
                 .set(self.outbound_dropped.get().saturating_add(1));
             // Said once per run of congestion rather than per packet: at a
@@ -413,6 +559,13 @@ impl RelayTransport for BrowserRelayChannel {
                 "the relay channel drained; {} outbound packets were dropped while it was behind",
                 self.outbound_dropped.replace(0)
             );
+        }
+        // Recorded here, past the ceiling above: what this has to answer is
+        // which streams reached the wire, and a packet the ceiling refused
+        // did not. Both directions keep this, since "we sent one stream" and
+        // "they sent us two" are different sentences about the same call.
+        if matches!(classify_relay_packet(&data), RelayPacketKind::Rtp) {
+            self.inbound.outbound_types.note(&data);
         }
         // Asked rather than inferred from the send returning. A channel that
         // is `closing` or `closed` does not throw: the specification has the
@@ -504,6 +657,15 @@ impl Drop for BrowserRelayChannel {
         // was never made — the shape the first call of a production session
         // took — and it reads identically to a working call unless the last
         // two are asked separately.
+        // The payload types alongside them, because "outbound: yes" counts a
+        // call's audio and says nothing about its video — which is the exact
+        // gap that left a proven-working camera and a peer with no picture
+        // with no next question to ask.
+        debug!(
+            "voip: the relay channel sent RTP stream(s) {} and received {}",
+            self.inbound.outbound_types.describe(),
+            self.inbound.inbound_types.describe()
+        );
         debug!(
             "voip: the relay channel is being released (outbound: {}, inbound: {}, peer media: {})",
             yes_no(self.sent_any.get()),
@@ -691,6 +853,7 @@ async fn connect_peer_connection(
     wired.release();
     Ok((
         std::sync::Arc::new(BrowserRelayChannel {
+            au: std::cell::Cell::new(Outbound::Between),
             connection: connection.release(),
             channel,
             _wiring: Wiring {

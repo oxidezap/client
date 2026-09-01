@@ -158,12 +158,11 @@ impl InputAreaView {
             touch_target: None,
             typing_state: TypingState::default(),
             typing_monitor_task: None,
-            // Asked once rather than per frame: whether this build has an
-            // Opus encoder is not something a browser grows between the
-            // question and the press. Recording a whole voice note and losing
-            // it at the send is the outcome this exists to prevent, and where
-            // it *can* be sent is no longer a second question — see
-            // `platform::capabilities`.
+            // Whether the browser has an Opus encoder, which is the one
+            // thing that can make this control a promise it cannot keep.
+            // Where it does, every arrangement a page can be in has somewhere
+            // to send what it encodes: a daemon over the bridge, the tab
+            // holding the account, or the page's own session.
             can_record: oxidezap_audio::can_record(),
         }
     }
@@ -409,7 +408,7 @@ impl InputAreaView {
         control: gpui::Pixels,
         metrics: Metrics,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let entity = cx.entity().clone();
         let record_entity = entity.clone();
         let attach_entity = entity.clone();
@@ -505,7 +504,7 @@ impl InputAreaView {
         control: gpui::Pixels,
         metrics: Metrics,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let entity = cx.entity().clone();
         let cancel_entity = entity.clone();
 

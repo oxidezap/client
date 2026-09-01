@@ -171,10 +171,14 @@ do not trust. See `endpoint_url` in `crates/ipc/src/endpoint/web.rs`.
 
 ### What a page cannot do
 
-* **A page holding its own session cannot send media.** The library's upload
-  path has no route a browser can take, so the microphone is not offered there
-  rather than offered and always failing at the send. Attached to an
-  `oxidezapd`, the payload is staged over the bridge and the daemon uploads it.
+* **A page records and sends voice notes wherever the browser has an Opus
+  encoder.** That question is asked of the browser rather than of the build —
+  `AudioEncoder` is something an older one may not have — and it is asked
+  before the microphone is offered, so a control that would always fail is not
+  drawn. It is the only thing asked: a page holding its own session uploads
+  through the library's buffered path, which needs only the one HTTP method a
+  browser can answer, and a page attached to an `oxidezapd` stages the payload
+  over the bridge for the daemon to upload.
 * **WebGL by default, WebGPU on request.** `?backend=webgpu` asks for the
   faster one, `?backend=auto` for whatever the browser prefers. The default is
   conservative because WebGPU can pass its own probe and then fail building a
@@ -223,9 +227,12 @@ document and has no privileged access.
 
 * Group calls and choosing an audio output device are drawn but disabled.
 * Spacing does not yet follow the rem scale, so the UI ignores base-font zoom.
-* A page holding its own session cannot send media, and its plugins share the
-  page's single agent rather than getting a thread each. Attaching it to an
-  `oxidezapd` fixes both. See [the web front end](#the-web-front-end).
+* A page's plugins share its single agent rather than getting a thread each;
+  attaching it to an `oxidezapd` gives each one a thread. See
+  [the web front end](#the-web-front-end).
+* Uploading from a page holding its own session has not been measured against
+  a real account: the CDN's CORS preflight is the part that is unverified. See
+  `docs/roadmap.md`.
 
 ## License
 

@@ -632,6 +632,89 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   every path out that is not a camera held withdraws it again, and the
   refusal's own teardown queues on the call's video lane behind the enable it
   is answering.
+- **A video call announces its direction; the offer only advertises the
+  capability.** A call placed as video enables its plane ungated, encodes, and
+  packetises — and the peer shows nothing, because the receiving side brings
+  its video stream up off a `<video state="1">` *announcement*, not off the
+  offer. The official client's own decoder is driven by `handle_peer_video_enabled`
+  and `update_video_info`, both fed by `<video state=…>`. Android says its own
+  direction (`state="11"`) and, when nothing answers for ours, gives up
+  (`state="0"`). A mid-call camera already announced, through `start_video`;
+  the from-start path was the one that never did.
+- **Neither encoder may go without a periodic IDR, and it is not a quality
+  setting.** The media plane drops every access unit that is not an IDR while
+  one of its keyframe gates is closed — the engine's `keyframe_required` and
+  the driver's send gate — and both close on ordinary events: shedding under
+  backpressure, a relay reconnect, an inbound PLI. The only notice either
+  gives is `CallEvent::VideoKeyframeNeeded`, which the client ignored, and the
+  library's own retry logic is written against an encoder that produces an IDR
+  anyway. The desktop met that contract with openh264's three-second intra
+  period and so never showed the fault; the browser encoder emitted a keyframe
+  only when asked, so the first missed request stopped its video for the rest
+  of the call. `KEYFRAME_SECONDS` is now one number both backends read, and the
+  event is answered as well — the cadence bounds the outage at three seconds,
+  the answer ends it in one frame.
+- **The outbound ceiling drops whole access units, never part of one.** The
+  browser relay's queue ceiling was applied per packet, which is right for
+  audio and ruinous for video: one Opus packet is one frame, but a 720p IDR is
+  tens of fragments and is itself large enough to cross the ceiling *while it
+  is being written*. What reached the peer was a keyframe with a hole in it,
+  and so was everything referencing it. Worse, the transport returns `Ok`, so
+  the library believed all of it went out — its own per-unit shedding never
+  ran, no gate closed, nothing asked for a replacement. The verdict is now
+  taken once, at an access unit's first packet, and holds to its marker bit; a
+  unit already begun is finished whatever the queue has done since, because
+  the bytes are spent either way and spending the remainder is what makes them
+  worth anything.
+
+- **A video call announces its direction; the offer only advertises the
+  capability.** A call placed as video enables its plane ungated, encodes and
+  packetises — and the peer shows nothing, because the receiving side brings
+  its video stream up off a `<video state="1">` *announcement*, not off the
+  offer. The official client's decoder is driven by `handle_peer_video_enabled`
+  and `update_video_info`, both fed by `<video state=...>`. Android says its
+  own direction (`state="11"`) and, when nothing answers for ours, gives up
+  (`state="0"`). A mid-call camera already announced, through `start_video`;
+  the from-start path was the one that never did.
+- **Neither encoder may go without a periodic IDR, and it is not a quality
+  setting.** The media plane drops every access unit that is not an IDR while
+  one of its keyframe gates is closed -- the engine's `keyframe_required` and
+  the driver's send gate -- and both close on ordinary events: shedding under
+  backpressure, a relay reconnect, an inbound PLI. The only notice either
+  gives is `CallEvent::VideoKeyframeNeeded`, which nothing here answered, and
+  the library's own retry logic is written against an encoder that produces an
+  IDR anyway. The desktop met that contract with openh264's three-second intra
+  period and so never showed the fault; the browser encoder emitted a keyframe
+  only when asked, so the first missed request stopped its video for the rest
+  of the call. `KEYFRAME_SECONDS` is now one number both backends read, and the
+  event is answered as well -- the cadence bounds the outage at three seconds,
+  the answer ends it in one frame.
+- **The outbound ceiling drops whole access units, never part of one.** The
+  browser relay's queue ceiling was applied per packet, which is right for
+  audio and ruinous for video: one Opus packet is one frame, but a 720p IDR is
+  tens of fragments and is itself large enough to cross the ceiling *while it
+  is being written*. What reached the peer was a keyframe with a hole in it,
+  and so was everything referencing it. Worse, the transport returns `Ok`, so
+  the library believed all of it went out -- its own per-unit shedding never
+  ran, no gate closed, nothing asked for a replacement. The verdict is taken
+  once now, at an access unit's first packet, and holds to its marker bit; a
+  unit already begun is finished whatever the queue has done since, because
+  the bytes are spent either way and spending the remainder is what makes them
+  worth anything.
+
+- **The relay reports which RTP streams crossed it, not just that media
+  did.** `RelayPacketKind::Rtp` says "media" and stops there, so a call
+  sending audio alone and one sending audio and video produce the same three
+  words in a release line. That gap cost a whole round: the outbound video
+  path was instrumented end to end, every stage of it proved to work — 276
+  chunks encoded, 269 handed to the media plane — and the peer still drew
+  nothing, leaving exactly one question ("did those packets reach the wire?")
+  that nothing could answer. The payload type is the low seven bits of RTP's
+  second byte and is fixed for the life of a stream, so the *set* of them is
+  the entire answer and costs one comparison per packet. Kept for both
+  directions, because "we sent one stream" and "they sent us two" are
+  different sentences about the same call.
+
 - **The outbound video path accounts for every hop, because all five of its
   failures are silence.** A call whose peer draws nothing can have stopped at
   the capture tick (which declines for three separate reasons), at an encoder
@@ -1089,6 +1172,27 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   it to whichever chat was on screen by then, or quoted whichever message had
   been picked since. `RecordingTarget` is that pair, and the draft is cleared
   at send only if it is still the one the note was bound to.
+- **A capture the microphone refused still goes through the resampler.**
+  `stop` answers with what it has, and what a denied `getUserMedia` leaves is
+  no samples and no rate — the rate is learned when the device opens. The
+  reason for the refusal is read *after* the capture has been prepared, so
+  that a caller which abandoned the recording is told nothing at all, and
+  zero is a whole multiple of 16 kHz: the preparation took the decimation
+  branch and divided by a step of zero. On a page a panic is the end of the
+  tab, not of a thread, so `resample_to_16khz` answers an empty capture with
+  an empty one before it looks at the rate.
+- **Preparing a note and encoding it are two steps, and only one of them may
+  leave the window.** Resampling to 16 kHz and measuring the envelope is pure
+  Rust on both platforms and the expensive half — a 63-tap filter over as
+  much as ten minutes of audio — so `RecordedAudio::prepare` is a step of its
+  own and `app/recording.rs` hands it to the background executor on both. The
+  codec is what differs: libopus follows the preparation onto the same
+  worker, while `AudioEncoder` belongs to the document that made it and is
+  awaited on the window. `Recording::Pending` is that seam — the capture out,
+  the prepared note in, the encoded note back — which is why the front end
+  reaches one `finish` with no `cfg` in it. Splitting the *resampler* instead
+  is the wrong half to reach for: a 63-tap filter carries state across any
+  boundary it is cut at, so chunking it changes the audio.
 - **An overlay that names a row is reconciled where rows change.** The media
   viewer holds a message id and resolves it every frame, so a revoke behind
   it left a modal that drew nothing and still swallowed the Escape meant to
@@ -1276,23 +1380,4 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   queue as the write that created it, so it cannot outrun its target. A row
   past PENDING already has a real server answer and must never be regressed.
 - **An invalidation is a claim that something changed.** A subscriber answers
-  `StoreChange` by re-querying, so emitting one for a batch that wrote nothing
-  — a receipt repeated by another of the peer's devices, a nack against a row
-  already acked — buys a reload for nothing. The reload is scoped to what the
-  window named: `Messages` rebuilds those chats (and their PN/LID aliases),
-  anything else rebuilds the whole list, which is the only load that may prune.
-- **SQLite is bundled and trimmed** in `.cargo/config.toml`. FTS5 must stay:
-  the `search` feature builds its index on it.
-- **No real PII in tests**, including fixtures derived from captures.
-
-A scrollbar belongs to whatever scrolls, and both lists have one: the sidebar
-hands `Scrollbar::vertical` its `VirtualListScrollHandle` and the conversation
-hands it the `ListState` itself, since a self-measuring list is the only thing
-that knows how tall its rows turned out. In both it is drawn over the scrolling
-region at its trailing edge, outside the rows' own gutter — and *where* that is
-comes from the handle rather than from the element the bar was hung on: a
-`Scrollbar` paints itself over the bounds its handle reports, so the overlay
-around it only has to exist. Which is why a gutter belongs to the rows and
-never to a container wrapped around the list: padding there moves the list, and
-the bar with it, leaving it hanging a gutter's width inside the pane.
-
+  `StoreChange` by re-querying, so emitting one for a batch that wro

@@ -25,8 +25,14 @@
 //! microphone (a permission prompt), the encoder's packets, and the flush at
 //! the end. `start` is therefore optimistic — it opens the device on a task
 //! and reports a refusal through [`AudioRecorder::stop`], which is where the
-//! caller already handles failure — and `stop` answers a channel rather than
-//! a value. [`crate::Recording`] is that difference, named once.
+//! caller already handles failure — and `stop` answers a pair of channels
+//! rather than a value. [`crate::Recording`] is that difference, named once.
+//!
+//! What `stop` does *not* do is prepare the capture. Resampling to 16 kHz and
+//! measuring the envelope is the same pure Rust the desktop runs and the
+//! expensive half of making a note, and a page has one thread it draws on: it
+//! went back to the caller so that it can be run on a worker, and only
+//! `AudioEncoder` — which belongs to this document — stayed here.
 //!
 //! # ScriptProcessorNode
 //!
@@ -42,7 +48,9 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 
-use crate::recorder::{EncodedNote, RecordedAudio, RecorderError, Recording, TARGET_SAMPLE_RATE};
+use crate::recorder::{
+    EncodedNote, PreparedNote, RecordedAudio, RecorderError, Recording, TARGET_SAMPLE_RATE,
+};
 
 /// How many frames the capture node hands over at a time.
 ///
@@ -296,7 +304,7 @@ impl AudioRecorder {
         let context = Closing::new(context);
 
         let capture = Rc::clone(&self.capture);
-        wasm_bindgen_futures::spawn_local(async move {
+        super::spawn(async move {
             if let Err(e) = open_microphone(&capture, generation, context).await {
                 let mut capture = capture.borrow_mut();
                 if capture.generation == generation {
@@ -313,7 +321,14 @@ impl AudioRecorder {
         self.capture.borrow().level
     }
 
-    /// Close the microphone and encode what was captured.
+    /// Close the microphone and hand back what was captured.
+    ///
+    /// The capture goes back to the caller rather than straight into the
+    /// encoder: preparing it is the same pure Rust the desktop runs and the
+    /// expensive half of the job — a 63-tap filter over as much as ten
+    /// minutes of audio — so it belongs on whatever worker the caller has,
+    /// while only the browser's own encoder has to stay on this thread. See
+    /// [`Recording::Pending`].
     ///
     /// # Errors
     ///
@@ -341,17 +356,40 @@ impl AudioRecorder {
             )
         };
 
-        let (tx, rx) = futures_channel::oneshot::channel();
-        wasm_bindgen_futures::spawn_local(async move {
+        // Measured at the rate the samples were captured at, before the
+        // resampler touches them. `max(1)` because a capture whose device
+        // never opened has learned no rate at all, and a refusal reaching
+        // here as a divide by zero would be a length of `NaN`.
+        let duration_secs = (samples.len() as f64 / f64::from(sample_rate.max(1))) as u32;
+        let captured = RecordedAudio {
+            samples,
+            sample_rate,
+            duration_secs,
+        };
+
+        let (prepared_tx, prepared_rx) = futures_channel::oneshot::channel::<PreparedNote>();
+        let (note_tx, note_rx) = futures_channel::oneshot::channel();
+        super::spawn(async move {
+            // Awaited before the refusal is read, so that a caller which
+            // dropped the sender — a recording cancelled between the stop and
+            // the preparation — ends this task silently. There is nobody left
+            // to tell about the microphone by then.
+            let Ok(prepared) = prepared_rx.await else {
+                return;
+            };
             let outcome = match failed {
                 Some(e) => Err(RecorderError::DeviceError(e)),
-                None => encode(samples, sample_rate).await,
+                None => encode(prepared).await,
             };
             // Nobody listening is a recording that was cancelled while it
             // encoded, which is not a failure worth reporting anywhere.
-            let _ = tx.send(outcome);
+            let _ = note_tx.send(outcome);
         });
-        Ok(Recording::Pending(rx))
+        Ok(Recording::Pending {
+            captured,
+            prepared: prepared_tx,
+            note: note_rx,
+        })
     }
 
     /// Drop the recording and close the device.
@@ -474,34 +512,30 @@ async fn open_microphone(
     Ok(())
 }
 
-/// Encode captured samples into the voice note that gets sent.
-async fn encode(samples: Vec<f32>, sample_rate: u32) -> Result<EncodedNote, RecorderError> {
-    if samples.is_empty() {
+/// Encode a prepared note into the voice note that gets sent.
+///
+/// Only the codec and the container: the resampling and the envelope are
+/// [`RecordedAudio::prepare`], which the desktop runs too, and the envelope
+/// has to be measured while the note is still samples because once the
+/// browser has handed back packets there is nothing left to measure.
+async fn encode(prepared: PreparedNote) -> Result<EncodedNote, RecorderError> {
+    if prepared.samples.is_empty() {
         return Err(RecorderError::DeviceError(
             "the microphone produced nothing".to_string(),
         ));
     }
-    let duration_secs = (samples.len() as f64 / f64::from(sample_rate.max(1))) as u32;
-    let captured = RecordedAudio {
-        samples,
-        sample_rate,
-        duration_secs,
-    };
-    // The same resampler the desktop uses, and the same waveform: the
-    // envelope is measured while these are still samples, because once the
-    // browser has handed back packets there is nothing left to measure.
-    let at_target = captured.resample_to_16khz();
-    let waveform = crate::waveform::generate_waveform(&at_target);
 
-    let packets = encode_opus(&at_target).await?;
-    let bytes = crate::ogg_opus::package(packets, at_target.len()).map_err(|e| {
+    let packets = encode_opus(&prepared.samples).await?;
+    // The same packager the desktop writes with, so the bytes a recipient
+    // receives come from one place rather than two that would have to agree.
+    let bytes = crate::ogg_opus::package(packets, prepared.samples.len()).map_err(|e| {
         RecorderError::DeviceError(format!("the voice note would not package: {e}"))
     })?;
 
     Ok(EncodedNote {
         bytes,
-        waveform,
-        duration_secs: captured.duration_secs,
+        waveform: prepared.waveform,
+        duration_secs: prepared.duration_secs,
     })
 }
 

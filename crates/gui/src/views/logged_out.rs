@@ -19,7 +19,7 @@ pub fn render_logged_out_view(
     message: &str,
     entity: Entity<WhatsAppApp>,
     cx: &App,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let metrics = cx.product().metrics;
     let pair_entity = entity;
 
