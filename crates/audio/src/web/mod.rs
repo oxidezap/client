@@ -37,8 +37,8 @@ pub use recorder::AudioRecorder;
 
 /// The page's event loop, which is the only executor there is here.
 ///
-/// Named once so the two modules that spawn do not each reach for
-/// `wasm_bindgen_futures` and drift on what they mean by it.
-pub(crate) fn spawn(future: impl std::future::Future<Output = ()> + 'static) {
-    wasm_bindgen_futures::spawn_local(future);
-}
+/// Re-exported rather than written, so the two modules that spawn do not each
+/// reach for `wasm_bindgen_futures` and drift on what they mean by it — and
+/// so that this crate agrees with the rest of the workspace about what "hand
+/// it to the loop" is. See `oxidezap_platform`.
+pub(crate) use oxidezap_platform::spawn;

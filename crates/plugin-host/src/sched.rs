@@ -28,18 +28,13 @@ pub use platform::{Receiver, Sender, Task, breathe, channel, sleep, spawn};
 ///
 /// A worker thread is handed its `Runtime` across a thread boundary; a page's
 /// loop moves nothing anywhere and would rule out every browser object the
-/// storage behind a plugin holds. The same trick the session plays, for the
-/// same reason.
-#[cfg(not(target_family = "wasm"))]
-pub trait MaybeSend: Send {}
-#[cfg(not(target_family = "wasm"))]
-impl<T: Send> MaybeSend for T {}
-
-/// See the desktop half: on a page the bound is empty.
-#[cfg(target_family = "wasm")]
-pub trait MaybeSend {}
-#[cfg(target_family = "wasm")]
-impl<T> MaybeSend for T {}
+/// storage behind a plugin holds.
+///
+/// Re-exported from [`oxidezap_platform`] rather than declared here, which is
+/// the whole reason that crate exists: this host cannot depend on the
+/// session, so "the same trick the session plays" was a copy — and so was the
+/// `setTimeout` under `sleep` beside it.
+pub use oxidezap_platform::MaybeSend;
 
 /// What a full or closed queue gives back.
 ///

@@ -17,6 +17,7 @@ use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 
 use super::{Cancelled, MaybeSend};
+use oxidezap_platform::sleep;
 
 /// The page's loop, plus whether the session's own future is still on it.
 pub struct Executor {
@@ -54,7 +55,7 @@ impl Executor {
     ) -> std::io::Result<()> {
         let finished = self.finished.clone();
         let done = self.done.clone();
-        wasm_bindgen_futures::spawn_local(async move {
+        oxidezap_platform::spawn(async move {
             future.await;
             finished.set(true);
             done.notify_waiters();
@@ -126,69 +127,6 @@ impl Executor {
         )
         .await;
         self.finished.get() && !Outstanding::any()
-    }
-}
-
-/// Whichever global this agent has a `setTimeout` on.
-///
-/// A window in the page and a `WorkerGlobalScope` in a worker. Both carry the
-/// same two methods and neither inherits from the other, so the choice is
-/// made once, here.
-enum Timers {
-    Window(web_sys::Window),
-    Worker(web_sys::WorkerGlobalScope),
-}
-
-thread_local! {
-    /// The agent's global, resolved once.
-    ///
-    /// `web_sys::window()` is an `instanceof` across the wasm/JS boundary and
-    /// the worker fallback is a second one, which is a strange price to pay
-    /// per `setTimeout` on a path this hot: the library yields once per item
-    /// it processes, so a history sync arms one of these per message.
-    static TIMERS: Option<Timers> = Timers::here();
-}
-
-/// Do something with this agent's timers, if it has any.
-fn with_timers<T>(f: impl FnOnce(&Timers) -> T) -> Option<T> {
-    // `try_with` rather than `with`: a `Timer` can be dropped while thread
-    // locals are being destroyed, and a panic there is a panic in a
-    // destructor.
-    TIMERS
-        .try_with(|timers| timers.as_ref().map(f))
-        .ok()
-        .flatten()
-}
-
-impl Timers {
-    fn here() -> Option<Self> {
-        if let Some(window) = web_sys::window() {
-            return Some(Self::Window(window));
-        }
-        js_sys::global()
-            .dyn_into::<web_sys::WorkerGlobalScope>()
-            .ok()
-            .map(Self::Worker)
-    }
-
-    fn arm(&self, fire: &Closure<dyn FnMut()>, millis: i32) -> Result<i32, wasm_bindgen::JsValue> {
-        match self {
-            Self::Window(window) => window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                fire.as_ref().unchecked_ref(),
-                millis,
-            ),
-            Self::Worker(worker) => worker.set_timeout_with_callback_and_timeout_and_arguments_0(
-                fire.as_ref().unchecked_ref(),
-                millis,
-            ),
-        }
-    }
-
-    fn disarm(&self, handle: i32) {
-        match self {
-            Self::Window(window) => window.clear_timeout_with_handle(handle),
-            Self::Worker(worker) => worker.clear_timeout_with_handle(handle),
-        }
     }
 }
 
@@ -315,68 +253,6 @@ thread_local! {
     static PUMP: Option<Pump> = Pump::new();
 }
 
-/// `setTimeout`, as a future.
-///
-/// Parks forever where no timer can be armed, which is what the window's own
-/// clock does and for the same reason: every caller here is a loop that waits
-/// — a reconnect backoff, the QR rotation, a keepalive — so returning at once
-/// turns one into a spin that never yields and takes the tab with it.
-/// Stopping the loop is the honest outcome, and the log is what says so.
-pub async fn sleep(duration: Duration) {
-    /// Disarms the timer when the sleep is dropped.
-    ///
-    /// A `setTimeout` left armed fires into a `Closure` that has already been
-    /// freed, which is a wasm-bindgen panic rather than a missed wakeup — and
-    /// this is raced against something that routinely wins.
-    struct Timer {
-        handle: i32,
-        /// Raised by the callback below. A timer that has already fired has
-        /// nothing to cancel, and `clearTimeout` is a call across the
-        /// boundary either way — paid on every sleep, every retry and every
-        /// yield the library makes, which on this target is one per item.
-        fired: Rc<Cell<bool>>,
-        _fire: Closure<dyn FnMut()>,
-    }
-
-    impl Drop for Timer {
-        fn drop(&mut self) {
-            if self.fired.get() {
-                return;
-            }
-            with_timers(|timers| timers.disarm(self.handle));
-        }
-    }
-
-    let (tx, rx) = futures_channel::oneshot::channel::<()>();
-    let mut tx = Some(tx);
-    let fired = Rc::new(Cell::new(false));
-    let raise = Rc::clone(&fired);
-    let fire = Closure::<dyn FnMut()>::new(move || {
-        raise.set(true);
-        if let Some(tx) = tx.take() {
-            let _ = tx.send(());
-        }
-    });
-    let armed = with_timers(|timers| {
-        timers.arm(
-            &fire,
-            i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
-        )
-    })
-    .and_then(|handle| handle.ok())
-    .map(|handle| Timer {
-        handle,
-        fired,
-        _fire: fire,
-    });
-    let Some(_timer) = armed else {
-        log::error!("this agent has no timer; the loop that was waiting on one stops here");
-        std::future::pending::<()>().await;
-        return;
-    };
-    let _ = rx.await;
-}
-
 /// A handle that can spawn onto the page's loop later.
 ///
 /// Unused on this target, because the one thing that needs a spawner rather
@@ -410,7 +286,7 @@ pub fn spawn<T: MaybeSend + 'static>(
     future: impl Future<Output = T> + MaybeSend + 'static,
 ) -> Task<T> {
     let (tx, rx) = futures_channel::oneshot::channel();
-    wasm_bindgen_futures::spawn_local(async move {
+    oxidezap_platform::spawn(async move {
         let _ = tx.send(future.await);
     });
     Task(rx)
@@ -430,7 +306,7 @@ pub fn spawn_owned<T: MaybeSend + 'static>(
 ) -> Task<T> {
     let (tx, rx) = futures_channel::oneshot::channel();
     let counted = Outstanding::enter();
-    wasm_bindgen_futures::spawn_local(async move {
+    oxidezap_platform::spawn(async move {
         let _outstanding = counted;
         let _ = tx.send(future.await);
     });
@@ -535,19 +411,4 @@ impl<T> Future for Task<T> {
 /// with a signature that matches.
 pub async fn let_go<T: MaybeSend + 'static>(value: T) {
     drop(value);
-}
-
-/// Whichever finishes first: the work, or the wait. `None` when the wait won.
-///
-/// Raced rather than driven by a timer wheel, because the timer here is the
-/// browser's own `setTimeout` and there is no wheel to put it in.
-pub async fn with_timeout<T>(
-    work: impl Future<Output = T>,
-    limit: std::time::Duration,
-) -> Option<T> {
-    futures_lite::future::or(async { Some(work.await) }, async {
-        sleep(limit).await;
-        None
-    })
-    .await
 }

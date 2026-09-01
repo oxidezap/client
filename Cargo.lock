@@ -6132,6 +6132,7 @@ dependencies = [
  "log",
  "ogg",
  "opus",
+ "oxidezap-platform",
  "portable-atomic",
  "ringbuf",
  "tokio",
@@ -6153,6 +6154,7 @@ dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.4.3",
  "log",
+ "oxidezap-platform",
  "portable-atomic",
  "serde_json",
  "thiserror 2.0.20",
@@ -6160,7 +6162,6 @@ dependencies = [
  "wacore",
  "wacore-binary",
  "waproto",
- "wasm-bindgen-futures",
  "whatsapp-rust-sqlite-storage",
 ]
 
@@ -6239,6 +6240,7 @@ dependencies = [
  "oxidezap-daemon",
  "oxidezap-ipc",
  "oxidezap-logging",
+ "oxidezap-platform",
  "portable-atomic",
  "qrcode",
  "rust-embed",
@@ -6288,6 +6290,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxidezap-platform"
+version = "0.1.0"
+dependencies = [
+ "futures-channel",
+ "futures-lite",
+ "js-sys",
+ "log",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "oxidezap-plugin"
 version = "0.1.0"
 dependencies = [
@@ -6307,19 +6323,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "futures-channel",
  "futures-lite",
- "js-sys",
  "log",
  "oxidezap-core",
+ "oxidezap-platform",
  "oxidezap-plugin-abi",
  "portable-atomic",
  "rustix 1.1.4",
  "serde_json",
  "tokio",
  "wacore",
- "wasm-bindgen",
- "wasm-bindgen-futures",
  "wasmi",
  "wat",
  "web-sys",
@@ -6342,6 +6355,7 @@ dependencies = [
  "oxidezap-audio",
  "oxidezap-chat-store",
  "oxidezap-core",
+ "oxidezap-platform",
  "oxidezap-video",
  "portable-atomic",
  "serde_json",

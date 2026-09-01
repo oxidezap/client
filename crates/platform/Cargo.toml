@@ -1,0 +1,38 @@
+[package]
+name = "oxidezap-platform"
+description = "The seam under everything: where a task runs, and how it waits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Racing a future against a timer, which is the whole of `with_timeout` and
+# the only executor-free combinator this crate needs. The same crate the
+# session, the plugin host and the window already race with.
+futures-lite = { version = "2", default-features = false, features = ["std"] }
+log = { workspace = true }
+# The desktop's executor *and* its clock: `spawn` is `tokio::spawn` and
+# `sleep` is the wheel a runtime already carries. `rt` rather than
+# `rt-multi-thread` — nothing here builds a runtime, it only reaches the one
+# that is already running, and which shape that runtime has is the caller's
+# business. Target-gated, because `src/web.rs` names it nowhere and this crate
+# is now under every wasm binary in the tree.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["rt", "time"] }
+
+# The browser's executor and the browser's clock: the loop the page already
+# turns, and `setTimeout`. `WorkerGlobalScope` beside `Window` because a
+# worker is not a window and neither inherits from the other — see
+# `src/web.rs`, which is now the one place in the tree that says so.
+[target.'cfg(target_family = "wasm")'.dependencies]
+futures-channel = "0.3"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "WorkerGlobalScope"] }
+
+[lints]
+workspace = true
