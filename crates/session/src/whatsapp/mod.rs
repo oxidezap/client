@@ -3,6 +3,9 @@
 /// Voice calls, which are the one part of the session a page cannot run.
 mod calls;
 
+/// What a message's media is, for both the roads it arrives on.
+mod media;
+
 use calls::CallRegistry;
 
 use std::collections::{HashMap, HashSet};
@@ -32,8 +35,7 @@ use whatsapp_rust_sqlite_storage::SqliteStore;
 use crate::exec::{Executor, Task};
 use oxidezap_core::{
     Availability, CallVideoFrame, Chat, ChatMessage, ComposingKind, DownloadableMedia,
-    IncomingCall, MediaContent, MediaType, MessageStatus, SystemNotice, UiEvent, VideoStream,
-    fallback_chat_name,
+    IncomingCall, MessageStatus, SystemNotice, UiEvent, VideoStream, fallback_chat_name,
 };
 
 use crate::names::NameBook;
@@ -78,37 +80,6 @@ fn logout_message(event: &whatsapp_rust::types::events::LoggedOut) -> String {
             "WhatsApp rejected this client as outdated.".to_string()
         }
         other => format!("WhatsApp ended the session ({other:?})."),
-    }
-}
-
-/// Helper struct for building DownloadableMedia from common message fields
-struct DownloadableBuilder<'a> {
-    direct_path: Option<&'a str>,
-    media_key: Option<&'a [u8]>,
-    file_enc_sha256: Option<&'a [u8]>,
-    file_length: Option<u64>,
-    mime_type: &'a str,
-    duration_secs: Option<u32>,
-    download_type: DownloadMediaType,
-}
-
-impl<'a> DownloadableBuilder<'a> {
-    /// Try to build a DownloadableMedia from the provided fields.
-    /// Returns None if any required field (direct_path, media_key, file_enc_sha256) is missing.
-    fn build(self) -> Option<DownloadableMedia> {
-        let direct_path = self.direct_path?;
-        let media_key = self.media_key?;
-        let file_enc_sha256 = self.file_enc_sha256?;
-
-        Some(DownloadableMedia {
-            direct_path: direct_path.to_string(),
-            media_key: media_key.to_vec(),
-            file_enc_sha256: file_enc_sha256.to_vec(),
-            file_length: self.file_length.unwrap_or(0),
-            mime_type: self.mime_type.to_string(),
-            duration_secs: self.duration_secs,
-            download_type: self.download_type,
-        })
     }
 }
 
@@ -1190,7 +1161,7 @@ impl WhatsAppClient {
         }
 
         // Try to extract media content
-        let media_result = Self::try_extract_media(base_msg, client, eager).await;
+        let media_result = media::media_now(base_msg, client, eager).await;
 
         // Extract text content
         let content = msg
@@ -1275,332 +1246,6 @@ impl WhatsAppClient {
             message: Box::new(chat_message),
             sender_name,
         });
-    }
-
-    /// The eager fetch, or nothing when this is not the moment for one.
-    async fn fetch_now<T: whatsapp_rust::wacore::download::Downloadable>(
-        client: &Arc<Client>,
-        media: &T,
-        media_name: &str,
-        eager: bool,
-        file_length: Option<u64>,
-    ) -> Option<Vec<u8>> {
-        if !Self::worth_fetching_now(eager, file_length) {
-            return None;
-        }
-        Self::download_media(client, media, media_name).await
-    }
-
-    /// Helper to download media with logging
-    async fn download_media<T: whatsapp_rust::wacore::download::Downloadable>(
-        client: &Arc<Client>,
-        media: &T,
-        media_name: &str,
-    ) -> Option<Vec<u8>> {
-        info!("Downloading {}...", media_name);
-        match client.download(media).await {
-            Ok(data) => {
-                info!(
-                    "{} downloaded successfully: {} bytes",
-                    media_name,
-                    data.len()
-                );
-                Some(data)
-            }
-            Err(e) => {
-                warn!("Failed to download {}: {}", media_name, e);
-                None
-            }
-        }
-    }
-
-    /// Most bytes a picture may be worth fetching before anybody has asked
-    /// for it.
-    ///
-    /// A photo sent through WhatsApp is a fraction of this; past it the
-    /// message keeps its thumbnail and its download metadata, which is what
-    /// the renderer already draws for a video, and the full bytes arrive when
-    /// somebody opens it.
-    const EAGER_MEDIA_BYTES: u64 = 4 * 1024 * 1024;
-
-    /// Whether media of this size is worth fetching before anybody asked.
-    fn worth_fetching_now(eager: bool, file_length: Option<u64>) -> bool {
-        eager && file_length.is_none_or(|len| len <= Self::EAGER_MEDIA_BYTES)
-    }
-
-    /// Try to extract media from a message, fetching the bytes when they are
-    /// worth having before anybody has asked for them.
-    ///
-    /// Not fetching them is the same shape as failing to: the thumbnail is
-    /// what shows and the download metadata is what makes the full bytes
-    /// retryable.
-    async fn try_extract_media(
-        msg: &wa::Message,
-        _client: &Arc<Client>,
-        eager: bool,
-    ) -> Option<MediaContent> {
-        // Check for sticker message
-        if let Some(sticker) = effective_sticker(msg) {
-            let mime = sticker
-                .mimetype
-                .clone()
-                .unwrap_or_else(|| "image/webp".to_string());
-            let downloadable = DownloadableBuilder {
-                direct_path: sticker.direct_path.as_deref(),
-                media_key: sticker.media_key.as_deref(),
-                file_enc_sha256: sticker.file_enc_sha256.as_deref(),
-                file_length: sticker.file_length,
-                mime_type: &mime,
-                duration_secs: None,
-                download_type: DownloadMediaType::Sticker,
-            }
-            .build();
-            // Same rule as the image path below: a failed eager download
-            // degrades to the thumbnail (and stays retryable through the
-            // download metadata) instead of the message losing its media.
-            let (data, mime_type, is_animated, data_is_preview) = match Self::fetch_now(
-                _client,
-                sticker,
-                "sticker",
-                eager,
-                sticker.file_length,
-            )
-            .await
-            {
-                Some(data) => (data, mime, sticker.is_animated.unwrap_or(false), false),
-                None => {
-                    let still = still_preview(
-                        thumbnail_bytes(sticker.png_thumbnail.as_deref()),
-                        "image/png",
-                        mime,
-                        downloadable.is_some(),
-                    );
-                    (
-                        still.data,
-                        still.mime,
-                        // What the sticker *is*, not what the still is: the
-                        // flag describes the file that replaces it, and
-                        // `data_is_preview` beside it says which of the two
-                        // is in hand.
-                        sticker.is_animated.unwrap_or(false),
-                        still.is_preview,
-                    )
-                }
-            };
-            if data.is_empty() && downloadable.is_none() {
-                return None;
-            }
-            info!(
-                "Sticker: mime={}, is_animated={}, is_lottie={}, size={} bytes",
-                mime_type,
-                is_animated,
-                sticker.is_lottie.unwrap_or(false),
-                data.len()
-            );
-            return Some(MediaContent {
-                media_type: MediaType::Sticker,
-                data: Arc::new(data),
-                cache_key: None,
-                mime_type,
-                width: sticker.width,
-                height: sticker.height,
-                caption: None,
-                file_name: None,
-                downloadable,
-                is_animated,
-                duration_secs: None,
-                data_is_preview,
-                waveform: None,
-            });
-        }
-
-        // Check for image message
-        if let Some(image) = msg.image_message.as_option() {
-            let downloadable = DownloadableBuilder {
-                direct_path: image.direct_path.as_deref(),
-                media_key: image.media_key.as_deref(),
-                file_enc_sha256: image.file_enc_sha256.as_deref(),
-                file_length: image.file_length,
-                mime_type: image.mimetype.as_deref().unwrap_or("image/jpeg"),
-                duration_secs: None,
-                download_type: DownloadMediaType::Image,
-            }
-            .build();
-            // A failed eager download keeps the metadata: the thumbnail shows
-            // now and the full image stays retryable, instead of the message
-            // degrading to a plain text row for the whole session.
-            let (data, mime_type, data_is_preview) =
-                match Self::fetch_now(_client, image, "image", eager, image.file_length).await {
-                    Some(data) => (
-                        data,
-                        image
-                            .mimetype
-                            .clone()
-                            .unwrap_or_else(|| "image/jpeg".to_string()),
-                        false,
-                    ),
-                    None => {
-                        let still = still_preview(
-                            thumbnail_bytes(image.jpeg_thumbnail.as_deref()),
-                            "image/jpeg",
-                            image
-                                .mimetype
-                                .clone()
-                                .unwrap_or_else(|| "image/jpeg".to_string()),
-                            downloadable.is_some(),
-                        );
-                        (still.data, still.mime, still.is_preview)
-                    }
-                };
-            if data.is_empty() && downloadable.is_none() {
-                return None;
-            }
-            return Some(MediaContent {
-                media_type: MediaType::Image,
-                data: Arc::new(data),
-                cache_key: None,
-                mime_type,
-                width: image.width,
-                height: image.height,
-                caption: image.caption.clone(),
-                file_name: None,
-                downloadable,
-                is_animated: false,
-                duration_secs: None,
-                data_is_preview,
-                waveform: None,
-            });
-        }
-
-        // Check for video message - store thumbnail for preview, metadata for
-        // download. PTVs (round video notes) are the same proto type in a
-        // different field and play like any other video.
-        if let Some(video) = msg
-            .ptv_message
-            .as_option()
-            .or(msg.video_message.as_option())
-        {
-            // Use thumbnail for display, or empty vec if none
-            let thumbnail_data = video
-                .jpeg_thumbnail
-                .as_ref()
-                .filter(|t| !t.is_empty())
-                .cloned()
-                .unwrap_or_default();
-
-            // Build downloadable info using helper
-            let downloadable = DownloadableBuilder {
-                direct_path: video.direct_path.as_deref(),
-                media_key: video.media_key.as_deref(),
-                file_enc_sha256: video.file_enc_sha256.as_deref(),
-                file_length: video.file_length,
-                mime_type: video.mimetype.as_deref().unwrap_or("video/mp4"),
-                duration_secs: video.seconds,
-                download_type: DownloadMediaType::Video,
-            }
-            .build();
-
-            // Only return if we have either thumbnail or downloadable info
-            if !thumbnail_data.is_empty() || downloadable.is_some() {
-                // A video's `data` is never the video: these are the JPEG
-                // bytes of its poster frame, which is what the mime type
-                // beside them already says. Calling them the full media wrote
-                // a thumbnail under the full-video cache key, and every later
-                // read of that key handed back a still.
-                let data_is_preview = !thumbnail_data.is_empty();
-                return Some(MediaContent {
-                    media_type: MediaType::Video,
-                    data: Arc::new(thumbnail_data),
-                    cache_key: None,
-                    mime_type: "image/jpeg".to_string(), // Thumbnail is JPEG
-                    width: video.width,
-                    height: video.height,
-                    caption: video.caption.clone(),
-                    file_name: None,
-                    downloadable,
-                    is_animated: false,
-                    duration_secs: video.seconds,
-                    data_is_preview,
-                    waveform: None,
-                });
-            }
-        }
-
-        // Check for audio message - lazy load, only download when user clicks play
-        if let Some(audio) = msg.audio_message.as_option() {
-            let default_mime = "audio/ogg; codecs=opus";
-            let mime_type = audio.mimetype.as_deref().unwrap_or(default_mime);
-
-            // Build downloadable info using helper
-            let downloadable = DownloadableBuilder {
-                direct_path: audio.direct_path.as_deref(),
-                media_key: audio.media_key.as_deref(),
-                file_enc_sha256: audio.file_enc_sha256.as_deref(),
-                file_length: audio.file_length,
-                mime_type,
-                duration_secs: audio.seconds,
-                download_type: DownloadMediaType::Audio,
-            }
-            .build();
-
-            // Only return if we have downloadable info
-            if downloadable.is_some() {
-                return Some(MediaContent {
-                    media_type: MediaType::Audio,
-                    data: Arc::new(vec![]), // Empty until downloaded
-                    cache_key: None,
-                    mime_type: mime_type.to_string(),
-                    width: None,
-                    height: None,
-                    caption: None,
-                    file_name: None,
-                    downloadable,
-                    is_animated: false,
-                    duration_secs: audio.seconds,
-                    data_is_preview: false,
-                    // Drawn before a byte of audio is fetched, which is the
-                    // point: the shape of a voice note is most useful while
-                    // deciding whether to play it.
-                    waveform: audio
-                        .waveform
-                        .as_deref()
-                        .filter(|w| !w.is_empty())
-                        .map(|w| Arc::new(w.to_vec())),
-                });
-            }
-        }
-
-        // Check for document message (no eager download, just metadata)
-        if let Some(doc) = msg.document_message.as_option() {
-            let mime = doc.mimetype.clone().unwrap_or_default();
-            let downloadable = DownloadableBuilder {
-                direct_path: doc.direct_path.as_deref(),
-                media_key: doc.media_key.as_deref(),
-                file_enc_sha256: doc.file_enc_sha256.as_deref(),
-                file_length: doc.file_length,
-                mime_type: &mime,
-                duration_secs: None,
-                download_type: DownloadMediaType::Document,
-            }
-            .build();
-            return Some(MediaContent {
-                media_type: MediaType::Document,
-                data: Arc::new(vec![]),
-                cache_key: None,
-                mime_type: mime,
-                width: None,
-                height: None,
-                caption: doc.caption.clone(),
-                file_name: doc.file_name.clone(),
-                downloadable,
-                is_animated: false,
-                duration_secs: None,
-                data_is_preview: false,
-                waveform: None,
-            });
-        }
-
-        None
     }
 
     /// Send a text message to a chat.
@@ -2912,259 +2557,6 @@ fn history_preview(stored: Option<String>, newest: Option<&ChatMessage>) -> Opti
     stored.or_else(|| newest.map(ChatMessage::preview_text))
 }
 
-/// Convert a durable store row into the UI message model. Media stays
-/// download-on-demand (the encoded proto lives in the store if needed later).
-/// Media metadata (thumbnail + download info) from a message proto, without
-/// downloading anything. Shared by hydration; the live path additionally
-/// downloads images/stickers eagerly.
-/// The stand-in bytes a still carries before its media is fetched.
-struct Still {
-    data: Vec<u8>,
-    mime: String,
-    is_preview: bool,
-}
-
-fn thumbnail_bytes(thumbnail: Option<&[u8]>) -> Vec<u8> {
-    thumbnail
-        .filter(|t| !t.is_empty())
-        .unwrap_or_default()
-        .to_vec()
-}
-
-/// What a still is holding, decided once for the live path and the hydrated
-/// one. They had drifted: the live path flagged a thumbnail as a preview with
-/// no download metadata to make good on it, so the viewer refused to open the
-/// only bytes that will ever exist and the daemon refused to cache them.
-///
-/// A preview is bytes standing in for a fetch that can actually be made, and
-/// the mime describes what is in hand rather than what is being waited for.
-/// The video paths do not come through here on purpose: a poster frame is
-/// never the video, download metadata or not.
-fn still_preview(
-    thumbnail: Vec<u8>,
-    thumbnail_mime: &str,
-    own_mime: String,
-    downloadable: bool,
-) -> Still {
-    let has_preview = !thumbnail.is_empty();
-    Still {
-        mime: if has_preview {
-            thumbnail_mime.to_string()
-        } else {
-            own_mime
-        },
-        is_preview: has_preview && downloadable,
-        data: thumbnail,
-    }
-}
-
-fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
-    if let Some(sticker) = effective_sticker(msg) {
-        let mime = sticker
-            .mimetype
-            .clone()
-            .unwrap_or_else(|| "image/webp".to_string());
-        let downloadable = DownloadableBuilder {
-            direct_path: sticker.direct_path.as_deref(),
-            media_key: sticker.media_key.as_deref(),
-            file_enc_sha256: sticker.file_enc_sha256.as_deref(),
-            file_length: sticker.file_length,
-            mime_type: &mime,
-            duration_secs: None,
-            download_type: DownloadMediaType::Sticker,
-        }
-        .build();
-        let still = still_preview(
-            thumbnail_bytes(sticker.png_thumbnail.as_deref()),
-            "image/png",
-            mime,
-            downloadable.is_some(),
-        );
-        if still.data.is_empty() && downloadable.is_none() {
-            return None;
-        }
-        return Some(MediaContent {
-            media_type: MediaType::Sticker,
-            data: Arc::new(still.data),
-            cache_key: None,
-            mime_type: still.mime,
-            width: sticker.width,
-            height: sticker.height,
-            caption: None,
-            file_name: None,
-            data_is_preview: still.is_preview,
-            waveform: None,
-            downloadable,
-            // What the sticker *is*, not what the stand-in bytes are: the
-            // preview is a still, but the flag describes the file that
-            // replaces it, and `data_is_preview` beside it already says which
-            // of the two is in hand.
-            is_animated: sticker.is_animated.unwrap_or(false),
-            duration_secs: None,
-        });
-    }
-    if let Some(image) = msg.image_message.as_option() {
-        let downloadable = DownloadableBuilder {
-            direct_path: image.direct_path.as_deref(),
-            media_key: image.media_key.as_deref(),
-            file_enc_sha256: image.file_enc_sha256.as_deref(),
-            file_length: image.file_length,
-            mime_type: image.mimetype.as_deref().unwrap_or("image/jpeg"),
-            duration_secs: None,
-            download_type: DownloadMediaType::Image,
-        }
-        .build();
-        let still = still_preview(
-            thumbnail_bytes(image.jpeg_thumbnail.as_deref()),
-            "image/jpeg",
-            image
-                .mimetype
-                .clone()
-                .unwrap_or_else(|| "image/jpeg".to_string()),
-            downloadable.is_some(),
-        );
-        if still.data.is_empty() && downloadable.is_none() {
-            return None;
-        }
-        return Some(MediaContent {
-            media_type: MediaType::Image,
-            data: Arc::new(still.data),
-            cache_key: None,
-            mime_type: still.mime,
-            width: image.width,
-            height: image.height,
-            caption: image.caption.clone(),
-            file_name: None,
-            downloadable,
-            is_animated: false,
-            duration_secs: None,
-            data_is_preview: still.is_preview,
-            waveform: None,
-        });
-    }
-    // PTVs (round video notes) are VideoMessage in a different field.
-    if let Some(video) = msg
-        .ptv_message
-        .as_option()
-        .or(msg.video_message.as_option())
-    {
-        let downloadable = DownloadableBuilder {
-            direct_path: video.direct_path.as_deref(),
-            media_key: video.media_key.as_deref(),
-            file_enc_sha256: video.file_enc_sha256.as_deref(),
-            file_length: video.file_length,
-            mime_type: video.mimetype.as_deref().unwrap_or("video/mp4"),
-            duration_secs: video.seconds,
-            download_type: DownloadMediaType::Video,
-        }
-        .build();
-        let thumbnail = video
-            .jpeg_thumbnail
-            .as_ref()
-            .filter(|t| !t.is_empty())
-            .cloned()
-            .unwrap_or_default();
-        if thumbnail.is_empty() && downloadable.is_none() {
-            return None;
-        }
-        // The same as the live path: a poster frame, not the video.
-        let data_is_preview = !thumbnail.is_empty();
-        return Some(MediaContent {
-            media_type: MediaType::Video,
-            data: Arc::new(thumbnail),
-            cache_key: None,
-            mime_type: "image/jpeg".to_string(),
-            width: video.width,
-            height: video.height,
-            caption: video.caption.clone(),
-            file_name: None,
-            downloadable,
-            is_animated: false,
-            duration_secs: video.seconds,
-            data_is_preview,
-            waveform: None,
-        });
-    }
-    if let Some(audio) = msg.audio_message.as_option() {
-        let mime = audio
-            .mimetype
-            .clone()
-            .unwrap_or_else(|| "audio/ogg; codecs=opus".to_string());
-        let downloadable = DownloadableBuilder {
-            direct_path: audio.direct_path.as_deref(),
-            media_key: audio.media_key.as_deref(),
-            file_enc_sha256: audio.file_enc_sha256.as_deref(),
-            file_length: audio.file_length,
-            mime_type: &mime,
-            duration_secs: audio.seconds,
-            download_type: DownloadMediaType::Audio,
-        }
-        .build()?;
-        return Some(MediaContent {
-            media_type: MediaType::Audio,
-            data: Arc::new(vec![]),
-            cache_key: None,
-            mime_type: mime.clone(),
-            width: None,
-            height: None,
-            caption: None,
-            file_name: None,
-            downloadable: Some(downloadable),
-            is_animated: false,
-            duration_secs: audio.seconds,
-            data_is_preview: false,
-            // The same field the live path reads. Dropping it here made every
-            // voice note flatten to a placeholder shape the moment history
-            // was reloaded — which is most of the time.
-            waveform: audio
-                .waveform
-                .as_deref()
-                .filter(|w| !w.is_empty())
-                .map(|w| Arc::new(w.to_vec())),
-        });
-    }
-    if let Some(doc) = msg.document_message.as_option() {
-        let mime = doc.mimetype.clone().unwrap_or_default();
-        let downloadable = DownloadableBuilder {
-            direct_path: doc.direct_path.as_deref(),
-            media_key: doc.media_key.as_deref(),
-            file_enc_sha256: doc.file_enc_sha256.as_deref(),
-            file_length: doc.file_length,
-            mime_type: &mime,
-            duration_secs: None,
-            download_type: DownloadMediaType::Document,
-        }
-        .build();
-        return Some(MediaContent {
-            media_type: MediaType::Document,
-            data: Arc::new(vec![]),
-            cache_key: None,
-            mime_type: mime,
-            width: None,
-            height: None,
-            caption: doc.caption.clone(),
-            file_name: doc.file_name.clone(),
-            downloadable,
-            is_animated: false,
-            duration_secs: None,
-            data_is_preview: false,
-            waveform: None,
-        });
-    }
-    None
-}
-
-/// Some animated stickers arrive wrapped in the `lottie_sticker_message`
-/// future-proof envelope instead of the top-level `sticker_message`.
-fn effective_sticker(msg: &wa::Message) -> Option<&wa::message::StickerMessage> {
-    msg.sticker_message.as_option().or_else(|| {
-        msg.lottie_sticker_message
-            .as_option()
-            .and_then(|w| w.message.as_option())
-            .and_then(|m| m.sticker_message.as_option())
-    })
-}
-
 /// How many lanes events about a subject are spread across.
 ///
 /// Fixed rather than one per subject: a lane is a task and a queue, and a
@@ -3374,6 +2766,8 @@ fn mark_unread_tail(messages: &mut [ChatMessage], unread: u32) -> u32 {
     remaining
 }
 
+/// Convert a durable store row into the UI message model. Media stays
+/// download-on-demand (the encoded proto lives in the store if needed later).
 fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage) -> ChatMessage {
     // The stored proto still carries the media envelope: hydrate thumbnails +
     // download info so historical media renders and stays fetchable, instead
@@ -3381,7 +2775,7 @@ fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage) -> ChatMes
     let media = (!stored.revoked)
         .then_some(stored.message.as_deref())
         .flatten()
-        .and_then(|m| media_metadata(m.get_base_message()));
+        .and_then(|m| media::media_of(m.get_base_message(), None));
     let content = match (&stored.text, stored.revoked) {
         (_, true) => "[Message deleted]".to_string(),
         (Some(text), _) => text.clone(),
@@ -3667,9 +3061,9 @@ mod tests {
 
     use super::{
         ChatEntry, ChatStore, Client, LoadedHistory, NameBook, ReadBoundary, ReloadScope,
-        SqliteStore, StoreChange, WhatsAppClient, apply_status_views, chat_cursor, media_metadata,
+        SqliteStore, StoreChange, WhatsAppClient, apply_status_views, chat_cursor,
         merge_alias_history_messages, message_cursor, parse_chat_cursor, parse_message_cursor,
-        read_message_range, still_preview,
+        read_message_range,
     };
     use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
     use std::sync::Arc;
@@ -3956,25 +3350,6 @@ mod tests {
         );
     }
 
-    /// Reconnecting after a while offline hands over a batch of hundreds, and
-    /// fetching a picture per message before the first bubble reaches the
-    /// window spends the whole reconnection on it. The same question decides
-    /// a picture nobody is going to look at soon enough to be worth the
-    /// bytes.
-    #[test]
-    fn a_backlog_is_not_a_reason_to_fetch_every_picture() {
-        // Live and small: the one case worth the round trip.
-        assert!(WhatsAppClient::worth_fetching_now(true, Some(64 * 1024)));
-        assert!(WhatsAppClient::worth_fetching_now(true, None));
-
-        assert!(!WhatsAppClient::worth_fetching_now(false, Some(64 * 1024)));
-        assert!(!WhatsAppClient::worth_fetching_now(false, None));
-        assert!(
-            !WhatsAppClient::worth_fetching_now(true, Some(WhatsAppClient::EAGER_MEDIA_BYTES + 1)),
-            "past the ceiling the thumbnail shows and the bytes stay retryable"
-        );
-    }
-
     /// The quote bar above a reply named an unknown contact while the bubbles
     /// from the same person, an inch above it, carried their name: the
     /// participant went onto the row exactly as the envelope spelled it,
@@ -4227,40 +3602,6 @@ mod tests {
             !chats[1].messages[0].is_read,
             "a conversation is not the broadcast, whatever ids collide"
         );
-    }
-
-    #[test]
-    fn a_still_with_nothing_to_download_is_not_offered_as_a_preview() {
-        let orphan = still_preview(vec![1, 2, 3], "image/png", "image/webp".into(), false);
-        assert!(!orphan.is_preview);
-        assert_eq!(orphan.mime, "image/png");
-
-        let fetchable = still_preview(vec![1, 2, 3], "image/png", "image/webp".into(), true);
-        assert!(fetchable.is_preview);
-
-        // No bytes in hand: the mime describes the file being waited for.
-        let empty = still_preview(Vec::new(), "image/png", "image/webp".into(), true);
-        assert!(!empty.is_preview);
-        assert_eq!(empty.mime, "image/webp");
-    }
-
-    #[test]
-    fn historical_sticker_keeps_thumbnail_without_download_metadata() {
-        let message = wa::Message {
-            sticker_message: MessageField::some(wa::message::StickerMessage {
-                png_thumbnail: Some(vec![1, 2, 3]),
-                width: Some(64),
-                height: Some(64),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let media = media_metadata(&message).expect("sticker metadata");
-        assert_eq!(media.data.as_slice(), [1, 2, 3]);
-        assert_eq!(media.mime_type, "image/png");
-        assert!(media.downloadable.is_none());
-        assert!(!media.data_is_preview);
     }
 
     #[test]
