@@ -647,6 +647,17 @@ pub struct WhatsAppApp {
     /// Written by the render pass, because being on screen is a fact about
     /// what was drawn.
     visible_chat: Option<String>,
+    /// The conversation whose media this window is still holding for.
+    ///
+    /// [`Self::visible_chat`] with the gaps filled in: the frame reports no
+    /// conversation whenever Settings is up, the reader is in Status, the
+    /// fullscreen viewer is open or the window is too narrow to draw a chat
+    /// area beside the list — and none of those means the reader has left the
+    /// conversation they were in. Only *another* conversation being drawn
+    /// moves it. Read by [`Self::sweep_retained_media`], which would
+    /// otherwise empty an album the moment somebody opened one of its
+    /// pictures full screen.
+    retained_chat: Option<String>,
     /// Store-backed chats a complete load said were gone, kept on screen only
     /// because they are the open conversation.
     ///
@@ -935,7 +946,19 @@ impl WhatsAppApp {
             while let Some(message) = ui_rx.recv().await {
                 let result = match message {
                     FromDaemon::Session(event) => entity.update(cx, |app, cx| {
+                        // The two events that carry media, and so the only
+                        // two that can leave this window holding more of it
+                        // than it is allowed to. Asked before the event is
+                        // applied because applying it consumes it; swept
+                        // after, because the bytes arrive with it.
+                        let bearing = matches!(
+                            &*event,
+                            UiEvent::MessageReceived { .. } | UiEvent::HistoryLoaded { .. }
+                        );
                         app.handle_event(*event, cx);
+                        if bearing {
+                            app.sweep_retained_media();
+                        }
                     }),
                     // Adopted whole rather than replayed: these are the calls
                     // that were already happening when this window attached,
@@ -1066,6 +1089,7 @@ impl WhatsAppApp {
             playback_epoch: 0,
             status_tick_at: None,
             visible_chat: None,
+            retained_chat: None,
             departed_chats: std::collections::HashSet::new(),
             owed_reads: std::collections::HashSet::new(),
             timeline_pages: paging::TimelinePages::new(),
@@ -1603,7 +1627,20 @@ impl WhatsAppApp {
         if let Some(jid) = &jid {
             self.ensure_timeline_page(jid);
         }
+        // Moving to *another* conversation is the moment the last one's media
+        // stops being anything anybody can see, and the one signal a front
+        // end has that a row is off screen. Compared against
+        // [`Self::retained_chat`] rather than the field below, which the
+        // render pass clears at the top of every frame: against that, every
+        // frame would look like a move and sweep the whole account.
+        let moved = jid.is_some() && self.retained_chat != jid;
+        if jid.is_some() {
+            self.retained_chat.clone_from(&jid);
+        }
         self.visible_chat = jid;
+        if moved {
+            self.sweep_retained_media();
+        }
     }
 
     /// Whether the chat list this frame draws has no rows in it at all.
@@ -1673,6 +1710,7 @@ impl WhatsAppApp {
         self.chats.clear();
         self.selected_chat = None;
         self.visible_chat = None;
+        self.retained_chat = None;
         self.departed_chats.clear();
         // The cursors describe positions in one account's store; the next
         // account's rows are not behind them.
