@@ -787,6 +787,75 @@ mod tests {
         assert_eq!(shape.thumbnail, None, "with no preview, which is the point");
     }
 
+    /// The second of the three paths that give up on the pixels: a format the
+    /// header names and this build has no decoder for. Its dimensions cannot
+    /// be read either, so there is nothing to say about it *except* what it
+    /// is — and that much is still worth saying.
+    #[test]
+    fn a_format_with_no_decoder_here_still_says_what_it_is() {
+        // A BMP signature. `image` recognises it by its magic bytes whatever
+        // the feature set, and this build has no BMP decoder, so the
+        // dimensions are the thing that fails.
+        let bmp = b"BM\x00\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00".to_vec();
+        let (shape, sent) = prepared("image/png", bmp.clone());
+
+        assert_eq!(sent.data, bmp, "the bytes are the ones that came in");
+        assert_eq!(sent.mime_type, "image/bmp");
+        assert_eq!(shape, Shape::default(), "and nothing was measured");
+    }
+
+    /// The third: a picture whose header declares more pixels than this will
+    /// decode. It is never read, so its type comes from the header alone —
+    /// and a hundred megapixels is thirty-three bytes to *claim*, which is
+    /// what makes the ceiling worth having and this worth testing.
+    #[test]
+    fn a_picture_past_the_decode_ceiling_still_says_what_it_is() {
+        let huge = png_claiming(10_000, 10_000);
+        let (shape, sent) = prepared("image/webp", huge.clone());
+
+        assert_eq!(sent.data, huge, "nothing re-encoded it");
+        assert_eq!(sent.mime_type, "image/png", "and it is a PNG, not a WebP");
+        // Measured from the header, which is all this path ever reads.
+        assert_eq!((shape.width, shape.height), (Some(10_000), Some(10_000)));
+        assert_eq!(shape.thumbnail, None);
+    }
+
+    /// A PNG whose header claims a size nothing here will allocate.
+    ///
+    /// Built rather than encoded, because encoding one would mean allocating
+    /// the four hundred megabytes this exists to refuse: a real PNG's `IHDR`
+    /// is patched with the dimensions and its checksum recomputed, which is
+    /// the whole of what a decoder reads before it decides.
+    fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+        let mut png = png(1, 1);
+        // Signature (8), length (4), type (4), then the 13 bytes of `IHDR`
+        // whose first two fields are the dimensions, then the checksum.
+        png[16..20].copy_from_slice(&width.to_be_bytes());
+        png[20..24].copy_from_slice(&height.to_be_bytes());
+        let checksum = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&checksum.to_be_bytes());
+        png
+    }
+
+    /// CRC-32/ISO-HDLC, which is the one PNG chunks carry.
+    ///
+    /// Ten lines rather than a dependency: this exists to make one fixture,
+    /// and the alternative is a crate in the manifest for a test.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
     /// Transparency has to land somewhere once the alpha channel is gone, and
     /// "wherever the encoder left it" is not somewhere. A pixel that is fully
     /// transparent over red must come out white rather than red.
