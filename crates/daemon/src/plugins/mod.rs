@@ -147,7 +147,7 @@ struct Bridge {
 
 impl Commands for Bridge {
     fn send_text(&self, jid: &str, text: &str, quoted: Option<&str>) -> Outcome {
-        self.ask(Action::SendText {
+        self.ask(Action::SendText(oxidezap_ipc::SendText {
             jid: jid.to_owned(),
             text: text.to_owned(),
             // The daemon invents one. A plugin has no bubble to rename, so a
@@ -167,20 +167,20 @@ impl Commands for Bridge {
                 preview: String::new(),
                 kind: None,
             }),
-        })
+        }))
     }
 
     fn mark_read(&self, jid: &str, message_id: Option<&str>) -> Outcome {
-        self.ask(Action::MarkRead {
+        self.ask(Action::MarkRead(oxidezap_ipc::MarkRead {
             jid: jid.to_owned(),
             through_message_id: message_id.map(str::to_owned),
-        })
+        }))
     }
 
     fn typing(&self, jid: &str, composing: bool) -> Outcome {
-        self.ask(Action::Typing {
+        self.ask(Action::Typing(oxidezap_ipc::Typing {
             jid: jid.to_owned(),
             composing,
-        })
+        }))
     }
 }

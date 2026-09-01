@@ -470,6 +470,130 @@ fn owns_a_window() -> bool {
     true
 }
 
+// The payloads below are named structs rather than a variant's own fields,
+// and each is carried by exactly one [`ClientRequest`] variant as a newtype.
+//
+// The reason is on the daemon's side of the socket: what a client asks for and
+// what the daemon then hands its session are the same set of fields, so a
+// payload spelled into the variant here had to be spelled again into the
+// daemon's command enum and shuffled field-by-field between the two. Nothing
+// checked that the two spellings agreed — adding a field to one and forgetting
+// the other compiles, and the field silently never arrives. Declared once, the
+// shuffle is a move and the compiler is the thing that notices.
+//
+// This does *not* contradict the note on [`ClientRequest::PluginAction`],
+// which is a named field precisely to avoid a newtype. That variant wraps a
+// type whose fields must stay in an object of their own; these payloads are
+// the fields that were already flat in the request map, and an internally
+// tagged newtype variant serializes a struct's fields into that same map — so
+// flattening is exactly what keeps the bytes what they were. The wire is
+// unchanged, and
+// `tests::every_request_payload_puts_the_same_bytes_on_the_wire` is what says
+// so in literal JSON.
+
+/// Send a text message. See [`ClientRequest::SendText`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendText {
+    pub jid: String,
+    pub text: String,
+    /// The id to give the message until the server assigns a real one.
+    ///
+    /// A client that draws the message before it is sent needs to know this,
+    /// or it cannot match the [`UiEvent::MessageIdAssigned`] that renames it.
+    /// `None` for a client that does not draw anything, and the daemon makes
+    /// one up.
+    #[serde(default)]
+    pub local_id: Option<String>,
+    /// The message being replied to, when this is a reply.
+    ///
+    /// Carried on the request rather than set up beforehand, because a reply
+    /// is one send: the quote is part of the message, and a client that
+    /// composed one has everything the wire needs — the original's id, who
+    /// wrote it, and the line to show in the quote bar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted: Option<QuotedMessage>,
+}
+
+/// Send a recorded voice note. See [`ClientRequest::SendAudio`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendAudio {
+    pub jid: String,
+    /// Cache key the client wrote the encoded audio under.
+    pub upload: String,
+    pub duration_secs: u32,
+    pub waveform: Vec<u8>,
+    /// The id to give the note until the server assigns a real one, as
+    /// [`SendText::local_id`].
+    ///
+    /// Deliberately *not* `#[serde(default)]`, unlike that one, and the
+    /// difference is a fact about the wire rather than about this struct: an
+    /// `Option` alone does not make a key optional to serde, so a frame that
+    /// leaves `local_id` out is malformed here and merely `None` there. Every
+    /// client in this tree sends the key, so nothing depends on it either
+    /// way — but widening it is a protocol change and belongs in
+    /// `PROTOCOL_VERSION`'s changelog, not in the move that gave this payload
+    /// a name.
+    pub local_id: Option<String>,
+    /// The message being replied to, when this is a reply.
+    ///
+    /// The same field [`SendText`] carries, for the same reason: recording is
+    /// a way of answering, not a different kind of message. Without it a reply
+    /// draft open when the user pressed the microphone was silently dropped —
+    /// and worse, stayed armed and attached itself to whatever was typed next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted: Option<QuotedMessage>,
+}
+
+/// Whether we are typing at a peer. See [`ClientRequest::Typing`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Typing {
+    pub jid: String,
+    pub composing: bool,
+}
+
+/// Media to fetch. See [`ClientRequest::Download`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Download {
+    pub media: Box<DownloadableMedia>,
+}
+
+/// How far a chat has been read. See [`ClientRequest::MarkRead`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkRead {
+    pub jid: String,
+    /// The preview the requester holds for this chat, by id. See
+    /// [`ClientRequest::MarkRead`], which is where the checking is explained.
+    pub through_message_id: Option<String>,
+}
+
+/// Status updates that have been watched. See
+/// [`ClientRequest::MarkStatusWatched`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkStatusWatched {
+    pub message_ids: Vec<String>,
+}
+
+/// One page of a chat's messages. See [`ClientRequest::LoadMessages`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadMessages {
+    pub jid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<PageCursor>,
+    /// How many, at most. The daemon clamps it; a client with no opinion
+    /// leaves it out and takes the default page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One page of the chat list. See [`ClientRequest::LoadChats`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadChats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<PageCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 /// What a client asks the daemon to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -511,63 +635,23 @@ pub enum ClientRequest {
     /// Ask for a fresh snapshot, after a [`DaemonMessage::Resync`] or on
     /// reconnect.
     Snapshot,
-    SendText {
-        jid: String,
-        text: String,
-        /// The id to give the message until the server assigns a real one.
-        ///
-        /// A client that draws the message before it is sent needs to know
-        /// this, or it cannot match the [`UiEvent::MessageIdAssigned`] that
-        /// renames it. `None` for a client that does not draw anything, and
-        /// the daemon makes one up.
-        #[serde(default)]
-        local_id: Option<String>,
-        /// The message being replied to, when this is a reply.
-        ///
-        /// Carried on the request rather than set up beforehand, because a
-        /// reply is one send: the quote is part of the message, and a client
-        /// that composed one has everything the wire needs — the original's
-        /// id, who wrote it, and the line to show in the quote bar.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        quoted: Option<QuotedMessage>,
-    },
+    SendText(SendText),
     /// Send a recorded voice note.
     ///
     /// The audio arrives through the media cache rather than the socket: it
     /// is the one client-to-daemon payload big enough to matter, and the cache
     /// is a per-user directory both processes can already reach.
-    SendAudio {
-        jid: String,
-        /// Cache key the client wrote the encoded audio under.
-        upload: String,
-        duration_secs: u32,
-        waveform: Vec<u8>,
-        local_id: Option<String>,
-        /// The message being replied to, when this is a reply.
-        ///
-        /// The same field [`ClientRequest::SendText`] carries, for the same
-        /// reason: recording is a way of answering, not a different kind of
-        /// message. Without it a reply draft open when the user pressed the
-        /// microphone was silently dropped — and worse, stayed armed and
-        /// attached itself to whatever was typed next.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        quoted: Option<QuotedMessage>,
-    },
+    SendAudio(SendAudio),
     /// Tell the peer whether we are typing. One request rather than two,
     /// because it is one piece of state with two values.
-    Typing {
-        jid: String,
-        composing: bool,
-    },
+    Typing(Typing),
     Call(CallAction),
     /// Fetch media the daemon has not cached yet.
     ///
     /// The one request whose answer is neither a state change nor an
     /// acknowledgement: it takes seconds, several are normally in flight, and
     /// the answer is [`DaemonMessage::Downloaded`] under the request's id.
-    Download {
-        media: Box<DownloadableMedia>,
-    },
+    Download(Download),
     /// Ask for the whole history again.
     ///
     /// What a client does after [`DaemonMessage::Resync`]: a front end that
@@ -591,10 +675,7 @@ pub enum ClientRequest {
     /// second and a burst of two lands on the same one. The daemon refuses
     /// when this is not the message it would name in a snapshot right now, and
     /// the client resends after catching up.
-    MarkRead {
-        jid: String,
-        through_message_id: Option<String>,
-    },
+    MarkRead(MarkRead),
     /// Remember that these status updates have been watched.
     ///
     /// Not a [`MarkRead`](Self::MarkRead) for the broadcast: that one clears a
@@ -608,9 +689,7 @@ pub enum ClientRequest {
     ///
     /// Nothing is sent to anyone. A status read receipt is a privacy setting
     /// the library does not expose.
-    MarkStatusWatched {
-        message_ids: Vec<String>,
-    },
+    MarkStatusWatched(MarkStatusWatched),
     /// One page of a chat's messages, older than `before`.
     ///
     /// Answered with [`DaemonMessage::Messages`] under the request's id. This
@@ -622,15 +701,7 @@ pub enum ClientRequest {
     /// `before` is the cursor the previous page came back with; `None` asks
     /// for the newest page. A front end that asks twice with the same cursor
     /// gets the same page: the cursor names a position, not a state.
-    LoadMessages {
-        jid: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        before: Option<PageCursor>,
-        /// How many, at most. The daemon clamps it; a client with no opinion
-        /// leaves it out and takes the default page.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
+    LoadMessages(LoadMessages),
     /// One page of the chat list, after `after`.
     ///
     /// Answered with [`DaemonMessage::Chats`] under the request's id. The
@@ -638,12 +709,7 @@ pub enum ClientRequest {
     /// reason: an account with a thousand conversations has nine hundred a
     /// window will never draw, and shipping them all on attach is a cost paid
     /// before anything is on screen.
-    LoadChats {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        after: Option<PageCursor>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
+    LoadChats(LoadChats),
     /// Ask what this account is taking up on disk.
     ///
     /// Answered with [`DaemonMessage::Storage`] under the request's id. The
@@ -922,11 +988,11 @@ mod tests {
     /// changed would page from somewhere the daemon never was.
     #[test]
     fn a_page_request_and_its_answer_round_trip() {
-        let ask = ClientRequest::LoadMessages {
+        let ask = ClientRequest::LoadMessages(LoadMessages {
             jid: "559900000001@s.whatsapp.net".into(),
             before: Some(PageCursor::new("m1:1700000000123:4242")),
             limit: None,
-        };
+        });
         let line = serde_json::to_string(&Request::bare(ask.clone())).unwrap();
         assert!(line.contains(r#""request":"load_messages""#), "{line}");
         assert!(!line.contains("limit"), "an absent limit is absent: {line}");
@@ -1072,10 +1138,10 @@ mod tests {
     fn a_request_carries_its_id_without_nesting() {
         let line = serde_json::to_string(&Request {
             id: Some(7),
-            request: ClientRequest::MarkRead {
+            request: ClientRequest::MarkRead(MarkRead {
                 jid: "1@s.whatsapp.net".into(),
                 through_message_id: Some("3EB0".into()),
-            },
+            }),
         })
         .unwrap();
         assert!(
@@ -1090,9 +1156,9 @@ mod tests {
     /// opened.
     #[test]
     fn a_status_view_names_the_updates_it_watched() {
-        let request = ClientRequest::MarkStatusWatched {
+        let request = ClientRequest::MarkStatusWatched(MarkStatusWatched {
             message_ids: vec!["3EB0A".into(), "3EB0B".into()],
-        };
+        });
         let line = serde_json::to_string(&Request::bare(request.clone())).unwrap();
         assert!(
             line.contains(r#""request":"mark_status_watched""#),
@@ -1146,5 +1212,146 @@ mod tests {
         let line = serde_json::to_string(&msg).unwrap();
         assert!(!line.contains('\n'), "frames are newline-delimited");
         assert_eq!(serde_json::from_str::<DaemonMessage>(&line).unwrap(), msg);
+    }
+
+    /// Every request that carries a payload, spelled out as the exact bytes it
+    /// puts on the wire.
+    ///
+    /// Literal JSON rather than a round trip, because a round trip only proves
+    /// that this build agrees with itself: it passes just as happily after a
+    /// field has been renamed, made optional, or moved into a nested object,
+    /// and the peer on the other end of the socket is not necessarily this
+    /// build. These literals are what the daemon and every front end outside
+    /// this workspace have already agreed on, so a diff here is a protocol
+    /// change and belongs in `PROTOCOL_VERSION`'s changelog rather than in a
+    /// fixup.
+    ///
+    /// Absence is part of the shape, so it is asserted too: `quoted`, `before`,
+    /// `limit` and `after` vanish when unset, while `local_id` and
+    /// `through_message_id` are written as `null`. What a frame leaves out, its
+    /// reader fills in — and which of the two a field does is not something a
+    /// later reading of the struct can recover.
+    #[test]
+    fn every_request_payload_puts_the_same_bytes_on_the_wire() {
+        let quoted = QuotedMessage {
+            message_id: "3EB0A".into(),
+            sender: "559900000001@s.whatsapp.net".into(),
+            sender_name: "quem quer que seja".into(),
+            preview: "a linha citada".into(),
+            kind: None,
+        };
+        // Read back rather than constructed: the download type is spelled in a
+        // crate this one does not depend on, and the bytes are the subject
+        // here anyway.
+        let media_json = r#"{"direct_path":"/v/t62/abc","media_key":[1,2,3],"file_enc_sha256":[4,5,6],"file_length":4242,"mime_type":"image/jpeg","duration_secs":null,"download_type":"image"}"#;
+        let media: DownloadableMedia = serde_json::from_str(media_json).unwrap();
+
+        let cases: Vec<(ClientRequest, String)> = vec![
+            (
+                ClientRequest::SendText(SendText {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    text: "oi".into(),
+                    local_id: Some("local-1".into()),
+                    quoted: Some(quoted.clone()),
+                }),
+                r#"{"request":"send_text","jid":"559900000001@s.whatsapp.net","text":"oi","local_id":"local-1","quoted":{"message_id":"3EB0A","sender":"559900000001@s.whatsapp.net","sender_name":"quem quer que seja","preview":"a linha citada","kind":null}}"#.to_string(),
+            ),
+            (
+                ClientRequest::SendText(SendText {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    text: "oi".into(),
+                    local_id: None,
+                    quoted: None,
+                }),
+                r#"{"request":"send_text","jid":"559900000001@s.whatsapp.net","text":"oi","local_id":null}"#.to_string(),
+            ),
+            (
+                ClientRequest::SendAudio(SendAudio {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    upload: "staged-local-1".into(),
+                    duration_secs: 3,
+                    waveform: vec![7, 8],
+                    local_id: Some("local-1".into()),
+                    quoted: Some(quoted),
+                }),
+                r#"{"request":"send_audio","jid":"559900000001@s.whatsapp.net","upload":"staged-local-1","duration_secs":3,"waveform":[7,8],"local_id":"local-1","quoted":{"message_id":"3EB0A","sender":"559900000001@s.whatsapp.net","sender_name":"quem quer que seja","preview":"a linha citada","kind":null}}"#.to_string(),
+            ),
+            (
+                ClientRequest::Typing(Typing {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    composing: true,
+                }),
+                r#"{"request":"typing","jid":"559900000001@s.whatsapp.net","composing":true}"#
+                    .to_string(),
+            ),
+            (
+                ClientRequest::Download(Download {
+                    media: Box::new(media),
+                }),
+                format!(r#"{{"request":"download","media":{media_json}}}"#),
+            ),
+            (
+                ClientRequest::MarkRead(MarkRead {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    through_message_id: Some("3EB0".into()),
+                }),
+                r#"{"request":"mark_read","jid":"559900000001@s.whatsapp.net","through_message_id":"3EB0"}"#.to_string(),
+            ),
+            (
+                ClientRequest::MarkStatusWatched(MarkStatusWatched {
+                    message_ids: vec!["3EB0A".into(), "3EB0B".into()],
+                }),
+                r#"{"request":"mark_status_watched","message_ids":["3EB0A","3EB0B"]}"#.to_string(),
+            ),
+            (
+                ClientRequest::LoadMessages(LoadMessages {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    before: Some(PageCursor::new("m1:1700000000123:4242")),
+                    limit: Some(50),
+                }),
+                r#"{"request":"load_messages","jid":"559900000001@s.whatsapp.net","before":"m1:1700000000123:4242","limit":50}"#.to_string(),
+            ),
+            (
+                ClientRequest::LoadMessages(LoadMessages {
+                    jid: "559900000001@s.whatsapp.net".into(),
+                    before: None,
+                    limit: None,
+                }),
+                r#"{"request":"load_messages","jid":"559900000001@s.whatsapp.net"}"#.to_string(),
+            ),
+            (
+                ClientRequest::LoadChats(LoadChats {
+                    after: Some(PageCursor::new("c1:1700000000123")),
+                    limit: Some(20),
+                }),
+                r#"{"request":"load_chats","after":"c1:1700000000123","limit":20}"#.to_string(),
+            ),
+            (
+                ClientRequest::LoadChats(LoadChats {
+                    after: None,
+                    limit: None,
+                }),
+                r#"{"request":"load_chats"}"#.to_string(),
+            ),
+            (
+                ClientRequest::ReloadHistory,
+                r#"{"request":"reload_history"}"#.to_string(),
+            ),
+            (
+                ClientRequest::ForgetSession,
+                r#"{"request":"forget_session"}"#.to_string(),
+            ),
+        ];
+
+        for (request, expected) in cases {
+            let line = serde_json::to_string(&request).unwrap();
+            assert_eq!(line, expected, "{request:?} changed shape on the wire");
+            // And the same bytes read back as the same request: a shape that
+            // only serializes is half a protocol.
+            assert_eq!(
+                serde_json::from_str::<ClientRequest>(&line).unwrap(),
+                request
+            );
+        }
     }
 }
