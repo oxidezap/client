@@ -10,8 +10,8 @@ use waproto::whatsapp as wa;
 use crate::schema;
 use crate::store::chat_rows::{chat_row, ensure_chat};
 use crate::store::message_rows::message_row;
-use crate::store::read_state::{UNREAD_MARKER, advance_read_state, count_unread, read_state};
-use crate::store::writer::ChangeSet;
+use crate::store::read_state::{advance_read_state, clear_unread_marker, count_unread};
+use crate::store::writer::{ChangeSet, route_chat};
 
 pub(super) fn apply_receipt(
     conn: &mut SqliteConnection,
@@ -34,11 +34,7 @@ pub(super) fn apply_receipt(
             // Self receipts are LID-addressed once the peer is; the thread may
             // be keyed by either identity (or split) — route to where it lives
             // so the read state lands on the real rows, not a stray twin.
-            let wire = chat;
-            let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
-            if chat != wire {
-                cs.message_chats.insert(wire);
-            }
+            let chat = route_chat(conn, device_id, chat, cs)?;
             // Read on another of our devices — up to the covered messages.
             // WA read state is "read up to X": the boundary is the newest
             // covered row (falling back to the receipt's own timestamp).
@@ -71,17 +67,7 @@ pub(super) fn apply_receipt(
             else {
                 // Cursor didn't move (chat re-read on another device), but a
                 // self-read still clears a manual-unread marker.
-                let state = read_state(conn, device_id, &chat)?;
-                let unread = count_unread(conn, device_id, &chat, &state)?;
-                let cleared = diesel::update(
-                    chat_row(device_id, &chat)
-                        .filter(schema::chats::unread_count.eq(UNREAD_MARKER)),
-                )
-                .set(schema::chats::unread_count.eq(unread))
-                .execute(conn)?;
-                if cleared > 0 {
-                    cs.chats = true;
-                }
+                clear_unread_marker(conn, device_id, &chat, cs)?;
                 return Ok(());
             };
             let unread = count_unread(conn, device_id, &chat, &state)?;

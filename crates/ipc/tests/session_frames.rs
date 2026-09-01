@@ -161,6 +161,10 @@ fn an_omitted_field_comes_back_as_what_it_was() {
     full.revoked = true;
     full.reactions
         .insert("🎉".into(), vec!["1@s.whatsapp.net".into()]);
+    // A literal on purpose, and one no constructor could produce: every
+    // optional field is set at once — an animated image with a duration — so
+    // that the round trip covers all of them rather than the ones some kind
+    // of media happens to carry together.
     full.media = Some(MediaContent {
         media_type: MediaType::Image,
         data: Default::default(),
@@ -191,26 +195,13 @@ fn an_omitted_field_comes_back_as_what_it_was() {
 /// so this is what does.
 #[test]
 fn media_bytes_only_leave_the_frame_once_a_key_names_them() {
-    use oxidezap_core::{ChatMessage, MediaContent, MediaType};
+    use oxidezap_core::{ChatMessage, MediaContent};
     use std::sync::Arc;
 
     let mut message =
         ChatMessage::new_incoming("3EB0".into(), "1@s.whatsapp.net".into(), "oi".into());
-    let media = MediaContent {
-        media_type: MediaType::Image,
-        data: Arc::new(vec![0xab; 4096]),
-        cache_key: None,
-        mime_type: "image/jpeg".into(),
-        width: Some(1200),
-        height: Some(800),
-        caption: None,
-        file_name: None,
-        downloadable: None,
-        is_animated: false,
-        duration_secs: None,
-        data_is_preview: false,
-        waveform: None,
-    };
+    let media = MediaContent::image(Arc::new(vec![0xab; 4096]), "image/jpeg".into(), false)
+        .with_size(Some(1200), Some(800));
     message.media = Some(media.clone());
 
     let line = serde_json::to_string(&message).expect("serializes");

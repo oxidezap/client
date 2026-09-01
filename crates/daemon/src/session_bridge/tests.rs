@@ -6,28 +6,21 @@
 
 use std::sync::Arc;
 
-use oxidezap_core::{Chat, ChatMessage, UiEvent};
+use oxidezap_core::{Chat, ChatMessage, UiEvent, fixtures};
 use oxidezap_ipc::{ConnectionState, DaemonMessage};
 
 use super::translate::deadline_ms;
 use super::*;
 
 pub(super) fn message(id: &str, sender: &str, secs: i64, from_me: bool, read: bool) -> ChatMessage {
-    ChatMessage {
-        id: id.into(),
-        sender: sender.into(),
-        sender_name: None,
-        content: "hi".into(),
-        timestamp: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
-        is_from_me: from_me,
-        is_read: read,
-        media: None,
-        reactions: Default::default(),
-        status: Default::default(),
-        quoted: None,
-        revoked: false,
-        system: None,
-    }
+    let mut message = fixtures::message(id, sender, "hi");
+    // `secs` is the whole instant rather than an offset from [`fixtures::at`]:
+    // the read tracker is about ordering against timestamps its own tests
+    // build the same way, and small round numbers are what those read as.
+    message.timestamp = chrono::DateTime::from_timestamp(secs, 0).unwrap();
+    message.is_from_me = from_me;
+    message.is_read = read;
+    message
 }
 
 pub(super) fn received(chat_jid: &str, message: ChatMessage, sender_name: Option<&str>) -> UiEvent {
@@ -38,14 +31,10 @@ pub(super) fn received(chat_jid: &str, message: ChatMessage, sender_name: Option
     }
 }
 
-/// One chat as a store reload would present it.
+/// One chat as a store reload would present it — the shared fixture, under
+/// the name this module's callers already know it by.
 pub(super) fn stored_chat(jid: &str, unread: u32, messages: Vec<ChatMessage>) -> Chat {
-    let mut chat = Chat::new(jid.to_string());
-    chat.unread_count = unread;
-    chat.last_message = messages.last().map(|m| m.content.clone());
-    chat.last_message_time = messages.last().map(|m| m.timestamp);
-    chat.messages = messages;
-    chat
+    fixtures::chat_with(jid, unread, messages)
 }
 
 pub(super) fn loaded(chats: Vec<Chat>) -> UiEvent {

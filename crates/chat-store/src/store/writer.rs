@@ -186,7 +186,7 @@ fn apply_writer_msg(
             text,
             timestamp_ms,
         } => {
-            let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
+            let chat_str = route_chat(conn, device_id, chat.to_string(), cs)?;
             let stored = insert_message(
                 conn,
                 device_id,
@@ -246,7 +246,7 @@ fn apply_writer_msg(
             text,
             timestamp_ms,
         } => {
-            let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
+            let chat_str = route_chat(conn, device_id, chat.to_string(), cs)?;
             if !local_target_collides_with_peer(conn, device_id, &chat_str, target_id)?
                 && apply_edit(
                     conn,
@@ -271,7 +271,7 @@ fn apply_writer_msg(
             target_id,
             timestamp_ms,
         } => {
-            let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
+            let chat_str = route_chat(conn, device_id, chat.to_string(), cs)?;
             if !local_target_collides_with_peer(conn, device_id, &chat_str, target_id)?
                 && apply_revoke(
                     conn,
@@ -296,7 +296,7 @@ fn apply_writer_msg(
             emoji,
             timestamp_ms,
         } => {
-            let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
+            let chat_str = route_chat(conn, device_id, chat.to_string(), cs)?;
             if local_reaction_target_matches(
                 conn,
                 device_id,
@@ -325,7 +325,7 @@ fn apply_writer_msg(
             // public and its doc names no restriction: a user chat given here
             // unrouted would write under the key half the reads do not look
             // at.
-            let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
+            let chat_str = route_chat(conn, device_id, chat.to_string(), cs)?;
             // Ours carry the peer's read tick in this column, so a local view
             // must not set it; and `< READ` is what keeps a second viewing —
             // or a played voice status — from moving anything backwards.
@@ -358,6 +358,11 @@ fn apply_writer_msg(
             // nothing matched, nothing was invalidated, and the message sat
             // PENDING for the rest of the session — a spinner with no error
             // state and no retry.
+            //
+            // Routed by hand rather than through `route_chat`, which claims
+            // the wire key up front: here the claim is owed only if a row
+            // actually moved, and the common case is a failure that lost the
+            // race to a positive ack and writes nothing at all.
             let wire = chat.to_string();
             let chat_str = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
             // Same guard as the nack path: a row past PENDING already got its
@@ -385,13 +390,24 @@ fn apply_writer_msg(
     }
 }
 
-fn route_writer_chat(
+/// Route a wire chat key to the key the thread's rows actually live under, and
+/// claim the wire key as well when the two differ.
+///
+/// The claim is the half that is easy to forget: a window watching the peer
+/// under the identity that addressed the traffic answers a `Messages`
+/// invalidation for THAT key, so writing under the routed key and naming only
+/// it leaves that window showing the thread as it was.
+///
+/// The claim is unconditional, which is the right trade for a path that
+/// materializes a row — it has something to say by the time it gets here. A
+/// path whose common case writes nothing wants the claim held back until it
+/// does, and routes by hand instead; `SendFailed` is that case and says so.
+pub(super) fn route_chat(
     conn: &mut SqliteConnection,
     device_id: i32,
-    chat: &Jid,
+    wire: String,
     cs: &mut ChangeSet,
 ) -> QueryResult<String> {
-    let wire = chat.to_string();
     let routed = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
     if routed != wire {
         cs.message_chats.insert(wire);

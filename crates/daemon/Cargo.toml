@@ -110,6 +110,8 @@ wasm-bindgen-test = "0.3"
 
 [dev-dependencies]
 chrono = { workspace = true, features = ["std", "clock"] }
+# The same synthetic chats and messages every crate above core tests against.
+oxidezap-core = { workspace = true, features = ["fixtures"] }
 # `start_paused`: the handshake deadline is ten seconds of wall clock, and a
 # test that actually waited it out would be ten seconds of CI.
 tokio = { workspace = true, features = ["test-util"] }

@@ -1510,21 +1510,11 @@ mod tests {
     /// arrives naming its media rather than holding it.
     #[test]
     fn media_bytes_do_not_survive_a_round_trip_through_a_frame() {
-        let media = MediaContent {
-            media_type: oxidezap_core::MediaType::Image,
-            data: Arc::new(vec![7; 4096]),
-            cache_key: Some("m-abc".into()),
-            mime_type: "image/jpeg".into(),
-            width: None,
-            height: None,
-            caption: None,
-            file_name: None,
-            downloadable: None,
-            is_animated: false,
-            duration_secs: None,
-            data_is_preview: false,
-            waveform: None,
-        };
+        let mut media = MediaContent::image(Arc::new(vec![7; 4096]), "image/jpeg".into(), false);
+        // Set here rather than by a constructor: the key is the daemon's to
+        // write as the message leaves the process holding the bytes, which is
+        // exactly the moment this test is about.
+        media.cache_key = Some("m-abc".into());
         let small = serde_json::to_string(&media).unwrap();
         let bigger = serde_json::to_string(&MediaContent {
             data: Arc::new(vec![7; 1024 * 1024]),

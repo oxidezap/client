@@ -38,7 +38,7 @@ pub fn render_settings_view(
     app: &mut WhatsAppApp,
     window: &mut Window,
     cx: &mut Context<WhatsAppApp>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     // Before anything reads a plugin's tree, exactly as the conversation
     // does it. Settings is where a plugin's own panel lives, so leaving this
     // to the connected view alone meant a text field a plugin published there

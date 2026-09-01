@@ -64,6 +64,8 @@ rustix = { workspace = true }
 # checked in would be a binary nobody reviews, and building one in CI would
 # mean a wasm toolchain there for the sake of six tests.
 chrono = { workspace = true, features = ["std", "clock"] }
+# The same synthetic chats and messages every crate above core tests against.
+oxidezap-core = { workspace = true, features = ["fixtures"] }
 wat = "1.0"
 
 [lints]
