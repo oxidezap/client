@@ -48,27 +48,91 @@ pub struct EncodedNote {
     pub duration_secs: u32,
 }
 
+/// A capture turned into everything a voice note is made of, short of the
+/// codec.
+///
+/// The pure-Rust half of preparing one: resampled to [`TARGET_SAMPLE_RATE`],
+/// which is the only rate the codec is asked for, and measured for the
+/// envelope that travels beside the bytes. It names no platform and it is the
+/// expensive half — a 63-tap filter over as much as ten minutes of audio —
+/// which is exactly why it is a step of its own: both backends produce one,
+/// and either may produce it on a worker.
+///
+/// The envelope is measured here rather than by each backend so that one
+/// recording draws the same bars whoever encoded it, and it is measured
+/// *after* the resample, on the samples a recipient will actually hear.
+pub struct PreparedNote {
+    /// Mono, at [`TARGET_SAMPLE_RATE`].
+    pub samples: Vec<f32>,
+    /// The envelope, in [`crate::WAVEFORM_SAMPLES`] buckets.
+    pub waveform: Vec<u8>,
+    /// How long the capture ran, in whole seconds. Carried through from the
+    /// capture rather than re-derived here: these samples are at the codec's
+    /// rate rather than the microphone's, and a length is a count of samples
+    /// only against the rate that produced them.
+    pub duration_secs: u32,
+}
+
 /// What stopping a recording produced.
 ///
-/// Two shapes because the platforms answer at different times. A desktop hands
-/// back samples and the encode is ordinary work on a background thread; a
-/// browser encodes *as it captures*, through an encoder whose last packets
-/// arrive after the microphone has closed, so the answer is a channel rather
-/// than a value.
+/// Two shapes because the codec belongs to a different place on each
+/// platform. A desktop's is ordinary Rust, so preparing and encoding are one
+/// piece of work for whichever worker the caller has. A browser's is a
+/// `web_sys` object that cannot leave the window, and its last packets arrive
+/// after the microphone has closed, so the answer there is a pair of channels
+/// rather than a value.
 ///
-/// The caller awaits one and encodes the other, which is the whole difference
-/// and is why this is an enum rather than a future on both: making the desktop
-/// asynchronous to match would move a real encode off the background pool for
-/// nothing.
+/// What the two share is [`RecordedAudio::prepare`], which is why the second
+/// hands the capture back rather than swallowing it: the pure half is the
+/// same work on both, and on both it belongs off the window.
 pub enum Recording {
     /// Samples this build encodes itself.
     Samples(RecordedAudio),
-    /// A note the platform is still flushing.
-    Pending(futures_channel::oneshot::Receiver<Result<EncodedNote, RecorderError>>),
+    /// A capture whose codec belongs to the thread that took it.
+    ///
+    /// The caller prepares `captured` wherever it has a worker, sends the
+    /// result on `prepared`, and reads the encoded note from `note`.
+    /// Dropping `prepared` abandons the recording: nothing is encoded and
+    /// nothing is answered, which is what a cancel during the encode is.
+    Pending {
+        /// Everything captured, at the rate it was captured at.
+        captured: RecordedAudio,
+        /// Where the prepared note goes.
+        prepared: futures_channel::oneshot::Sender<PreparedNote>,
+        /// Where the encoded one comes back.
+        note: futures_channel::oneshot::Receiver<Result<EncodedNote, RecorderError>>,
+    },
 }
 
 impl RecordedAudio {
+    /// Resample to what the codec takes, and measure the envelope.
+    ///
+    /// Every platform's route to a voice note goes through this, so the two
+    /// cannot drift on what a note is made of — which they had, the desktop
+    /// measuring its envelope from the raw capture and the browser from the
+    /// resampled one.
+    #[must_use]
+    pub fn prepare(&self) -> PreparedNote {
+        let samples = self.resample_to_16khz();
+        let waveform = crate::waveform::generate_waveform(&samples);
+        PreparedNote {
+            samples,
+            waveform,
+            duration_secs: self.duration_secs,
+        }
+    }
+
     pub fn resample_to_16khz(&self) -> Vec<f32> {
+        // A capture that never opened its device has no rate, and zero is a
+        // whole multiple of the target — so this fell into the decimation
+        // branch below and divided by a step of zero. It is the shape a
+        // refused microphone takes on the web, where a panic is the end of
+        // the tab rather than of a thread, and it reaches here because the
+        // refusal is read *after* the capture has been prepared.
+        if self.samples.is_empty() || self.sample_rate == 0 {
+            return Vec::new();
+        }
+
         if self.sample_rate == TARGET_SAMPLE_RATE {
             return self.samples.clone();
         }
@@ -812,3 +876,83 @@ impl std::fmt::Display for RecorderError {
 }
 
 impl std::error::Error for RecorderError {}
+
+/// The half of a recording that has no platform in it, and so is testable
+/// wherever `cargo test` runs. The capture around it is not: it opens a
+/// microphone.
+#[cfg(test)]
+mod prepare_tests {
+    use super::{RecordedAudio, TARGET_SAMPLE_RATE};
+    use crate::waveform::WAVEFORM_SAMPLES;
+
+    /// A tone at `freq`, one second of it, at `rate`.
+    fn tone(freq: f32, rate: u32) -> RecordedAudio {
+        RecordedAudio {
+            samples: (0..rate as usize)
+                .map(|i| (std::f32::consts::TAU * freq * i as f32 / rate as f32).sin())
+                .collect(),
+            sample_rate: rate,
+            duration_secs: 1,
+        }
+    }
+
+    /// What the codec is handed is at the codec's rate, whatever the
+    /// microphone opened at. Both backends encode from this, so a rate that
+    /// slipped through would be a note played at the wrong speed on one
+    /// platform and not the other.
+    #[test]
+    fn a_prepared_note_is_at_the_rate_the_codec_takes() {
+        for rate in [48_000, 44_100, 16_000] {
+            let prepared = tone(440.0, rate).prepare();
+            let seconds = prepared.samples.len() as f32 / TARGET_SAMPLE_RATE as f32;
+            assert!(
+                (seconds - 1.0).abs() < 0.01,
+                "a second captured at {rate} Hz came out as {seconds}s"
+            );
+        }
+    }
+
+    /// The envelope has one value per bucket however short the capture is,
+    /// and it is measured from the resampled samples rather than the raw
+    /// ones — which is the difference the two backends used to disagree on,
+    /// each measuring its own and drawing different bars for one recording.
+    #[test]
+    fn the_envelope_is_measured_from_what_the_recipient_hears() {
+        let captured = tone(440.0, 48_000);
+        let prepared = captured.prepare();
+        assert_eq!(prepared.waveform.len(), WAVEFORM_SAMPLES);
+        assert_eq!(
+            prepared.waveform,
+            crate::waveform::generate_waveform(&captured.resample_to_16khz())
+        );
+    }
+
+    /// The length is carried rather than re-derived. These samples are at the
+    /// codec's rate, so dividing them by the microphone's would report a
+    /// three-second note as one second on any 48 kHz device.
+    #[test]
+    fn the_length_survives_the_resample() {
+        let captured = RecordedAudio {
+            samples: vec![0.25; 48_000 * 3],
+            sample_rate: 48_000,
+            duration_secs: 3,
+        };
+        assert_eq!(captured.prepare().duration_secs, 3);
+    }
+
+    /// A capture that produced nothing prepares into nothing rather than
+    /// panicking on a division or an empty slice: it is the shape a refused
+    /// microphone takes, and both backends run it before they read the
+    /// reason for the refusal.
+    #[test]
+    fn an_empty_capture_prepares_into_an_empty_note() {
+        let prepared = RecordedAudio {
+            samples: Vec::new(),
+            sample_rate: 0,
+            duration_secs: 0,
+        }
+        .prepare();
+        assert!(prepared.samples.is_empty());
+        assert_eq!(prepared.waveform.len(), WAVEFORM_SAMPLES);
+    }
+}

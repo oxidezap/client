@@ -1138,6 +1138,27 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   it to whichever chat was on screen by then, or quoted whichever message had
   been picked since. `RecordingTarget` is that pair, and the draft is cleared
   at send only if it is still the one the note was bound to.
+- **A capture the microphone refused still goes through the resampler.**
+  `stop` answers with what it has, and what a denied `getUserMedia` leaves is
+  no samples and no rate — the rate is learned when the device opens. The
+  reason for the refusal is read *after* the capture has been prepared, so
+  that a caller which abandoned the recording is told nothing at all, and
+  zero is a whole multiple of 16 kHz: the preparation took the decimation
+  branch and divided by a step of zero. On a page a panic is the end of the
+  tab, not of a thread, so `resample_to_16khz` answers an empty capture with
+  an empty one before it looks at the rate.
+- **Preparing a note and encoding it are two steps, and only one of them may
+  leave the window.** Resampling to 16 kHz and measuring the envelope is pure
+  Rust on both platforms and the expensive half — a 63-tap filter over as
+  much as ten minutes of audio — so `RecordedAudio::prepare` is a step of its
+  own and `app/recording.rs` hands it to the background executor on both. The
+  codec is what differs: libopus follows the preparation onto the same
+  worker, while `AudioEncoder` belongs to the document that made it and is
+  awaited on the window. `Recording::Pending` is that seam — the capture out,
+  the prepared note in, the encoded note back — which is why the front end
+  reaches one `finish` with no `cfg` in it. Splitting the *resampler* instead
+  is the wrong half to reach for: a 63-tap filter carries state across any
+  boundary it is cut at, so chunking it changes the audio.
 - **An overlay that names a row is reconciled where rows change.** The media
   viewer holds a message id and resolves it every frame, so a revoke behind
   it left a modal that drew nothing and still swallowed the Escape meant to

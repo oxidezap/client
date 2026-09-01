@@ -152,14 +152,12 @@ impl InputAreaView {
             touch_target: None,
             typing_state: TypingState::default(),
             typing_monitor_task: None,
-            // Both halves of the journey, because either one failing makes
-            // the control a promise it cannot keep: the browser has to have
-            // an encoder, and the session has to have somewhere to send what
-            // it encodes. A page holding its own account has the first and
-            // not the second, and recording a whole voice note to lose it at
-            // the send is the worse of the two ways to find that out.
-            can_record: oxidezap_audio::can_record()
-                && crate::platform::media_send_unavailable().is_none(),
+            // Whether the browser has an Opus encoder, which is the one
+            // thing that can make this control a promise it cannot keep.
+            // Where it does, every arrangement a page can be in has somewhere
+            // to send what it encodes: a daemon over the bridge, the tab
+            // holding the account, or the page's own session.
+            can_record: oxidezap_audio::can_record(),
         }
     }
 
@@ -478,11 +476,7 @@ impl InputAreaView {
                     .tooltip(if can_record {
                         "Hold to record a voice message"
                     } else {
-                        // Which half is missing, since the two have different
-                        // answers: one is the browser and the other is a
-                        // daemon this page could be pointed at.
-                        crate::platform::media_send_unavailable()
-                            .unwrap_or("Voice messages cannot be recorded in this browser")
+                        "Voice messages cannot be recorded in this browser"
                     })
                     .w(control)
                     .h(control)
