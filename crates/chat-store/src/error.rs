@@ -19,6 +19,16 @@ pub enum ChatStoreError {
 
 pub type Result<T> = std::result::Result<T, ChatStoreError>;
 
-pub(crate) fn db_err(e: diesel::result::Error) -> StoreError {
+/// A diesel error as the storage error this crate reports.
+///
+/// Public rather than `pub(crate)` because the integration tests are a
+/// separate crate and issue their own statements: `map_err(db_err)` was
+/// written out as its expansion thirteen times over there, which is one
+/// spelling of the boxed variant per site to keep in step.
+///
+/// Hidden from the docs: it is reachable rather than offered, and the surface
+/// an embedder is meant to read is `ChatStoreError`.
+#[doc(hidden)]
+pub fn db_err(e: diesel::result::Error) -> StoreError {
     StoreError::Database(Box::new(e))
 }

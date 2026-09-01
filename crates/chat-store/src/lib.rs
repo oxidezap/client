@@ -39,7 +39,7 @@ mod spawn;
 mod store;
 pub mod types;
 
-pub use error::{ChatStoreError, Result};
+pub use error::{ChatStoreError, Result, db_err};
 pub use materialize::is_control_only;
 pub use store::ChatStore;
 pub use types::{

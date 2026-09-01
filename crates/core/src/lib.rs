@@ -13,6 +13,10 @@
 //! - `UiEvent`: Events for UI updates
 
 pub mod base64;
+/// Synthetic chats and messages the tests above this crate share. Off unless
+/// asked for, so nothing an embedder links carries it.
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
 
 mod app_state;
 mod call;

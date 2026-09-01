@@ -8,6 +8,13 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Synthetic chats and messages for the tests of the crates above this one.
+# Additive and off by default: it adds a module and changes no existing type,
+# which is what keeps this crate publishable to its embedders.
+fixtures = []
+
 [dependencies]
 async-trait = { workspace = true }
 # Only for the call-state transitions, which refuse a second offer and say so.
