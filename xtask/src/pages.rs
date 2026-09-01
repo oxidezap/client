@@ -59,6 +59,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::check::{Api, Precondition, Wanted};
+use crate::deploy;
 use crate::util::{Result, Run, TempDir, copy_dir_contents, env_or, need_env, remove};
 use crate::{err, note, say};
 
@@ -82,6 +83,16 @@ pub struct Job {
     /// Which publish this is, in the order they were started.
     pub ordinal: u64,
     pub check: Precondition,
+    /// Whether to see the push through to what Pages actually serves.
+    ///
+    /// Off by default, and on in the workflow. A write to the branch is not a
+    /// deployment: GitHub's own `pages build and deployment` run is, and it
+    /// refuses to create one while another is in flight — which is the
+    /// ordinary case here, since the lease is what puts two writers' pushes
+    /// seconds apart. `deploy` is the module, and its header is the whole
+    /// story. A publish driven by hand against a repository on disk has no
+    /// Pages behind it and asks for none.
+    pub settle: bool,
     /// The tree to publish. Only read by `Publish`.
     pub bundle: PathBuf,
 }
@@ -121,10 +132,20 @@ pub fn run(job: &Job, remote: &Remote) -> Result<()> {
 
     // Read once: a missing variable should be one message before the first
     // network call, not a surprise on attempt four.
-    let api = match job.check {
-        Precondition::Always => None,
+    let api = match (job.check, job.settle) {
+        (Precondition::Always, false) => None,
         _ => Some(Api::from_env()?),
     };
+
+    // Before the first attempt only, and not a guard: see `wait_for_quiet`.
+    // A push that lands while a deployment is in flight costs a red run of a
+    // workflow nobody here wrote, and waiting out the one in front of us is
+    // how most of those stop happening.
+    if job.settle
+        && let Some(api) = &api
+    {
+        deploy::wait_for_quiet(api);
+    }
 
     for attempt in 1..=ATTEMPTS {
         if let Some(api) = &api
@@ -136,7 +157,18 @@ pub fn run(job: &Job, remote: &Remote) -> Result<()> {
 
         let work = TempDir::new("oxidezap-pages")?;
         match attempt_once(job, work.path(), remote, &target, &slug)? {
-            Outcome::Done => return Ok(()),
+            Outcome::Nothing => return Ok(()),
+            Outcome::Pushed(commit) => {
+                // The branch is right; whether Pages serves it is a separate
+                // question, and one this run is the last thing in a position
+                // to ask. A preview's take-down happens once.
+                if let Some(api) = &api
+                    && job.settle
+                {
+                    deploy::settle(api, &remote.url, BRANCH, &commit)?;
+                }
+                return Ok(());
+            }
             Outcome::LostTheLease => {
                 note!(
                     "{BRANCH} moved while we were building the tree; re-reading (attempt {attempt})"
@@ -151,7 +183,10 @@ pub fn run(job: &Job, remote: &Remote) -> Result<()> {
 }
 
 enum Outcome {
-    Done,
+    /// Landed, as this commit. What Pages serves is asked about separately.
+    Pushed(String),
+    /// Nothing to write: already up to date, or a newer run owns this target.
+    Nothing,
     LostTheLease,
 }
 
@@ -211,7 +246,7 @@ fn attempt_once(
     let held = read_claim(&work.join(".publish").join(slug));
     if held > job.ordinal {
         say!("a newer publish ({held}) already holds {target}; standing down");
-        return Ok(Outcome::Done);
+        return Ok(Outcome::Nothing);
     }
 
     let message = match job.action {
@@ -250,7 +285,7 @@ fn attempt_once(
         .success();
     if !dirty && has_head {
         say!("nothing changed");
-        return Ok(Outcome::Done);
+        return Ok(Outcome::Nothing);
     }
 
     // One commit, no parent: see the note at the top.
@@ -280,7 +315,7 @@ fn attempt_once(
             Action::Remove => say!("removed {target} from {BRANCH}"),
             Action::Publish => say!("published {target} to {BRANCH}"),
         }
-        return Ok(Outcome::Done);
+        return Ok(Outcome::Pushed(git(&["rev-parse", "HEAD"]).read()?));
     }
     Ok(Outcome::LostTheLease)
 }
@@ -496,6 +531,7 @@ mod tests {
             target: target.to_string(),
             ordinal,
             check: Precondition::Always,
+            settle: false,
             bundle: bundle.clone(),
         };
 
@@ -539,6 +575,7 @@ mod tests {
             target: target.to_string(),
             ordinal,
             check: Precondition::Always,
+            settle: false,
             bundle: bundle.clone(),
         };
         super::run(&remove("pr/12", 5), &remote)?;
