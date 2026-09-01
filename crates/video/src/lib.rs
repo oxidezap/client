@@ -28,8 +28,13 @@ mod encoder;
 #[cfg(target_family = "wasm")]
 mod web;
 
+// The same four names on both. `camera::open` used to be a fifth, exported
+// only here: the blocking open the wrapper below wraps, with no web twin and
+// no caller outside this file, so a crate that offers `open_camera` on both
+// platforms also offered a second way in on one of them. It stays inside
+// `camera`, where the wrapper reaches it.
 #[cfg(not(target_family = "wasm"))]
-pub use camera::{CameraControl, CameraStream, is_available, open};
+pub use camera::{CameraControl, CameraStream, is_available};
 #[cfg(target_family = "wasm")]
 pub use web::{CameraControl, CameraStream, is_available, open_camera};
 
@@ -45,7 +50,7 @@ pub use web::{CameraControl, CameraStream, is_available, open_camera};
 /// If no camera can be opened at `quality`.
 #[cfg(not(target_family = "wasm"))]
 pub async fn open_camera(quality: VideoQuality) -> anyhow::Result<CameraStream> {
-    tokio::task::spawn_blocking(move || open(quality))
+    tokio::task::spawn_blocking(move || camera::open(quality))
         .await
         .map_err(|e| anyhow::anyhow!("camera task failed: {e}"))?
 }

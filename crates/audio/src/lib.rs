@@ -86,8 +86,15 @@ pub use player::PlayerError;
 pub use recorder::{EncodedNote, RecordedAudio, RecorderError, Recording, TARGET_SAMPLE_RATE};
 pub use waveform::{WAVEFORM_SAMPLES, generate_waveform};
 
+// The same three names on both, which is the claim the header makes. Kept
+// honest by being written as one list per platform rather than by trusting
+// the sentence: `spawn_mic` and `spawn_speaker` used to be here too, with no
+// caller outside `call_device` and no web twin, so the crate promised one API
+// and exported two. They are the halves `open_call_audio` opens together --
+// a call needs both or neither -- and they stay inside the backend that has
+// them.
 #[cfg(not(target_family = "wasm"))]
-pub use call_device::{open_call_audio, spawn_mic, spawn_speaker};
+pub use call_device::open_call_audio;
 #[cfg(not(target_family = "wasm"))]
 pub use player::AudioPlayer;
 #[cfg(not(target_family = "wasm"))]
