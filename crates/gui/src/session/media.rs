@@ -127,16 +127,86 @@ impl MediaCache for Directory {
     }
 }
 
-/// What the bridge has already served, held until the frame that names it has
+/// What a page has already fetched, held until the frame that names it has
 /// been applied.
 ///
 /// Filled by the reader before it hands a frame on, and emptied by the same
 /// pass: nothing here outlives the frame it was fetched for, because the
 /// decoded image cache above is what actually remembers media.
+///
+/// Both page transports need exactly this map and fill it exactly this way —
+/// the errand differs (an HTTP request to the bridge, a message to the tab
+/// holding the account) and what it lands in does not. What they do *not*
+/// share is staging, which is why there are still two caches around this one
+/// map rather than one cache: over HTTP a `DELETE` can overtake its own
+/// `PUT`, and on a channel that preserves its own order it cannot.
+#[cfg(target_family = "wasm")]
+#[derive(Default)]
+pub struct Held {
+    bytes: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
+}
+
+#[cfg(target_family = "wasm")]
+impl Held {
+    /// Hold bytes for the frame about to be applied.
+    pub fn put(&self, key: String, bytes: Vec<u8>) {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Arc::new(bytes));
+    }
+
+    /// Forget whatever the last frame did not use.
+    pub fn clear(&self) {
+        self.bytes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Forget one key, whether or not the frame is done with it.
+    pub fn forget(&self, key: &str) {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    /// Read without consuming.
+    ///
+    /// One frame can name the same key on more than one message — media is
+    /// content-addressed, so a photo forwarded twice is one payload — and
+    /// taking it would leave every message after the first drawing a download
+    /// offer for bytes that are already here. [`clear`](Self::clear) is what
+    /// bounds the map, once per frame.
+    pub fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(Arc::clone)
+            .ok_or_else(|| format!("media {key} was not fetched with its frame"))
+    }
+
+    /// Moved out, not copied.
+    ///
+    /// This map is the page's only copy, and a document can be hundreds of
+    /// megabytes: cloning it would hold two in a linear memory that has a
+    /// ceiling, for as long as it takes the next frame to clear the map.
+    /// Nothing else is going to ask for this key — a download answers one
+    /// request — so there is nothing to leave behind.
+    pub fn read_once(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key)
+            .ok_or_else(|| format!("media {key} was not fetched with its frame"))
+    }
+}
+
+/// What the bridge has already served, and the uploads going the other way.
 #[cfg(target_family = "wasm")]
 #[derive(Default)]
 pub struct Fetched {
-    bytes: std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
+    /// The frame's own media, fetched over HTTP before it is applied.
+    pub held: Held,
     /// Keys whose upload is in flight, and whether the send was abandoned
     /// while it was.
     ///
@@ -153,52 +223,13 @@ pub struct Fetched {
 }
 
 #[cfg(target_family = "wasm")]
-impl Fetched {
-    /// Hold bytes for the frame about to be applied.
-    pub fn put(&self, key: String, bytes: Vec<u8>) {
-        self.bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, Arc::new(bytes));
-    }
-
-    /// Forget whatever the last frame did not use.
-    pub fn clear(&self) {
-        self.bytes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-}
-
-#[cfg(target_family = "wasm")]
 impl MediaCache for Fetched {
-    /// Read without consuming.
-    ///
-    /// One frame can name the same key on more than one message — media is
-    /// content-addressed, so a photo forwarded twice is one payload — and
-    /// taking it would leave every message after the first drawing a download
-    /// offer for bytes that are already here. `clear` is what bounds the map,
-    /// once per frame.
     fn read(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
-        self.bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .map(Arc::clone)
-            .ok_or_else(|| format!("media {key} was not fetched with its frame"))
+        self.held.read(key)
     }
 
-    /// Moved out, not copied.
-    ///
-    /// This map is the page's only copy, and a document can be hundreds of
-    /// megabytes: cloning it would hold two in a linear memory that has a
-    /// ceiling, for as long as it takes the next frame to clear the map.
-    /// Nothing else is going to ask for this key — a download answers one
-    /// request — so there is nothing to leave behind.
     fn read_once(&self, key: &str) -> Result<Arc<Vec<u8>>, String> {
-        self.bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key)
-            .ok_or_else(|| format!("media {key} was not fetched with its frame"))
+        self.held.read_once(key)
     }
 
     /// Refused, because staging from a page is not synchronous.
@@ -261,10 +292,7 @@ impl MediaCache for Fetched {
     /// staged uploads from its cache sweep, so a send abandoned after the
     /// upload landed would leave that file until the account is wiped.
     fn discard(&self, key: &str) {
-        self.bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
+        self.held.forget(key);
         if !oxidezap_ipc::is_staged_key(key) {
             return;
         }
