@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use log::{info, warn};
-use oxidezap_core::{DownloadableMedia, MediaContent, MediaType};
+use oxidezap_core::{DownloadableMedia, MediaContent};
 use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore::download::Downloadable;
 use whatsapp_rust::waproto::whatsapp as wa;
@@ -150,31 +150,6 @@ pub(super) fn still_preview(
     }
 }
 
-/// A `MediaContent` of this kind with nothing in it yet.
-///
-/// Every branch below fills in the four or five fields its kind actually has
-/// and takes the rest from here, so a field added to the type arrives with one
-/// answer for all five rather than five chances to spell it differently. There
-/// is no `Default` to lean on: the kind is never a default, and `cache_key` is
-/// the daemon's to set as it hands the message to another process.
-fn blank(media_type: MediaType) -> MediaContent {
-    MediaContent {
-        media_type,
-        data: Arc::new(Vec::new()),
-        cache_key: None,
-        mime_type: String::new(),
-        width: None,
-        height: None,
-        caption: None,
-        file_name: None,
-        downloadable: None,
-        is_animated: false,
-        duration_secs: None,
-        data_is_preview: false,
-        waveform: None,
-    }
-}
-
 /// The media on a message, with `fetched` holding the full bytes when
 /// somebody already had a reason to go and get them.
 ///
@@ -212,20 +187,18 @@ pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<Me
         if still.data.is_empty() && downloadable.is_none() {
             return None;
         }
-        return Some(MediaContent {
-            data: Arc::new(still.data),
-            mime_type: still.mime,
-            width: sticker.width,
-            height: sticker.height,
-            downloadable,
-            // What the sticker *is*, not what the stand-in bytes are: the
-            // preview is a still, but the flag describes the file that
-            // replaces it, and `data_is_preview` beside it already says which
-            // of the two is in hand.
-            is_animated: sticker.is_animated.unwrap_or(false),
-            data_is_preview: still.is_preview,
-            ..blank(MediaType::Sticker)
-        });
+        // `is_animated` is what the sticker *is*, not what the stand-in bytes
+        // are; the constructor's own doc is where that reasoning lives.
+        return Some(
+            MediaContent::sticker(
+                Arc::new(still.data),
+                still.mime,
+                still.is_preview,
+                sticker.is_animated.unwrap_or(false),
+            )
+            .with_size(sticker.width, sticker.height)
+            .with_download(downloadable),
+        );
     }
 
     if let Some(image) = msg.image_message.as_option() {
@@ -253,16 +226,12 @@ pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<Me
         if still.data.is_empty() && downloadable.is_none() {
             return None;
         }
-        return Some(MediaContent {
-            data: Arc::new(still.data),
-            mime_type: still.mime,
-            width: image.width,
-            height: image.height,
-            caption: image.caption.clone(),
-            downloadable,
-            data_is_preview: still.is_preview,
-            ..blank(MediaType::Image)
-        });
+        return Some(
+            MediaContent::image(Arc::new(still.data), still.mime, still.is_preview)
+                .with_size(image.width, image.height)
+                .with_caption(image.caption.clone())
+                .with_download(downloadable),
+        );
     }
 
     // PTVs (round video notes) are the same proto type in a different field
@@ -282,20 +251,14 @@ pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<Me
             return None;
         }
         // A video's `data` is never the video: these are the JPEG bytes of its
-        // poster frame, which is what the mime type beside them already says.
-        // Calling them the full media wrote a thumbnail under the full-video
-        // cache key, and every later read of that key handed back a still.
-        return Some(MediaContent {
-            data_is_preview: !thumbnail.is_empty(),
-            data: Arc::new(thumbnail),
-            mime_type: "image/jpeg".to_string(),
-            width: video.width,
-            height: video.height,
-            caption: video.caption.clone(),
-            downloadable,
-            duration_secs: video.seconds,
-            ..blank(MediaType::Video)
-        });
+        // poster frame, which is why the constructor takes it under that name
+        // and settles the mime type and the preview flag itself.
+        return Some(
+            MediaContent::video(Arc::new(thumbnail), video.seconds)
+                .with_size(video.width, video.height)
+                .with_caption(video.caption.clone())
+                .with_download(downloadable),
+        );
     }
 
     // Audio is lazy either way: the bytes are fetched when somebody presses
@@ -306,22 +269,24 @@ pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<Me
             .clone()
             .unwrap_or_else(|| "audio/ogg; codecs=opus".to_string());
         let downloadable = downloadable_of(audio, &mime, audio.seconds)?;
-        return Some(MediaContent {
-            mime_type: mime,
-            downloadable: Some(downloadable),
-            duration_secs: audio.seconds,
-            // Drawn before a byte of audio is fetched, which is the point: the
-            // shape of a voice note is most useful while deciding whether to
-            // play it. Dropping it on the hydrated side once made every voice
-            // note flatten to a placeholder shape the moment history was
-            // reloaded — which is most of the time.
-            waveform: audio
-                .waveform
-                .as_deref()
-                .filter(|w| !w.is_empty())
-                .map(|w| Arc::new(w.to_vec())),
-            ..blank(MediaType::Audio)
-        });
+        // The waveform is drawn before a byte of audio is fetched, which is the
+        // point: the shape of a voice note is most useful while deciding
+        // whether to play it. Dropping it on the hydrated side once made every
+        // voice note flatten to a placeholder shape the moment history was
+        // reloaded — which is most of the time.
+        return Some(
+            MediaContent::audio(
+                Arc::new(Vec::new()),
+                mime,
+                audio.seconds,
+                audio
+                    .waveform
+                    .as_deref()
+                    .filter(|w| !w.is_empty())
+                    .map(|w| Arc::new(w.to_vec())),
+            )
+            .with_download(Some(downloadable)),
+        );
     }
 
     // A document is metadata all the way down — never fetched until somebody
@@ -330,13 +295,11 @@ pub(super) fn media_of(msg: &wa::Message, fetched: Option<Vec<u8>>) -> Option<Me
     if let Some(doc) = msg.document_message.as_option() {
         let mime = doc.mimetype.clone().unwrap_or_default();
         let downloadable = downloadable_of(doc, &mime, None);
-        return Some(MediaContent {
-            mime_type: mime,
-            caption: doc.caption.clone(),
-            file_name: doc.file_name.clone(),
-            downloadable,
-            ..blank(MediaType::Document)
-        });
+        return Some(
+            MediaContent::document(mime, doc.file_name.clone())
+                .with_caption(doc.caption.clone())
+                .with_download(downloadable),
+        );
     }
 
     None
@@ -377,6 +340,7 @@ pub(super) async fn media_now(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxidezap_core::MediaType;
     use whatsapp_rust::buffa::MessageField;
 
     /// Enough of a downloadable to build one: the three fields

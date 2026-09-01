@@ -125,27 +125,21 @@ mod tests {
     }
 
     fn image(preview: bool, downloaded: bool) -> MediaContent {
-        MediaContent {
-            media_type: MediaType::Image,
-            data: std::sync::Arc::new(if downloaded {
+        MediaContent::image(
+            std::sync::Arc::new(if downloaded {
                 vec![1, 2, 3]
             } else {
                 Vec::new()
             }),
-            cache_key: None,
-            mime_type: "image/jpeg".to_string(),
-            width: Some(100),
-            height: Some(100),
-            caption: None,
-            file_name: None,
-            downloadable: None,
-            is_animated: false,
-            duration_secs: None,
-            data_is_preview: preview,
-            waveform: None,
-        }
+            "image/jpeg".to_string(),
+            preview,
+        )
+        .with_size(Some(100), Some(100))
     }
 
+    /// Deliberately not `MediaContent::video`, which would call its bytes a
+    /// poster and so a preview: what the gate above has to be shown refusing
+    /// is the *kind*, on media that passes every other test it applies.
     fn video() -> MediaContent {
         MediaContent {
             media_type: MediaType::Video,
