@@ -226,6 +226,34 @@ fn release_element(element: &web_sys::HtmlVideoElement) {
     element.remove();
 }
 
+/// Takes down a preview that was inserted but never handed to [`Held`].
+///
+/// [`attach`] puts the element in the document and starts it playing, and
+/// from there to [`Held`] there are three more fallible steps — the encoder
+/// the browser may not build, the configuration it may refuse, the timer that
+/// may not arm. Each of them returns through a `?` that used to leave the
+/// element where it was: rooted in the document, still wired to a stream, and
+/// kept alive by the browser because playback is a root. The `CameraGuard`
+/// above stops the tracks on those paths, which is the device; this is the
+/// node and the sink on it, and repeated failures accumulate one of each.
+struct ElementGuard(Option<web_sys::HtmlVideoElement>);
+
+impl ElementGuard {
+    /// Setup succeeded; [`Held`] takes it down from here.
+    fn release(mut self) -> web_sys::HtmlVideoElement {
+        self.0.take().expect("a guard is released once")
+    }
+}
+
+impl Drop for ElementGuard {
+    fn drop(&mut self) {
+        if let Some(element) = self.0.take() {
+            release_element(&element);
+            debug!("the camera's preview is taken down again: its setup did not finish");
+        }
+    }
+}
+
 /// Closes an encoder that was built but never handed to [`Held`].
 ///
 /// A `VideoEncoder` is asynchronous on both ends — a configuration it will not
@@ -371,7 +399,10 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
     // open, and every `?` below would otherwise leave it that way.
     let guard = CameraGuard(Some(open_device(&window, quality).await?));
     let stream = guard.0.as_ref().expect("just armed").clone();
-    let element = attach(&window, &stream).await?;
+    // Guarded from the moment it is in the document, for the same reason the
+    // camera is guarded from the moment it is open: see `ElementGuard`.
+    let preview = ElementGuard(Some(attach(&window, &stream).await?));
+    let element = preview.0.as_ref().expect("just armed").clone();
 
     let (tx, rx) = async_channel::bounded::<EncodedFrame>(FRAME_DEPTH);
     // Before the callback rather than after, so the chunk handler can ask for
@@ -510,7 +541,7 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
             // Setup finished: the guard hands the camera to `Held`, which is
             // what closes it from here.
             stream: guard.release(),
-            element,
+            element: preview.release(),
             encoder: guarded.release(),
             timer: Some(timer),
             _on_tick: on_tick,
@@ -650,9 +681,10 @@ async fn after(window: &web_sys::Window, ms: i32) {
 /// to hide it — a hidden element is entitled to stop rendering, and this one
 /// exists precisely to produce frames.
 ///
-/// Removed again by [`Held`], and by this function on the way out of a
-/// failure: six failed attempts in one call is six elements, and a leak of
-/// them is a leak of the streams they hold.
+/// Taken down again by [`Held`] at the end of the call, by [`ElementGuard`]
+/// if setup fails after this returns, and by this function on the way out of
+/// its own failure: six failed attempts in one call is six elements, and a
+/// leak of them is a leak of the streams they hold.
 async fn attach(
     window: &web_sys::Window,
     stream: &web_sys::MediaStream,
@@ -710,12 +742,18 @@ async fn attach(
     // came apart in production: `play()` was aborted for a lifecycle reason
     // while the element went on decoding perfectly well, and treating the
     // promise as the answer downgraded every video call to voice. So the
-    // element is asked directly — which is the same question the capture tick
-    // asks before every frame, and the same one that makes a real autoplay
-    // refusal still fatal, because a refused element is not ready and never
-    // becomes so.
+    // element is asked directly instead.
+    //
+    // `paused` first, and it is the load-bearing half. Readiness alone is not
+    // playback here: a `MediaStream` reaches `HAVE_CURRENT_DATA` with a
+    // nonzero `videoWidth` as soon as the element is wired to it, whether or
+    // not it was ever allowed to start — so an element genuinely refused by
+    // autoplay policy passes the readiness test and then hands the encoder
+    // one still picture for the length of the call. The two together are the
+    // question the capture tick asks plus the one it cannot: playing, and
+    // showing something.
     if let Some(reason) = refused {
-        if element.ready_state() < 2 || element.video_width() == 0 {
+        if element.paused() || element.ready_state() < 2 || element.video_width() == 0 {
             release_element(&element);
             bail!("the browser would not play the camera's own stream: {reason}");
         }
