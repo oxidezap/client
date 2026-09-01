@@ -105,6 +105,27 @@ const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// recovery request was lost is not left staring at a frozen frame.
 pub(crate) const KEYFRAME_SECONDS: u32 = 3;
 
+/// The shortest gap between two *requested* keyframes.
+///
+/// A request is not a suggestion — an IDR is emitted for every one — and the
+/// requests arrive from four independent places: the peer's PLI, the media
+/// plane's own gate, an access unit the browser relay refused, and a
+/// self-view frame the window could not take. None of them coordinates with
+/// the others, and each is *caused* by congestion, so answering every one
+/// individually spends the whole bitrate budget on the largest frames the
+/// encoder can make at exactly the moment the wire has least room for them.
+/// One call answered 38 requests in twelve seconds: better than one in seven
+/// frames was an IDR, on a stream whose budget affords one in sixty.
+///
+/// A second is chosen against the drain, not the round trip: at 1980 kbps a
+/// relay channel takes about a quarter-second to clear a keyframe, so a
+/// second IDR inside that window cannot be delivered whatever it costs to
+/// make. It is also longer than any relayed round trip, so a burst of PLIs
+/// describing one loss coalesces into one answer instead of a dozen. The
+/// cadence above remains the backstop, which bounds recovery at three
+/// seconds even if every request is coalesced away.
+pub(crate) const MIN_REQUESTED_KEYFRAME_SECONDS: u32 = 1;
+
 /// What WhatsApp Web itself offers on a desktop: Constrained Baseline at
 /// 720p20, a shade under 2 Mbps.
 const DEFAULT_WIDTH: u32 = 1280;

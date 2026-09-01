@@ -688,6 +688,54 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   every path out that is not a camera held withdraws it again, and the
   refusal's own teardown queues on the call's video lane behind the enable it
   is answering.
+- **Nothing on this side can ask the peer for a keyframe, and that makes one
+  dropped unit permanent.** The library parses an inbound PLI and FIR to drive
+  our own encoder, and builds neither, so the receive path has no way to say
+  "send me a recovery point". Every other hop recovers by asking: the media
+  plane asks us, the window's refusal asks us, the peer's PLI asks us. The
+  peer's picture is the one direction where a single lost access unit ends the
+  stream for good -- the decoder abandons its chain at the gap and waits for a
+  keyframe the peer will only send on its own cadence, which for WhatsApp
+  mobile is on demand and therefore never. The official client's own receive
+  path is built on the opposite assumption: `pjmedia_rtcp_build_rtcp_pli`,
+  throttled by `pli_throttle_time_ms`, fired on decode error via
+  `enable_pli_for_dec_err`, with NACK escalating to PLI. Until the library can
+  send one, every drop between the relay and the decoder is a black pane for
+  the rest of the call.
+- **Video encoded before the peer accepts is thrown away twice, and poisons
+  the channel it is thrown away in.** The camera has to open before the offer
+  -- an offer with no camera is not a video offer -- but nothing wants those
+  frames. The window has no live call to draw them into, and the peer opens
+  its pane off the announcement sent at accept, not off the offer, so a unit
+  arriving before it is decoded by nobody. What made this expensive rather
+  than merely wasteful is where the bytes go in the meantime: the relay
+  channel is allocated when the server acks the offer, while the callee is
+  still ringing, and SCTP starts in slow start with a congestion window of
+  about 4 KB. Half a second of 720p at 1980 kbps arrives into that. One call
+  logged the channel 138872 bytes behind before the peer had answered -- 561
+  ms of encoder output, queued in front of every packet that would matter.
+  The plane hand-off is gated on the same flag the self-view uses.
+- **A requested keyframe is not free, and four things request them without
+  knowing about each other**: the peer's PLI, the media plane's gate, an
+  access unit the relay refused, and a self-view frame the window could not
+  take. Each is *caused* by congestion, so answering every one individually
+  spends the whole bitrate budget on the largest frames the encoder can make
+  at the moment the wire has least room for them. One call answered 38 in
+  twelve seconds -- better than one frame in seven was an IDR, on a budget
+  that affords one in sixty. Requests are now rate-limited to one per second
+  in both backends, against the relay's drain time rather than the round trip:
+  at 1980 kbps a channel takes about a quarter-second to clear a keyframe, so
+  a second IDR inside that window cannot be delivered whatever it costs to
+  make. The request is *kept* rather than consumed when it is too soon, so the
+  last ask of a burst is never the one lost, and `KEYFRAME_SECONDS` remains
+  the backstop.
+- **The outbound ceiling is video's, and it was dropping the voice.** One
+  Opus stream is 16 kbps against video's 1980, so audio can never be the cause
+  of a backlog and is what a call least affords to lose -- yet a video
+  keyframe filling the buffer took the voice with it, because both were
+  decided against the same line. Audio is exempt now up to a hard ceiling
+  eight times higher, past which the channel is not congested but wedged.
+
 - **A video call announces its direction; the offer only advertises the
   capability.** A call placed as video enables its plane ungated, encodes, and
   packetises — and the peer shows nothing, because the receiving side brings

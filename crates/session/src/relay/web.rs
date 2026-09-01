@@ -108,6 +108,19 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 /// enough to be a ceiling and not a second jitter buffer.
 const OUTBOUND_CEILING: u32 = 64 * 1024;
 
+/// The ceiling above which even audio is dropped.
+///
+/// Audio is exempt from `OUTBOUND_CEILING` because it can never be the cause
+/// of a backlog and is what a call least affords to lose: one Opus stream is
+/// 16 kbps against video's 1980, so every byte the ceiling was written for
+/// belongs to the other stream. Dropping audio to make room for video is the
+/// wrong trade in a call, and the ceiling was making it — a video keyframe
+/// filled the buffer and the voice went with it.
+///
+/// Exempt is not unbounded, though. Past this the channel is not congested,
+/// it is wedged, and adding to it only delays noticing.
+const OUTBOUND_HARD_CEILING: u32 = 8 * OUTBOUND_CEILING;
+
 /// The platform's answer to "how does media reach the relay".
 pub struct BrowserRelay;
 
@@ -464,7 +477,9 @@ impl BrowserRelayChannel {
         ) {
             return Outbound::Send;
         }
-        let over_ceiling = self.channel.buffered_amount() > OUTBOUND_CEILING;
+        let buffered = self.channel.buffered_amount();
+        let over_ceiling = buffered > OUTBOUND_CEILING;
+        let wedged = buffered > OUTBOUND_HARD_CEILING;
         // The payload type and the marker bit share RTP's second byte: the top
         // bit is the marker, the low seven are the type. A packet too short to
         // have one is not RTP and is treated as media by the ceiling alone.
@@ -475,8 +490,10 @@ impl BrowserRelayChannel {
                 Outbound::Send
             };
         };
+        // Not video, so it is the voice: exempt until the channel is wedged
+        // rather than merely behind. See `OUTBOUND_HARD_CEILING`.
         if second & 0x7f != RTP_PAYLOAD_TYPE_H264 {
-            return if over_ceiling {
+            return if wedged {
                 Outbound::Drop
             } else {
                 Outbound::Send

@@ -568,7 +568,7 @@ impl CallRegistry {
         let Some(local) = calls.cameras.get(call_id) else {
             return false;
         };
-        local.drawable();
+        local.live();
         local.request_keyframe();
         true
     }
@@ -985,7 +985,7 @@ impl WhatsAppClient {
                         // that starts on the first frame to arrive has
                         // nothing to start from until the next one, seconds
                         // away, so it is asked for here.
-                        local.drawable();
+                        local.live();
                         local.request_keyframe();
                         match calls.hold_camera(&call_id, local).await {
                             Camera::Held => {
@@ -1205,7 +1205,7 @@ impl WhatsAppClient {
                     // draws this starts a decoder on the first frame that
                     // arrives and can do nothing with it until a keyframe,
                     // which is otherwise the periodic one, seconds away.
-                    local.drawable();
+                    local.live();
                     local.request_keyframe();
                     // The announcement landed and the device may not have
                     // survived it: the peer has this direction enabled and is
