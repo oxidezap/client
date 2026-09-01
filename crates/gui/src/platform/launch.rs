@@ -24,7 +24,7 @@ pub fn run(application: Application, launch: impl FnOnce(&mut App) + 'static) {
 mod imp {
     use gpui::{App, Application};
 
-    pub fn run(application: Application, launch: impl FnOnce(&mut App) + 'static) {
+    pub(super) fn run(application: Application, launch: impl FnOnce(&mut App) + 'static) {
         application.run(launch);
     }
 }
@@ -33,7 +33,7 @@ mod imp {
 mod imp {
     use gpui::{App, Application};
 
-    pub fn run(application: Application, launch: impl FnOnce(&mut App) + 'static) {
+    pub(super) fn run(application: Application, launch: impl FnOnce(&mut App) + 'static) {
         // `run_embedded` is gpui's answer for a run loop it does not own, and
         // the handle it returns is what holds the app. Leaked deliberately:
         // the page *is* the process here, so the app lives until the tab

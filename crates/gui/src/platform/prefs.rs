@@ -24,14 +24,7 @@ pub type Revision = u64;
 /// rather than offering to edit something that cannot exist.
 #[must_use]
 pub fn location() -> Option<String> {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        native::path().map(|path| path.display().to_string())
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        web::location()
-    }
+    imp::location()
 }
 
 /// The document, or `None` where there is none yet.
@@ -41,14 +34,7 @@ pub fn location() -> Option<String> {
 /// There is somewhere to look and looking failed — a permission, a browser
 /// with site data switched off. Absent is not an error.
 pub fn read() -> Result<Option<String>, String> {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        native::read()
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        web::read()
-    }
+    imp::read()
 }
 
 /// Write the document back.
@@ -57,31 +43,17 @@ pub fn read() -> Result<Option<String>, String> {
 ///
 /// Nowhere to keep one, or keeping it failed.
 pub fn write(document: &str) -> Result<(), String> {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        native::write(document)
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        web::write(document)
-    }
+    imp::write(document)
 }
 
 /// What the document's current version is, for the poll that watches it.
 #[must_use]
 pub fn revision() -> Option<Revision> {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        native::revision()
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        web::revision()
-    }
+    imp::revision()
 }
 
 #[cfg(not(target_family = "wasm"))]
-mod native {
+mod imp {
     use std::path::PathBuf;
 
     /// Where this platform keeps a per-user configuration file.
@@ -94,7 +66,7 @@ mod native {
     /// a hidden directory of a convention that platform does not have, and
     /// the message Settings shows told the reader to set `$XDG_CONFIG_HOME`
     /// or `$HOME`, neither of which exists there.
-    pub fn path() -> Option<PathBuf> {
+    fn path() -> Option<PathBuf> {
         let not_empty =
             |value: std::ffi::OsString| (!value.is_empty()).then(|| PathBuf::from(value));
         let dir = if cfg!(windows) {
@@ -111,7 +83,13 @@ mod native {
         Some(dir.join("oxidezap").join("theme.json"))
     }
 
-    pub fn read() -> Result<Option<String>, String> {
+    /// The path, in words: it is a file a person opens in an editor, so the
+    /// path *is* the instruction.
+    pub(super) fn location() -> Option<String> {
+        path().map(|path| path.display().to_string())
+    }
+
+    pub(super) fn read() -> Result<Option<String>, String> {
         let Some(path) = path() else {
             return Ok(None);
         };
@@ -123,7 +101,7 @@ mod native {
         }
     }
 
-    pub fn write(document: &str) -> Result<(), String> {
+    pub(super) fn write(document: &str) -> Result<(), String> {
         let path = path().ok_or_else(|| {
             if cfg!(windows) {
                 "no config directory: %LOCALAPPDATA% is not set".to_string()
@@ -178,7 +156,7 @@ mod native {
     ///
     /// Only ever compared against another of these, so the epoch it counts
     /// from does not matter — only that it moves when the file does.
-    pub fn revision() -> Option<super::Revision> {
+    pub(super) fn revision() -> Option<super::Revision> {
         let modified = std::fs::metadata(path()?)
             .and_then(|meta| meta.modified())
             .ok()?;
@@ -212,7 +190,7 @@ mod native {
 }
 
 #[cfg(target_family = "wasm")]
-mod web {
+mod imp {
     use std::cell::{Cell, RefCell};
 
     use wasm_bindgen::JsCast as _;
@@ -234,11 +212,11 @@ mod web {
         web_sys::window()?.local_storage().ok().flatten()
     }
 
-    pub fn location() -> Option<String> {
+    pub(super) fn location() -> Option<String> {
         storage().map(|_| format!("browser storage ({KEY})"))
     }
 
-    pub fn read() -> Result<Option<String>, String> {
+    pub(super) fn read() -> Result<Option<String>, String> {
         let Some(storage) = storage() else {
             return Ok(None);
         };
@@ -247,7 +225,7 @@ mod web {
             .map_err(|e| format!("could not read the stored theme: {e:?}"))
     }
 
-    pub fn write(document: &str) -> Result<(), String> {
+    pub(super) fn write(document: &str) -> Result<(), String> {
         let storage = storage().ok_or_else(|| {
             "this browser is not letting the page keep anything, so the theme cannot be saved"
                 .to_string()
@@ -300,7 +278,7 @@ mod web {
     /// own [`write`], and another tab's, which arrives as a `storage` event.
     /// Anything else — a browser that will not fire the event, a first call —
     /// falls through to the read.
-    pub fn revision() -> Option<super::Revision> {
+    pub(super) fn revision() -> Option<super::Revision> {
         watch_other_tabs();
         if let Some(known) = MEMO.with(Cell::get) {
             return known;

@@ -103,25 +103,25 @@ mod imp {
     use super::Home;
 
     /// A desktop front end reaches `oxidezapd`, whose plugins are files.
-    pub fn home() -> Home {
+    pub(super) fn home() -> Home {
         Home::Folder
     }
 
     /// Not this front end's to do: the folder belongs to the daemon, which
     /// may not even be on this machine. Present so the interface is one
     /// interface — the call sites ask [`Home::can_install`] first.
-    pub async fn install() -> Result<Option<String>, String> {
+    pub(super) async fn install() -> Result<Option<String>, String> {
         Err("this front end cannot install plugins".to_owned())
     }
 
     /// See [`install`].
-    pub async fn uninstall(_id: &str) -> Result<(), String> {
+    pub(super) async fn uninstall(_id: &str) -> Result<(), String> {
         Err("this front end cannot remove plugins".to_owned())
     }
 
     /// See [`install`]. The daemon's folder is not this front end's to list —
     /// what it *runs* out of it arrives in the snapshot like everything else.
-    pub async fn installed() -> Result<Vec<String>, String> {
+    pub(super) async fn installed() -> Result<Vec<String>, String> {
         Err("this front end has no plugin folder of its own".to_owned())
     }
 }
@@ -141,7 +141,7 @@ mod imp {
     /// already travel — and the folder they came out of is that daemon's.
     /// A page holding the session itself has its own, and is asked the same
     /// way the session asks it, so the two cannot answer differently.
-    pub fn home() -> Home {
+    pub(super) fn home() -> Home {
         match oxidezap_ipc::web::named_daemon() {
             oxidezap_ipc::web::NamedDaemon::Named(_) => Home::Folder,
             // No daemon named, and no session here either: this tab is a
@@ -166,7 +166,7 @@ mod imp {
     /// of the gesture and is taken out again — a detached input's `click()`
     /// is ignored outright by some engines, and one that stays is a control
     /// the page grew and never lost.
-    pub async fn install() -> Result<Option<String>, String> {
+    pub(super) async fn install() -> Result<Option<String>, String> {
         let Some(chosen) = choose().await else {
             return Ok(None);
         };
@@ -193,11 +193,11 @@ mod imp {
             .map(Some)
     }
 
-    pub async fn uninstall(id: &str) -> Result<(), String> {
+    pub(super) async fn uninstall(id: &str) -> Result<(), String> {
         oxidezap_daemon::plugins::web::uninstall(id).await
     }
 
-    pub async fn installed() -> Result<Vec<String>, String> {
+    pub(super) async fn installed() -> Result<Vec<String>, String> {
         oxidezap_daemon::plugins::web::names().await
     }
 

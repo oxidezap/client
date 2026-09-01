@@ -18,7 +18,7 @@ pub fn front_end_id() -> u64 {
 
 #[cfg(not(target_family = "wasm"))]
 mod imp {
-    pub fn front_end_id() -> u64 {
+    pub(super) fn front_end_id() -> u64 {
         u64::from(std::process::id())
     }
 }
@@ -32,7 +32,7 @@ mod imp {
     /// same optimistic id within a millisecond of each other, and the daemon
     /// broadcasts every assignment to both — so one tab's send would rename
     /// or dedup the other's bubble.
-    pub fn front_end_id() -> u64 {
+    pub(super) fn front_end_id() -> u64 {
         static TAB: AtomicU64 = AtomicU64::new(0);
         let known = TAB.load(Ordering::Relaxed);
         if known != 0 {

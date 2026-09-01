@@ -34,39 +34,6 @@ pub fn media_send_unavailable() -> Option<&'static str> {
     imp::media_send_unavailable()
 }
 
-#[cfg(not(target_family = "wasm"))]
-mod imp {
-    /// A desktop front end hands its media to `oxidezapd`, which holds the
-    /// ureq client and does the upload.
-    pub fn media_send_unavailable() -> Option<&'static str> {
-        None
-    }
-}
-
-#[cfg(target_family = "wasm")]
-mod imp {
-    /// A page attached to a real daemon sends media through it: the payload
-    /// is staged over the bridge and the daemon's own HTTP client uploads it.
-    /// It is only a page holding the session *itself* that cannot, and it is
-    /// asked the same way the session picks which of the two it is, so the
-    /// two cannot answer differently.
-    pub fn media_send_unavailable() -> Option<&'static str> {
-        match oxidezap_ipc::web::named_daemon() {
-            oxidezap_ipc::web::NamedDaemon::Named(_) => None,
-            // `Rejected` is not "no daemon", but the window is on the settled
-            // refusal screen and drawing no composer at all, so it is
-            // answered with the same sentence rather than a third case
-            // nothing can reach.
-            _ => Some(
-                "A page that holds its own account cannot upload media yet: \
-                 the library's upload path has no route a browser can take. \
-                 Point this page at an oxidezapd with #daemon=ws://… and it \
-                 sends through that.",
-            ),
-        }
-    }
-}
-
 /// # Decoding video
 ///
 /// Why this front end cannot decode a video at all, or `None` if it can.
@@ -83,29 +50,7 @@ mod imp {
 /// older one is the case this exists for.
 #[must_use]
 pub fn video_decode_unavailable() -> Option<&'static str> {
-    video::video_decode_unavailable()
-}
-
-#[cfg(not(target_family = "wasm"))]
-mod video {
-    /// openh264 is linked in.
-    pub fn video_decode_unavailable() -> Option<&'static str> {
-        None
-    }
-}
-
-#[cfg(target_family = "wasm")]
-mod video {
-    /// Asked of the global rather than by constructing one: a `VideoDecoder`
-    /// needs a configuration to be built and there is none to give before the
-    /// file is here, which is precisely the ordering this exists to fix.
-    pub fn video_decode_unavailable() -> Option<&'static str> {
-        let global = js_sys::global();
-        match js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("VideoDecoder")) {
-            Ok(found) if !found.is_undefined() && !found.is_null() => None,
-            _ => Some("Videos cannot be played in this browser."),
-        }
-    }
+    imp::video_decode_unavailable()
 }
 
 /// # A call from the wrong tab
@@ -124,7 +69,7 @@ mod video {
 /// So this one leaves the offer ringing and says where to answer it.
 #[must_use]
 pub fn calls_belong_to_another_tab() -> Option<&'static str> {
-    calls::calls_belong_to_another_tab()
+    imp::calls_belong_to_another_tab()
 }
 
 /// # Placing a call
@@ -158,24 +103,67 @@ pub fn calls_belong_to_another_tab() -> Option<&'static str> {
 /// this browser has.
 #[must_use]
 pub fn calls_unavailable() -> Option<&'static str> {
-    calls::calls_unavailable()
+    imp::calls_unavailable()
 }
 
 #[cfg(not(target_family = "wasm"))]
-mod calls {
+mod imp {
+    /// A desktop front end hands its media to `oxidezapd`, which holds the
+    /// ureq client and does the upload.
+    pub(super) fn media_send_unavailable() -> Option<&'static str> {
+        None
+    }
+
+    /// openh264 is linked in.
+    pub(super) fn video_decode_unavailable() -> Option<&'static str> {
+        None
+    }
+
     /// The daemon holds the session, and with it the UDP socket.
-    pub fn calls_unavailable() -> Option<&'static str> {
+    pub(super) fn calls_unavailable() -> Option<&'static str> {
         None
     }
 
     /// There are no follower windows here: every one talks to the daemon.
-    pub fn calls_belong_to_another_tab() -> Option<&'static str> {
+    pub(super) fn calls_belong_to_another_tab() -> Option<&'static str> {
         None
     }
 }
 
 #[cfg(target_family = "wasm")]
-mod calls {
+mod imp {
+    /// A page attached to a real daemon sends media through it: the payload
+    /// is staged over the bridge and the daemon's own HTTP client uploads it.
+    /// It is only a page holding the session *itself* that cannot, and it is
+    /// asked the same way the session picks which of the two it is, so the
+    /// two cannot answer differently.
+    pub(super) fn media_send_unavailable() -> Option<&'static str> {
+        match oxidezap_ipc::web::named_daemon() {
+            oxidezap_ipc::web::NamedDaemon::Named(_) => None,
+            // `Rejected` is not "no daemon", but the window is on the settled
+            // refusal screen and drawing no composer at all, so it is
+            // answered with the same sentence rather than a third case
+            // nothing can reach.
+            _ => Some(
+                "A page that holds its own account cannot upload media yet: \
+                 the library's upload path has no route a browser can take. \
+                 Point this page at an oxidezapd with #daemon=ws://… and it \
+                 sends through that.",
+            ),
+        }
+    }
+
+    /// Asked of the global rather than by constructing one: a `VideoDecoder`
+    /// needs a configuration to be built and there is none to give before the
+    /// file is here, which is precisely the ordering this exists to fix.
+    pub(super) fn video_decode_unavailable() -> Option<&'static str> {
+        let global = js_sys::global();
+        match js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("VideoDecoder")) {
+            Ok(found) if !found.is_undefined() && !found.is_null() => None,
+            _ => Some("Videos cannot be played in this browser."),
+        }
+    }
+
     /// Asked of the *session* first, not of the build, exactly as
     /// `media_send_unavailable` is — and for the same reason, which this
     /// answered wrongly at first by looking only at the page.
@@ -192,7 +180,7 @@ mod calls {
     /// without one carries nothing. Asked before the control is drawn,
     /// because a browser is not going to grow one between the question and
     /// the press — the same rule the rest of this module follows.
-    pub fn calls_unavailable() -> Option<&'static str> {
+    pub(super) fn calls_unavailable() -> Option<&'static str> {
         match oxidezap_ipc::web::named_daemon() {
             oxidezap_ipc::web::NamedDaemon::Named(_) => None,
             // `Rejected` answered like `Nobody`, as above: the window is on
@@ -224,7 +212,7 @@ mod calls {
     /// `calls_unavailable`: it is which document owns the media, and moving
     /// that means the follower opening the devices and handing them across —
     /// a change to the tab protocol rather than a check.
-    pub fn calls_belong_to_another_tab() -> Option<&'static str> {
+    pub(super) fn calls_belong_to_another_tab() -> Option<&'static str> {
         if matches!(
             oxidezap_ipc::web::named_daemon(),
             oxidezap_ipc::web::NamedDaemon::Named(_)
