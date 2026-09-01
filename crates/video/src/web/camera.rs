@@ -733,8 +733,8 @@ async fn attach(
     // same defect as an unanswered permission prompt — so a slow resolve is
     // not read as anything: the deadline lets setup carry on, and the ticks
     // wait for readiness as they already do.
-    let playing = match element.play() {
-        Ok(playing) => playing,
+    let started = match element.play() {
+        Ok(started) => started,
         Err(e) => {
             // The element is in the document by now, so this exit has to take
             // it down itself: `ElementGuard` only covers the failures *after*
@@ -745,7 +745,7 @@ async fn attach(
     };
     let refused = futures_lite::future::or(
         async {
-            wasm_bindgen_futures::JsFuture::from(playing)
+            wasm_bindgen_futures::JsFuture::from(started)
                 .await
                 .err()
                 .map(|e| describe(&e))
@@ -756,37 +756,48 @@ async fn attach(
         },
     )
     .await;
-    // A rejection is not the question; whether frames will come is. The two
+    // The promise is not the question; whether frames will come is. The two
     // came apart in production: `play()` was aborted for a lifecycle reason
     // while the element went on decoding perfectly well, and treating the
     // promise as the answer downgraded every video call to voice. So the
-    // element is asked directly instead.
+    // element is asked, and it is asked whatever the promise did — a
+    // rejection, a resolution, and a promise still pending at the grace all
+    // reach the same test. Asking only on a rejection would let the one case
+    // that never answers through untested.
     //
-    // `paused` first, and it is the load-bearing half. Readiness alone is not
-    // playback here: a `MediaStream` reaches `HAVE_CURRENT_DATA` with a
-    // nonzero `videoWidth` as soon as the element is wired to it, whether or
-    // not it was ever allowed to start — so an element genuinely refused by
-    // autoplay policy passes the readiness test and then hands the encoder
-    // one still picture for the length of the call. The two together are the
-    // question the capture tick asks plus the one it cannot: playing, and
-    // showing something.
-    if let Some(reason) = refused {
-        if element.paused() || element.ready_state() < 2 || element.video_width() == 0 {
-            release_element(&element);
-            bail!("the browser would not play the camera's own stream: {reason}");
+    // `paused` is the load-bearing half. Readiness alone is not playback
+    // here: a `MediaStream` reaches `HAVE_CURRENT_DATA` with a nonzero
+    // `videoWidth` as soon as the element is wired to it, whether or not it
+    // was ever allowed to start — so an element genuinely refused by autoplay
+    // policy passes the readiness test and then hands the encoder one still
+    // picture for the length of the call. The two together are the question
+    // the capture tick asks plus the one it cannot: playing, and showing
+    // something.
+    if element.paused() || element.ready_state() < 2 || element.video_width() == 0 {
+        release_element(&element);
+        match refused {
+            Some(reason) => bail!("the browser would not play the camera's own stream: {reason}"),
+            None => bail!(
+                "the camera's preview never started playing, and said nothing about why in \
+                 {PLAYBACK_GRACE_MS}ms"
+            ),
         }
+    }
+    // Only reachable with the element playing, which is why this is a warning
+    // and not the failure above.
+    if let Some(reason) = refused {
         warn!("the camera's preview reported {reason}, but it is playing; carrying on");
     }
     Ok(element)
 }
 
-/// How long a rejection from `play()` is waited for before setup carries on.
+/// How long `play()` is given to say anything before the element is asked.
 ///
-/// Not how long playback may take: a resolve means it started and a timeout
-/// means nothing at all, so this only bounds how long a *refusal* has to
-/// arrive in. Short, because a refusal is decided by policy rather than by
-/// the device, and the cost of missing one is the tick logging that the
-/// element is not ready.
+/// Not how long playback may take, and not a verdict of its own: whatever
+/// this expires on, the element is still asked whether it is playing, so a
+/// timeout costs a decision rather than making one. Short, because a refusal
+/// is decided by policy rather than by the device — the device having already
+/// answered, upstream, when `getUserMedia` returned.
 const PLAYBACK_GRACE_MS: i32 = 2_000;
 
 /// One capture tick: take what the element is showing and encode it.

@@ -602,8 +602,9 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   element has to be in the document.** A hidden element plays the stream and
   every tick takes a `VideoFrame` from it. `MediaStreamTrackProcessor` would
   read frames off the track with no element at all and is the nicer shape, but
-  it is Chromium's and neither Firefox nor Safari has it — so the element path
-  has to exist regardless, and one path is better than two. It was written
+  it is not in every engine this has to run on — Firefox has none of it — so
+  the element path has to exist regardless, and one path is better than two.
+  Re-check the support table before concluding it still has to. It was written
   *detached*, on the reasoning that an element with no parent still decodes
   and an added one would draw the self-view twice. Production disagreed, on
   every camera a call ever opened: `play()` rejected with "The play() request
@@ -617,7 +618,11 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   come is. The two came apart here: the promise was aborted for a lifecycle
   reason while the element went on decoding, and treating the rejection as
   fatal downgraded every video call to voice. The element is asked directly
-  instead: `paused` first, then `readyState` and `videoWidth`. `paused` is the
+  instead, and asked whatever the promise did — a rejection, a resolution, and
+  a promise still pending when the grace expires all reach the same test,
+  since asking only on a rejection lets the one case that never answers
+  through untested. The test is `paused` first, then `readyState` and
+  `videoWidth`. `paused` is the
   load-bearing half — a `MediaStream` reaches `HAVE_CURRENT_DATA` with a
   nonzero `videoWidth` the moment the element is wired to it, whether or not
   it was ever allowed to start, so readiness alone would pass a genuine
