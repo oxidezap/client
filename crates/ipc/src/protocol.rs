@@ -533,7 +533,7 @@ pub struct SendAudio {
     /// serde's buffered `Content` rather than straight from the reader, and
     /// on that path a missing key for an `Option` field is `None` whether or
     /// not a default is declared. Both sends already accept a frame without
-    /// the key; `tests::either_send_may_leave_out_the_local_id` is what says
+    /// the key; `tests::every_send_may_leave_out_the_local_id` is what says
     /// so, and it is the thing to look at before adding the attribute to
     /// "fix" this — the change that would really alter the wire is giving
     /// this enum a different tag representation, and that test is what would
@@ -581,15 +581,13 @@ pub struct SendMedia {
     /// The id to give the message until the server assigns a real one, as
     /// [`SendText::local_id`].
     ///
-    /// `#[serde(default)]`, unlike [`SendAudio::local_id`] — and the
-    /// difference is that this payload is new rather than that the two want
-    /// different things. An `Option` alone does not make a key optional to
-    /// serde, so a frame that leaves the field out is malformed without this;
-    /// the daemon has always been able to make an id up for a client that
-    /// draws nothing, and there is no older reader whose expectations
-    /// widening this would break. The other one is left alone because
-    /// widening *it* is a protocol change with a changelog entry to write.
-    #[serde(default)]
+    /// No `#[serde(default)]`, for the reason [`SendAudio::local_id`] does
+    /// not carry one either: it would not do anything. This enum is
+    /// internally tagged, so a missing key for an `Option` reads back as
+    /// `None` whichever way the field is declared, and a frame from a client
+    /// that draws nothing is one the daemon makes an id up for.
+    /// `tests::every_send_may_leave_out_the_local_id` is what says so, for
+    /// all three sends at once.
     pub local_id: Option<String>,
     /// The message being replied to, when this is a reply. The same field
     /// [`SendText`] and [`SendAudio`] carry, for the same reason.
@@ -931,22 +929,6 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A client that draws nothing has no local id to offer, and the daemon
-    /// makes one up for it — which it never gets the chance to do if serde
-    /// refuses the frame first. An `Option` is not an optional key.
-    #[test]
-    fn a_media_send_without_a_local_id_is_a_frame_rather_than_a_refusal() {
-        let frame = r#"{"request":"send_media","jid":"a@s.whatsapp.net","upload":"u-1","kind":"video","mime_type":"video/mp4","file_name":"clipe.mp4"}"#;
-        let parsed: ClientRequest =
-            serde_json::from_str(frame).expect("a frame without a local id");
-        let ClientRequest::SendMedia(media) = parsed else {
-            panic!("that is not a media send");
-        };
-        assert_eq!(media.local_id, None);
-        assert_eq!(media.caption, None);
-        assert_eq!(media.kind, OutgoingMedia::Video);
-    }
 
     /// One chat holds everybody's status updates, and watching one is
     /// recorded on the message rather than on that counter — so it never goes
@@ -1458,10 +1440,11 @@ mod tests {
         }
     }
 
-    /// Both sends accept a frame that leaves `local_id` out.
+    /// Every send accepts a frame that leaves `local_id` out.
     ///
-    /// `SendText::local_id` declares `#[serde(default)]` and `SendAudio`'s
-    /// does not, which reads like the audio one being stricter. It is not:
+    /// `SendText::local_id` declares `#[serde(default)]` and neither
+    /// `SendAudio`'s nor `SendMedia`'s does, which reads like those two being
+    /// stricter. They are not:
     /// this enum is internally tagged, so a variant is deserialized through
     /// serde's buffered `Content`, and on that path a missing key for an
     /// `Option` is `None` with or without the attribute. The asymmetry is in
@@ -1474,9 +1457,10 @@ mod tests {
     /// externally or adjacently tagged and the audio arm starts refusing a
     /// frame the text arm accepts.
     #[test]
-    fn either_send_may_leave_out_the_local_id() {
+    fn every_send_may_leave_out_the_local_id() {
         let text = r#"{"request":"send_text","jid":"559900000001@s.whatsapp.net","text":"oi"}"#;
         let audio = r#"{"request":"send_audio","jid":"559900000001@s.whatsapp.net","upload":"staged-local-1","duration_secs":3,"waveform":[7,8]}"#;
+        let media = r#"{"request":"send_media","jid":"559900000001@s.whatsapp.net","upload":"u-1","kind":"video","mime_type":"video/mp4","file_name":"clipe.mp4"}"#;
 
         match serde_json::from_str::<ClientRequest>(text).unwrap() {
             ClientRequest::SendText(send) => assert_eq!(send.local_id, None),
@@ -1485,6 +1469,16 @@ mod tests {
         match serde_json::from_str::<ClientRequest>(audio).unwrap() {
             ClientRequest::SendAudio(send) => assert_eq!(send.local_id, None),
             other => panic!("not a send_audio: {other:?}"),
+        }
+        match serde_json::from_str::<ClientRequest>(media).unwrap() {
+            ClientRequest::SendMedia(send) => {
+                assert_eq!(send.local_id, None);
+                // The other two keys a media send may leave out, in the same
+                // frame: absent is `None` for these as well.
+                assert_eq!(send.caption, None);
+                assert_eq!(send.quoted, None);
+            }
+            other => panic!("not a send_media: {other:?}"),
         }
     }
 }

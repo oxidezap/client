@@ -787,9 +787,13 @@ impl Session {
                 &self.events,
                 &self.media,
                 id,
+                // The same two figures the file chooser prints, from the same
+                // formatter: a person who was told a file fits and then told
+                // it does not must not be reading two different numbers.
                 format!(
-                    "{what} is {size} bytes, past the {} that can be staged",
-                    oxidezap_ipc::MAX_STAGED_BYTES
+                    "{what} could not be sent: it is {} and the most that can be staged is {}.",
+                    crate::utils::format_size(size),
+                    crate::utils::format_size(oxidezap_ipc::MAX_STAGED_BYTES)
                 ),
             );
             return;

@@ -1441,10 +1441,11 @@ impl WhatsAppClient {
     /// name, so what the recipient needs in order to *draw* it before
     /// downloading anything is worked out here. See [`outgoing`].
     ///
-    /// Both halves of the shaping are deliberately on the caller's task
-    /// rather than hoisted out of it: they take a decode and an upload, and
-    /// this returns a handle the way every other send does so a queue in
-    /// front of it stays a queue.
+    /// Returns a handle the way every other send does, so a queue in front of
+    /// it stays a queue — and what the handle covers is the *ordering*, not
+    /// the work: the shaping goes to [`crate::exec::unblock`] because it is a
+    /// decode, and the upload is I/O. Neither runs on this task, and both are
+    /// awaited by it.
     pub fn send_media_message(
         &self,
         jid_str: &str,

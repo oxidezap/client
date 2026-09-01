@@ -348,10 +348,22 @@ impl Bridge {
                     let upload = upload.clone();
                     oxidezap_session::unblock(move || crate::media::take(&upload)).await
                 };
-                let Some(data) = taken.ok().flatten() else {
-                    return CommandOutcome::Refused(format!(
-                        "nothing cached under {upload}; stage it before sending"
-                    ));
+                // Two answers, not one. A read that never ran — the worker
+                // panicked, or the runtime is going down — is not a payload
+                // nobody staged, and folding the two told a client that had
+                // just staged a file to stage it before sending.
+                let data = match taken {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        return CommandOutcome::Refused(format!(
+                            "nothing cached under {upload}; stage it before sending"
+                        ));
+                    }
+                    Err(e) => {
+                        return CommandOutcome::Refused(format!(
+                            "the payload staged under {upload} could not be read: {e}"
+                        ));
+                    }
                 };
                 let Some(permit) = self.permit() else {
                     return too_busy();

@@ -146,6 +146,25 @@ const MAX_NAME_CHARS: usize = 64;
 /// Counted in `chars`, never in bytes: a name is somebody's, most of the
 /// world's are not ASCII, and cutting a UTF-8 sequence in half panics.
 /// Truncated here rather than only in the component, because the string is
+/// A byte count as a person reads one.
+///
+/// MiB rather than MB, because every ceiling this is used on is a power of
+/// two and the two units are not the same: 64 MiB printed as "64.0 MB"
+/// understates itself by three megabytes, which matters exactly when somebody
+/// is reading the number to decide whether a file will fit.
+///
+/// Here rather than beside either caller, because both the sentence at the
+/// file chooser and the one on a refused send are read by the same person and
+/// must not disagree about what the limit is.
+pub fn format_size(bytes: u64) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a figure printed to one decimal place; the exact byte count is not the point"
+    )]
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    format!("{mib:.1} MiB")
+}
+
 /// also measured, compared and put in tooltips.
 #[must_use]
 pub fn capped_name(name: &str) -> String {

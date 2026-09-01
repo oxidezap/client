@@ -149,35 +149,49 @@ pub fn mime_for_name(file_name: &str) -> &'static str {
 /// budget are refused by name rather than silently dropped.
 const SELECTION_BUDGET_BYTES: u64 = oxidezap_ipc::MAX_STAGED_BYTES;
 
-/// Tracks what a selection has read so far, and refuses what would not fit.
+/// Tracks what a selection is actually holding, and refuses what would not
+/// fit beside it.
 ///
 /// Held by each half of [`choose`] across its own loop, so the answer is one
 /// rule rather than two: the desktop reads files one at a time from paths and
 /// a page reads them one at a time from a `FileList`, and both ask this
 /// before they read rather than after.
+///
+/// Asking and counting are separate calls, and that is the whole of the type.
+/// A file whose length fits can still fail to be read — a permission, a
+/// device that went away, a browser that refused the `ArrayBuffer` — and
+/// charging it at the question would hold budget for bytes nobody is holding,
+/// so the files after it are refused to make room for one that is not there.
 #[derive(Default)]
 struct Budget {
-    taken: u64,
+    held: u64,
 }
 
 impl Budget {
-    /// Why this file cannot join what is already read, or `None` if it can —
-    /// counting it when it can.
-    fn refuse(&mut self, file_name: &str, size: u64) -> Option<String> {
+    /// Why this file cannot join what is already held, or `None` if it can.
+    ///
+    /// Counts nothing: the caller reads the file and says [`took`](Self::took)
+    /// if the read worked.
+    fn refuse(&self, file_name: &str, size: u64) -> Option<String> {
         if let Some(refusal) = unsendable(file_name, size) {
             return Some(refusal);
         }
-        match self.taken.checked_add(size) {
-            Some(total) if total <= SELECTION_BUDGET_BYTES => {
-                self.taken = total;
-                None
-            }
-            _ => Some(format!(
+        let fits = self
+            .held
+            .checked_add(size)
+            .is_some_and(|total| total <= SELECTION_BUDGET_BYTES);
+        (!fits).then(|| {
+            format!(
                 "{file_name} did not fit: one trip to the file chooser can \
                  carry {} in total. Send it on its own.",
-                in_mib(SELECTION_BUDGET_BYTES)
-            )),
-        }
+                crate::utils::format_size(SELECTION_BUDGET_BYTES)
+            )
+        })
+    }
+
+    /// Count a file that is now in hand.
+    fn took(&mut self, size: u64) {
+        self.held = self.held.saturating_add(size);
     }
 }
 
@@ -201,25 +215,10 @@ pub fn unsendable(file_name: &str, size: u64) -> Option<String> {
     (size > ceiling).then(|| {
         format!(
             "{file_name} is {} and the most that can be sent is {}.",
-            in_mib(size),
-            in_mib(ceiling)
+            crate::utils::format_size(size),
+            crate::utils::format_size(ceiling)
         )
     })
-}
-
-/// A byte count as a person reads one.
-///
-/// MiB rather than MB, because the number above it is a power of two and the
-/// two are not the same: 64 MiB printed as "64.0 MB" understates the ceiling
-/// by three megabytes, which matters exactly when somebody is looking at this
-/// sentence to decide whether a file will fit.
-fn in_mib(bytes: u64) -> String {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a figure printed to one decimal place; the exact byte count is not the point"
-    )]
-    let mib = bytes as f64 / (1024.0 * 1024.0);
-    format!("{mib:.1} MiB")
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -291,6 +290,10 @@ mod imp {
 
         let bytes =
             std::fs::read(path).map_err(|e| format!("{file_name} could not be read: {e}"))?;
+        // Counted once it is really here, and against what was read rather
+        // than against what the metadata promised: a file being appended to
+        // between the `stat` and the read is the difference.
+        budget.took(bytes.len() as u64);
         Ok(Picked {
             mime_type: super::mime_for_name(&file_name).to_string(),
             file_name,
@@ -349,19 +352,24 @@ mod imp {
                 }
 
                 match JsFuture::from(file.array_buffer()).await {
-                    Ok(buffer) => chosen.files.push(Picked {
-                        // The browser's own answer, and this table only where
-                        // it declined to give one: `File.type` is empty for
-                        // every type the agent does not recognise.
-                        mime_type: match file.type_() {
-                            declared if declared.is_empty() => {
-                                super::mime_for_name(&file_name).to_string()
-                            }
-                            declared => declared,
-                        },
-                        bytes: Uint8Array::new(&buffer).to_vec(),
-                        file_name,
-                    }),
+                    Ok(buffer) => {
+                        let bytes = Uint8Array::new(&buffer).to_vec();
+                        // Counted once it is really here; see `Budget`.
+                        budget.took(bytes.len() as u64);
+                        chosen.files.push(Picked {
+                            // The browser's own answer, and this table only where
+                            // it declined to give one: `File.type` is empty for
+                            // every type the agent does not recognise.
+                            mime_type: match file.type_() {
+                                declared if declared.is_empty() => {
+                                    super::mime_for_name(&file_name).to_string()
+                                }
+                                declared => declared,
+                            },
+                            bytes,
+                            file_name,
+                        });
+                    }
                     Err(e) => chosen
                         .refused
                         .push(format!("{file_name} could not be read ({e:?}).")),
@@ -454,7 +462,9 @@ mod tests {
         let quarter = SELECTION_BUDGET_BYTES / 4;
         let mut budget = Budget::default();
         assert!(budget.refuse("um.jpg", quarter).is_none());
+        budget.took(quarter);
         assert!(budget.refuse("dois.jpg", quarter).is_none());
+        budget.took(quarter);
         // Half the budget is left, so the film does not fit — and it says so
         // by name rather than being dropped.
         let refusal = budget
@@ -464,9 +474,27 @@ mod tests {
         // And the photo after it still does: a refusal is about the file that
         // did not fit, not the end of the selection.
         assert!(budget.refuse("tres.jpg", quarter).is_none());
+        budget.took(quarter);
         // Exactly full is not over.
         assert!(budget.refuse("quatro.jpg", quarter).is_none());
+        budget.took(quarter);
         assert!(budget.refuse("cinco.jpg", 1).is_some());
+    }
+
+    /// Asking is not taking. A file whose length fits can still fail to be
+    /// read, and charging it at the question would hold budget for bytes
+    /// nobody holds — refusing the files after it to make room for one that
+    /// is not there.
+    #[test]
+    fn a_file_that_could_not_be_read_holds_no_budget() {
+        let mut budget = Budget::default();
+        let whole = SELECTION_BUDGET_BYTES;
+        // Asked about, and then not taken, which is what a failed read does.
+        assert!(budget.refuse("ilegivel.jpg", whole).is_none());
+        // So the whole budget is still there for the next one.
+        assert!(budget.refuse("praia.jpg", whole).is_none());
+        budget.took(whole);
+        assert!(budget.refuse("outra.jpg", 1).is_some());
     }
 
     /// The other length that cannot become a message: a recipient handed an
