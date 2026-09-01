@@ -27,45 +27,29 @@ use crate::state::{Change, StateHub};
 /// Deliberately narrower than [`oxidezap_ipc::ClientRequest`]: requests the
 /// session has no part in (a snapshot, a window) never reach here, so this
 /// enum is exactly the set of actions that touch the account.
+///
+/// Where a request and an action carry the same fields they carry the *same
+/// struct* — the ones `oxidezap_ipc` declares — and the server moves it across
+/// rather than copying it out field by field into a second spelling nothing
+/// checked. The variants that are not a move say why in their own right: a
+/// download and a page also carry the id and the connection their answer goes
+/// back on, which are facts about who asked rather than about what was asked,
+/// and an `Outbox` could not go on a wire in any case. That difference is the
+/// reason this enum exists at all, so it stays spelled out here rather than
+/// being folded into the shared payload.
 #[derive(Debug)]
 pub enum Action {
-    SendText {
-        jid: String,
-        text: String,
-        local_id: Option<String>,
-        /// The message being replied to, when this is a reply.
-        quoted: Option<oxidezap_core::QuotedMessage>,
-    },
-    SendAudio {
-        jid: String,
-        /// Cache key the client wrote the encoded audio under.
-        upload: String,
-        duration_secs: u32,
-        waveform: Vec<u8>,
-        local_id: Option<String>,
-        quoted: Option<oxidezap_core::QuotedMessage>,
-    },
-    MarkRead {
-        jid: String,
-        /// The preview the requester holds for this chat, by id. See
-        /// [`oxidezap_ipc::ClientRequest::MarkRead`].
-        through_message_id: Option<String>,
-    },
-    MarkStatusWatched {
-        /// The updates the reader has looked at. See
-        /// [`oxidezap_ipc::ClientRequest::MarkStatusWatched`].
-        message_ids: Vec<String>,
-    },
-    Typing {
-        jid: String,
-        composing: bool,
-    },
+    SendText(oxidezap_ipc::SendText),
+    SendAudio(oxidezap_ipc::SendAudio),
+    MarkRead(oxidezap_ipc::MarkRead),
+    MarkStatusWatched(oxidezap_ipc::MarkStatusWatched),
+    Typing(oxidezap_ipc::Typing),
     Call(CallAction),
     /// Fetch media and answer on `answer_to` rather than through the command's
     /// own reply, which resolves in microseconds while this takes seconds.
     Download {
         id: RequestId,
-        media: Box<oxidezap_core::DownloadableMedia>,
+        request: oxidezap_ipc::Download,
         answer_to: Outbox,
     },
     /// Reload the whole history, for a front end that has just attached and
@@ -81,16 +65,13 @@ pub enum Action {
     /// in one front end's view of one conversation.
     LoadMessages {
         id: RequestId,
-        jid: String,
-        before: Option<PageCursor>,
-        limit: Option<u32>,
+        request: oxidezap_ipc::LoadMessages,
         answer_to: Outbox,
     },
     /// One page of the chat list, answered on `answer_to`.
     LoadChats {
         id: RequestId,
-        after: Option<PageCursor>,
-        limit: Option<u32>,
+        request: oxidezap_ipc::LoadChats,
         answer_to: Outbox,
     },
     /// Wipe local state so the user can pair again. The daemon owns the store
@@ -121,7 +102,7 @@ impl Action {
             Self::ReloadHistory
                 | Self::RefreshVideo
                 | Self::ForgetSession
-                | Self::MarkStatusWatched { .. }
+                | Self::MarkStatusWatched(_)
                 | Self::LoadMessages { .. }
                 | Self::LoadChats { .. }
         )
@@ -754,7 +735,7 @@ impl Bridge {
         reply: tokio::sync::oneshot::Sender<CommandOutcome>,
     ) -> Option<(Action, tokio::sync::oneshot::Sender<CommandOutcome>)> {
         match action {
-            Action::MarkStatusWatched { message_ids } => {
+            Action::MarkStatusWatched(oxidezap_ipc::MarkStatusWatched { message_ids }) => {
                 // The other actions are finished when the session has taken
                 // them and what the network makes of them arrives later; this
                 // one *is* the write, there is no retry, and the answer is the
@@ -776,9 +757,7 @@ impl Bridge {
             }
             Action::LoadMessages {
                 id,
-                jid,
-                before,
-                limit,
+                request: oxidezap_ipc::LoadMessages { jid, before, limit },
                 answer_to,
             } => {
                 // Before the call, not after it: `load_messages` spawns the
@@ -854,8 +833,7 @@ impl Bridge {
             }
             Action::LoadChats {
                 id,
-                after,
-                limit,
+                request: oxidezap_ipc::LoadChats { after, limit },
                 answer_to,
             } => {
                 // As above: the permit is what decides whether the query
@@ -947,12 +925,12 @@ impl Bridge {
         }
 
         match action {
-            Action::SendText {
+            Action::SendText(oxidezap_ipc::SendText {
                 jid,
                 text,
                 local_id,
                 quoted,
-            } => {
+            }) => {
                 let Some(permit) = self.permit() else {
                     return too_busy();
                 };
@@ -972,14 +950,14 @@ impl Bridge {
                 );
                 CommandOutcome::Accepted
             }
-            Action::SendAudio {
+            Action::SendAudio(oxidezap_ipc::SendAudio {
                 jid,
                 upload,
                 duration_secs,
                 waveform,
                 local_id,
                 quoted,
-            } => {
+            }) => {
                 // Through the cache, not the socket: a voice note is the one
                 // thing a client sends that is too big for a frame. Taken
                 // rather than read: the client wrote it directly, so its bytes
@@ -1006,17 +984,17 @@ impl Bridge {
                 );
                 CommandOutcome::Accepted
             }
-            Action::MarkRead {
+            Action::MarkRead(oxidezap_ipc::MarkRead {
                 jid,
                 through_message_id,
-            } => self.mark_read(client, &jid, through_message_id.as_deref()),
+            }) => self.mark_read(client, &jid, through_message_id.as_deref()),
             // Answered from a task of its own. See `begin_slow`.
-            Action::MarkStatusWatched { .. }
+            Action::MarkStatusWatched(_)
             | Action::LoadMessages { .. }
             | Action::LoadChats { .. } => {
                 CommandOutcome::Refused("a store read reached the wrong path".to_string())
             }
-            Action::Typing { jid, composing } => {
+            Action::Typing(oxidezap_ipc::Typing { jid, composing }) => {
                 if composing {
                     client.send_composing(&jid);
                 } else {
@@ -1147,7 +1125,7 @@ impl Bridge {
             }
             Action::Download {
                 id,
-                media,
+                request: oxidezap_ipc::Download { media },
                 answer_to,
             } => self.download(client, id, *media, answer_to),
             Action::ReloadHistory => {

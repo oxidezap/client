@@ -811,51 +811,20 @@ async fn handle_request(
         // A second hello is harmless but says nothing; acknowledging keeps the
         // rule that every request gets exactly one answer.
         ClientRequest::Hello { .. } => acted(Ok(())),
-        ClientRequest::SendText {
-            jid,
-            text,
-            local_id,
-            quoted,
-        } => acted(
-            dispatch(
-                hub,
-                commands,
-                Action::SendText {
-                    jid,
-                    text,
-                    local_id,
-                    quoted,
-                },
-            )
-            .await,
-        ),
-        ClientRequest::SendAudio {
-            jid,
-            upload,
-            duration_secs,
-            waveform,
-            local_id,
-            quoted,
-        } => acted(
-            dispatch(
-                hub,
-                commands,
-                Action::SendAudio {
-                    jid,
-                    upload,
-                    duration_secs,
-                    waveform,
-                    local_id,
-                    quoted,
-                },
-            )
-            .await,
-        ),
-        ClientRequest::Typing { jid, composing } => {
-            acted(dispatch(hub, commands, Action::Typing { jid, composing }).await)
+        // The payload moves rather than being unpacked and rebuilt: the
+        // request and the action carry the same struct, so there is nothing
+        // here for a field to be dropped from.
+        ClientRequest::SendText(request) => {
+            acted(dispatch(hub, commands, Action::SendText(request)).await)
+        }
+        ClientRequest::SendAudio(request) => {
+            acted(dispatch(hub, commands, Action::SendAudio(request)).await)
+        }
+        ClientRequest::Typing(request) => {
+            acted(dispatch(hub, commands, Action::Typing(request)).await)
         }
         ClientRequest::Call(action) => acted(dispatch(hub, commands, Action::Call(action)).await),
-        ClientRequest::Download { media } => {
+        ClientRequest::Download(request) => {
             // The only request that needs an id rather than merely carrying
             // one: its answer arrives seconds later, on a channel shared with
             // every other download this client asked for.
@@ -881,7 +850,7 @@ async fn handle_request(
                 commands,
                 Action::Download {
                     id,
-                    media,
+                    request,
                     answer_to: outbox.clone(),
                 },
             )
@@ -895,7 +864,7 @@ async fn handle_request(
         // Answered with the page under this id, like a download and for the
         // same reason: the rows are the answer rather than an
         // acknowledgement, so only a refusal is answered here.
-        ClientRequest::LoadMessages { jid, before, limit } => {
+        ClientRequest::LoadMessages(request) => {
             let Some(id) = id else {
                 return Answer::frame(always(
                     None,
@@ -912,9 +881,7 @@ async fn handle_request(
                 commands,
                 Action::LoadMessages {
                     id,
-                    jid,
-                    before,
-                    limit,
+                    request,
                     answer_to: outbox.clone(),
                 },
             )
@@ -924,7 +891,7 @@ async fn handle_request(
                 Err(error) => Answer::frame(always(Some(id), error_frame(Some(id), error))),
             }
         }
-        ClientRequest::LoadChats { after, limit } => {
+        ClientRequest::LoadChats(request) => {
             let Some(id) = id else {
                 return Answer::frame(always(
                     None,
@@ -941,8 +908,7 @@ async fn handle_request(
                 commands,
                 Action::LoadChats {
                     id,
-                    after,
-                    limit,
+                    request,
                     answer_to: outbox.clone(),
                 },
             )
@@ -953,22 +919,11 @@ async fn handle_request(
             }
         }
         ClientRequest::ForgetSession => acted(dispatch(hub, commands, Action::ForgetSession).await),
-        ClientRequest::MarkRead {
-            jid,
-            through_message_id,
-        } => acted(
-            dispatch(
-                hub,
-                commands,
-                Action::MarkRead {
-                    jid,
-                    through_message_id,
-                },
-            )
-            .await,
-        ),
-        ClientRequest::MarkStatusWatched { message_ids } => {
-            acted(dispatch(hub, commands, Action::MarkStatusWatched { message_ids }).await)
+        ClientRequest::MarkRead(request) => {
+            acted(dispatch(hub, commands, Action::MarkRead(request)).await)
+        }
+        ClientRequest::MarkStatusWatched(request) => {
+            acted(dispatch(hub, commands, Action::MarkStatusWatched(request)).await)
         }
         // Measured here rather than by the client: the daemon is the only
         // process that opens the store or writes the media cache, so a front
@@ -1423,12 +1378,12 @@ mod tests {
         let hub = connected_hub();
         let (commands, taken) = bridge(CommandOutcome::Accepted);
 
-        let request = bare(ClientRequest::SendText {
+        let request = bare(ClientRequest::SendText(oxidezap_ipc::SendText {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
             local_id: None,
             quoted: None,
-        });
+        }));
         let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
@@ -1437,7 +1392,8 @@ mod tests {
         assert!(!answer.shutdown);
         assert!(matches!(
             taken.await.unwrap(),
-            Some(Action::SendText { jid, text, .. }) if jid == "a@s.whatsapp.net" && text == "hi"
+            Some(Action::SendText(oxidezap_ipc::SendText { jid, text, .. }))
+                if jid == "a@s.whatsapp.net" && text == "hi"
         ));
     }
 
@@ -1452,10 +1408,10 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::Refused("has moved on".into()));
 
-        let request = bare(ClientRequest::MarkRead {
+        let request = bare(ClientRequest::MarkRead(oxidezap_ipc::MarkRead {
             jid: "a@s.whatsapp.net".into(),
             through_message_id: None,
-        });
+        }));
         let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
@@ -1474,12 +1430,12 @@ mod tests {
         let hub = connected_hub();
         let (commands, _taken) = bridge(CommandOutcome::NoSession("not connected".into()));
 
-        let request = bare(ClientRequest::SendText {
+        let request = bare(ClientRequest::SendText(oxidezap_ipc::SendText {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
             local_id: None,
             quoted: None,
-        });
+        }));
         let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
@@ -1499,12 +1455,12 @@ mod tests {
         let hub = StateHub::new();
         let (commands, taken) = bridge(CommandOutcome::Accepted);
 
-        let request = bare(ClientRequest::SendText {
+        let request = bare(ClientRequest::SendText(oxidezap_ipc::SendText {
             jid: "a@s.whatsapp.net".into(),
             text: "hi".into(),
             local_id: None,
             quoted: None,
-        });
+        }));
         let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(
             parse(answer.frame),
@@ -1874,18 +1830,18 @@ mod tests {
         // A view is one local row and no stanza, over history a disconnected
         // window can still read — and the ring it watched is already drawn.
         assert!(
-            !Action::MarkStatusWatched {
+            !Action::MarkStatusWatched(oxidezap_ipc::MarkStatusWatched {
                 message_ids: vec!["3EB0".into()],
-            }
+            })
             .needs_network()
         );
         assert!(
-            Action::SendText {
+            Action::SendText(oxidezap_ipc::SendText {
                 jid: "a@s.whatsapp.net".into(),
                 text: "hi".into(),
                 local_id: None,
                 quoted: None,
-            }
+            })
             .needs_network()
         );
     }
@@ -1901,12 +1857,12 @@ mod tests {
 
         let request = Request {
             id: Some(42),
-            request: ClientRequest::SendText {
+            request: ClientRequest::SendText(oxidezap_ipc::SendText {
                 jid: "a@s.whatsapp.net".into(),
                 text: "hi".into(),
                 local_id: Some("local_1".into()),
                 quoted: None,
-            },
+            }),
         };
         let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox()).await;
         assert!(matches!(

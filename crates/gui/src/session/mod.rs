@@ -78,6 +78,12 @@ use std::sync::{Arc, Mutex};
 use log::error;
 use oxidezap_core::{CallState, Chat, ChatMessage, DownloadableMedia, QuotedMessage, UiEvent};
 use oxidezap_ipc::{CallAction, ClientRequest, Link, PageCursor, Request, RequestId};
+// The payload structs the protocol declares, named rather than glob-imported
+// so `Typing` and `Download` read at the call site as what they are: the
+// request's own payload, built here and moved onto the wire unchanged.
+use oxidezap_ipc::{
+    Download, LoadChats, LoadMessages, MarkRead, MarkStatusWatched, SendAudio, SendText, Typing,
+};
 use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
 
@@ -644,12 +650,12 @@ impl Session {
         quoted: Option<QuotedMessage>,
     ) {
         self.ask(
-            ClientRequest::SendText {
+            ClientRequest::SendText(SendText {
                 jid: jid.to_string(),
                 text: text.to_string(),
                 local_id: Some(local_id.clone()),
                 quoted,
-            },
+            }),
             Awaiting::Send {
                 chat_jid: jid.to_string(),
                 local_id,
@@ -671,14 +677,14 @@ impl Session {
         // sends that does not belong in a frame. The key is the local id,
         // which is already unique per recording.
         let upload = oxidezap_ipc::staged_key(&sanitize(&local_id));
-        let request = ClientRequest::SendAudio {
+        let request = ClientRequest::SendAudio(SendAudio {
             jid: jid.to_string(),
             upload: upload.clone(),
             duration_secs,
             waveform,
             local_id: Some(local_id.clone()),
             quoted,
-        };
+        });
         // Reserved before the payload is staged and sent after it lands. The
         // id is taken in the order the person acted in, which a reservation
         // made later would not be; the *frame* waits, because the daemon
@@ -762,10 +768,10 @@ impl Session {
     }
 
     fn typing(&self, jid: &str, composing: bool) {
-        self.tell(ClientRequest::Typing {
+        self.tell(ClientRequest::Typing(Typing {
             jid: jid.to_string(),
             composing,
-        });
+        }));
     }
 
     /// Mark a chat read up to the message the UI is looking at.
@@ -776,10 +782,10 @@ impl Session {
     /// holds, and the daemon refuses anything else — a read is irreversible
     /// and must not reach past what the user has seen.
     pub fn mark_chat_read(&self, jid: &str, through_message_id: Option<String>) {
-        self.tell(ClientRequest::MarkRead {
+        self.tell(ClientRequest::MarkRead(MarkRead {
             jid: jid.to_string(),
             through_message_id,
-        });
+        }));
     }
 
     /// Ask the daemon to republish the history it holds.
@@ -814,14 +820,14 @@ impl Session {
     /// way, and only an answer releases it.
     pub fn load_messages(&self, jid: String, before: Option<PageCursor>) {
         self.ask(
-            ClientRequest::LoadMessages {
+            ClientRequest::LoadMessages(LoadMessages {
                 jid: jid.clone(),
                 before,
                 // The daemon's own page size, which is the one number that
                 // has to match the store's indexes: a front end with an
                 // opinion about it would be guessing.
                 limit: None,
-            },
+            }),
             Awaiting::Page { jid: Some(jid) },
         );
     }
@@ -829,7 +835,7 @@ impl Session {
     /// Ask for one page of the chat list, after `after`.
     pub fn load_chats(&self, after: Option<PageCursor>) {
         self.ask(
-            ClientRequest::LoadChats { after, limit: None },
+            ClientRequest::LoadChats(LoadChats { after, limit: None }),
             Awaiting::Page { jid: None },
         );
     }
@@ -839,9 +845,9 @@ impl Session {
             return;
         }
         self.ask(
-            ClientRequest::MarkStatusWatched {
+            ClientRequest::MarkStatusWatched(MarkStatusWatched {
                 message_ids: message_ids.clone(),
-            },
+            }),
             Awaiting::StatusView { message_ids },
         );
     }
@@ -1007,9 +1013,9 @@ impl Session {
     ) -> oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, String>> {
         let (tx, rx) = oneshot::channel();
         self.ask(
-            ClientRequest::Download {
+            ClientRequest::Download(Download {
                 media: Box::new(media),
-            },
+            }),
             Awaiting::Download(tx),
         );
         rx
