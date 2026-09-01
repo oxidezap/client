@@ -722,9 +722,16 @@ async fn attach(
     // same defect as an unanswered permission prompt — so a slow resolve is
     // not read as anything: the deadline lets setup carry on, and the ticks
     // wait for readiness as they already do.
-    let playing = element
-        .play()
-        .map_err(|e| anyhow!("the camera preview would not start: {}", describe(&e)))?;
+    let playing = match element.play() {
+        Ok(playing) => playing,
+        Err(e) => {
+            // The element is in the document by now, so this exit has to take
+            // it down itself: `ElementGuard` only covers the failures *after*
+            // this function returns one.
+            release_element(&element);
+            bail!("the camera preview would not start: {}", describe(&e));
+        }
+    };
     let refused = futures_lite::future::or(
         async {
             wasm_bindgen_futures::JsFuture::from(playing)
