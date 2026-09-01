@@ -14,6 +14,12 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
+/// The same three verbs over HTTP, for the front end that shares no
+/// filesystem with the daemon. Native only: a page's own daemon hands its
+/// bytes over in memory, and there is no port to serve them on.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod http;
+
 /// The orphan sweep, called by the daemon at startup as well as from the
 /// repair below. Native only: a page has no directory to walk.
 #[cfg(not(target_family = "wasm"))]
