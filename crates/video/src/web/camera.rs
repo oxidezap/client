@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use anyhow::{Result, anyhow, bail};
-use log::{debug, warn};
+use log::{debug, error, warn};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
 
@@ -444,6 +444,11 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
                 let keyframe = chunk.type_() == web_sys::EncodedVideoChunkType::Key;
                 let n = capture.chunks.get().saturating_add(1);
                 capture.chunks.set(n);
+                if keyframe {
+                    capture
+                        .keyframes
+                        .set(capture.keyframes.get().saturating_add(1));
+                }
                 if n == 1 {
                     // The one line that separates "the encoder never answered"
                     // from every fault downstream of it. An encoder that
@@ -459,6 +464,22 @@ pub async fn open_camera(quality: VideoQuality) -> Result<CameraStream> {
                             "not a keyframe"
                         }
                     );
+                    // And whether it is the shape everything downstream
+                    // assumes. The library splits access units on Annex-B
+                    // start codes and yields *nothing* for a buffer without
+                    // one — silently, with no packet and no error — so an
+                    // encoder that ignored `avc.format` would look, from
+                    // every log we have, exactly like a working one whose
+                    // peer cannot see it. AVCC's leading length word is four
+                    // bytes that read almost identically at a glance, which
+                    // is why counting bytes never caught it. One check, once.
+                    if !data.starts_with(&[0, 0, 0, 1]) && !data.starts_with(&[0, 0, 1]) {
+                        error!(
+                            "the encoder is not emitting Annex-B: the first chunk begins \
+                             {:02x?} — the media plane will discard every frame of this call",
+                            &data[..data.len().min(8)]
+                        );
+                    }
                 }
                 // Something is dropped when this queue is full, and *which*
                 // is the whole question — with the opposite answer to the
@@ -831,6 +852,11 @@ const PLAYBACK_GRACE_MS: i32 = 2_000;
 struct Capture {
     submitted: Cell<u64>,
     chunks: Cell<u64>,
+    /// IDRs among those chunks. Counted because one keyframe followed by two
+    /// hundred P-frames and a healthy stream are the same two numbers above,
+    /// and the difference between them is the whole fault this backend had:
+    /// the library drops every non-IDR while a keyframe gate is closed.
+    keyframes: Cell<u64>,
     /// Encoded units that never reached the session, at either hop.
     dropped: Cell<u64>,
     /// One per reason, so a reason is explained the first time it bites and
@@ -854,8 +880,10 @@ impl Capture {
     /// without this — and are three unrelated faults.
     fn report(&self) {
         debug!(
-            "the camera encoded {} chunk(s) from {} submitted frame(s), {} dropped on the way out",
+            "the camera encoded {} chunk(s) ({} keyframe(s)) from {} submitted frame(s), \
+             {} dropped on the way out",
             self.chunks.get(),
+            self.keyframes.get(),
             self.submitted.get(),
             self.dropped.get()
         );
@@ -889,6 +917,8 @@ fn tick(
     // early, and a tick that arrives before its frame is due does nothing.
     let period_ms = MILLIS_PER_SECOND / f64::from(quality.fps.max(1));
     let due = Rc::new(Cell::new(f64::NEG_INFINITY));
+    /// Frames since the last one that asked for an IDR; see the cadence below.
+    let keyed = Rc::new(Cell::new(0u64));
     let complained = Rc::new(RefCell::new(false));
     Closure::<dyn FnMut()>::new(move || {
         if encoder.state() != web_sys::CodecState::Configured {
@@ -949,7 +979,18 @@ fn tick(
             }
         };
         let options = web_sys::VideoEncoderEncodeOptions::new();
-        let wanted_key = control.0.keyframe.replace(false);
+        // Asked for on a cadence as well as on request, which is not belt and
+        // braces: it is the contract the desktop backend has always met and
+        // this one did not. The library drops every access unit that is not
+        // an IDR while one of its keyframe gates is closed, raises those
+        // gates on backpressure and on a relay reconnect, and asks for a
+        // keyframe by publishing an event — so a backend that only ever emits
+        // a requested IDR sends nothing at all for the rest of the call the
+        // first time such a request is missed. See `KEYFRAME_SECONDS`.
+        let since_key = keyed.get().saturating_add(1);
+        let due_a_key = since_key >= u64::from(quality.fps.max(1) * crate::KEYFRAME_SECONDS);
+        let wanted_key = control.0.keyframe.replace(false) || due_a_key;
+        keyed.set(if wanted_key { 0 } else { since_key });
         options.set_key_frame(wanted_key);
         if let Err(e) = encoder.encode_with_options(&frame, &options) {
             // The ask outlives the frame it was made of. This encoder is

@@ -573,6 +573,30 @@ impl CallRegistry {
         true
     }
 
+    /// Tell the peer this side is sending video, on a call that always was.
+    ///
+    /// A video-from-start call describes its video in the `<offer>` and then
+    /// says nothing more, and for a long time that looked complete: the plane
+    /// is enabled ungated, the encoder runs, and the packets go out. The peer
+    /// still shows nothing, because the offer is a *capability* and the
+    /// receiving side brings its video stream up off an *announcement* — the
+    /// official client's own decoder is driven by `handle_peer_video_enabled`
+    /// and `update_video_info`, both fed by `<video state=…>` and neither by
+    /// the offer. Android duly told us its direction (`state="11"`, then
+    /// `state="0"` when nothing answered) and never opened a pane for ours.
+    ///
+    /// Only ever "1": this says which direction *we* are sending, and a call
+    /// that offered video is sending from the moment the peer accepts. A
+    /// mid-call camera goes through `start_video`, which announces already.
+    pub(in crate::whatsapp) async fn announce_our_video(&self, call_id: &str) {
+        let Some(handle) = self.live(call_id) else {
+            return;
+        };
+        if let Err(e) = handle.announce_video_enabled().await {
+            warn!("Call {call_id}: could not announce our video direction: {e}");
+        }
+    }
+
     /// Whether this side's camera is on for this call.
     fn camera_on(&self, call_id: &str) -> bool {
         self.calls
@@ -1741,6 +1765,48 @@ impl WhatsAppClient {
                     } if reports_video && feedback.iter().any(reports_loss) => {
                         calls.ask_for_keyframe(&call_id);
                     }
+                    // The library asking for the one thing only the encoder
+                    // can produce, and for a long time nobody answered.
+                    //
+                    // Two gates inside the engine and the driver drop *every*
+                    // access unit that is not an IDR while they are closed —
+                    // and both close on ordinary events: backpressure shedding
+                    // a queued unit, a relay reconnect, a group epoch, an
+                    // inbound PLI. This event is the only notice either gate
+                    // gives. Unanswered, outbound video stops for the rest of
+                    // the call, which is exactly what production showed: 276
+                    // access units encoded, 269 accepted by the media plane,
+                    // and not one picture at the peer.
+                    //
+                    // The desktop hid it, which is why it lasted: openh264 is
+                    // configured with a periodic IDR, so every gate reopened
+                    // within three seconds whether or not anyone listened. The
+                    // browser's encoder had no such cadence — it does now, and
+                    // this arm is still the correct fix, because a cadence
+                    // makes recovery take seconds where an answer makes it
+                    // take one frame.
+                    CallEvent::VideoKeyframeNeeded => {
+                        debug!("call {call_id}: the media plane asked for a keyframe");
+                        calls.ask_for_keyframe(&call_id);
+                    }
+                    // The driver saying it threw our media away. A discarded
+                    // access unit is a gap every later frame references, so
+                    // this is a keyframe request in all but name — and it is
+                    // the line that says whether a call losing video is losing
+                    // it here or somewhere with no account of itself.
+                    CallEvent::OutboundMediaDropped {
+                        video_access_units,
+                        packets,
+                    } => {
+                        if video_access_units > 0 {
+                            warn!(
+                                "call {call_id}: the media plane dropped {video_access_units} \
+                                 outbound video access unit(s) ({packets} packet(s)); asking for \
+                                 a keyframe"
+                            );
+                            calls.ask_for_keyframe(&call_id);
+                        }
+                    }
                     // The reason the call is about to end, and the only
                     // place it is ever said. `wait_ended` fires right behind
                     // this, so a call whose media never came up otherwise
@@ -1901,7 +1967,7 @@ fn reports_loss(feedback: &whatsapp_rust::wacore::voip::rtcp::RtcpFeedback) -> b
 /// far side: an upgrade holds our video off the wire until the peer accepts,
 /// so the accept is the first moment they have anywhere to put it — and what
 /// they receive from there references units encoded while nobody was
-/// listening. Our encoder emits an IDR every few seconds on its own, so
+/// listening. Both encoders emit an IDR every few seconds on their own, so
 /// without this the picture arrives when it arrives, which is a peer looking
 /// at a blank pane for up to a GOP after answering.
 ///

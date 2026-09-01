@@ -88,6 +88,23 @@ pub struct VideoQuality {
 /// The 90 kHz clock every H.264 RTP profile counts in.
 const VIDEO_CLOCK_RATE: u32 = 90_000;
 
+/// How often a keyframe goes out regardless of what anyone asked for.
+///
+/// **Both backends owe this, and it is not a quality setting.** The library
+/// drops every access unit that is not an IDR while any of its keyframe gates
+/// is closed — the engine's `keyframe_required` and the driver's send gate,
+/// which backpressure and a relay reconnect both raise — and its own retry
+/// logic is written against an encoder that produces one anyway ("the
+/// encoder's own periodic IDR reached the wire while the request was
+/// waiting"). A backend with no periodic IDR therefore stops sending video
+/// permanently the first time a gate closes, which is what a browser call
+/// did: 276 access units encoded, 269 accepted by the media plane, and not
+/// one picture at the peer.
+///
+/// Long enough not to dominate the bitrate, short enough that a peer whose
+/// recovery request was lost is not left staring at a frozen frame.
+pub(crate) const KEYFRAME_SECONDS: u32 = 3;
+
 /// What WhatsApp Web itself offers on a desktop: Constrained Baseline at
 /// 720p20, a shade under 2 Mbps.
 const DEFAULT_WIDTH: u32 = 1280;
