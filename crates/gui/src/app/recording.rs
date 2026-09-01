@@ -214,11 +214,15 @@ impl WhatsAppApp {
     ///
     /// Preparing it — the resample to 16 kHz and the envelope — is the same
     /// pure Rust on both platforms and the expensive half, so on both it goes
-    /// to the background executor, which on a page is a real worker. What the
-    /// two arms disagree about is only where the *codec* lives: a desktop's
-    /// is libopus and follows the preparation onto the same worker, while a
-    /// browser's is an `AudioEncoder` that cannot leave the window, so the
-    /// prepared note goes back to it and the encoded one is awaited here.
+    /// to the background executor. On a page that is a `wasm_thread` worker
+    /// where the browser gives `gpui_web` the shared memory to make one, and
+    /// a `setTimeout(0)` back onto the loop where it does not — a yield
+    /// rather than a worker, which is still not the window's current frame.
+    /// What the two arms disagree about is only where the *codec* lives: a
+    /// desktop's is libopus and follows the preparation onto the same worker,
+    /// while a browser's is an `AudioEncoder` that cannot leave the window,
+    /// so the prepared note goes back to it and the encoded one is awaited
+    /// here.
     ///
     /// The minimum-duration guard stays at the end rather than moving up in
     /// front of the encode, though both arms now know the length before they

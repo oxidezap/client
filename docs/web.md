@@ -313,14 +313,18 @@ body through `HttpClient::execute` these days, which is the one method
 a daemon over the bridge, the tab holding the account, its own session — have
 somewhere to send a note.
 
-What `stop` hands back is the capture, not a note. Resampling to 16 kHz and
-measuring the envelope is the same pure Rust the desktop runs and the
-expensive half of the job, so it goes to `cx.background_spawn` on both
-platforms, which here is a real worker; only `AudioEncoder`, which belongs to
-the document that made it, is awaited on the window. `Recording::Pending` is
-that seam — the capture out, the prepared note in, the encoded note back —
-and it is why a page and a desktop reach `send_voice_note` through one
-`finish` with no `cfg` between them.
+What `stop` hands back is the capture, not a note, and `docs/gotchas.md` has
+why. The part that belongs here is where the preparation actually runs, since
+it is the one step of a voice note this page places differently from a
+desktop and the answer is conditional. `gpui_web`'s dispatcher sends a
+background runnable to a pool of `wasm_thread` workers, but only where
+`SharedArrayBuffer`, a shared module memory and `Atomics.waitAsync` are all
+present — the isolation `web/coi-serviceworker.js` is there to obtain. Where
+any of them is missing it falls back to the main thread, through a
+`setTimeout(0)` rather than inline. So `cx.background_spawn` is a real worker
+in the arrangement this front end is built for and a yield to the event loop
+otherwise, and the resampler is bounded by the ten-minute capture ceiling
+either way: a stall on the worse of the two, never a hang.
 
 A call's video decodes the same way, through the same module, and obeys the
 same stream rules the desktop path does — a decoder born mid-stream waits for
