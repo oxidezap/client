@@ -49,7 +49,31 @@ pub(super) fn range_bound(
 }
 
 /// Extra read-boundary ids kept per chat; overflow drops the oldest entries.
-pub(super) const READ_EXTRA_IDS_CAP: usize = 256;
+const READ_EXTRA_IDS_CAP: usize = 256;
+
+/// Bound the kept ids, dropping the oldest first. The list is unbounded on the
+/// wire — a chat read a keyed second at a time accumulates one entry per
+/// boundary — and the oldest are the safest to lose: they sit furthest below
+/// the watermark, which already covers everything it reaches.
+pub(super) fn cap_read_ids(ids: &mut Vec<String>) {
+    if ids.len() > READ_EXTRA_IDS_CAP {
+        let overflow = ids.len() - READ_EXTRA_IDS_CAP;
+        ids.drain(..overflow);
+    }
+}
+
+/// Encode the kept ids for `chats.read_boundary_ids`. An empty list — and a
+/// list that somehow refuses to serialize — is stored as NULL, which
+/// [`read_state`] reads back as no extra coverage.
+///
+/// Separate from [`cap_read_ids`] on purpose: a caller that has not yet
+/// decided to write must be able to cap and compare without paying for the
+/// encode, which on a stale replay would be pure waste.
+pub(super) fn encode_read_ids(ids: &[String]) -> Option<String> {
+    (!ids.is_empty())
+        .then(|| serde_json::to_string(ids).ok())
+        .flatten()
+}
 
 /// The chat's materialized self-read state: everything at or below the
 /// watermark is read, plus the explicitly-named ids — boundary-instant/keyed
@@ -125,16 +149,11 @@ pub(super) fn advance_read_state(
             state.extra_ids.retain(|id| !implied.contains(id));
         }
     }
-    if state.extra_ids.len() > READ_EXTRA_IDS_CAP {
-        let overflow = state.extra_ids.len() - READ_EXTRA_IDS_CAP;
-        state.extra_ids.drain(..overflow);
-    }
+    cap_read_ids(&mut state.extra_ids);
     if (state.watermark_ms, &state.extra_ids) == (before.0, &before.1) {
         return Ok(None);
     }
-    let ids_json = (!state.extra_ids.is_empty())
-        .then(|| serde_json::to_string(&state.extra_ids).ok())
-        .flatten();
+    let ids_json = encode_read_ids(&state.extra_ids);
     diesel::update(chat_row(device_id, chat))
         .set((
             schema::chats::read_boundary_ms.eq(state.watermark_ms),
@@ -142,6 +161,36 @@ pub(super) fn advance_read_state(
         ))
         .execute(conn)?;
     Ok(Some(state))
+}
+
+/// Recount the badge and clear a manual-unread marker, if the chat carries
+/// one. The write a read still owes when its cursor did not move.
+///
+/// A read that advanced the state recounts the badge outright; this is the
+/// other case — the chat was already read to here (a replayed app-state
+/// action, a re-read on another device) — where the only thing left to undo is
+/// a marker the user set by hand. The filter is what keeps it honest both
+/// ways: a chat without the marker is not written, and a chat with one is
+/// recounted rather than zeroed, since rows may have arrived since the read
+/// this replay is a copy of. Silent when nothing matched, because an
+/// invalidation is a claim that something changed.
+pub(super) fn clear_unread_marker(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    let state = read_state(conn, device_id, chat)?;
+    let unread = count_unread(conn, device_id, chat, &state)?;
+    let cleared = diesel::update(
+        chat_row(device_id, chat).filter(schema::chats::unread_count.eq(UNREAD_MARKER)),
+    )
+    .set(schema::chats::unread_count.eq(unread))
+    .execute(conn)?;
+    if cleared > 0 {
+        cs.chats = true;
+    }
+    Ok(())
 }
 
 /// Incoming rows not covered by the read state.

@@ -19,11 +19,11 @@ use crate::store::history_sync::apply_history_sync;
 use crate::store::inbound::apply_inbound;
 use crate::store::message_rows::{NewMessage, StoredRow, insert_message, message_row};
 use crate::store::read_state::{
-    UNREAD_MARKER, advance_read_state, count_uncovered_incoming, count_unread, range_bound,
-    read_state, set_unread_count,
+    UNREAD_MARKER, advance_read_state, clear_unread_marker, count_uncovered_incoming, count_unread,
+    range_bound, read_state, set_unread_count,
 };
 use crate::store::receipt::apply_receipt;
-use crate::store::writer::ChangeSet;
+use crate::store::writer::{ChangeSet, route_chat};
 
 pub(super) fn apply_event(
     conn: &mut SqliteConnection,
@@ -48,11 +48,7 @@ pub(super) fn apply_event(
         }
         Event::UndecryptableMessage(undec) => {
             let kind = unavailable_kind(undec.unavailable_type).unwrap_or(KIND_UNDECRYPTABLE);
-            let wire = undec.info.source.chat.to_string();
-            let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
-            if chat != wire {
-                cs.message_chats.insert(wire);
-            }
+            let chat = route_chat(conn, device_id, undec.info.source.chat.to_string(), cs)?;
             let sender = undec.info.source.sender.to_string();
             let inserted = insert_message(
                 conn,
@@ -133,6 +129,14 @@ pub(super) fn apply_event(
             cs.chats = true;
             Ok(())
         }
+        // The pin, mute and archive arms hold one shape — derive the value,
+        // read the column, write it only when it is news — over three columns
+        // of three types. Sharing it needs a function generic over diesel's
+        // `Column` with a load bound to match, or an enum naming the three,
+        // and either buys the repetition back as machinery; the half that
+        // actually differs (what the wire value means) is the half worth
+        // reading anyway. `set_unread_count` is the same shape written out for
+        // a fourth column, which is this tree's answer to the question.
         Event::PinUpdate(update) => {
             let pinned_at = update
                 .action
@@ -244,23 +248,10 @@ pub(super) fn apply_event(
                         set_unread_count(conn, device_id, &chat, unread, cs)?;
                     }
                     // Cursor didn't move (re-reading an already-read chat),
-                    // but a read still clears a manual-unread marker.
-                    None => {
-                        let state = read_state(conn, device_id, &chat)?;
-                        let unread = count_unread(conn, device_id, &chat, &state)?;
-                        let cleared = diesel::update(
-                            chat_row(device_id, &chat)
-                                .filter(schema::chats::unread_count.eq(UNREAD_MARKER)),
-                        )
-                        .set(schema::chats::unread_count.eq(unread))
-                        .execute(conn)?;
-                        // A replay of a read this chat already holds writes
-                        // nothing, and the same rule the `ReadSelf` arm keeps
-                        // applies: no write, no reload.
-                        if cleared > 0 {
-                            cs.chats = true;
-                        }
-                    }
+                    // but a read still clears a manual-unread marker — the
+                    // same write, under the same no-write-no-reload rule, that
+                    // the `ReadSelf` receipt owes.
+                    None => clear_unread_marker(conn, device_id, &chat, cs)?,
                 }
             } else {
                 set_unread_count(conn, device_id, &chat, UNREAD_MARKER, cs)?;
