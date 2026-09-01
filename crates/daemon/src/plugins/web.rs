@@ -13,7 +13,13 @@
 //!   it.
 //! * **The approval and a plugin's settings** are small and are read and
 //!   written from inside a synchronous wasm call, so they live in
-//!   `localStorage` — see [`oxidezap_plugin_host::Origin`].
+//!   `localStorage` — see [`Origin`].
+//!
+//! Above those sits this half of the daemon's platform split — `start`,
+//! `reload`, `detach`, `approve` and [`Bridge::ask`], the five things a page
+//! answers differently from a desktop. What they have in common is that a
+//! page has no thread to move work to: `spawn_blocking` there is not a slow
+//! answer but a panic, so everything runs on the one loop the browser lends.
 //!
 //! What replaces `only_this_user_can_write` is the origin itself. There is no
 //! second local account here and no mode to read: an origin's private
@@ -23,6 +29,8 @@
 //! same thing a folder does not answer on a desktop — that the module is the
 //! one the user meant — which is what the approval prompt is for.
 
+use std::sync::Arc;
+
 use js_sys::Uint8Array;
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -31,7 +39,122 @@ use web_sys::{
     FileSystemWritableFileStream,
 };
 
-use oxidezap_plugin_host::{MAX_PLUGINS, Module};
+use oxidezap_plugin_host::{Backing, MAX_PLUGINS, Module, Origin, Outcome, Plugins, Reloaded};
+
+use super::{Bridge, publishing_to};
+use crate::session_bridge::{Action, Commands as SessionCommands, SessionCommand};
+use crate::state::StateHub;
+
+/// See [`super::start`].
+///
+/// A page's plugins come out of its own origin: the modules from OPFS, the
+/// approvals and each plugin's settings from `localStorage`. What a page
+/// gives a plugin instead of a thread is a task on its own loop; see
+/// `oxidezap_plugin_host::sched`. There is nothing to move off a worker here
+/// and nowhere to move it to, so the whole of it is awaited inline.
+pub(super) async fn start(hub: &Arc<StateHub>, commands: SessionCommands) -> Arc<Plugins> {
+    let sink = publishing_to(hub);
+    let modules = installed().await;
+    Arc::new(
+        Plugins::start(
+            modules,
+            Arc::new(Origin::storage()),
+            Arc::new(Bridge { commands }),
+            sink,
+        )
+        .await,
+    )
+}
+
+/// See [`super::reload`].
+pub(super) async fn reload(plugins: &Arc<Plugins>) -> Reloaded {
+    // Handed over as a future rather than as values, and that is not style:
+    // `Origin::storage()` *stamps* the origin's storage, retiring every
+    // handle taken before it. `Plugins::reload` refuses a second reload while
+    // one is running, so gathering these eagerly would let a refused call
+    // retire the handle the surviving generation is about to be installed
+    // with — every approval and settings write refused afterwards, and a
+    // revoked grant left on disk to come back. A future does nothing until it
+    // is polled, which is after the reservation.
+    let host = Arc::clone(plugins);
+    let plugins = &host;
+    plugins
+        .reload(|| async {
+            // `discover` and not `installed`: the fallible one. A folder that
+            // cannot be read is not an empty folder, and treating it as one
+            // here would retire every healthy plugin and publish an empty set
+            // over a transient storage error.
+            let modules = discover().await.ok()?;
+            // And the host is still this account's. `ForgetSession` can land
+            // while that await is suspended, and a page rebuilds its whole
+            // service in the same agent — so by the time this resumes, a
+            // *replacement* host may already hold the newest storage handle.
+            // Taking one here would retire it, and every approval and
+            // settings write the new host makes would be refused until some
+            // later reload happened to succeed. `reload` rechecks too, but
+            // only after the stamp has moved, which is exactly too late.
+            if plugins.is_retired() {
+                return None;
+            }
+            // And the fresh handle only once there is something to install
+            // with it: taking one retires every older handle, so a scan that
+            // failed would leave the running generation writing through a
+            // store it no longer owns.
+            let state: Arc<dyn Backing> = Arc::new(Origin::storage());
+            Some((modules, state))
+        })
+        .await
+}
+
+/// Where [`super::reload_in_background`] puts its work: the page's own event
+/// loop, which is the only executor there is. Nothing here is `Send`, and
+/// nothing needs to be — the task never leaves the agent that owns it.
+pub(super) fn detach(work: impl std::future::Future<Output = ()> + 'static) {
+    wasm_bindgen_futures::spawn_local(work);
+}
+
+/// See [`super::approve`].
+///
+/// Inline, and there is nowhere else it could go. `spawn_blocking` needs a
+/// blocking pool, and a page's runtime has none — nor could it, since a
+/// browser agent is one thread. What this costs is the write itself, which is
+/// a `localStorage` set: the same call a plugin's own settings already make
+/// from inside a wasm call. `async` with nothing to await, because the
+/// desktop half awaits a blocking thread and one signature serves both.
+pub(super) async fn approve(plugins: &Arc<Plugins>, plugin: String, approved: bool) -> bool {
+    plugins.approve(&plugin, approved)
+}
+
+impl Bridge {
+    /// Hand one action to the session, without waiting for what it made of
+    /// it.
+    ///
+    /// The one place a page's plugin is weaker than a desktop's, and it is
+    /// not a shortcut: the plugin's call is synchronous wasm on the *same*
+    /// agent the bridge runs on, so waiting for the answer would be waiting
+    /// for a task that cannot run until this call returns — a deadlock, not a
+    /// delay. So a page's plugin gets the same "it was taken" a socket front
+    /// end already lives with.
+    ///
+    /// What is still honest here is the refusal: a full command channel is a
+    /// session that will not take this now, and a closed one is no session at
+    /// all. Both are the answers a plugin acts on; only `Refused` for a
+    /// command the daemon would have declined is lost, and that arrives in
+    /// the event stream as it does for every other front end.
+    pub(super) fn ask(&self, action: Action) -> Outcome {
+        use tokio::sync::mpsc::error::TrySendError;
+
+        // Dropped, not awaited. The command is answered on a channel nobody
+        // is listening to, which the bridge already tolerates: every other
+        // sender there is a connection that has gone.
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        match self.commands.try_send(SessionCommand { action, reply }) {
+            Ok(()) => Outcome::Accepted,
+            Err(TrySendError::Full(_)) => Outcome::Refused,
+            Err(TrySendError::Closed(_)) => Outcome::NoSession,
+        }
+    }
+}
 
 /// What the folder is called inside this origin's filesystem.
 ///
