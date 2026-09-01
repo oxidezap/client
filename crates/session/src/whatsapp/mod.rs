@@ -1500,12 +1500,14 @@ impl WhatsAppClient {
             // call in a page, which is the honest answer where there is
             // nowhere to hand work to.
             //
-            // The file goes in and comes back out because the shaping only
-            // borrows it: moving it is free, and it is the alternative to
-            // cloning the bytes to look at them.
+            // The file goes in and comes back out for two reasons: the
+            // shaping only borrows it, so moving it is free where cloning the
+            // bytes to look at them is not — and it may not be the same file
+            // coming back, because a picture in a format the recipient will
+            // not draw is re-encoded there.
             let (shape, mut file) =
-                match crate::exec::unblock(move || (outgoing::Shape::of(&file), file)).await {
-                    Ok(shaped) => shaped,
+                match crate::exec::unblock(move || outgoing::prepare(file)).await {
+                    Ok(prepared) => prepared,
                     Err(e) => {
                         // The executor is going away, which is the session
                         // shutting down. Reported rather than dropped: the bubble

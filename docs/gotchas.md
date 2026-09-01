@@ -201,6 +201,20 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   bubble, once to describe it) and would put a thumbnail in a
   newline-delimited JSON frame, which is the thing `staged_key` exists to
   avoid.
+  A picture is also *re-encoded* there, and that is the second thing the two
+  places are split over. A photo message is expected to carry a photo format,
+  and the expectation is the recipient's rather than this tree's: WhatsApp's
+  own clients re-encode everything they send to JPEG, so a client written
+  against what it actually receives has never had to decode anything else in
+  that position. A WebP sent from here uploaded, delivered and was marked
+  read, and drew as nothing at all on the recipient's Android — while the
+  browser that sent it drew the same bytes perfectly, which is what makes this
+  a rule about the far end rather than about a decoder. JPEG and PNG go out
+  untouched (a screenshot is a PNG, and re-encoding one is the loss nobody
+  wants); everything else this build can decode becomes a JPEG, at the same
+  dimensions, out of the decode the thumbnail was already paying for. What
+  cannot be decoded goes out as it came, because bytes nothing here can read
+  are bytes nothing here can improve.
   The thumbnail is not a nicety: WhatsApp draws it while the file downloads,
   and this tree draws it too — the store keeps what was sent and hydration
   reads a sent message back through the same `media_of` an arriving one goes

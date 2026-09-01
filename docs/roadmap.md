@@ -180,11 +180,24 @@
   producing one means decoding H.264 inside the process holding the account —
   the decoder is in `oxidezap-video`, which the session already depends on, so
   what is missing is a first-frame path rather than a decoder. And a picture
-  is uploaded at full size, where WhatsApp's own clients re-encode: sending a
-  12 MP photo over a phone connection is what that costs.
+  is uploaded at its own size: a photo whose format the recipient will not
+  draw is re-encoded now, but nothing is *scaled down*, so a 12 MP photo goes
+  over a phone connection at 12 MP, where WhatsApp's own clients would have
+  resized it first.
   The preflight question above is this feature's too, and more so: a photo
   from a page takes exactly the route a voice note takes, and there are more
   of them.
+
+- **An animated picture arrives as its first frame.** A photo message carries
+  a photo, so an animated GIF or WebP is decoded, flattened and re-encoded as
+  a still JPEG like any other picture whose format the other side will not
+  draw. It is an improvement on what it replaced — the animation was not
+  playing before either, it simply rendered as nothing — but it is not what
+  the sender meant. WhatsApp's own clients send motion as a *video* with
+  `gifPlayback` set, which is the shape this wants; what stands in the way is
+  an encoder, since nothing in this tree writes H.264. Sending it as a
+  document instead would keep the file intact and lose the inline preview,
+  which is the other half of the trade and is why neither is done yet.
 
 - **A video with B-frames is stamped in the wrong order.** `stamp_of` labels
   each access unit with its decode-order index, and `collect` reads that label
