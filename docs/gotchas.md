@@ -21,7 +21,7 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   who is on the other end either way — a peer uid on the socket, the serving
   process's token SID on the pipe.
   Two more transports joined them rather than becoming new places:
-  `endpoint/web.rs` and `listener/web.rs` are a WebSocket, because a page can
+  `endpoint/web/` and `listener/web/` are a WebSocket, because a page can
   open neither of the others, and `endpoint/tab.rs` and `listener/tab.rs` are
   a `BroadcastChannel` between two tabs of one origin — the tab holding the
   account serving the tabs that do not, which is the same daemon-and-front-end
