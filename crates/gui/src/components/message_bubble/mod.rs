@@ -31,6 +31,7 @@ use quote::render_quote;
 use reactions::{render_hover_actions, render_reactions};
 
 use crate::app::{BubbleIds, CopyMessage, ReplyToMessage, RetryMessage, WhatsAppApp};
+use crate::components::parts;
 use crate::components::{BubbleText, bubble_status_ticks, render_rich_text};
 use crate::responsive::ResponsiveLayout;
 use crate::theme::{ActiveProductTheme as _, Metrics};
@@ -380,7 +381,7 @@ fn render_meta(
                 .mix(product.palette.foreground, 0.55),
         )
     } else {
-        product.hsla(product.palette.subtle_foreground)
+        parts::subtle(cx)
     };
 
     h_flex()

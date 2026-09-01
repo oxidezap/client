@@ -13,7 +13,7 @@
 
 use gpui::{
     App, InteractiveElement as _, IntoElement, ParentElement, StatefulInteractiveElement as _,
-    Styled, div, px,
+    Styled, div,
 };
 use gpui_component::ActiveTheme as _;
 
@@ -57,7 +57,7 @@ pub fn render_notices<F: Fn(u64, &mut App) + Clone + 'static>(
                 // A line is read left to right and this one is short, so the
                 // box is sized to the text rather than to the window, with a
                 // ceiling so a long message wraps instead of spanning it.
-                .max_w(px(360.))
+                .max_w(metrics.notice_width())
                 .px(metrics.space_md())
                 .py(metrics.space_sm())
                 .rounded(metrics.radius_md())

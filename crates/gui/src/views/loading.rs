@@ -9,6 +9,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::{Icon, IconName, Sizable, spinner::Spinner};
 
 use super::centered_view;
+use crate::components::parts;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 
 /// A step in getting from launch to a usable window.
@@ -43,15 +44,20 @@ impl Step {
     }
 }
 
-pub fn render_loading_view(cx: &App) -> impl IntoElement {
+// Three names for one screen, because the root's `match` over `AppState` is
+// where the step is known and each arm has to name the one it is in. They
+// carry `use<>` for the reason every render helper here does: without it the
+// 2024 capture rules hand the returned element `cx`'s lifetime, which
+// `render_progress` below is careful not to and these were quietly undoing.
+pub fn render_loading_view(cx: &App) -> impl IntoElement + use<> {
     render_progress(Step::Loading, cx)
 }
 
-pub fn render_connecting_view(cx: &App) -> impl IntoElement {
+pub fn render_connecting_view(cx: &App) -> impl IntoElement + use<> {
     render_progress(Step::Connecting, cx)
 }
 
-pub fn render_syncing_view(cx: &App) -> impl IntoElement {
+pub fn render_syncing_view(cx: &App) -> impl IntoElement + use<> {
     render_progress(Step::Syncing, cx)
 }
 
@@ -84,7 +90,7 @@ fn render_progress(current: Step, cx: &App) -> impl IntoElement + use<> {
 fn render_step(step: Step, current: Step, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
     let is_done = step < current;
     let is_current = step == current;
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
 
     div()
         .flex()

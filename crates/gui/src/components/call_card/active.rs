@@ -14,8 +14,9 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _};
 
 use crate::app::WhatsAppApp;
+use crate::components::parts;
 use crate::components::{Avatar, ProductIcon};
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::theme::Metrics;
 use oxidezap_core::ActiveCall;
 
 /// The card header shown while a call is live: a dot, a label, and the two
@@ -179,7 +180,7 @@ fn mic_state(muted: bool, metrics: Metrics, cx: &App) -> impl IntoElement + use<
     const LEVELS: [f32; 8] = [0.35, 0.7, 1.0, 0.5, 0.85, 0.4, 0.95, 0.6];
     let full: Pixels = metrics.space_xxl();
     let colour = if muted {
-        cx.product().hsla(cx.product().palette.faint_foreground)
+        parts::faint(cx)
     } else {
         cx.theme().primary
     };
@@ -213,12 +214,7 @@ fn controls(
     let muted = call.muted;
 
     let round = |id: &'static str, icon: Icon, tip: &'static str| {
-        Button::new(id)
-            .icon(icon)
-            .ghost()
-            .tooltip(tip)
-            .w(metrics.call_control())
-            .h(metrics.call_control())
+        parts::icon_button(id, icon, tip, metrics.call_control())
     };
 
     div()
@@ -334,7 +330,7 @@ fn labelled<C: IntoElement>(
         .child(
             div()
                 .text_size(metrics.text_micro())
-                .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+                .text_color(parts::subtle(cx))
                 .child(label),
         )
 }

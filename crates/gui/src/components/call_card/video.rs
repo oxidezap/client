@@ -13,12 +13,13 @@
 
 use gpui::{App, Entity, IntoElement, ParentElement, Styled, StyledImage as _, div, img};
 use gpui_component::ActiveTheme as _;
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::ButtonVariants as _;
 use gpui_component::{Disableable as _, Icon, Selectable as _};
 
 use crate::app::WhatsAppApp;
+use crate::components::parts;
 use crate::components::{Avatar, ProductIcon};
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::theme::Metrics;
 use oxidezap_core::{ActiveCall, VideoStream};
 
 use super::active::live_header;
@@ -237,7 +238,7 @@ fn placeholder(label: &str, metrics: Metrics, cx: &App) -> impl IntoElement + us
     div()
         .font_family(cx.theme().mono_font_family.clone())
         .text_size(metrics.text_micro())
-        .text_color(cx.product().hsla(cx.product().palette.faint_foreground))
+        .text_color(parts::faint(cx))
         .child(label.to_string())
 }
 
@@ -261,12 +262,7 @@ fn video_controls(
     let asked = app.call_video_requested();
 
     let round = |id: &'static str, icon: Icon, tip: &'static str| {
-        Button::new(id)
-            .icon(icon)
-            .ghost()
-            .tooltip(tip)
-            .w(metrics.call_control())
-            .h(metrics.call_control())
+        parts::icon_button(id, icon, tip, metrics.call_control())
     };
 
     div()

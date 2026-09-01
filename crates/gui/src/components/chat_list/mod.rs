@@ -17,9 +17,10 @@ use gpui_component::{Disableable as _, Icon, IconName, Sizable as _, VirtualList
 use gpui_component::{scroll::Scrollbar, v_virtual_list};
 
 use crate::app::{ChatFilter, ChatListCache, SelectDown, SelectUp, WhatsAppApp};
+use crate::components::parts;
 use crate::components::{EmptyState, render_chat_item};
 use crate::responsive::ResponsiveLayout;
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::theme::Metrics;
 
 use filters::render_filters;
 
@@ -211,7 +212,7 @@ fn render_search(
                         .border_color(cx.theme().border)
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(metrics.text_meta())
-                        .text_color(cx.product().hsla(cx.product().palette.faint_foreground))
+                        .text_color(parts::faint(cx))
                         // Naming the shortcut is how anyone finds out it exists.
                         .child(if cfg!(target_os = "macos") {
                             "⌘K"
@@ -342,8 +343,6 @@ fn render_empty(
 }
 
 fn render_account(account: AccountSummary, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
-    let product = cx.product();
-
     div()
         .flex_shrink_0()
         .h(metrics.sidebar_footer_height())
@@ -358,19 +357,12 @@ fn render_account(account: AccountSummary, metrics: Metrics, cx: &App) -> impl I
                 .on(cx.theme().sidebar),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .child(
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_secondary())
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(cx.theme().foreground)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(account.name),
                 )
                 .child(
@@ -380,7 +372,7 @@ fn render_account(account: AccountSummary, metrics: Metrics, cx: &App) -> impl I
                         .gap(metrics.space_sm())
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(metrics.text_micro())
-                        .text_color(product.hsla(product.palette.subtle_foreground))
+                        .text_color(parts::subtle(cx))
                         .child(
                             div()
                                 .size(metrics.space_sm())
@@ -392,14 +384,7 @@ fn render_account(account: AccountSummary, metrics: Metrics, cx: &App) -> impl I
                                     cx.theme().warning
                                 }),
                         )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(account.status),
-                        ),
+                        .child(parts::one_line().min_w_0().child(account.status)),
                 ),
         )
 }

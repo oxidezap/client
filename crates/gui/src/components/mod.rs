@@ -14,6 +14,7 @@ pub mod message_bubble;
 mod message_list;
 mod nav_rail;
 pub mod notice;
+pub mod parts;
 pub mod plugin_ui;
 mod rich_text;
 mod status;

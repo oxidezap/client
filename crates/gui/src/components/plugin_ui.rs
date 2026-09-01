@@ -22,7 +22,8 @@ use gpui_component::{Disableable as _, Sizable as _};
 use oxidezap_core::{PluginNode, PluginSlot, PluginSurface, PluginWidget};
 
 use crate::app::WhatsAppApp;
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::components::parts;
+use crate::theme::Metrics;
 
 /// What a widget needs beyond the tree itself.
 ///
@@ -162,7 +163,7 @@ fn widget(
 
         PluginWidget::Label => div()
             .text_size(metrics.text_small())
-            .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+            .text_color(parts::subtle(cx))
             .child(node.label.clone())
             .into_any_element(),
 
@@ -190,7 +191,7 @@ fn widget(
                     div()
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(metrics.text_micro())
-                        .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+                        .text_color(parts::subtle(cx))
                         .child(node.label.to_uppercase()),
                 )
             })
@@ -330,7 +331,7 @@ fn heading(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
     // The colour says the same thing the word does, so nothing here depends
     // on reading it: a legend nobody is given is a legend nobody has.
     let tone = match standing {
@@ -344,11 +345,7 @@ fn heading(
         .items_center()
         .gap(metrics.space_md())
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .gap(metrics.space_xxs())
                 .child(
                     div()
@@ -393,7 +390,7 @@ pub fn settings_entry(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let metrics = ctx.metrics;
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
     let standing = if surface.stopped.is_some() {
         Standing::Stopped
     } else {
@@ -533,7 +530,7 @@ pub fn unloaded_entry(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let subtle = cx.product().hsla(cx.product().palette.subtle_foreground);
+    let subtle = parts::subtle(cx);
     entry(
         heading(id.to_owned(), id, Standing::NotLoaded, remove, metrics, cx).into_any_element(),
         vec![

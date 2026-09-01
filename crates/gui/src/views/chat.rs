@@ -11,9 +11,9 @@ use gpui_component::{Icon, IconName};
 use crate::app::{Destination, MessageListCache, WhatsAppApp};
 use crate::components::{
     ChatListProps, EmptyState, InputAreaView, PluginContext, ProductIcon, StatusListProps,
-    StatusSelection, StatusViewProps, ViewerProps, plugin_ui, render_call_card, render_chat_header,
-    render_chat_list, render_conversation_search, render_media_viewer, render_message_list,
-    render_nav_rail, render_status_list, render_status_view,
+    StatusSelection, StatusViewProps, ViewerProps, parts, plugin_ui, render_call_card,
+    render_chat_header, render_chat_list, render_conversation_search, render_media_viewer,
+    render_message_list, render_nav_rail, render_status_list, render_status_view,
 };
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
@@ -533,14 +533,11 @@ fn render_return_banner(
                 .text_color(cx.theme().primary),
         )
         .child(
-            div()
+            parts::one_line()
                 .flex_1()
                 .min_w_0()
                 .text_size(metrics.text_small())
                 .text_color(cx.theme().foreground)
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
                 .child(format!("On call with {name}")),
         )
         .child(

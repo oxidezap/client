@@ -6,11 +6,10 @@ use gpui::{
     App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, Sizable as _};
 
 use crate::app::{BubbleIds, WhatsAppApp};
-use crate::components::ProductIcon;
+use crate::components::{ProductIcon, parts};
 use crate::theme::Metrics;
 
 /// The reaction chips hanging off a bubble's lower edge.
@@ -87,13 +86,7 @@ pub fn render_hover_actions(
     let has_text = !content.is_empty();
 
     let action = |id: SharedString, icon: Icon, tip: &'static str| {
-        Button::new(id)
-            .icon(icon)
-            .ghost()
-            .xsmall()
-            .tooltip(tip)
-            .w(metrics.icon_button())
-            .h(metrics.icon_button())
+        parts::icon_button(id, icon, tip, metrics.icon_button()).xsmall()
     };
 
     div()

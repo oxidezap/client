@@ -14,10 +14,11 @@ use gpui_component::scroll::Scrollbar;
 use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
 
 use crate::app::WhatsAppApp;
+use crate::components::parts;
 use crate::components::status::status_ring;
 use crate::components::{EmptyState, ProductIcon};
 use crate::responsive::ResponsiveLayout;
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::theme::Metrics;
 use crate::utils::format_status_time;
 
 use oxidezap_core::{StatusAuthor, StatusFeed};
@@ -226,7 +227,7 @@ fn section_label(label: &'static str, metrics: Metrics, cx: &App) -> impl IntoEl
         .pb(metrics.space_sm())
         .text_size(metrics.text_meta())
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+        .text_color(parts::subtle(cx))
         .child(label)
 }
 
@@ -287,33 +288,23 @@ fn render_author_row(
             cx,
         ))
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .gap(metrics.space_xs())
                 .child(
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_body())
                         .text_color(cx.theme().foreground)
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(name),
                 )
                 .child(
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_small())
                         .text_color(if author.has_unseen() {
                             cx.theme().primary
                         } else {
-                            cx.product().hsla(cx.product().palette.subtle_foreground)
+                            parts::subtle(cx)
                         })
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(subtitle),
                 ),
         )
@@ -341,11 +332,7 @@ fn render_placeholder_row(
                 .tooltip("Posting a status update is not available yet"),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .gap(metrics.space_xs())
                 .child(
                     div()
@@ -357,7 +344,7 @@ fn render_placeholder_row(
                 .child(
                     div()
                         .text_size(metrics.text_small())
-                        .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+                        .text_color(parts::subtle(cx))
                         .child(subtitle),
                 ),
         )

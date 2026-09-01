@@ -14,6 +14,7 @@ use gpui_component::{Disableable as _, Icon, IconName};
 
 use crate::app::WhatsAppApp;
 use crate::components::ProductIcon;
+use crate::components::parts;
 use crate::theme::ActiveProductTheme as _;
 use crate::utils::{mime_to_image_format, scale_media_dimensions};
 use crate::video::VideoPlayerState;
@@ -328,9 +329,7 @@ fn render_download_placeholder(
                             div()
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .text_size(metrics.text_micro())
-                                .text_color(
-                                    cx.product().hsla(cx.product().palette.subtle_foreground),
-                                )
+                                .text_color(parts::subtle(cx))
                                 .child(size)
                         })),
                 )
@@ -491,25 +490,18 @@ fn render_document_placeholder(
                 }),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .child(
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_secondary())
                         .text_color(cx.theme().foreground)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(name.clone()),
                 )
                 .child(
                     div()
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(metrics.text_micro())
-                        .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+                        .text_color(parts::subtle(cx))
                         .child(if is_downloading {
                             "Saving…".to_string()
                         } else {
@@ -526,21 +518,21 @@ fn render_document_placeholder(
                 .file_name
                 .unwrap_or_else(|| "document".to_string());
             row.child(
-                Button::new(SharedString::from(format!("save-{message_id}")))
-                    .icon(Icon::new(IconName::ArrowDown).size(metrics.icon_small()))
-                    .ghost()
-                    .tooltip("Save to Downloads")
-                    .disabled(is_downloading)
-                    .w(metrics.icon_button())
-                    .h(metrics.icon_button())
-                    .on_click(move |_, _window, cx| {
-                        let msg_id = message_id.clone();
-                        let name = file_name.clone();
-                        let dl = dl.clone();
-                        entity.update(cx, |app, cx| {
-                            app.download_document(msg_id, name, dl, cx);
-                        });
-                    }),
+                parts::icon_button(
+                    SharedString::from(format!("save-{message_id}")),
+                    Icon::new(IconName::ArrowDown).size(metrics.icon_small()),
+                    "Save to Downloads",
+                    metrics.icon_button(),
+                )
+                .disabled(is_downloading)
+                .on_click(move |_, _window, cx| {
+                    let msg_id = message_id.clone();
+                    let name = file_name.clone();
+                    let dl = dl.clone();
+                    entity.update(cx, |app, cx| {
+                        app.download_document(msg_id, name, dl, cx);
+                    });
+                }),
             )
             .into_any_element()
         }
@@ -621,8 +613,8 @@ fn render_video_player(
     let is_paused = state.is_paused();
     let is_loading = state.is_loading();
     let is_error = state.is_error();
-    let scrim = cx.product().hsla(cx.product().palette.scrim);
-    let on_scrim = cx.product().hsla(cx.product().palette.on_scrim);
+    let scrim = parts::scrim(cx);
+    let on_scrim = parts::on_scrim(cx);
     let metrics = cx.product().metrics;
 
     div()

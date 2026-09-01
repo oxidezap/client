@@ -15,8 +15,9 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Icon, Selectable as _};
 
 use crate::app::{Destination, WhatsAppApp};
+use crate::components::parts;
 use crate::responsive::ResponsiveLayout;
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::theme::Metrics;
 
 pub fn render_nav_rail(
     current: Destination,
@@ -124,7 +125,7 @@ fn render_destination(
         .child(icon.size(metrics.icon()).text_color(if is_current {
             cx.theme().foreground
         } else {
-            cx.product().hsla(cx.product().palette.subtle_foreground)
+            parts::subtle(cx)
         }))
         // A count, not a dot: how many conversations are waiting is the thing
         // worth knowing before deciding to look.

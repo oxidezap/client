@@ -12,6 +12,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::{Icon, IconName};
 use oxidezap_core::MessageStatus;
 
+use crate::components::parts;
 use crate::theme::ActiveProductTheme as _;
 
 use super::ProductIcon;
@@ -50,7 +51,7 @@ fn ticks(
                 .mix(product.palette.foreground, 0.55),
         )
     } else {
-        product.hsla(product.palette.subtle_foreground)
+        parts::subtle(cx)
     };
 
     let (icon, colour): (Icon, _) = match status {

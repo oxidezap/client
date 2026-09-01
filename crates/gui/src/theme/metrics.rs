@@ -220,67 +220,70 @@ impl Metrics {
     fn dense(&self, design_px: f32) -> Pixels {
         px(design_px * self.rem_size / REFERENCE_REM * self.density.scale())
     }
+}
 
+/// Declare the scale: one line per token, naming the rule it follows and the
+/// number the design specified at the reference base.
+///
+/// Every accessor below used to be four lines of the same shape, which put the
+/// rule an accessor follows — [`Metrics::scaled`] or [`Metrics::dense`], the
+/// one distinction that matters here — in the middle of a stanza rather than
+/// beside the name. Written as a table it reads as what it is: the design's
+/// measurements. The generated functions are the hand-written ones, name for
+/// name and value for value, and nothing about how a caller reads them
+/// changed — which matters more here than anywhere else, because this file is
+/// the mechanism the whole rem rule rests on.
+macro_rules! tokens {
+    ($(
+        $(#[$meta:meta])*
+        $name:ident = $rule:ident($design_px:literal);
+    )*) => {
+        impl Metrics {
+            $(
+                $(#[$meta])*
+                pub fn $name(&self) -> Pixels {
+                    self.$rule($design_px)
+                }
+            )*
+        }
+    };
+}
+
+tokens! {
     // ---- spacing ------------------------------------------------------
     //
     // The semantic steps from the design system, named for the relationship
     // they express rather than their size.
 
     /// Optical correction: an icon baseline, a separator nudge.
-    pub fn space_xxs(&self) -> Pixels {
-        self.dense(2.0)
-    }
+    space_xxs = dense(2.0);
     /// Parts of one control: a title and its description.
-    pub fn space_xs(&self) -> Pixels {
-        self.dense(4.0)
-    }
+    space_xs = dense(4.0);
     /// Closely related controls: an icon and its label.
-    pub fn space_sm(&self) -> Pixels {
-        self.dense(6.0)
-    }
+    space_sm = dense(6.0);
     /// One content group.
-    pub fn space_md(&self) -> Pixels {
-        self.dense(8.0)
-    }
+    space_md = dense(8.0);
     /// Separate groups within a section.
-    pub fn space_lg(&self) -> Pixels {
-        self.dense(12.0)
-    }
+    space_lg = dense(12.0);
     /// Separate sections.
-    pub fn space_xl(&self) -> Pixels {
-        self.dense(16.0)
-    }
+    space_xl = dense(16.0);
     /// A major region boundary.
-    pub fn space_xxl(&self) -> Pixels {
-        self.dense(24.0)
-    }
+    space_xxl = dense(24.0);
     /// Empty-state breathing room.
-    pub fn space_xxxl(&self) -> Pixels {
-        self.dense(32.0)
-    }
+    space_xxxl = dense(32.0);
 
     // ---- radii --------------------------------------------------------
 
     /// Chips, ticks, small inline surfaces.
-    pub fn radius_sm(&self) -> Pixels {
-        self.scaled(8.0)
-    }
+    radius_sm = scaled(8.0);
     /// Fields, icon buttons, thumbnails.
-    pub fn radius_md(&self) -> Pixels {
-        self.scaled(10.0)
-    }
+    radius_md = scaled(10.0);
     /// Message bubbles and panels.
-    pub fn radius_lg(&self) -> Pixels {
-        self.scaled(12.0)
-    }
+    radius_lg = scaled(12.0);
     /// Floating cards: the call card, dialogs.
-    pub fn radius_xl(&self) -> Pixels {
-        self.scaled(14.0)
-    }
+    radius_xl = scaled(14.0);
     /// The tight corner that marks the authored side of a bubble.
-    pub fn radius_bubble_tail(&self) -> Pixels {
-        self.scaled(4.0)
-    }
+    radius_bubble_tail = scaled(4.0);
 
     // ---- type ---------------------------------------------------------
     //
@@ -288,143 +291,79 @@ impl Metrics {
     // zoom.
 
     /// Screen and dialog titles.
-    pub fn text_title(&self) -> Pixels {
-        self.scaled(19.0)
-    }
+    text_title = scaled(19.0);
     /// Section headings, a caller's name on the call card.
-    pub fn text_heading(&self) -> Pixels {
-        self.scaled(17.0)
-    }
+    text_heading = scaled(17.0);
     /// Names in a header.
-    pub fn text_strong(&self) -> Pixels {
-        self.scaled(16.0)
-    }
+    text_strong = scaled(16.0);
     /// Body text.
-    pub fn text_body(&self) -> Pixels {
-        self.scaled(15.0)
-    }
+    text_body = scaled(15.0);
     /// Secondary text: previews, subtitles.
-    pub fn text_secondary(&self) -> Pixels {
-        self.scaled(13.5)
-    }
+    text_secondary = scaled(13.5);
     /// Chips and compact controls.
-    pub fn text_small(&self) -> Pixels {
-        self.scaled(12.5)
-    }
+    text_small = scaled(12.5);
     /// Monospace metadata: timestamps, counters, shortcuts.
-    pub fn text_meta(&self) -> Pixels {
-        self.scaled(11.0)
-    }
+    text_meta = scaled(11.0);
     /// The smallest step: a tick's timestamp, a date divider.
-    pub fn text_micro(&self) -> Pixels {
-        self.scaled(10.5)
-    }
+    text_micro = scaled(10.5);
 
     // ---- chat list ----------------------------------------------------
 
     /// A conversation row. The design lifted this from 72 to 78 so the name,
     /// preview and badge stop crowding each other.
-    pub fn chat_row_height(&self) -> Pixels {
-        self.dense(78.0)
-    }
+    chat_row_height = dense(78.0);
     /// Gap between rows: rows read as cards, not as a ruled table.
-    pub fn chat_row_gap(&self) -> Pixels {
-        self.dense(4.0)
-    }
-    pub fn chat_row_padding_x(&self) -> Pixels {
-        self.dense(12.0)
-    }
+    chat_row_gap = dense(4.0);
+    chat_row_padding_x = dense(12.0);
     /// The teal bar that marks the selected row.
-    pub fn selection_bar_width(&self) -> Pixels {
-        self.scaled(3.0)
-    }
-    pub fn avatar_row(&self) -> Pixels {
-        self.dense(44.0)
-    }
-    pub fn avatar_header(&self) -> Pixels {
-        self.dense(38.0)
-    }
+    selection_bar_width = scaled(3.0);
+    avatar_row = dense(44.0);
+    avatar_header = dense(38.0);
     /// Beside a typing bubble, and in the sidebar footer.
-    pub fn avatar_inline(&self) -> Pixels {
-        self.dense(28.0)
-    }
-    pub fn avatar_call(&self) -> Pixels {
-        self.dense(64.0)
-    }
+    avatar_inline = dense(28.0);
+    avatar_call = dense(64.0);
     /// The presence dot on an avatar.
     #[expect(
         dead_code,
         reason = "a step nothing draws today is still the step between the ones that do"
     )]
-    pub fn presence_dot(&self) -> Pixels {
-        self.scaled(12.0)
-    }
+    presence_dot = scaled(12.0);
 
     // ---- chrome -------------------------------------------------------
 
     /// The sidebar's own header, which holds the title and its actions.
-    pub fn sidebar_header_height(&self) -> Pixels {
-        self.dense(56.0)
-    }
+    sidebar_header_height = dense(56.0);
     /// The account row at the foot of the sidebar.
-    pub fn sidebar_footer_height(&self) -> Pixels {
-        self.dense(56.0)
-    }
+    sidebar_footer_height = dense(56.0);
     /// The conversation header: taller than the sidebar's, because it carries
     /// a subtitle under the name.
-    pub fn header_height(&self) -> Pixels {
-        self.dense(60.0)
-    }
-    pub fn mobile_header_height(&self) -> Pixels {
-        self.dense(56.0)
-    }
+    header_height = dense(60.0);
+    mobile_header_height = dense(56.0);
     /// The composer's slot. `InputAreaView` is given this rather than owning a
     /// constant of its own, which is what used to clip it by 6px on mobile.
-    pub fn composer_height(&self) -> Pixels {
-        self.dense(62.0)
-    }
+    composer_height = dense(62.0);
     /// Mobile keeps a full touch target plus its padding, and no more.
-    pub fn composer_height_mobile(&self) -> Pixels {
-        self.dense(56.0)
-    }
+    composer_height_mobile = dense(56.0);
     /// The floor for a pointer target on touch.
-    pub fn touch_target(&self) -> Pixels {
-        self.dense(48.0)
-    }
+    touch_target = dense(48.0);
     #[expect(
         dead_code,
         reason = "a step nothing draws today is still the step between the ones that do"
     )]
-    pub fn search_field_height(&self) -> Pixels {
-        self.dense(38.0)
-    }
-    pub fn filter_chip_height(&self) -> Pixels {
-        self.dense(26.0)
-    }
+    search_field_height = dense(38.0);
+    filter_chip_height = dense(26.0);
     /// A quiet icon button in a header or toolbar.
-    pub fn icon_button(&self) -> Pixels {
-        self.dense(34.0)
-    }
+    icon_button = dense(34.0);
     /// The glyph inside an icon button.
-    pub fn icon(&self) -> Pixels {
-        self.scaled(17.0)
-    }
-    pub fn icon_small(&self) -> Pixels {
-        self.scaled(14.0)
-    }
+    icon = scaled(17.0);
+    icon_small = scaled(14.0);
     /// A glyph over media: bigger than a toolbar's, because the wash behind
     /// it is a picture rather than a surface.
-    pub fn icon_media(&self) -> Pixels {
-        self.scaled(20.0)
-    }
+    icon_media = scaled(20.0);
     /// The play control at the centre of a video.
-    pub fn icon_media_large(&self) -> Pixels {
-        self.scaled(32.0)
-    }
+    icon_media_large = scaled(32.0);
     /// The same, once a video is playing and the control gives way to it.
-    pub fn icon_media_playing(&self) -> Pixels {
-        self.scaled(24.0)
-    }
+    icon_media_playing = scaled(24.0);
 
     // ---- fine geometry ------------------------------------------------
     //
@@ -434,106 +373,80 @@ impl Metrics {
 
     /// The narrowest a drawn bar gets, and the floor under a bar whose height
     /// is a level: a waveform column at silence is still a column.
-    pub fn bar_thin(&self) -> Pixels {
-        self.scaled(2.0)
-    }
+    bar_thin = scaled(2.0);
     /// A level meter's column.
-    pub fn bar(&self) -> Pixels {
-        self.scaled(3.0)
-    }
+    bar = scaled(3.0);
     /// A dot in a row of them, as the connecting indicator draws.
-    pub fn dot_small(&self) -> Pixels {
-        self.scaled(3.0)
-    }
+    dot_small = scaled(3.0);
     /// A single status dot beside a label.
-    pub fn dot(&self) -> Pixels {
-        self.scaled(6.0)
-    }
+    dot = scaled(6.0);
     /// The floor under a badge that is otherwise a fraction of its avatar.
-    pub fn badge_min(&self) -> Pixels {
-        self.scaled(10.0)
-    }
+    badge_min = scaled(10.0);
     /// The round control drawn over a video: play, retry, or the spinner.
-    pub fn media_control(&self) -> Pixels {
-        self.scaled(48.0)
-    }
+    media_control = scaled(48.0);
     /// A status ring's stroke, and the breathing room between it and the
     /// avatar inside. Rem-derived like the row height the ring is sized
     /// against.
-    pub fn ring_thickness(&self) -> Pixels {
-        self.scaled(2.0)
-    }
-    pub fn ring_gap(&self) -> Pixels {
-        self.scaled(3.0)
-    }
+    ring_thickness = scaled(2.0);
+    ring_gap = scaled(3.0);
 
     // ---- timeline -----------------------------------------------------
 
-    pub fn bubble_padding_x(&self) -> Pixels {
-        self.dense(13.0)
-    }
-    pub fn bubble_padding_y(&self) -> Pixels {
-        self.dense(9.0)
-    }
+    bubble_padding_x = dense(13.0);
+    bubble_padding_y = dense(9.0);
     /// Between consecutive bubbles from the same author.
-    pub fn bubble_gap_grouped(&self) -> Pixels {
-        self.dense(2.0)
-    }
+    bubble_gap_grouped = dense(2.0);
     /// Where authorship changes.
-    pub fn bubble_gap_authored(&self) -> Pixels {
-        self.dense(8.0)
-    }
+    bubble_gap_authored = dense(8.0);
     #[expect(
         dead_code,
         reason = "a step nothing draws today is still the step between the ones that do"
     )]
-    pub fn date_divider_height(&self) -> Pixels {
-        self.dense(34.0)
-    }
+    date_divider_height = dense(34.0);
     #[expect(
         dead_code,
         reason = "a step nothing draws today is still the step between the ones that do"
     )]
-    pub fn typing_row_height(&self) -> Pixels {
-        self.dense(46.0)
-    }
+    typing_row_height = dense(46.0);
     /// Reactions overlap the bubble's lower edge by this much.
-    pub fn reaction_overlap(&self) -> Pixels {
-        self.dense(6.0)
-    }
+    reaction_overlap = dense(6.0);
     #[expect(
         dead_code,
         reason = "a step nothing draws today is still the step between the ones that do"
     )]
-    pub fn reaction_height(&self) -> Pixels {
-        self.dense(22.0)
-    }
+    reaction_height = dense(22.0);
     /// How far beyond the viewport the timeline keeps rows laid out.
     ///
     /// About a screen either way, which is a claim about the rows rather than
     /// about the glass: at double the base font a fixed 800px is no longer a
     /// screen, and a flick lands on rows nobody has measured.
-    pub fn timeline_overdraw(&self) -> Pixels {
-        self.scaled(800.0)
-    }
+    timeline_overdraw = scaled(800.0);
 
     /// One line of body text in a bubble.
     #[expect(
         dead_code,
         reason = "a step nothing draws today is still the step between the ones that do"
     )]
-    pub fn line_height(&self) -> Pixels {
-        self.scaled(22.0)
-    }
+    line_height = scaled(22.0);
 
     /// How wide a column of prose is allowed to get.
     ///
     /// Scales with the base font rather than sitting at a pixel count: the
     /// limit exists so a line stays a comfortable number of characters, and
     /// that is a property of the text size, not of the window.
-    pub fn reading_width(&self) -> Pixels {
-        self.scaled(720.0)
-    }
+    reading_width = scaled(720.0);
+
+    /// How wide a transient notice is allowed to get.
+    ///
+    /// The last `px` literal in the interface lived here, and it was the same
+    /// mistake the reading width exists to name: the ceiling is there so a
+    /// long message wraps into a readable line rather than spanning the
+    /// window, and how many characters fit on a line is a property of the
+    /// text size. Fixed at 360 device pixels it was three words at double the
+    /// base font. `scaled` and not `dense` for the same reason as the reading
+    /// width: this is a bound on content, and density is rhythm and control
+    /// frames.
+    notice_width = scaled(360.0);
 
     /// How tall a read-only block of configuration is allowed to get.
     ///
@@ -541,80 +454,54 @@ impl Metrics {
     /// width works right up until someone adjusts the width for the reason it
     /// exists — line length — and silently resizes a panel that has nothing
     /// to do with prose.
-    pub fn config_block_height(&self) -> Pixels {
-        self.scaled(360.0)
-    }
+    config_block_height = scaled(360.0);
 
     /// One theme preset's swatch in the Appearance pane.
     ///
     /// Sized for the row of them, not derived from the call card: they share
     /// no reason to be related, and tying them made the call card's width a
     /// remote control for a settings pane.
-    pub fn preset_card_width(&self) -> Pixels {
-        self.dense(184.0)
-    }
+    preset_card_width = dense(184.0);
 
     /// The miniature window inside a preset card.
     ///
     /// Its own token rather than an avatar size: the preview is a picture of
     /// a layout, and it wants the shape of a window — wider than tall — not
     /// the shape of a face.
-    pub fn preset_preview_height(&self) -> Pixels {
-        self.dense(84.0)
-    }
+    preset_preview_height = dense(84.0);
 
     /// One destination in the Settings side navigation.
     ///
     /// Its own token, not an avatar's size: nothing on this row is a picture
     /// of a person, and a list of seven places wants to read as a list rather
     /// than as seven cards.
-    pub fn nav_item_height(&self) -> Pixels {
-        self.dense(34.0)
-    }
+    nav_item_height = dense(34.0);
 
     /// The Settings side navigation.
     ///
     /// Not the call card's width. The two were the same number and neither
     /// was chosen for the other, so widening a floating card over a video
     /// call would have moved a settings column.
-    pub fn settings_nav_width(&self) -> Pixels {
-        self.dense(248.0)
-    }
+    settings_nav_width = dense(248.0);
 
     // ---- call card ----------------------------------------------------
 
-    pub fn call_card_width(&self) -> Pixels {
-        self.dense(340.0)
-    }
+    call_card_width = dense(340.0);
     /// Video and group need room for the picture, so they are wider.
-    pub fn call_card_width_wide(&self) -> Pixels {
-        self.dense(380.0)
-    }
+    call_card_width_wide = dense(380.0);
     /// The drag handle strip along the card's top edge.
-    pub fn call_drag_handle_height(&self) -> Pixels {
-        self.dense(26.0)
-    }
-    pub fn call_action_height(&self) -> Pixels {
-        self.dense(42.0)
-    }
+    call_drag_handle_height = dense(26.0);
+    call_action_height = dense(42.0);
     /// A round call control: mute, hang up, camera.
-    pub fn call_control(&self) -> Pixels {
-        self.dense(44.0)
-    }
+    call_control = dense(44.0);
 
     // ---- audio --------------------------------------------------------
 
     /// The scrubbable waveform's hit area, taller than the bars it draws so
     /// the pointer target stays comfortable.
-    pub fn waveform_height(&self) -> Pixels {
-        self.dense(28.0)
-    }
-    pub fn waveform_bar_width(&self) -> Pixels {
-        self.scaled(2.0)
-    }
-    pub fn waveform_bar_gap(&self) -> Pixels {
-        self.scaled(2.0)
-    }
+    waveform_height = dense(28.0);
+    waveform_bar_width = scaled(2.0);
+    waveform_bar_gap = scaled(2.0);
 
     // ---- layout -------------------------------------------------------
     //
@@ -627,47 +514,25 @@ impl Metrics {
     // four words wide.
 
     /// Below this the window shows one pane at a time.
-    pub fn breakpoint_mobile(&self) -> Pixels {
-        self.scaled(600.0)
-    }
+    breakpoint_mobile = scaled(600.0);
     /// Below this the sidebar is narrowed rather than dropped.
-    pub fn breakpoint_tablet(&self) -> Pixels {
-        self.scaled(900.0)
-    }
+    breakpoint_tablet = scaled(900.0);
     /// Below this the conversation header has no room for its action row, so
     /// the actions move into the overflow menu.
-    pub fn breakpoint_header_actions(&self) -> Pixels {
-        self.scaled(400.0)
-    }
+    breakpoint_header_actions = scaled(400.0);
 
-    pub fn sidebar_width(&self) -> Pixels {
-        self.scaled(340.0)
-    }
-    pub fn sidebar_width_compact(&self) -> Pixels {
-        self.scaled(280.0)
-    }
-    pub fn sidebar_width_min(&self) -> Pixels {
-        self.scaled(240.0)
-    }
+    sidebar_width = scaled(340.0);
+    sidebar_width_compact = scaled(280.0);
+    sidebar_width_min = scaled(240.0);
 
     /// How wide a bubble may get where there is a conversation pane to spare,
     /// and where the conversation is the whole window.
-    pub fn bubble_max_width(&self) -> Pixels {
-        self.scaled(520.0)
-    }
-    pub fn bubble_max_width_compact(&self) -> Pixels {
-        self.scaled(420.0)
-    }
-    pub fn bubble_max_width_phone(&self) -> Pixels {
-        self.scaled(350.0)
-    }
+    bubble_max_width = scaled(520.0);
+    bubble_max_width_compact = scaled(420.0);
+    bubble_max_width_phone = scaled(350.0);
 
-    pub fn media_max_size(&self) -> Pixels {
-        self.scaled(300.0)
-    }
-    pub fn media_max_size_compact(&self) -> Pixels {
-        self.scaled(280.0)
-    }
+    media_max_size = scaled(300.0);
+    media_max_size_compact = scaled(280.0);
 
     // ---- other --------------------------------------------------------
 
@@ -678,9 +543,10 @@ impl Metrics {
     /// camera across a desk, and Compact took it to ~138px on a handheld
     /// against 160px in Comfortable, near the limit, for a preference that
     /// was never about content.
-    pub fn qr_size(&self) -> Pixels {
-        self.scaled(256.0)
-    }
+    qr_size = scaled(256.0);
+}
+
+impl Metrics {
     /// A hairline stays one device pixel at any zoom: multiplying it makes the
     /// whole interface read as heavier rather than larger.
     pub fn hairline(&self) -> Pixels {

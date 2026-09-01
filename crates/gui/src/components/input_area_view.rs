@@ -9,12 +9,12 @@ use wacore::time::Instant;
 
 use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, div, prelude::*};
 use gpui_component::{
-    ActiveTheme, Disableable as _, IconName, Sizable as _,
+    ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants},
     input::{InputEvent, Textarea, TextareaState},
 };
 
-use crate::components::ProductIcon;
+use crate::components::{ProductIcon, parts};
 use crate::theme::{ActiveProductTheme as _, Metrics};
 
 /// Events emitted by the input area to communicate with the parent app.
@@ -427,13 +427,13 @@ impl InputAreaView {
                 // composer *is* and should not appear the day sending files
                 // lands; a control that looks live and does nothing is worse
                 // than one that admits it.
-                Button::new("attach")
-                    .icon(ProductIcon::Paperclip)
-                    .ghost()
-                    .disabled(true)
-                    .tooltip("Attaching files is not available yet")
-                    .w(control)
-                    .h(control),
+                parts::icon_button(
+                    "attach",
+                    Icon::new(ProductIcon::Paperclip),
+                    "Attaching files is not available yet",
+                    control,
+                )
+                .disabled(true),
             )
             .child(
                 div()
@@ -442,13 +442,13 @@ impl InputAreaView {
                     .child(Textarea::new(&self.input).w_full()),
             )
             .child(
-                Button::new("emoji")
-                    .icon(ProductIcon::Smile)
-                    .ghost()
-                    .disabled(true)
-                    .tooltip("The emoji picker is not available yet")
-                    .w(control)
-                    .h(control),
+                parts::icon_button(
+                    "emoji",
+                    Icon::new(ProductIcon::Smile),
+                    "The emoji picker is not available yet",
+                    control,
+                )
+                .disabled(true),
             )
             // Record or send, never both: which one is available follows
             // whether there is anything to send, the way every messaging
@@ -508,22 +508,21 @@ impl InputAreaView {
     ) -> impl IntoElement {
         let entity = cx.entity().clone();
         let cancel_entity = entity.clone();
-        let product = cx.product();
 
         div()
             .flex()
             .items_center()
             .gap(metrics.space_lg())
             .child(
-                Button::new("cancel-recording")
-                    .icon(ProductIcon::Trash)
-                    .ghost()
-                    .tooltip("Discard recording")
-                    .w(control)
-                    .h(control)
-                    .on_click(move |_, _window, cx| {
-                        cancel_entity.update(cx, |view, cx| view.cancel_recording(cx));
-                    }),
+                parts::icon_button(
+                    "cancel-recording",
+                    Icon::new(ProductIcon::Trash),
+                    "Discard recording",
+                    control,
+                )
+                .on_click(move |_, _window, cx| {
+                    cancel_entity.update(cx, |view, cx| view.cancel_recording(cx));
+                }),
             )
             .child(
                 div()
@@ -548,7 +547,7 @@ impl InputAreaView {
             .child(
                 div()
                     .text_size(metrics.text_small())
-                    .text_color(product.hsla(product.palette.subtle_foreground))
+                    .text_color(parts::subtle(cx))
                     .child("Recording"),
             )
             .child(
@@ -613,11 +612,7 @@ fn render_reply_bar(
                 .bg(hue),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .child(
                     div()
                         .text_size(metrics.text_small())
@@ -626,12 +621,9 @@ fn render_reply_bar(
                         .child(format!("Replying to {}", reply.sender_name)),
                 )
                 .child(
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_secondary())
                         .text_color(cx.theme().muted_foreground)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(reply.preview),
                 ),
         )

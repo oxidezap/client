@@ -18,6 +18,7 @@ use gpui_component::{Disableable as _, Icon, Sizable as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::ProductIcon;
+use crate::components::parts;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 use oxidezap_core::MediaContent;
 
@@ -148,7 +149,7 @@ fn render_waveform(
     let seek_id = message_id.to_string();
     let height = metrics.waveform_height();
     let played = cx.theme().primary;
-    let remaining = cx.product().hsla(cx.product().palette.faint_foreground);
+    let remaining = parts::faint(cx);
     let playhead = cx.theme().foreground;
     let count = bars.len().max(1);
 

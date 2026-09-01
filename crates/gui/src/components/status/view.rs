@@ -18,9 +18,10 @@ use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::media_viewer::CAPTION_LINES;
+use crate::components::parts;
 use crate::components::{Avatar, EmptyState, ProductIcon};
 use crate::responsive::ResponsiveLayout;
-use crate::theme::{ActiveProductTheme as _, Metrics};
+use crate::theme::Metrics;
 use crate::utils::format_status_time;
 
 use oxidezap_core::ChatMessage;
@@ -128,7 +129,7 @@ fn render_segments(
     metrics: Metrics,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let remaining = cx.product().hsla(cx.product().palette.faint_foreground);
+    let remaining = parts::faint(cx);
     let watched = cx.theme().primary;
 
     div()
@@ -171,26 +172,19 @@ fn render_header(
             .on(cx.theme().background),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
+            parts::detail_stack()
                 .child(
-                    div()
+                    parts::one_line()
                         .text_size(metrics.text_body())
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(cx.theme().foreground)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
                         .child(props.author_name.clone()),
                 )
                 .child(
                     div()
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(metrics.text_meta())
-                        .text_color(cx.product().hsla(cx.product().palette.subtle_foreground))
+                        .text_color(parts::subtle(cx))
                         .child(when),
                 ),
         )

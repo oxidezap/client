@@ -16,6 +16,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::Icon;
 use gpui_component::button::Button;
 
+use crate::components::parts;
 use crate::theme::ActiveProductTheme as _;
 
 type OnAction = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -91,8 +92,7 @@ impl EmptyState {
 impl RenderOnce for EmptyState {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let metrics = cx.product().metrics;
-        let product = cx.product();
-        let subtle = product.hsla(product.palette.subtle_foreground);
+        let subtle = parts::subtle(cx);
         let icon_frame = if self.compact {
             metrics.avatar_header()
         } else {
@@ -111,19 +111,17 @@ impl RenderOnce for EmptyState {
                 metrics.space_xl()
             })
             .children(self.icon.map(|icon| {
-                div()
-                    .size(icon_frame)
-                    .rounded_full()
-                    .bg(cx.theme().secondary)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        icon.size(icon_frame * 0.42)
-                            .text_color(cx.theme().muted_foreground),
-                    )
+                // The glyph is a fraction of its frame rather than a token of
+                // its own, because the frame here is the one thing that is
+                // not fixed: a compact empty state wears the header's avatar
+                // size and a full one the call card's.
+                parts::hero_icon(
+                    icon,
+                    icon_frame,
+                    icon_frame * 0.42,
+                    cx.theme().muted_foreground,
+                    cx,
+                )
             }))
             .child(
                 div()
