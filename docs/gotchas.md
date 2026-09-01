@@ -93,6 +93,19 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   refuse a shared view, and a `ScriptProcessorNode` with zero input channels
   fires perfectly well, which is what the evidence first pointed at and is not
   what was wrong.
+  What a transport may *not* do is stay quiet about either direction, which
+  is why the relay accounts for three things and not two — outbound, inbound,
+  and inbound *media* separately. The relay answers our STUN allocate whether
+  or not it ever bridges the peer to us, and an unanswered allocate ends the
+  call in ten seconds, so a call that lived longer certainly received control
+  traffic: a single "did anything arrive" flag reports the broken call as
+  healthy, which is the opposite of what it is for. What separates them: a channel that opens, carries our media
+  and is released having received nothing is a different fault from a peer
+  who said nothing, and the two read identically in a log that reports
+  neither. The first call of a production session was exactly that — not one
+  decoded frame in twenty-one seconds, while the second call carried
+  thousands — and nothing anywhere could say whether the relay never spoke,
+  the peer never reached it, or the drive loop never listened.
   Three outages was enough, so the spelling is now banned rather than
   remembered: `clippy.toml` lists the `&[u8]`/`&[f32]` bindings under
   `disallowed-methods` with the copying replacement in the reason, and CI's
@@ -174,6 +187,24 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   has to know is also the one thing worth overriding, so `OXIDEZAP_FRONT_END`
   names another — a TUI, a second GUI — and the shipped pair is only the
   default.
+- **An ending is claimed, not owned.** Two places want to publish
+  `UiEvent::CallEnded` — the arm handling the peer's `<terminate>`, and the
+  watcher parked on `wait_ended` that the resulting hangup resolves — and in a
+  production log both did, twice per hangup. Which one is "the owner" cannot
+  be read off the registry: media can end before the stanza arrives or after
+  it, so in one order the watcher has already removed the entry and announced
+  by the time the terminate is handled, and in the other the terminate has
+  taken it before the watcher runs. Either way one of them looks like the
+  owner and the other announces regardless. So `announce_ending` is a claim
+  that is true exactly once per call id and the first caller wins. It lives
+  inside `notify_call_ended` rather than at the call sites: there are four of
+  them — the watcher and three exits in the accept path — and a peer hanging up
+  mid-acceptance reaches two for one hangup, so a guard that has to be
+  remembered at each is one that will be forgotten at the next. The record is
+  bounded against *concurrent teardowns* rather than time, since both
+  announcements of one ending come out of the same one. `CallEndedElsewhere` is not
+  that duplicate and stays unconditional: it says *where* the call went, a
+  second sentence rather than the same one.
 - **A call is held by whoever holds the session.** `oxidezap-session` is what
   opens the mic, the speaker and the camera, so the process that owns the
   session owns the devices. That follows from the split rather than being

@@ -250,6 +250,32 @@ struct BrowserRelayChannel {
     outbound_dropped: std::cell::Cell<u32>,
     /// Whether anything has gone out yet; see [`RelayTransport::send`].
     sent_any: std::cell::Cell<bool>,
+    /// What has come *in*, kept as two answers rather than one.
+    ///
+    /// The mirror of `sent_any`, and it exists for the same reason: a call
+    /// whose relay opens, sends, and hears nothing back is indistinguishable
+    /// — from this side and from every log — from one whose peer simply said
+    /// nothing. It has already happened once in production, where the first
+    /// call of a session carried not one decoded frame in twenty-one seconds
+    /// while the second carried thousands.
+    ///
+    /// Two answers because one would have got that very call wrong. The relay
+    /// answers our STUN allocate whether or not it ever bridges the peer to
+    /// us — an unanswered allocate ends the call in ten seconds, and that one
+    /// lived twice as long, so control traffic certainly arrived. A flag
+    /// raised by any packet would have reported it as having "carried
+    /// inbound", which is the opposite of what it is for.
+    inbound: std::rc::Rc<InboundSeen>,
+}
+
+/// What the relay has actually delivered, by kind that matters.
+#[derive(Default)]
+struct InboundSeen {
+    /// Anything at all: the relay is talking to us.
+    any: std::cell::Cell<bool>,
+    /// RTP: the *peer* is reaching us through it. The one that decides
+    /// whether a silent call is their end or the path in between.
+    media: std::cell::Cell<bool>,
 }
 
 /// Where an inbound packet goes, and what happens when there is no room.
@@ -261,10 +287,31 @@ struct Inbound {
     /// drop is indistinguishable from a peer who stopped sending — which is
     /// the ambiguity `RelayTransportEvent::InboundDropped` exists to close.
     dropped: std::cell::Cell<u32>,
+    /// Raised on what the relay delivers; see `inbound` on the channel.
+    seen: std::rc::Rc<InboundSeen>,
 }
 
 impl Inbound {
     fn deliver(&self, packet: Bytes) {
+        // Before anything that can drop it: what this answers is whether the
+        // relay ever spoke to us, which a full queue does not change.
+        if !self.seen.any.replace(true) {
+            debug!("voip: the relay channel received its first inbound packet");
+        }
+        // And separately whether the *peer* did. STUN comes back from the
+        // relay itself, so it says only that the path to the relay works;
+        // media is the half that says the call has two ends.
+        //
+        // The flag is read before the classifier runs, not after: this is the
+        // callback every inbound packet arrives on, fifty times a second for
+        // the length of a call, and the answer stops changing after the first
+        // one. Written the other way round it classifies for a question
+        // already answered.
+        if !self.seen.media.get() && matches!(classify_relay_packet(&packet), RelayPacketKind::Rtp)
+        {
+            self.seen.media.set(true);
+            debug!("voip: the relay channel received the peer's first media packet");
+        }
         let pending = self.dropped.get();
         if pending > 0
             && let Ok(()) = self
@@ -450,13 +497,18 @@ impl Drop for BrowserRelayChannel {
         // which is a very different fault from one that sent and then lost
         // the channel — and the two are indistinguishable from a teardown
         // that reports neither.
+        // Three answers, because they fail apart. Outbound says whether the
+        // driver ever reached the transport; inbound says whether the relay
+        // ever answered us at all; media says whether the *peer* got through
+        // it. "Sent, heard the relay, never heard the peer" is a bridge that
+        // was never made — the shape the first call of a production session
+        // took — and it reads identically to a working call unless the last
+        // two are asked separately.
         debug!(
-            "voip: the relay channel is being released (it {} anything)",
-            if self.sent_any.get() {
-                "sent"
-            } else {
-                "never sent"
-            }
+            "voip: the relay channel is being released (outbound: {}, inbound: {}, peer media: {})",
+            yes_no(self.sent_any.get()),
+            yes_no(self.inbound.any.get()),
+            yes_no(self.inbound.media.get()),
         );
         if self.closed.replace(true) {
             return;
@@ -513,9 +565,11 @@ async fn connect_peer_connection(
     channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
     let (events_tx, events_rx) = async_channel::bounded(INBOUND_DEPTH);
+    let seen = std::rc::Rc::new(InboundSeen::default());
     let inbound = Rc::new(Inbound {
         events: events_tx.clone(),
         dropped: std::cell::Cell::new(0),
+        seen: std::rc::Rc::clone(&seen),
     });
 
     // Opened before the SDP exchange, so a channel that opens between the two
@@ -649,9 +703,15 @@ async fn connect_peer_connection(
             congested: std::cell::Cell::new(false),
             outbound_dropped: std::cell::Cell::new(0),
             sent_any: std::cell::Cell::new(false),
+            inbound: seen,
         }),
         events_rx,
     ))
+}
+
+/// For a log line that answers three questions in a row.
+fn yes_no(answer: bool) -> &'static str {
+    if answer { "yes" } else { "no" }
 }
 
 /// A `JsValue` as something worth putting in a log line.
