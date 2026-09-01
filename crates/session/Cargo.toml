@@ -20,6 +20,11 @@ wacore = { workspace = true }
 oxidezap-audio = { workspace = true }
 oxidezap-chat-store = { workspace = true, features = ["search"] }
 oxidezap-core = { workspace = true }
+# Where a task runs and how it waits, for both targets. `exec` is still the
+# module the session asks; what it asks is one crate down, because the plugin
+# host sits beside the session and cannot ask it — which is how the browser
+# timer came to exist three times.
+oxidezap-platform = { workspace = true }
 # Both targets now. The camera and the encoder are a platform each — nokhwa is
 # V4L2, AVFoundation and Media Foundation, and OpenH264 is C — and a browser has
 # both too, through `getUserMedia` and `VideoEncoder`. That split lives inside

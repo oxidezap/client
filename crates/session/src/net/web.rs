@@ -17,10 +17,8 @@
 //! callers hold a queue into it, which is the same arrangement `ipc::Link`
 //! describes and for the same reason.
 
-use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -28,7 +26,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::Closure;
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::JsFuture;
 use whatsapp_rust::wacore::net::{
     DisconnectReason, HttpClient, HttpRequest, HttpResponse, Transport, TransportEvent,
     TransportFactory,
@@ -55,7 +53,7 @@ impl Runtime for BrowserRuntime {
     /// that killed the task.
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) -> AbortHandle {
         let (cancel, cancelled) = futures_channel::oneshot::channel::<()>();
-        spawn_local(async move {
+        oxidezap_platform::spawn(async move {
             // Which of the two ended it, said out loud. An abort here drops
             // the future *where it was*, and for a future that has not been
             // polled yet that means it never runs at all — no log, no error,
@@ -116,94 +114,16 @@ impl Runtime for BrowserRuntime {
     }
 }
 
-thread_local! {
-    /// The page's window, resolved once.
-    ///
-    /// `web_sys::window()` is an `instanceof` across the wasm/JS boundary and
-    /// this is the library's own clock: it is asked for on every retry, every
-    /// poll and — through `yield_now`, which is this function at zero
-    /// milliseconds with `yield_frequency` of one — once per item the library
-    /// processes. Twice, before this, since the guard asked again to disarm.
-    static WINDOW: Option<web_sys::Window> = web_sys::window();
-}
-
-/// Do something with the page's window, if this agent has one.
-///
-/// `try_with` rather than `with`: the guard below is dropped from a task that
-/// can be torn down while thread locals are being destroyed, and a panic
-/// there is a panic in a destructor.
-fn with_window<T>(f: impl FnOnce(&web_sys::Window) -> T) -> Option<T> {
-    WINDOW
-        .try_with(|window| window.as_ref().map(f))
-        .ok()
-        .flatten()
-}
-
 /// `setTimeout`, as a future.
 ///
-/// Resolves immediately where no timer can be armed — a worker torn down
-/// mid-task — rather than never, because a future that never completes holds
-/// whatever is awaiting it for the life of the page.
+/// [`oxidezap_platform::try_sleep`] rather than its `sleep`, and the
+/// difference is the `false`: this is the library's own clock, so a wait that
+/// cannot be armed — a worker torn down mid-task — must resolve rather than
+/// park, because a future that never completes holds whatever is awaiting it
+/// for the life of the page. Every other caller in this tree is a loop that
+/// would spin instead, and takes the parking one.
 async fn sleep(duration: Duration) {
-    /// Disarms the timer when the sleep is dropped.
-    ///
-    /// Load-bearing now that an abort really drops the future it raced: a
-    /// `setTimeout` left armed fires into a `Closure` that has already been
-    /// freed, which is a wasm-bindgen panic rather than a missed wakeup. And
-    /// `yield_now` is this function at zero milliseconds, so a page that
-    /// cancels anything in a loop would strand one timer per iteration.
-    struct Timer {
-        handle: i32,
-        /// Raised by the callback. A timer that has already fired has nothing
-        /// to cancel, and the ordinary end of a wait is exactly that — so
-        /// cancelling unconditionally spent a `clearTimeout`, and the
-        /// `instanceof Window` in front of it, on every one of these.
-        fired: Rc<Cell<bool>>,
-        _fire: Closure<dyn FnMut()>,
-    }
-
-    impl Drop for Timer {
-        /// Cancels the pending `setTimeout`.
-        ///
-        /// Not tidiness: the closure it would fire into is freed with this
-        /// struct, and a browser calling a freed `Closure` is a wasm-bindgen
-        /// panic rather than a missed wakeup.
-        fn drop(&mut self) {
-            if self.fired.get() {
-                return;
-            }
-            with_window(|window| window.clear_timeout_with_handle(self.handle));
-        }
-    }
-
-    let (tx, rx) = futures_channel::oneshot::channel::<()>();
-    let mut tx = Some(tx);
-    let fired = Rc::new(Cell::new(false));
-    let raise = Rc::clone(&fired);
-    let fire = Closure::<dyn FnMut()>::new(move || {
-        raise.set(true);
-        if let Some(tx) = tx.take() {
-            let _ = tx.send(());
-        }
-    });
-    let armed = with_window(|window| {
-        window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            fire.as_ref().unchecked_ref(),
-            i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
-        )
-    });
-    let Some(Ok(handle)) = armed else {
-        return;
-    };
-    // Held until it has fired *or this future is dropped*. `Closure::forget`
-    // would hand it to the JS heap for the life of the page, and this is
-    // called once per retry, per poll and per yield.
-    let _timer = Timer {
-        handle,
-        fired,
-        _fire: fire,
-    };
-    let _ = rx.await;
+    let _ = oxidezap_platform::try_sleep(duration).await;
 }
 
 /// `fetch`, as the library's [`HttpClient`].
@@ -425,7 +345,7 @@ impl TransportFactory for BrowserTransportFactory {
         // The socket never leaves this task, and the closures never leave
         // the socket. Everything a caller can hold is the sender below.
         let (outbound, orders) = async_channel::unbounded();
-        spawn_local(async move {
+        oxidezap_platform::spawn(async move {
             // Moved in, not borrowed: this is where they die, which is what
             // keeps a reconnect from leaving four closures on the JS heap.
             let _handlers = (opened, message, closed, failed);

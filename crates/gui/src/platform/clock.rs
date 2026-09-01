@@ -7,9 +7,16 @@
 //! and `errno` behind it, neither of which builds for a target whose OS is
 //! "unknown".
 //!
-//! A browser's own timer is `setTimeout`, which is a callback rather than a
-//! future. Bridging it is ten lines and no dependency, so that is what this
-//! is — bound through `web-sys` in Rust like everything else here.
+//! A browser's own timer is `setTimeout`, and bridging it is a `Closure`, a
+//! drop guard and a `WorkerGlobalScope` fallback — which this module used to
+//! carry, minus the fallback, alongside two other copies elsewhere in the
+//! tree. It is `oxidezap_platform::sleep` now, and the window is the third
+//! caller of one timer rather than the author of a third one.
+//!
+//! What stays here is the *desktop* half, and that is the reason this module
+//! is not simply the shared crate's own `sleep` on both sides: the shared one
+//! waits on a Tokio wheel, and the window has no runtime to carry a wheel. A
+//! front end has not owned one since the daemon took the session over.
 
 use std::time::Duration;
 
@@ -26,7 +33,7 @@ pub async fn sleep(duration: Duration) {
     }
     #[cfg(target_family = "wasm")]
     {
-        web::sleep(duration).await;
+        oxidezap_platform::sleep(duration).await;
     }
 }
 
@@ -35,7 +42,9 @@ pub async fn sleep(duration: Duration) {
 /// `None` when the wait won. Written here rather than at the call site
 /// because the two halves come from different places on the web — the future
 /// is ours and the timer is the browser's — and racing them is the only thing
-/// a caller wants.
+/// a caller wants. Over the [`sleep`] above rather than the shared crate's
+/// `with_timeout`, for the reason the module header gives: that one is a race
+/// against a Tokio timer, and this side of the window has no runtime.
 pub async fn with_timeout<T>(work: impl Future<Output = T>, limit: Duration) -> Option<T> {
     let timeout = sleep(limit);
     futures_lite::future::or(async { Some(work.await) }, async {
@@ -43,132 +52,4 @@ pub async fn with_timeout<T>(work: impl Future<Output = T>, limit: Duration) -> 
         None
     })
     .await
-}
-
-#[cfg(target_family = "wasm")]
-mod web {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::task::{Poll, Waker};
-    use std::time::Duration;
-
-    use wasm_bindgen::JsCast as _;
-    use wasm_bindgen::prelude::Closure;
-
-    thread_local! {
-        /// The page's window, resolved once.
-        ///
-        /// `web_sys::window()` is an `instanceof` across the wasm/JS boundary,
-        /// and this used to ask twice per wait — once to arm and once in the
-        /// guard's `Drop`. Every caller here is a loop, so the cost is per
-        /// tick rather than per screen.
-        static WINDOW: Option<web_sys::Window> = web_sys::window();
-    }
-
-    /// Do something with the page's window, if this agent has one.
-    ///
-    /// `try_with` rather than `with`: the guard below is dropped from an
-    /// async task that can be torn down while thread locals are being
-    /// destroyed, and a panic there is a panic in a destructor.
-    fn with_window<T>(f: impl FnOnce(&web_sys::Window) -> T) -> Option<T> {
-        WINDOW
-            .try_with(|window| window.as_ref().map(f))
-            .ok()
-            .flatten()
-    }
-
-    /// A `setTimeout` that has been armed, as a future.
-    ///
-    /// The closure has to outlive this call and be dropped when the timer
-    /// fires or the future is dropped — which is why it is held here rather
-    /// than forgotten: these are armed per tick, and a leaked closure per
-    /// frame of video is a leak per frame of video.
-    pub async fn sleep(duration: Duration) {
-        let fired = Rc::new(RefCell::new(State::default()));
-        let armed = fired.clone();
-        let ring = Closure::<dyn FnMut()>::new(move || {
-            let waker = {
-                let mut state = armed.borrow_mut();
-                state.fired = true;
-                state.waker.take()
-            };
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        });
-
-        // Milliseconds, saturating: `setTimeout` takes an `i32` and a wait
-        // longer than 24 days is not a wait this window ever asks for.
-        let millis = i32::try_from(duration.as_millis()).unwrap_or(i32::MAX);
-        let handle = with_window(|window| {
-            window
-                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    ring.as_ref().unchecked_ref(),
-                    millis,
-                )
-                .ok()
-        })
-        .flatten();
-
-        // Nothing to wait on: no window, or the browser refused the timer.
-        //
-        // Every caller here is a polling loop, so returning immediately would
-        // turn one into a spin that never yields to the browser and freezes
-        // the tab. Parking forever stops that loop instead, which is the
-        // honest outcome: a page with no clock cannot animate anything, and
-        // the loop had nothing left to wait for.
-        if handle.is_none() {
-            log::error!("this page has no timer; the loop that was waiting on one stops here");
-            std::future::pending::<()>().await;
-            return;
-        }
-
-        let _guard = Cancel {
-            handle,
-            fired: Rc::clone(&fired),
-            _ring: ring,
-        };
-        std::future::poll_fn(|cx| {
-            let mut state = fired.borrow_mut();
-            if state.fired {
-                Poll::Ready(())
-            } else {
-                state.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await;
-    }
-
-    #[derive(Default)]
-    struct State {
-        fired: bool,
-        waker: Option<Waker>,
-    }
-
-    /// Clears the timer if the future is dropped before it fires, and keeps
-    /// the closure alive until then. A timer whose callback has been freed is
-    /// a crash rather than a missed wake.
-    struct Cancel {
-        handle: Option<i32>,
-        /// What the callback raised. A timer that has already fired has
-        /// nothing to cancel, and the ordinary end of a wait is exactly that
-        /// — so cancelling unconditionally spent a `clearTimeout` per tick of
-        /// every loop in the window for a handle the browser had already
-        /// retired.
-        fired: Rc<RefCell<State>>,
-        _ring: Closure<dyn FnMut()>,
-    }
-
-    impl Drop for Cancel {
-        fn drop(&mut self) {
-            if self.fired.borrow().fired {
-                return;
-            }
-            let Some(handle) = self.handle else {
-                return;
-            };
-            with_window(|window| window.clear_timeout_with_handle(handle));
-        }
-    }
 }

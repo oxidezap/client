@@ -10,15 +10,21 @@
 //! and forgets it. The host's shutdown does not depend on the wait, only on
 //! the flag it raises and the sender it drops; see `Plugins::shutdown`.
 
-use std::cell::Cell;
-use std::rc::Rc;
 use std::time::Duration;
 
 use wacore::time::Instant;
-use wasm_bindgen::JsCast as _;
-use wasm_bindgen::prelude::Closure;
 
 use super::{TrySend, Wake};
+
+/// `setTimeout`, as a future, from the crate that owns the browser's clock.
+///
+/// It used to be written out here, worker arm and drop guard and all, because
+/// this host cannot depend on the session that had already written it. That
+/// is what `oxidezap-platform` is for. Parking where no timer can be armed is
+/// its behaviour as well as this one's, and for the same reason: every caller
+/// here is a wait inside a loop, so returning at once turns one into a spin
+/// that never yields and takes the tab with it.
+pub use oxidezap_platform::sleep;
 
 /// A bounded queue on the page's loop.
 #[must_use]
@@ -78,66 +84,6 @@ impl<T> Receiver<T> {
     }
 }
 
-/// Whichever global this agent has a `setTimeout` on.
-///
-/// A window in the page and a `WorkerGlobalScope` in a worker. Both carry the
-/// same two methods and neither inherits from the other, so the choice is
-/// made once — and made at all, because a plugin worker is where this is
-/// eventually meant to run.
-enum Timers {
-    Window(web_sys::Window),
-    Worker(web_sys::WorkerGlobalScope),
-}
-
-thread_local! {
-    /// The agent's global, resolved once rather than per wait: a throttled
-    /// plugin sleeps in slices, so this is asked for far more often than a
-    /// plugin is scheduled.
-    static TIMERS: Option<Timers> = Timers::here();
-}
-
-/// Do something with this agent's timers, if it has any.
-fn with_timers<T>(f: impl FnOnce(&Timers) -> T) -> Option<T> {
-    // `try_with`, because a `Timer` can be dropped while thread locals are
-    // being destroyed and a panic there is a panic in a destructor.
-    TIMERS
-        .try_with(|timers| timers.as_ref().map(f))
-        .ok()
-        .flatten()
-}
-
-impl Timers {
-    fn here() -> Option<Self> {
-        if let Some(window) = web_sys::window() {
-            return Some(Self::Window(window));
-        }
-        js_sys::global()
-            .dyn_into::<web_sys::WorkerGlobalScope>()
-            .ok()
-            .map(Self::Worker)
-    }
-
-    fn arm(&self, fire: &Closure<dyn FnMut()>, millis: i32) -> Result<i32, wasm_bindgen::JsValue> {
-        match self {
-            Self::Window(window) => window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                fire.as_ref().unchecked_ref(),
-                millis,
-            ),
-            Self::Worker(worker) => worker.set_timeout_with_callback_and_timeout_and_arguments_0(
-                fire.as_ref().unchecked_ref(),
-                millis,
-            ),
-        }
-    }
-
-    fn disarm(&self, handle: i32) {
-        match self {
-            Self::Window(window) => window.clear_timeout_with_handle(handle),
-            Self::Worker(worker) => worker.clear_timeout_with_handle(handle),
-        }
-    }
-}
-
 /// Give the page's loop a turn.
 ///
 /// A zero-length `setTimeout` rather than a bare yield, because what has to
@@ -147,64 +93,6 @@ pub async fn breathe() {
     sleep(Duration::ZERO).await;
 }
 
-/// `setTimeout`, as a future.
-///
-/// Parks forever where no timer can be armed, which is the same answer the
-/// session's own clock gives: every caller here is a wait inside a loop, so
-/// returning at once turns one into a spin that never yields and takes the
-/// tab with it.
-pub async fn sleep(duration: Duration) {
-    /// Disarms the timer when the sleep is dropped — a `setTimeout` left
-    /// armed fires into a freed `Closure`, which is a panic rather than a
-    /// missed wakeup, and this is raced against something that wins often.
-    struct Timer {
-        handle: i32,
-        /// Raised by the callback below: a timer that has already fired has
-        /// nothing to cancel, and `clearTimeout` is a call across the
-        /// boundary either way.
-        fired: Rc<Cell<bool>>,
-        _fire: Closure<dyn FnMut()>,
-    }
-
-    impl Drop for Timer {
-        fn drop(&mut self) {
-            if self.fired.get() {
-                return;
-            }
-            with_timers(|timers| timers.disarm(self.handle));
-        }
-    }
-
-    let (tx, rx) = futures_channel::oneshot::channel::<()>();
-    let mut tx = Some(tx);
-    let fired = Rc::new(Cell::new(false));
-    let raise = Rc::clone(&fired);
-    let fire = Closure::<dyn FnMut()>::new(move || {
-        raise.set(true);
-        if let Some(tx) = tx.take() {
-            let _ = tx.send(());
-        }
-    });
-    let armed = with_timers(|timers| {
-        timers.arm(
-            &fire,
-            i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
-        )
-    })
-    .and_then(|handle| handle.ok())
-    .map(|handle| Timer {
-        handle,
-        fired,
-        _fire: fire,
-    });
-    let Some(_timer) = armed else {
-        log::error!("this agent has no timer; the plugin that was waiting on one stops here");
-        std::future::pending::<()>().await;
-        return;
-    };
-    let _ = rx.await;
-}
-
 /// Put a plugin's whole life on the page's loop.
 ///
 /// # Errors
@@ -212,7 +100,7 @@ pub async fn sleep(duration: Duration) {
 /// None here, and the signature keeps the `Result` because the interface is
 /// one interface: a page has one loop and `spawn_local` finds it.
 pub fn spawn(_name: &str, work: impl super::Work) -> std::io::Result<Task> {
-    wasm_bindgen_futures::spawn_local(work);
+    oxidezap_platform::spawn(work);
     Ok(Task)
 }
 

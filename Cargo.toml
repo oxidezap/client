@@ -10,6 +10,7 @@ members = [
     "crates/gui",
     "crates/ipc",
     "crates/logging",
+    "crates/platform",
     "crates/plugin-abi",
     "crates/plugin-host",
     "crates/plugin-sdk",
@@ -94,6 +95,7 @@ oxidezap-core = { path = "crates/core" }
 oxidezap-daemon = { path = "crates/daemon" }
 oxidezap-ipc = { path = "crates/ipc" }
 oxidezap-logging = { path = "crates/logging" }
+oxidezap-platform = { path = "crates/platform" }
 oxidezap-plugin-abi = { path = "crates/plugin-abi" }
 oxidezap-plugin-host = { path = "crates/plugin-host" }
 oxidezap-plugin = { path = "crates/plugin-sdk" }

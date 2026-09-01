@@ -25,6 +25,9 @@ chrono = { workspace = true, features = ["now"] }
 diesel = { workspace = true }
 diesel_migrations = { workspace = true }
 log = { workspace = true }
+# The one executor this crate names, on both targets: `tokio::spawn` inside
+# the session's runtime, the page's own loop in a browser. See `src/spawn.rs`.
+oxidezap-platform = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
@@ -50,9 +53,6 @@ whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rus
 # everywhere else in the workspace.
 getrandom = { workspace = true }
 getrandom_02 = { workspace = true }
-# The page's event loop, which is the only executor there is here. See
-# `src/spawn.rs`.
-wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 flate2 = { workspace = true }

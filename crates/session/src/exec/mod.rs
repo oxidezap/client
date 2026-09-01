@@ -17,16 +17,27 @@
 //! the page's event loop never leaves the agent that owns it and must not be
 //! required to, since the browser objects it holds are not `Send` and no
 //! amount of wrapping makes them so. [`MaybeSend`] is that difference, named
-//! once — the same trick the library plays with `MaybeSendSync`, for the same
-//! reason.
+//! once.
+//!
+//! Named once *underneath* this module, now, along with the spawn and the
+//! timer it is a bound on. This used to be the seam the whole tree was told
+//! to go through, and the plugin host could not: it sits beside the session
+//! rather than above it, so it copied the browser timer instead, and so did
+//! the window. What is left here is the part that really is the session's —
+//! the runtime it owns, the thread it drives, and the tasks it has to be able
+//! to wait for — over [`oxidezap_platform`], which is the seam proper.
 
 #[cfg_attr(target_family = "wasm", path = "web.rs")]
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
-/// Where the session waits.
+/// What only the session has: the executor it owns and the tasks it can wait
+/// for.
+pub use platform::{Executor, Task, breathe, let_go, spawn, spawn_owned, unblock};
+
+/// Where the session waits, and the bound it spawns under.
 ///
-/// [`sleep`] and [`with_timeout`] are here rather than reached for from
+/// [`sleep`] and [`with_timeout`] are named here rather than reached for from
 /// `tokio::time`, which is where a timeout would ordinarily come from and
 /// which does not work on a page: tokio's clock is `std::time::Instant::now`
 /// with no platform under it, so the first `sleep` or `timeout` on
@@ -34,26 +45,11 @@ mod platform;
 /// platform". That the crate *compiles* for the target says nothing about the
 /// timer running on it — a distinction only running the page can make, and it
 /// made it.
-pub use platform::{
-    Executor, Task, breathe, let_go, sleep, spawn, spawn_owned, unblock, with_timeout,
-};
-
-/// [`Send`], where the platform's executor asks for it.
 ///
-/// A work-stealing runtime moves a task between threads, so everything it is
-/// given must be `Send`. A browser's event loop moves nothing anywhere, and
-/// requiring it there would rule out every `web-sys` object — none of which
-/// is `Send`, and none of which needs to be.
-#[cfg(not(target_family = "wasm"))]
-pub trait MaybeSend: Send {}
-#[cfg(not(target_family = "wasm"))]
-impl<T: Send> MaybeSend for T {}
-
-/// See the desktop half: on a page the bound is empty.
-#[cfg(target_family = "wasm")]
-pub trait MaybeSend {}
-#[cfg(target_family = "wasm")]
-impl<T> MaybeSend for T {}
+/// Re-exported rather than declared, so the session, the plugin host and the
+/// store draw one line rather than three that can be drawn differently: this
+/// is still where the session asks for a wait, and no caller above changes.
+pub use oxidezap_platform::{MaybeSend, sleep, with_timeout};
 
 /// The task did not finish, and nothing is coming.
 ///

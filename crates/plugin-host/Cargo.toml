@@ -21,6 +21,11 @@ futures-lite = "2"
 portable-atomic = { workspace = true }
 log = { workspace = true }
 oxidezap-core = { workspace = true }
+# The browser's clock and the browser's loop, written once for the whole
+# workspace. This host sits beside the session rather than above it, so it
+# cannot reach the session's `exec` — which is exactly how it came to carry
+# its own copy of the same `setTimeout`, worker arm and drop guard and all.
+oxidezap-platform = { workspace = true }
 oxidezap-plugin-abi = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
 # The interpreter, deliberately: wasmi has no JIT, so nothing here generates
@@ -45,16 +50,11 @@ wasmi = { version = "1.0", default-features = false, features = ["std"] }
 # `std::time::Instant`, which traps on this target — so the waits go through
 # `sched`.
 [target.'cfg(target_family = "wasm")'.dependencies]
-futures-channel = "0.3"
-js-sys = "0.3"
 tokio = { workspace = true, features = ["sync"] }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
-    "Storage",
-    "Window",
-    "WorkerGlobalScope",
-] }
+# A plugin's settings, which is the one browser object this crate still names
+# for itself. The timer that used to need `js-sys`, `wasm-bindgen` and a
+# `WorkerGlobalScope` feature beside it now comes from `oxidezap-platform`.
+web-sys = { version = "0.3", features = ["Storage", "Window"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
