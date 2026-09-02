@@ -74,11 +74,9 @@ fn handle(ev: &Event) {
             set_count(count);
             draw();
         }
-        Which::Action(a) => {
-            if a.id().as_str() == ID_RESET {
-                set_count(0);
-                draw();
-            }
+        Which::Action(a) if a.id().as_str() == ID_RESET => {
+            set_count(0);
+            draw();
         }
         _ => {}
     }

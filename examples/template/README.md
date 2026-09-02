@@ -6,10 +6,15 @@ need.
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo build --release --target wasm32-unknown-unknown
+# From the repository root. Not a bare `cargo build --target wasm32-unknown-unknown`
+# in this directory: the root's `.cargo/config.toml` gives that target the web
+# front end's flags (`+atomics`, `--shared-memory`), cargo joins them into any
+# build under the tree, and the module that comes out has a shared memory the
+# daemon refuses. The task clears them and prints where the `.wasm` landed.
+module="$(cargo xtask plugin build examples/template)"
 
 mkdir -p ~/.local/share/oxidezap/plugins
-cp target/wasm32-unknown-unknown/release/template.wasm ~/.local/share/oxidezap/plugins/
+cp "$module" ~/.local/share/oxidezap/plugins/
 ```
 
 Restart `oxidezapd`. Set `OXIDEZAP_PLUGIN_DIR` to load from somewhere else,

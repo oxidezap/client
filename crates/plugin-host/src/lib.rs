@@ -723,6 +723,7 @@ async fn generation(
                 Ok(bytes) => bytes,
                 Err(e) => {
                     log::warn!("not loading {id}: {e:#}");
+                    registry.refuse(&id, format!("{e:#}"));
                     continue;
                 }
             };
@@ -756,8 +757,13 @@ async fn generation(
                 // One plugin that will not load is one plugin, said plainly
                 // and once. A daemon that refused to serve an account because
                 // a file in a folder was stale would be a worse trade than
-                // any plugin is worth.
-                Err(e) => log::warn!("not loading {id}: {e:#}"),
+                // any plugin is worth. Said to the registry as well as to the
+                // log, because the log is not where the person who dropped
+                // the file in is looking: Settings is, and it lists the file.
+                Err(e) => {
+                    log::warn!("not loading {id}: {e:#}");
+                    registry.refuse(&id, format!("{e:#}"));
+                }
             }
         }
 

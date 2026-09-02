@@ -332,11 +332,28 @@ fn invalidate() {
 mod tests {
     use super::*;
 
+    /// The epoch is one static, and the test runner is many threads.
+    ///
+    /// The three tests below read it, bump it and compare against it, and
+    /// cargo runs them at once: a clear bumped by one test between another's
+    /// `epoch()` and its `put_since` refused a write that had checked the
+    /// epoch a moment earlier — which is exactly what that write is *meant*
+    /// to do, and so read as the lock test failing. Seen once on the Windows
+    /// runner, where the thread that holds the write is scheduled later than
+    /// on Linux. Not `WIPE_LOCK`: `put_since` takes that itself, so a test
+    /// holding it across the call would deadlock the thing it is timing.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    fn alone() -> std::sync::MutexGuard<'static, ()> {
+        ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A publisher's queue outlives the tap that cleared the cache, so the
     /// write it is still holding has to be refused rather than repopulating a
     /// directory the user was just told was empty.
     #[test]
     fn a_write_prepared_before_a_clear_is_refused() {
+        let _alone = alone();
         let before = epoch();
         invalidate();
         assert!(
@@ -354,6 +371,7 @@ mod tests {
     /// rather than a suite that hangs.
     #[test]
     fn a_write_that_checked_the_epoch_still_reaches_the_disk() {
+        let _alone = alone();
         let Some(dir) = oxidezap_ipc::state_dir() else {
             return; // Nowhere to write, so nothing to race over.
         };
@@ -377,6 +395,7 @@ mod tests {
     /// leaves it standing is a clear that undoes itself.
     #[test]
     fn clearing_the_cache_retires_the_epoch_every_writer_is_holding() {
+        let _alone = alone();
         let before = epoch();
         invalidate();
         assert_ne!(epoch(), before);

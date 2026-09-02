@@ -23,8 +23,32 @@ pub struct PluginField {
     /// repeats itself: overwriting the box on every frame would delete a
     /// half-typed word the moment any other plugin changed anything.
     published: String,
+    /// The value this window last sent for it, until the plugin publishes
+    /// again.
+    ///
+    /// What makes "not saved yet" an honest thing to draw. Compared against
+    /// `published` alone, a value the plugin stored without redrawing would
+    /// read as unsaved forever, and Enter followed by clicking elsewhere
+    /// would send the same value twice — once for the key and once for the
+    /// blur. Cleared when the plugin publishes a different value, because
+    /// that is the plugin's answer replacing this window's guess.
+    committed: Option<String>,
     /// Dropped with the field, which is what unsubscribes it.
     _commit: gpui::Subscription,
+}
+
+impl PluginField {
+    /// The last value the plugin was given for this field, as far as this
+    /// window knows: what it sent, or failing that what the plugin published.
+    fn given(&self) -> &str {
+        self.committed.as_deref().unwrap_or(&self.published)
+    }
+
+    /// What is in the box, if it differs from [`Self::given`].
+    fn pending(&self, cx: &App) -> Option<String> {
+        let typed = self.state.read(cx).value();
+        (typed.as_ref() != self.given()).then(|| typed.to_string())
+    }
 }
 
 /// How much text one plugin setting may carry.
@@ -144,6 +168,27 @@ impl Plugins {
         self.fields
             .get(&key(plugin, slot, chat, id))
             .map(|f| &f.state)
+    }
+
+    /// Whether the box holds something the plugin has not been given.
+    ///
+    /// What the render pass asks before drawing "not saved yet" under a
+    /// field. A box with no field behind it has nothing to be unsaved.
+    pub(super) fn unsaved(&self, k: &FieldKey, cx: &App) -> bool {
+        self.fields.get(k).is_some_and(|f| f.pending(cx).is_some())
+    }
+
+    /// What one box holds that the plugin has not been given, if anything.
+    pub(super) fn pending(&self, k: &FieldKey, cx: &App) -> Option<String> {
+        self.fields.get(k).and_then(|f| f.pending(cx))
+    }
+
+    /// Note that `value` was sent for this field, so it is not pending any
+    /// more and a second commit of the same text sends nothing.
+    pub(super) fn sent(&mut self, k: &FieldKey, value: String) {
+        if let Some(field) = self.fields.get_mut(k) {
+            field.committed = Some(value);
+        }
     }
 
     /// Take the daemon's set of surfaces, and say whether the *membership*
@@ -267,6 +312,9 @@ impl Plugins {
             };
             if held.published != field.value {
                 held.published.clone_from(&field.value);
+                // The plugin has answered, so what this window sent is no
+                // longer the last word on the field's value.
+                held.committed = None;
                 let value = field.value.clone();
                 held.state
                     .update(cx, |state, cx| state.set_value(&value, window, cx));
@@ -290,6 +338,7 @@ impl Plugins {
             PluginField {
                 state,
                 published: field.value,
+                committed: None,
                 _commit: commit,
             },
         );
@@ -311,33 +360,28 @@ impl WhatsAppApp {
             let commit_plugin = field.plugin.clone();
             let commit_id = field.id.clone();
             let commit_slot = field.slot;
-            let commit = cx.subscribe(&state, move |this, state, event, cx| {
-                // Enter, and only Enter. A field that committed on every
-                // keystroke would send one request per letter and hand the
-                // plugin a keyword it is halfway through being given.
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    let value = state.read(cx).value().to_string();
-                    // Refused here rather than sent. The daemon caps a
-                    // request at a megabyte and *closes the connection* on
-                    // one that is longer, so somebody pasting a document into
-                    // a plugin's settings box would take the whole window's
-                    // session down rather than have one setting rejected.
-                    if value.len() > MAX_FIELD_BYTES {
-                        log::warn!(
-                            "plugin {commit_plugin}: refusing a {} byte value for `{commit_id}`; \
-                             the limit is {MAX_FIELD_BYTES}",
-                            value.len()
-                        );
-                        return;
+            let commit = cx.subscribe(&state, move |this, _state, event, cx| {
+                match event {
+                    // Not a commit. A field that committed on every keystroke
+                    // would send one request per letter and hand the plugin a
+                    // keyword it is halfway through being given. But the
+                    // "not saved yet" line under the box follows what is
+                    // typed, and nothing else redraws this view for a
+                    // keystroke inside somebody else's entity.
+                    InputEvent::Change => cx.notify(),
+                    // Enter, and leaving the box. Enter alone was the whole
+                    // story once, and nothing on screen said so: somebody
+                    // typed a new keyword, saw it in the box, closed
+                    // Settings, and the plugin went on answering the old one
+                    // — then a restart drew the old one back and it read as
+                    // a setting that had not been saved, which is exactly
+                    // what it was. Clicking elsewhere, tabbing away and
+                    // closing the screen all blur the box, and all of them
+                    // now commit what is in it.
+                    InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                        this.commit_plugin_field(&commit_plugin, commit_slot, &commit_id, cx);
                     }
-                    this.send_plugin_action(
-                        &commit_plugin,
-                        &commit_id,
-                        Some(value),
-                        commit_slot,
-                        PluginWidget::TextField,
-                        cx,
-                    );
+                    _ => {}
                 }
             });
             let chat = chat.clone();
@@ -345,6 +389,69 @@ impl WhatsAppApp {
                 plugins.adopt_field(chat.as_deref(), field, state, commit);
             });
         }
+    }
+
+    /// Send what is typed in one plugin field, if the plugin has not been
+    /// given it already.
+    ///
+    /// The same call for Enter, for the box losing focus and for the Save
+    /// button under it, which is what keeps the three from sending the same
+    /// value three times: a Save click blurs the box first, and the second
+    /// arrival finds nothing pending.
+    pub fn commit_plugin_field(
+        &mut self,
+        plugin: &str,
+        slot: PluginSlot,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let chat = self.selected_chat_jid();
+        let k = key(plugin, slot, chat.as_deref(), id);
+        let Some(value) = self.plugins.read(cx).pending(&k, cx) else {
+            return;
+        };
+        // Refused here rather than sent. The daemon caps a request at a
+        // megabyte and *closes the connection* on one that is longer, so
+        // somebody pasting a document into a plugin's settings box would
+        // take the whole window's session down rather than have one setting
+        // rejected. Left pending, so the line under the box goes on saying
+        // it is not saved — because it is not.
+        if value.len() > MAX_FIELD_BYTES {
+            log::warn!(
+                "plugin {plugin}: refusing a {} byte value for `{id}`; the limit is \
+                 {MAX_FIELD_BYTES}",
+                value.len()
+            );
+            return;
+        }
+        // Between connections there is nothing to send it to, and
+        // `send_plugin_action` drops it on the floor. Left pending rather
+        // than noted as sent: the line under the box goes on saying it is
+        // not saved, and the next Enter, blur or Save after the session is
+        // back sends it.
+        if self.client.is_none() {
+            log::debug!("plugin {plugin}: holding `{id}` until this window is attached");
+            return;
+        }
+        self.send_plugin_action(
+            plugin,
+            id,
+            Some(value.clone()),
+            slot,
+            PluginWidget::TextField,
+            cx,
+        );
+        self.plugins
+            .update(cx, |plugins, _| plugins.sent(&k, value));
+    }
+
+    /// Whether one plugin field holds something the plugin has not been
+    /// given.
+    #[must_use]
+    pub fn plugin_field_unsaved(&self, plugin: &str, slot: PluginSlot, id: &str, cx: &App) -> bool {
+        let chat = self.selected_chat_jid();
+        let k = key(plugin, slot, chat.as_deref(), id);
+        self.plugins.read(cx).unsaved(&k, cx)
     }
 
     /// The box holding what is typed into one plugin's field.
@@ -666,6 +773,7 @@ mod tests {
             approved: true,
             roots: Vec::new(),
             stopped: None,
+            refused: None,
         }
     }
 

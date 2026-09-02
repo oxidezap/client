@@ -81,6 +81,12 @@ impl Run {
         self
     }
 
+    /// Unset a variable for the child, whatever this process inherited.
+    pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
+        self.cmd.env_remove(key);
+        self
+    }
+
     pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.cmd.current_dir(dir);
         self

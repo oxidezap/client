@@ -16,6 +16,7 @@
 //!
 //!     cargo xtask web build
 //!     cargo xtask web map [dist]
+//!     cargo xtask plugin build <dir>
 //!     cargo xtask bundle check [dir] [--relocatable]
 //!     cargo xtask bundle size  [dir]
 //!     cargo xtask pages where
@@ -28,11 +29,12 @@ mod check;
 mod deploy;
 mod json;
 mod pages;
+mod plugin;
 mod sourcemap;
 mod util;
 mod web;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use check::{Api, Precondition, State};
 use pages::{Action, Job, Remote};
@@ -68,6 +70,9 @@ usage: cargo xtask <task>
   web map [dir]                  write a source map beside the module in it,
                                  out of the DWARF a `WEB_PROFILE=dwarf` build
                                  left in the module
+  plugin build <dir>             build the plugin in <dir> for wasm32 without
+                                 the web front end's flags, and print where
+                                 the .wasm landed
   bundle check [dir] [--relocatable]
                                  check the bundle is complete, and — for the
                                  archive a release carries — that nothing in
@@ -86,6 +91,8 @@ fn dispatch(args: &[&str]) -> Result<()> {
     match args {
         ["web", "build"] => web::build(),
         ["web", "map", rest @ ..] => web::map(&dist_of(rest)),
+        ["plugin", "build", dir] => plugin::build(Path::new(dir)).map(|_| ()),
+        ["plugin", "build", ..] => Err(err!("plugin build wants one directory\n\n{USAGE}")),
         ["bundle", "check", rest @ ..] => {
             let (rest, relocatable) = relocatable_flag(rest)?;
             bundle::check(&dist_of(&rest), relocatable)

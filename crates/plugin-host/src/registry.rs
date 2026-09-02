@@ -29,6 +29,8 @@ struct Entry {
     requested: i64,
     roots: Vec<PluginRoot>,
     stopped: Option<String>,
+    /// Why the loader would not run it. See [`Registry::refuse`].
+    refused: Option<String>,
 }
 
 /// Every loaded plugin, ordered by id.
@@ -121,6 +123,35 @@ impl Registry {
                 requested,
                 roots: Vec::new(),
                 stopped: None,
+                refused: None,
+            },
+        );
+        self.publish();
+    }
+
+    /// Record a module the loader would not run, with the reason a user will
+    /// read.
+    ///
+    /// Published like a plugin that loaded, because it is in the same folder
+    /// and it is the entry somebody is most likely to be looking for. Left
+    /// to the log alone, the Settings screen listed the file with a guess —
+    /// "not a plugin, or built against a different version of the ABI" —
+    /// over a module whose actual problem was the flags it was built with,
+    /// and the one sentence that named the problem was in a file nobody
+    /// reading Settings had open.
+    ///
+    /// The entry holds nothing else: no name but the id, no capabilities, no
+    /// roots. Nothing ran, so nothing was declared, and an action or an
+    /// approval naming this id finds no worker and goes nowhere.
+    pub fn refuse(&self, id: &str, reason: impl Into<String>) {
+        self.lock().insert(
+            id.to_owned(),
+            Entry {
+                name: id.to_owned(),
+                requested: 0,
+                roots: Vec::new(),
+                stopped: None,
+                refused: Some(reason.into()),
             },
         );
         self.publish();
@@ -218,7 +249,9 @@ impl Registry {
     /// Whether this plugin is still allowed to run.
     #[must_use]
     pub fn is_running(&self, id: &str) -> bool {
-        self.lock().get(id).is_some_and(|e| e.stopped.is_none())
+        self.lock()
+            .get(id)
+            .is_some_and(|e| e.stopped.is_none() && e.refused.is_none())
     }
 
     /// Everything, as a front end sees it.
@@ -234,6 +267,7 @@ impl Registry {
                 approved: self.approvals.is_approved(id, entry.requested),
                 roots: entry.roots.clone(),
                 stopped: entry.stopped.clone(),
+                refused: entry.refused.clone(),
             })
             .collect()
     }
@@ -407,6 +441,37 @@ mod tests {
         assert_eq!(
             registry.surfaces()[0].stopped.as_deref(),
             Some("out of fuel")
+        );
+    }
+
+    /// A module the loader would not run is still a file in the folder, and
+    /// the one entry somebody is most likely to be looking for. It is
+    /// published with the reason, and with nothing else: nothing ran, so
+    /// nothing was declared.
+    #[test]
+    fn a_refused_module_is_published_with_its_reason_and_nothing_else() {
+        let (registry, log) = recorder();
+        registry.refuse("stale", "its memory is shared");
+
+        assert_eq!(log.lock().expect("not poisoned").len(), 1);
+        let surface = registry.surfaces().remove(0);
+        assert_eq!(surface.id, "stale");
+        assert_eq!(
+            surface.name, "stale",
+            "no name was declared, so the id is it"
+        );
+        assert_eq!(surface.refused.as_deref(), Some("its memory is shared"));
+        assert!(
+            surface.stopped.is_none(),
+            "it never ran, so it never stopped"
+        );
+        assert!(surface.capabilities.is_empty());
+        assert!(surface.roots.is_empty());
+        assert!(!surface.is_running());
+        assert!(!registry.is_running("stale"));
+        assert!(
+            !registry.draws("stale", "go", PluginSlot::ChatHeader, PluginWidget::Button),
+            "and no press can be routed to it"
         );
     }
 

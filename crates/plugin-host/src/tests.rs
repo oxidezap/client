@@ -652,7 +652,60 @@ fn a_module_built_for_another_abi_is_refused_before_it_runs() {
     let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
 
     assert!(plugins.is_empty());
-    assert!(published.latest().is_empty());
+    // Refused is not invisible: the file is in the folder, so it is in the
+    // list, with the reason where the person who put it there will read it.
+    let surfaces = published.latest();
+    assert_eq!(surfaces.len(), 1);
+    let refused = surfaces[0]
+        .refused
+        .as_deref()
+        .expect("the reason it was not run");
+    assert!(
+        refused.contains("ABI") || refused.contains("version"),
+        "the reason should name the version mismatch, got {refused:?}"
+    );
+    assert!(!surfaces[0].is_running());
+    assert!(surfaces[0].roots.is_empty());
+}
+
+/// The mistake the folder is most likely to hold. The root `.cargo/config.toml`
+/// gives every wasm build under the tree the web front end's flags, and a
+/// plugin built beside it — `cargo build --target wasm32-unknown-unknown` in
+/// its own directory — comes out with a shared memory. wasmi refuses that at
+/// the memory section, and until the reason travelled with the surface,
+/// Settings drew the file as "built against a different version of the ABI",
+/// which sent somebody off to check a number that was right.
+#[test]
+fn a_module_built_with_the_web_front_ends_flags_is_refused_for_that_reason() {
+    let dir = TempDir::new("shared-memory");
+    dir.plugin(
+        "webbuilt",
+        &versioned(
+            r#"(module
+             (import "oxidezap" "oxi_subscribe" (func $subscribe (param i64)))
+             (memory (export "memory") 1 1 shared)
+             (func (export "oxi_abi_version") (result i32) (i32.const $ABI_VERSION))
+             (func (export "oxi_init") (result i32) (call $subscribe (i64.const 2)) (i32.const 0))
+             (func (export "oxi_on_event") (param i32 i32) (result i32) (i32.const 0)))"#,
+        ),
+    );
+    let published = Published::default();
+    let plugins = host(&dir, Recorder::new(Outcome::Accepted), &published);
+
+    assert!(plugins.is_empty());
+    let surfaces = published.latest();
+    let refused = surfaces[0]
+        .refused
+        .as_deref()
+        .expect("the reason it was not run");
+    assert!(
+        refused.contains("shared") && refused.contains("cargo xtask plugin build"),
+        "the reason should name the flags and the build that avoids them, got {refused:?}"
+    );
+    assert!(
+        !refused.contains("ABI"),
+        "and not blame the ABI version, which is right: {refused:?}"
+    );
 }
 
 #[test]
@@ -684,7 +737,23 @@ fn one_unloadable_file_does_not_stop_the_others() {
     let published = Published::default();
     let plugins = host(&dir, Arc::clone(&commands), &published);
 
-    assert_eq!(published.latest().len(), 1);
+    // Both files are listed — the junk with the reason it is not running —
+    // and only the plugin runs.
+    let surfaces = published.latest();
+    assert_eq!(surfaces.len(), 2);
+    assert_eq!(
+        surfaces
+            .iter()
+            .filter(|s| s.is_running())
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
+        ["autoreply"]
+    );
+    assert!(
+        surfaces
+            .iter()
+            .any(|s| s.id == "junk" && s.refused.is_some())
+    );
     plugins.observe(&message("a@s.whatsapp.net", "ping"));
     until("the reply", || commands.sent().len() == 1);
 }
@@ -1026,12 +1095,16 @@ fn shutting_down_joins_every_plugin() {
 /// The real SDK, against the real host.
 ///
 /// Ignored by default because it needs the example built for wasm32, which
-/// means a target CI does not install:
+/// the ordinary test run does not do. CI's Linux `Check` job does both:
 ///
 /// ```text
-/// cd examples/autoreply && cargo build --release --target wasm32-unknown-unknown
+/// cargo xtask plugin build examples/autoreply
 /// cargo test -p oxidezap-plugin-host -- --ignored
 /// ```
+///
+/// Through the task and not a bare `cargo build`: the root config's wasm
+/// flags would give the module a shared memory, and this test would then be
+/// checking that the host refuses it.
 ///
 /// The `.wat` fixtures above test the host; this tests the *pair* — that what
 /// `oxidezap-plugin` emits is what this file expects, which is the one thing
@@ -2881,9 +2954,11 @@ fn declaring_a_result_on_a_resultless_import_refuses_the_module() {
     let published = Published::default();
     let plugins = unapproved_host(&dir, Recorder::new(Outcome::Accepted), &published);
 
+    let surfaces = plugins.surfaces();
     assert!(
-        plugins.surfaces().is_empty(),
-        "a module whose import signature disagrees with the host does not load"
+        surfaces.len() == 1 && surfaces[0].refused.is_some() && !surfaces[0].is_running(),
+        "a module whose import signature disagrees with the host does not load, \
+         and is listed with the reason: {surfaces:?}"
     );
 }
 
