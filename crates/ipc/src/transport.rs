@@ -9,12 +9,13 @@ use std::path::PathBuf;
 /// an Open and no way back: the icon did nothing when clicked, and the one
 /// way to put the window away was to close it. Now a click on the icon
 /// toggles — raise when nothing is attached, hide when something is — and
-/// the menu offers whichever of the two applies. A v25 window reads the
-/// frame as unparsable and logs it, so Hide would do nothing against a
-/// window built before it existed; the direction that matters is the other
-/// one, a v25 daemon under an upgraded window, which never sends the frame
+/// the menu offers whichever of the two applies. Without a version a v25
+/// window would read the frame as unparsable and log it, so Hide would do
+/// nothing against a window built before it existed; with one, the hello
+/// refuses the pair outright, which is the honest answer. The other
+/// direction, a v25 daemon under an upgraded window, never sends the frame
 /// and has no item to send it from — so this is a version for the same
-/// reason v22 was, a frame an older reader drops on the floor.
+/// reason v22 was, a frame an older reader would drop on the floor.
 ///
 /// 25: `ClientRequest::InstallPlugin`, `RemovePlugin` and
 /// `ListInstalledPlugins`, answered by `DaemonMessage::PluginInstalled` and
