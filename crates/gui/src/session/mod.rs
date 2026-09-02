@@ -1518,10 +1518,15 @@ fn fail_reserved(conn: &Conn, id: RequestId, detail: String) {
         conn.media.discard(key);
     }
     match waiting {
-        // This runs on the GPUI executor, and that executor is what drains
-        // this queue. `failed` publishes with the waiting variant of the
-        // send, so a full queue would park the only thread that could empty
-        // it — the window stops rather than saying the message did not go.
+        // `try_send` because this can run on the GPUI executor, and that
+        // executor is what drains this queue: `failed` publishes with the
+        // waiting variant of the send, so a full queue would park the only
+        // thread that could empty it — the window stops rather than saying the
+        // message did not go. It is not the only caller any more — a staged
+        // send's continuation reaches this from wherever the media cache
+        // finished, which on a desktop is the cache's own thread — and the
+        // rule is kept for the one that can deadlock rather than split in two
+        // by where the failure came from.
         Awaiting::Send {
             chat_jid, local_id, ..
         } => {

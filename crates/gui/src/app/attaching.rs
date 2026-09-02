@@ -147,7 +147,10 @@ impl WhatsAppApp {
             return false;
         };
 
-        let kind = OutgoingMedia::for_mime(&file.mime_type);
+        // The picker's answer rather than the protocol's: `for_mime` says what
+        // an `image/*` is, and the picker says which of those actually reach
+        // the recipient as a picture. See `picker::kind_for`.
+        let kind = crate::platform::picker::kind_for(&file.mime_type);
         let local_id = Self::next_local_id("local_media");
         // Built before the bytes are handed over, because for a picture it
         // *is* those bytes: the sender sees what they sent rather than a
@@ -234,5 +237,73 @@ fn image_size(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
     {
         Some((width, height)) => (Some(width), Some(height)),
         None => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use oxidezap_core::{MediaType, OutgoingMedia};
+
+    use super::echo_of;
+    use crate::platform::picker::{Picked, kind_for};
+
+    /// A file of this type, with bytes that are nothing in particular: what is
+    /// being asserted is what the *type* decides, and no branch here reads a
+    /// byte of a document.
+    fn picked(file_name: &str, mime_type: &str) -> Picked {
+        Picked {
+            file_name: file_name.to_string(),
+            mime_type: mime_type.to_string(),
+            bytes: vec![0; 4096],
+        }
+    }
+
+    /// A picture in a format the far end will not draw goes as a document, so
+    /// the recipient gets a file they can open instead of a bubble that is
+    /// blank on every client — see `picker::kind_for`.
+    ///
+    /// And the bubble for it holds no bytes. The echo carries a copy of the
+    /// payload only where those bytes *are* the picture; drawing a document
+    /// from them is not something this side can do, so keeping a second copy
+    /// of an SVG until the upload finished bought nothing at all.
+    #[test]
+    fn a_picture_nothing_draws_is_sent_and_echoed_as_a_document() {
+        for undrawable in [
+            "image/svg+xml",
+            "image/heic",
+            "image/heif",
+            "image/avif",
+            "image/tiff",
+            "image/bmp",
+        ] {
+            let file = picked("desenho", undrawable);
+            let kind = kind_for(&file.mime_type);
+            assert_eq!(kind, OutgoingMedia::Document, "{undrawable}");
+
+            let echo = echo_of(&file, kind);
+            assert_eq!(echo.media_type, MediaType::Document, "{undrawable}");
+            assert!(
+                echo.data.is_empty(),
+                "{undrawable} echoed {} bytes it cannot draw",
+                echo.data.len()
+            );
+            // The name still travels, because a document is drawn as one.
+            assert_eq!(echo.file_name.as_deref(), Some("desenho"), "{undrawable}");
+        }
+    }
+
+    /// And a photo is still a photo, drawn from the bytes in hand: the sender
+    /// sees what they sent rather than a placeholder that resolves into it.
+    #[test]
+    fn a_photo_is_still_echoed_from_its_own_bytes() {
+        for photo in ["image/jpeg", "image/png", "image/gif", "image/webp"] {
+            let file = picked("praia", photo);
+            let kind = kind_for(&file.mime_type);
+            assert_eq!(kind, OutgoingMedia::Image, "{photo}");
+
+            let echo = echo_of(&file, kind);
+            assert_eq!(echo.media_type, MediaType::Image, "{photo}");
+            assert_eq!(echo.data.len(), file.bytes.len(), "{photo}");
+        }
     }
 }
