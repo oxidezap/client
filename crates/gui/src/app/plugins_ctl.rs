@@ -424,9 +424,25 @@ impl WhatsAppApp {
             );
             return;
         }
+        // Between connections there is nothing to send it to, and
+        // `send_plugin_action` drops it on the floor. Left pending rather
+        // than noted as sent: the line under the box goes on saying it is
+        // not saved, and the next Enter, blur or Save after the session is
+        // back sends it.
+        if self.client.is_none() {
+            log::debug!("plugin {plugin}: holding `{id}` until this window is attached");
+            return;
+        }
+        self.send_plugin_action(
+            plugin,
+            id,
+            Some(value.clone()),
+            slot,
+            PluginWidget::TextField,
+            cx,
+        );
         self.plugins
-            .update(cx, |plugins, _| plugins.sent(&k, value.clone()));
-        self.send_plugin_action(plugin, id, Some(value), slot, PluginWidget::TextField, cx);
+            .update(cx, |plugins, _| plugins.sent(&k, value));
     }
 
     /// Whether one plugin field holds something the plugin has not been

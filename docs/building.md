@@ -25,10 +25,12 @@ cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxideza
 # for this target — that target is the *web front end* — and cargo joins those
 # into any build under the tree. A plugin built with them has a shared memory,
 # which the host refuses, saying so on the Settings screen. The task is the one
-# place that knows to clear `RUSTFLAGS`; it prints where the `.wasm` landed.
+# place that knows to clear `RUSTFLAGS`; it prints where the `.wasm` landed,
+# which is the only thing it prints, so the path can be taken from it — and
+# should be, since `CARGO_TARGET_DIR` moves it.
 rustup target add wasm32-unknown-unknown
-cargo xtask plugin build examples/autoreply
-cp examples/autoreply/target/wasm32-unknown-unknown/release/autoreply.wasm ~/.local/share/oxidezap/plugins/
+module="$(cargo xtask plugin build examples/autoreply)"
+cp "$module" ~/.local/share/oxidezap/plugins/
 # And the one test that exercises the real SDK against the real host: it loads
 # the module the line above built. CI runs both, in the Linux `Check` job.
 cargo test -p oxidezap-plugin-host --all-features -- --ignored

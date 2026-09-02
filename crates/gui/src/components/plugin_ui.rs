@@ -291,16 +291,23 @@ fn unsaved_row(
                 .child("Not saved yet. Press Enter, or click Save."),
         )
         .child(
-            Button::new(SharedString::from(format!("plugin/{plugin}/{id}/save")))
-                .label("Save")
-                .primary()
-                .small()
-                .on_click(move |_, _window, cx| {
-                    let (plugin, id) = (plugin.clone(), id.clone());
-                    entity.update(cx, |app, cx| {
-                        app.commit_plugin_field(&plugin, slot, &id, cx);
-                    });
-                }),
+            // Its own namespace, and the slot in it. A widget id may hold
+            // `/`, so `plugin/{plugin}/{id}/save` was also the id of a
+            // plugin button called `{id}/save`; and one plugin may draw the
+            // same field in the header and in Settings, which are two boxes
+            // and so two Save buttons.
+            Button::new(SharedString::from(format!(
+                "plugin-save/{plugin}/{slot:?}/{id}"
+            )))
+            .label("Save")
+            .primary()
+            .small()
+            .on_click(move |_, _window, cx| {
+                let (plugin, id) = (plugin.clone(), id.clone());
+                entity.update(cx, |app, cx| {
+                    app.commit_plugin_field(&plugin, slot, &id, cx);
+                });
+            }),
         )
 }
 

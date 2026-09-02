@@ -37,8 +37,8 @@ pub fn build(dir: &Path) -> Result<PathBuf> {
     let manifest = dir.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| err!("{} is not a plugin directory: {e}", dir.display()))?;
-    let name =
-        package_name(&text).ok_or_else(|| err!("{} names no package", manifest.display()))?;
+    let artifact =
+        artifact_name(&text).ok_or_else(|| err!("{} names no package", manifest.display()))?;
 
     // The cargo this task was started by, so a `cargo +nightly xtask` builds
     // the plugin with the same toolchain, and a plain one stays on stable —
@@ -61,7 +61,7 @@ pub fn build(dir: &Path) -> Result<PathBuf> {
     let module = target_dir(dir)
         .join(TARGET)
         .join("release")
-        .join(format!("{name}.wasm"));
+        .join(format!("{artifact}.wasm"));
     if !module.is_file() {
         return Err(err!(
             "the build finished but {} is not there; is `crate-type = [\"cdylib\"]` set?",
@@ -87,34 +87,48 @@ fn target_dir(dir: &Path) -> PathBuf {
         .unwrap_or_else(|| dir.join("target"))
 }
 
-/// The `name` under `[package]`, which is the plugin's id and the module's
-/// file name.
+/// What cargo will call the module, without the extension.
+///
+/// The library target's name, which is not the package's: cargo turns a
+/// hyphen into an underscore there, since a target name has to be an
+/// identifier, and a `[lib] name` replaces it outright. The stem is also the
+/// plugin's id, so a package called `auto-reply` is the plugin `auto_reply`
+/// — which the host accepts, and which the person naming it should know.
+fn artifact_name(manifest: &str) -> Option<String> {
+    if let Some(lib) = value_in(manifest, "lib", "name") {
+        return Some(lib);
+    }
+    value_in(manifest, "package", "name").map(|name| name.replace('-', "_"))
+}
+
+/// One quoted string under one table of a manifest.
 ///
 /// A line reader rather than a TOML parser, because this crate takes no
-/// dependencies and a manifest's package name is one quoted string on one
-/// line. Anything stranger — a name on a continuation line, a `[package]`
-/// table written inline — is not something either example does, and a
-/// manifest that fools this is answered by the build finishing and the file
-/// not being there, which `build` says.
-fn package_name(manifest: &str) -> Option<String> {
-    let mut in_package = false;
+/// dependencies and a manifest's names are one quoted string on one line
+/// each. Comments are dropped before anything is compared, so a header or a
+/// value with one beside it reads as it would to cargo. Anything stranger —
+/// a value on a continuation line, a table written inline — is not something
+/// either example does, and a manifest that fools this is answered by the
+/// build finishing and the file not being there, which `build` says.
+fn value_in(manifest: &str, table: &str, key: &str) -> Option<String> {
+    let mut inside = false;
     for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_package = line == "[package]";
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(header) = line.strip_prefix('[') {
+            inside = header.strip_suffix(']').map(str::trim) == Some(table);
             continue;
         }
-        if !in_package {
+        if !inside {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else {
+        let Some((k, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() != "name" {
+        if k.trim() != key {
             continue;
         }
-        let value = value.split('#').next().unwrap_or("").trim();
         return value
+            .trim()
             .strip_prefix('"')
             .and_then(|v| v.strip_suffix('"'))
             .map(str::to_owned);
@@ -130,7 +144,7 @@ mod tests {
     #[test]
     fn the_name_comes_from_the_package_table_and_nowhere_else() {
         let manifest = r#"
-[package]
+[package] # the header may carry a comment too
 # This name is the plugin's id.
 name = "autoreply" # trailing
 version = "0.1.0"
@@ -138,13 +152,28 @@ version = "0.1.0"
 [dependencies]
 name = "not-this-one"
 "#;
-        assert_eq!(package_name(manifest).as_deref(), Some("autoreply"));
+        assert_eq!(artifact_name(manifest).as_deref(), Some("autoreply"));
+    }
+
+    /// What cargo does to a hyphen, and what a `[lib] name` does to all of
+    /// it: the file on disk is what the task has to name, not the package.
+    #[test]
+    fn the_module_is_named_the_way_cargo_names_it() {
+        assert_eq!(
+            artifact_name("[package]\nname = \"auto-reply\"\n").as_deref(),
+            Some("auto_reply")
+        );
+        assert_eq!(
+            artifact_name("[package]\nname = \"auto-reply\"\n\n[lib]\nname = \"replies\"\n")
+                .as_deref(),
+            Some("replies")
+        );
     }
 
     #[test]
     fn a_manifest_without_a_package_names_nothing() {
-        assert_eq!(package_name("[workspace]\nmembers = []\n"), None);
-        assert_eq!(package_name("[package]\nversion = \"1\"\n"), None);
+        assert_eq!(artifact_name("[workspace]\nmembers = []\n"), None);
+        assert_eq!(artifact_name("[package]\nversion = \"1\"\n"), None);
     }
 
     /// The file's name is the plugin's id, and the READMEs say which file to
@@ -161,7 +190,7 @@ name = "not-this-one"
             };
             let expected = dir.file_name().and_then(|n| n.to_str()).map(str::to_owned);
             assert_eq!(
-                package_name(&manifest),
+                artifact_name(&manifest),
                 expected,
                 "{} should be named after its directory",
                 dir.display()

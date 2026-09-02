@@ -72,6 +72,17 @@ cargo test --workspace --all-features
 cargo fmt --manifest-path xtask/Cargo.toml --all -- --check
 cargo clippy --manifest-path xtask/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path xtask/Cargo.toml
+
+# And the example plugins, which are their own workspaces too: the same three
+# on the host for each, then built for wasm32 through the task and loaded by
+# the host's ignored test (`rustup target add wasm32-unknown-unknown` first).
+for example in examples/*/; do
+  cargo fmt --manifest-path "$example/Cargo.toml" --all -- --check
+  cargo clippy --manifest-path "$example/Cargo.toml" --all-targets -- -D warnings
+  cargo test --manifest-path "$example/Cargo.toml"
+  cargo xtask plugin build "$example"
+done
+cargo test -p oxidezap-plugin-host --all-features -- --ignored
 ```
 
 `cargo xtask help` lists the repository's own tooling — prefer asking it to

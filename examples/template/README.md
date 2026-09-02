@@ -11,10 +11,10 @@ rustup target add wasm32-unknown-unknown
 # front end's flags (`+atomics`, `--shared-memory`), cargo joins them into any
 # build under the tree, and the module that comes out has a shared memory the
 # daemon refuses. The task clears them and prints where the `.wasm` landed.
-cargo xtask plugin build examples/template
+module="$(cargo xtask plugin build examples/template)"
 
 mkdir -p ~/.local/share/oxidezap/plugins
-cp examples/template/target/wasm32-unknown-unknown/release/template.wasm ~/.local/share/oxidezap/plugins/
+cp "$module" ~/.local/share/oxidezap/plugins/
 ```
 
 Restart `oxidezapd`. Set `OXIDEZAP_PLUGIN_DIR` to load from somewhere else,
