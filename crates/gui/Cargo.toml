@@ -138,6 +138,9 @@ web-sys = { version = "0.3", features = [
     "Location",
     "Node",
     "PageTransitionEvent",
+    # The emoji face, fetched from beside `index.html` rather than embedded;
+    # see `platform/fonts.rs`.
+    "Response",
     "Storage",
     "StorageEvent",
     "Url",

@@ -386,6 +386,29 @@ exactly as its comment described, which says nothing about a function that
 never needed it. When a comment says something is impossible, reproduce the
 impossibility it describes before believing it.
 
+**A page has no fonts, and no way to borrow the browser's.** The window
+rasterizes every glyph itself — swash, out of a `fontdb` that
+`CosmicTextSystem::new_without_system_fonts` starts empty — onto a canvas the
+browser's own text pipeline never touches. So `local()` in CSS, `system-ui`,
+and whatever emoji font the machine has are all unreachable: a family the page
+was not handed is a family it cannot draw, and gpui *panics* rather than
+falling back. `platform::fonts` is the answer, and it makes the split the
+bundle's shape depends on: the two text families are `include_bytes!`d,
+because a window that cannot resolve `.SystemUIFont` never draws a frame,
+while the emoji face is a file fetched from beside `index.html`, because the
+worst it can cost is boxes where the emoji were. That is also why the emoji
+face is monochrome Noto Emoji rather than the colour one — gpui takes swash's
+colour path for exactly one PostScript name, `NotoColorEmoji`, and swash reads
+COLR **version 0** or CBDT strikes, while what Google Fonts serves today is
+COLRv1: 25 MB the renderer would draw as nothing. The colour build that does
+work is ten megabytes of bitmaps.
+
+The fetch finishes *before* the window opens, and the deadline on it is what
+keeps that from being a page that never draws. Opening first and adding the
+face later looks cheaper and is not: gpui's `LineLayoutCache` keeps a shaped
+line for as long as something asks for it every frame, so the chat list a page
+opens onto would have kept its boxes until it was scrolled away and back.
+
 **A fix is not deployed until the service worker agrees.** `coi-serviceworker.js`
 is there because cross-origin isolation needs two response headers GitHub Pages
 will not set, and the price is that the *document* comes back through it: an
