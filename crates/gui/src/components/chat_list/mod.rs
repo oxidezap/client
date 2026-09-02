@@ -258,7 +258,7 @@ fn render_rows(
                         // knows which rows are on screen; asking twice for the
                         // same page is what the paging state prevents.
                         if crate::app::nearing_end(visible_range.end, rows.len()) {
-                            view.want_more_chats();
+                            view.want_more_chats(cx);
                         }
                         visible_range
                             .map(|ix| {

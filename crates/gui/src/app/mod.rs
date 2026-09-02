@@ -680,11 +680,9 @@ pub struct WhatsAppApp {
     /// every row is a row without messages, so two of them can be opened
     /// before either load lands.
     owed_reads: std::collections::HashSet<String>,
-    /// Where each conversation's timeline continues, and whether it is
-    /// asking. See [`paging`].
-    timeline_pages: paging::TimelinePages,
-    /// Where the chat list continues.
-    chat_pages: paging::Paging,
+    /// Where both paged lists continue, and whether either is asking. See
+    /// [`paging`].
+    pages: Entity<paging::Pages>,
     /// Status updates watched in this window. Local by design — there is no
     /// receipt to send — and therefore this window's job to remember across a
     /// hydration merge, which replaces those rows from the store.
@@ -721,20 +719,9 @@ pub struct WhatsAppApp {
     /// cancels it.
     #[allow(dead_code)]
     reconnect_task: Option<Task<()>>,
-    /// Audio recorder for PTT messages
-    audio_recorder: AudioRecorder,
-    /// Current recording state
-    recording_state: RecordingState,
-    /// Chat the current PTT recording started in; the note is sent there even
-    /// if the user switches chats before stopping
-    recording_target: Option<RecordingTarget>,
-    /// Which recording the encode still in flight belongs to.
-    ///
-    /// Encoding runs detached on the background pool and nothing can stop it,
-    /// so cancelling is not a matter of aborting the work but of disowning
-    /// its result. Bumped by `cancel_recording`; a completion whose epoch no
-    /// longer matches is dropped rather than sent.
-    recording_epoch: usize,
+    /// The microphone, what it is being held open for, and the timer that
+    /// draws the meter. See [`recording`].
+    recorder: Entity<recording::Recorder>,
     /// Audio player for voice message and video audio playback
     audio_player: AudioPlayer,
     /// Playback speed for voice notes, shared across clips: someone who
@@ -757,20 +744,13 @@ pub struct WhatsAppApp {
     /// completions autoplay only if they still match it, so a stale download
     /// can't steal playback from media the user started meanwhile.
     pending_media_request: Option<String>,
-    /// When the automatic retry fires, while the error screen is up.
-    retry_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Counts the retry down. Only alive while the error screen is.
-    #[allow(dead_code)]
-    retry_task: Option<Task<()>>,
-    /// Whether the error screen's technical detail is unfolded.
-    error_detail_open: bool,
-    /// Transient lines drawn over whatever screen is up. See [`notices`].
-    notices: Vec<notices::Notice>,
-    /// Never reused, so a dismissal cannot land on a later notice.
-    next_notice_id: u64,
-    /// Expires them. Alive only while something is up.
-    #[allow(dead_code)]
-    notice_task: Option<Task<()>>,
+    /// What the error screen is waiting on, and what it is showing. See
+    /// [`recovery`].
+    recovery: Entity<recovery::Recovering>,
+    /// The transient lines drawn over whatever screen is up, and the timer
+    /// that expires them. A view of its own, hung off the root. See
+    /// [`notices`].
+    notices: Entity<notices::Notices>,
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
@@ -836,10 +816,6 @@ pub struct WhatsAppApp {
     /// The broadcast grouped by author, against the message count it was
     /// built from.
     status_feed_cache: RefCell<Option<(usize, oxidezap_core::StatusFeed)>>,
-    /// Repaints the recording panel's clock and level meter. Only alive while
-    /// the microphone is.
-    #[allow(dead_code)]
-    recording_tick: Option<Task<()>>,
     /// Redraws the status feed when its next update lapses. A status is the
     /// one thing that changes with nothing happening.
     #[allow(dead_code)]
@@ -921,8 +897,8 @@ impl WhatsAppApp {
                     FromDaemon::CallFrames => entity.update(cx, |app, cx| {
                         app.draw_waiting_call_frames(cx);
                     }),
-                    FromDaemon::PageLost { jid } => entity.update(cx, |app, _cx| {
-                        app.page_lost(jid);
+                    FromDaemon::PageLost { jid } => entity.update(cx, |app, cx| {
+                        app.page_lost(jid, cx);
                     }),
                     FromDaemon::StatusViewLost(message_ids) => entity.update(cx, |app, cx| {
                         app.forget_status_views(&message_ids, cx);
@@ -975,8 +951,7 @@ impl WhatsAppApp {
             retained_chat: None,
             departed_chats: std::collections::HashSet::new(),
             owed_reads: std::collections::HashSet::new(),
-            timeline_pages: paging::TimelinePages::new(),
-            chat_pages: paging::Paging::default(),
+            pages: cx.new(|_| paging::Pages::new()),
             watched_status: std::collections::HashSet::new(),
             viewer: cx.new(viewer::Viewer::new),
             // The window's own base font is not known until it has been laid
@@ -988,22 +963,15 @@ impl WhatsAppApp {
             drafts: HashMap::new(),
             event_task: None,
             reconnect_task: None,
-            audio_recorder: AudioRecorder::new(),
-            recording_state: RecordingState::default(),
-            recording_target: None,
-            recording_epoch: 0,
+            recorder: cx.new(|_| recording::Recorder::new()),
             audio_player: AudioPlayer::new(),
             playback_speed: 1.0,
             playback_tick: None,
             audio: AudioHolder::None,
             active_media: ActiveMedia::None,
             pending_media_request: None,
-            retry_at: None,
-            retry_task: None,
-            error_detail_open: false,
-            notices: Vec::new(),
-            next_notice_id: 0,
-            notice_task: None,
+            recovery: cx.new(|_| recovery::Recovering::new()),
+            notices: cx.new(|_| notices::Notices::new()),
             downloads_in_flight: std::collections::HashSet::new(),
             calls: cx.new(|_| calls_ctl::Calls::new()),
             plugins: cx.new(|_| plugins_ctl::Plugins::new()),
@@ -1029,7 +997,6 @@ impl WhatsAppApp {
             settings: cx.new(|_| settings::Settings::new()),
             status_tick: None,
             heartbeat: None,
-            recording_tick: None,
         }
     }
 
@@ -1311,6 +1278,7 @@ impl WhatsAppApp {
         chat_jid: &str,
         typing: Option<TypingSummary>,
         layout: ResponsiveLayout,
+        cx: &mut App,
     ) -> MessageListCache {
         let rows = {
             let Some(chat) = self.find_chat(chat_jid) else {
@@ -1347,7 +1315,7 @@ impl WhatsAppApp {
             chat_jid,
         ) && self.timeline_nearing_start()
         {
-            self.want_older_messages(chat_jid);
+            self.want_older_messages(chat_jid, cx);
         }
 
         self.sync_timeline(
@@ -1490,7 +1458,7 @@ impl WhatsAppApp {
     /// in Status).
     pub fn note_visible_conversation(&mut self, jid: Option<String>, cx: &mut App) {
         if let Some(jid) = &jid {
-            self.ensure_timeline_page(jid);
+            self.ensure_timeline_page(jid, cx);
         }
         // Moving to *another* conversation is the moment the last one's media
         // stops being anything anybody can see, and the one signal a front
@@ -1547,8 +1515,7 @@ impl WhatsAppApp {
         // so outlive the view they were raised in. "That recording could not
         // be sent" is about an account that has gone, shown to whoever pairs
         // next, and a reset is a departure rather than a clear.
-        self.notices.clear();
-        self.notice_task = None;
+        self.notices.update(cx, |notices, _| notices.forget());
         // What the *old* account occupied, and the query that is still
         // measuring it. See [`settings::Settings::forget`].
         self.settings.update(cx, |settings, cx| settings.forget(cx));
@@ -1562,7 +1529,7 @@ impl WhatsAppApp {
         self.departed_chats.clear();
         // The cursors describe positions in one account's store; the next
         // account's rows are not behind them.
-        self.forget_paging();
+        self.forget_paging(cx);
         self.owed_reads.clear();
         // The reader is a selection too, and a JID-keyed one. Left alone, it
         // pointed the new account at the old account's contact: at their
@@ -1615,7 +1582,7 @@ impl WhatsAppApp {
     /// Not [`AppState::Offline`]: that keeps the conversation on screen and
     /// only refuses to send.
     fn leave_connected_view(&mut self, cx: &mut Context<Self>) {
-        if self.recording_state != RecordingState::Idle {
+        if self.recorder.read(cx).state() != RecordingState::Idle {
             self.cancel_recording(cx);
         }
         self.stop_current_media();
@@ -1858,7 +1825,7 @@ impl WhatsAppApp {
         // For the same reason, and it is the stronger one here: a paging
         // position outliving its chat is a conversation that never asks for
         // its history again.
-        self.forget_chat_paging(&gone);
+        self.forget_chat_paging(&gone, cx);
         for jid in &gone {
             // A read owed by a chat that has left is a read nobody is waiting
             // for. Kept, it is spent by the first merge that brings the chat
@@ -3140,14 +3107,15 @@ impl Render for WhatsAppApp {
             }
             AppState::Error(fault) => render_error_view(
                 fault,
-                self.retry_countdown(),
-                self.error_detail_open,
+                self.retry_countdown(cx),
+                self.error_detail_open(cx),
                 entity,
                 cx,
             )
             .into_any_element(),
             AppState::Refused { reason } => {
-                render_refused_view(reason, self.error_detail_open, entity, cx).into_any_element()
+                render_refused_view(reason, self.error_detail_open(cx), entity, cx)
+                    .into_any_element()
             }
             AppState::LoggedOut { message } => {
                 render_logged_out_view(message, entity, cx).into_any_element()
@@ -3174,19 +3142,13 @@ impl Render for WhatsAppApp {
 
         // Above the call card as well as the body: a notice raised by
         // something the call did is about the call, and a card that covered
-        // it would leave the sentence unread.
-        let notices = (!self.notices.is_empty()).then(|| {
-            let entity = cx.entity().clone();
-            crate::components::notice::render_notices(
-                &self.notices,
-                move |id, cx| {
-                    entity.update(cx, |app, cx| app.dismiss_notice(id, cx));
-                },
-                cx,
-            )
-        });
-
-        root.child(body).children(call_overlay).children(notices)
+        // it would leave the sentence unread. A view rather than a slice read
+        // out of here, so the clock taking a line down repaints the stack and
+        // asks nothing of the conversation underneath it; the stack draws
+        // nothing at all while it is empty.
+        root.child(body)
+            .children(call_overlay)
+            .child(self.notices().clone())
     }
 }
 

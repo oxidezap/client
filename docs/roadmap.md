@@ -16,9 +16,17 @@
   `theme/` (where the scale is defined) and outside test modules. Read the
   matches; the ones that need changing are the ones naming a number nobody
   derived.
-- **`WhatsAppApp` still owns all state**, though it is now split across
-  `app/{events,recording,calls_ctl,media_ctl}.rs` rather than one file. The
-  guides want per-feature entities; that is a bigger change than moving code.
+- **`WhatsAppApp` still owns most state.** Four clusters are per-feature
+  entities now — `app/{paging,recording,notices,recovery}.rs` each own a
+  struct the app holds an `Entity` of, rather than fields on the root — and
+  the rest is still fields on one struct, split across `app/*.rs` by file
+  rather than by owner. The pattern the four settled on is in the module
+  headers: the entity owns its state and the tasks that mutate it, methods
+  take `Context<TheEntity>` so they *cannot* mark the app dirty, and anything
+  needing a chat, a session or a draft stays above it. What is left is the
+  clusters that share state — playback and status both answer "what is
+  playing" — and the four `RefCell` caches, which exist because the render
+  pass holds `&self`, and which an entity split is what retires.
 - ~~**Two large files outside the GUI**~~ — done. `whatsapp/mod.rs` is now
   `whatsapp/{media,history,paging,lanes,convert,tests}.rs` beside a `mod.rs`
   holding the event pump, and `chat-store`'s `store.rs` is a `store/` split by
