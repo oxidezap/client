@@ -115,7 +115,7 @@ fn plugins(
                 surface,
                 app,
                 &ctx,
-                removal(&surface.id, home, app, entity.clone(), metrics, cx),
+                removal(&surface.id, app, entity.clone(), metrics, cx),
                 cx,
             )
             .into_any_element()
@@ -123,7 +123,7 @@ fn plugins(
         .children(unloaded.iter().map(|id| {
             crate::components::plugin_ui::unloaded_entry(
                 id,
-                removal(id, home, app, entity.clone(), metrics, cx),
+                removal(id, app, entity.clone(), metrics, cx),
                 metrics,
                 cx,
             )
@@ -143,7 +143,7 @@ fn plugins(
             } else {
                 list.into_any_element()
             })
-            .child(plugin_controls(home, entity, metrics, cx)),
+            .child(plugin_controls(entity, metrics, cx)),
         metrics,
     )
     .into_any_element()
@@ -163,15 +163,11 @@ fn plugins(
 /// tell somebody every plugin they are running had been removed.
 fn removal(
     id: &str,
-    home: crate::platform::plugins::Home,
     app: &WhatsAppApp,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     cx: &App,
 ) -> Option<gpui::AnyElement> {
-    if !home.can_install() {
-        return None;
-    }
     if app
         .installed_plugins()
         .is_some_and(|ids| !ids.iter().any(|f| f == id))
@@ -217,21 +213,18 @@ fn empty(what: &'static str, metrics: Metrics, cx: &App) -> impl IntoElement + u
         .child(what)
 }
 
-/// The row under the list: reload, and — where this front end has a folder of
-/// its own — add.
+/// The row under the list: reload, and add.
 ///
-/// Reload is drawn everywhere and Add is not, and the asymmetry is the whole
-/// of what each is about. The folder belongs to whichever daemon is running
-/// the plugins, so only a front end that *is* that daemon can put a file in
-/// it; but asking it to read the folder again is a request on the wire, which
-/// every front end can make. A desktop window's Reload is for somebody who
-/// has just dropped a `.wasm` beside `oxidezapd`; a follower tab's is for
-/// somebody who installed one into an origin whose host is another tab.
+/// Both are drawn everywhere, because both are requests on the wire: the
+/// folder belongs to whichever daemon is running the plugins, and adding to
+/// it and re-reading it are things every front end asks that daemon for. A
+/// desktop window's Reload is also for somebody who has just dropped a
+/// `.wasm` beside `oxidezapd` by hand; a follower tab's is for somebody whose
+/// host is another tab.
 ///
 /// With a line saying what Reload does, because "reload" over a list of
 /// running things is a word somebody is right to hesitate over.
 fn plugin_controls(
-    home: crate::platform::plugins::Home,
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     cx: &App,
@@ -258,14 +251,14 @@ fn plugin_controls(
                     entity.update(cx, |app, cx| app.reload_plugins(cx));
                 }),
         )
-        .children(home.can_install().then(|| {
+        .child(
             Button::new("install-plugin")
                 .label("Add a plugin…")
                 .outline()
                 .on_click(move |_, _window, cx| {
                     installer.update(cx, |app, cx| app.install_plugin(cx));
-                })
-        }))
+                }),
+        )
 }
 
 /// A short all-caps section label.

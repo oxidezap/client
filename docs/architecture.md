@@ -90,7 +90,10 @@ The crate map, the theme, and how the interface responds to viewport size.
   is the second split (`store/`, behind a `Backing` trait that earns its keep
   on three impls): files in a private directory, or the origin's
   `localStorage`. Finding the modules on disk is the third (`loader/`), and it
-  is native-only — a page installs into OPFS instead.
+  is native-only — a page keeps them in OPFS instead. Putting one *there* is
+  the daemon's on both, and reached the same way on both: `InstallPlugin`,
+  with the module staged through the media cache like any other payload too
+  large for a frame.
   What is loaded is a *generation* rather than the host itself, because
   everything in the daemon holds the host: a connection, the session bridge
   and the tab listener each keep an `Arc<Plugins>` for their own lifetime, so

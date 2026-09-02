@@ -893,15 +893,16 @@ pub struct WhatsAppApp {
     settings: Option<SettingsState>,
     /// What this account occupies on disk, as the daemon last measured it.
     storage_usage: Option<crate::session::StorageUsage>,
-    /// Every plugin id in this front end's own folder, whether or not it
-    /// loaded.
+    /// Every plugin id in the daemon's folder, whether or not it loaded.
     ///
     /// Not the same list as `plugins`, and the difference is the whole reason
     /// it exists: a module that fails to parse, answers the wrong ABI version
     /// or traps in `oxi_init` publishes no surface, so a screen drawn from
     /// the surfaces alone has nowhere to put a Remove button for the one file
-    /// somebody most needs to remove. `None` is "not asked yet", which is
-    /// what a front end with no folder of its own stays at forever.
+    /// somebody most needs to remove. `None` is "nothing has answered yet" —
+    /// and only that, now that every front end has a folder to ask about:
+    /// it used to double as "this front end has no folder", which is a
+    /// different fact drawn the same way.
     installed_plugins: Option<Vec<String>>,
     /// Which of the sidebar's destinations is on screen.
     destination: Destination,

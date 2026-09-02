@@ -49,7 +49,7 @@ use oxidezap_core::{PluginAction, PluginSlot, PluginSurface, UiEvent};
 use oxidezap_plugin_abi as abi;
 
 #[cfg(not(target_family = "wasm"))]
-pub use loader::{default_dir, default_state_dir, forget_approvals};
+pub use loader::{default_dir, default_state_dir, forget_approvals, sync_dir};
 pub use registry::Sink;
 #[cfg(not(target_family = "wasm"))]
 pub use store::Files;
@@ -61,7 +61,7 @@ pub use store::{Backing, Nowhere};
 // another local account could have written, and how a write and a rename
 // survive losing power. Nothing to import where there is no filesystem.
 #[cfg(not(target_family = "wasm"))]
-pub(crate) use loader::{only_this_user_can_write, sync_dir, write_private};
+pub(crate) use loader::{only_this_user_can_write, write_private};
 
 // And the rest of it for the tests, which are a child module and reach both
 // the loader's names and the paths to hand them through `use super::*`. This
@@ -106,7 +106,12 @@ const MAX_TABLES: usize = 4;
 /// and so before its limiter — exists. `examples/autoreply` is under six
 /// kilobytes; a plugin written in a language that ships a runtime is a couple
 /// of megabytes, and this leaves room for several of those.
-const MAX_MODULE_BYTES: usize = 32 * 1024 * 1024;
+///
+/// Public because the daemon installs modules as well as loading them, and
+/// the two have to agree: a file written past this is one the loader skips
+/// before it opens it, so an install that did not ask would report success
+/// for a plugin that silently never runs.
+pub const MAX_MODULE_BYTES: usize = 32 * 1024 * 1024;
 
 /// What share of its own thread a plugin may actually spend running.
 ///

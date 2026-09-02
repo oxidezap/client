@@ -39,7 +39,12 @@
 
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-use super::{entries, folder, install, installed, names, uninstall};
+use super::{entries, folder, installed};
+// The three a front end asks for by name go through the module above this
+// one, which is where the file name becomes an id: that rule is written once
+// for both folders, and these tests are the ones that hold it to a real
+// browser.
+use crate::plugins::{install, names, uninstall};
 
 wasm_bindgen_test_configure!(run_in_browser);
 

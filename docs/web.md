@@ -80,20 +80,30 @@ that fails to parse, answers the wrong ABI version or traps in `oxi_init`
 publishes no surface at all, so Settings drawn from the surfaces alone leaves
 the one file somebody most needs to remove with no control anywhere — and it
 goes on spending the folder's budget at every load.
-`daemon::plugins::web::names` is that second list, asked when Settings opens
-and again after an install or a removal, the same shape and on the same terms
-as the storage total beside it.
+`ClientRequest::ListInstalledPlugins` is that second list, asked when Settings
+opens and again after an install or a removal, the same shape and on the same
+terms as the storage total beside it.
 
-The front end says which of the two it is looking at rather than guessing:
+Adding one is a request too — `ClientRequest::InstallPlugin`, with the module
+staged through the media cache under a `u-` key exactly as a file being sent
+is, because a `.wasm` is up to thirty-two megabytes and a request frame is
+capped at one. It was not always: a page holding the session had the daemon in
+its own address space, and the window called `daemon::plugins::web::install`
+directly. That was a second control channel beside the protocol, it existed on
+no other target, and it is why a desktop window's Add button did not exist at
+all. The folder belongs to whichever daemon runs the plugins, so every front
+end now asks that daemon — including the one that could have reached past it.
+
+The front end still says which folder it is looking at rather than guessing:
 `platform::plugins::home` is the mirror of `daemon::plugins::start`, and the
 two halves are written to be read together — a page that drew "drop a .wasm in
 the plugins folder" would be giving instructions about a folder it does not
-have. It is also what decides whether the install and remove controls are
-drawn at all: only a page holding its own session has a folder it can write,
-and a window talking to an `oxidezapd` is looking at another process's
-directory. Installing *does* start it, by asking the daemon to reload — one
-act from where somebody is standing and two here, because the folder is the
-front end's and the host is the daemon's.
+have. What it decides now is the *sentence*, not the controls: a tab that
+holds no session installs perfectly well and cannot start what it installed,
+because the folder is one per origin and the host is one per account.
+Installing *does* start it, by asking the daemon to reload — one act from
+where somebody is standing and two on the wire, because installing and
+loading are two different moments and a reload retires the whole generation.
 
 **A page picks files the only way a page can.** There is no path to a
 filesystem and no `showOpenFilePicker` worth depending on — it is Chromium-only

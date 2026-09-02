@@ -366,6 +366,34 @@ pub enum DaemonMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next: Option<PageCursor>,
     },
+    /// A module was installed, and the id it claimed.
+    ///
+    /// Addressed to the client that asked, like a page of history: the id is
+    /// the answer, and every *other* front end learns what changed from the
+    /// republished set of surfaces after the reload — which is state, and
+    /// travels as state.
+    ///
+    /// The id and not the file name, because they are not the same thing: the
+    /// folder is the registry, so the daemon is the side that decides what
+    /// name a file may be a plugin under, and a client that printed its own
+    /// guess would be printing a second answer to that question.
+    PluginInstalled { id: RequestId, plugin: String },
+    /// Every plugin id in the daemon's folder, answering
+    /// [`ClientRequest::ListInstalledPlugins`].
+    ///
+    /// Named fields rather than a newtype, and not as a matter of taste: this
+    /// enum is internally tagged and serde cannot write a tag beside a JSON
+    /// array, so a newtype variant holding a `Vec` fails at `to_string` and
+    /// the frame is dropped. That is the v22 entry in `PROTOCOL_VERSION`'s
+    /// changelog, and
+    /// `tests::installing_a_plugin_survives_both_directions_of_the_wire` is
+    /// what asks the question the only way it can be asked: by serializing
+    /// one.
+    InstalledPlugins {
+        id: RequestId,
+        /// Sorted by id, which is also the order they load in.
+        plugins: Vec<String>,
+    },
     /// The bytes a [`ClientRequest::Download`] asked for are in the cache.
     ///
     /// A cache key rather than bytes, for the same reason media never travels
@@ -593,6 +621,29 @@ pub struct SendMedia {
     /// [`SendText`] and [`SendAudio`] carry, for the same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quoted: Option<QuotedMessage>,
+}
+
+/// Put a `.wasm` in the daemon's plugin folder. See
+/// [`ClientRequest::InstallPlugin`].
+///
+/// Staged exactly as [`SendMedia`] is, and for the same reason rather than
+/// for symmetry: a module is up to thirty-two megabytes and a request frame
+/// is capped at [`crate::MAX_REQUEST_BYTES`], so bytes on this wire are not
+/// a design to argue about — they are a frame the reader ends the connection
+/// over. So the front end writes the payload into the media cache under
+/// [`upload`](Self::upload) and this names it, which is the one sideband both
+/// transports already have.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallPlugin {
+    /// What the file was called where it was picked.
+    ///
+    /// A name and never a path, like [`SendMedia::file_name`] — and it is
+    /// also the *id*: the folder is the registry, so `autoreply.wasm` is the
+    /// plugin `autoreply`, and the daemon refuses a name it could not name a
+    /// plugin after rather than keeping a file nothing would ever load.
+    pub file_name: String,
+    /// Cache key the client staged the module under.
+    pub upload: String,
 }
 
 /// Whether we are typing at a peer. See [`ClientRequest::Typing`].
@@ -854,6 +905,57 @@ pub enum ClientRequest {
     /// no events and no call video. Nothing waits for it: what came back is
     /// state, and every front end reads it in the same frame.
     ReloadPlugins,
+    /// Put a module in the daemon's plugin folder.
+    ///
+    /// The folder belongs to the daemon that runs it — a directory beside
+    /// `oxidezapd`, or a page's own origin storage — so a front end that
+    /// wanted to add one had nothing to write into and, on one target, wrote
+    /// into it anyway by calling the daemon crate directly. That second
+    /// control channel is what this replaces: installing is a request like
+    /// approving is, so every front end can do it and every front end does it
+    /// the same way.
+    ///
+    /// Answered with [`DaemonMessage::PluginInstalled`] naming the id the
+    /// module claimed, so the window can say what it just added — which is
+    /// the daemon's answer rather than the client's guess at the file name.
+    ///
+    /// It grants nothing. A plugin declares its capabilities once and an
+    /// approval is recorded separately and read live; a module that has just
+    /// been installed is a module nobody has said yes to. It does not start
+    /// it either: [`ReloadPlugins`](Self::ReloadPlugins) is what does, and
+    /// keeping the two apart is what keeps one rule about retiring a
+    /// generation before loading the next.
+    InstallPlugin(InstallPlugin),
+    /// Take one back out of that folder.
+    ///
+    /// By id, which is what the folder is keyed on. Removing what is not
+    /// there is not a failure — a second press deserves the answer the first
+    /// one produced, not an error about a file it took away — and the plugin
+    /// goes on running until the next reload, exactly as a file deleted by
+    /// hand does.
+    ///
+    /// The recorded approval stays. An id reinstalled later is the same id,
+    /// and the answer was given against the id and its mask rather than
+    /// against the bytes; withdrawing it is [`PluginApproval`] and is
+    /// somebody's own decision.
+    ///
+    /// [`PluginApproval`]: Self::PluginApproval
+    RemovePlugin {
+        plugin: String,
+    },
+    /// Every plugin id in that folder, loaded or not.
+    ///
+    /// Answered with [`DaemonMessage::InstalledPlugins`]. Not the same list
+    /// as the surfaces in the snapshot, and that is the whole reason it
+    /// exists: a module that fails to parse, answers the wrong ABI version or
+    /// traps in `oxi_init` publishes no surface at all, so a screen drawn
+    /// from the surfaces alone leaves the one file somebody most needs to
+    /// remove with no control anywhere.
+    ///
+    /// A request rather than state, because it is read when a settings pane
+    /// is opened and after an install or a removal — not something every
+    /// front end has to be told about.
+    ListInstalledPlugins,
     /// Stop the daemon: disconnect the session, close the store, exit.
     Shutdown,
 }
@@ -1419,6 +1521,24 @@ mod tests {
                 r#"{"request":"load_chats"}"#.to_string(),
             ),
             (
+                ClientRequest::InstallPlugin(InstallPlugin {
+                    file_name: "autoreply.wasm".into(),
+                    upload: "u-plugin-1".into(),
+                }),
+                r#"{"request":"install_plugin","file_name":"autoreply.wasm","upload":"u-plugin-1"}"#
+                    .to_string(),
+            ),
+            (
+                ClientRequest::RemovePlugin {
+                    plugin: "autoreply".into(),
+                },
+                r#"{"request":"remove_plugin","plugin":"autoreply"}"#.to_string(),
+            ),
+            (
+                ClientRequest::ListInstalledPlugins,
+                r#"{"request":"list_installed_plugins"}"#.to_string(),
+            ),
+            (
                 ClientRequest::ReloadHistory,
                 r#"{"request":"reload_history"}"#.to_string(),
             ),
@@ -1438,6 +1558,73 @@ mod tests {
                 request
             );
         }
+    }
+
+    /// Installing a plugin, both directions, as the bytes each side reads.
+    ///
+    /// Its own test rather than another row above, because the interesting
+    /// half is the *answer*: `InstalledPlugins` carries a sequence, and this
+    /// enum is internally tagged — serde cannot write a tag beside a JSON
+    /// array, so a newtype variant holding a `Vec` fails at `to_string` and
+    /// the frame is silently dropped. That is exactly what happened to
+    /// `PluginsChanged` from v19 to v22, and the only way to ask the question
+    /// is to serialize it.
+    #[test]
+    fn installing_a_plugin_survives_both_directions_of_the_wire() {
+        let ask = Request {
+            id: Some(7),
+            request: ClientRequest::InstallPlugin(InstallPlugin {
+                file_name: "autoreply.wasm".into(),
+                upload: "u-plugin-1".into(),
+            }),
+        };
+        let line = serde_json::to_string(&ask).expect("a request is writable");
+        assert_eq!(
+            line,
+            r#"{"id":7,"request":"install_plugin","file_name":"autoreply.wasm","upload":"u-plugin-1"}"#,
+            "the frame is one object, and the payload is flat in it"
+        );
+        assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), ask);
+
+        // The module itself is not in any of this, which is the point: it
+        // travels through the media cache under the key above.
+        assert!(!line.contains("bytes"), "{line}");
+
+        let answered = DaemonMessage::PluginInstalled {
+            id: 7,
+            plugin: "autoreply".into(),
+        };
+        let line = serde_json::to_string(&answered).expect("an answer is writable");
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            answered
+        );
+
+        let listed = DaemonMessage::InstalledPlugins {
+            id: 8,
+            plugins: vec!["autoreply".into(), "greeter".into()],
+        };
+        let line = serde_json::to_string(&listed)
+            .unwrap_or_else(|e| panic!("a listing cannot be written: {e}"));
+        assert_eq!(
+            line, r#"{"type":"installed_plugins","id":8,"plugins":["autoreply","greeter"]}"#,
+            "the tag has a place beside the sequence, which is why it is a named field"
+        );
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            listed
+        );
+
+        // An empty folder is an empty list and not a missing key: a reader
+        // that filled the absence in would be inventing the one answer this
+        // must not invent.
+        let none = DaemonMessage::InstalledPlugins {
+            id: 9,
+            plugins: Vec::new(),
+        };
+        let line = serde_json::to_string(&none).unwrap();
+        assert!(line.contains(r#""plugins":[]"#), "{line}");
+        assert_eq!(serde_json::from_str::<DaemonMessage>(&line).unwrap(), none);
     }
 
     /// Every send accepts a frame that leaves `local_id` out.
