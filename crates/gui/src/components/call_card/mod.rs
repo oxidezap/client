@@ -94,8 +94,8 @@ pub fn render_call_card(
                     entity,
                     focus_handle,
                     metrics,
-                    app.call_video_requested(),
-                    app.call_video_showing(),
+                    app.call_video_requested(cx),
+                    app.call_video_showing(cx),
                     cx,
                 ))
                 .children(panes)
@@ -247,12 +247,12 @@ fn expanded_card(
             call,
             entity.clone(),
             metrics,
-            app.call_video_requested(),
+            app.call_video_requested(cx),
             // What this window asked for, which the state cannot have caught
             // up with yet: the card is the audio one precisely because no
             // camera is on, and the seconds a device takes to open are the
             // ones the control has to account for.
-            app.call_video_showing(),
+            app.call_video_showing(cx),
             cx,
         )
         .into_any_element(),
@@ -318,7 +318,7 @@ fn drag_handle(
             gpui::CursorStyle::OpenHand
         })
         .on_mouse_down(gpui::MouseButton::Left, move |event, _window, cx| {
-            down_entity.update(cx, |app, _| app.begin_call_drag(event.position));
+            down_entity.update(cx, |app, cx| app.begin_call_drag(event.position, cx));
         })
         .on_drag(CallCardDrag, |_, _, _window, cx| cx.new(|_| DragPreview))
         .on_drag_move(move |event: &DragMoveEvent<CallCardDrag>, _window, cx| {
@@ -327,7 +327,7 @@ fn drag_handle(
             });
         })
         .on_mouse_up(gpui::MouseButton::Left, move |_, _window, cx| {
-            up_entity.update(cx, |app, _| app.end_call_drag());
+            up_entity.update(cx, |app, cx| app.end_call_drag(cx));
         })
         .children((0..4).map(|_| div().size(metrics.dot_small()).rounded_full().bg(dot)))
 }

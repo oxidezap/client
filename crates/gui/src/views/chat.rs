@@ -42,7 +42,7 @@ pub fn render_connected_view(
         metrics: *layout.metrics(),
     };
     let plugin_actions = plugin_ui::slot(
-        app.plugins(),
+        app.plugins(cx),
         oxidezap_core::PluginSlot::ChatHeader,
         app,
         &plugin_ctx,
@@ -53,7 +53,7 @@ pub fn render_connected_view(
     // the app mutably, and these are handles — a clone is a refcount.
     let chat_list_scroll = app.chat_list_scroll().clone();
     let chat_list_focus = app.chat_list_focus().clone();
-    let chat_search_input = app.chat_search_input().cloned();
+    let chat_search_input = app.chat_search_input(cx).cloned();
 
     let message_list = app.message_list().clone();
     let input_area = app.input_area();
@@ -71,27 +71,25 @@ pub fn render_connected_view(
     // fullscreen viewer covers whatever is underneath it — a picture at the
     // size of the window is a mode, so the timeline behind it is no more
     // visible than a chat on another screen.
-    app.note_visible_conversation(
-        (app.destination() == Destination::Chats
-            && layout.show_chat_area()
-            && app.media_viewer().is_none())
-        .then(|| selected_jid.clone())
-        .flatten(),
-        cx,
-    );
+    let visible = (app.destination() == Destination::Chats
+        && layout.show_chat_area()
+        && app.media_viewer(cx).is_none())
+    .then(|| selected_jid.clone())
+    .flatten();
+    app.note_visible_conversation(visible, cx);
     // Against what this frame is about to draw, and before anything reads the
     // chat list: a chat a complete load said was gone is kept only while it is
     // on screen, and this is where looking away is noticed.
     app.prune_departed_chats(cx);
 
-    let viewer_focus = app.viewer_focus().clone();
+    let viewer_focus = app.viewer_focus(cx).clone();
 
     let list_props = ChatListProps {
-        cache: app.get_chat_list_cache(),
+        cache: app.get_chat_list_cache(cx),
         selected_jid: selected_jid.clone(),
         filter: app.chat_filter(),
         unread_count: app.unread_chat_count(),
-        is_searching: app.is_searching(),
+        is_searching: app.is_searching(cx),
         search_input: chat_search_input.as_ref(),
         account: app.account_summary(),
     };
@@ -101,7 +99,7 @@ pub fn render_connected_view(
     // unread chat — can be on a page nobody has fetched. An empty list is at
     // its end by definition, so it asks like any other list that is; the
     // paging state is what stops it asking twice, and `Done` is what ends it.
-    if app.chat_list_is_empty() {
+    if app.chat_list_is_empty(cx) {
         app.want_more_chats(cx);
     }
 
@@ -120,17 +118,17 @@ pub fn render_connected_view(
         .map(|jid| app.get_message_list_cache(jid, typing.clone(), layout, cx));
     // A call in a chat other than the one on screen is what the return banner
     // is for; a call in *this* chat is already obvious from the card.
-    let return_banner = app
-        .active_call()
-        .filter(|call| open_chat.as_deref().is_none_or(|jid| jid != call.peer_jid));
-    let banner = return_banner.map(|call| (call.peer_name.clone(), call.elapsed_label()));
+    let banner = app
+        .active_call(cx)
+        .filter(|call| open_chat.as_deref().is_none_or(|jid| jid != call.peer_jid))
+        .map(|call| (call.peer_name.clone(), call.elapsed_label()));
     // Rendered as an element here rather than passed down as state: the
     // search belongs to the conversation pane, and only this level has both
     // the app and the entity to drive it from.
-    let search_bar = app.conversation_search().map(|search| {
+    let search_bar = app.conversation_search(cx).map(|search| {
         render_conversation_search(
             search,
-            app.conversation_search_input(),
+            app.conversation_search_input(cx),
             entity.clone(),
             *layout.metrics(),
             cx,
@@ -139,11 +137,11 @@ pub fn render_connected_view(
     });
     // The picture, when one is open. Above the conversation and below the
     // call card: a photo can wait, an incoming call cannot.
-    let viewer = app.media_viewer().and_then(|viewer| {
-        let message = app.media_viewer_message()?.clone();
+    let viewer = app.media_viewer(cx).and_then(|viewer| {
+        let message = app.media_viewer_message(cx)?.clone();
         let media = message.media.as_ref()?;
         let image = (!media.data.is_empty())
-            .then(|| app.get_decoded_image(&message.id, media))
+            .then(|| app.get_decoded_image(&message.id, media, cx))
             .flatten();
         let frame = app.video_current_frame(&message.id);
         let author = if message.is_from_me {
@@ -193,7 +191,7 @@ pub fn render_connected_view(
             .media
             .as_ref()
             .filter(|media| !media.data.is_empty())
-            .and_then(|media| app.get_decoded_image(&message.id, media));
+            .and_then(|media| app.get_decoded_image(&message.id, media, cx));
         let frame = app.video_current_frame(&message.id);
         // A video says it is loading in its *player*, not in the download
         // table: `start_video_download` records progress there and nowhere
@@ -338,8 +336,8 @@ pub fn render_call_overlay(
     let layout = app.responsive_layout(window, cx);
     let call_focus = app.call_focus().clone();
     render_call_card(
-        app.call_state(),
-        app.call_card(),
+        app.call_state(cx),
+        app.call_card(cx),
         cx.entity().clone(),
         &call_focus,
         layout,

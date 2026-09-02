@@ -49,7 +49,7 @@ pub fn render_settings_view(
     let layout = app.responsive_layout(window, cx);
     let metrics = *layout.metrics();
     let entity = cx.entity().clone();
-    let Some(settings) = app.settings() else {
+    let Some(settings) = app.settings(cx) else {
         return div().into_any_element();
     };
     let section = settings.section;

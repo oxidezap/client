@@ -184,7 +184,7 @@ impl WhatsAppApp {
                 message,
                 sender_name,
             } => {
-                self.handle_message_received(chat_jid, *message, sender_name);
+                self.handle_message_received(chat_jid, *message, sender_name, cx);
                 // A live status update brings its own 24-hour deadline with
                 // it, and it can be the earliest one on screen.
                 self.ensure_status_tick(cx);
@@ -206,7 +206,7 @@ impl WhatsAppApp {
                     // still queued — or about to fail. The tick comes from
                     // the store's own ServerAck, through the reload.
                 }
-                self.invalidate_message_cache(&chat_jid);
+                self.invalidate_message_cache(&chat_jid, cx);
                 self.invalidate_chat_cache();
                 cx.notify();
             }
@@ -224,7 +224,7 @@ impl WhatsAppApp {
                 if let Some(chat) = self.find_chat_mut(&chat_jid)
                     && chat.mark_send_failed(&message_id)
                 {
-                    self.invalidate_message_cache(&chat_jid);
+                    self.invalidate_message_cache(&chat_jid, cx);
                     self.invalidate_chat_cache();
                     cx.notify();
                 }
@@ -264,7 +264,7 @@ impl WhatsAppApp {
                 message_ids,
                 receipt_type,
             } => {
-                self.handle_receipt_received(chat_jid, message_ids, receipt_type);
+                self.handle_receipt_received(chat_jid, message_ids, receipt_type, cx);
                 cx.notify();
             }
             UiEvent::ReactionReceived {
@@ -273,7 +273,7 @@ impl WhatsAppApp {
                 sender,
                 emoji,
             } => {
-                self.handle_reaction_received(chat_jid, message_id, sender, emoji);
+                self.handle_reaction_received(chat_jid, message_id, sender, emoji, cx);
                 cx.notify();
             }
             // A call is state, and the daemon is the only thing that writes
@@ -397,7 +397,7 @@ impl WhatsAppApp {
                 // session never knew, so a call the user gave up on while it
                 // was still connecting is ringing at the far end with nothing
                 // holding it. The daemon not tracking it is what says so.
-                if !self.call_state.holds(&call_id)
+                if !self.call_state(cx).holds(&call_id)
                     && let Some(client) = &self.client
                 {
                     info!("cancelling {call_id}, which nobody is waiting for");

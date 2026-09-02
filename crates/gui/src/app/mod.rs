@@ -30,13 +30,11 @@ mod timeline_ctl;
 mod viewer;
 
 pub use calls::CallCard;
-pub use calls_ctl::CallPictures;
 pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
 pub use chats::{ChatFilter, ChatListCache, Survival, survives_complete_load};
 pub use media::RecordingState;
 pub use messages::{BubbleIds, MessageListCache, TimelineItem};
 pub use paging::nearing_end;
-pub use plugins_ctl::PluginFields;
 
 /// What the conversation list was last told about.
 /// What the audio sink is holding, and where it came from.
@@ -369,9 +367,6 @@ pub const CALL_CONTEXT: &str = "Call";
 /// there and still move the caret in the composer everywhere else.
 pub const VIEWER_CONTEXT: &str = "MediaViewer";
 
-/// Search debounce delay in milliseconds
-const SEARCH_DEBOUNCE_MS: u64 = 150;
-
 /// Maximum number of video players to keep cached (each holds decoded frames)
 const MAX_VIDEO_PLAYERS: usize = 10;
 
@@ -692,23 +687,12 @@ pub struct WhatsAppApp {
     /// receipt to send — and therefore this window's job to remember across a
     /// hydration merge, which replaces those rows from the store.
     watched_status: std::collections::HashSet<String>,
-    /// Focus target for the fullscreen viewer, which owns the arrow keys
-    /// only while it is up.
-    viewer_focus: FocusHandle,
-    /// Search input state for chat list (created lazily when window is available)
-    chat_search_input: Option<Entity<InputState>>,
-    /// The picture being looked at full screen, when one is.
-    media_viewer: Option<MediaViewer>,
-    /// Searching inside the open conversation, when that is open. Separate
-    /// from the list's field, which filters chats by name.
-    conversation_search: Option<ConversationSearch>,
-    /// The field for it, created the first time the search is opened.
-    conversation_search_input: Option<Entity<InputState>>,
-    /// Current search query (lowercase, trimmed)
-    chat_search_query: String,
-    /// Debounced search task
-    #[allow(dead_code)]
-    chat_search_task: Option<Task<()>>,
+    /// The picture being looked at full screen, and the keyboard it takes
+    /// while it is. See [`viewer`].
+    viewer: Entity<viewer::Viewer>,
+    /// The sidebar's filter and the conversation's search, with the fields
+    /// they are typed into. See [`search`].
+    search: Entity<search::Search>,
     /// Scroll handle for message list
     /// The conversation's list, which measures its own rows.
     ///
@@ -738,13 +722,6 @@ pub struct WhatsAppApp {
     /// The microphone, what it is being held open for, and the timer that
     /// draws the meter. See [`recording`].
     recorder: Entity<recording::Recorder>,
-    /// Which account the answers still in flight belong to.
-    ///
-    /// A measurement asked of one daemon can land after the window has been
-    /// handed to another, and the surfaces that show it — Settings, most of
-    /// all — survive the change. Bumped by `forget_account_state`; an answer
-    /// whose epoch no longer matches is dropped rather than displayed.
-    account_epoch: usize,
     /// Audio player for voice message and video audio playback
     audio_player: AudioPlayer,
     /// Playback speed for voice notes, shared across clips: someone who
@@ -774,59 +751,12 @@ pub struct WhatsAppApp {
     /// that expires them. A view of its own, hung off the root. See
     /// [`notices`].
     notices: Entity<notices::Notices>,
-    /// The log level somebody chose in this front end, if they chose one.
-    ///
-    /// Kept so a reconnection can say it again: an ask made while the daemon
-    /// was unreachable reached nobody, and one made before it restarted is
-    /// one it may not have read. `None` is nobody having asked, which is not
-    /// the same as `info` and must not be sent as one — a fresh window at the
-    /// default must not quiet a daemon another window put at `debug`.
-    ///
-    /// It starts from the store where the store is this front end's own — a
-    /// page's `localStorage`, which no daemon can open, so a choice made
-    /// there is one only this side can carry across a reload. It does not on
-    /// a desktop, where the stored answer is the daemon's own file and the
-    /// daemon read it before this window existed.
-    ///
-    /// And never where this run was given a level from outside. `?log=` wins
-    /// over the stored choice for the run it was given for, which is the
-    /// whole of the precedence — so seeding from the store there would send
-    /// the stored level at the first connection and, in the tab holding the
-    /// account, hand it to a daemon sharing this process's own logging
-    /// state: `?log=off` beside a stored `debug` would turn itself back on.
-    log_level_asked: Option<oxidezap_core::LogLevel>,
     /// Message ids whose media is being fetched right now, so a bubble can
     /// say so and a second tap cannot start the same download twice.
     downloads_in_flight: std::collections::HashSet<String>,
-    /// What call is happening. Adopted whole from the daemon on attach, and
-    /// advanced by the same events the daemon applies to its own copy.
-    call_state: CallState,
-    /// Where *this* window puts the card for it.
-    call_card: CallCard,
-    /// The newest decoded picture of each of the call's two directions.
-    ///
-    /// One frame per direction and no history: this is a stream, and a
-    /// backlog of pictures is latency between the person talking and the
-    /// person watching. Cleared with the call, because the last frame of a
-    /// call that has ended is not something to keep drawing.
-    call_pictures: CallPictures,
-    /// What this window last asked the camera to do, until the daemon agrees.
-    ///
-    /// Opening a camera is device work and, the first time, a permission
-    /// prompt — seconds during which the state still says the camera is off.
-    /// A toggle computed from that state alone asks to turn it *on* again on
-    /// every click, so somebody who changed their mind could not say so until
-    /// the camera they no longer wanted had finished coming on.
-    call_video_asked: Option<(String, bool)>,
-    /// The same, for the microphone.
-    ///
-    /// The announcement is a round trip through the daemon and the peer, and
-    /// every other call frame in between — the peer turning a camera on, a
-    /// waiting call promoted — carries the mute the daemon still holds. That
-    /// took the button back to "open", and the next press computed its toggle
-    /// from that stale value and asked to unmute a microphone the user
-    /// believed was muted.
-    call_muted_asked: Option<(String, bool)>,
+    /// What call is happening, where this window draws it, and what it has
+    /// asked the devices for that has not come back yet. See [`calls_ctl`].
+    calls: Entity<calls_ctl::Calls>,
     /// Cache of JID -> display name mappings (from notify/pushname attribute)
     name_cache: HashMap<String, String>,
     /// System notices whose conversation has not arrived yet.
@@ -873,31 +803,12 @@ pub struct WhatsAppApp {
     /// The same account's LID. A chat with your own number can be keyed by
     /// either alias, and neither string matches the other.
     account_lid: Option<String>,
-    /// Every plugin the daemon loaded, and what each wants drawn.
-    ///
-    /// Daemon state, held whole and replaced whole. A plugin's interface is
-    /// not this window's memory of it: closing the window and opening
-    /// another brings the same buttons back, because they were never here in
-    /// the first place.
-    plugins: Vec<oxidezap_core::PluginSurface>,
-    /// Somewhere to hold what is being typed into a plugin's text field,
-    /// before anybody commits it. Keyed by plugin and widget id; see
-    /// [`plugins_ctl`].
-    plugin_fields: PluginFields,
-    /// The Settings screen, when it is open. `None` is the conversation view.
-    settings: Option<SettingsState>,
-    /// What this account occupies on disk, as the daemon last measured it.
-    storage_usage: Option<crate::session::StorageUsage>,
-    /// Every plugin id in this front end's own folder, whether or not it
-    /// loaded.
-    ///
-    /// Not the same list as `plugins`, and the difference is the whole reason
-    /// it exists: a module that fails to parse, answers the wrong ABI version
-    /// or traps in `oxi_init` publishes no surface, so a screen drawn from
-    /// the surfaces alone has nowhere to put a Remove button for the one file
-    /// somebody most needs to remove. `None` is "not asked yet", which is
-    /// what a front end with no folder of its own stays at forever.
-    installed_plugins: Option<Vec<String>>,
+    /// Every plugin the daemon loaded, what each wants drawn, and the boxes
+    /// this window holds for their text fields. See [`plugins_ctl`].
+    plugins: Entity<plugins_ctl::Plugins>,
+    /// The Settings screen, the totals it shows and the log level somebody
+    /// chose in it. See [`settings`].
+    settings: Entity<settings::Settings>,
     /// Which of the sidebar's destinations is on screen.
     destination: Destination,
     /// Whose status updates are open, and which one of them.
@@ -905,10 +816,6 @@ pub struct WhatsAppApp {
     /// The broadcast grouped by author, against the message count it was
     /// built from.
     status_feed_cache: RefCell<Option<(usize, oxidezap_core::StatusFeed)>>,
-    /// Repaints the call duration, and expires stale typing notices. Only
-    /// alive while there is something to tick.
-    #[allow(dead_code)]
-    tick_task: Option<Task<()>>,
     /// Redraws the status feed when its next update lapses. A status is the
     /// one thing that changes with nothing happening.
     #[allow(dead_code)]
@@ -937,7 +844,7 @@ impl WhatsAppApp {
                         );
                         app.handle_event(*event, cx);
                         if bearing {
-                            app.sweep_retained_media();
+                            app.sweep_retained_media(cx);
                         }
                     }),
                     // Adopted whole rather than replayed: these are the calls
@@ -951,35 +858,7 @@ impl WhatsAppApp {
                     // nothing when the set has not moved, so replacing is
                     // both correct and no more work than merging.
                     FromDaemon::Plugins(plugins) => entity.update(cx, |app, cx| {
-                        // The folder is re-read when the *membership* moves,
-                        // and only then. Somebody else changing it — another
-                        // tab of this origin, a reload of a desktop daemon's
-                        // directory — is the one thing that makes this
-                        // window's listing wrong, and a listing captured when
-                        // Settings opened labels a plugin just added as
-                        // "Removed" and leaves a phantom "Not loaded" row
-                        // where one was taken away.
-                        //
-                        // Which is not the same as "the set was published". A
-                        // plugin republishes its whole tree whenever anything
-                        // in it changes — for one that redraws on every
-                        // message, that is most messages — so refreshing on
-                        // every frame would start an OPFS scan per redraw,
-                        // overlapping, with Settings very likely not even
-                        // open. Ids, in order, because the daemon publishes
-                        // them ordered and a set that reshuffled itself would
-                        // be a different bug.
-                        let moved = app.plugins.len() != plugins.len()
-                            || app
-                                .plugins
-                                .iter()
-                                .zip(&plugins)
-                                .any(|(had, now)| had.id != now.id);
-                        app.plugins = plugins;
-                        if moved {
-                            app.refresh_installed_plugins(cx);
-                        }
-                        cx.notify();
+                        app.adopt_plugins(plugins, cx);
                     }),
                     // Announced on connect, before this window existed, so it
                     // arrives with the snapshot rather than as an event.
@@ -1074,13 +953,7 @@ impl WhatsAppApp {
             owed_reads: std::collections::HashSet::new(),
             pages: cx.new(|_| paging::Pages::new()),
             watched_status: std::collections::HashSet::new(),
-            viewer_focus: cx.focus_handle(),
-            chat_search_input: None, // Created lazily when window is available
-            media_viewer: None,
-            conversation_search: None,
-            conversation_search_input: None,
-            chat_search_query: String::new(),
-            chat_search_task: None,
+            viewer: cx.new(viewer::Viewer::new),
             // The window's own base font is not known until it has been laid
             // out; the reference scale is what it starts from.
             message_list: new_timeline_state(0, crate::theme::Metrics::default()),
@@ -1091,7 +964,6 @@ impl WhatsAppApp {
             event_task: None,
             reconnect_task: None,
             recorder: cx.new(|_| recording::Recorder::new()),
-            account_epoch: 0,
             audio_player: AudioPlayer::new(),
             playback_speed: 1.0,
             playback_tick: None,
@@ -1100,16 +972,10 @@ impl WhatsAppApp {
             pending_media_request: None,
             recovery: cx.new(|_| recovery::Recovering::new()),
             notices: cx.new(|_| notices::Notices::new()),
-            log_level_asked: (crate::platform::log_store::is_ours()
-                && oxidezap_logging::forced().is_none())
-            .then(oxidezap_logging::stored)
-            .flatten(),
             downloads_in_flight: std::collections::HashSet::new(),
-            call_state: CallState::new(),
-            call_card: CallCard::default(),
-            call_pictures: CallPictures::default(),
-            call_video_asked: None,
-            call_muted_asked: None,
+            calls: cx.new(|_| calls_ctl::Calls::new()),
+            plugins: cx.new(|_| plugins_ctl::Plugins::new()),
+            search: cx.new(|_| search::Search::new()),
             name_cache: HashMap::new(),
             pending_notices: HashMap::new(),
             video_players: HashMap::new(),
@@ -1118,8 +984,6 @@ impl WhatsAppApp {
             message_list_cache: RefCell::new(HashMap::new()),
             chat_list_cache: RefCell::new(None),
             chat_cache_version: std::cell::Cell::new(0),
-            storage_usage: None,
-            installed_plugins: None,
             destination: Destination::default(),
             status_pane: StatusPane::default(),
             status_feed_cache: RefCell::new(None),
@@ -1130,10 +994,7 @@ impl WhatsAppApp {
             account_name: None,
             account_jid: None,
             account_lid: None,
-            plugins: Vec::new(),
-            plugin_fields: PluginFields::new(),
-            settings: None,
-            tick_task: None,
+            settings: cx.new(|_| settings::Settings::new()),
             status_tick: None,
             heartbeat: None,
         }
@@ -1216,7 +1077,7 @@ impl WhatsAppApp {
     /// This avoids expensive recomputation of chat list data on every render.
     /// Filters by search query if active. Item sizes are computed at render time
     /// based on ResponsiveLayout.
-    pub fn get_chat_list_cache(&self) -> ChatListCache {
+    pub fn get_chat_list_cache(&self, cx: &App) -> ChatListCache {
         let mut cache = self.chat_list_cache.borrow_mut();
 
         // Asked before anything is filtered, which is the whole of this: the
@@ -1238,7 +1099,7 @@ impl WhatsAppApp {
             return cached.clone();
         }
 
-        let query = &self.chat_search_query;
+        let query = self.search.read(cx).list_query();
         let matches = |chat: &Chat| {
             self.chat_filter.matches(chat)
                 && (contains_ignore_case(&chat.name, query)
@@ -1312,8 +1173,8 @@ impl WhatsAppApp {
 
     /// Whether a search is currently narrowing the list, which is what makes
     /// an empty list mean "no matches" rather than "no chats".
-    pub fn is_searching(&self) -> bool {
-        !self.chat_search_query.is_empty()
+    pub fn is_searching(&self, cx: &App) -> bool {
+        self.search.read(cx).narrowing_the_list()
     }
 
     /// The linked-device row at the foot of the sidebar.
@@ -1576,10 +1437,10 @@ impl WhatsAppApp {
     /// `&mut self` because an open conversation search is derived from those
     /// same messages: every caller here is announcing that the chat's history
     /// changed, which is exactly when the search's matches stop describing it.
-    fn invalidate_message_cache(&mut self, chat_jid: &str) {
+    fn invalidate_message_cache(&mut self, chat_jid: &str, cx: &mut App) {
         self.message_list_cache.borrow_mut().remove(chat_jid);
-        self.refresh_conversation_search(chat_jid);
-        self.refresh_media_viewer(chat_jid);
+        self.refresh_conversation_search(chat_jid, cx);
+        self.refresh_media_viewer(chat_jid, cx);
         // The status feed is a second view of one chat's messages, and its
         // own guard — the message count — cannot see a message *changing*.
         if Self::is_status_jid(chat_jid) {
@@ -1611,7 +1472,7 @@ impl WhatsAppApp {
         }
         self.visible_chat = jid;
         if moved {
-            self.sweep_retained_media();
+            self.sweep_retained_media(cx);
         }
     }
 
@@ -1621,8 +1482,8 @@ impl WhatsAppApp {
     /// that pages the sidebar is not built when there is nothing to put in
     /// it, so the one list that most needs another page — a filter matching
     /// nothing yet — would be the one list that never asks for one.
-    pub fn chat_list_is_empty(&self) -> bool {
-        self.get_chat_list_cache().rows.is_empty()
+    pub fn chat_list_is_empty(&self, cx: &App) -> bool {
+        self.get_chat_list_cache(cx).rows.is_empty()
     }
 
     /// Record which keyboard surfaces this frame drew. See
@@ -1647,37 +1508,20 @@ impl WhatsAppApp {
         // epoch nothing had bumped, and send the old account's note from the
         // newly paired one.
         self.leave_connected_view(cx);
-        // A call is account state as much as a chat is. Left standing, the
-        // next daemon's first (empty) snapshot reads as this stage ending, and
-        // the record is written into the account that has just been paired —
-        // recreating a chat for the old account's peer to hold it.
-        self.call_state = CallState::new();
-        self.call_card.call_ended();
-        // Including the pictures: a frame of the old account's peer left in
-        // a pane is exactly the kind of thing a reset exists to remove.
-        self.call_pictures = CallPictures::default();
-        self.call_video_asked = None;
-        self.call_muted_asked = None;
+        // A call is account state as much as a chat is. See
+        // [`calls_ctl::Calls::forget`].
+        self.calls.update(cx, |calls, cx| calls.forget(cx));
         // And the notices, which are drawn by the root over every screen and
         // so outlive the view they were raised in. "That recording could not
         // be sent" is about an account that has gone, shown to whoever pairs
         // next, and a reset is a departure rather than a clear.
         self.notices.update(cx, |notices, _| notices.forget());
         // What the *old* account occupied, and the query that is still
-        // measuring it. Settings survives the reset, so a completion landing
-        // after it would show the previous account's database and media under
-        // the new one; `account_epoch` is what the detached task checks.
-        self.storage_usage = None;
-        self.account_epoch = self.account_epoch.wrapping_add(1);
-        // A plugin's boxes hold what somebody typed into them for the *old*
-        // account, and the entities carry live commit subscriptions. Left
-        // standing, a restarted plugin republishing the same default value it
-        // published before changes nothing that `sync_plugin_fields` compares
-        // — `published` is unchanged — so the half-typed text survives, and
-        // pressing Enter sends the old account's words into the new one's
-        // plugin. The next sync rebuilds whatever is still drawn.
-        self.plugins.clear();
-        self.plugin_fields.clear();
+        // measuring it. See [`settings::Settings::forget`].
+        self.settings.update(cx, |settings, cx| settings.forget(cx));
+        // A plugin's boxes are the departing account's too. See
+        // [`plugins_ctl::Plugins::forget`].
+        self.plugins.update(cx, |plugins, cx| plugins.forget(cx));
         self.chats.clear();
         self.selected_chat = None;
         self.visible_chat = None;
@@ -1717,9 +1561,13 @@ impl WhatsAppApp {
         // Playback itself is already stopped, above.
         self.video_players.clear();
         self.downloads_in_flight.clear();
-        self.media_viewer = None;
-        self.conversation_search = None;
-        self.chat_search_query.clear();
+        // The viewer names a chat and a message in it, both of which have
+        // just gone; and both searches were typed against a list and a
+        // conversation this account no longer has.
+        self.viewer.update(cx, |viewer, cx| {
+            viewer.close(cx);
+        });
+        self.search.update(cx, |search, cx| search.forget(cx));
     }
 
     /// Everything that has to stop when the connected view goes away.
@@ -1783,34 +1631,15 @@ impl WhatsAppApp {
     /// responding, as far as anyone looking at it could tell. Reconciled here
     /// because this is the announcement that a chat's history changed, which
     /// is the whole set of ways a picture can stop existing.
-    fn refresh_media_viewer(&mut self, chat_jid: &str) {
-        if self
-            .media_viewer
-            .as_ref()
-            .is_none_or(|viewer| viewer.jid != chat_jid)
-        {
+    fn refresh_media_viewer(&mut self, chat_jid: &str, cx: &mut App) {
+        if self.viewer.read(cx).jid() != Some(chat_jid) {
             return;
         }
-        let Some(mut viewer) = self.media_viewer.take() else {
-            return;
-        };
-        if self.viewer_survives(&mut viewer) {
-            self.media_viewer = Some(viewer);
-        }
-    }
-
-    /// Point `viewer` at what its chat holds now, and say whether anything is
-    /// left to look at.
-    ///
-    /// Takes the viewer rather than reading it out of `self`, so the chat can
-    /// be borrowed where it lies: the alternative is cloning a conversation's
-    /// whole message vector to hand it to a viewer that owns three strings.
-    fn viewer_survives(&self, viewer: &mut MediaViewer) -> bool {
-        match self.find_chat(&viewer.jid) {
-            Some(chat) => viewer.refresh(&chat.messages),
-            // The conversation itself is gone; so is everything it held.
-            None => false,
-        }
+        let messages = self
+            .find_chat(chat_jid)
+            .map(|chat| chat.messages.as_slice());
+        self.viewer
+            .update(cx, |viewer, cx| viewer.reconcile(messages, cx));
     }
 
     /// Re-run an open conversation search over the chat's current messages.
@@ -1820,24 +1649,15 @@ impl WhatsAppApp {
     /// navigation describing a conversation that had moved on — with no way
     /// to correct it but to retype the query. Called from every path that
     /// invalidates a chat's timeline, which is the same set of changes.
-    fn refresh_conversation_search(&mut self, chat_jid: &str) {
-        if self
-            .conversation_search
-            .as_ref()
-            .is_none_or(|search| search.jid != chat_jid || search.query.is_empty())
-        {
+    fn refresh_conversation_search(&mut self, chat_jid: &str, cx: &mut App) {
+        if !self.search.read(cx).stale_for(chat_jid) {
             return;
         }
-        // Lifted out for the same reason as in `set_conversation_search`:
-        // reading the messages needs `self` while the search is being written.
-        let Some(mut search) = self.conversation_search.take() else {
+        let Some(chat) = self.find_chat(chat_jid) else {
             return;
         };
-        let query = search.query.clone();
-        if let Some(chat) = self.find_chat(&search.jid) {
-            search.refresh(&query, &chat.messages);
-        }
-        self.conversation_search = Some(search);
+        self.search
+            .update(cx, |search, cx| search.refresh_open(&chat.messages, cx));
     }
 
     // ========== Accessors ==========
@@ -1920,7 +1740,7 @@ impl WhatsAppApp {
     /// the message actually advances the chat (duplicates and older backfills
     /// leave the ordering alone).
     /// Returns true if the chat was found and updated, false otherwise.
-    fn add_message_to_chat(&mut self, jid: &str, message: ChatMessage) -> bool {
+    fn add_message_to_chat(&mut self, jid: &str, message: ChatMessage, cx: &mut App) -> bool {
         if let Some(index) = self.chats.iter().position(|c| c.jid == jid) {
             if Arc::make_mut(&mut self.chats[index]).add_message(message) {
                 self.reposition_chat_by_time(index);
@@ -1929,7 +1749,7 @@ impl WhatsAppApp {
             // (even if it didn't move, the last message preview needs updating)
             self.invalidate_chat_cache();
             // Also invalidate message cache for this chat
-            self.invalidate_message_cache(jid);
+            self.invalidate_message_cache(jid, cx);
             true
         } else {
             false
@@ -2021,13 +1841,8 @@ impl WhatsAppApp {
         // The viewer names a chat and a message in it, and resolves them every
         // frame: one left open over a chat that has just gone draws nothing,
         // keeps the keyboard, and swallows the Escape meant to close it.
-        if self
-            .media_viewer
-            .as_ref()
-            .is_some_and(|viewer| gone.iter().any(|jid| jid == &viewer.jid))
-        {
-            self.media_viewer = None;
-        }
+        self.viewer
+            .update(cx, |viewer, cx| viewer.close_if_about_any(&gone, cx));
         self.invalidate_chat_cache();
     }
 
@@ -2109,38 +1924,43 @@ impl WhatsAppApp {
         &self.chat_list_focus
     }
 
-    /// Get the chat search input entity
-    pub fn chat_search_input(&self) -> Option<&Entity<InputState>> {
-        self.chat_search_input.as_ref()
+    /// The sidebar's search field, when one has been built.
+    pub fn chat_search_input<'a>(&self, cx: &'a App) -> Option<&'a Entity<InputState>> {
+        self.search.read(cx).list_input()
     }
 
-    /// Ensure the chat search input is initialized
+    /// Make sure the sidebar has a field to type a filter into.
+    ///
+    /// Built here rather than inside [`search::Search`], and subscribed to
+    /// here too, because that is what makes typing in it safe: a
+    /// subscription's handler is given its own entity leased out of the map,
+    /// so one registered on the search that called back into the window —
+    /// which answers by updating the search — would take a second lease of
+    /// one entity, and gpui panics on that rather than papering over it. The
+    /// box is the window's; where what is typed in it *goes* is the search's.
     pub fn ensure_chat_search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_component::input::InputEvent;
 
-        if self.chat_search_input.is_some() {
+        if self.search.read(cx).list_input().is_some() {
             return;
         }
-
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search chats..."));
-
-        // Subscribe to search input changes
-        cx.subscribe(&search_input, |this, input, event: &InputEvent, cx| {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search chats..."));
+        cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
                 let query = input.read(cx).value().to_string();
                 this.set_chat_search(query, cx);
             }
         })
         .detach();
-
-        self.chat_search_input = Some(search_input);
+        self.search
+            .update(cx, |search, _| search.adopt_list_input(input));
     }
 
     // ========== Chat List Navigation ==========
 
     /// Select the next chat in the list (keyboard navigation)
     pub fn select_next_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let cache = self.get_chat_list_cache();
+        let cache = self.get_chat_list_cache(cx);
         if cache.rows.is_empty() {
             return;
         }
@@ -2164,7 +1984,7 @@ impl WhatsAppApp {
 
     /// Select the previous chat in the list (keyboard navigation)
     pub fn select_previous_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let cache = self.get_chat_list_cache();
+        let cache = self.get_chat_list_cache(cx);
         if cache.rows.is_empty() {
             return;
         }
@@ -2188,32 +2008,20 @@ impl WhatsAppApp {
 
     // ========== Chat Search ==========
 
-    /// Update chat search query with debouncing
+    /// Filter the list by what was typed, once the typing has settled.
+    ///
+    /// The cache is dropped here rather than in the search itself, for the
+    /// reason the search hands the answer back at all: what a filter costs is
+    /// this window's chat cache, and the search holds no chats.
     pub fn set_chat_search(&mut self, query: String, cx: &mut Context<Self>) {
-        // Cancel previous debounce task
-        self.chat_search_task = None;
-
-        if query.is_empty() {
-            // Immediate clear
-            self.chat_search_query.clear();
+        let app = cx.entity().downgrade();
+        let now = self
+            .search
+            .update(cx, |search, cx| search.set_list_query(query, app, cx));
+        if now {
             self.invalidate_chat_cache();
             cx.notify();
-            return;
         }
-
-        // Debounce the actual filtering
-        let trimmed = query.trim().to_lowercase();
-        self.chat_search_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS))
-                .await;
-
-            let _ = entity.update(cx, |this, cx| {
-                this.chat_search_query = trimmed;
-                this.invalidate_chat_cache();
-                cx.notify();
-            });
-        }));
     }
 
     // ========== Actions ==========
@@ -2266,20 +2074,10 @@ impl WhatsAppApp {
         // A search belongs to the conversation it was typed for, so leaving
         // that conversation closes it rather than carrying a query into a
         // chat it says nothing about.
-        if self
-            .conversation_search
-            .as_ref()
-            .is_some_and(|search| search.jid != jid)
-        {
-            self.conversation_search = None;
-        }
-        if self
-            .media_viewer
-            .as_ref()
-            .is_some_and(|viewer| viewer.jid != jid)
-        {
-            self.media_viewer = None;
-        }
+        self.search
+            .update(cx, |search, cx| search.close_unless_about(&jid, cx));
+        self.viewer
+            .update(cx, |viewer, cx| viewer.close_unless_about(&jid, cx));
         // And so does a reply. The draft is one shared field feeding one
         // shared composer, so a reply begun in A and sent from B quoted A's
         // message — putting A's text in front of B as the thing being
@@ -2329,7 +2127,7 @@ impl WhatsAppApp {
             // Both caches: the badge, and the is_read snapshot the message
             // list renders ticks from (its count guard can't see this).
             self.invalidate_chat_cache();
-            self.invalidate_message_cache(&jid);
+            self.invalidate_message_cache(&jid, cx);
         }
 
         // Scroll to the last message
@@ -2398,7 +2196,7 @@ impl WhatsAppApp {
                         // A level chosen while this was unreachable reached
                         // nobody, and the daemon on the other end may be a
                         // new one. Nothing is sent if nobody chose.
-                        app.resend_log_level();
+                        app.resend_log_level(cx);
                     }
                     Err(e) if Session::is_settled(&e) => {
                         // A refusal, not a failure to reach anything: this
@@ -2565,7 +2363,7 @@ impl WhatsAppApp {
         // The bubble shows its own quote from the moment it is drawn, the way
         // the reply will look once it comes back from the store.
         msg.quoted = quoted;
-        if self.add_message_to_chat(&jid, msg) {
+        if self.add_message_to_chat(&jid, msg, cx) {
             self.scroll_to_last_message();
         }
         // The reply bar goes with the reply it composed.
@@ -2732,6 +2530,7 @@ impl WhatsAppApp {
         chat_jid: String,
         mut message: ChatMessage,
         sender_name: Option<String>,
+        cx: &mut App,
     ) {
         // Parse JID to determine chat type
         let jid = chat_jid.parse::<Jid>().ok();
@@ -2801,7 +2600,7 @@ impl WhatsAppApp {
 
             // Always invalidate caches since chat content changed
             self.invalidate_chat_cache();
-            self.invalidate_message_cache(&chat_jid);
+            self.invalidate_message_cache(&chat_jid, cx);
         } else {
             // Create new chat
             let display_name = if is_group || is_status {
@@ -2844,7 +2643,7 @@ impl WhatsAppApp {
                 chat.mark_as_read();
             }
             self.invalidate_chat_cache();
-            self.invalidate_message_cache(&chat_jid);
+            self.invalidate_message_cache(&chat_jid, cx);
         }
     }
 
@@ -2859,6 +2658,7 @@ impl WhatsAppApp {
         chat_jid: String,
         message_ids: Vec<String>,
         receipt_type: ReceiptType,
+        cx: &mut App,
     ) {
         let status = match receipt_type {
             ReceiptType::Delivered => MessageStatus::Delivered,
@@ -2890,7 +2690,7 @@ impl WhatsAppApp {
             );
             // Ticks and the unread badge changed; count-based cache guards
             // can't see either.
-            self.invalidate_message_cache(&chat_jid);
+            self.invalidate_message_cache(&chat_jid, cx);
             self.invalidate_chat_cache();
         }
     }
@@ -2929,7 +2729,7 @@ impl WhatsAppApp {
                                 chat.update_participant(sender_jid.clone(), name.clone());
                             }
                             // Rows that were waiting for this name have it now.
-                            self.invalidate_message_cache(&chat_jid);
+                            self.invalidate_message_cache(&chat_jid, cx);
                         }
                         name
                     }
@@ -3017,7 +2817,7 @@ impl WhatsAppApp {
             self.reposition_chat_by_time(index);
         }
 
-        self.invalidate_message_cache(&chat_jid);
+        self.invalidate_message_cache(&chat_jid, cx);
         // And the sidebar, when the notice is now the last thing in the
         // conversation: the list's preview is drawn from that row, while its
         // cache guard counts chats and cannot see one gaining a message.
@@ -3057,11 +2857,12 @@ impl WhatsAppApp {
         message_id: String,
         sender: String,
         emoji: String,
+        cx: &mut App,
     ) {
         if let Some(chat) = self.find_chat_mut(&chat_jid) {
             if chat.add_reaction(&message_id, emoji.clone(), sender.clone()) {
                 // Invalidate cache since reactions affect message height
-                self.invalidate_message_cache(&chat_jid);
+                self.invalidate_message_cache(&chat_jid, cx);
                 info!(
                     "Added reaction '{}' from {} to message {} in {}",
                     emoji,
@@ -3298,7 +3099,7 @@ impl Render for WhatsAppApp {
             AppState::Syncing => render_syncing_view(cx).into_any_element(),
             // Settings is a screen over the conversation view, so it takes
             // the whole frame while it is open rather than floating.
-            AppState::Connected | AppState::Offline if self.settings.is_some() => {
+            AppState::Connected | AppState::Offline if self.showing_settings(cx) => {
                 render_settings_view(self, window, cx).into_any_element()
             }
             AppState::Connected | AppState::Offline => {
