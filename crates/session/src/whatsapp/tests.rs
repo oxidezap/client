@@ -21,12 +21,12 @@ use whatsapp_rust::waproto::whatsapp as wa;
 /// A name book with nothing behind its handle: the history paths hand the
 /// store in with every call, and only the live paths read it from there.
 fn book() -> NameBook {
-    NameBook::new(Arc::new(super::Mutex::new(None)))
+    NameBook::new(None)
 }
 
 /// A name book that can reach the address book, the way the live paths do.
 fn book_with(store: &Arc<ChatStore>) -> NameBook {
-    NameBook::new(Arc::new(super::Mutex::new(Some(store.clone()))))
+    NameBook::new(Some(store.clone()))
 }
 
 /// A store-hydrated chat list must label a photo the way the live path
@@ -961,4 +961,129 @@ fn a_chat_cursor_keeps_an_address_with_a_colon_in_it() {
 fn an_unreadable_pin_does_not_read_back_as_unpinned() {
     assert!(parse_chat_cursor("c1:xx:1700000000123:5599000000001@s.whatsapp.net").is_none());
     assert!(parse_chat_cursor("c1::1700000000123:5599000000001@s.whatsapp.net").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// The session's own lifecycle: what a caller can observe while it comes up,
+// and what is left of it once it has gone.
+// ---------------------------------------------------------------------------
+
+/// A send that arrives before the session is up still reaches the front end.
+///
+/// The optimistic bubble is already drawn and carries its local id; nothing
+/// else will ever fail it, so a session that answers such a send with silence
+/// leaves it pending for the life of the window. This is the whole reason the
+/// event channel exists from construction rather than from `start`: the sender
+/// it used to be filled into was `None` until the session task got there.
+#[tokio::test]
+async fn a_send_before_the_session_is_up_still_fails_its_bubble() {
+    let mut client = WhatsAppClient::new().expect("an executor");
+    let mut events = client.take_events().expect("the event stream");
+
+    client
+        .send_message(TEST_PEER, "oi", "local-1".to_string(), None)
+        .await
+        .expect("the send task runs");
+
+    match events.try_recv() {
+        Ok(oxidezap_core::UiEvent::SendFailed { message_id, .. }) => {
+            assert_eq!(message_id, "local-1");
+        }
+        other => panic!("the bubble was left pending: {other:?}"),
+    }
+    // The executor owns a runtime, and tokio refuses to drop one from inside
+    // an async context; letting go is the platform's answer to that.
+    crate::exec::let_go(client).await;
+}
+
+/// The event stream is handed out once. It used to be a `bool` beside four
+/// handles; now the receiver is the token, so "already started" cannot
+/// disagree with whether anybody is listening.
+#[tokio::test]
+async fn the_event_stream_is_handed_out_once() {
+    let mut client = WhatsAppClient::new().expect("an executor");
+    assert!(client.take_events().is_some());
+    assert!(client.take_events().is_none());
+    crate::exec::let_go(client).await;
+}
+
+/// Nothing a caller can observe is ever half a session.
+///
+/// The four handles this replaced were published one at a time, so throughout
+/// a cold start a caller could hold a chat store with no address book to name
+/// people from, or — from the other end, at teardown — a live client with no
+/// store recording what it sent.
+///
+/// Sampled at every await the opening does, rather than from a racing task: a
+/// gap of one yield is exactly what a race misses half the time, and every
+/// caller in this crate reaches the session across such a yield. So the
+/// opening future is driven poll by poll and the slot read between polls —
+/// which observes the whole of it, deterministically.
+#[tokio::test]
+async fn a_session_is_never_observed_half_open() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session: super::SessionSlot = Arc::new(super::Mutex::new(None));
+
+    let opening = WhatsAppClient::open_session(
+        "file:oxidezap-session-half-open?mode=memory&cache=shared",
+        &ui_tx,
+        &session,
+    );
+    let mut opening = std::pin::pin!(opening);
+    let mut cx = Context::from_waker(Waker::noop());
+
+    let mut polls = 0_u32;
+    let opened = loop {
+        // Re-polled rather than woken: the waker is a no-op, so nothing here
+        // depends on a notification arriving, and the loop is bounded so a
+        // future that genuinely cannot finish fails the test instead of
+        // hanging it.
+        if let Poll::Ready(opened) = opening.as_mut().poll(&mut cx) {
+            break opened;
+        }
+        let seen = super::parts_visible(&session).await;
+        assert!(
+            seen == [true; 3] || seen == [false; 3],
+            "half a session was visible after {polls} polls: {seen:?}"
+        );
+        polls += 1;
+        assert!(polls < 100_000, "the session never finished opening");
+        tokio::task::yield_now().await;
+    };
+
+    assert!(opened.is_some(), "the session opens offline");
+    assert!(polls > 0, "the opening was observed while it ran");
+    assert_eq!(super::parts_visible(&session).await, [true; 3]);
+}
+
+/// Letting go of the session takes the client with the store.
+///
+/// The teardown used to take only the chat store, leaving the client handle
+/// live: a send racing it went out on a wire nothing was recording any more,
+/// and the `Arc<Client>` — and the pool under it — outlived the wipe that
+/// followed on the "clear data and pair again" path.
+#[tokio::test]
+async fn closing_takes_the_client_away_with_the_store() {
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session: super::SessionSlot = Arc::new(super::Mutex::new(None));
+    WhatsAppClient::open_session(
+        "file:oxidezap-session-close?mode=memory&cache=shared",
+        &ui_tx,
+        &session,
+    )
+    .await
+    .expect("the session opens offline");
+    assert_eq!(super::parts_visible(&session).await, [true; 3]);
+
+    // What `drain_chat_store` does: the whole session, in one take.
+    let taken = session.lock().await.take();
+    assert!(taken.is_some(), "the session was published");
+    assert_eq!(
+        super::parts_visible(&session).await,
+        [false; 3],
+        "nothing is left for a racing send to use"
+    );
 }

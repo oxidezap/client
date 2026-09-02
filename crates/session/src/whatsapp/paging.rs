@@ -110,20 +110,24 @@ impl WhatsAppClient {
         before: Option<String>,
         limit: i64,
     ) -> Task<Result<Page<ChatMessage>, String>> {
-        let chat_store = self.chat_store.clone();
-        let client_handle = self.client_handle.clone();
-        let names = self.names.clone();
+        let session = self.session.clone();
         self.exec.spawn(async move {
-            let Some(store) = chat_store.lock().await.clone() else {
-                return Err("no chat store yet".to_string());
-            };
-            let Some(client) = client_handle.lock().await.clone() else {
+            // One answer to one question. Three slots asked in turn could each
+            // be answered differently — a store without the book that has to
+            // name the people in it — and the three answers came from three
+            // moments, any of which a teardown could fall between.
+            let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let Some(names) = names.lock().await.clone() else {
-                return Err("no session yet".to_string());
-            };
-            Self::message_page(&store, &client, &names, jid, before, limit).await
+            Self::message_page(
+                &live.chat_store,
+                &live.client,
+                &live.names,
+                jid,
+                before,
+                limit,
+            )
+            .await
         })
     }
 
@@ -189,19 +193,12 @@ impl WhatsAppClient {
         after: Option<String>,
         limit: i64,
     ) -> Task<Result<Page<oxidezap_core::Chat>, String>> {
-        let chat_store = self.chat_store.clone();
-        let client_handle = self.client_handle.clone();
-        let names = self.names.clone();
+        let session = self.session.clone();
         self.exec.spawn(async move {
-            let Some(store) = chat_store.lock().await.clone() else {
-                return Err("no chat store yet".to_string());
-            };
-            let Some(client) = client_handle.lock().await.clone() else {
+            let Some(live) = session.lock().await.clone() else {
                 return Err("no session yet".to_string());
             };
-            let Some(names) = names.lock().await.clone() else {
-                return Err("no session yet".to_string());
-            };
+            let (store, client, names) = (&live.chat_store, &live.client, &live.names);
             let after = after
                 .map(|cursor| parse_chat_cursor(&cursor).ok_or("unreadable cursor".to_string()))
                 .transpose()?;
@@ -217,14 +214,14 @@ impl WhatsAppClient {
             let next = ((entries.len() as i64) == limit)
                 .then(|| entries.last().map(chat_cursor))
                 .flatten();
-            let entries = Self::with_alias_rows(&store, &client, &names, entries).await;
+            let entries = Self::with_alias_rows(store, client, names, entries).await;
             // Sized exactly as the attach load sizes it, and for the same
             // reasons: the row previews from its newest message, a read owes
             // a receipt per unread message rather than one for the chat, and
             // the status broadcast is nobody's conversation to open. A page
             // that carried the newest row alone let a window read a chat
             // whose older unread messages then went unacknowledged.
-            let chats = Self::hydrate_entries(&store, &client, &names, entries, Self::attach_page)
+            let chats = Self::hydrate_entries(store, client, names, entries, Self::attach_page)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(Page { items: chats, next })
