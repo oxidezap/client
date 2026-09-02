@@ -108,10 +108,14 @@ pub async fn run(
             // the only place the *last* window leaving can be noticed:
             // nothing announces a subscriber going away, and one frame is
             // what it costs to find out.
+            //
+            // Offered, then answered. Asking first and publishing second was
+            // two questions with a gap between them: the reader could leave in
+            // it, and the frame was then dropped by the publish while this
+            // side, having been told there was a reader, left the camera
+            // running for another one.
             Some(frame) = video.recv() => {
-                if bridge.hub.wants_video() {
-                    bridge.hub.publish_video(frame);
-                } else {
+                if bridge.hub.publish_video(frame).is_unwanted() {
                     client.set_video_publishing(false);
                 }
             }
