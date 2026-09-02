@@ -1,194 +1,43 @@
-//! The single owner of daemon state.
+//! The single owner of daemon state, and the single way out of it.
+//!
+//! Two things, and they used to be one type. [`StateStore`] is what the daemon
+//! *knows*: the chats, the connection, the calls, the account, the plugins,
+//! and the version that orders them. [`Fanout`] is where what it knows *goes*:
+//! four channels with four different delivery disciplines, a `watch` for the
+//! tray, and the count of clients that own a window. Neither names the other's
+//! concerns, and the module headers on each argue their own half.
+//!
+//! [`StateHub`] is the pair, and the pairing is where the two meet: a mutation
+//! records under the state lock and takes a claim on the publication order
+//! before that lock goes, so frames leave in the order their versions were
+//! assigned. That hand-over-hand is the one thing neither half could hold
+//! alone, and it is why the store's mutating methods take a closure rather
+//! than the hub asking for the order afterwards.
 //!
 //! One task mutates; everyone else observes. That is what keeps the state
-//! consistent without a lock held across await points, and it is why
+//! consistent without a lock held across an await point, and it is why
 //! [`StateHub::apply`] takes `&self` but is only ever called from the event
 //! loop in `main`.
-//!
-//! Three consumers, three different needs, so three different channels:
-//!
-//! * **Snapshots** for a client that just connected. Guarded by a `Mutex` held
-//!   only for the clone, never across an await.
-//! * **A broadcast** of already-serialized frames for connected clients. Frames
-//!   are serialized once for all of them rather than once per client, and not
-//!   at all when nobody is listening.
-//! * **A second broadcast** for frames that are not state: a window request, a
-//!   send that failed. They carry no version and no snapshot can recover
-//!   them, so they must not travel on a channel a client stops reading while
-//!   it resynchronizes.
-//! * **A third broadcast** carrying the session's own events, for a front end
-//!   that owns chats and messages rather than a summary of them. Opt-in,
-//!   because it is the whole traffic of the account.
-//! * **A `watch`** for the tray, which only cares about the latest value and
-//!   coalesces bursts on its own.
+
+mod fanout;
+mod store;
 
 use std::sync::Arc;
-use std::sync::Mutex;
 
-use oxidezap_ipc::{
-    ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, PROTOCOL_VERSION, StateSnapshot,
-    StateVersion,
-};
+use oxidezap_ipc::{ChatSummary, ConnectionState, DaemonEvent, DaemonMessage, PROTOCOL_VERSION};
+use oxidezap_ipc::{StateSnapshot, StateVersion};
 use tokio::sync::{broadcast, watch};
 
-/// How many frames a slow client may fall behind before its stream is
-/// truncated.
-///
-/// Bounded on purpose: an unbounded queue would let one stalled client grow
-/// the daemon's memory without limit. A client that overruns it gets
-/// `Resync` and rebuilds from a snapshot, which is correct, just more
-/// expensive than keeping up.
-const BROADCAST_CAPACITY: usize = 256;
+pub use fanout::Delivery;
+pub use store::{Change, StateStore, TrayState};
 
-/// How many pass-through frames may queue for one client.
-///
-/// Small, because these are user-initiated: a tray click, a send that failed.
-/// A client far enough behind to overrun even this has bigger problems than a
-/// missed window raise, and unlike state there is nothing to converge — a
-/// dropped one is simply gone, which is why it is not worth buffering deeply.
-const SIGNAL_CAPACITY: usize = 32;
+use fanout::{Claim, Fanout};
+use store::Published;
 
-/// How many session events a front end may fall behind by.
-///
-/// Deeper than the summary stream: one history load is a single event but a
-/// burst of messages is many, and a front end that overruns has to rebuild
-/// from a fresh load rather than from a cheap snapshot.
-const SESSION_CAPACITY: usize = 1024;
-
-/// A quarter of a second of video at the rate a call runs, and no more. This
-/// is the one channel where depth is the *problem*: every frame held here is
-/// latency between the person talking and the person watching, and a reader
-/// that cannot keep up should be shown the newest frame rather than led
-/// through the backlog.
-const VIDEO_CAPACITY: usize = 8;
-
-/// What the tray renders. Small and comparable so `watch` can drop
-/// no-op updates before they reach the icon.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrayState {
-    pub connected: bool,
-    pub unread: u32,
-}
-
-/// A state change on its way into the hub.
-///
-/// [`DaemonEvent`] is the wire type: it carries what a client needs and
-/// nothing else. Provenance is not that. A client never has to know whether a
-/// chat arrived from a store reload or from live traffic, while the hub does,
-/// because only a chat the store has vouched for may be pruned by a complete
-/// reload that omits it.
-#[derive(Debug, Clone)]
-pub struct Change {
-    pub event: DaemonEvent,
-    /// Whether this came from the chat store rather than from live traffic.
-    from_store: bool,
-}
-
-impl Change {
-    /// A change from live traffic: a message arriving, a connection state.
-    #[must_use]
-    pub fn live(event: DaemonEvent) -> Self {
-        Self {
-            event,
-            from_store: false,
-        }
-    }
-
-    /// A change the chat store produced, so the chat it names exists on disk.
-    #[must_use]
-    pub fn from_store(event: DaemonEvent) -> Self {
-        Self {
-            event,
-            from_store: true,
-        }
-    }
-}
-
-/// One chat plus what the wire type cannot carry.
-struct ChatEntry {
-    summary: ChatSummary,
-    /// Set once the store has published this chat, and never cleared: a chat
-    /// only ever seen live is not yet something a complete reload can
-    /// contradict, and pruning it would drop a conversation that arrived
-    /// during pairing, before the store had any rows at all.
-    from_store: bool,
-}
-
-/// The mutable half, owned by the event loop.
-struct Inner {
-    version: StateVersion,
-    connection: ConnectionState,
-    /// Which calls are happening.
-    ///
-    /// Not a chat and not a summary, so it rides neither. The same type the
-    /// front end keeps, so attaching hands it over whole rather than replaying
-    /// events that would not reconstruct it: a call this account placed was
-    /// never an event at all.
-    calls: oxidezap_core::CallState,
-    /// Who this device is linked as, once the session has said.
-    ///
-    /// State for the same reason the calls are: announced on connect, once,
-    /// and a client attaching afterwards never saw it.
-    account: Option<oxidezap_ipc::AccountIdentity>,
-    /// Every loaded plugin, and what each wants drawn.
-    ///
-    /// State like the calls are: a plugin publishes its interface when it
-    /// starts, once, and a window attaching an hour later never saw that
-    /// happen. Held whole rather than per plugin, because a set of some
-    /// plugins is not a snapshot of the set.
-    plugins: Vec<oxidezap_core::PluginSurface>,
-    /// Chats keyed by JID. A map, not a Vec: every update is a lookup by JID,
-    /// and a Vec would make a rename or a receipt O(n) over every chat.
-    chats: std::collections::HashMap<String, ChatEntry>,
-    /// Which account this is, counted up every time one leaves.
-    ///
-    /// Here rather than beside the lock, so a task that asks and then applies
-    /// can have both answered without the account leaving in between: see
-    /// [`StateHub::apply_for`].
-    account_generation: usize,
-}
-
+/// What the daemon knows, and everyone it tells.
 pub struct StateHub {
-    inner: Mutex<Inner>,
-    /// Held from inside the state lock until a frame is on the channel, so
-    /// versions leave in the order they were assigned. See [`StateHub::apply`].
-    ordering: Mutex<()>,
-    /// Pre-serialized frames. `Arc<str>` so fanning out to N clients costs N
-    /// refcount bumps rather than N serializations.
-    updates: broadcast::Sender<Arc<str>>,
-    /// Frames that are not state, on their own channel.
-    ///
-    /// Separate from `updates` because a client that has been told to resync
-    /// stops reading that one until its snapshot arrives, and a window
-    /// request published in that window would simply be lost: it has no
-    /// version, and no snapshot contains it. The tray's Open item doing
-    /// nothing precisely while the front end is recovering is the failure
-    /// this avoids.
-    signals: broadcast::Sender<Arc<str>>,
-    /// The session's own events, for front ends that asked for them.
-    ///
-    /// Its own channel rather than a flag on `updates`: a tray subscribes to
-    /// summaries and would otherwise pay the serialization of every message in
-    /// the account, and a front end subscribes to events and has no use for
-    /// summaries it derives itself.
-    sessions: broadcast::Sender<Arc<str>>,
-    /// A live call's video, for front ends that draw it.
-    ///
-    /// A third channel because it obeys neither of the other two's rules.
-    /// State converges from a snapshot and news must not be lost; a video
-    /// frame is neither — the newest one is the only one worth having, and a
-    /// client that falls behind is *right* to skip. Sharing `sessions` would
-    /// turn a slow window into a `Resync` and throw its whole history away to
-    /// recover a picture that had already moved on.
-    video: broadcast::Sender<Arc<str>>,
-    tray: watch::Sender<TrayState>,
-    /// How many attached clients own a window.
-    ///
-    /// Not the same question as how many are subscribed: every client reads
-    /// the signal channel, and only a front end can act on a window request.
-    /// A TUI or a notifier attached to summaries would otherwise make
-    /// [`crate::window::show`] believe there was a window to raise.
-    windows: std::sync::atomic::AtomicUsize,
+    state: StateStore,
+    out: Fanout,
 }
 
 /// One attached client that owns a window, counted while it is connected.
@@ -199,39 +48,15 @@ pub struct WindowGuard(Arc<StateHub>);
 
 impl Drop for WindowGuard {
     fn drop(&mut self) {
-        self.0
-            .windows
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.out.detach_window();
     }
 }
 
 impl StateHub {
     pub fn new() -> Arc<Self> {
-        let (updates, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let (signals, _) = broadcast::channel(SIGNAL_CAPACITY);
-        let (sessions, _) = broadcast::channel(SESSION_CAPACITY);
-        let (video, _) = broadcast::channel(VIDEO_CAPACITY);
-        let (tray, _) = watch::channel(TrayState {
-            connected: false,
-            unread: 0,
-        });
         Arc::new(Self {
-            ordering: Mutex::new(()),
-            inner: Mutex::new(Inner {
-                version: StateVersion::INITIAL,
-                connection: ConnectionState::Connecting,
-                calls: oxidezap_core::CallState::default(),
-                account: None,
-                plugins: Vec::new(),
-                chats: std::collections::HashMap::new(),
-                account_generation: 0,
-            }),
-            updates,
-            signals,
-            sessions,
-            video,
-            tray,
-            windows: std::sync::atomic::AtomicUsize::new(0),
+            state: StateStore::new(),
+            out: Fanout::new(),
         })
     }
 
@@ -242,7 +67,7 @@ impl StateHub {
     /// snapshot, and the version on each frame is what lets the client drop
     /// the overlap. The reverse order would lose those events entirely.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<str>> {
-        self.updates.subscribe()
+        self.out.subscribe_updates()
     }
 
     /// Subscribe to the frames that are not state.
@@ -251,52 +76,36 @@ impl StateHub {
     /// these loses it for good, so a client keeps reading them through a
     /// resync.
     pub fn subscribe_signals(&self) -> broadcast::Receiver<Arc<str>> {
-        self.signals.subscribe()
+        self.out.subscribe_signals()
     }
 
     /// Subscribe to the session's own events.
     pub fn subscribe_sessions(&self) -> broadcast::Receiver<Arc<str>> {
-        self.sessions.subscribe()
+        self.out.subscribe_sessions()
     }
 
-    /// Whether any front end is listening for session events.
+    /// Whether preparing a session event is worth it.
     ///
-    /// Asked before the work of preparing one: media has to be written to the
+    /// Asked before the work of building one: media has to be written to the
     /// cache before an event can be serialized, and with nobody attached that
     /// is a copy of every photo in the account for no reader.
     pub fn wants_session_events(&self) -> bool {
-        self.sessions.receiver_count() > 0
+        self.out.session_events_wanted()
     }
 
     /// Subscribe to the live call's video.
     pub fn subscribe_video(&self) -> broadcast::Receiver<Arc<str>> {
-        self.video.subscribe()
+        self.out.subscribe_video()
     }
 
-    /// Whether anybody is drawing a call.
+    /// Publish one video frame, and say whether anybody took it.
     ///
-    /// Asked before a frame is serialized, which is the whole reason it
-    /// exists: base64 and a JSON pass over every access unit of a call
-    /// nobody is watching is real work for no reader — and a daemon holding
-    /// a call with its window closed is the ordinary case.
-    pub fn wants_video(&self) -> bool {
-        self.video.receiver_count() > 0
-    }
-
-    /// Publish one video frame.
-    ///
-    /// Dropped rather than queued when there is nobody to take it, like every
-    /// other frame on this channel.
-    pub fn publish_video(&self, frame: oxidezap_core::CallVideoFrame) {
-        if !self.wants_video() {
-            return;
-        }
-        match serde_json::to_string(&DaemonMessage::CallVideo(Box::new(frame))) {
-            Ok(line) => {
-                let _ = self.video.send(Arc::from(line.as_str()));
-            }
-            Err(e) => log::error!("dropping an unserializable video frame: {e}"),
-        }
+    /// The answer is the producer's flow control: nothing announces the last
+    /// window going away, so a session finds out by offering a frame and being
+    /// told it was [`Delivery::Unwanted`]. See that type for what asking
+    /// beforehand cost.
+    pub fn publish_video(&self, frame: oxidezap_core::CallVideoFrame) -> Delivery {
+        self.out.publish_video(frame)
     }
 
     /// Publish one session event, already serialized.
@@ -305,11 +114,11 @@ impl StateHub {
     /// see [`StateHub::wants_session_events`] — and the caller is the only one
     /// that can do it.
     pub fn publish_session(&self, frame: String) {
-        let _ = self.sessions.send(Arc::from(frame.as_str()));
+        self.out.publish_session(frame);
     }
 
     pub fn watch_tray(&self) -> watch::Receiver<TrayState> {
-        self.tray.subscribe()
+        self.out.watch_tray()
     }
 
     /// The current state, as the first frame of a connection.
@@ -322,22 +131,7 @@ impl StateHub {
     }
 
     fn snapshot(&self) -> StateSnapshot {
-        let inner = self.lock();
-        let mut chats: Vec<ChatSummary> = inner.chats.values().map(|e| e.summary.clone()).collect();
-        // Newest first, and by JID when timestamps tie, so two clients given
-        // the same state render the same order.
-        chats.sort_by(|a, b| {
-            let ts = |c: &ChatSummary| c.last_message.as_ref().map_or(i64::MIN, |m| m.timestamp_ms);
-            ts(b).cmp(&ts(a)).then_with(|| a.jid.cmp(&b.jid))
-        });
-        StateSnapshot {
-            version: inner.version,
-            connection: inner.connection.clone(),
-            chats,
-            calls: inner.calls.clone(),
-            account: inner.account.clone(),
-            plugins: inner.plugins.clone(),
-        }
+        self.state.snapshot()
     }
 
     /// Record who this device is linked as, and tell everyone.
@@ -351,42 +145,29 @@ impl StateHub {
     /// A re-announcement of the same identity is not news and consumes no
     /// version.
     pub fn set_account(&self, account: oxidezap_ipc::AccountIdentity) {
-        if self.lock().account.as_ref() == Some(&account) {
+        if self.state.holds_account(&account) {
             return;
         }
         self.apply(Change::live(DaemonEvent::AccountChanged(account)));
     }
 
-    /// Everything this account had, gone with it.
-    ///
-    /// An account reset is a departure, and the hub only ever learned by
-    /// event: nothing cleared the chats, the identity or the calls, so a
-    /// front end attaching after the next pairing was handed the previous
-    /// account's list and identity in its first snapshot. Cleared under one
-    /// lock and with one version bump, rather than a removal per chat: the
-    /// frame that follows says the account is gone, and a client that had
-    /// fallen far enough behind to need the rest recovers by snapshot
-    /// anyway. Plugins stay: they are the daemon's, not the account's.
+    /// Everything this account had, gone with it. See
+    /// [`StateStore::forget_account`].
     pub fn forget_account(&self) {
-        let mut inner = self.lock();
-        inner.chats.clear();
-        inner.account = None;
-        inner.calls = oxidezap_core::CallState::new();
-        inner.version = inner.version.next();
-        inner.account_generation += 1;
+        self.state.forget_account();
     }
 
     /// Which account the hub is holding, for a task that has to outlive its
     /// own answer. See [`Self::forget_account`].
     pub fn account_generation(&self) -> usize {
-        self.lock().account_generation
+        self.state.account_generation()
     }
 
     /// Record what the plugins are now, and tell everyone.
     ///
     /// Called from a plugin's own thread rather than from the event loop,
-    /// which is the one place in this file that is true. The lock already
-    /// covers the mutation and the version bump together, so it costs
+    /// which is the one place in this file that is true. The state lock
+    /// already covers the mutation and the version bump together, so it costs
     /// nothing beyond the note: a plugin republishing its tree is a writer
     /// like the bridge is.
     ///
@@ -394,15 +175,7 @@ impl StateHub {
     /// plugin that redraws the same button on every message is the ordinary
     /// case, not the exception.
     pub fn set_plugins(&self, plugins: Vec<oxidezap_core::PluginSurface>) {
-        // The guard is bound and dropped before `apply` takes the lock again.
-        // An `if self.lock()… { }` would rely on where a condition's
-        // temporaries die, which is a rule nobody should have to recall to
-        // see that this does not deadlock.
-        let unchanged = {
-            let inner = self.lock();
-            inner.plugins == plugins
-        };
-        if unchanged {
+        if self.state.holds_plugins(&plugins) {
             return;
         }
         self.apply(Change::live(DaemonEvent::PluginsChanged { plugins }));
@@ -420,55 +193,26 @@ impl StateHub {
     /// A change that leaves the state identical consumes no version and sends
     /// no frame: a mute already muted is not news.
     pub fn calls(&self, change: impl FnOnce(&mut oxidezap_core::CallState)) {
-        let published = {
-            let mut inner = self.lock();
-            let before = inner.calls.clone();
-            change(&mut inner.calls);
-            if inner.calls == before {
-                None
-            } else {
-                inner.version = inner.version.next();
-                // Taken before the state lock goes, like `apply` does it.
-                let order = self
-                    .ordering
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                Some((inner.version, inner.calls.clone(), order))
-            }
-        };
-
-        if let Some((version, calls, order)) = published {
-            self.broadcast(version, DaemonEvent::CallsChanged(calls), order);
+        if let Some(published) = self.state.change_calls(change, || self.out.claim()) {
+            Self::deliver(published);
         }
     }
 
     /// Send the call state again, unchanged.
     ///
-    /// For a front end that drew a call this daemon then refused. Nothing
-    /// here moved, so [`calls`](Self::calls) would publish nothing, and a
-    /// refusal carries no request id for the window to answer against — it
-    /// is logged and the phantom outgoing call stays on screen with no way
-    /// to end it. Saying the state again is what takes it back.
+    /// For a front end that drew a call this daemon then refused. See
+    /// [`StateStore::republish_calls`].
     pub fn republish_calls(&self) {
-        let (version, calls, order) = {
-            let mut inner = self.lock();
-            inner.version = inner.version.next();
-            let order = self
-                .ordering
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (inner.version, inner.calls.clone(), order)
-        };
-        self.broadcast(version, DaemonEvent::CallsChanged(calls), order);
+        Self::deliver(self.state.republish_calls(|| self.out.claim()));
     }
 
     /// What is happening on the call front right now.
     ///
-    /// The snapshot reads the field directly; this is for a caller that wants
+    /// The snapshot reads the state directly; this is for a caller that wants
     /// only the calls — the bridge asks before placing one, because whether
     /// this account is already on a call is the daemon's fact, not a window's.
     pub fn call_state(&self) -> oxidezap_core::CallState {
-        self.lock().calls.clone()
+        self.state.call_state()
     }
 
     /// Where the connection stands right now.
@@ -477,7 +221,7 @@ impl StateHub {
     /// yet, rather than accepting it into a channel whose other end will fail
     /// silently.
     pub fn connection(&self) -> ConnectionState {
-        self.lock().connection.clone()
+        self.state.connection()
     }
 
     /// The summary held for `jid`, if any.
@@ -486,52 +230,23 @@ impl StateHub {
     /// a live message updates a chat without waiting for the store to hand
     /// back a whole reloaded list.
     pub fn chat(&self, jid: &str) -> Option<ChatSummary> {
-        self.lock().chats.get(jid).map(|e| e.summary.clone())
+        self.state.chat(jid)
     }
 
-    /// The JIDs a complete store reload is allowed to contradict.
-    ///
-    /// Only store-backed chats. A chat the daemon has only ever seen live has
-    /// not been published by the store yet, so its absence from a reload says
-    /// nothing: during initial pairing the store is still empty while live
-    /// messages already populate the hub, and an early complete-but-empty load
-    /// would otherwise wipe them.
-    ///
-    /// Returns owned strings rather than a borrow: the lock must not be held
-    /// while the caller decides what to remove, since deciding involves
-    /// touching the hub again.
+    /// The JIDs a complete store reload is allowed to contradict. See
+    /// [`StateStore::store_backed_chat_jids`].
     pub fn store_backed_chat_jids(&self) -> Vec<String> {
-        self.lock()
-            .chats
-            .iter()
-            .filter(|(_, e)| e.from_store)
-            .map(|(jid, _)| jid.clone())
-            .collect()
+        self.state.store_backed_chat_jids()
     }
 
     /// Publish a frame that is not state.
-    ///
-    /// No version, because nothing changed: a window request is passed
-    /// through to whoever owns a window, and a failed send is news about one
-    /// message rather than a fact a snapshot could hold. Serialized only when
-    /// someone is listening, like every other frame.
     pub fn signal(&self, message: &DaemonMessage) {
-        if self.signals.receiver_count() == 0 {
-            return;
-        }
-        match serde_json::to_string(message) {
-            // Err means every receiver dropped since the count above.
-            Ok(line) => {
-                let _ = self.signals.send(Arc::from(line.as_str()));
-            }
-            Err(e) => log::error!("dropping unserializable frame: {e}"),
-        }
+        self.out.signal(message);
     }
 
     /// Count this connection as owning a window until the guard drops.
     pub fn attach_window(self: &Arc<Self>) -> WindowGuard {
-        self.windows
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.out.attach_window();
         WindowGuard(Arc::clone(self))
     }
 
@@ -541,173 +256,54 @@ impl StateHub {
     /// clients say so themselves in their hello, because nothing the daemon
     /// can observe distinguishes a window from any other subscriber.
     pub fn windows_attached(&self) -> bool {
-        self.windows.load(std::sync::atomic::Ordering::Relaxed) > 0
+        self.out.windows_attached()
     }
 
     /// Record a change and publish it.
     ///
-    /// Returns the version it produced. The lock covers the mutation and the
-    /// version bump together, so no two events can share a version and no
+    /// Returns the version it produced. The state lock covers the mutation and
+    /// the version bump together, so no two events can share a version and no
     /// observer can read a state whose version has not caught up.
     pub fn apply(&self, change: Change) -> StateVersion {
-        self.apply_unless_stale(change, None)
-            .expect("an unconditional apply always applies")
+        let published = self
+            .state
+            .apply_unless_stale(change, None, || self.out.claim())
+            .expect("an unconditional apply always applies");
+        Self::deliver(published)
     }
 
     /// The same, for a change belonging to a particular account.
     ///
-    /// Answers whether it applied. A store read is served from a task of its
-    /// own, so a page of the old account's chats can still be in flight when
-    /// the account goes; asked separately, the question and the write are two
-    /// steps a logout can land between, which is why the comparison happens
-    /// under the lock that does the writing.
+    /// Answers whether it applied. See [`StateStore::apply_unless_stale`].
     pub fn apply_for(&self, generation: usize, change: Change) -> bool {
-        self.apply_unless_stale(change, Some(generation)).is_some()
-    }
-
-    fn apply_unless_stale(&self, change: Change, only_for: Option<usize>) -> Option<StateVersion> {
-        let Change { event, from_store } = change;
-        // Taken before the state lock is released and held across the send, so
-        // frames leave in the order their versions were assigned. There is
-        // more than one writer now — a plugin publishes from its own thread
-        // while the session bridge publishes from its task — and a client
-        // drops any frame it has already passed, so version N broadcast after
-        // N+1 is not late, it is *lost*: the widget change or the approval in
-        // it would sit stale until something unrelated published again.
-        //
-        // Hand-over-hand rather than broadcasting under the state lock: the
-        // order is fixed here, and the serialization that follows happens with
-        // the state free.
-        let (version, tray, order) = {
-            let mut inner = self.lock();
-            if only_for.is_some_and(|asked| asked != inner.account_generation) {
-                return None;
-            }
-            inner.version = inner.version.next();
-
-            match &event {
-                DaemonEvent::ConnectionChanged(state) => inner.connection = state.clone(),
-                DaemonEvent::ChatUpdated(summary) => {
-                    match inner.chats.entry(summary.jid.clone()) {
-                        std::collections::hash_map::Entry::Occupied(mut slot) => {
-                            let entry = slot.get_mut();
-                            entry.summary = summary.clone();
-                            // Sticky: a live update to a chat the store has
-                            // already published must not make it live-only
-                            // again, or a deletion elsewhere would stop being
-                            // prunable the moment one more message arrived.
-                            entry.from_store |= from_store;
-                        }
-                        std::collections::hash_map::Entry::Vacant(slot) => {
-                            slot.insert(ChatEntry {
-                                summary: summary.clone(),
-                                from_store,
-                            });
-                        }
-                    }
-                }
-                DaemonEvent::ChatRemoved { jid } => {
-                    inner.chats.remove(jid);
-                }
-                // Not the usual route in — [`Self::calls`] is — but the state
-                // it names is the state this holds, so applying it here keeps
-                // one field with one writer.
-                DaemonEvent::CallsChanged(calls) => inner.calls = calls.clone(),
-                DaemonEvent::AccountChanged(account) => {
-                    inner.account = Some(account.clone());
-                }
-                DaemonEvent::PluginsChanged { plugins } => inner.plugins = plugins.clone(),
-            }
-
-            let order = self
-                .ordering
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (inner.version, inner.tray_state(), order)
-        };
-
-        self.broadcast(version, event, order);
-
-        // `send_if_modified` so an update that leaves the tray identical wakes
-        // nothing: receipts and typing churn state constantly without changing
-        // what the icon shows.
-        self.tray.send_if_modified(|current| {
-            if *current == tray {
-                false
-            } else {
-                *current = tray;
+        match self
+            .state
+            .apply_unless_stale(change, Some(generation), || self.out.claim())
+        {
+            Some(published) => {
+                Self::deliver(published);
                 true
             }
-        });
-
-        Some(version)
-    }
-
-    /// Put one versioned event on the update channel.
-    ///
-    /// Serializes once, and only when someone is listening: with no clients
-    /// the daemon still tracks state for the tray, but pays nothing to format
-    /// frames nobody reads.
-    fn broadcast(
-        &self,
-        version: StateVersion,
-        event: DaemonEvent,
-        _order: std::sync::MutexGuard<'_, ()>,
-    ) {
-        if self.updates.receiver_count() == 0 {
-            return;
-        }
-        match serde_json::to_string(&DaemonMessage::Update { version, event }) {
-            Ok(line) => {
-                // Err means every receiver dropped between the count above and
-                // here. Nothing to do: the state is already recorded.
-                let _ = self.updates.send(Arc::from(line.as_str()));
-            }
-            Err(e) => log::error!("dropping unserializable event: {e}"),
+            None => false,
         }
     }
 
-    /// A poisoned lock means a previous holder panicked mid-mutation.
-    ///
-    /// Panicked on rather than recovered, which is the rule in docs/gotchas.md
-    /// applied to what this lock covers: `Inner` holds the version, the
-    /// connection, the calls and the chats together, and a holder that died
-    /// between two of those left a state no frame should describe. The
-    /// ordering lock beside it is recovered for the same reason read the
-    /// other way round — it protects nothing but the order of two sends.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| panic!("daemon state lock poisoned: {e}"))
+    /// Hand one recorded change to the readers, under the claim it was
+    /// recorded with.
+    fn deliver(published: Published<Claim<'_>>) -> StateVersion {
+        let Published {
+            version,
+            event,
+            tray,
+            claim,
+        } = published;
+        claim.publish(version, event, tray);
+        version
     }
 }
-
-impl Inner {
-    fn tray_state(&self) -> TrayState {
-        TrayState {
-            connected: self.connection.is_connected(),
-            // A manually-unread chat carries a badge with no number, so it
-            // counts as one for a tray that can only show a total. The status
-            // broadcast is left out of it entirely: see
-            // `ChatSummary::counts_toward_unread`.
-            unread: self
-                .chats
-                .values()
-                .map(|e| &e.summary)
-                .filter(|c| c.counts_toward_unread())
-                .fold(0u32, |acc, c| {
-                    acc.saturating_add(if c.unread == 0 && c.manually_unread {
-                        1
-                    } else {
-                        c.unread
-                    })
-                }),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::fanout::{BROADCAST_CAPACITY, VIDEO_CAPACITY};
     use super::*;
     use oxidezap_ipc::MessagePreview;
 
@@ -1164,7 +760,7 @@ mod tests {
     #[test]
     fn no_subscribers_means_no_serialization() {
         let hub = StateHub::new();
-        assert_eq!(hub.updates.receiver_count(), 0);
+        assert!(!hub.out.updates_wanted(), "nobody is listening");
         let version = hub.apply(live(chat("a@s.whatsapp.net", 1, 10)));
         assert_eq!(hub.snapshot().version, version, "state still advanced");
     }
@@ -1188,7 +784,7 @@ mod tests {
         let mut video = hub.subscribe_video();
         let before = hub.snapshot().version;
 
-        hub.publish_video(video_frame("call"));
+        assert_eq!(hub.publish_video(video_frame("call")), Delivery::Taken);
 
         assert_eq!(hub.snapshot().version, before, "state did not move");
         let frame: DaemonMessage = serde_json::from_str(&video.recv().await.unwrap()).unwrap();
@@ -1203,8 +799,11 @@ mod tests {
     #[test]
     fn nobody_watching_means_nothing_is_serialized() {
         let hub = StateHub::new();
-        assert!(!hub.wants_video());
-        hub.publish_video(video_frame("call"));
+        assert_eq!(
+            hub.publish_video(video_frame("call")),
+            Delivery::Unwanted,
+            "nobody took it, so nothing was serialized to give them"
+        );
         // Subscribing afterwards proves the channel is empty rather than
         // holding a backlog for a reader that did not exist.
         let mut video = hub.subscribe_video();
@@ -1220,7 +819,7 @@ mod tests {
         let mut video = hub.subscribe_video();
 
         for index in 0..(VIDEO_CAPACITY + 4) {
-            hub.publish_video(video_frame(&format!("call-{index}")));
+            let _ = hub.publish_video(video_frame(&format!("call-{index}")));
         }
 
         assert!(
