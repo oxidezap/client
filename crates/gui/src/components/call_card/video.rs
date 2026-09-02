@@ -48,7 +48,7 @@ pub fn active_video(
             metrics.call_card_width() * 0.62,
             cx,
         ))
-        .child(video_controls(call, entity, metrics, app))
+        .child(video_controls(call, entity, metrics, app, cx))
 }
 
 /// The peer's picture with ours inset in the corner, which is how every
@@ -64,8 +64,8 @@ pub(super) fn panes(
     height: gpui::Pixels,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let remote = app.call_picture(VideoStream::Remote).cloned();
-    let local = app.call_picture(VideoStream::Local).cloned();
+    let remote = app.call_picture(VideoStream::Remote, cx).cloned();
+    let local = app.call_picture(VideoStream::Local, cx).cloned();
     div()
         .relative()
         .m(metrics.space_lg())
@@ -198,7 +198,7 @@ pub fn active_group(
                         .map(|(jid, name)| participant_tile(jid, name, metrics, cx)),
                 ),
         )
-        .child(video_controls(call, entity, metrics, app))
+        .child(video_controls(call, entity, metrics, app, cx))
 }
 
 fn participant_tile(jid: &str, name: &str, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
@@ -253,13 +253,14 @@ fn video_controls(
     entity: Entity<WhatsAppApp>,
     metrics: Metrics,
     app: &WhatsAppApp,
+    cx: &App,
 ) -> impl IntoElement + use<> {
     let mute_entity = entity.clone();
     let camera_entity = entity.clone();
     let end_entity = entity;
     let muted = call.muted;
-    let camera_on = app.call_video_showing();
-    let asked = app.call_video_requested();
+    let camera_on = app.call_video_showing(cx);
+    let asked = app.call_video_requested(cx);
 
     let round = |id: &'static str, icon: Icon, tip: &'static str| {
         parts::icon_button(id, icon, tip, metrics.call_control())

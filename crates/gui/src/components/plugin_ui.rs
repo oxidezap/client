@@ -145,7 +145,7 @@ fn widget(
             // The plugin owns the value; this window owns what is being
             // typed. A field with no box yet is one whose sync has not run,
             // which happens for exactly one frame after a plugin adds it.
-            let state = app.plugin_field(&surface.id, slot, &node.id);
+            let state = app.plugin_field(&surface.id, slot, &node.id, cx);
             div()
                 .flex()
                 .flex_col()

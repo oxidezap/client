@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use gpui::{AppContext as _, Context, Entity, Window};
+use gpui::{App, AppContext as _, Context, Entity, Window};
 use gpui_component::input::{InputEvent, InputState};
 use oxidezap_core::{PluginNode, PluginSlot, PluginSurface, PluginWidget};
 
@@ -86,20 +86,159 @@ pub struct FieldKey {
     id: String,
 }
 
-impl WhatsAppApp {
-    /// Make sure every text field in the current plugin trees has somewhere
-    /// to hold what is typed, and drop the ones whose widgets are gone.
+/// Every plugin the daemon loaded, what each wants drawn, and the boxes this
+/// window holds for them.
+///
+/// An entity rather than three fields on the app. The surfaces are daemon
+/// state, held whole and replaced whole — a plugin's interface is not this
+/// window's memory of it — and the only thing here that is genuinely the
+/// window's is a half-typed field. Keeping the two together is what makes
+/// "the tree moved, so the boxes for it move too" one method rather than a
+/// convention, and the context every method takes is what stops any of it
+/// marking the conversation as having changed.
+pub(super) struct Plugins {
+    /// Daemon state, held whole and replaced whole. Closing the window and
+    /// opening another brings the same buttons back, because they were never
+    /// here in the first place.
+    surfaces: Vec<PluginSurface>,
+    /// Somewhere to hold what is being typed into a plugin's text field,
+    /// before anybody commits it. Keyed by plugin, slot, conversation and
+    /// widget id; see [`key`].
+    fields: PluginFields,
+    /// Every plugin id in this front end's own folder, whether or not it
+    /// loaded.
+    ///
+    /// Not the same list as `surfaces`, and the difference is the whole
+    /// reason it exists: a module that fails to parse, answers the wrong ABI
+    /// version or traps in `oxi_init` publishes no surface, so a screen drawn
+    /// from the surfaces alone has nowhere to put a Remove button for the one
+    /// file somebody most needs to remove. `None` is "not asked yet", which
+    /// is what a front end with no folder of its own stays at forever.
+    installed: Option<Vec<String>>,
+}
+
+impl Plugins {
+    pub(super) fn new() -> Self {
+        Self {
+            surfaces: Vec::new(),
+            fields: PluginFields::new(),
+            installed: None,
+        }
+    }
+
+    pub(super) fn surfaces(&self) -> &[PluginSurface] {
+        &self.surfaces
+    }
+
+    pub(super) fn installed(&self) -> Option<&[String]> {
+        self.installed.as_deref()
+    }
+
+    pub(super) fn field(
+        &self,
+        plugin: &str,
+        slot: PluginSlot,
+        chat: Option<&str>,
+        id: &str,
+    ) -> Option<&Entity<InputState>> {
+        self.fields
+            .get(&key(plugin, slot, chat, id))
+            .map(|f| &f.state)
+    }
+
+    /// Take the daemon's set of surfaces, and say whether the *membership*
+    /// moved.
+    ///
+    /// Whole every time. A plugin republishes its tree when anything in it
+    /// changes, and the daemon publishes nothing when the set has not moved,
+    /// so replacing is both correct and no more work than merging.
+    ///
+    /// The answer is what decides whether the folder is read again, and the
+    /// distinction it draws is the point. Somebody else changing the folder —
+    /// another tab of this origin, a reload of a desktop daemon's directory —
+    /// is the one thing that makes this window's listing wrong, and a listing
+    /// captured when Settings opened labels a plugin just added as "Removed"
+    /// and leaves a phantom "Not loaded" row where one was taken away.
+    ///
+    /// Which is not the same as "the set was published". A plugin republishes
+    /// its whole tree whenever anything of its own changes — for one that
+    /// redraws on every message, that is most messages — so treating every
+    /// publication as a move would start an OPFS scan per redraw,
+    /// overlapping, with Settings very likely not even open. Ids, in order,
+    /// because the daemon publishes them ordered and a set that reshuffled
+    /// itself would be a different bug.
+    pub(super) fn publish(&mut self, surfaces: Vec<PluginSurface>, cx: &mut Context<Self>) -> bool {
+        let moved = self.membership_moved(&surfaces);
+        self.surfaces = surfaces;
+        cx.notify();
+        moved
+    }
+
+    /// Whether `surfaces` is a different *set* of plugins from the one held,
+    /// rather than the same set saying something new.
+    ///
+    /// Apart from [`Self::publish`] because it is the half with the decision
+    /// in it, and the half a test can drive.
+    fn membership_moved(&self, surfaces: &[PluginSurface]) -> bool {
+        self.surfaces.len() != surfaces.len()
+            || self
+                .surfaces
+                .iter()
+                .zip(surfaces)
+                .any(|(had, now)| had.id != now.id)
+    }
+
+    /// What this front end's own folder holds.
+    ///
+    /// Left as it was rather than emptied on a failed read: a read that
+    /// failed is not a folder that is empty, and drawing it as one would take
+    /// away the Remove button somebody was about to press — which is why this
+    /// is only ever called with an answer.
+    pub(super) fn set_installed(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        self.installed = Some(ids);
+        cx.notify();
+    }
+
+    /// Everything a departing account left in a plugin's boxes.
+    ///
+    /// A plugin's boxes hold what somebody typed into them for the *old*
+    /// account, and the entities carry live commit subscriptions. Left
+    /// standing, a restarted plugin republishing the same default value it
+    /// published before changes nothing that [`Self::sync_fields`] compares —
+    /// `published` is unchanged — so the half-typed text survives, and
+    /// pressing Enter sends the old account's words into the new one's
+    /// plugin. The next sync rebuilds whatever is still drawn.
+    pub(super) fn forget(&mut self, cx: &mut Context<Self>) {
+        self.surfaces.clear();
+        self.fields.clear();
+        cx.notify();
+    }
+
+    /// Take the values the plugins published, and say which fields still
+    /// need a box built for them.
     ///
     /// Called from the render pass, because that is the only place that knows
     /// which widgets are actually on screen — and because a plugin's tree
     /// changes without any event this window would otherwise act on.
-    pub fn sync_plugin_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The same answer `send_plugin_action` will give when one of these
-        // commits, taken here so the two cannot disagree about which
-        // conversation a header field belongs to.
-        let chat = self.selected_chat_jid();
+    ///
+    /// `chat` is the same answer `send_plugin_action` will give when one of
+    /// these commits, resolved by the window and handed down so the two
+    /// cannot disagree about which conversation a header field belongs to.
+    ///
+    /// What it does *not* do is build the boxes. A commit is a request, a
+    /// request needs the session, and a subscription's handler is given its
+    /// own entity leased out of gpui's map — so a handler registered here
+    /// that reached the window through anything touching this entity would
+    /// take a second lease of it, which is a panic rather than a glitch. The
+    /// window builds them, and hands each back through [`Self::adopt_field`].
+    pub(super) fn sync_fields(
+        &mut self,
+        chat: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Field> {
         let mut wanted: Vec<Field> = Vec::new();
-        for surface in &self.plugins {
+        for surface in &self.surfaces {
             for root in &surface.roots {
                 collect_fields(&surface.id, root.slot, &root.node, &mut wanted);
             }
@@ -110,99 +249,133 @@ impl WhatsAppApp {
         // fires into a widget nobody can see.
         let live: std::collections::HashSet<FieldKey> = wanted
             .iter()
-            .map(|f| key(&f.plugin, f.slot, chat.as_deref(), &f.id))
+            .map(|f| key(&f.plugin, f.slot, chat, &f.id))
             .collect();
-        self.plugin_fields.retain(|k, _| live.contains(k));
+        self.fields.retain(|k, _| live.contains(k));
 
-        for Field {
-            plugin,
-            slot,
-            id,
-            value,
-        } in wanted
-        {
-            let k = key(&plugin, slot, chat.as_deref(), &id);
-            match self.plugin_fields.get_mut(&k) {
-                Some(field) => {
-                    // Only when the *plugin* moved it. A tree republished with
-                    // the same value must not reach into a box somebody is
-                    // typing in — which, since a plugin republishes whenever
-                    // anything of its own changes, is most republications.
-                    if field.published != value {
-                        field.published.clone_from(&value);
-                        field
-                            .state
-                            .update(cx, |state, cx| state.set_value(&value, window, cx));
+        // What is left is what has no box yet. The ones that do are brought
+        // up to date here, and only when the *plugin* moved them: a tree
+        // republished with the same value must not reach into a box somebody
+        // is typing in — which, since a plugin republishes whenever anything
+        // of its own changes, is most republications.
+        wanted.retain(|field| {
+            let Some(held) = self
+                .fields
+                .get_mut(&key(&field.plugin, field.slot, chat, &field.id))
+            else {
+                return true;
+            };
+            if held.published != field.value {
+                held.published.clone_from(&field.value);
+                let value = field.value.clone();
+                held.state
+                    .update(cx, |state, cx| state.set_value(&value, window, cx));
+            }
+            false
+        });
+        wanted
+    }
+
+    /// Keep the box the window built for one field.
+    pub(super) fn adopt_field(
+        &mut self,
+        chat: Option<&str>,
+        field: Field,
+        state: Entity<InputState>,
+        commit: gpui::Subscription,
+    ) {
+        let k = key(&field.plugin, field.slot, chat, &field.id);
+        self.fields.insert(
+            k,
+            PluginField {
+                state,
+                published: field.value,
+                _commit: commit,
+            },
+        );
+    }
+}
+
+impl WhatsAppApp {
+    /// Make sure every text field in the current plugin trees has somewhere
+    /// to hold what is typed. See [`Plugins::sync_fields`], which decides
+    /// which ones need one; the boxes and their subscriptions are built here,
+    /// because a commit is a request and the session is the window's.
+    pub fn sync_plugin_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let chat = self.selected_chat_jid();
+        let wanted = self.plugins.update(cx, |plugins, cx| {
+            plugins.sync_fields(chat.as_deref(), window, cx)
+        });
+        for field in wanted {
+            let state = cx.new(|cx| InputState::new(window, cx).default_value(field.value.clone()));
+            let commit_plugin = field.plugin.clone();
+            let commit_id = field.id.clone();
+            let commit_slot = field.slot;
+            let commit = cx.subscribe(&state, move |this, state, event, cx| {
+                // Enter, and only Enter. A field that committed on every
+                // keystroke would send one request per letter and hand the
+                // plugin a keyword it is halfway through being given.
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let value = state.read(cx).value().to_string();
+                    // Refused here rather than sent. The daemon caps a
+                    // request at a megabyte and *closes the connection* on
+                    // one that is longer, so somebody pasting a document into
+                    // a plugin's settings box would take the whole window's
+                    // session down rather than have one setting rejected.
+                    if value.len() > MAX_FIELD_BYTES {
+                        log::warn!(
+                            "plugin {commit_plugin}: refusing a {} byte value for `{commit_id}`; \
+                             the limit is {MAX_FIELD_BYTES}",
+                            value.len()
+                        );
+                        return;
                     }
-                }
-                None => {
-                    let state =
-                        cx.new(|cx| InputState::new(window, cx).default_value(value.clone()));
-                    let commit_plugin = plugin.clone();
-                    let commit_id = id.clone();
-                    let commit_slot = slot;
-                    let commit = cx.subscribe(&state, move |app, state, event, cx| {
-                        // Enter, and only Enter. A field that committed on
-                        // every keystroke would send one request per letter
-                        // and hand the plugin a keyword it is halfway through
-                        // being given.
-                        if matches!(event, InputEvent::PressEnter { .. }) {
-                            let value = state.read(cx).value().to_string();
-                            // Refused here rather than sent. The daemon caps
-                            // a request at a megabyte and *closes the
-                            // connection* on one that is longer, so somebody
-                            // pasting a document into a plugin's settings
-                            // box would take the whole window's session down
-                            // rather than have one setting rejected.
-                            if value.len() > MAX_FIELD_BYTES {
-                                log::warn!(
-                                    "plugin {commit_plugin}: refusing a {} byte value for `{commit_id}`; \
-                                     the limit is {MAX_FIELD_BYTES}",
-                                    value.len()
-                                );
-                                return;
-                            }
-                            app.send_plugin_action(
-                                &commit_plugin,
-                                &commit_id,
-                                Some(value),
-                                commit_slot,
-                                PluginWidget::TextField,
-                                cx,
-                            );
-                        }
-                    });
-                    self.plugin_fields.insert(
-                        k,
-                        PluginField {
-                            state,
-                            published: value,
-                            _commit: commit,
-                        },
+                    this.send_plugin_action(
+                        &commit_plugin,
+                        &commit_id,
+                        Some(value),
+                        commit_slot,
+                        PluginWidget::TextField,
+                        cx,
                     );
                 }
-            }
+            });
+            let chat = chat.clone();
+            self.plugins.update(cx, |plugins, _| {
+                plugins.adopt_field(chat.as_deref(), field, state, commit);
+            });
         }
     }
 
     /// The box holding what is typed into one plugin's field.
     #[must_use]
-    pub fn plugin_field(
+    pub fn plugin_field<'a>(
         &self,
         plugin: &str,
         slot: PluginSlot,
         id: &str,
-    ) -> Option<&Entity<InputState>> {
+        cx: &'a App,
+    ) -> Option<&'a Entity<InputState>> {
         let chat = self.selected_chat_jid();
-        self.plugin_fields
-            .get(&key(plugin, slot, chat.as_deref(), id))
-            .map(|f| &f.state)
+        self.plugins
+            .read(cx)
+            .field(plugin, slot, chat.as_deref(), id)
     }
 
     /// Every plugin the daemon has loaded.
     #[must_use]
-    pub fn plugins(&self) -> &[PluginSurface] {
-        &self.plugins
+    pub fn plugins<'a>(&self, cx: &'a App) -> &'a [PluginSurface] {
+        self.plugins.read(cx).surfaces()
+    }
+
+    /// Take the set of surfaces the daemon published.
+    pub(super) fn adopt_plugins(&mut self, surfaces: Vec<PluginSurface>, cx: &mut Context<Self>) {
+        let moved = self
+            .plugins
+            .update(cx, |plugins, cx| plugins.publish(surfaces, cx));
+        if moved {
+            self.refresh_installed_plugins(cx);
+        }
     }
 
     /// Every plugin id in this front end's own folder, or `None` where the
@@ -213,8 +386,8 @@ impl WhatsAppApp {
     /// nobody has asked for yet is not that fact. The read is a task, so the
     /// first frame after Settings opens has none of it.
     #[must_use]
-    pub fn installed_plugins(&self) -> Option<&[String]> {
-        self.installed_plugins.as_deref()
+    pub fn installed_plugins<'a>(&self, cx: &'a App) -> Option<&'a [String]> {
+        self.plugins.read(cx).installed()
     }
 
     /// Read the folder, so Settings can offer to remove what is in it.
@@ -233,19 +406,18 @@ impl WhatsAppApp {
         if !crate::platform::plugins::home().can_install() {
             return;
         }
-        cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
+        let plugins = self.plugins.clone();
+        cx.spawn(async move |_: gpui::WeakEntity<Self>, cx| {
             let found = crate::platform::plugins::installed().await;
-            let _ = entity.update(cx, |app, cx| {
-                match found {
-                    Ok(ids) => app.installed_plugins = Some(ids),
-                    // Left as it was rather than emptied: a read that failed
-                    // is not a folder that is empty, and drawing it as one
-                    // would take away the Remove button somebody was about
-                    // to press.
-                    Err(e) => log::warn!("cannot read this page's plugin folder: {e}"),
+            match found {
+                Ok(ids) => {
+                    plugins.update(cx, |plugins, cx| plugins.set_installed(ids, cx));
                 }
-                cx.notify();
-            });
+                // Left as it was rather than emptied: a read that failed is
+                // not a folder that is empty, and drawing it as one would
+                // take away the Remove button somebody was about to press.
+                Err(e) => log::warn!("cannot read this page's plugin folder: {e}"),
+            }
         })
         .detach();
     }
@@ -389,7 +561,7 @@ impl WhatsAppApp {
 }
 
 /// One text field found in a plugin's tree.
-struct Field {
+pub(super) struct Field {
     plugin: String,
     /// Which slot its root was in, so committing it carries the same context
     /// pressing a button there would.
@@ -413,12 +585,63 @@ fn collect_fields(plugin: &str, slot: PluginSlot, node: &PluginNode, out: &mut V
     }
 }
 
-/// The map the app holds.
-pub type PluginFields = HashMap<FieldKey, PluginField>;
+/// The boxes, keyed by what names each one.
+type PluginFields = HashMap<FieldKey, PluginField>;
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginSlot, key};
+    use super::{PluginSlot, PluginSurface, Plugins, key};
+
+    fn surface(id: &str) -> PluginSurface {
+        PluginSurface {
+            id: id.to_string(),
+            name: id.to_string(),
+            capabilities: Vec::new(),
+            gated: Vec::new(),
+            approved: true,
+            roots: Vec::new(),
+            stopped: None,
+        }
+    }
+
+    fn holding(ids: &[&str]) -> Plugins {
+        let mut plugins = Plugins::new();
+        plugins.surfaces = ids.iter().copied().map(surface).collect();
+        plugins
+    }
+
+    /// A plugin republishes its whole tree whenever anything of its own
+    /// changes — for one that redraws on every message, that is most
+    /// messages. Treating each of those as a change of *membership* would
+    /// start a folder scan per redraw, overlapping, with Settings very likely
+    /// not even open.
+    #[test]
+    fn the_same_plugins_saying_something_new_have_not_moved() {
+        let plugins = holding(&["autoreply", "notes"]);
+
+        assert!(!plugins.membership_moved(&[surface("autoreply"), surface("notes")]));
+    }
+
+    /// The listing captured when Settings opened is what goes wrong: a plugin
+    /// just added is labelled "Removed", and a phantom "Not loaded" row is
+    /// left where one was taken away.
+    #[test]
+    fn a_plugin_arriving_or_leaving_is_a_move() {
+        let plugins = holding(&["autoreply", "notes"]);
+
+        assert!(
+            plugins.membership_moved(&[surface("autoreply")]),
+            "one left"
+        );
+        assert!(
+            plugins.membership_moved(&[surface("autoreply"), surface("notes"), surface("clock")]),
+            "one arrived"
+        );
+        assert!(
+            plugins.membership_moved(&[surface("autoreply"), surface("clock")]),
+            "one was swapped for another, which is the same count"
+        );
+    }
 
     /// A Settings field is one field whatever is selected, because the action
     /// it commits carries no conversation. A header field is one per chat,

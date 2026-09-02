@@ -164,6 +164,7 @@ impl WhatsAppApp {
             Retry::Text(content) => self.send_quoted(&content, quoted, cx),
             Retry::VoiceNote(media) => {
                 self.send_voice_note(
+                    cx,
                     &jid,
                     (*media.data).clone(),
                     media.waveform.as_deref().cloned().unwrap_or_default(),

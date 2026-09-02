@@ -179,7 +179,7 @@ impl WhatsAppApp {
         // The bubble shows the quote too, or the sender sees a bare photo
         // where the recipient sees a reply.
         message.quoted = quoted;
-        self.add_message_to_chat(jid, message)
+        self.add_message_to_chat(jid, message, cx)
     }
 }
 

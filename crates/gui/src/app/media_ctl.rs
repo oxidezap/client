@@ -41,8 +41,8 @@ impl WhatsAppApp {
     /// renderer already draws for media the daemon never cached, and the
     /// press that accepts it fetches — which is the whole reason the policy
     /// is allowed to be coarse.
-    pub(super) fn sweep_retained_media(&mut self) {
-        self.sweep_retained_media_keeping(None);
+    pub(super) fn sweep_retained_media(&mut self, cx: &mut App) {
+        self.sweep_retained_media_keeping(None, cx);
     }
 
     /// The same, with one more row nothing may take.
@@ -50,9 +50,9 @@ impl WhatsAppApp {
     /// For the download that has just landed: the bytes arrive into a row the
     /// reader asked for by pressing on it, and the request that named it may
     /// already have been cleared by the time they do.
-    pub(super) fn sweep_retained_media_keeping(&mut self, also: Option<&str>) {
+    pub(super) fn sweep_retained_media_keeping(&mut self, also: Option<&str>, cx: &mut App) {
         // A viewer open is a reader walking one chat's pictures; see above.
-        if self.media_viewer.is_some() {
+        if self.viewer.read(cx).showing().is_some() {
             return;
         }
 
@@ -123,12 +123,12 @@ impl WhatsAppApp {
             }
         }
         for jid in touched {
-            self.invalidate_message_cache(&jid);
+            self.invalidate_message_cache(&jid, cx);
         }
     }
 
     /// Update a message's media data (used to cache downloaded media)
-    fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>) {
+    fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>, cx: &mut App) {
         // Find the message in any chat and update its media data
         let mut touched: Option<String> = None;
         for chat in self.chats.iter_mut().map(std::sync::Arc::make_mut) {
@@ -152,7 +152,7 @@ impl WhatsAppApp {
         // and the status feed — which is — went on serving the version with no
         // bytes in it, so a downloaded update stayed "cannot be shown".
         if let Some(jid) = touched {
-            self.invalidate_message_cache(&jid);
+            self.invalidate_message_cache(&jid, cx);
             // This is the other path that adds bytes, and the one that adds
             // them deliberately: a reader working back through an album,
             // pressing download on picture after picture, passes the
@@ -160,7 +160,7 @@ impl WhatsAppApp {
             // just landed is what the press was for, so it is what the sweep
             // may not take — the request that named it is often already
             // cleared by the time the bytes arrive.
-            self.sweep_retained_media_keeping(Some(message_id));
+            self.sweep_retained_media_keeping(Some(message_id), cx);
         }
     }
     /// Stop any currently playing media. Does NOT call cx.notify().
@@ -490,7 +490,7 @@ impl WhatsAppApp {
                     let _ = entity.update(cx, |app, cx| {
                         app.finish_download(&msg_id);
                         // Cache the audio data in the message so we don't need to download again
-                        app.update_message_media_data(&msg_id, data.clone());
+                        app.update_message_media_data(&msg_id, data.clone(), cx);
                         // Autoplay only if the user hasn't started other media
                         // since this download began.
                         if app.pending_media_request.as_deref() == Some(msg_id.as_str()) {
@@ -562,7 +562,7 @@ impl WhatsAppApp {
                 match result {
                     Ok(data) => {
                         info!("Image downloaded: {} bytes", data.len());
-                        app.update_message_media_data(&message_id, data);
+                        app.update_message_media_data(&message_id, data, cx);
                     }
                     Err(e) => {
                         error!("Failed to download image: {}", e);
@@ -713,7 +713,12 @@ impl WhatsAppApp {
     /// own file once it has been fetched, and nothing decodes those as one.
     /// Answered before the cache is touched, so an MP4 cannot take a slot
     /// from the pictures the cache exists for.
-    pub fn get_decoded_image(&self, message_id: &str, media: &MediaContent) -> Option<Arc<Image>> {
+    pub fn get_decoded_image(
+        &self,
+        message_id: &str,
+        media: &MediaContent,
+        cx: &App,
+    ) -> Option<Arc<Image>> {
         let (data, format) = (&media.data, mime_to_image_format(&media.mime_type)?);
 
         // Keyed by the id *and* what the bytes are, because a message's bytes
@@ -764,10 +769,7 @@ impl WhatsAppApp {
 
         // What is on screen right now, which may not be evicted whatever the
         // order says: dropping it is a rebuild inside the same frame.
-        let pinned = [
-            self.media_viewer.as_ref().and_then(MediaViewer::current_id),
-            self.status_pane.shown(),
-        ];
+        let pinned = [self.viewer.read(cx).current_id(), self.status_pane.shown()];
         let mut cache = self.decoded_images.borrow_mut();
 
         // Least recently used first, never one that is being drawn, until
@@ -1033,7 +1035,7 @@ impl WhatsAppApp {
 
                                 // Invalidate message cache to force virtual list re-render
                                 if let Some(jid) = app.selected_chat.clone() {
-                                    app.invalidate_message_cache(&jid);
+                                    app.invalidate_message_cache(&jid, cx);
                                 }
 
                                 // Schedule play() for the next frame to allow GPUI to decode the image

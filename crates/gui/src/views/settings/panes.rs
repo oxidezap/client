@@ -98,19 +98,19 @@ fn plugins(
     // one file somebody most needs to remove with no control anywhere — and
     // it goes on spending the folder's budget at every load.
     let unloaded: Vec<String> = app
-        .installed_plugins()
+        .installed_plugins(cx)
         .unwrap_or_default()
         .iter()
-        .filter(|id| !app.plugins().iter().any(|surface| &surface.id == *id))
+        .filter(|id| !app.plugins(cx).iter().any(|surface| &surface.id == *id))
         .cloned()
         .collect();
 
-    let rows = app.plugins().len() + unloaded.len();
+    let rows = app.plugins(cx).len() + unloaded.len();
     let list = div()
         .flex()
         .flex_col()
         .gap(metrics.space_lg())
-        .children(app.plugins().iter().map(|surface| {
+        .children(app.plugins(cx).iter().map(|surface| {
             crate::components::plugin_ui::settings_entry(
                 surface,
                 app,
@@ -173,7 +173,7 @@ fn removal(
         return None;
     }
     if app
-        .installed_plugins()
+        .installed_plugins(cx)
         .is_some_and(|ids| !ids.iter().any(|f| f == id))
     {
         // Said rather than left blank: a control that vanishes tells nobody
@@ -535,7 +535,7 @@ fn storage(
     metrics: Metrics,
     cx: &App,
 ) -> AnyElement {
-    let usage = app.storage_usage();
+    let usage = app.storage_usage(cx);
 
     div()
         .flex()
