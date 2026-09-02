@@ -13,6 +13,29 @@ use std::path::Path;
 use crate::util::{Result, Run, append_github_file};
 use crate::{err, say};
 
+/// Files the bundle has to carry whether or not the emitted document names
+/// them.
+///
+/// Both arrive through a `data-trunk rel="copy-file"` link, and trunk consumes
+/// those links rather than emitting them — so the reference check below, which
+/// reads the document trunk produced, sees a copied file only where something
+/// *else* names it. The service worker is named by its own `<script src>` and
+/// so is covered twice; the emoji face is fetched from Rust and named nowhere
+/// in the document at all, which makes its absence silent at build time and
+/// visible only as boxes in a browser. Hence the list.
+const REQUIRED: &[(&str, &str)] = &[
+    (
+        "coi-serviceworker.js",
+        "the page will load without cross-origin isolation and the window \
+         will have no executor",
+    ),
+    (
+        "NotoEmoji-Regular.ttf",
+        "the window fetches it before opening and every emoji in a chat name, \
+         a reaction or a message will draw as a box",
+    ),
+];
+
 /// Proof the artifact is the one the page will ask for: trunk rewrites
 /// `index.html` to point at hashed file names, and a mismatch is a blank page
 /// rather than a failed build.
@@ -30,11 +53,10 @@ pub fn check(dist: &Path, relocatable: bool) -> Result<()> {
     if !index.is_file() {
         return Err(err!("no index.html in {}", dist.display()));
     }
-    if !dist.join("coi-serviceworker.js").is_file() {
-        return Err(err!(
-            "the service worker is missing: the page will load without \
-             cross-origin isolation and the window will have no executor"
-        ));
+    for (name, consequence) in REQUIRED {
+        if !dist.join(name).is_file() {
+            return Err(err!("{name} is missing: {consequence}"));
+        }
     }
 
     let html =
@@ -177,7 +199,9 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join(super::basename(asset)), "").unwrap();
-        fs::write(dir.join("coi-serviceworker.js"), "").unwrap();
+        for (name, _) in super::REQUIRED {
+            fs::write(dir.join(name), "").unwrap();
+        }
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -195,6 +219,20 @@ mod tests {
         let refused = check(&dir, true).unwrap_err().to_string();
         assert!(refused.contains("origin root"), "{refused}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A copied file is one the emitted document no longer names, so its
+    /// absence has to be an error of its own or it is no error at all.
+    #[test]
+    fn a_bundle_missing_a_copied_file_is_refused() {
+        for (name, _) in super::REQUIRED {
+            let dir = scratch(&format!("missing-{name}"));
+            bundle(&dir, "./oxidezap-abc123.js");
+            fs::remove_file(dir.join(name)).unwrap();
+            let refused = check(&dir, false).unwrap_err().to_string();
+            assert!(refused.contains(name), "{refused}");
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
