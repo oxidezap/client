@@ -29,6 +29,27 @@
 /// never cached.
 pub const WEB_MEDIA_BUDGET_BYTES: u64 = 48 * 1024 * 1024;
 
+/// What one conversation may keep resident in the rows themselves.
+///
+/// The fourth number, and the one that was missing: the three above bound
+/// what is *cached*, and a message holding its own bytes is neither of those
+/// caches — it is the interface retaining what a cache already let go of. See
+/// `Chat::release_media`, which is the arithmetic, and the front end that
+/// calls it, which is the judgement.
+///
+/// A quarter of [`WEB_MEDIA_BUDGET_BYTES`], the same share as the decoded
+/// images and for a related reason: a conversation on screen is on the order
+/// of twenty rows and a handful of pictures among them, so twelve megabytes
+/// is several full-size photos of headroom past what anybody is looking at.
+/// Above it are rows a reader would have to scroll to reach, and reaching one
+/// re-fetches — which is what the renderer already does for media the daemon
+/// never cached.
+///
+/// The same number on the desktop, deliberately. A window open for a week
+/// growing by every photo it has ever drawn is the same defect as a tab
+/// running out of address space, only slower and harder to notice.
+pub const RETAINED_MEDIA_BUDGET_BYTES: u64 = WEB_MEDIA_BUDGET_BYTES / 4;
+
 /// What the interface may hold *decoded*, on top of the caches above.
 ///
 /// A quarter of [`WEB_MEDIA_BUDGET_BYTES`] — derived from it so the two move

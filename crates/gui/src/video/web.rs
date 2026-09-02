@@ -68,6 +68,11 @@ pub struct StreamingVideoDecoder {
     decoder: Option<webcodecs::Decoder>,
     /// The furthest sample handed to the decoder, so a forward seek continues
     /// rather than replaying.
+    ///
+    /// A *decode* index, and the only one this type holds: everything a
+    /// caller passes in or reads back is a presentation rank. The two agree
+    /// on a baseline stream and part company the moment one carries
+    /// B-frames, which is why the cursor is named for which of them it is.
     last_fed_index: i32,
     /// Whether the next unit fed has to carry the parameter sets.
     ///
@@ -193,19 +198,26 @@ impl StreamingVideoDecoder {
         self.seek_to_frame(self.track.index_at(time));
     }
 
-    /// Feed the decoder up to `target_index`, and collect whatever has landed.
+    /// Feed the decoder the samples the picture at `target_rank` depends on,
+    /// and collect whatever has landed.
+    ///
+    /// `target_rank` is a position in presentation order, which is what every
+    /// caller counts in; the samples are walked in decode order, which is the
+    /// only place that order appears. On a stream with B-frames the two
+    /// differ, and the walk below is "everything this picture depends on"
+    /// rather than a range of positions.
     ///
     /// Returns having *asked* rather than having answered: the picture comes
     /// back on the browser's callback, so [`Self::current_frame`] is what
     /// eventually sees it. See the module note on why that is enough.
-    pub fn seek_to_frame(&mut self, target_index: usize) {
-        if target_index >= self.track.samples.len() {
+    pub fn seek_to_frame(&mut self, target_rank: usize) {
+        if target_rank >= self.track.samples.len() {
             return;
         }
         if self
             .current_frame
             .as_ref()
-            .is_some_and(|frame| frame.index == target_index)
+            .is_some_and(|frame| frame.index == target_rank)
         {
             self.collect();
             return;
@@ -230,13 +242,22 @@ impl StreamingVideoDecoder {
             .as_ref()
             .is_some_and(webcodecs::Decoder::take_refusal);
 
+        // Where the feed has to reach for this picture to have been produced,
+        // which is not the sample the picture *is*: a decoder that reorders
+        // has to have been given everything shown before it too. Compared
+        // against the cursor rather than the rank, because the cursor is a
+        // decode index and a B-frame stream is exactly the case where the two
+        // disagree — and it is a running maximum, so playing forward walks
+        // forward instead of reading every third frame as a backward seek.
+        let target_decode = self.track.decode_through(target_rank);
+
         // Already fed, and its picture is on the way: the browser decodes on
         // its own schedule, so "asked for and not arrived" is the ordinary
         // state a moment after a seek. Resetting here threw away the very
         // work that was about to answer, and then replayed the whole group of
         // pictures to ask for it again.
         if !refused
-            && i64::try_from(target_index).unwrap_or(i64::MAX) == i64::from(self.last_fed_index)
+            && i64::try_from(target_decode).unwrap_or(i64::MAX) == i64::from(self.last_fed_index)
         {
             self.collect();
             return;
@@ -246,7 +267,7 @@ impl StreamingVideoDecoder {
         // what has to be redone is a picture and not a position: the decoder
         // is re-entered at the keyframe before the target and walked to it,
         // which is exactly what a backward seek already does.
-        let start = if !refused && target_index as i32 > self.last_fed_index {
+        let start = if !refused && target_decode as i32 > self.last_fed_index {
             (self.last_fed_index + 1) as usize
         } else {
             // Backwards: the decoder's reference chain only runs forwards, so
@@ -258,10 +279,10 @@ impl StreamingVideoDecoder {
             self.last_fed_index = -1;
             self.needs_parameter_sets = true;
             self.shown_stamp = None;
-            self.track.keyframe_at_or_before(target_index)
+            self.track.keyframe_for(target_rank)
         };
 
-        for index in start..=target_index {
+        for index in start..=target_decode {
             // The browser's decode queue is the browser's, and the only back
             // pressure this side has is to stop handing it units. A backward
             // seek in a long group of pictures, or a file with no keyframe
@@ -290,7 +311,15 @@ impl StreamingVideoDecoder {
                 sample.data.clone()
             };
             if let Some(decoder) = self.decoder.as_ref() {
-                decoder.decode(&unit, stamp_of(index), sample.is_keyframe);
+                // Stamped with where the picture is *shown*, not with where
+                // it was fed: the browser answers in presentation order and
+                // hands the label back, so a decode-order label comes back
+                // out of sequence on any stream with B-frames.
+                decoder.decode(
+                    &unit,
+                    stamp_of(self.track.rank_of(index)),
+                    sample.is_keyframe,
+                );
             }
             self.last_fed_index = index as i32;
         }
@@ -299,10 +328,10 @@ impl StreamingVideoDecoder {
 
     /// Take whatever the decoder has produced since the last look.
     ///
-    /// The index comes back out of the stamp the sample was fed under, which
-    /// is what makes a picture identify itself: pictures arrive in decode
-    /// order and a seek feeds several, so "what was asked for" is the wrong
-    /// label for the first of them.
+    /// The rank comes back out of the stamp the sample was fed under, which
+    /// is what makes a picture identify itself: a seek feeds several samples
+    /// and the browser answers them in its own order, so "what was asked for"
+    /// is the wrong label for the first of them.
     fn collect(&mut self) {
         let Some(picture) = self.decoder.as_ref().and_then(webcodecs::Decoder::newest) else {
             return;
@@ -312,15 +341,17 @@ impl StreamingVideoDecoder {
             return;
         }
         self.shown_stamp = Some(stamp);
-        // The stamp *is* the index, so nothing has to be inverted. The
-        // position shown is computed from it rather than carried on the
+        // The stamp *is* the rank, so nothing has to be inverted. The
+        // position shown is looked up from it rather than carried on the
         // picture, because a WebCodecs timestamp is a label and this one is
         // deliberately not a clock.
-        let index = usize::try_from(stamp.max(0)).unwrap_or(0);
+        let rank = usize::try_from(stamp.max(0))
+            .unwrap_or(0)
+            .min(self.track.samples.len().saturating_sub(1));
         self.current_frame = Some(StreamingFrame {
             image: picture.image,
-            timestamp: self.track.timestamp_of(index),
-            index: index.min(self.track.samples.len().saturating_sub(1)),
+            timestamp: self.track.timestamp_of(rank),
+            index: rank,
         });
     }
 
