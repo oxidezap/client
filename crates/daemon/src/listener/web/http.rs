@@ -227,24 +227,51 @@ fn is_loopback_origin(origin: &str) -> bool {
 /// restricted to characters that survive that untouched, so this exists for
 /// the one that does not survive being *sent* — and anything malformed falls
 /// through to `media_path`, which refuses it.
+///
+/// An escape is read before it is consumed, so a malformed one really is kept
+/// as written: the earlier spelling took both digits off the iterator before
+/// deciding whether they were digits, so `%zz` came back as `%` and a
+/// mistyped key was answered with a refusal naming something the caller had
+/// never sent.
+///
+/// Decoding is to bytes, and what they spell is checked as UTF-8 at the end,
+/// because one escape can be one byte of several: pushing each decoded byte
+/// as a `char` spelled a two-byte sequence as two Latin-1 characters, which
+/// is a different key again. Today's keys are ASCII either way — this
+/// function is here for the day they are not.
 pub(crate) fn percent_decode(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut bytes = raw.bytes();
-    while let Some(byte) = bytes.next() {
-        if byte != b'%' {
-            out.push(byte as char);
+    let source = raw.as_bytes();
+    let mut out = Vec::with_capacity(source.len());
+    let mut at = 0;
+    while let Some(&byte) = source.get(at) {
+        if byte == b'%'
+            && let Some(high) = hex_digit(source.get(at + 1))
+            && let Some(low) = hex_digit(source.get(at + 2))
+        {
+            out.push(high * 16 + low);
+            at += 3;
             continue;
         }
-        let high = bytes.next().and_then(|b| (b as char).to_digit(16));
-        let low = bytes.next().and_then(|b| (b as char).to_digit(16));
-        match (high, low) {
-            (Some(high), Some(low)) => out.push(((high * 16 + low) as u8) as char),
-            // Malformed: keep it as written and let `media_path` refuse it.
-            _ => out.push('%'),
-        }
+        // Not an escape, or not a whole one. Written through exactly as it
+        // arrived, so what `media_path` refuses is what the caller sent.
+        out.push(byte);
+        at += 1;
     }
-    out
+    // An escape can spell bytes that are not text at all, and a key is a file
+    // name. Handing the request back as written leaves the refusal where it
+    // belongs rather than inventing replacement characters here.
+    String::from_utf8(out).unwrap_or_else(|_| raw.to_string())
 }
+
+/// One hex digit of an escape, if that is what is there.
+///
+/// Through `char::from`, which is the one byte-to-char mapping that makes no
+/// claim about encoding: a byte past ASCII is not a digit either way.
+fn hex_digit(byte: Option<&u8>) -> Option<u8> {
+    let digit = char::from(*byte?).to_digit(16)?;
+    u8::try_from(digit).ok()
+}
+
 /// Answer a preflight, including the one a page needs to reach loopback at all.
 ///
 /// A hosted page is a *public* origin asking a *private* address, which Chrome
@@ -553,6 +580,31 @@ pub(super) mod tests {
         ] {
             assert!(!is_loopback_origin(elsewhere), "{elsewhere} was admitted");
         }
+    }
+
+    /// A malformed escape is kept as written, which is the only way the
+    /// refusal can name what the caller actually sent. Reading the digits
+    /// off the iterator before deciding they were digits deleted them: `%zz`
+    /// became `%`, and a key mistyped by one character was refused under a
+    /// name nobody had asked for.
+    #[test]
+    fn a_malformed_escape_keeps_every_character_it_was_sent() {
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("f-3EB0ABC%4"), "f-3EB0ABC%4");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%%41"), "%A");
+    }
+
+    /// An escape can be one byte of several, so the bytes are decoded and
+    /// only then read as text. Taken one at a time into a `char` each byte
+    /// became its own Latin-1 character, and the key that came out was
+    /// nothing the caller had sent.
+    #[test]
+    fn a_multi_byte_escape_decodes_to_the_character_it_spells() {
+        assert_eq!(percent_decode("%C3%A9"), "é");
+        assert_eq!(percent_decode("f-%E2%9C%93"), "f-\u{2713}");
+        assert_eq!(percent_decode("f-3EB0ABC"), "f-3EB0ABC");
+        assert_eq!(percent_decode("a%20b"), "a b");
     }
 
     /// The token is pasted into a URL, so it arrives percent-encoded when it

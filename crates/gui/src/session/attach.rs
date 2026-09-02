@@ -73,7 +73,7 @@ pub(super) fn begin(
         session_events: true,
         has_window,
     })?;
-    let pending = Arc::clone(&session.pending);
+    let pending = Arc::clone(&session.conn.pending);
     let pictures = session.call_frames().clone();
     Ok(Attached {
         session,

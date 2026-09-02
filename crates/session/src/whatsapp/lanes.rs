@@ -13,7 +13,7 @@ use whatsapp_rust::client::Client;
 use whatsapp_rust::wacore::types::events::Event;
 use whatsapp_rust::wacore_binary::jid::Jid;
 
-use super::normalize_chat_jid;
+use crate::names::NameBook;
 
 /// How many lanes events about a subject are spread across.
 ///
@@ -74,7 +74,7 @@ impl EventLanes {
         Self { lanes }
     }
 
-    pub(super) async fn dispatch(&mut self, client: &Client, event: Arc<Event>) {
+    pub(super) async fn dispatch(&mut self, client: &Client, names: &NameBook, event: Arc<Event>) {
         // A batch may span chats, and a lane is one chat's order: sent whole
         // on the first message's lane, a receipt for a later chat in it runs
         // on that chat's own lane and can overtake the message it answers.
@@ -82,7 +82,7 @@ impl EventLanes {
         // else about that chat, and two chats in one batch were never ordered
         // against each other.
         for event in split_by_subject(&event) {
-            let lane = lane_for(client, &event).await;
+            let lane = lane_for(client, names, &event).await;
             let _ = self.lanes[lane].send(event);
         }
     }
@@ -133,13 +133,25 @@ pub(super) fn split_by_subject(event: &Arc<Event>) -> Vec<Arc<Event>> {
 /// under the LID were handled concurrently: the receipt could overtake the
 /// message it answers -- most easily while that message waits on an eager
 /// media fetch -- and a front end drops a receipt naming a row it has not
-/// been given yet. The library keeps the pairing in memory in front of its
-/// store, so this is a map read for a peer already seen and not asked at all
-/// of a LID.
-async fn lane_for(client: &Client, event: &Event) -> usize {
+/// been given yet. It is asked of the one book that answers it, which memoizes
+/// the pair, so this is a map read for a peer already seen and not asked at
+/// all of a LID -- and the handler on the other end of the lane finds the same
+/// answer already there.
+///
+/// A pair nobody could read picks the lane the address as written hashes to.
+/// A lane is an ordering choice and never a key: two events about one chat
+/// that disagree about its address lose their order against each other, which
+/// is what this cost before the pairing was consulted at all, and nothing is
+/// filed anywhere on the strength of it.
+async fn lane_for(client: &Client, names: &NameBook, event: &Event) -> usize {
     let subject = match event_subject(event) {
         Some(Subject::Call(id)) => Some(id),
-        Some(Subject::Chat(jid)) => Some(normalize_chat_jid(client, &jid.to_string()).await),
+        Some(Subject::Chat(jid)) => Some(
+            names
+                .chat_key(client, &jid)
+                .await
+                .unwrap_or_else(|| jid.to_non_ad_string()),
+        ),
         None => None,
     };
     lane_of(subject.as_deref())

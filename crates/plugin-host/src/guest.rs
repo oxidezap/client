@@ -1293,19 +1293,6 @@ fn read_str(caller: &mut Caller<'_, Guest>, ptr: i32, len: i32) -> Result<String
     String::from_utf8(bytes).map_err(|_| abi::outcome::INVALID)
 }
 
-/// Write into the plugin's buffer and answer the value's *full* length.
-///
-/// The snprintf convention: a caller detects a short buffer by `n > cap`,
-/// sizes one and asks again. Truncating silently would hand a plugin half a
-/// JID, and returning only an error would make the first call useless for
-/// learning how much room to make.
-/// Write one of the event's own strings into the plugin, copying it only
-/// into the plugin's memory.
-///
-/// `Memory::data_and_store_mut` is what makes this possible: it hands back
-/// the guest's bytes and the store's data at the same time, so the value can
-/// be read out of the event and written into the plugin without a `String`
-/// in between. Everything else here is [`write_str`]'s contract, which see.
 /// The string a handle carries under `field`, or the element a child handle
 /// *is*.
 fn field_str(guest: &Guest, ev: i32, field: i32) -> Option<&str> {
@@ -1320,6 +1307,18 @@ fn field_str(guest: &Guest, ev: i32, field: i32) -> Option<&str> {
     }
 }
 
+/// Write one of the event's own strings into the plugin's buffer, copying it
+/// only into the plugin's memory, and answer the value's *full* length.
+///
+/// The snprintf convention: a caller detects a short buffer by `n > cap`,
+/// sizes one and asks again. Truncating silently would hand a plugin half a
+/// JID, and returning only an error would make the first call useless for
+/// learning how much room to make.
+///
+/// `Memory::data_and_store_mut` is what makes the copy possible: it hands
+/// back the guest's bytes and the store's data at the same time, so the value
+/// can be read out of the event and written into the plugin without a
+/// `String` in between.
 fn write_field(caller: &mut Caller<'_, Guest>, ev: i32, field: i32, ptr: i32, cap: i32) -> i32 {
     let Ok(cap) = usize::try_from(cap) else {
         return abi::outcome::INVALID;

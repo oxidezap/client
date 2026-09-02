@@ -201,6 +201,30 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   bubble, once to describe it) and would put a thumbnail in a
   newline-delimited JSON frame, which is the thing `staged_key` exists to
   avoid.
+  A picture is also *re-encoded* there, and that is the second thing the two
+  places are split over. A photo message is expected to carry a photo format,
+  and the expectation is the recipient's rather than this tree's: WhatsApp's
+  own clients re-encode everything they send to JPEG, so a client written
+  against what it actually receives has never had to decode anything else in
+  that position. A WebP sent from here uploaded, delivered and was marked
+  read, and drew as nothing at all on the recipient's Android — while the
+  browser that sent it drew the same bytes perfectly, which is what makes this
+  a rule about the far end rather than about a decoder. JPEG and PNG go out
+  untouched (a screenshot is a PNG, and re-encoding one is the loss nobody
+  wants); everything else this build can decode becomes a JPEG, at the same
+  dimensions, out of the decode the thumbnail was already paying for. What
+  cannot be decoded goes out as it came, because bytes nothing here can read
+  are bytes nothing here can improve.
+  Two smaller things fall out of having read the bytes at all. The message
+  states the type the *payload* is rather than the one it was picked as —
+  those are two different claims, and only one of them was read out of the
+  file, so a JPEG that arrives named `.png` no longer goes out saying so. And
+  transparency is *composited* rather than dropped: JPEG has no alpha channel,
+  and `to_rgb8` keeps whatever colour sits under a transparent pixel, which is
+  nobody's decision — an encoder may leave the last drawn colour or garbage,
+  and a logo drawn on nothing then arrives on a field of whatever that was. It
+  goes onto white, because a picture drawn with transparency is nearly always
+  drawn for a light ground.
   The thumbnail is not a nicety: WhatsApp draws it while the file downloads,
   and this tree draws it too — the store keeps what was sent and hydration
   reads a sent message back through the same `media_of` an arriving one goes
@@ -596,6 +620,22 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   per direction, the newest overwriting the last, and the channel carries only
   a nudge; a dropped nudge costs nothing, because the slot still holds the
   newest picture and the next frame nudges again.
+- **A picture's position is where it is shown, not where it was decoded.**
+  An attachment has two orders — `stts` says when a sample is decoded and
+  `ctts` the offset to when it is displayed — and they differ exactly when a
+  stream carries B-frames, because a picture referencing a later one has to
+  be decoded after it and shown before it. So every index above
+  `video::demux` is a **rank** in presentation order: a seek target, a
+  position on the scrubber, `StreamingFrame::index`, and the stamp a unit is
+  fed to WebCodecs under. Only the two feed loops count in decode indices,
+  and `Track::decode_index_of` is the one place the orders meet. Stamping a
+  unit with where it was *fed* is the bug this replaced: a browser answers in
+  presentation order and hands the label back with the picture, so the
+  answers arrive out of sequence and the timeline reads a picture as a
+  position it does not hold. Invisible until it is not — decode order *is*
+  presentation order on every baseline stream, which is every video WhatsApp
+  itself sends, and only an attachment from somewhere else has the shape that
+  breaks it.
 - **A peer's orientation describes their device, not their picture.** The
   camera encodes in the sensor's orientation whatever the phone is doing, so a
   frame arrives already turned by however it is held and `device_orientation`
@@ -663,41 +703,6 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   the library believed all of it went out — its own per-unit shedding never
   ran, no gate closed, nothing asked for a replacement. The verdict is now
   taken once, at an access unit's first packet, and holds to its marker bit; a
-  unit already begun is finished whatever the queue has done since, because
-  the bytes are spent either way and spending the remainder is what makes them
-  worth anything.
-
-- **A video call announces its direction; the offer only advertises the
-  capability.** A call placed as video enables its plane ungated, encodes and
-  packetises — and the peer shows nothing, because the receiving side brings
-  its video stream up off a `<video state="1">` *announcement*, not off the
-  offer. The official client's decoder is driven by `handle_peer_video_enabled`
-  and `update_video_info`, both fed by `<video state=...>`. Android says its
-  own direction (`state="11"`) and, when nothing answers for ours, gives up
-  (`state="0"`). A mid-call camera already announced, through `start_video`;
-  the from-start path was the one that never did.
-- **Neither encoder may go without a periodic IDR, and it is not a quality
-  setting.** The media plane drops every access unit that is not an IDR while
-  one of its keyframe gates is closed -- the engine's `keyframe_required` and
-  the driver's send gate -- and both close on ordinary events: shedding under
-  backpressure, a relay reconnect, an inbound PLI. The only notice either
-  gives is `CallEvent::VideoKeyframeNeeded`, which nothing here answered, and
-  the library's own retry logic is written against an encoder that produces an
-  IDR anyway. The desktop met that contract with openh264's three-second intra
-  period and so never showed the fault; the browser encoder emitted a keyframe
-  only when asked, so the first missed request stopped its video for the rest
-  of the call. `KEYFRAME_SECONDS` is now one number both backends read, and the
-  event is answered as well -- the cadence bounds the outage at three seconds,
-  the answer ends it in one frame.
-- **The outbound ceiling drops whole access units, never part of one.** The
-  browser relay's queue ceiling was applied per packet, which is right for
-  audio and ruinous for video: one Opus packet is one frame, but a 720p IDR is
-  tens of fragments and is itself large enough to cross the ceiling *while it
-  is being written*. What reached the peer was a keyframe with a hole in it,
-  and so was everything referencing it. Worse, the transport returns `Ok`, so
-  the library believed all of it went out -- its own per-unit shedding never
-  ran, no gate closed, nothing asked for a replacement. The verdict is taken
-  once now, at an access unit's first packet, and holds to its marker bit; a
   unit already begun is finished whatever the queue has done since, because
   the bytes are spent either way and spending the remainder is what makes them
   worth anything.
@@ -1037,7 +1042,23 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   destroyed and a panic there is a panic in a destructor.
 - **Decoded images are cached by message id**, because GPUI tracks animation
   state per `Arc<Image>` and rebuilding one re-decodes the bytes. Whoever
-  replaces a preview with real bytes must evict the entry.
+  replaces a preview with real bytes must evict the entry — and so must
+  whoever *takes* the bytes away, which is the sweep below.
+- **A conversation lets go of media it can fetch again, and only that.** A
+  message holds its own bytes for as long as the row is loaded, so the two
+  media budgets that exist bound what is *cached* rather than what the window
+  is retaining. `Chat::release_media` is the arithmetic and it lives in
+  `oxidezap-core` because the ordering and the budget are about the data; the
+  *judgement* is `WhatsAppApp::sweep_retained_media`, because a viewport is a
+  front end's and core has none. Three things make it safe rather than
+  destructive. Only bytes with a `downloadable` beside them go, so a voice
+  note recorded here or a poster frame that is the row's only picture is
+  never "evicted" into deletion. What the interface is holding open —
+  playing, in the viewer, mid-download — is pinned whatever the budget says.
+  And a released row is left in the state a row whose media never arrived is
+  already in, which is why it costs no protocol change and no new field: the
+  renderer already draws that as an offer to download, and the press that
+  accepts it is the same press it always was.
 - **The daemon's state version is what makes a mid-stream join safe.** The
   server subscribes and then snapshots, so the window between the two is
   delivered twice rather than lost, and the client drops the overlap by

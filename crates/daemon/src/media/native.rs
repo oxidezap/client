@@ -214,7 +214,13 @@ pub fn has(key: &str) -> bool {
 /// under one while the directory was open is served as the attachment it
 /// names. So a directory found open is swept of what this daemon did not write,
 /// which is the whole of what an open directory can have gained.
-fn prepare_dir(dir: &std::path::Path) -> Result<()> {
+///
+/// Reachable from outside this module because `put` is not the only thing
+/// that makes this directory: the daemon prepares it once at startup, and the
+/// web bridge's staging write goes through it too. An account that stages
+/// uploads and never caches a download used to keep the umask's mode here for
+/// ever, with nothing ever sweeping it.
+pub(crate) fn prepare_dir(dir: &std::path::Path) -> Result<()> {
     if crate::private_dir::prepare(dir, "cached media")? == crate::private_dir::Found::WasOpen {
         log::warn!(
             "{} was reachable by other accounts on this machine; dropping what this daemon did not put there",

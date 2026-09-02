@@ -2,16 +2,19 @@
 //!
 //! Split by what the pieces are about rather than by type: the conversation
 //! and the names in it here, one row in [`message`], the media hanging off a
-//! row in [`media`], reactions in [`reactions`], and in [`merge`] the rules
-//! for folding arriving traffic and hydrated history into a timeline.
+//! row in [`media`], reactions in [`reactions`], in [`merge`] the rules for
+//! folding arriving traffic and hydrated history into a timeline, and in
+//! [`retain`] what a conversation lets go of when it is holding too much.
 
 mod media;
 mod merge;
 mod message;
 mod reactions;
+mod retain;
 
 pub use media::{DownloadableMedia, MediaContent, MediaType, OutgoingMedia};
 pub use message::{ChatMessage, Resend};
+pub use retain::ReleasedMedia;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -5,10 +5,20 @@
 //! somebody chose, works out what the recipient's client needs to draw them
 //! before it has downloaded anything, and builds the message that carries it.
 //!
-//! Two halves, and they are separate on purpose. [`Shape::of`] is pure — bytes
-//! in, dimensions and a thumbnail out — so it can be tested without a session,
-//! a network or a store; [`message`] is the assembly, and does nothing but
-//! move fields. What is *between* them is the upload, which is the session's.
+//! Two halves, and they are separate on purpose. [`prepare`] is pure — bytes
+//! in, dimensions and a thumbnail out, and the bytes to send if the ones in
+//! hand will not do — so it can be tested without a session, a network or a
+//! store; [`message`] is the assembly, and does nothing but move fields. What
+//! is *between* them is the upload, which is the session's.
+//!
+//! # Why a picture is sometimes re-encoded
+//!
+//! A photo message is expected to carry a photo format, and the expectation
+//! is the recipient's rather than this tree's: WhatsApp's own clients
+//! re-encode everything they send to JPEG, so a client written against what
+//! it actually receives has never had to decode anything else there. A WebP
+//! sent as a photo from here uploaded, delivered, and was marked read — and
+//! drew as nothing at all on the recipient's Android. See [`draws_as_a_photo`].
 //!
 //! # Why the thumbnail is worth the work
 //!
@@ -19,7 +29,7 @@
 //! was sent and hydration reads it back through the same `media_of` an
 //! arriving message goes through.
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 use oxidezap_core::{OutgoingMedia, QuotedMessage};
 use whatsapp_rust::buffa::MessageField;
 use whatsapp_rust::upload::UploadResponse;
@@ -93,6 +103,17 @@ const THUMBNAIL_EDGE: u32 = 96;
 /// of the size it is encoded at, so artefacts at this quality are invisible.
 const THUMBNAIL_QUALITY: u8 = 60;
 
+/// What a photo message carries when this side has a say in it.
+const PHOTO_MIME: &str = "image/jpeg";
+
+/// How hard a picture is compressed when it has to be re-encoded.
+///
+/// Higher than the thumbnail's, because this one *is* the picture: it is what
+/// the recipient opens and keeps. Around what WhatsApp's own clients use for
+/// a photo, and the same trade — a file a fraction of the size of a lossless
+/// original, at a quality nobody looking at it would question.
+const PHOTO_QUALITY: u8 = 85;
+
 /// Past this, the picture is described but not scaled down.
 ///
 /// Decoding is what costs: four bytes a pixel, allocated inside the process
@@ -131,33 +152,120 @@ pub(super) struct Shape {
     pub thumbnail: Option<Vec<u8>>,
 }
 
-impl Shape {
-    /// Read what this file can be made to say about itself.
-    ///
-    /// Never fails: a file whose shape cannot be read is sent with its shape
-    /// unstated, which is what every field being an `Option` is for. The
-    /// reasons are logged, because "the picture arrived without a preview" is
-    /// otherwise indistinguishable from "nobody tried".
-    pub(super) fn of(file: &OutgoingFile) -> Self {
-        match file.kind {
-            OutgoingMedia::Image => still(&file.data),
-            OutgoingMedia::Video => moving(&file.data),
-            // A document has no dimensions and no poster frame. WhatsApp's own
-            // clients render a first page for a PDF; doing that means a PDF
-            // renderer in the process holding the account, which is a much
-            // larger thing than this.
-            OutgoingMedia::Document => Self::default(),
+/// Read what this file can be made to say about itself, and put it in a form
+/// the recipient can actually open.
+///
+/// Never fails, and never refuses: a file whose shape cannot be read is sent
+/// with its shape unstated, which is what every field of [`Shape`] being an
+/// `Option` is for. The reasons are logged, because "the picture arrived
+/// without a preview" is otherwise indistinguishable from "nobody tried".
+///
+/// The file comes back because it may not be the one that went in — see
+/// [`still`], which re-encodes a picture whose format a recipient will not
+/// draw. Nothing else is touched.
+pub(super) fn prepare(mut file: OutgoingFile) -> (Shape, OutgoingFile) {
+    match file.kind {
+        OutgoingMedia::Image => {
+            let (shape, photo) = still(&file.data);
+            if let Some(Photo { data, mime }) = photo {
+                if let Some(jpeg) = data {
+                    info!(
+                        "re-encoded {} ({} bytes) as {mime} ({} bytes): a photo message \
+                         carries a photo format",
+                        file.mime_type,
+                        file.data.len(),
+                        jpeg.len()
+                    );
+                    file.data = jpeg;
+                } else if file.mime_type != mime {
+                    // Not a re-encode — a correction. What a file is called
+                    // and what it is are two different claims, and only one
+                    // of them was read out of the bytes.
+                    info!(
+                        "sending a {mime} that was picked as {}: the message says what the \
+                         bytes are",
+                        file.mime_type
+                    );
+                }
+                file.mime_type = mime.to_string();
+            }
+            (shape, file)
         }
+        OutgoingMedia::Video => (moving(&file.data), file),
+        // A document has no dimensions and no poster frame, and its bytes are
+        // the point — it is the one kind that promises nothing about what is
+        // inside it, so nothing here re-encodes one. WhatsApp's own clients
+        // render a first page for a PDF; doing that means a PDF renderer in
+        // the process holding the account, which is a much larger thing than
+        // this.
+        OutgoingMedia::Document => (Shape::default(), file),
     }
 }
 
-/// A picture: its dimensions from the header, its thumbnail from the pixels.
-fn still(data: &[u8]) -> Shape {
+/// Whether a recipient will draw a photo message carrying this format.
+///
+/// Not "can the format hold a picture" — every format here can. It is what
+/// the *other side* does with one, and the answer is narrower than the
+/// question: WhatsApp's own clients re-encode every photo they send to JPEG,
+/// so JPEG is the only format an `imageMessage` is ever observed to carry in
+/// the wild, and a client written against that is a client that has never had
+/// to decode anything else in this position.
+///
+/// This tree found that out the way it is usually found out. A WebP sent as a
+/// photo uploaded, delivered and was marked read — and rendered as nothing at
+/// all on the recipient's Android, while the browser that sent it drew the
+/// same bytes perfectly. Nothing failed anywhere; the picture was simply not
+/// there.
+///
+/// PNG stays because it is the one non-JPEG format observed arriving intact
+/// on that same client in that same session — a screenshot is the common case
+/// for it, and re-encoding a screenshot to JPEG is exactly the trade nobody
+/// wants. Everything else is re-encoded, which is what
+/// [`prepare`] does with this answer.
+fn draws_as_a_photo(format: image::ImageFormat) -> bool {
+    matches!(format, image::ImageFormat::Jpeg | image::ImageFormat::Png)
+}
+
+/// What a picture turned out to be, once its bytes were read.
+///
+/// Absent where they could not be read at all, which is the one case where
+/// this side has nothing to say the picker did not already say.
+struct Photo {
+    /// The bytes to send, where they are not the ones handed in.
+    data: Option<Vec<u8>>,
+    /// What the payload *is*, which is not always what it was called: a file
+    /// is named by whoever saved it and typed by a table or a browser, and
+    /// neither of those read the bytes. This did.
+    mime: &'static str,
+}
+
+/// All that is known about a picture nothing could decode: what type it is,
+/// where the header said so.
+///
+/// Reading the pixels and reading the *magic bytes* are two different acts,
+/// and only the second of them is what says whether the picker was right
+/// about the type. So a picture too large to decode, or in a format named in
+/// the header and refused by the decoder, still corrects the claim on the
+/// message — it keeps its own bytes, and the message stops calling them
+/// something they are not.
+fn only_the_type(format: Option<image::ImageFormat>) -> Option<Photo> {
+    format.map(|format| Photo {
+        data: None,
+        mime: format.to_mime_type(),
+    })
+}
+
+/// A picture: its dimensions from the header, its thumbnail from the pixels,
+/// and the bytes to send if the ones in hand will not do.
+///
+/// The re-encode is free of any decode this was not going to pay anyway: a
+/// thumbnail needs the pixels, so the picture is decoded once and used twice.
+fn still(data: &[u8]) -> (Shape, Option<Photo>) {
     let reader = match image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format() {
         Ok(reader) => reader,
         Err(e) => {
             warn!("could not read that image's header: {e}");
-            return Shape::default();
+            return (Shape::default(), None);
         }
     };
     // Kept, because `into_dimensions` consumes the reader and guessing the
@@ -167,7 +275,7 @@ fn still(data: &[u8]) -> Shape {
         Ok(dimensions) => dimensions,
         Err(e) => {
             warn!("could not measure that image: {e}");
-            return Shape::default();
+            return (Shape::default(), only_the_type(format));
         }
     };
 
@@ -177,32 +285,79 @@ fn still(data: &[u8]) -> Shape {
         ..Shape::default()
     };
     if u64::from(width) * u64::from(height) > MAX_THUMBNAIL_SOURCE_PIXELS {
-        warn!("{width}x{height} is too large to thumbnail; sending it without one");
-        return shape;
+        // Not re-encoded either, and for the same reason: both want the
+        // pixels. A picture this large keeps its own bytes and arrives
+        // however the recipient's client manages with them, which is the
+        // better of the two failures available here.
+        warn!("{width}x{height} is too large to decode; sending it as it came");
+        return (shape, only_the_type(format));
     }
 
+    let Some(format) = format else {
+        warn!("that image is in a format this build cannot read");
+        return (shape, None);
+    };
     let mut reader = image::ImageReader::new(std::io::Cursor::new(data));
-    reader.set_format(match format {
-        Some(format) => format,
-        None => {
-            warn!("that image is in a format this build cannot read");
-            return shape;
-        }
-    });
+    reader.set_format(format);
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_THUMBNAIL_DECODE_BYTES);
     reader.limits(limits);
     let decoded = match reader.decode() {
         Ok(decoded) => decoded,
         Err(e) => {
-            warn!("could not decode that image for a thumbnail: {e}");
-            return shape;
+            // A format named in the header and refused by the decoder — a
+            // HEIC, an AVIF, anything this build was not given a decoder for.
+            // It goes out as it came, which is the only thing left to do with
+            // bytes nothing here can read.
+            warn!("could not decode that image: {e}");
+            return (shape, only_the_type(Some(format)));
         }
     };
 
-    Shape {
-        thumbnail: jpeg_thumbnail(&decoded),
-        ..shape
+    // Decoded once, used twice: the thumbnail always, and the payload only
+    // where the format it arrived in is not one the other side will draw.
+    let thumbnail = jpeg_thumbnail(&decoded);
+    let transcoded = (!draws_as_a_photo(format))
+        .then(|| as_jpeg(&decoded, PHOTO_QUALITY))
+        .flatten();
+    // The type the *bytes* are, either way. A re-encode is a JPEG and an
+    // untouched picture is whatever the header said it was — which is not
+    // necessarily what it was picked as, and the message is read by a client
+    // that has only what we tell it.
+    let mime = match &transcoded {
+        Some(_) => PHOTO_MIME,
+        None => format.to_mime_type(),
+    };
+
+    (
+        Shape { thumbnail, ..shape },
+        Some(Photo {
+            data: transcoded,
+            mime,
+        }),
+    )
+}
+
+/// Encode a decoded picture as JPEG, or say why not.
+///
+/// The one place that turns pixels into the format a photo message carries,
+/// so the thumbnail and the payload cannot disagree about how it is done —
+/// including the part that is easy to get wrong, which this got wrong first:
+/// JPEG has no alpha channel, and *dropping* one is not the same as removing
+/// it. `to_rgb8` keeps whatever colour is stored underneath a transparent
+/// pixel, and what is stored there is nobody's decision — an encoder may
+/// leave the last drawn colour, or garbage, and a logo drawn on nothing then
+/// arrives on a field of whatever that was.
+fn as_jpeg(image: &image::DynamicImage, quality: u8) -> Option<Vec<u8>> {
+    let rgb = flattened(image);
+    let mut bytes = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality);
+    match encoder.encode_image(&rgb) {
+        Ok(()) => Some(bytes),
+        Err(e) => {
+            warn!("could not encode that picture as a JPEG: {e}");
+            None
+        }
     }
 }
 
@@ -217,23 +372,54 @@ fn jpeg_thumbnail(image: &image::DynamicImage) -> Option<Vec<u8>> {
     // runs on the page's only thread when the page is the one holding the
     // account.
     let small = image.thumbnail(width, height);
-    // JPEG has no alpha, and an RGBA source encoded as RGB without being told
-    // to drop it is a panic in the encoder rather than a wrong picture.
-    let rgb = small.into_rgb8();
+    let bytes = as_jpeg(&small, THUMBNAIL_QUALITY)?;
+    debug!("thumbnail: {}x{} in {} bytes", width, height, bytes.len());
+    Some(bytes)
+}
 
-    let mut bytes = Vec::new();
-    let mut encoder =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, THUMBNAIL_QUALITY);
-    match encoder.encode_image(&rgb) {
-        Ok(()) => {
-            debug!("thumbnail: {}x{} in {} bytes", width, height, bytes.len());
-            Some(bytes)
-        }
-        Err(e) => {
-            warn!("could not encode a thumbnail: {e}");
-            None
-        }
+/// A picture with no alpha channel, composited if it had one.
+///
+/// White, and it is a choice rather than a derivation: something has to be
+/// behind a transparent pixel once the channel is gone, and the alternative
+/// is not another colour — it is whatever the file happened to store there,
+/// which is the bug this exists to answer. White because a picture drawn with
+/// transparency is nearly always drawn for a light ground: a logo, a diagram,
+/// a screenshot with rounded corners. On black those go dark on dark.
+///
+/// Untouched where there is no alpha to composite, which is every photograph
+/// — so the common case pays a colour-type check and nothing else.
+fn flattened(image: &image::DynamicImage) -> image::RgbImage {
+    if !image.color().has_alpha() {
+        return image.to_rgb8();
     }
+
+    /// What transparency is composited onto. See above.
+    const GROUND: u8 = 0xff;
+
+    let rgba = image.to_rgba8();
+    let mut flat = image::RgbImage::new(rgba.width(), rgba.height());
+    for (to, from) in flat.pixels_mut().zip(rgba.pixels()) {
+        let [red, green, blue, alpha] = from.0;
+        // `src * a + ground * (1 - a)`, in eighths of a byte rather than in
+        // floats: the rounding is invisible at this depth and the loop runs
+        // once per pixel of a picture that may be fifty megapixels.
+        let over = |channel: u8| {
+            let blended =
+                u32::from(channel) * u32::from(alpha) + u32::from(GROUND) * u32::from(255 - alpha);
+            // Rounded division by 255, which `+ 127 / 255` is not quite and
+            // this is: the exact form used by every compositor.
+            let rounded = blended + 128;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a weighted average of two bytes is a byte"
+            )]
+            {
+                ((rounded + (rounded >> 8)) >> 8) as u8
+            }
+        };
+        to.0 = [over(red), over(green), over(blue)];
+    }
+    flat
 }
 
 /// The largest box within `edge` that keeps the aspect ratio.
@@ -448,12 +634,33 @@ mod tests {
         }
     }
 
+    /// The same picture in a format the caller names.
+    fn encoded(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+            .unwrap_or_else(|e| panic!("this build should encode {format:?}: {e}"));
+        bytes
+    }
+
+    /// What `prepare` made of a picture: its shape, and what would be
+    /// uploaded.
+    fn prepared(mime: &str, data: Vec<u8>) -> (Shape, OutgoingFile) {
+        prepare(OutgoingFile {
+            mime_type: mime.to_string(),
+            ..file(OutgoingMedia::Image, data)
+        })
+    }
+
     /// The dimensions the recipient draws the placeholder at, and a thumbnail
     /// small enough to ride on the message. Without these the other side has a
     /// grey box until somebody opens it.
     #[test]
     fn a_picture_is_measured_and_carries_a_thumbnail() {
-        let shape = Shape::of(&file(OutgoingMedia::Image, png(640, 480)));
+        let (shape, _) = prepared("image/png", png(640, 480));
         assert_eq!((shape.width, shape.height), (Some(640), Some(480)));
         let thumbnail = shape.thumbnail.expect("a picture should get a thumbnail");
         // It has to be a JPEG, because that is the field it goes in.
@@ -479,23 +686,216 @@ mod tests {
         );
     }
 
+    /// The bug this module was corrected for. A WebP sent as a photo
+    /// uploaded, delivered and was read, and rendered as nothing on the
+    /// recipient's Android — so it goes out as a JPEG now, and the message
+    /// says so.
+    #[test]
+    fn a_picture_in_a_format_the_other_side_will_not_draw_is_re_encoded() {
+        let webp = encoded(640, 480, image::ImageFormat::WebP);
+        let (shape, sent) = prepared("image/webp", webp.clone());
+
+        assert_eq!(sent.mime_type, "image/jpeg");
+        assert_ne!(sent.data, webp, "the payload should be the re-encode");
+        assert_eq!(
+            image::guess_format(&sent.data).ok(),
+            Some(image::ImageFormat::Jpeg)
+        );
+        // The same picture, at the same size: what changed is the container,
+        // not the photograph. The dimensions on the message describe the
+        // bytes that are actually uploaded, so they have to agree.
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(&sent.data))
+            .with_guessed_format()
+            .expect("the re-encode should be readable")
+            .into_dimensions()
+            .expect("the re-encode should have dimensions");
+        assert_eq!((width, height), (640, 480));
+        assert_eq!((shape.width, shape.height), (Some(640), Some(480)));
+        assert!(shape.thumbnail.is_some(), "and it still has a preview");
+    }
+
+    /// The two formats a recipient is known to draw are left exactly as they
+    /// are: re-encoding a JPEG loses a generation for nothing, and a PNG is
+    /// usually a screenshot, where the loss is the whole point of not doing
+    /// it.
+    #[test]
+    fn a_picture_the_other_side_draws_is_sent_untouched() {
+        for (mime, format) in [
+            ("image/jpeg", image::ImageFormat::Jpeg),
+            ("image/png", image::ImageFormat::Png),
+        ] {
+            let original = encoded(64, 48, format);
+            let (shape, sent) = prepared(mime, original.clone());
+            assert_eq!(sent.data, original, "{mime} should be sent as it came");
+            assert_eq!(sent.mime_type, mime);
+            assert!(shape.thumbnail.is_some(), "{mime} should still preview");
+        }
+    }
+
     /// A file this build cannot read is still sent. Refusing it would be
     /// refusing to send a file for a reason that is about the *preview*.
     #[test]
     fn a_picture_nothing_can_read_is_sent_without_a_shape() {
-        let shape = Shape::of(&file(
-            OutgoingMedia::Image,
-            b"not a picture at all".to_vec(),
-        ));
+        let (shape, sent) = prepared("image/png", b"not a picture at all".to_vec());
         assert_eq!(shape, Shape::default());
+        // And it goes out with the bytes it came with: nothing here could
+        // read them, so nothing here may claim to have improved them.
+        assert_eq!(sent.data, b"not a picture at all");
     }
 
     /// A document has neither dimensions nor a poster frame, and asking the
     /// image decoder about a PDF wastes a decode to learn that.
     #[test]
     fn a_document_is_not_asked_what_it_looks_like() {
-        let shape = Shape::of(&file(OutgoingMedia::Document, png(64, 64)));
+        let (shape, sent) = prepare(file(OutgoingMedia::Document, png(64, 64)));
         assert_eq!(shape, Shape::default());
+        // And nothing re-encoded it: a document's bytes are the point.
+        assert_eq!(sent.data, png(64, 64));
+        assert_eq!(sent.mime_type, "image/png");
+    }
+
+    /// What a file is called and what it is are two different claims, and only
+    /// one of them was read out of the bytes. A JPEG picked as `image/png` —
+    /// a renamed file, a browser guessing from an extension — went out saying
+    /// `image/png`, which is the same kind of lie about a payload that this
+    /// whole module exists to stop telling.
+    #[test]
+    fn the_message_says_what_the_bytes_are_rather_than_what_they_were_called() {
+        let jpeg = encoded(64, 48, image::ImageFormat::Jpeg);
+        let (_, sent) = prepared("image/png", jpeg.clone());
+        assert_eq!(sent.mime_type, "image/jpeg");
+        // Corrected, not re-encoded: a JPEG is already a format the other
+        // side draws, so the bytes are the ones that came in.
+        assert_eq!(sent.data, jpeg);
+    }
+
+    /// Reading the pixels and reading the magic bytes are two different acts,
+    /// and a picture that fails the first has still passed the second. A PNG
+    /// whose data is truncated — or one too large to decode — kept the
+    /// picker's claim about its type, so a mislabelled one went out saying
+    /// what it was called rather than what it is.
+    #[test]
+    fn a_picture_that_cannot_be_decoded_still_says_what_it_is() {
+        // A real PNG header with the image data cut off: enough to sniff the
+        // format and read the dimensions, not enough to decode.
+        let png = encoded(64, 48, image::ImageFormat::Png);
+        let header = png[..48.min(png.len())].to_vec();
+
+        let (shape, sent) = prepared("image/jpeg", header.clone());
+        assert_eq!(sent.data, header, "the bytes are the ones that came in");
+        assert_eq!(sent.mime_type, "image/png", "and the type is the real one");
+        assert_eq!(shape.thumbnail, None, "with no preview, which is the point");
+    }
+
+    /// The second of the three paths that give up on the pixels: a format the
+    /// header names and this build has no decoder for. Its dimensions cannot
+    /// be read either, so there is nothing to say about it *except* what it
+    /// is — and that much is still worth saying.
+    #[test]
+    fn a_format_with_no_decoder_here_still_says_what_it_is() {
+        // A BMP signature. `image` recognises it by its magic bytes whatever
+        // the feature set, and this build has no BMP decoder, so the
+        // dimensions are the thing that fails.
+        let bmp = b"BM\x00\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00".to_vec();
+        let (shape, sent) = prepared("image/png", bmp.clone());
+
+        assert_eq!(sent.data, bmp, "the bytes are the ones that came in");
+        assert_eq!(sent.mime_type, "image/bmp");
+        assert_eq!(shape, Shape::default(), "and nothing was measured");
+    }
+
+    /// The third: a picture whose header declares more pixels than this will
+    /// decode. It is never read, so its type comes from the header alone —
+    /// and a hundred megapixels is thirty-three bytes to *claim*, which is
+    /// what makes the ceiling worth having and this worth testing.
+    #[test]
+    fn a_picture_past_the_decode_ceiling_still_says_what_it_is() {
+        let huge = png_claiming(10_000, 10_000);
+        let (shape, sent) = prepared("image/webp", huge.clone());
+
+        assert_eq!(sent.data, huge, "nothing re-encoded it");
+        assert_eq!(sent.mime_type, "image/png", "and it is a PNG, not a WebP");
+        // Measured from the header, which is all this path ever reads.
+        assert_eq!((shape.width, shape.height), (Some(10_000), Some(10_000)));
+        assert_eq!(shape.thumbnail, None);
+    }
+
+    /// A PNG whose header claims a size nothing here will allocate.
+    ///
+    /// Built rather than encoded, because encoding one would mean allocating
+    /// the four hundred megabytes this exists to refuse: a real PNG's `IHDR`
+    /// is patched with the dimensions and its checksum recomputed, which is
+    /// the whole of what a decoder reads before it decides.
+    fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+        let mut png = png(1, 1);
+        // Signature (8), length (4), type (4), then the 13 bytes of `IHDR`
+        // whose first two fields are the dimensions, then the checksum.
+        png[16..20].copy_from_slice(&width.to_be_bytes());
+        png[20..24].copy_from_slice(&height.to_be_bytes());
+        let checksum = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&checksum.to_be_bytes());
+        png
+    }
+
+    /// CRC-32/ISO-HDLC, which is the one PNG chunks carry.
+    ///
+    /// Ten lines rather than a dependency: this exists to make one fixture,
+    /// and the alternative is a crate in the manifest for a test.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// Transparency has to land somewhere once the alpha channel is gone, and
+    /// "wherever the encoder left it" is not somewhere. A pixel that is fully
+    /// transparent over red must come out white rather than red.
+    #[test]
+    fn transparency_is_composited_rather_than_dropped() {
+        let mut source = image::RgbaImage::new(2, 1);
+        // Invisible, and red underneath — which is what `to_rgb8` would have
+        // handed the encoder.
+        source.put_pixel(0, 0, image::Rgba([255, 0, 0, 0]));
+        source.put_pixel(1, 0, image::Rgba([0, 0, 255, 255]));
+
+        let flat = flattened(&image::DynamicImage::ImageRgba8(source));
+        assert_eq!(
+            flat.get_pixel(0, 0).0,
+            [255, 255, 255],
+            "the transparent one"
+        );
+        assert_eq!(flat.get_pixel(1, 0).0, [0, 0, 255], "and the opaque one");
+    }
+
+    /// Half-transparent is half-composited, and the arithmetic has to round
+    /// rather than drift: an eighth-of-a-byte blend that truncates turns a
+    /// flat grey wash into banding.
+    #[test]
+    fn a_half_transparent_pixel_lands_halfway() {
+        let mut source = image::RgbaImage::new(1, 1);
+        source.put_pixel(0, 0, image::Rgba([0, 0, 0, 128]));
+        let flat = flattened(&image::DynamicImage::ImageRgba8(source));
+        let [red, green, blue] = flat.get_pixel(0, 0).0;
+        // Black at just over half alpha over white: near the midpoint, and
+        // the same on every channel.
+        assert_eq!([red, green, blue], [127, 127, 127]);
+    }
+
+    /// A picture with no alpha is not walked pixel by pixel to learn that.
+    #[test]
+    fn a_picture_without_transparency_is_left_alone() {
+        let source = image::RgbImage::from_fn(4, 4, |x, _| image::Rgb([x as u8, 7, 9]));
+        let flat = flattened(&image::DynamicImage::ImageRgb8(source.clone()));
+        assert_eq!(flat, source);
     }
 
     /// The one that used to be a panic: JPEG has no alpha channel, and the
@@ -511,11 +911,7 @@ mod tests {
                 image::ImageFormat::Png,
             )
             .expect("the encoder should write a PNG");
-        assert!(
-            Shape::of(&file(OutgoingMedia::Image, bytes))
-                .thumbnail
-                .is_some()
-        );
+        assert!(prepared("image/png", bytes).0.thumbnail.is_some());
     }
 
     /// A picture narrower than the thumbnail box keeps both of its edges: a

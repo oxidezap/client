@@ -22,7 +22,7 @@ use oxidezap_ipc::{
 
 use super::media::MediaCache;
 use super::sink::EventSink;
-use super::{Awaiting, Fault, FromDaemon, Pending, StorageUsage};
+use super::{Awaiting, Failure, Fault, FromDaemon, Pending, StorageUsage};
 
 /// The reader's state, between frames.
 pub(super) struct Frames<'a> {
@@ -206,10 +206,17 @@ impl<'a> Frames<'a> {
                 let bytes = self.media.read_once(&key);
                 match waiting {
                     Awaiting::Download(tx) => {
-                        let _ = tx.send(bytes);
+                        // Not offered as a retry, though it reads like one:
+                        // the daemon holds these bytes under this key, so
+                        // asking again is answered from its cache without
+                        // fetching anything and this side fails to read the
+                        // same entry a second time.
+                        let _ = tx.send(bytes.map_err(Failure::permanent));
                     }
                     // Nothing but a download asks for one.
-                    waiting => self.fail(waiting, "unexpected download answer"),
+                    waiting => {
+                        self.fail(waiting, &Failure::permanent("unexpected download answer"))
+                    }
                 }
             }
             // Every command is answered under the id it was asked with, which
@@ -227,7 +234,7 @@ impl<'a> Frames<'a> {
             DaemonMessage::Accepted { id: None } => {}
             DaemonMessage::Error { id, error } => {
                 match id.and_then(|id| take_pending(self.pending, id)) {
-                    Some(waiting) => self.fail(waiting, &error.to_string()),
+                    Some(waiting) => self.fail(waiting, &Failure::from(&error)),
                     // A refusal for nothing in particular: a malformed frame,
                     // or a request sent without an id.
                     None => error!("daemon refused a request: {error}"),
@@ -261,7 +268,9 @@ impl<'a> Frames<'a> {
                         media_files,
                     });
                 }
-                Some(waiting) => self.fail(waiting, "unexpected storage answer"),
+                Some(waiting) => {
+                    self.fail(waiting, &Failure::permanent("unexpected storage answer"))
+                }
                 None => debug!("a storage answer arrived for {id}, which nobody is waiting on"),
             },
             // Already inside the snapshot this connection started from. The
@@ -348,11 +357,11 @@ impl<'a> Frames<'a> {
     /// staged voice note to drop: nothing will ever read those bytes, and a
     /// retry stages another copy under a new local id. `Session::ask` does the
     /// same for the failures that happen before a request leaves.
-    fn fail(&self, waiting: Awaiting, detail: &str) {
+    fn fail(&self, waiting: Awaiting, failure: &Failure) {
         if let Some(key) = waiting.staged_key() {
             self.media.discard(key);
         }
-        waiting.failed(detail, Some(self.events));
+        waiting.failed(failure, Some(self.events));
     }
 
     /// A front end that has gone is the one reason to stop mid-frame.
@@ -376,7 +385,12 @@ impl<'a> Frames<'a> {
             .map(|(_, waiting)| waiting)
             .collect();
         for waiting in abandoned {
-            self.fail(waiting, "the daemon connection closed");
+            // The connection, not the request: the app reconnects, and
+            // what was asked for here can be asked for again.
+            self.fail(
+                waiting,
+                &Failure::worth_retrying("the daemon connection closed"),
+            );
         }
         let _ = self
             .events

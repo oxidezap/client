@@ -23,9 +23,18 @@ pub(crate) mod http;
 /// The orphan sweep, as the daemon runs it: once at startup and on a schedule
 /// after. Native only — a page has no directory to walk — and a task rather
 /// than a call, because it is a `stat` per cached file and none of the places
-/// an orphan is made can afford one.
+/// an orphan is made can afford one. It used to be reached through
+/// [`prepare_cache_dir`], back when preparing walked the directory; that is
+/// what made every staged upload pay for a walk.
 #[cfg(not(target_family = "wasm"))]
 pub use platform::reclaim_abandoned_writes_periodically;
+
+/// Make the cache directory this account's alone, before anything writes into
+/// it. Called at startup and by every writer; native only, for the reason the
+/// sweep above is. Two syscalls — the walk that used to follow it is the
+/// scheduled task now.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use platform::prepare_dir as prepare_cache_dir;
 pub use platform::{cache_usage, claim, has, take};
 /// Read without removing, where the front end is this process. See `web.rs`.
 #[cfg(target_family = "wasm")]
@@ -79,22 +88,52 @@ pub fn download_key(file_enc_sha256: &[u8]) -> Option<String> {
 /// enough to read.
 const KEY_HASH_BYTES: usize = 16;
 
-/// Keep a key to the characters [`oxidezap_ipc::media_path`] accepts.
+/// Spell a key in the characters [`oxidezap_ipc::media_path`] accepts,
+/// without letting two ids meet under one name.
 ///
 /// Message ids come off the network. One carrying a separator would name a
 /// file outside the cache, and the daemon writes as the user who owns the
-/// session.
+/// session. The earlier answer folded every character outside
+/// `[A-Za-z0-9_-]` onto `.`, which kept the file inside the cache and lost
+/// the difference between ids: `3EB0A/B` and `3EB0A?B` were one key. A
+/// message key is a content address, so the second message would have been
+/// served the first one's bytes — which is the failure [`download_key`]
+/// above already carries the scar of.
+///
+/// So this escapes rather than folds: a byte outside that set becomes `.`
+/// and its two hex digits, and `.` escapes itself, which makes the spelling
+/// reversible and therefore injective. Per byte rather than per character,
+/// so a non-ASCII id is distinguished by what it actually is.
+///
+/// An id of the alphabet WhatsApp actually uses has nothing to escape, so it
+/// passes through byte for byte and every entry already on disk keeps the
+/// name it was written under. The two spellings do share a directory for as
+/// long as those entries live: a fold wrote `.` where this writes `.2E`, so
+/// an entry an older build cached under an id carrying punctuation could be
+/// read as some other id's now. It takes an id no WhatsApp build produces to
+/// have written one, and the budget sweep retires whatever did; changing the
+/// prefix instead — the answer this key's own `m-` history records — would
+/// orphan every cached photo on every disk to answer an id nobody has seen.
+///
+/// Nothing is truncated, and a key that does not fit a file name is left not
+/// fitting. `media_path` refuses a name over 128 bytes, so an id that long —
+/// escaped to three bytes a character, or simply written long — is a message
+/// whose media is fetched on demand every time instead of cached. That is the
+/// price of the rule: a key cut to a length is some *other* id's address, and
+/// this function exists because two ids sharing one key is how a photo is
+/// served as the wrong message's.
 fn sanitize(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '.'
-            }
-        })
-        .take(120)
-        .collect()
+    use std::fmt::Write as _;
+
+    let mut key = String::with_capacity(id.len());
+    for byte in id.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
+            key.push(char::from(byte));
+        } else {
+            let _ = write!(key, ".{byte:02X}");
+        }
+    }
+    key
 }
 
 /// How much of the directory a wipe is entitled to.
@@ -434,6 +473,53 @@ mod tests {
             );
             assert!(!key.contains('/'), "{key}");
         }
+    }
+
+    /// A message key is a content address, so two ids sharing one is the
+    /// same failure `download_key` records: a hit is served as that message's
+    /// own media. Folding every character outside `[A-Za-z0-9_-]` onto `.`
+    /// made these pairs one key each.
+    #[test]
+    fn two_message_ids_never_share_a_key() {
+        for (one, other) in [
+            ("3EB0A/B", "3EB0A?B"),
+            ("3EB0A.B", "3EB0A/B"),
+            ("a b", "a-b"),
+            ("..", "//"),
+            // The same characters, differing only in what they are: an
+            // escape is per byte, so this is two ids rather than one.
+            ("é", "e\u{301}"),
+        ] {
+            assert_ne!(
+                message_key(one),
+                message_key(other),
+                "{one} and {other} were cached as one message"
+            );
+        }
+    }
+
+    /// An id too long to spell as a file name loses its cache rather than its
+    /// tail: the truncation it replaced handed two ids sharing a prefix one
+    /// key, and that is the failure this whole spelling exists to answer. The
+    /// message still arrives; its media is fetched on demand.
+    #[test]
+    fn an_id_too_long_to_name_a_file_is_refused_rather_than_cut() {
+        let long = message_key(&"/".repeat(60));
+        assert!(
+            oxidezap_ipc::media_path(&long).is_none(),
+            "an id this long was cut to fit, and the cut is another id's key"
+        );
+        assert_ne!(long, message_key(&"/".repeat(61)));
+    }
+
+    /// The key is a file name on a disk that outlives the process, so a
+    /// spelling change orphans every entry written under the old one. An id
+    /// of the alphabet WhatsApp uses has nothing to escape and keeps the name
+    /// it already has.
+    #[test]
+    fn an_ordinary_message_id_keeps_the_key_it_was_cached_under() {
+        assert_eq!(message_key("3EB0A1B2C3D4E5F6"), "f-3EB0A1B2C3D4E5F6");
+        assert_eq!(message_key("A-B_c9"), "f-A-B_c9");
     }
 
     /// The same media shared into two chats is one file, so the second

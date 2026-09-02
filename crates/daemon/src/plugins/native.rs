@@ -135,7 +135,10 @@ impl Bridge {
         match answer.blocking_recv() {
             Ok(CommandOutcome::Accepted) => Outcome::Accepted,
             Ok(CommandOutcome::NoSession(_)) | Err(_) => Outcome::NoSession,
-            Ok(CommandOutcome::Refused(_)) => Outcome::Refused,
+            // The plugin ABI has one word for both, and this is the honest
+            // half of it: a plugin's command did not run. Widening its
+            // `Outcome` is an ABI change, and no plugin retries anything.
+            Ok(CommandOutcome::Refused(_) | CommandOutcome::Busy(_)) => Outcome::Refused,
         }
     }
 }
