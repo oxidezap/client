@@ -10,8 +10,10 @@ use crate::state::{StateHub, TrayState};
 /// The icon's model. ksni renders from this; the daemon updates it.
 struct Item {
     state: TrayState,
-    /// Held so the menu can publish. The tray is otherwise a pure observer;
-    /// its two menu items are the one place it speaks back.
+    /// Held so the menu and the icon can publish. The tray is otherwise a
+    /// pure observer; its menu items and a click on it are the one place it
+    /// speaks back — and the one thing it asks, whether a window is
+    /// attached, is what the first item is named from.
     hub: Arc<StateHub>,
 }
 
@@ -39,6 +41,25 @@ impl KsniTray for Item {
         Vec::new()
     }
 
+    /// A click on the icon. The host sends this for a left click (a double
+    /// click is two of them, which lands where one does), and what it means
+    /// depends on what is up: away if there is a window, up if there is
+    /// not. The daemon has no window, so both are requests — see
+    /// `crate::window::toggle`.
+    fn activate(&mut self, _x: i32, _y: i32) {
+        crate::window::toggle(&self.hub);
+    }
+
+    /// The host is about to open the menu.
+    ///
+    /// Nothing to do, and the method exists to say so: ksni re-reads
+    /// [`Self::menu`] before showing it only when this is implemented, and
+    /// the first item below is named from whether a window is attached — a
+    /// fact the tray is otherwise told nothing about, since it follows the
+    /// hub's `TrayState` and a window attaching moves none of it. Without
+    /// this the label would be whatever was true at the last unread count.
+    fn menu_about_to_show(&mut self) {}
+
     fn tool_tip(&self) -> ToolTip {
         let description = match (self.state.connected, self.state.unread) {
             (false, _) => "Disconnected".to_string(),
@@ -54,7 +75,23 @@ impl KsniTray for Item {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        vec![
+        // One item, named for what it would do rather than a fixed pair: the
+        // menu is read when the host opens it (`menu_about_to_show`), so the
+        // label follows the window. Each label does only what it says — Open
+        // raises, Hide asks to go — rather than both toggling, so a label a
+        // host showed stale can at worst do nothing, never the opposite.
+        let window = if self.hub.windows_attached() {
+            StandardItem {
+                label: "Hide".into(),
+                // A request, like Open: the daemon owns no window, and the
+                // front end decides what going away means for it. See
+                // `crate::window::hide`.
+                activate: Box::new(|item: &mut Self| {
+                    crate::window::hide(&item.hub);
+                }),
+                ..Default::default()
+            }
+        } else {
             StandardItem {
                 label: "Open".into(),
                 // The daemon has no window, so this is a request passed
@@ -66,7 +103,9 @@ impl KsniTray for Item {
                 }),
                 ..Default::default()
             }
-            .into(),
+        };
+        vec![
+            window.into(),
             MenuItem::Separator,
             StandardItem {
                 label: "Quit".into(),

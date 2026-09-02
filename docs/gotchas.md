@@ -186,7 +186,19 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   stand in for a window that is not there. The one front end name the daemon
   has to know is also the one thing worth overriding, so `OXIDEZAP_FRONT_END`
   names another — a TUI, a second GUI — and the shipped pair is only the
-  default.
+  default. The way back is the same door: the tray's Hide, and a click on
+  the icon while a window is attached, relay `HideWindow`, and the front end
+  answers it by leaving — on a desktop the window *is* the process, and
+  ending it is exactly what closing the window does, so the two cannot drift.
+  There is no cheaper hide to reach for on Wayland, where a toplevel cannot
+  be withdrawn and brought back by its owner, and minimising is not hiding
+  (the issue was reported on exactly that). The icon click toggles on
+  `has_window` for the same reason Open launches on it: a subscriber that is
+  not a window must not turn a click into a hide nothing acts on. The menu's
+  first item is named from the same fact — Open or Hide, each doing only
+  what it says — and is re-read when the host opens the menu, which ksni
+  does only for a tray that implements `menu_about_to_show`; the tray
+  otherwise hears only `TrayState`, which a window attaching does not move.
 - **What a file is sent as is decided in the front end; what it looks like is
   worked out where the bytes land.** Two questions, and they are answered in
   two places because they have two different pieces of evidence. The *kind* —

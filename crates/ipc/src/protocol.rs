@@ -419,6 +419,15 @@ pub enum DaemonMessage {
     /// Carries no version because it changes no state. A front end with a
     /// window raises it; one without (a notifier, a CLI) ignores it.
     ShowWindow,
+    /// Somebody asked for the front end to go away: the tray's "Hide" item,
+    /// or the icon clicked while a window is up.
+    ///
+    /// The mirror of [`DaemonMessage::ShowWindow`], and versionless for the
+    /// same reason. What "away" means is the front end's to decide — on a
+    /// desktop the window is the process, so leaving is what closing it
+    /// does, and the daemon keeps the account exactly as it does then. A
+    /// client with nothing on screen ignores it, as it does the other.
+    HideWindow,
     /// A message the daemon accepted could not be delivered.
     ///
     /// Also versionless, and for the same reason: nothing about the daemon's
@@ -1366,12 +1375,14 @@ mod tests {
     /// other, which is what the type tag is for.
     #[test]
     fn a_payloadless_frame_is_still_tagged() {
-        let line = serde_json::to_string(&DaemonMessage::ShowWindow).unwrap();
-        assert_eq!(line, r#"{"type":"show_window"}"#);
-        assert_eq!(
-            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
-            DaemonMessage::ShowWindow
-        );
+        for (frame, bytes) in [
+            (DaemonMessage::ShowWindow, r#"{"type":"show_window"}"#),
+            (DaemonMessage::HideWindow, r#"{"type":"hide_window"}"#),
+        ] {
+            let line = serde_json::to_string(&frame).unwrap();
+            assert_eq!(line, bytes);
+            assert_eq!(serde_json::from_str::<DaemonMessage>(&line).unwrap(), frame);
+        }
     }
 
     #[test]

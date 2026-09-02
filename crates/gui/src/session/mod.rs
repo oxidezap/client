@@ -146,6 +146,9 @@ pub enum FromDaemon {
     Plugins(Vec<oxidezap_core::PluginSurface>),
     /// Somebody asked for a front end to come forward.
     ShowWindow,
+    /// Somebody asked for the front end to go away — the tray's Hide, or
+    /// its icon clicked while this window is up.
+    HideWindow,
     /// This connection is over, and why — in terms the screen can draw
     /// rather than one line of prose for three different endings.
     Ended(Fault),

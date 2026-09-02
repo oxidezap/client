@@ -263,6 +263,7 @@ impl<'a> Frames<'a> {
                 return ControlFlow::Break(());
             }
             DaemonMessage::ShowWindow => self.publish(FromDaemon::ShowWindow)?,
+            DaemonMessage::HideWindow => self.publish(FromDaemon::HideWindow)?,
             // The id the module claimed, which is the daemon's answer and not
             // this window's guess at the file name it sent.
             DaemonMessage::PluginInstalled { id, plugin } => match take_pending(self.pending, id) {
