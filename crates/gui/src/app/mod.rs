@@ -919,6 +919,14 @@ impl WhatsAppApp {
                         });
                         Ok(())
                     }
+                    // The tray's Hide, or its icon clicked over this window.
+                    // What going away means is a platform question — on a
+                    // desktop the window is the process — and it is answered
+                    // beneath `platform/` like every other one.
+                    FromDaemon::HideWindow => {
+                        cx.update(crate::platform::leave);
+                        Ok(())
+                    }
                 };
                 if result.is_err() {
                     // Entity was dropped, stop the loop

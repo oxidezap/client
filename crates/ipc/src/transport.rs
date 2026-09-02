@@ -5,6 +5,18 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 26: `DaemonMessage::HideWindow`, the mirror of `ShowWindow`. The tray had
+/// an Open and no way back: the icon did nothing when clicked, and the one
+/// way to put the window away was to close it. Now a click on the icon
+/// toggles — raise when nothing is attached, hide when something is — and
+/// the menu offers whichever of the two applies. Without a version a v25
+/// window would read the frame as unparsable and log it, so Hide would do
+/// nothing against a window built before it existed; with one, the hello
+/// refuses the pair outright, which is the honest answer. The other
+/// direction, a v25 daemon under an upgraded window, never sends the frame
+/// and has no item to send it from — so this is a version for the same
+/// reason v22 was, a frame an older reader would drop on the floor.
+///
 /// 25: `ClientRequest::InstallPlugin`, `RemovePlugin` and
 /// `ListInstalledPlugins`, answered by `DaemonMessage::PluginInstalled` and
 /// `DaemonMessage::InstalledPlugins`. A plugin belongs to the daemon that
@@ -187,7 +199,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

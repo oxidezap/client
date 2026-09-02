@@ -1,4 +1,4 @@
-//! Noticing that the front end is going away.
+//! Noticing that the front end is going away — and going, when asked to.
 //!
 //! A desktop `main` is the teardown: it waits for [`shutdown::requested`],
 //! and everything after that wait disconnects the session and closes SQLite.
@@ -7,6 +7,8 @@
 //! teardown the daemon library carries was unreachable from a tab.
 //!
 //! [`shutdown::requested`]: oxidezap_daemon::shutdown::requested
+
+use gpui::App;
 
 /// Ask the platform to say when the front end is closing.
 ///
@@ -17,10 +19,33 @@ pub fn watch_for_departure() {
     imp::watch_for_departure();
 }
 
+/// Put the window away, because the tray asked.
+///
+/// What that means is the platform's. On a desktop the front end owns no
+/// session and the window is the process, so going away is what closing the
+/// window already does: the process ends, the daemon keeps the account, and
+/// the tray's Open starts a fresh one — which is cheaper than it sounds, and
+/// is the one thing a hidden window can be on Wayland, where a toplevel
+/// cannot be withdrawn and brought back by its owner. A page cannot close
+/// itself, and no tray reaches one anyway.
+pub fn leave(cx: &mut App) {
+    imp::leave(cx);
+}
+
 #[cfg(not(target_family = "wasm"))]
 mod imp {
+    use gpui::App;
+
     /// `main` is the ending here, and it already waits.
     pub(super) fn watch_for_departure() {}
+
+    /// The platform's own quit, which is what closing the last window
+    /// reaches on every desktop but macOS — and there too, because a window
+    /// that hid by merely closing would leave a process the daemon still
+    /// counts as one, and Open would go on raising nothing.
+    pub(super) fn leave(cx: &mut App) {
+        cx.quit();
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -37,6 +62,15 @@ mod imp {
         /// not leave two.
         static LEAVING: RefCell<Option<Closure<dyn FnMut(web_sys::PageTransitionEvent)>>> =
             const { RefCell::new(None) };
+    }
+
+    /// A page cannot close itself — `window.close()` works only on a tab a
+    /// script opened — and none is ever asked to: a socket client says it
+    /// owns no window, and a page holding its own daemon has no tray.
+    /// Answered here rather than left unmatched so the variant is handled
+    /// wherever it can arrive.
+    pub(super) fn leave(_cx: &mut gpui::App) {
+        log::debug!("asked to hide, and a page has no window to put away");
     }
 
     pub(super) fn watch_for_departure() {
