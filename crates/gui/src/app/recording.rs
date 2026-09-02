@@ -1,4 +1,19 @@
 //! Voice-message recording: capture, encode and send.
+//!
+//! The microphone, the state machine around it and the timer that draws the
+//! meter are an entity of their own — [`Recorder`] — and what stayed on the
+//! app is the three actions a person can take. The line between them is the
+//! one the split is for: the [`Recorder`] owns the device and can say what it
+//! did, and everything that needs a chat, a draft or a session is above it.
+//!
+//! The meter's tick is the clearest thing the split buys. It ran ten times a
+//! second and ended in a `cx.notify()` on the app, so a voice note being
+//! recorded redrew the chat list, the sidebar and the header along with the
+//! two things that had actually moved. The composer is a view of its own and
+//! already repaints itself when the level changes, so the tick now says so to
+//! the composer and to nothing else.
+
+use gpui::{Context, Entity, Task, WeakEntity};
 
 use super::*;
 
@@ -8,14 +23,193 @@ use super::*;
 /// it is nothing next to the audio callback already running.
 const RECORDING_TICK_MS: u64 = 100;
 
-impl WhatsAppApp {
-    /// Update the recording state in the input area (call only when recording state changes)
-    fn update_input_recording(&self, cx: &mut Context<Self>) {
-        if let Some(ref input_area) = self.input_area {
+/// What closing the microphone produced.
+pub(super) enum Stopped {
+    /// Nothing was bound to it, so there is nothing to send. Already
+    /// cancelled: the device has to be released either way.
+    Nowhere,
+    /// The device would not stop, with the sentence to show for it. Also
+    /// already cancelled — see [`Recorder::stop`].
+    Refused(String),
+    /// What was captured, and which recording it belongs to.
+    Captured {
+        target: RecordingTarget,
+        recording: oxidezap_audio::Recording,
+        epoch: usize,
+    },
+}
+
+/// The microphone, and what it is being held open for.
+pub(super) struct Recorder {
+    device: AudioRecorder,
+    state: RecordingState,
+    /// Chat the current PTT recording started in; the note is sent there even
+    /// if the user switches chats before stopping.
+    target: Option<RecordingTarget>,
+    /// Which recording the encode still in flight belongs to.
+    ///
+    /// Encoding runs detached on the background pool and nothing can stop it,
+    /// so cancelling is not a matter of aborting the work but of disowning
+    /// its result. Bumped by [`Self::cancel`]; a completion whose epoch no
+    /// longer matches is dropped rather than sent.
+    epoch: usize,
+    /// Repaints the recording panel's clock and level meter. Only alive while
+    /// the microphone is.
+    tick: Option<Task<()>>,
+}
+
+impl Recorder {
+    pub(super) fn new() -> Self {
+        Self {
+            device: AudioRecorder::new(),
+            state: RecordingState::default(),
+            target: None,
+            epoch: 0,
+            tick: None,
+        }
+    }
+
+    pub(super) fn state(&self) -> RecordingState {
+        self.state
+    }
+
+    pub(super) fn is_recording(&self) -> bool {
+        self.state.is_recording()
+    }
+
+    /// Which recording an encode in flight has to still belong to.
+    pub(super) fn epoch(&self) -> usize {
+        self.epoch
+    }
+
+    /// Open the microphone for `target`, or say why it stayed shut.
+    ///
+    /// The `Err` is written for a reader, because every one of these is a
+    /// press that otherwise does nothing at all: the composer stays as it
+    /// was, with the reason only in the log.
+    ///
+    /// Takes both the composer it has in hand *and* the window it belongs to:
+    /// the first is what is told, right now, that a panel is up, and the
+    /// second is what the meter's timer asks again on every tick, because a
+    /// composer built after the microphone opened still has a meter to draw.
+    pub(super) fn open(
+        &mut self,
+        target: RecordingTarget,
+        composer: Option<Entity<InputAreaView>>,
+        app: WeakEntity<WhatsAppApp>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        // Refused where nothing can come of it. The composer already draws
+        // the microphone disabled there, so this is the keyboard route and
+        // anything else that reaches the action directly.
+        if !oxidezap_audio::can_record() {
+            warn!("this build cannot record a voice note");
+            return Err("Voice messages cannot be recorded in this browser.".to_string());
+        }
+        if let Err(e) = self.device.init() {
+            error!("Failed to initialize audio recorder: {}", e);
+            return Err("The microphone could not be opened.".to_string());
+        }
+        if let Err(e) = self.device.start() {
+            error!("Failed to start recording: {}", e);
+            return Err("Recording could not be started.".to_string());
+        }
+
+        self.state = RecordingState::Recording;
+        self.target = Some(target);
+        self.show(&composer, cx);
+        self.ensure_tick(app, cx);
+        Ok(())
+    }
+
+    /// Close the microphone and hand back what it captured.
+    pub(super) fn stop(
+        &mut self,
+        composer: Option<Entity<InputAreaView>>,
+        cx: &mut Context<Self>,
+    ) -> Stopped {
+        let Some(target) = self.take_target() else {
+            warn!("No recording chat, cancelling recording");
+            self.cancel(composer, cx);
+            return Stopped::Nowhere;
+        };
+
+        self.state = RecordingState::Processing;
+        self.show(&composer, cx);
+
+        match self.device.stop() {
+            Ok(recording) => Stopped::Captured {
+                target,
+                recording,
+                epoch: self.epoch,
+            },
+            Err(e) => {
+                error!("Failed to stop recording: {}", e);
+                // Said *and* acted on. Through the cancel, which is the only
+                // thing that releases the device: setting the state to idle
+                // alone left the capture running with `is_recording` false and
+                // the panel gone, so no control on screen could close the
+                // microphone after that — a notice about a microphone that is
+                // still open is the worse half of that bug, not a fix for it.
+                self.cancel(composer, cx);
+                Stopped::Refused("The recording could not be stopped.".to_string())
+            }
+        }
+    }
+
+    /// Back to idle after an encode that ended, however it ended.
+    pub(super) fn settle(
+        &mut self,
+        composer: Option<Entity<InputAreaView>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.idle();
+        self.show(&composer, cx);
+    }
+
+    /// Release the device and disown whatever it was for.
+    pub(super) fn cancel(
+        &mut self,
+        composer: Option<Entity<InputAreaView>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.disown();
+        self.show(&composer, cx);
+    }
+
+    /// Where the note this recording is for was bound, taken so a second stop
+    /// has nowhere to send. See [`RecordingTarget`].
+    fn take_target(&mut self) -> Option<RecordingTarget> {
+        self.target.take()
+    }
+
+    /// Back to idle, keeping the epoch: the encode this settles is the one
+    /// that just ended, and bumping here would have every successful send
+    /// discard the recording after it.
+    fn idle(&mut self) {
+        self.state = RecordingState::Idle;
+    }
+
+    /// Release the device and disown whatever it was for.
+    ///
+    /// The epoch bump is the disowning. Encoding runs detached and nothing
+    /// can stop it, so cancelling is not a matter of aborting the work but of
+    /// having the completion ask on the way back whether the recording it was
+    /// started for is still the current one — and this is the answer that
+    /// says no. Apart from the composer it tells, so a test can drive the
+    /// half that decides.
+    fn disown(&mut self) {
+        self.device.cancel();
+        self.idle();
+        self.target = None;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Tell the composer whether it is drawing a recording panel.
+    fn show(&self, composer: &Option<Entity<InputAreaView>>, cx: &mut Context<Self>) {
+        if let Some(composer) = composer {
             let is_recording = self.is_recording();
-            input_area.update(cx, |view, cx| {
-                view.set_recording(is_recording, cx);
-            });
+            composer.update(cx, |view, cx| view.set_recording(is_recording, cx));
         }
     }
 
@@ -26,101 +220,77 @@ impl WhatsAppApp {
     /// the meter had no source at all. This is that source — the recorder's
     /// own buffer, read at a rate a person can follow, and stopped the moment
     /// recording does so an idle window wakes for nothing.
-    fn ensure_recording_tick(&mut self, cx: &mut Context<Self>) {
-        if self.recording_tick.is_some() || !self.is_recording() {
+    ///
+    /// The repaint it asks for is the composer's, which is the view that
+    /// draws both the clock and the meter. Nothing else on screen moves ten
+    /// times a second because somebody is talking — which is what this cost
+    /// before the split, when the tick ended in a `cx.notify()` on the app.
+    ///
+    /// The composer is looked up on every pass rather than captured, for the
+    /// two reasons the old lookup had: one built after the microphone opened
+    /// still gets a meter, and a window that has gone ends the timer instead
+    /// of writing into a handle nobody is drawing.
+    fn ensure_tick(&mut self, app: WeakEntity<WhatsAppApp>, cx: &mut Context<Self>) {
+        if self.tick.is_some() || !self.is_recording() {
             return;
         }
-        self.recording_tick = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+        self.tick = Some(cx.spawn(async move |me: WeakEntity<Self>, cx| {
             loop {
                 crate::platform::sleep(std::time::Duration::from_millis(RECORDING_TICK_MS)).await;
-                let keep_going = entity.update(cx, |app, cx| {
-                    if !app.is_recording() {
-                        return false;
-                    }
-                    let level = app.audio_recorder.level();
-                    if let Some(ref input_area) = app.input_area {
-                        input_area.update(cx, |view, cx| view.set_level(level, cx));
-                    }
-                    // The clock lives in the view and is read from an
-                    // `Instant`, so the repaint above is what advances it.
-                    cx.notify();
-                    true
+                let level = me.update(cx, |recorder, _| {
+                    recorder.is_recording().then(|| recorder.device.level())
                 });
-                match keep_going {
-                    Ok(true) => continue,
-                    Ok(false) | Err(_) => break,
+                let Ok(Some(level)) = level else {
+                    break;
+                };
+                let Ok(composer) = app.update(cx, |app, _| app.input_area.clone()) else {
+                    break;
+                };
+                // The clock lives in the view and is read from an `Instant`,
+                // so this repaint is what advances it as well as the meter.
+                if let Some(composer) = composer {
+                    composer.update(cx, |view, cx| view.set_level(level, cx));
                 }
             }
-            let _ = entity.update(cx, |app, _| app.recording_tick = None);
+            let _ = me.update(cx, |recorder, _| recorder.tick = None);
         }));
     }
-    /// Check if currently recording
-    pub fn is_recording(&self) -> bool {
-        self.recording_state.is_recording()
-    }
+}
+
+impl WhatsAppApp {
     /// Start audio recording for PTT
     pub fn start_recording(&mut self, cx: &mut Context<Self>) {
-        if self.selected_chat.is_none() {
+        let Some(jid) = self.selected_chat.clone() else {
             warn!("Cannot record: no chat selected");
             return;
-        }
+        };
 
-        if self.recording_state != RecordingState::Idle {
+        if self.recorder.read(cx).state() != RecordingState::Idle {
             warn!("Audio recording is already active");
             return;
         }
 
-        // Refused where nothing can come of it. The composer already draws
-        // the microphone disabled there, so this is the keyboard route and
-        // anything else that reaches the action directly.
-        if !oxidezap_audio::can_record() {
-            warn!("this build cannot record a voice note");
-            self.notify_user(
-                "Voice messages cannot be recorded in this browser.".to_string(),
-                crate::app::notices::Tone::Problem,
-                cx,
-            );
-            return;
-        }
-
-        // Initialize and start recording. Said out loud on both paths: a
-        // microphone the browser refused, or a device that will not open, is
-        // a press that otherwise does nothing at all, the composer stays as
-        // it was, with the reason only in the log.
-        if let Err(e) = self.audio_recorder.init() {
-            error!("Failed to initialize audio recorder: {}", e);
-            self.notify_user(
-                "The microphone could not be opened.".to_string(),
-                crate::app::notices::Tone::Problem,
-                cx,
-            );
-            return;
-        }
-
-        if let Err(e) = self.audio_recorder.start() {
-            error!("Failed to start recording: {}", e);
-            self.notify_user(
-                "Recording could not be started.".to_string(),
-                crate::app::notices::Tone::Problem,
-                cx,
-            );
-            return;
-        }
-
-        self.recording_state = RecordingState::Recording;
         // Bind the note to the chat it started in *and* to the reply it is
         // answering: resolving either at stop time would misdeliver if the
         // user switches chats meanwhile — which also cancels the draft, so
         // the note arrived in the right conversation with its quote gone.
-        self.recording_target = self.selected_chat.clone().map(|jid| RecordingTarget {
+        let target = RecordingTarget {
             jid,
             reply: self.reply_to.clone(),
-        });
-        self.update_input_recording(cx);
-        self.ensure_recording_tick(cx);
-        info!("PTT recording started");
-        cx.notify();
+        };
+        let composer = self.input_area.clone();
+        let app = cx.entity().downgrade();
+        match self
+            .recorder
+            .update(cx, |recorder, cx| recorder.open(target, composer, app, cx))
+        {
+            // No notify: what the microphone being open changes on screen is
+            // the composer's panel, and the composer was told directly.
+            Ok(()) => info!("PTT recording started"),
+            Err(reason) => self.notify_user(reason, crate::app::notices::Tone::Problem, cx),
+        }
     }
+
     /// Stop recording and send the audio message
     pub fn stop_recording_and_send(&mut self, cx: &mut Context<Self>) {
         // Check if connected before attempting to send
@@ -139,39 +309,24 @@ impl WhatsAppApp {
             return;
         }
 
-        if !self.is_recording() {
+        if !self.recorder.read(cx).is_recording() {
             warn!("Not recording");
             return;
         }
 
-        let Some(RecordingTarget { jid, reply }) = self.recording_target.take() else {
-            warn!("No recording chat, cancelling recording");
-            self.cancel_recording(cx);
-            return;
-        };
-
-        self.recording_state = RecordingState::Processing;
-        self.update_input_recording(cx);
-        cx.notify();
-
-        // Stop recording and get audio data
-        let recording = match self.audio_recorder.stop() {
-            Ok(recording) => recording,
-            Err(e) => {
-                error!("Failed to stop recording: {}", e);
-                self.notify_user(
-                    "The recording could not be stopped.".to_string(),
-                    crate::app::notices::Tone::Problem,
-                    cx,
-                );
-                // Said *and* acted on. Through the cancel, which is the only
-                // thing that releases the device: setting the state to idle
-                // alone left the capture running with `is_recording` false and
-                // the panel gone, so no control on screen could close the
-                // microphone after that — a notice about a microphone that is
-                // still open is the worse half of that bug, not a fix for it.
-                // The cancel resets the input area and notifies as well.
-                self.cancel_recording(cx);
+        let composer = self.input_area.clone();
+        let (RecordingTarget { jid, reply }, recording, epoch) = match self
+            .recorder
+            .update(cx, |recorder, cx| recorder.stop(composer, cx))
+        {
+            Stopped::Captured {
+                target,
+                recording,
+                epoch,
+            } => (target, recording, epoch),
+            Stopped::Nowhere => return,
+            Stopped::Refused(reason) => {
+                self.notify_user(reason, crate::app::notices::Tone::Problem, cx);
                 return;
             }
         };
@@ -183,16 +338,13 @@ impl WhatsAppApp {
                 crate::app::notices::Tone::Problem,
                 cx,
             );
-            self.recording_state = RecordingState::Idle;
-            self.update_input_recording(cx);
-            cx.notify();
+            self.settle_recording(cx);
             return;
         }
         // Which recording this encode belongs to. The task below is detached
         // and cannot be stopped from outside, so the only way a teardown can
         // disown it is for it to ask on the way back whether the recording it
         // was started for is still the current one.
-        let epoch = self.recording_epoch;
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let encoded = Self::finish(cx, recording).await;
             let _ = entity.update(cx, |app, cx| {
@@ -201,7 +353,7 @@ impl WhatsAppApp {
                 // it anyway delivers a cancelled recording; and setting `Idle`
                 // over a recording that has since started hides its controls
                 // with the microphone still open.
-                if app.recording_epoch != epoch {
+                if app.recorder.read(cx).epoch() != epoch {
                     info!("Discarding an encode from a recording that was cancelled");
                     return;
                 }
@@ -210,6 +362,7 @@ impl WhatsAppApp {
         })
         .detach();
     }
+
     /// Turn a stopped recording into the note that gets sent.
     ///
     /// Preparing it — the resample to 16 kHz and the envelope — is the same
@@ -289,26 +442,21 @@ impl WhatsAppApp {
                 // is written for a reader: a refused microphone, a recording
                 // too short to send, an encoder that stopped.
                 self.notify_user(error, crate::app::notices::Tone::Problem, cx);
-                self.recording_state = RecordingState::Idle;
-                self.update_input_recording(cx);
-                cx.notify();
+                self.settle_recording(cx);
                 return;
             }
         };
 
-        let Some(client) = &self.client else {
+        if self.client.is_none() {
             warn!("Cannot send audio: client is unavailable");
             self.notify_user(
                 "That recording could not be sent: not connected.".to_string(),
                 crate::app::notices::Tone::Problem,
                 cx,
             );
-            self.recording_state = RecordingState::Idle;
-            self.update_input_recording(cx);
-            cx.notify();
+            self.settle_recording(cx);
             return;
-        };
-        let _ = client;
+        }
         // Recording is a way of answering, so the draft the note was bound to
         // belongs to *this* send — and leaving it armed made it attach itself
         // to whatever was typed next, which is the half of the bug nobody
@@ -329,9 +477,10 @@ impl WhatsAppApp {
             QuotedMessage::from(draft)
         });
         self.send_voice_note(&jid, ogg_data, waveform, duration_secs, quoted);
-        self.recording_state = RecordingState::Idle;
-        self.update_input_recording(cx);
+        self.settle_recording(cx);
         info!("PTT audio sent successfully");
+        // The bubble the send just drew is the app's, and this is what puts
+        // it on screen.
         cx.notify();
     }
 
@@ -392,17 +541,107 @@ impl WhatsAppApp {
             self.scroll_to_last_message();
         }
     }
+
     /// Cancel recording without sending
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
-        self.audio_recorder.cancel();
-        self.recording_state = RecordingState::Idle;
-        self.recording_target = None;
-        // Disown an encode that is still running. Cancelling is the only way
-        // out of `Processing` other than the completion itself, which is why
-        // this is the one place that has to say so.
-        self.recording_epoch = self.recording_epoch.wrapping_add(1);
-        self.update_input_recording(cx);
+        let composer = self.input_area.clone();
+        self.recorder
+            .update(cx, |recorder, cx| recorder.cancel(composer, cx));
         info!("PTT recording cancelled");
-        cx.notify();
+    }
+
+    /// Back to idle, without disowning anything: the encode this settles is
+    /// the one that just ended.
+    fn settle_recording(&mut self, cx: &mut Context<Self>) {
+        let composer = self.input_area.clone();
+        self.recorder
+            .update(cx, |recorder, cx| recorder.settle(composer, cx));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A [`Recorder`] with no window behind it. The device is not opened by
+    /// any of this: what the tests below drive is the state machine that
+    /// decides whether an encode is still wanted.
+    fn recorder() -> Recorder {
+        Recorder::new()
+    }
+
+    /// The three states mean three different things to the composer, and
+    /// only one of them is the microphone being open.
+    #[test]
+    fn only_recording_holds_the_microphone() {
+        let mut recorder = recorder();
+        assert_eq!(recorder.state(), RecordingState::Idle);
+        assert!(!recorder.is_recording());
+
+        recorder.state = RecordingState::Recording;
+        assert!(recorder.is_recording());
+
+        // Processing is the encode: the microphone is shut, and the panel it
+        // was drawing has to go with it.
+        recorder.state = RecordingState::Processing;
+        assert!(!recorder.is_recording());
+    }
+
+    /// Cancelling disowns the encode that is still running, because nothing
+    /// can stop it: the completion asks on the way back whether the recording
+    /// it was started for is still the current one, and this is the answer
+    /// that says no.
+    #[test]
+    fn cancelling_disowns_an_encode_in_flight() {
+        let mut recorder = recorder();
+        recorder.state = RecordingState::Processing;
+        let encoding = recorder.epoch();
+
+        recorder.disown();
+
+        assert_ne!(
+            recorder.epoch(),
+            encoding,
+            "the note that comes back is not this one's"
+        );
+        assert_eq!(recorder.state(), RecordingState::Idle);
+        assert!(recorder.take_target().is_none(), "and it is bound nowhere");
+    }
+
+    /// Settling is what a completed encode does, and it must *not* disown
+    /// anything: the recording it settles is the one that just finished, and
+    /// bumping here would have every successful send discard the next one.
+    #[test]
+    fn settling_leaves_the_epoch_where_it_is() {
+        let mut recorder = recorder();
+        recorder.state = RecordingState::Processing;
+        let encoding = recorder.epoch();
+
+        recorder.idle();
+
+        assert_eq!(recorder.epoch(), encoding);
+        assert_eq!(recorder.state(), RecordingState::Idle);
+    }
+
+    /// The note is bound to where it is going when the microphone opens, not
+    /// when it closes: the reader can switch chats or answer something else
+    /// while it runs, and both would otherwise be resolved against whatever
+    /// the window looks like at the end.
+    #[test]
+    fn stopping_takes_the_target_the_recording_started_with() {
+        let mut recorder = recorder();
+        recorder.state = RecordingState::Recording;
+        recorder.target = Some(RecordingTarget {
+            jid: "111@s.whatsapp.net".to_string(),
+            reply: None,
+        });
+
+        let bound = recorder.take_target().expect("bound when it opened");
+
+        assert_eq!(bound.jid, "111@s.whatsapp.net");
+        assert!(
+            recorder.take_target().is_none(),
+            "and taken, so a second stop has nowhere to send"
+        );
     }
 }

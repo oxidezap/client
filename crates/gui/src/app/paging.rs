@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use gpui::Context;
+use gpui::{App, Context};
 use log::debug;
 use oxidezap_core::{Chat, ChatMessage};
 use oxidezap_ipc::PageCursor;
@@ -93,49 +93,165 @@ impl Paging {
     }
 }
 
+/// Where both paged lists stand, and nothing else.
+///
+/// The first of the four clusters lifted off [`WhatsAppApp`] into an entity of
+/// its own. What it owns is two positions; what it deliberately does not own
+/// is the rows those positions describe, which are the app's — so every method
+/// here answers "should this be asked for, and from where" and the app is what
+/// asks. Nothing in it is drawn, so nothing in it notifies: an entity that
+/// nobody observes and no view reads is one whose changes cost a window
+/// exactly nothing, which is the cheapest end of the split.
+pub(super) struct Pages {
+    /// Where each conversation's timeline continues, and whether it is asking.
+    timelines: TimelinePages,
+    /// Where the chat list continues.
+    chats: Paging,
+}
+
+impl Pages {
+    pub(super) fn new() -> Self {
+        Self {
+            timelines: TimelinePages::new(),
+            chats: Paging::default(),
+        }
+    }
+
+    /// Whether a conversation's newest page is worth asking for, marking it
+    /// asked if it is.
+    ///
+    /// Only ever true once per conversation: the first page is the one that
+    /// fills a timeline the attach load left holding a preview.
+    fn open_timeline(&mut self, jid: &str) -> bool {
+        let paging = self.timelines.entry(jid.to_string()).or_default();
+        if !matches!(paging, Paging::Unasked) {
+            return false;
+        }
+        *paging = Paging::Loading { from: None };
+        true
+    }
+
+    /// The cursor the page *before* this conversation's oldest row is asked
+    /// with, marking it asked.
+    fn older(&mut self, jid: &str) -> Option<PageCursor> {
+        let paging = self.timelines.entry(jid.to_string()).or_default();
+        // Either nothing to ask for, or the first page is still coming — and
+        // that one lands at the bottom, which is where the reader is.
+        let Some(Some(cursor)) = paging.to_ask() else {
+            return None;
+        };
+        *paging = Paging::Loading {
+            from: Some(cursor.clone()),
+        };
+        Some(cursor)
+    }
+
+    /// The cursor the next page of the chat list is asked with, marking it
+    /// asked. The inner `None` is "from the top".
+    fn more_chats(&mut self) -> Option<Option<PageCursor>> {
+        let ask = self.chats.to_ask()?;
+        self.chats = Paging::Loading { from: ask.clone() };
+        Some(ask)
+    }
+
+    /// Settle a conversation's position on the page that arrived, saying
+    /// whether anything was waiting for it.
+    ///
+    /// A page nobody is waiting for is a page from before an account reset:
+    /// [`Self::forget`] clears these positions, and the answer to a request
+    /// made under the old account can still be on the socket. Folding it in
+    /// would put that account's rows into this one's list.
+    fn timeline_page_arrived(&mut self, jid: &str, next: Option<PageCursor>) -> bool {
+        let Some(Paging::Loading { from }) = self.timelines.get(jid) else {
+            return false;
+        };
+        let asked_from = from.clone();
+        self.timelines
+            .insert(jid.to_string(), Paging::arrived(asked_from, next));
+        true
+    }
+
+    /// The same, for the chat list.
+    fn chat_page_arrived(&mut self, next: Option<PageCursor>) -> bool {
+        let Paging::Loading { from } = &self.chats else {
+            return false;
+        };
+        self.chats = Paging::arrived(from.clone(), next);
+        true
+    }
+
+    /// A page that was refused. Put the position back so it can be asked for
+    /// again; a list that stayed `Loading` would never ask anything again.
+    fn lost(&mut self, jid: Option<&str>) {
+        match jid {
+            Some(jid) => {
+                let paging = self.timelines.entry(jid.to_string()).or_default();
+                *paging = paging.lost();
+            }
+            None => self.chats = self.chats.lost(),
+        }
+    }
+
+    /// Forget where these conversations continued. See
+    /// [`WhatsAppApp::forget_chat_paging`].
+    fn forget_chats(&mut self, gone: &[String]) {
+        for jid in gone {
+            self.timelines.remove(jid);
+        }
+    }
+
+    /// Ask the finished lists again. See
+    /// [`WhatsAppApp::reopen_finished_pages`].
+    fn reopen(&mut self, loaded: &[String]) {
+        for jid in loaded {
+            if let Some(paging) = self.timelines.get_mut(jid) {
+                *paging = paging.reopened();
+            }
+        }
+        self.chats = self.chats.reopened();
+    }
+
+    /// Everything this window learned about where its lists continue.
+    fn forget(&mut self) {
+        self.timelines.clear();
+        self.chats = Paging::Unasked;
+    }
+}
+
 impl WhatsAppApp {
     /// Ask for a conversation's newest page, if nobody has yet.
     ///
     /// Called where a conversation becomes the one on screen. The rows the
     /// attach load left are the unread tail and the preview — enough to draw a
     /// list row, not a conversation — so this is what fills the timeline.
-    pub(super) fn ensure_timeline_page(&mut self, jid: &str) {
-        let paging = self.timeline_pages.entry(jid.to_string()).or_default();
-        if !matches!(paging, Paging::Unasked) {
-            return;
-        }
+    pub(super) fn ensure_timeline_page(&mut self, jid: &str, cx: &mut App) {
         // Only once there is somebody to answer. Nothing sends `PageLost`
         // for a request that was never made, so a `Loading` set here with no
         // session is one the list never leaves — and a reconnect keeps it,
         // because the paging state survives. Common on the web, where a page
-        // cannot start a daemon and simply waits for one.
+        // cannot start a daemon and simply waits for one. Asked before the
+        // position moves, so a window with no session leaves it `Unasked`.
         let Some(client) = &self.client else {
             return;
         };
-        *paging = Paging::Loading { from: None };
-        client.load_messages(jid.to_string(), None);
+        if self.pages.update(cx, |pages, _| pages.open_timeline(jid)) {
+            client.load_messages(jid.to_string(), None);
+        }
     }
 
     /// Ask for the page before the one this conversation is showing.
     ///
     /// The reader is near the top of what has been drawn; whether there *is*
     /// anything older is what the last page said.
-    pub(super) fn want_older_messages(&mut self, jid: &str) {
-        let paging = self.timeline_pages.entry(jid.to_string()).or_default();
-        let Some(Some(cursor)) = paging.to_ask() else {
-            // Either nothing to ask for, or the first page is still coming —
-            // and that one lands at the bottom, which is where the reader is.
-            return;
-        };
+    pub(super) fn want_older_messages(&mut self, jid: &str, cx: &mut App) {
         // See `ensure_timeline_page`: no session, no request, so no
         // `Loading` to be stuck in.
         let Some(client) = &self.client else {
             return;
         };
-        *paging = Paging::Loading {
-            from: Some(cursor.clone()),
-        };
-        client.load_messages(jid.to_string(), Some(cursor));
+        if let Some(cursor) = self.pages.update(cx, |pages, _| pages.older(jid)) {
+            client.load_messages(jid.to_string(), Some(cursor));
+        }
     }
 
     /// Ask for more of the chat list.
@@ -145,15 +261,13 @@ impl WhatsAppApp {
     /// window does not have. Asking from the top is the fallback for a load
     /// that named no position: it re-fetches the rows already on screen to
     /// obtain a cursor, and they merge into themselves.
-    pub fn want_more_chats(&mut self) {
-        let Some(ask) = self.chat_pages.to_ask() else {
-            return;
-        };
+    pub fn want_more_chats(&mut self, cx: &mut App) {
         let Some(client) = &self.client else {
             return;
         };
-        self.chat_pages = Paging::Loading { from: ask.clone() };
-        client.load_chats(ask);
+        if let Some(ask) = self.pages.update(cx, |pages, _| pages.more_chats()) {
+            client.load_chats(ask);
+        }
     }
 
     /// Fold one page of a conversation into it.
@@ -164,20 +278,16 @@ impl WhatsAppApp {
         next: Option<PageCursor>,
         cx: &mut Context<Self>,
     ) {
-        // A page nobody is waiting for is a page from before an account
-        // reset: `forget_paging` clears these positions, and the answer to a
-        // request made under the old account can still be on the socket.
-        // Folding it in would put that account's rows into this one's list.
-        let Some(Paging::Loading { from }) = self.timeline_pages.get(&jid) else {
+        if !self
+            .pages
+            .update(cx, |pages, _| pages.timeline_page_arrived(&jid, next))
+        {
             debug!(
                 "a page arrived for {}, which nobody asked for",
                 observe_str(&jid)
             );
             return;
-        };
-        let asked_from = from.clone();
-        self.timeline_pages
-            .insert(jid.clone(), Paging::arrived(asked_from, next));
+        }
         if messages.is_empty() {
             return;
         }
@@ -218,11 +328,13 @@ impl WhatsAppApp {
     ) {
         // The same rule, and the one that matters most: this page's rows go
         // into the list whether or not anything else remembers them.
-        let Paging::Loading { from } = &self.chat_pages else {
+        if !self
+            .pages
+            .update(cx, |pages, _| pages.chat_page_arrived(next))
+        {
             debug!("a chat page arrived that nobody asked for");
             return;
-        };
-        self.chat_pages = Paging::arrived(from.clone(), next);
+        }
         if chats.is_empty() {
             return;
         }
@@ -237,14 +349,8 @@ impl WhatsAppApp {
 
     /// A page that was refused. Put the position back so it can be asked for
     /// again; a view that stayed `Loading` would never ask anything again.
-    pub(super) fn page_lost(&mut self, jid: Option<String>) {
-        match jid {
-            Some(jid) => {
-                let paging = self.timeline_pages.entry(jid).or_default();
-                *paging = paging.lost();
-            }
-            None => self.chat_pages = self.chat_pages.lost(),
-        }
+    pub(super) fn page_lost(&mut self, jid: Option<String>, cx: &mut App) {
+        self.pages.update(cx, |pages, _| pages.lost(jid.as_deref()));
     }
 
     /// Forget where these conversations continued.
@@ -254,10 +360,8 @@ impl WhatsAppApp {
     /// same name would otherwise inherit a `Done` and never ask for its own
     /// history again — an empty conversation with nothing to fill it. Keyed
     /// by JID alone, like the message cache evicted beside it.
-    pub(super) fn forget_chat_paging(&mut self, gone: &[String]) {
-        for jid in gone {
-            self.timeline_pages.remove(jid);
-        }
+    pub(super) fn forget_chat_paging(&mut self, gone: &[String], cx: &mut App) {
+        self.pages.update(cx, |pages, _| pages.forget_chats(gone));
     }
 
     /// Ask the finished lists again, because the store has more to give.
@@ -278,13 +382,8 @@ impl WhatsAppApp {
     /// says changed. The chat list itself reopens either way: a load naming
     /// chats is one the store answered, and whether it could also have grown
     /// the list is not something the event says.
-    pub(super) fn reopen_finished_pages(&mut self, loaded: &[String]) {
-        for jid in loaded {
-            if let Some(paging) = self.timeline_pages.get_mut(jid) {
-                *paging = paging.reopened();
-            }
-        }
-        self.chat_pages = self.chat_pages.reopened();
+    pub(super) fn reopen_finished_pages(&mut self, loaded: &[String], cx: &mut App) {
+        self.pages.update(cx, |pages, _| pages.reopen(loaded));
     }
 
     /// Where a history load leaves the chat list.
@@ -298,17 +397,23 @@ impl WhatsAppApp {
     ///
     /// A page already in flight is left alone: it asked from a position of
     /// its own and its answer is what settles the list.
-    pub(super) fn note_chat_list_end(&mut self, complete: bool, next: Option<String>) {
-        settle_chat_list_end(&mut self.chat_pages, complete, next);
+    pub(super) fn note_chat_list_end(
+        &mut self,
+        complete: bool,
+        next: Option<String>,
+        cx: &mut App,
+    ) {
+        self.pages.update(cx, |pages, _| {
+            settle_chat_list_end(&mut pages.chats, complete, next);
+        });
     }
 
     /// Everything this window learned about where its lists continue.
     ///
     /// Dropped with the account: the cursors describe positions in one
     /// account's store, and the next account's rows are not behind them.
-    pub(super) fn forget_paging(&mut self) {
-        self.timeline_pages.clear();
-        self.chat_pages = Paging::Unasked;
+    pub(super) fn forget_paging(&mut self, cx: &mut App) {
+        self.pages.update(cx, |pages, _| pages.forget());
     }
 }
 
@@ -616,5 +721,112 @@ mod tests {
     fn a_conversation_asks_when_the_reader_nears_its_top() {
         assert!(nearing_start(0), "the top row on screen asks");
         assert!(!nearing_start(40), "the middle does not");
+    }
+
+    const CHAT: &str = "111@s.whatsapp.net";
+
+    /// A conversation asks for its newest page exactly once. The second call
+    /// is the frame after the first, and the frame after that: this is asked
+    /// from the render pass, so "only once" is the whole of the rule.
+    #[test]
+    fn a_timeline_opens_once() {
+        let mut pages = Pages::new();
+
+        assert!(pages.open_timeline(CHAT), "nobody had asked");
+        assert!(!pages.open_timeline(CHAT), "and the ask is still in flight");
+        assert!(pages.timeline_page_arrived(CHAT, None));
+        assert!(
+            !pages.open_timeline(CHAT),
+            "an answered conversation does not start over"
+        );
+    }
+
+    /// Paging backwards asks from where the last page ended, and never twice
+    /// from the same place.
+    #[test]
+    fn a_conversation_asks_once_per_position() {
+        let mut pages = Pages::new();
+        pages.open_timeline(CHAT);
+        pages.timeline_page_arrived(CHAT, Some(cursor("m1:9:2")));
+
+        assert_eq!(pages.older(CHAT), Some(cursor("m1:9:2")));
+        assert_eq!(pages.older(CHAT), None, "that page is already coming");
+        assert!(pages.timeline_page_arrived(CHAT, None));
+        assert_eq!(pages.older(CHAT), None, "and there is nothing behind it");
+    }
+
+    /// A page nobody is waiting for is a page from before an account reset.
+    /// Folding it in would put the old account's rows into this one's list,
+    /// which is why the answer is a refusal rather than a merge.
+    #[test]
+    fn a_page_from_a_forgotten_account_is_refused() {
+        let mut pages = Pages::new();
+        pages.open_timeline(CHAT);
+        assert!(pages.more_chats().is_some());
+
+        pages.forget();
+
+        assert!(!pages.timeline_page_arrived(CHAT, None));
+        assert!(!pages.chat_page_arrived(None));
+    }
+
+    /// A refusal puts both lists back where they were asking from, so the
+    /// reader who scrolls again asks again rather than waiting forever.
+    #[test]
+    fn a_refusal_leaves_both_lists_able_to_ask() {
+        let mut pages = Pages::new();
+        pages.open_timeline(CHAT);
+        pages.timeline_page_arrived(CHAT, Some(cursor("m1:9:2")));
+        pages.older(CHAT);
+        pages.more_chats();
+
+        pages.lost(Some(CHAT));
+        pages.lost(None);
+
+        assert_eq!(pages.older(CHAT), Some(cursor("m1:9:2")));
+        assert_eq!(pages.more_chats(), Some(None), "from the top, as before");
+    }
+
+    /// A chat that left takes its position with it: a JID is reused, and a
+    /// recreated conversation inheriting a `Done` is one that never asks for
+    /// its own history.
+    #[test]
+    fn a_departed_chat_leaves_no_position_behind() {
+        let mut pages = Pages::new();
+        pages.open_timeline(CHAT);
+        pages.timeline_page_arrived(CHAT, None);
+
+        pages.forget_chats(&[CHAT.to_string()]);
+
+        assert!(
+            pages.open_timeline(CHAT),
+            "the chat that came back asks like a new one"
+        );
+    }
+
+    /// A history sync commits its batches over minutes, so a list that ended
+    /// before the sync did did not really end there. Reopening moves only the
+    /// settled ends; anything still in flight names its own continuation.
+    #[test]
+    fn a_finished_list_reopens_and_an_asking_one_does_not() {
+        let mut pages = Pages::new();
+        pages.open_timeline(CHAT);
+        pages.timeline_page_arrived(CHAT, Some(cursor("m1:9:2")));
+        pages.older(CHAT);
+        pages.timeline_page_arrived(CHAT, None);
+        pages.more_chats();
+
+        pages.reopen(&[CHAT.to_string()]);
+
+        assert_eq!(
+            pages.older(CHAT),
+            Some(cursor("m1:9:2")),
+            "asking again from where it stopped"
+        );
+        assert_eq!(
+            pages.more_chats(),
+            None,
+            "and a chat list still waiting is left alone"
+        );
     }
 }

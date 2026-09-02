@@ -46,13 +46,13 @@ impl WhatsAppApp {
                 // it now. Not gated on `complete`, which an account of a
                 // hundred chats never is — see `reopen_finished_pages`.
                 let reloaded: Vec<String> = chats.iter().map(|c| c.jid.clone()).collect();
-                self.reopen_finished_pages(&reloaded);
+                self.reopen_finished_pages(&reloaded, cx);
                 // And this load says where the list stands, which is the one
                 // answer that beats anything inferred from it: `next` is the
                 // position it stopped at, and a complete load is the whole
                 // list. Applied after the reopen above, so the load's own
                 // answer is the one that survives.
-                self.note_chat_list_end(complete, next);
+                self.note_chat_list_end(complete, next, cx);
                 if complete {
                     let loaded: std::collections::HashSet<&str> =
                         chats.iter().map(|c| c.jid.as_str()).collect();
@@ -94,7 +94,7 @@ impl WhatsAppApp {
                     // outlives its chat is one a recreated chat inherits, and
                     // a conversation that believes it has everything asks for
                     // nothing. See `forget_chat_paging`.
-                    self.forget_chat_paging(&dropped);
+                    self.forget_chat_paging(&dropped, cx);
                     self.departed_chats = departed;
                 }
                 // The updates this load itself brought back already read:

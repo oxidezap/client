@@ -77,11 +77,12 @@ pub fn render_connected_view(
             && app.media_viewer().is_none())
         .then(|| selected_jid.clone())
         .flatten(),
+        cx,
     );
     // Against what this frame is about to draw, and before anything reads the
     // chat list: a chat a complete load said was gone is kept only while it is
     // on screen, and this is where looking away is noticed.
-    app.prune_departed_chats();
+    app.prune_departed_chats(cx);
 
     let viewer_focus = app.viewer_focus().clone();
 
@@ -101,7 +102,7 @@ pub fn render_connected_view(
     // its end by definition, so it asks like any other list that is; the
     // paging state is what stops it asking twice, and `Done` is what ends it.
     if app.chat_list_is_empty() {
-        app.want_more_chats();
+        app.want_more_chats(cx);
     }
 
     // The conversation is named rather than held, so nothing here borrows
@@ -116,7 +117,7 @@ pub fn render_connected_view(
         .cloned();
     let message_cache = open_chat
         .as_ref()
-        .map(|jid| app.get_message_list_cache(jid, typing.clone(), layout));
+        .map(|jid| app.get_message_list_cache(jid, typing.clone(), layout, cx));
     // A call in a chat other than the one on screen is what the return banner
     // is for; a call in *this* chat is already obvious from the card.
     let return_banner = app
