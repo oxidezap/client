@@ -575,6 +575,38 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   because the daemon does not know it — two windows can have different
   conversations open, and a header button is about the one the person pressing
   it was looking at.
+- **A plugin's text field commits on Enter *and* on losing focus, and says so
+  while it has not.** It used to commit on Enter alone, and nothing on screen
+  said so: somebody typed a new keyword into the autoreply's box, saw it there,
+  closed Settings, and the plugin went on answering the old one — then a
+  restart drew the old one back, which read as a setting that had not been
+  saved, because it had not. Committing on every keystroke is still wrong (one
+  request per letter, and a keyword the plugin is halfway through being given),
+  so the box commits when Enter is pressed and when it is left, and draws "not
+  saved yet" with a Save button under itself while what it holds differs from
+  what the plugin was last given. That last phrase is the subtle half: the
+  window remembers the value it *sent* as well as the one the plugin
+  *published*, because a plugin may store without redrawing — compared against
+  the published value alone the line would never go away — and because Enter
+  followed by a click elsewhere is two commits of one value, of which the
+  second must find nothing pending. The plugin publishing a different value
+  clears that memory: its answer replaces the window's guess, and the box.
+- **A module the loader refused is published, with the reason.** Loading is
+  the one failure whose message used to reach only the daemon's log, and the
+  Settings screen filled the gap with a guess — "not a plugin, or built against
+  a different version of the ABI" — over a file whose actual problem was the
+  flags it was built with. So `Registry::refuse` records the id and the
+  sentence as a surface of its own kind (`PluginSurface::refused`, distinct
+  from `stopped`: a stopped plugin ran and declared things, a refused one has
+  nothing but the reason), and the card draws it. The reason most worth naming
+  is a shared memory: the root `.cargo/config.toml` gives the wasm target the
+  web front end's flags, cargo joins a target's `rustflags` from every config
+  file up the tree and no config *under* the examples can take them back, so a
+  bare `cargo build --target wasm32-unknown-unknown` in a plugin's directory
+  produces exactly that module. `cargo xtask plugin build <dir>` is the one
+  place that clears `RUSTFLAGS`; the loader's message names it, and a test
+  reads the message back so wasmi's wording cannot drift out from under the
+  match that recognises it.
 - **The camera is where the microphone is, and the picture crosses encoded.**
   `oxidezap-session` opens both, because the process that owns the session
   owns the devices — so the window has no camera of its own and no way to

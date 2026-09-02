@@ -723,6 +723,7 @@ mod tests {
                 },
             }],
             stopped: None,
+            refused: None,
         }
     }
 

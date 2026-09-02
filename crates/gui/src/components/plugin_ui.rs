@@ -146,6 +146,13 @@ fn widget(
             // typed. A field with no box yet is one whose sync has not run,
             // which happens for exactly one frame after a plugin adds it.
             let state = app.plugin_field(&surface.id, slot, &node.id, cx);
+            // Said under the box while what is in it has not reached the
+            // plugin, and not otherwise. A box that commits on Enter and on
+            // losing focus and says neither is a box somebody types a new
+            // keyword into, reads back, and leaves — and the plugin goes on
+            // answering the old one. Not drawn over a dead control: a
+            // plugin that stopped cannot be given anything.
+            let unsaved = live && app.plugin_field_unsaved(&surface.id, slot, &node.id, cx);
             div()
                 .flex()
                 .flex_col()
@@ -158,6 +165,16 @@ fn widget(
                         Input::new(state).w_full().disabled(!live)
                     }),
                 )
+                .when(unsaved, |el| {
+                    el.child(unsaved_row(
+                        &surface.id,
+                        slot,
+                        &node.id,
+                        ctx.entity.clone(),
+                        metrics,
+                        cx,
+                    ))
+                })
                 .into_any_element()
         }
 
@@ -242,6 +259,49 @@ fn row_with_label(
                 .child(label.to_owned()),
         )
         .child(control)
+}
+
+/// The line under a field whose contents the plugin has not been given yet,
+/// with the one control that sends them.
+///
+/// Enter and leaving the box send them too, so the button is mostly there to
+/// be read: it is what tells somebody the field has a commit at all, which
+/// nothing about a text box says on its own. A click blurs the box first, so
+/// the value goes once — `commit_plugin_field` finds nothing pending on the
+/// second arrival.
+fn unsaved_row(
+    plugin: &str,
+    slot: PluginSlot,
+    id: &str,
+    entity: Entity<WhatsAppApp>,
+    metrics: Metrics,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let (plugin, id) = (plugin.to_owned(), id.to_owned());
+    div()
+        .flex()
+        .items_center()
+        .gap(metrics.space_md())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(metrics.text_small())
+                .text_color(cx.theme().warning)
+                .child("Not saved yet. Press Enter, or click Save."),
+        )
+        .child(
+            Button::new(SharedString::from(format!("plugin/{plugin}/{id}/save")))
+                .label("Save")
+                .primary()
+                .small()
+                .on_click(move |_, _window, cx| {
+                    let (plugin, id) = (plugin.clone(), id.clone());
+                    entity.update(cx, |app, cx| {
+                        app.commit_plugin_field(&plugin, slot, &id, cx);
+                    });
+                }),
+        )
 }
 
 fn field_label(label: &str, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
@@ -391,6 +451,47 @@ pub fn settings_entry(
 ) -> impl IntoElement + use<> {
     let metrics = ctx.metrics;
     let subtle = parts::subtle(cx);
+
+    // A module the host would not run has no permissions to describe and
+    // nothing drawn: its card is the reason it was not run, which is the one
+    // sentence the person who copied the file in needs and which used to
+    // reach nobody but the daemon's log. Drawn in the same frame as the rest
+    // so it is found in the same list.
+    if let Some(reason) = &surface.refused {
+        return entry(
+            heading(
+                surface.name.clone(),
+                &surface.id,
+                Standing::NotLoaded,
+                remove,
+                metrics,
+                cx,
+            )
+            .into_any_element(),
+            vec![
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(metrics.space_xs())
+                    .child(
+                        div()
+                            .text_size(metrics.text_small())
+                            .text_color(subtle)
+                            .child("It is in the plugins folder but the host would not run it."),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.text_small())
+                            .text_color(cx.theme().danger)
+                            .child(reason.clone()),
+                    )
+                    .into_any_element(),
+            ],
+            metrics,
+            cx,
+        );
+    }
+
     let standing = if surface.stopped.is_some() {
         Standing::Stopped
     } else {
@@ -517,12 +618,15 @@ pub fn settings_entry(
     )
 }
 
-/// A file in the folder that the host could not run.
+/// A file in the folder that the host said nothing about.
 ///
-/// It has no surface, so there is no name, no permissions and nothing it
-/// drew — but it is in the folder, it spends the folder's budget at every
-/// load, and it is the one entry somebody is most likely to be looking for.
-/// Drawn in the same list and the same frame as the rest, with the one
+/// A module the host *refused* has a surface carrying the reason, and is
+/// drawn by `settings_entry`. This is the file that never got that far: one
+/// the loader skipped before opening it — writable by another user, past the
+/// folder's cap — or one a daemon older than this window did not report. It
+/// has no surface, so there is no name, no permissions and nothing it drew;
+/// but it is in the folder, it spends the folder's budget at every load, and
+/// it is drawn in the same list and the same frame as the rest, with the one
 /// control it can have.
 pub fn unloaded_entry(
     id: &str,
@@ -538,9 +642,9 @@ pub fn unloaded_entry(
                 .text_size(metrics.text_small())
                 .text_color(subtle)
                 .child(
-                    "It is in the plugins folder but the host would not run it. \
-                     Either it is not a plugin, or it was built against a different \
-                     version of the ABI.",
+                    "It is in the plugins folder but the host did not run it, and did \
+                     not say why here. The daemon's log has the reason; a file another \
+                     user can write is skipped before it is opened.",
                 )
                 .into_any_element(),
         ],

@@ -46,9 +46,16 @@ Two directories sit outside the workspace on purpose, each carrying its own
 so a host build fails at every `oxi_*` symbol) and `xtask/` (it takes no
 dependencies at all, so the Pages job can compile it from a sparse checkout).
 Only the first is in `exclude`; the second is simply not a member. The reasoning
-is commented at both. `xtask/` has its own CI job; **`examples/` has none, and
-nothing in CI builds either plugin** — the one test that loads a built module is
-`#[ignore]`d, so a change there is checked by whoever makes it or not at all.
+is commented at both. `xtask/` has its own CI job; `examples/` is checked at
+the end of the Linux `Check` job — linted and tested on the host, built for
+wasm32 through `cargo xtask plugin build`, and the module loaded by the host's
+`#[ignore]`d test. **Build a plugin through that task, never with a bare
+`cargo build --target wasm32-unknown-unknown`:** the root `.cargo/config.toml`
+gives that target the web front end's flags and cargo joins them into every
+build under the tree, so the bare command produces a module with a shared
+memory that the daemon refuses. The task is the one place that knows to clear
+them, and the READMEs, the building guide and CI all name it rather than
+carrying their own `RUSTFLAGS=`.
 
 ## Build & verify
 

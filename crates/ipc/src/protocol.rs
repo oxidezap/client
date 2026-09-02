@@ -1121,6 +1121,7 @@ mod tests {
             gated: vec!["send messages".into()],
             approved: false,
             stopped: None,
+            refused: None,
             roots: Vec::new(),
         };
         let events = vec![

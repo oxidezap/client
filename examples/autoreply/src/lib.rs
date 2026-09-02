@@ -224,7 +224,6 @@ mod tests {
     use super::*;
     use oxidezap_plugin::testing::{Event as In, Host};
     use std::string::ToString as _;
-    use std::{format, vec};
 
     /// The whole point of the plugin, checked without a daemon: a message
     /// carrying the keyword is answered, in the chat it arrived in.

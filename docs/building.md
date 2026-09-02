@@ -18,18 +18,20 @@ cargo xtask help    # what there is to run; from the repository root
 cargo build --release --bin oxidezap --bin oxidezapd && ./target/release/oxidezap
 
 # A plugin. Its own workspace, its own target, and the file's name is its id.
-# `examples/template` is the same three commands; `cargo test` in either runs
-# its handlers against the SDK's test host, with no daemon and no wasm.
-# `RUSTFLAGS=` because the root's `.cargo/config.toml` sets `+atomics` and
-# `--shared-memory` for this target — that target is the *web front end* — and
-# cargo joins those into any build under this directory. A plugin built with
-# them has a shared memory, which the host refuses outright.
-cd examples/autoreply && RUSTFLAGS= cargo build --release --target wasm32-unknown-unknown
-cp target/wasm32-unknown-unknown/release/autoreply.wasm ~/.local/share/oxidezap/plugins/
-# And the one test that exercises the real SDK against the real host. Back at
-# the root first: the example is its own workspace and the root excludes it, so
-# from in there cargo cannot resolve the host crate at all.
-cd ../.. && cargo test -p oxidezap-plugin-host --all-features -- --ignored
+# `examples/template` is the same command; `cargo test` in either directory
+# runs its handlers against the SDK's test host, with no daemon and no wasm.
+# Through the task rather than a bare `cargo build --target wasm32-unknown-unknown`,
+# because the root's `.cargo/config.toml` sets `+atomics` and `--shared-memory`
+# for this target — that target is the *web front end* — and cargo joins those
+# into any build under the tree. A plugin built with them has a shared memory,
+# which the host refuses, saying so on the Settings screen. The task is the one
+# place that knows to clear `RUSTFLAGS`; it prints where the `.wasm` landed.
+rustup target add wasm32-unknown-unknown
+cargo xtask plugin build examples/autoreply
+cp examples/autoreply/target/wasm32-unknown-unknown/release/autoreply.wasm ~/.local/share/oxidezap/plugins/
+# And the one test that exercises the real SDK against the real host: it loads
+# the module the line above built. CI runs both, in the Linux `Check` job.
+cargo test -p oxidezap-plugin-host --all-features -- --ignored
 ```
 
 The same window as a page:

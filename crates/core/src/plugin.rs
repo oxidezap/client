@@ -147,13 +147,33 @@ pub struct PluginSurface {
     /// anything to act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<String>,
+    /// Why the host would not run it, for a module that never did.
+    ///
+    /// Not the same thing as [`stopped`](Self::stopped), and a front end
+    /// draws them differently: a stopped plugin ran, declared what it wanted
+    /// and may have drawn, so its card has permissions to describe and
+    /// widgets to keep on screen; a refused one has none of that. What it has
+    /// is a file in the folder and the one sentence saying why the file is
+    /// not a plugin here — which used to reach nobody but the daemon's log,
+    /// while Settings guessed at "a different version of the ABI" over a
+    /// module that had merely been built with the wrong flags.
+    ///
+    /// [`name`](Self::name) is the id for one of these, and
+    /// [`capabilities`](Self::capabilities) and [`roots`](Self::roots) are
+    /// empty: nothing was declared, because nothing ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 impl PluginSurface {
     /// Whether this plugin is still running.
+    ///
+    /// A refused module never was, and answers the same as one that stopped:
+    /// a front end asking this wants to know whether a press would reach
+    /// anything.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.stopped.is_none()
+        self.stopped.is_none() && self.refused.is_none()
     }
 
     /// Its roots in one slot, in the order the plugin declared them.

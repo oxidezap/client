@@ -96,8 +96,29 @@ impl Runtime {
         // The whole reason this is defensible in-process.
         config.consume_fuel(true);
         let engine = Engine::new(&config);
-        let module = Module::new(&engine, bytes)
-            .map_err(|e| anyhow!("{id} is not a wasm module this host can load: {e}"))?;
+        let module = Module::new(&engine, bytes).map_err(|e| {
+            let said = e.to_string();
+            // The one parse failure with a known cause, named as the cause.
+            // The root `.cargo/config.toml` gives every wasm build under the
+            // tree the web front end's flags — `+atomics`, `--shared-memory`
+            // — because that target *is* the web front end there, and a
+            // plugin built beside it inherits them. What comes out is a
+            // module with a shared memory, which this engine refuses at the
+            // first byte of the memory section; said as wasmi says it, that
+            // reached Settings as "built against a different version of the
+            // ABI", which it was not. The wording is wasmi's, so the test
+            // that reads this back is what notices the day it changes.
+            if said.contains("shared memor") {
+                anyhow!(
+                    "its memory is shared, which is how the web front end is built and \
+                     not how a plugin may be: it was built with the wasm flags in the \
+                     root `.cargo/config.toml`. Build it with `cargo xtask plugin build \
+                     <dir>`, which leaves them out ({said})"
+                )
+            } else {
+                anyhow!("it is not a wasm module this host can load: {said}")
+            }
+        })?;
 
         let kv = Kv::open(Arc::clone(state), id);
         let mut store = Store::new(
