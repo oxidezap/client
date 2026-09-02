@@ -331,10 +331,16 @@
   other end of the scale from `AppState::Error`, which leaves the connected
   view and schedules a reconnect and is catastrophic for a save that did not
   start. A failed save and a failed recording go through it.
-  What still does not is anything the *daemon* refused: a front end learns
+  What still does not is most of what the *daemon* refused: a front end learns
   only `Accepted`, and a refusal reaching the window would need a field on the
   wire. `SendFailed` is the one exception, and it is against a chat rather
-  than against the request. `CallMediaFailed` is the second, and it was added
+  than against the request. A download is the second, and it is the shape the
+  rest of them would take: `ProtocolError::Failed` says the daemon tried and
+  something outside the request went wrong, and carries whether asking again
+  could work — because that is the only question the person actually has, and
+  a full disk and a dropped connection are the same sentence without it. The
+  answer decides what the notice ends in; `app/notices.rs::what_went_wrong`
+  is where the bit is spent. `CallMediaFailed` is the third, and it was added
   after a browser call that dialled no relay read in the console as an offer,
   an ending, and not one line between them: the library publishes
   `MediaSetupFailed` with the reason and the event pump's catch-all was

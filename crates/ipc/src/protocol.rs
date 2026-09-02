@@ -919,6 +919,27 @@ pub enum ProtocolError {
     /// what the client would have to change.
     #[error("refused: {detail}")]
     Refused { detail: String },
+    /// The daemon agreed to the request and the attempt failed anyway.
+    ///
+    /// Distinct from every error above it, because those are all about the
+    /// request: the frame was well formed, the session was there, the daemon
+    /// tried, and something outside the request went wrong. Saying that with
+    /// [`ProtocolError::Refused`] is a lie in the one place it matters — that
+    /// one promises `detail` names what the client would have to change, and
+    /// here there is nothing the client could change.
+    ///
+    /// `retryable` is the half a front end cannot reconstruct from a
+    /// sentence: whether sending the same request again could ever succeed. A
+    /// download that failed on the network is worth another go; one that
+    /// failed because the disk is full is not, until something else changes.
+    /// A client that cannot tell the two apart either retries forever or
+    /// never retries at all, and both were what the single string bought.
+    ///
+    /// Never skipped on the way out, unlike the fields a reader is meant to
+    /// fill in: it is the whole reason this variant is not `Refused`, and a
+    /// default would be a guess at exactly the bit the reader came for.
+    #[error("failed: {detail}")]
+    Failed { detail: String, retryable: bool },
     /// The daemon is already serving as many front ends as it will. Sent
     /// before the connection closes, so a client retries rather than guessing
     /// why the socket went quiet.
