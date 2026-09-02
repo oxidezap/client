@@ -5,6 +5,20 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 24: `ProtocolError::Failed`, which says the daemon tried and something
+/// outside the request went wrong, and carries whether asking again could
+/// work. A download answered a full disk, a dropped connection and a session
+/// that went away with one `Refused` and one sentence — and `Refused`
+/// promises that its detail names what the client would have to change,
+/// which none of the three does. A v23 client does not know the tag: it
+/// reads the frame as unparsable and logs it, so the download it was waiting
+/// on goes unanswered rather than being answered wrongly, which is why this
+/// is a version rather than a field. The daemon is the half that
+/// deliberately outlives an upgrade, so the direction that matters is a v23
+/// window against a v24 daemon — the same case v15, v21 and v23 were bumped
+/// for. The third failure is `NoSession`, which already existed and now
+/// carries the sessions that went away mid-answer.
+///
 /// 23: `ClientRequest::SendMedia`. A file the user picked — a photo, a
 /// video, a document — staged through the media cache and sent by the daemon,
 /// which is the half `SendAudio` already had and the composer's paperclip
@@ -156,7 +170,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

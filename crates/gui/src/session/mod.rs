@@ -192,6 +192,78 @@ pub enum FromDaemon {
     StatusViewLost(Vec<String>),
 }
 
+/// Why something a front end asked for did not happen.
+///
+/// `detail` is the sentence somebody reads. `retryable` is the bit no
+/// sentence carries, and the only one a caller can act on: whether asking the
+/// same thing again could work at all. Nothing on this side can work it out —
+/// a full disk and a dropped connection are both "the download failed" from
+/// here — so the daemon says which, through
+/// [`ProtocolError::Failed`](oxidezap_ipc::ProtocolError::Failed), and this
+/// is where that lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub detail: String,
+    /// Whether the same request, sent again, could succeed.
+    pub retryable: bool,
+}
+
+impl Failure {
+    /// Something that could work if it were asked again — a dropped
+    /// connection, a network that was busy.
+    pub fn worth_retrying(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            retryable: true,
+        }
+    }
+
+    /// Something that would fail the same way every time it was asked.
+    pub fn permanent(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            retryable: false,
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl From<&oxidezap_ipc::ProtocolError> for Failure {
+    /// What the daemon said, plus what a front end may do about it.
+    ///
+    /// Only one of these variants carries the answer; the rest are read off
+    /// what the variant *means*. A refusal is about the request, so the same
+    /// request is refused the same way; a malformed frame and a version
+    /// mismatch are about this build, which asking twice does not change. The
+    /// account being unreachable is the one that reads the other way round
+    /// from how it sounds: it is a state that ends — the app is already
+    /// reconnecting — and the download the person asked for works on the
+    /// next tap, so telling them it never will is the worse of the two
+    /// wrong answers. Too many clients clears the same way.
+    ///
+    /// The daemon's own `detail` rather than the whole `Display`, where there
+    /// is one: `thiserror` writes the variant in front of it, and a notice
+    /// built from that reads "Could not download that image: failed:
+    /// connection reset by peer". The prefix is for a log line, which is
+    /// where the full error still goes.
+    fn from(error: &oxidezap_ipc::ProtocolError) -> Self {
+        use oxidezap_ipc::ProtocolError as E;
+        let (detail, retryable) = match error {
+            E::Failed { detail, retryable } => (detail.clone(), *retryable),
+            E::NoSession { detail } => (detail.clone(), true),
+            E::Refused { detail } | E::Malformed { detail } => (detail.clone(), false),
+            E::TooManyClients { .. } => (error.to_string(), true),
+            E::VersionMismatch { .. } => (error.to_string(), false),
+        };
+        Self { detail, retryable }
+    }
+}
+
 /// What to do when a request comes back, by the id it was sent under.
 ///
 /// The daemon answers everything under the id it was asked with, so this is
@@ -199,7 +271,7 @@ pub enum FromDaemon {
 /// is waiting, and a send that was refused becomes the failure the message it
 /// drew is already able to render.
 enum Awaiting {
-    Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, String>>),
+    Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, Failure>>),
     /// What this account occupies on disk, for the Storage pane.
     Storage(oneshot::Sender<StorageUsage>),
     /// A message drawn before it was sent. On refusal it has to stop being
@@ -259,16 +331,18 @@ impl Awaiting {
     /// is [`Session`] on the paths that run before a request leaves and the
     /// reader on the paths that run after. Both call [`Self::staged_key`]
     /// first.
-    ///
     /// Takes the *reader's* end of the queue, and so is only reachable from
     /// the reader: publishing here waits for room, which is right on a thread
     /// of its own and a deadlock on the executor that drains the queue. The
-    /// paths that run there pass `None` and answer through
-    /// [`fail_reserved`].
-    fn failed(self, detail: &str, events: Option<&ReaderSink>) {
+    /// paths that run there pass `None` and answer through [`fail_reserved`].
+    fn failed(self, failure: &Failure, events: Option<&ReaderSink>) {
+        let detail = failure.detail.as_str();
         match self {
+            // The only caller that reads more than the sentence: whether
+            // asking again could work decides what the person is told to do
+            // about it. See [`Failure`].
             Self::Download(tx) => {
-                let _ = tx.send(Err(detail.to_string()));
+                let _ = tx.send(Err(failure.clone()));
             }
             // Dropping the sender is the failure: the pane it feeds shows
             // what it knows and says the rest is unavailable.
@@ -326,6 +400,58 @@ impl Awaiting {
             Self::Send { staged, .. } => staged.as_deref(),
             _ => None,
         }
+    }
+}
+
+/// The write half, and the one place it can be given up.
+///
+/// A [`Link`] is a clone of the connection's writer, and the connection lives
+/// exactly as long as the last clone of it does — on a named pipe that is not
+/// a figure of speech: the pipe breaks when the last handle to it closes, and
+/// cancelling the read at the other end disconnects nothing. While the writer
+/// was one field of the session, "the last clone" was that field and drop
+/// order was the whole of the argument. A [`SessionHandle`] every part of the
+/// window can hold means there are now several, and which one goes last is
+/// nobody's decision.
+///
+/// So the link is held behind one shared slot, and [`Session`]'s drop empties
+/// it. Every clone is left holding an empty slot, the writer is released at
+/// the moment the owner goes rather than whenever the last borrower does, and
+/// a send made through a stale handle afterwards is refused here instead of
+/// reaching a daemon the window has already given up on.
+#[derive(Clone, Default)]
+struct Wire(Arc<Mutex<Option<Link>>>);
+
+impl Wire {
+    fn new(link: Link) -> Self {
+        Self(Arc::new(Mutex::new(Some(link))))
+    }
+
+    /// Send one frame, or say that this connection is over.
+    ///
+    /// The link is cloned out from under the lock and written to outside it:
+    /// a write can block for as long as the transport's own write timeout,
+    /// and this lock is on the path of [`Self::close`] — a session dropped
+    /// while a send was in flight would otherwise wait for that write before
+    /// it could give the writer up.
+    fn send_line(&self, frame: &[u8]) -> std::io::Result<()> {
+        let link = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match link {
+            Some(link) => link.send_line(frame),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "this connection to the daemon has been closed",
+            )),
+        }
+    }
+
+    /// Give the write half up, whoever else is still holding a handle.
+    ///
+    /// A send already on its way out holds a clone of its own and finishes:
+    /// that frame is one the daemon was going to be sent anyway, and the
+    /// writer goes as the call returns.
+    fn close(&self) {
+        drop(self.0.lock().unwrap_or_else(|e| e.into_inner()).take());
     }
 }
 
@@ -452,15 +578,57 @@ impl Drop for Teardown {
     }
 }
 
-/// A connection to `oxidezapd`.
-pub struct Session {
-    /// The write half, whichever transport is under it. The reader holds the
-    /// other one, and the two are used at the same time.
-    link: Link,
+/// Everything a request is made with, and nothing that ends the connection.
+///
+/// Cheap to clone and shared by every clone: the request table, the outbox,
+/// the id counter, the media cache, the events channel and the call frames
+/// are one set per connection, whoever holds a handle to them. The window is
+/// not one thing that sends — a call bar, a composer, a settings pane and a
+/// plugin surface all do — and before this each of them had to borrow the one
+/// [`Session`] the root held, which is a good part of why the root held
+/// everything.
+///
+/// What a handle deliberately does *not* carry is the teardown: ending the
+/// connection is [`Session`]'s, once, and a part of the window that can send
+/// must not be a part of the window that can hang up. Sending through a
+/// handle whose session has gone is refused by [`Wire`] rather than being an
+/// error the holder has to prevent.
+#[derive(Clone)]
+pub struct SessionHandle {
+    /// Everything a request is written with, and every part of it crosses a
+    /// thread.
+    conn: Conn,
+    /// The newest decoded picture of each direction, written where the frames
+    /// are read and taken by the window. See [`FromDaemon::CallFrames`].
+    ///
+    /// Outside [`Conn`] because a decoded picture is the one thing here that
+    /// does not travel: on a page it is a `Rc<RefCell<..>>` of frames the
+    /// browser decoded, so a bundle carrying it could not be moved into the
+    /// `Send` callback a staged send finishes on. Nothing in that callback
+    /// wants a picture anyway — it is writing a frame, and the video belongs
+    /// to whoever is drawing.
+    frames: crate::video::LatestFrames,
+}
+
+/// The request-making half of a connection, as one cloneable set.
+///
+/// Every send needs all of it and the staged path needs to *own* all of it —
+/// a voice note is written from the completion of its own upload, which
+/// outlives the call that started it — so it is one value rather than five
+/// arguments, which is what this reached eight parameters as.
+#[derive(Clone)]
+struct Conn {
+    /// The write half, whichever transport is under it, behind the slot the
+    /// owner empties. The reader holds the other half, and the two are used
+    /// at the same time.
+    wire: Wire,
     pending: Pending,
     /// Keeps the wire in the order the person acted in. See [`Outbox`].
     outbox: Sending,
-    next_id: AtomicU64,
+    /// Shared, because an id correlates an answer for the whole connection:
+    /// two handles taking ids from two counters would be answering each
+    /// other's requests.
+    next_id: Arc<AtomicU64>,
     /// Where the bytes a frame only names live.
     ///
     /// Held here as well as by the reader because sending has a direction of
@@ -473,15 +641,31 @@ pub struct Session {
     /// drawn the message. Without a way to say so from here those failures had
     /// nowhere to go, and the bubble sat pending for good with no retry.
     events: UiSink,
-    /// The newest decoded picture of each direction, written where the frames
-    /// are read and taken by the window. See [`FromDaemon::CallFrames`].
-    frames: crate::video::LatestFrames,
+}
+
+/// A connection to `oxidezapd`, and the one value that ends it.
+///
+/// The requests all live on [`SessionHandle`], which this derefs to, so a
+/// caller that only sends can be handed a handle and never learn that the
+/// connection is somebody's to end. There is exactly one of these per
+/// connection, it lives where the window's own state does, and dropping it is
+/// how a reconnect begins.
+pub struct Session {
+    handle: SessionHandle,
     /// How this connection's reader is ended when this goes.
     ///
-    /// Last, and that is load-bearing on a named pipe: fields drop in
-    /// declaration order, so the write half is released with `link` before
-    /// the hangup runs. Cancelling a pipe read disconnects nothing — the
-    /// pipe breaks when the last handle to it closes.
+    /// Last, and that is load-bearing on a named pipe: cancelling a pipe read
+    /// disconnects nothing — the pipe breaks when the last handle to it
+    /// closes — so the write half has to be released *before* the hangup
+    /// runs. Two things keep that true, and both are needed now that the
+    /// write half is reachable from every clone of the handle:
+    ///
+    /// - this value's own `Drop` empties the shared slot the link sits in
+    ///   (see [`Wire`]), which releases the writer however many handles
+    ///   outlive the session, and runs before any field is dropped;
+    /// - and this field stays declared last, so the local reasoning holds
+    ///   too: fields drop in declaration order, and `handle` — the only place
+    ///   the link is reachable from — goes before the hangup does.
     ///
     /// Held for its `Drop` and read by nobody, which on a page is the whole
     /// of it: there is no reader thread to end.
@@ -490,6 +674,35 @@ pub struct Session {
         expect(dead_code, reason = "a page's socket goes with the page")
     )]
     teardown: Teardown,
+}
+
+impl std::ops::Deref for Session {
+    type Target = SessionHandle;
+
+    /// Every request, read through the value that owns the connection.
+    ///
+    /// A `Deref` rather than a hundred forwarding methods, and it is honest
+    /// about the containment: a session *is* a handle plus the ending, and
+    /// the only thing it hides is that the caller could have taken a handle
+    /// of its own instead. Which is what most callers should do — see
+    /// [`Session::handle`].
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
+impl Drop for Session {
+    /// End the connection, in the one order that ends it everywhere.
+    ///
+    /// The link goes first and explicitly, because a handle held anywhere
+    /// else would otherwise keep the transport's last write handle open, and
+    /// the daemon would go on counting a client that has gone — the ghost
+    /// connections [`Teardown`] describes, arriving by a different road. The
+    /// hangup that follows is the field below, dropped once this body has
+    /// run.
+    fn drop(&mut self) {
+        self.handle.conn.wire.close();
+    }
 }
 
 impl Session {
@@ -575,13 +788,17 @@ impl Session {
     /// The parts every transport supplies, assembled.
     fn new(link: Link, events: UiSink, media: Arc<dyn MediaCache>) -> Self {
         Self {
-            link,
-            pending: Pending::default(),
-            outbox: Sending::default(),
-            next_id: AtomicU64::new(1),
-            media,
-            events,
-            frames: crate::video::LatestFrames::default(),
+            handle: SessionHandle {
+                conn: Conn {
+                    wire: Wire::new(link),
+                    pending: Pending::default(),
+                    outbox: Sending::default(),
+                    next_id: Arc::new(AtomicU64::new(1)),
+                    media,
+                    events,
+                },
+                frames: crate::video::LatestFrames::default(),
+            },
             teardown: Teardown::none(),
         }
     }
@@ -596,6 +813,27 @@ impl Session {
         self.teardown = teardown;
     }
 
+    /// A handle of one's own, for a part of the window that only sends.
+    ///
+    /// The thing to hand an entity: it is a refcount on the same connection,
+    /// it carries every request, and it carries no way to end anything. A
+    /// handle outliving this session is not a leak and not a bug — its sends
+    /// are refused from the moment the session goes, which is the answer a
+    /// stale caller wants anyway.
+    ///
+    /// Called from the tests below the window for now, which is the honest
+    /// state of it: the window still reaches its connection through the one
+    /// root that owns it, and handing each part of it a handle instead is the
+    /// point of the split rather than a thing this change does. Named rather
+    /// than left to a crate-wide `allow`, the way `notices` names its own.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn handle(&self) -> SessionHandle {
+        self.handle.clone()
+    }
+}
+
+impl SessionHandle {
     /// The newest decoded picture of each direction of the live call.
     ///
     /// Taken by the window when [`FromDaemon::CallFrames`] says one is
@@ -615,8 +853,7 @@ impl Session {
         // The unreserved callers want an io error, not the reservation list:
         // nothing on this path is waiting on an id, so the reason is all
         // there is to report.
-        write_or_queue(&self.link, &self.outbox, &self.pending, request.id, frame)
-            .map_err(|Unwritten { reason, .. }| reason)
+        write_or_queue(&self.conn, request.id, frame).map_err(|Unwritten { reason, .. }| reason)
     }
 
     /// Send and log rather than propagate.
@@ -633,18 +870,7 @@ impl Session {
     /// Send a request and remember what its answer means.
     fn ask(&self, request: ClientRequest, waiting: Awaiting) -> RequestId {
         let id = self.reserve(waiting);
-        deliver(
-            Wires {
-                link: &self.link,
-                outbox: &self.outbox,
-                pending: &self.pending,
-                events: &self.events,
-                media: &self.media,
-            },
-            id,
-            request,
-            Delivery::Ordinary,
-        );
+        deliver(&self.conn, id, request, Delivery::Ordinary);
         id
     }
 
@@ -655,8 +881,8 @@ impl Session {
     /// does, and the id still has to be taken in the order the person acted
     /// in. See [`Self::send_audio_message`].
     fn reserve(&self, waiting: Awaiting) -> RequestId {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let id = self.conn.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut pending = self.conn.pending.lock().unwrap_or_else(|e| e.into_inner());
         // Whoever gave up is no longer listening, and its answer may never
         // come. Swept here rather than on a timer: this is the only thing
         // that grows the map, so it is the only place that needs to shrink
@@ -789,9 +1015,7 @@ impl Session {
                 staged: None,
             });
             fail_reserved(
-                &self.pending,
-                &self.events,
-                &self.media,
+                &self.conn,
                 id,
                 // The same two figures the file chooser prints, from the same
                 // formatter: a person who was told a file fits and then told
@@ -820,31 +1044,19 @@ impl Session {
         // that a second payload claims the place *after* this one whichever
         // upload lands first.
         let ticket = self
+            .conn
             .outbox
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .claim();
-        let link = self.link.clone();
-        let outbox = Arc::clone(&self.outbox);
-        let pending = Arc::clone(&self.pending);
-        let events = self.events.clone();
-        let media = Arc::clone(&self.media);
-        self.media.stage_then(
+        // The callback outlives this borrow, so it takes the connection
+        // with it. One clone rather than five, and no picture: see [`Conn`].
+        let conn = self.conn.clone();
+        self.conn.media.stage_then(
             &upload,
             payload,
             Box::new(move |staged| match staged {
-                Ok(()) => deliver(
-                    Wires {
-                        link: &link,
-                        outbox: &outbox,
-                        pending: &pending,
-                        events: &events,
-                        media: &media,
-                    },
-                    id,
-                    request,
-                    Delivery::Staged(ticket),
-                ),
+                Ok(()) => deliver(&conn, id, request, Delivery::Staged(ticket)),
                 Err(e) => {
                     // The queue behind this send is waiting on a frame that
                     // is never going to be written. Releasing it can fail in
@@ -852,27 +1064,17 @@ impl Session {
                     // else: reservations nobody will ever answer, with the
                     // views that made them waiting for good. Answered here
                     // rather than discarded, exactly as `deliver` does.
-                    if let Err(Unwritten { lost, reason }) =
-                        release(&link, &outbox, &pending, ticket, None)
-                    {
+                    if let Err(Unwritten { lost, reason }) = release(&conn, ticket, None) {
                         error!("could not reach the daemon: {reason}");
                         for lost in lost {
                             fail_reserved(
-                                &pending,
-                                &events,
-                                &media,
+                                &conn,
                                 lost,
                                 format!("could not reach the daemon: {reason}"),
                             );
                         }
                     }
-                    fail_reserved(
-                        &pending,
-                        &events,
-                        &media,
-                        id,
-                        format!("could not stage {what}: {e}"),
-                    );
+                    fail_reserved(&conn, id, format!("could not stage {what}: {e}"));
                 }
             }),
         );
@@ -1129,7 +1331,7 @@ impl Session {
     pub fn download_downloadable_media(
         &self,
         media: DownloadableMedia,
-    ) -> oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, String>> {
+    ) -> oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, Failure>> {
         let (tx, rx) = oneshot::channel();
         self.ask(
             ClientRequest::Download(Download {
@@ -1145,15 +1347,9 @@ impl Session {
 ///
 /// See [`Outbox`]: the wire's order is the order things happen in, so nothing
 /// may overtake a send that is waiting on its payload.
-fn write_or_queue(
-    link: &Link,
-    outbox: &Sending,
-    pending: &Pending,
-    id: Option<RequestId>,
-    frame: Vec<u8>,
-) -> Result<(), Unwritten> {
+fn write_or_queue(conn: &Conn, id: Option<RequestId>, frame: Vec<u8>) -> Result<(), Unwritten> {
     let ready = {
-        let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
+        let mut outbox = conn.outbox.lock().unwrap_or_else(|e| e.into_inner());
         if outbox.slots.is_empty() {
             // Nothing is holding the wire, so this goes straight out. The
             // lock is released before the write for the reason below.
@@ -1164,8 +1360,8 @@ fn write_or_queue(
         }
     };
     match ready {
-        Some(ready) => write_ready(link, ready, pending),
-        None => link.send_line(&frame).map_err(|e| Unwritten {
+        Some(ready) => write_ready(&conn.wire, ready, &conn.pending),
+        None => conn.wire.send_line(&frame).map_err(|e| Unwritten {
             lost: id.into_iter().collect(),
             reason: e,
         }),
@@ -1186,7 +1382,7 @@ fn write_or_queue(
 /// necessarily refuse the write. Without that check a line typed behind a
 /// voice note could reach the daemon after the window had drawn it as failed.
 fn write_ready(
-    link: &Link,
+    wire: &Wire,
     ready: Vec<(Option<RequestId>, Vec<u8>)>,
     pending: &Pending,
 ) -> Result<(), Unwritten> {
@@ -1195,7 +1391,7 @@ fn write_ready(
         if !worth_writing(id, pending) {
             continue;
         }
-        if let Err(e) = link.send_line(&frame) {
+        if let Err(e) = wire.send_line(&frame) {
             // Which reservations did not go, rather than which call started
             // the batch. A staged send releases everything queued behind it,
             // so a failure part way through leaves frames *before* the break
@@ -1237,19 +1433,13 @@ fn worth_writing(id: Option<RequestId>, pending: &Pending) -> bool {
 /// The frame goes where the send was made, never at the head: another staged
 /// send can have been asked for first and still be crossing, and its place is
 /// ahead of this one whatever order the two uploads finished in.
-fn release(
-    link: &Link,
-    outbox: &Sending,
-    pending: &Pending,
-    ticket: u64,
-    frame: Option<(RequestId, Vec<u8>)>,
-) -> Result<(), Unwritten> {
+fn release(conn: &Conn, ticket: u64, frame: Option<(RequestId, Vec<u8>)>) -> Result<(), Unwritten> {
     let ready = {
-        let mut outbox = outbox.lock().unwrap_or_else(|e| e.into_inner());
+        let mut outbox = conn.outbox.lock().unwrap_or_else(|e| e.into_inner());
         outbox.fill(ticket, frame);
         outbox.drain_ready()
     };
-    write_ready(link, ready, pending)
+    write_ready(&conn.wire, ready, &conn.pending)
 }
 
 /// Whether this frame is the one the outbox is holding for.
@@ -1263,47 +1453,28 @@ enum Delivery {
     Staged(u64),
 }
 
-/// The connection's own handles, borrowed together.
-///
-/// One argument rather than five, because they always travel as a set: the
-/// staged path clones every one of them into a callback, and a free function
-/// taking them apart is how this reached eight parameters.
-struct Wires<'a> {
-    link: &'a Link,
-    outbox: &'a Sending,
-    pending: &'a Pending,
-    events: &'a UiSink,
-    media: &'a Arc<dyn MediaCache>,
-}
-
 /// Write a reserved request's frame, and answer for it if it will not go.
 ///
 /// A free function rather than a method because the staged path sends from a
 /// callback that outlives the borrow: everything it needs is cloneable, and
 /// the alternative was a second copy of the failure handling below, which is
 /// the part that must not drift.
-fn deliver(conn: Wires<'_>, id: RequestId, request: ClientRequest, how: Delivery) {
-    let Wires {
-        link,
-        outbox,
-        pending,
-        events,
-        media,
-    } = conn;
+fn deliver(conn: &Conn, id: RequestId, request: ClientRequest, how: Delivery) {
     // Still ours to send. A staged request is delivered from the upload's
     // completion, and the connection can end in between — `Frames::finish`
     // drains every reservation and answers each one. The link it holds is a
     // clone and does not necessarily refuse the write, so without this the
     // daemon could receive and send a voice note the window has already
     // reported as failed.
-    if !pending
+    if !conn
+        .pending
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains_key(&id)
     {
         // Nothing to send, but the queue behind it is still waiting.
         if let Delivery::Staged(ticket) = how {
-            let _ = release(link, outbox, pending, ticket, None);
+            let _ = release(conn, ticket, None);
         }
         return;
     }
@@ -1314,26 +1485,20 @@ fn deliver(conn: Wires<'_>, id: RequestId, request: ClientRequest, how: Delivery
         Ok(frame) => frame,
         Err(e) => {
             if let Delivery::Staged(ticket) = how {
-                let _ = release(link, outbox, pending, ticket, None);
+                let _ = release(conn, ticket, None);
             }
-            fail_reserved(pending, events, media, id, format!("unserializable: {e}"));
+            fail_reserved(conn, id, format!("unserializable: {e}"));
             return;
         }
     };
     let written = match how {
-        Delivery::Staged(ticket) => release(link, outbox, pending, ticket, Some((id, frame))),
-        Delivery::Ordinary => write_or_queue(link, outbox, pending, Some(id), frame),
+        Delivery::Staged(ticket) => release(conn, ticket, Some((id, frame))),
+        Delivery::Ordinary => write_or_queue(conn, Some(id), frame),
     };
     if let Err(Unwritten { lost, reason }) = written {
         error!("could not reach the daemon: {reason}");
         for id in lost {
-            fail_reserved(
-                pending,
-                events,
-                media,
-                id,
-                format!("could not reach the daemon: {reason}"),
-            );
+            fail_reserved(conn, id, format!("could not reach the daemon: {reason}"));
         }
     }
 }
@@ -1342,14 +1507,9 @@ fn deliver(conn: Wires<'_>, id: RequestId, request: ClientRequest, how: Delivery
 ///
 /// Whoever reserved an id is waiting on it, so a request that never left has
 /// to say so in the terms that request was made in.
-fn fail_reserved(
-    pending: &Pending,
-    events: &UiSink,
-    media: &Arc<dyn MediaCache>,
-    id: RequestId,
-    detail: String,
-) {
-    let Some(waiting) = pending
+fn fail_reserved(conn: &Conn, id: RequestId, detail: String) {
+    let Some(waiting) = conn
+        .pending
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id)
@@ -1359,37 +1519,44 @@ fn fail_reserved(
     // This request is not going to run, so whatever it staged is dead:
     // nothing will read those bytes and every retry would stage another copy.
     if let Some(key) = waiting.staged_key() {
-        media.discard(key);
+        conn.media.discard(key);
     }
-    // Answered here rather than through `Awaiting::failed`, which is the
-    // reader's version of this: that one publishes on a `ReaderSink` and is
-    // allowed to wait for room, and this runs on the GPUI executor — the
-    // thread that drains the queue. Holding a `UiSink` is what says so, and
-    // there is no waiting publish to reach from here.
     match waiting {
+        // This runs on the GPUI executor, and that executor is what drains
+        // this queue. `failed` publishes with the waiting variant of the
+        // send, so a full queue would park the only thread that could empty
+        // it — the window stops rather than saying the message did not go.
         Awaiting::Send {
             chat_jid, local_id, ..
         } => {
             error!("send failed before it left: {detail}");
-            let _ = events.try_send(FromDaemon::Session(Box::new(UiEvent::SendFailed {
-                chat_jid,
-                message_id: local_id,
-                reason: detail,
-            })));
+            let _ = conn
+                .events
+                .try_send(FromDaemon::Session(Box::new(UiEvent::SendFailed {
+                    chat_jid,
+                    message_id: local_id,
+                    reason: detail,
+                })));
         }
+        // Same thread, same rule: `failed` would `blocking_send` on the queue
+        // this executor drains.
         Awaiting::StatusView { message_ids } => {
             error!("a status view never left this process: {detail}");
-            let _ = events.try_send(FromDaemon::StatusViewLost(message_ids));
+            let _ = conn
+                .events
+                .try_send(FromDaemon::StatusViewLost(message_ids));
         }
-        // A view waiting on a page asks for nothing until it hears, so a
-        // request that never left has to say so — the reconnect keeps the
-        // chats and the paging state, and a list left `Loading` never asks
-        // again.
+        // And the same rule again, for the same reason it is a rule: a view
+        // waiting on a page asks for nothing until it hears, so a request
+        // that never left has to say so — the reconnect keeps the chats and
+        // the paging state, and a list left `Loading` never asks again.
         Awaiting::Page { jid } => {
             error!("a page request never left this process: {detail}");
-            let _ = events.try_send(FromDaemon::PageLost { jid });
+            let _ = conn.events.try_send(FromDaemon::PageLost { jid });
         }
-        waiting => waiting.failed(&detail, None),
+        // Nothing left this process, so nothing about the request itself
+        // failed: the connection did, and the app reconnects.
+        waiting => waiting.failed(&Failure::worth_retrying(detail), None),
     }
 }
 
@@ -1591,7 +1758,7 @@ mod tests {
         Awaiting::StatusView {
             message_ids: vec!["A".into(), "B".into()],
         }
-        .failed("the store is read-only", Some(&tx));
+        .failed(&Failure::permanent("the store is read-only"), Some(&tx));
 
         match rx.try_recv() {
             Ok(FromDaemon::StatusViewLost(ids)) => assert_eq!(ids, vec!["A", "B"]),

@@ -199,19 +199,22 @@
   document instead would keep the file intact and lose the inline preview,
   which is the other half of the trade and is why neither is done yet.
 
-- **A video with B-frames is stamped in the wrong order.** `stamp_of` labels
-  each access unit with its decode-order index, and `collect` reads that label
-  back as the picture's position. The two agree exactly while decode order is
-  presentation order, which is every baseline stream and so every video
-  WhatsApp itself sends. They stop agreeing the moment an attachment carries
-  B-frames: WebCodecs answers in presentation order, so the labels come back
-  out of sequence and the timeline reads a picture as a position it does not
-  hold. What it needs is the composition offset the container already carries
-  (`Mp4Sample::rendering_offset`) as the stamp, kept apart from the decode
-  cursor the feed loop walks, which makes a seek a search for the decode
-  samples a presentation position depends on rather than a range. That is the
-  timeline's indexing model rather than a patch to it, and verifying it wants
-  a B-frame fixture this tree has none of.
+- **A video with B-frames is ordered correctly and has never been played.**
+  The indexing model was the fix and it is done: `demux::Timeline` reads the
+  composition offsets the container carries (`Mp4Sample::rendering_offset`),
+  every index above the demux is a rank in presentation order, and the only
+  thing that still counts in decode indices is the loop that hands units to a
+  decoder — so a seek is the samples a presentation position depends on
+  rather than a range, and the stamp a unit is fed under is where its picture
+  belongs rather than where it was fed. What is *not* done is playing one:
+  the B-frame fixture the tests build is a container, not a stream, because
+  no real capture may be checked in and nothing in this tree encodes H.264 —
+  so the ordering is verified at the demux, which is pure logic, and the
+  WebCodecs half is verified by reading. The desktop's decoder is the other
+  half of the same gap: openh264 does its own reordering, and whether the
+  picture it hands back for a fed sample is the one this labels is untested
+  against anything but a baseline stream. Both want a real B-frame video and
+  a browser to play it in.
 - **A follower tab cannot place a call, and the reason is which document owns
   the devices.** A tab that lost the claim holds no session, so its Place or
   Accept is executed by the tab that does — and `getUserMedia` and
@@ -331,10 +334,16 @@
   other end of the scale from `AppState::Error`, which leaves the connected
   view and schedules a reconnect and is catastrophic for a save that did not
   start. A failed save and a failed recording go through it.
-  What still does not is anything the *daemon* refused: a front end learns
+  What still does not is most of what the *daemon* refused: a front end learns
   only `Accepted`, and a refusal reaching the window would need a field on the
   wire. `SendFailed` is the one exception, and it is against a chat rather
-  than against the request. `CallMediaFailed` is the second, and it was added
+  than against the request. A download is the second, and it is the shape the
+  rest of them would take: `ProtocolError::Failed` says the daemon tried and
+  something outside the request went wrong, and carries whether asking again
+  could work — because that is the only question the person actually has, and
+  a full disk and a dropped connection are the same sentence without it. The
+  answer decides what the notice ends in; `app/notices.rs::what_went_wrong`
+  is where the bit is spent. `CallMediaFailed` is the third, and it was added
   after a browser call that dialled no relay read in the console as an offer,
   an ending, and not one line between them: the library publishes
   `MediaSetupFailed` with the reason and the event pump's catch-all was
@@ -372,18 +381,22 @@
   arithmetic possible; nobody has done the arithmetic. Coordinating one
   allowance across three caches in two crates wants a measurement of what a
   page actually holds, which is the same measurement the item below needs.
-- **Nothing evicts the media a conversation is holding.** A message keeps its
-  full bytes in `MediaContent::data` for as long as the row is loaded, and
-  `Chat::add_message` has no ceiling — so the two media budgets that do exist
-  (the daemon's 512 MiB of disk, the page's 48 MiB map) bound what is
-  *cached*, not what the interface is retaining. The sweep can drop an entry
-  whose bytes are still alive through a message that names them. On a desktop
-  that is a long-running window growing; in a tab it is a linear memory with a
-  one-gigabyte ceiling, so the web is where it will be felt first. What is
-  missing is a policy — dematerialize media on rows that are far off screen,
-  and re-fetch on demand as the renderer already does for media it never had.
-  Predates the web build and is not made worse by it: sharing one `Arc` per
-  payload rather than a copy per row moved in the other direction.
+- **What evicts the media a conversation is holding is coarser than a
+  viewport.** There is a policy now — `Chat::release_media` is the
+  arithmetic, `RETAINED_MEDIA_BUDGET_BYTES` the allowance, and
+  `WhatsAppApp::sweep_retained_media` the judgement — and a released row is
+  left in the state a row whose media never arrived is already in, so it
+  draws the offer to download the renderer has always drawn and the press
+  that accepts it fetches. What the front end can actually answer is *which
+  conversation is on screen* and *what it is holding open*; inside the
+  visible conversation the newest rows keep their bytes and the rest let go,
+  which is not the same as "far off screen". gpui's `list` hands no visible
+  range out of its render pass, so a reader scrolled up into an album can
+  have a picture released out from under them and drawn as a download. The
+  honest fix is a touch signal from the row render — the decoded-image cache
+  is already an LRU keyed by message id and could carry it — and the reason
+  it is not here is that it wants a window to measure in, which is exactly
+  what this environment has none of.
 - **A withdrawal is applied before it is written down, and that is a trade.**
   A revocation clears the shared mask first and persists second, so the very
   next command a draining backlog attempts is already refused. The cost is a

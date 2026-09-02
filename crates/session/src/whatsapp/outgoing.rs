@@ -239,6 +239,22 @@ struct Photo {
     mime: &'static str,
 }
 
+/// All that is known about a picture nothing could decode: what type it is,
+/// where the header said so.
+///
+/// Reading the pixels and reading the *magic bytes* are two different acts,
+/// and only the second of them is what says whether the picker was right
+/// about the type. So a picture too large to decode, or in a format named in
+/// the header and refused by the decoder, still corrects the claim on the
+/// message — it keeps its own bytes, and the message stops calling them
+/// something they are not.
+fn only_the_type(format: Option<image::ImageFormat>) -> Option<Photo> {
+    format.map(|format| Photo {
+        data: None,
+        mime: format.to_mime_type(),
+    })
+}
+
 /// A picture: its dimensions from the header, its thumbnail from the pixels,
 /// and the bytes to send if the ones in hand will not do.
 ///
@@ -259,7 +275,7 @@ fn still(data: &[u8]) -> (Shape, Option<Photo>) {
         Ok(dimensions) => dimensions,
         Err(e) => {
             warn!("could not measure that image: {e}");
-            return (Shape::default(), None);
+            return (Shape::default(), only_the_type(format));
         }
     };
 
@@ -274,7 +290,7 @@ fn still(data: &[u8]) -> (Shape, Option<Photo>) {
         // however the recipient's client manages with them, which is the
         // better of the two failures available here.
         warn!("{width}x{height} is too large to decode; sending it as it came");
-        return (shape, None);
+        return (shape, only_the_type(format));
     }
 
     let Some(format) = format else {
@@ -294,7 +310,7 @@ fn still(data: &[u8]) -> (Shape, Option<Photo>) {
             // It goes out as it came, which is the only thing left to do with
             // bytes nothing here can read.
             warn!("could not decode that image: {e}");
-            return (shape, None);
+            return (shape, only_the_type(Some(format)));
         }
     };
 
@@ -751,6 +767,93 @@ mod tests {
         // Corrected, not re-encoded: a JPEG is already a format the other
         // side draws, so the bytes are the ones that came in.
         assert_eq!(sent.data, jpeg);
+    }
+
+    /// Reading the pixels and reading the magic bytes are two different acts,
+    /// and a picture that fails the first has still passed the second. A PNG
+    /// whose data is truncated — or one too large to decode — kept the
+    /// picker's claim about its type, so a mislabelled one went out saying
+    /// what it was called rather than what it is.
+    #[test]
+    fn a_picture_that_cannot_be_decoded_still_says_what_it_is() {
+        // A real PNG header with the image data cut off: enough to sniff the
+        // format and read the dimensions, not enough to decode.
+        let png = encoded(64, 48, image::ImageFormat::Png);
+        let header = png[..48.min(png.len())].to_vec();
+
+        let (shape, sent) = prepared("image/jpeg", header.clone());
+        assert_eq!(sent.data, header, "the bytes are the ones that came in");
+        assert_eq!(sent.mime_type, "image/png", "and the type is the real one");
+        assert_eq!(shape.thumbnail, None, "with no preview, which is the point");
+    }
+
+    /// The second of the three paths that give up on the pixels: a format the
+    /// header names and this build has no decoder for. Its dimensions cannot
+    /// be read either, so there is nothing to say about it *except* what it
+    /// is — and that much is still worth saying.
+    #[test]
+    fn a_format_with_no_decoder_here_still_says_what_it_is() {
+        // A BMP signature. `image` recognises it by its magic bytes whatever
+        // the feature set, and this build has no BMP decoder, so the
+        // dimensions are the thing that fails.
+        let bmp = b"BM\x00\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00".to_vec();
+        let (shape, sent) = prepared("image/png", bmp.clone());
+
+        assert_eq!(sent.data, bmp, "the bytes are the ones that came in");
+        assert_eq!(sent.mime_type, "image/bmp");
+        assert_eq!(shape, Shape::default(), "and nothing was measured");
+    }
+
+    /// The third: a picture whose header declares more pixels than this will
+    /// decode. It is never read, so its type comes from the header alone —
+    /// and a hundred megapixels is thirty-three bytes to *claim*, which is
+    /// what makes the ceiling worth having and this worth testing.
+    #[test]
+    fn a_picture_past_the_decode_ceiling_still_says_what_it_is() {
+        let huge = png_claiming(10_000, 10_000);
+        let (shape, sent) = prepared("image/webp", huge.clone());
+
+        assert_eq!(sent.data, huge, "nothing re-encoded it");
+        assert_eq!(sent.mime_type, "image/png", "and it is a PNG, not a WebP");
+        // Measured from the header, which is all this path ever reads.
+        assert_eq!((shape.width, shape.height), (Some(10_000), Some(10_000)));
+        assert_eq!(shape.thumbnail, None);
+    }
+
+    /// A PNG whose header claims a size nothing here will allocate.
+    ///
+    /// Built rather than encoded, because encoding one would mean allocating
+    /// the four hundred megabytes this exists to refuse: a real PNG's `IHDR`
+    /// is patched with the dimensions and its checksum recomputed, which is
+    /// the whole of what a decoder reads before it decides.
+    fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+        let mut png = png(1, 1);
+        // Signature (8), length (4), type (4), then the 13 bytes of `IHDR`
+        // whose first two fields are the dimensions, then the checksum.
+        png[16..20].copy_from_slice(&width.to_be_bytes());
+        png[20..24].copy_from_slice(&height.to_be_bytes());
+        let checksum = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&checksum.to_be_bytes());
+        png
+    }
+
+    /// CRC-32/ISO-HDLC, which is the one PNG chunks carry.
+    ///
+    /// Ten lines rather than a dependency: this exists to make one fixture,
+    /// and the alternative is a crate in the manifest for a test.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
     }
 
     /// Transparency has to land somewhere once the alpha channel is gone, and

@@ -587,16 +587,28 @@ async fn a_failed_send_is_published_rather_than_swallowed() {
     );
 }
 
+/// Take every permit there is, and hand back the ones still held.
+///
+/// Returned rather than dropped: a permit released is a permit the next
+/// command gets, which is the opposite of what a caller setting up a busy
+/// daemon wants. Shared with [`super::act`]'s tests, which need the same
+/// bridge with no room left in it.
+pub(super) fn saturate(bridge: &Bridge) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+    let held: Vec<_> = std::iter::repeat_with(|| bridge.permit())
+        .take(MAX_IN_FLIGHT)
+        .map(|permit| permit.expect("under the cap"))
+        .collect();
+    assert!(bridge.permit().is_none(), "and refused past it");
+    held
+}
+
 /// The bound the command channel cannot provide: every session call spawns
 /// and returns, so admission alone would let a client that reads its
 /// acknowledgements keep queueing network work forever.
 #[tokio::test]
 async fn work_in_flight_is_capped_rather_than_queued() {
     let bridge = bridge();
-    let held: Vec<_> = (0..MAX_IN_FLIGHT)
-        .map(|_| bridge.permit().expect("under the cap"))
-        .collect();
-    assert!(bridge.permit().is_none(), "and refused past it");
+    let held = saturate(&bridge);
 
     drop(held);
     assert!(

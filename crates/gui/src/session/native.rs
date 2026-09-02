@@ -38,7 +38,18 @@ const READER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 /// client that asks for events, so the chats arrive without being asked
 /// for separately.
 pub(super) fn connect() -> std::io::Result<(Session, Events)> {
-    let (reader, writer) = connect_or_start()?.split()?;
+    connect_over(connect_or_start()?)
+}
+
+/// Everything after the connection: split it, say hello, and start a reader.
+///
+/// Taken apart from [`connect`] so an endpoint can come from somewhere other
+/// than the daemon's own name — which is what lets a test stand a listener up
+/// of its own and watch what dropping the session does to a *real* reader.
+/// The alternative is asserting that `Drop` was called, which is the one
+/// thing that was never in doubt.
+fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
+    let (reader, writer) = endpoint.split()?;
     // Taken before the reader is handed to its thread, because after that
     // there is nothing left to ask.
     let hangup = reader.hangup()?;
@@ -291,4 +302,208 @@ fn daemon_program() -> Option<std::path::PathBuf> {
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
         .filter(|path| path.exists())
+}
+
+/// What dropping a connection does to the daemon at the other end.
+///
+/// Unix, and that is a statement about this box rather than about the code:
+/// the endpoint's platform split is `oxidezap_ipc`'s, a listener of our own is
+/// a `UnixListener` here and a named pipe there, and CI's `cross` job is what
+/// runs the pipe. What these prove is the half that is written *here* — that
+/// the owner ends the connection, that a handle does not, and in which order
+/// the two halves of the ending happen — and that half is one program on
+/// either platform.
+#[cfg(all(test, unix))]
+mod tests {
+    use std::io::{BufRead as _, BufReader};
+    use std::sync::Arc;
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+
+    use oxidezap_ipc::{ClientRequest, Endpoint, Link};
+
+    use super::Teardown;
+    use super::{Session, connect_over};
+
+    /// Long enough for a local socket to carry a line and a close, short
+    /// enough that a test that is going to fail does it now.
+    const SOON: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Long enough that a connection which was going to end would have.
+    ///
+    /// Only ever used to prove a *negative*, so it is a floor on the waiting
+    /// rather than a deadline: a slow box makes this test slower and never
+    /// makes it wrong.
+    const A_MOMENT: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// A daemon, to the extent these tests need one: something that accepts a
+    /// connection and says what it reads.
+    struct Peer {
+        /// One item per frame the client sent, and `None` when the client's
+        /// end of the connection closed.
+        heard: Receiver<Option<String>>,
+        path: std::path::PathBuf,
+    }
+
+    impl Peer {
+        /// Listen, accept one client, and report every line until it ends.
+        fn listening(name: &str) -> std::io::Result<Self> {
+            let path = std::env::temp_dir().join(format!(
+                "oxidezap-session-{}-{name}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener = std::os::unix::net::UnixListener::bind(&path)?;
+            let (told, heard) = channel();
+            std::thread::Builder::new()
+                .name(format!("peer-{name}"))
+                .spawn(move || {
+                    let Ok((stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let mut lines = BufReader::new(stream).lines();
+                    while let Some(Ok(line)) = lines.next() {
+                        if told.send(Some(line)).is_err() {
+                            return;
+                        }
+                    }
+                    // Read returned nothing: the client's write half is gone,
+                    // which is the ending this whole exercise is about.
+                    let _ = told.send(None);
+                })?;
+            Ok(Self { heard, path })
+        }
+
+        /// The client this peer is listening for.
+        fn client(&self) -> std::io::Result<(Session, super::Events)> {
+            connect_over(Endpoint::connect_at(&self.path)?)
+        }
+
+        /// The next frame, which every connection begins with: the hello.
+        fn hello(&self) {
+            assert!(
+                matches!(self.heard.recv_timeout(SOON), Ok(Some(line)) if line.contains("\"request\":\"hello\"")),
+                "a connection says hello before anything else"
+            );
+        }
+
+        /// Whether the connection ended, waiting for it if it has not.
+        fn ended(&self) -> bool {
+            loop {
+                match self.heard.recv_timeout(SOON) {
+                    // A frame in flight is not the ending; keep reading.
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(RecvTimeoutError::Disconnected) => return true,
+                    Err(RecvTimeoutError::Timeout) => return false,
+                }
+            }
+        }
+
+        /// Whether the connection is still up a moment later, with nothing
+        /// having been said on it.
+        ///
+        /// Both halves, because both are assertions the callers want: an
+        /// ending would arrive as `None`, and a frame that should never have
+        /// been written would arrive as a line. Answering `true` to a stray
+        /// frame would make this the assertion that cannot fail.
+        fn quiet(&self) -> bool {
+            matches!(
+                self.heard.recv_timeout(A_MOMENT),
+                Err(RecvTimeoutError::Timeout)
+            )
+        }
+    }
+
+    impl Drop for Peer {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// The owner is what ends the connection, and it ends it for good.
+    ///
+    /// The reader is a thread parked in a blocking read that nothing wakes,
+    /// so this is not a fact about `Drop` running — it is a fact about the
+    /// daemon at the other end seeing the connection close, which is the only
+    /// thing that stops it counting a client. Asserted on the peer, because
+    /// asserting that a destructor ran would prove the part nobody doubted.
+    #[test]
+    fn dropping_the_session_ends_the_connection() {
+        let peer = Peer::listening("dropped").expect("a listener of our own");
+        let (session, _events) = peer.client().expect("connect to it");
+        peer.hello();
+
+        // Held across the drop on purpose: a part of the window that kept a
+        // handle must not keep the connection.
+        let stale = session.handle();
+        drop(session);
+
+        assert!(peer.ended(), "the daemon's end of the connection closed");
+        assert!(
+            stale.send(ClientRequest::ReloadHistory).is_err(),
+            "and a handle that outlived it sends nowhere"
+        );
+    }
+
+    /// A handle is a refcount, not an owner: dropping one ends nothing.
+    #[test]
+    fn dropping_a_handle_leaves_the_connection_alone() {
+        let peer = Peer::listening("handle").expect("a listener of our own");
+        let (session, _events) = peer.client().expect("connect to it");
+        peer.hello();
+
+        drop(session.handle());
+
+        assert!(
+            peer.quiet(),
+            "the connection outlives a handle, and nothing was said on it"
+        );
+        session
+            .send(ClientRequest::ReloadHistory)
+            .expect("and still sends");
+        assert!(
+            matches!(peer.heard.recv_timeout(SOON), Ok(Some(_))),
+            "the request arrived"
+        );
+    }
+
+    /// The write half is given up before the hangup runs.
+    ///
+    /// The order matters on a named pipe, where cancelling the read
+    /// disconnects nothing — the pipe breaks when the last handle to it
+    /// closes — and it cannot be observed on a Unix socket, whose shutdown
+    /// ends the read either way. So it is observed from inside the teardown
+    /// instead: the closure that would hang up asks a handle to send, and
+    /// what it gets back says whether the link was already gone. That
+    /// question has one answer on both platforms.
+    #[test]
+    fn the_link_is_released_before_the_hangup_runs() {
+        let peer = Peer::listening("order").expect("a listener of our own");
+        let (_reader, writer) = Endpoint::connect_at(&peer.path)
+            .expect("connect to it")
+            .split()
+            .expect("two halves");
+        let attached =
+            super::attach::begin(Link::over_stream(writer), Arc::new(super::Directory), true)
+                .expect("say hello");
+        peer.hello();
+
+        let mut session = attached.session;
+        let handle = session.handle();
+        let (told, what_the_hangup_saw) = channel();
+        session.ends_with(Teardown::new(move || {
+            told.send(handle.send(ClientRequest::ReloadHistory).is_err())
+                .expect("the test is still standing here");
+        }));
+
+        drop(session);
+        assert_eq!(
+            what_the_hangup_saw.recv_timeout(SOON),
+            Ok(true),
+            "the link was already given up when the hangup ran"
+        );
+        assert!(
+            peer.quiet(),
+            "and the request the hangup tried to make never reached the daemon"
+        );
+    }
 }
