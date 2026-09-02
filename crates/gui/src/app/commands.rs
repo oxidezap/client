@@ -21,9 +21,9 @@ impl WhatsAppApp {
         }
         // Searching from inside Settings means leaving Settings: the field
         // being focused is behind it.
-        if self.settings.is_some() {
-            self.settings = None;
-        }
+        self.settings.update(cx, |settings, cx| {
+            settings.close(cx);
+        });
         // And so does searching from Status: the field belongs to the chat
         // list, and that list is not on screen while the status list is in its
         // slot. Focusing it there handed the keyboard to an input nothing was
@@ -35,26 +35,26 @@ impl WhatsAppApp {
             self.mobile_panel = MobilePanel::ChatList;
         }
         self.ensure_chat_search_input(window, cx);
-        if let Some(input) = &self.chat_search_input {
-            input.update(cx, |state, cx| state.focus(window, cx));
-        }
+        self.search
+            .update(cx, |search, cx| search.focus_list_input(window, cx));
         cx.notify();
     }
 
-    pub fn media_viewer(&self) -> Option<&MediaViewer> {
-        self.media_viewer.as_ref()
+    pub fn media_viewer<'a>(&self, cx: &'a App) -> Option<&'a MediaViewer> {
+        self.viewer.read(cx).showing()
     }
 
-    pub fn viewer_focus(&self) -> &FocusHandle {
-        &self.viewer_focus
+    pub fn viewer_focus<'a>(&self, cx: &'a App) -> &'a FocusHandle {
+        self.viewer.read(cx).focus()
     }
 
     /// The message the viewer is showing, resolved against the live chat so
     /// a download that finished behind it is what gets drawn.
-    pub fn media_viewer_message(&self) -> Option<&ChatMessage> {
-        let viewer = self.media_viewer.as_ref()?;
+    pub fn media_viewer_message<'a>(&'a self, cx: &App) -> Option<&'a ChatMessage> {
+        let viewer = self.viewer.read(cx);
+        let jid = viewer.jid()?;
         let id = viewer.current_id()?;
-        self.find_chat(&viewer.jid)?
+        self.find_chat(jid)?
             .messages
             .iter()
             .find(|message| message.id == id)
@@ -80,7 +80,7 @@ impl WhatsAppApp {
         let Some(viewer) = MediaViewer::open(jid, message_id, &chat.messages) else {
             return;
         };
-        self.media_viewer = Some(viewer);
+        self.viewer.update(cx, |state, cx| state.open(viewer, cx));
         // A photo and a voice note both want the speakers; opening one stops
         // the other rather than talking over it.
         self.stop_current_media();
@@ -92,35 +92,33 @@ impl WhatsAppApp {
     }
 
     pub fn close_media_viewer(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.media_viewer.take().is_some() {
+        let closed = self.viewer.update(cx, |state, cx| state.close(cx));
+        if closed {
             cx.notify();
-            return true;
         }
-        false
+        closed
     }
 
     /// Walk to the next picture in the conversation.
     pub fn step_media_viewer(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(mut viewer) = self.media_viewer.take() else {
+        let Some(jid) = self.viewer.read(cx).jid().map(str::to_string) else {
             return;
         };
-        // Re-resolve first: a download finishing adds a picture either side,
-        // and stepping over a stale list would skip it. Held out of `self`
-        // for the borrow, which is also why the chat is read where it lies
-        // rather than copied.
-        if self.viewer_survives(&mut viewer) {
-            viewer.step(forward);
-            self.media_viewer = Some(viewer);
-        }
+        // The messages are read where they lie: the viewer is somewhere else
+        // now, so re-resolving it no longer needs `self` mutably while a chat
+        // is borrowed out of it.
+        let messages = self.find_chat(&jid).map(|chat| chat.messages.as_slice());
+        self.viewer
+            .update(cx, |state, cx| state.step(forward, messages, cx));
         cx.notify();
     }
 
-    pub fn conversation_search(&self) -> Option<&ConversationSearch> {
-        self.conversation_search.as_ref()
+    pub fn conversation_search<'a>(&self, cx: &'a App) -> Option<&'a ConversationSearch> {
+        self.search.read(cx).conversation()
     }
 
-    pub fn conversation_search_input(&self) -> Option<&Entity<InputState>> {
-        self.conversation_search_input.as_ref()
+    pub fn conversation_search_input<'a>(&self, cx: &'a App) -> Option<&'a Entity<InputState>> {
+        self.search.read(cx).conversation_input()
     }
 
     /// Open — or close — the search over the conversation on screen.
@@ -129,7 +127,7 @@ impl WhatsAppApp {
     /// only way out other than Escape, and a control that can only open is
     /// half a control.
     pub fn toggle_conversation_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.conversation_search.is_some() {
+        if self.search.read(cx).conversation().is_some() {
             self.close_conversation_search(cx);
             return;
         }
@@ -139,42 +137,70 @@ impl WhatsAppApp {
             self.focus_search(window, cx);
             return;
         };
-        self.conversation_search = Some(ConversationSearch::new(jid));
-        self.ensure_conversation_search_input(window, cx);
-        if let Some(input) = &self.conversation_search_input {
-            input.update(cx, |state, cx| {
-                state.set_value("", window, cx);
-                state.focus(window, cx);
+        // Built and subscribed here for the reason
+        // [`Self::ensure_chat_search_input`] gives: a handler registered on
+        // the search would be handed the search leased, and every answer it
+        // has goes back through a method that updates it.
+        let input = self
+            .search
+            .read(cx)
+            .conversation_input()
+            .is_none()
+            .then(|| {
+                use gpui_component::input::InputEvent;
+
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("Search in this conversation")
+                });
+                cx.subscribe(&input, |this, input, event: &InputEvent, cx| match event {
+                    InputEvent::Change => {
+                        let query = input.read(cx).value().to_string();
+                        this.set_conversation_search(query, cx);
+                    }
+                    // Enter walks to the next match rather than submitting
+                    // anything: there is nothing to submit, and stepping is
+                    // what the reader wants after typing.
+                    InputEvent::PressEnter { shift, .. } => {
+                        this.step_conversation_search(!shift, cx);
+                    }
+                    _ => {}
+                })
+                .detach();
+                input
             });
-        }
+        self.search.update(cx, |search, cx| {
+            search.open_conversation(jid, input, window, cx);
+        });
         cx.notify();
     }
 
     pub fn close_conversation_search(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.conversation_search.take().is_some() {
+        let closed = self
+            .search
+            .update(cx, |search, cx| search.close_conversation(cx));
+        if closed {
             cx.notify();
-            return true;
         }
-        false
+        closed
     }
 
     /// Re-run the query, and follow it to its match.
     ///
-    /// The search is lifted out of `self` for the duration rather than
-    /// borrowed in place: refreshing it needs the chat's messages, and holding
-    /// a mutable borrow of one field while reading another is what previously
-    /// forced a clone of the entire message vector — on every keystroke, in
-    /// the longest conversation the user has.
+    /// The messages are read where they lie: the search is somewhere else
+    /// now, so refreshing it no longer needs a mutable borrow of one field
+    /// while another is read — which is what used to force a clone of the
+    /// entire message vector, on every keystroke, in the longest conversation
+    /// the reader has.
     pub fn set_conversation_search(&mut self, query: String, cx: &mut Context<Self>) {
-        let Some(mut search) = self.conversation_search.take() else {
+        let Some(jid) = self.search.read(cx).conversation_jid().map(str::to_string) else {
             return;
         };
-        if let Some(chat) = self.find_chat(&search.jid) {
-            search.refresh(&query, &chat.messages);
-        }
-        let target = search.current_match().map(str::to_string);
-        self.conversation_search = Some(search);
-
+        let target = match self.find_chat(&jid) {
+            Some(chat) => self.search.update(cx, |search, cx| {
+                search.refresh_conversation(&query, &chat.messages, cx)
+            }),
+            None => None,
+        };
         if let Some(target) = target {
             self.jump_to_message(&target, cx);
         }
@@ -183,53 +209,22 @@ impl WhatsAppApp {
 
     /// Walk the matches. `forward` is down the timeline, the way reading goes.
     pub fn step_conversation_search(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(search) = &mut self.conversation_search else {
-            return;
-        };
-        let Some(target) = search.step(forward).map(str::to_string) else {
+        let Some(target) = self
+            .search
+            .update(cx, |search, cx| search.step_conversation(forward, cx))
+        else {
             return;
         };
         self.jump_to_message(&target, cx);
         cx.notify();
     }
 
-    fn ensure_conversation_search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use gpui_component::input::InputEvent;
-
-        if self.conversation_search_input.is_some() {
-            return;
-        }
-        let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search in this conversation"));
-        cx.subscribe(&input, |this, input, event: &InputEvent, cx| match event {
-            InputEvent::Change => {
-                let query = input.read(cx).value().to_string();
-                this.set_conversation_search(query, cx);
-            }
-            // Enter walks to the next match rather than submitting anything:
-            // there is nothing to submit, and stepping is what the reader
-            // wants after typing.
-            InputEvent::PressEnter { shift, .. } => {
-                this.step_conversation_search(!shift, cx);
-            }
-            _ => {}
-        })
-        .detach();
-        self.conversation_search_input = Some(input);
-    }
-
     /// Empty the search field and restore the full list.
     pub fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(input) = &self.chat_search_input {
-            input.update(cx, |state, cx| state.set_value("", window, cx));
-        }
-        self.chat_search_query.clear();
+        self.search
+            .update(cx, |search, cx| search.clear_list_query(window, cx));
         self.invalidate_chat_cache();
         cx.notify();
-    }
-
-    pub fn settings(&self) -> Option<&SettingsState> {
-        self.settings.as_ref()
     }
 
     /// Open Settings over the conversation view.
@@ -243,41 +238,46 @@ impl WhatsAppApp {
         if !matches!(self.app_state, AppState::Connected | AppState::Offline) {
             return;
         }
-        if self.settings.is_none() {
-            // Settings replaces the body, so a viewer left open is a surface
-            // that is not drawn and still owns things: `sync_overlay_focus`
-            // keeps handing it the keyboard, and `close_overlay` spends the
-            // first Escape closing it — so Settings appears to ignore Escape
-            // once. A picture and a screen over the same slot is one too many.
-            self.close_media_viewer(cx);
-            self.settings = Some(SettingsState::new(cx.product().settings()));
-            // Asked on open rather than on reaching the pane: it is two
-            // directory reads in another process, and a pane that starts on
-            // "measuring…" every time is worse than one that is already right.
-            self.refresh_storage_usage(cx);
-            // And the plugin folder, for the same reason and on the same
-            // terms: it is a request to the process that holds it, answered
-            // whenever that process gets to it.
-            self.refresh_installed_plugins(cx);
-            cx.notify();
+        if self.showing_settings(cx) {
+            return;
         }
+        // Settings replaces the body, so a viewer left open is a surface
+        // that is not drawn and still owns things: `sync_overlay_focus`
+        // keeps handing it the keyboard, and `close_overlay` spends the
+        // first Escape closing it — so Settings appears to ignore Escape
+        // once. A picture and a screen over the same slot is one too many.
+        self.close_media_viewer(cx);
+        let state = SettingsState::new(cx.product().settings());
+        self.settings
+            .update(cx, |settings, cx| settings.show(state, cx));
+        // Asked on open rather than on reaching the pane: it is two
+        // directory reads in another process, and a pane that starts on
+        // "measuring…" every time is worse than one that is already right.
+        self.refresh_storage_usage(cx);
+        // And the plugin folder, for the same reason and on the same
+        // terms: it is a request to the process that holds it, answered
+        // whenever that process gets to it.
+        self.refresh_installed_plugins(cx);
+        cx.notify();
     }
 
+    /// Move to another pane, re-measuring what that pane is about.
     pub fn set_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
-        if let Some(settings) = &mut self.settings
-            && settings.section != section
-        {
-            settings.section = section;
-            if section == SettingsSection::Storage {
-                // Re-measured on arrival: a download since the pane was last
-                // open has changed the number it is about to show.
-                self.refresh_storage_usage(cx);
-            }
-            if section == SettingsSection::Plugins {
-                self.refresh_installed_plugins(cx);
-            }
-            cx.notify();
+        let Some(section) = self
+            .settings
+            .update(cx, |settings, cx| settings.set_section(section, cx))
+        else {
+            return;
+        };
+        if section == SettingsSection::Storage {
+            // Re-measured on arrival: a download since the pane was last
+            // open has changed the number it is about to show.
+            self.refresh_storage_usage(cx);
         }
+        if section == SettingsSection::Plugins {
+            self.refresh_installed_plugins(cx);
+        }
+        cx.notify();
     }
 
     /// Close Settings, keeping whatever theme is currently installed.
@@ -285,16 +285,11 @@ impl WhatsAppApp {
     /// The draft was applied live as it was edited, so closing is not a
     /// discard — `revert_theme` is the way back.
     pub fn close_settings(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.settings.take().is_some() {
+        let closed = self.settings.update(cx, |settings, cx| settings.close(cx));
+        if closed {
             cx.notify();
-            return true;
         }
-        false
-    }
-
-    /// Whether a Settings screen is up, for `sync_overlay_focus`.
-    pub(super) fn showing_settings(&self) -> bool {
-        self.settings.is_some()
+        closed
     }
 
     /// Escape: dismiss the topmost surface, one layer per press.
@@ -304,21 +299,21 @@ impl WhatsAppApp {
     pub fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The waiting strip is the topmost thing on screen when it is up, so
         // Escape refuses that caller and leaves the call underneath alone.
-        if self.call_state.waiting().is_some() {
+        if self.call_state(cx).waiting().is_some() {
             self.decline_waiting_call(cx);
             return;
         }
         if self.close_media_viewer(cx) {
             return;
         }
-        if self.settings.is_some() {
+        if self.showing_settings(cx) {
             self.close_settings(cx);
             return;
         }
         if self.close_conversation_search(cx) {
             return;
         }
-        if self.is_searching() {
+        if self.is_searching(cx) {
             self.clear_search(window, cx);
             return;
         }
@@ -330,21 +325,14 @@ impl WhatsAppApp {
     }
 
     /// Switch preset, taking its palette wholesale.
-    ///
-    /// Picking a preset means wanting that preset, so any per-key overrides
-    /// go with it — keeping them would make the card lie about what is
-    /// selected.
     pub fn set_theme_preset(
         &mut self,
         preset: crate::theme::Preset,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(settings) = &mut self.settings {
-            settings.draft.preset = preset;
-            settings.draft.palette = preset.palette();
-        }
-        self.apply_theme_draft(window, cx);
+        self.settings
+            .update(cx, |settings, cx| settings.set_preset(preset, window, cx));
     }
 
     pub fn set_theme_density(
@@ -353,83 +341,31 @@ impl WhatsAppApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(settings) = &mut self.settings {
-            settings.draft.density = density;
-        }
-        self.apply_theme_draft(window, cx);
+        self.settings
+            .update(cx, |settings, cx| settings.set_density(density, window, cx));
     }
 
     /// Nudge the base font, which scales the whole interface.
     pub fn step_font_size(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::theme::config::{MAX_FONT_SIZE, MIN_FONT_SIZE};
-        let Some(settings) = &mut self.settings else {
-            return;
-        };
-        let next = (settings.draft.font_size + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
-        if (next - settings.draft.font_size).abs() < f32::EPSILON {
-            return;
-        }
-        settings.draft.font_size = next;
-        self.apply_theme_draft(window, cx);
-    }
-
-    /// Install the draft theme so the window shows the change while it is
-    /// being chosen.
-    pub fn apply_theme_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(settings) = &self.settings else {
-            return;
-        };
-        crate::theme::install(settings.draft.clone(), cx);
-        // The base font is the rem reference, so frames already laid out
-        // against the old one are stale.
-        window.refresh();
-        cx.notify();
+        self.settings.update(cx, |settings, cx| {
+            settings.step_font_size(delta, window, cx)
+        });
     }
 
     /// Put back the theme that was in force when Settings opened.
     pub fn revert_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(settings) = &mut self.settings else {
-            return;
-        };
-        settings.draft = settings.original.clone();
-        self.apply_theme_draft(window, cx);
+        self.settings
+            .update(cx, |settings, cx| settings.revert(window, cx));
     }
 
     /// Write the draft to `theme.json`.
-    ///
-    /// Reports the outcome in Settings rather than only to the log: a save
-    /// that failed silently is indistinguishable from one that worked.
     pub fn save_theme(&mut self, cx: &mut Context<Self>) {
-        let Some(settings) = &mut self.settings else {
-            return;
-        };
-        match crate::theme::config::save(&settings.draft) {
-            Ok(location) => {
-                info!("Wrote theme to {location}");
-                // Cleared *before* the copy, or `original` keeps the warnings
-                // the save just made untrue: reverting in the same session, or
-                // closing and reopening Settings, resurrected complaints about
-                // a file that is now valid.
-                settings.draft.problems.clear();
-                settings.original = settings.draft.clone();
-            }
-            Err(err) => {
-                error!("Could not save the theme: {err}");
-                settings.draft.problems = vec![format!("could not save: {err}")];
-            }
-        }
-        cx.notify();
+        self.settings.update(cx, |settings, cx| settings.save(cx));
     }
 
     /// Re-read `theme.json` from disk, discarding the draft.
     pub fn reload_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let loaded = crate::theme::config::load();
-        crate::theme::install(loaded.clone(), cx);
-        if let Some(settings) = &mut self.settings {
-            settings.draft = loaded.clone();
-            settings.original = loaded;
-        }
-        window.refresh();
-        cx.notify();
+        self.settings
+            .update(cx, |settings, cx| settings.reload(window, cx));
     }
 }
