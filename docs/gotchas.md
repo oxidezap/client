@@ -688,20 +688,34 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   every path out that is not a camera held withdraws it again, and the
   refusal's own teardown queues on the call's video lane behind the enable it
   is answering.
-- **Nothing on this side can ask the peer for a keyframe, and that makes one
-  dropped unit permanent.** The library parses an inbound PLI and FIR to drive
-  our own encoder, and builds neither, so the receive path has no way to say
-  "send me a recovery point". Every other hop recovers by asking: the media
-  plane asks us, the window's refusal asks us, the peer's PLI asks us. The
-  peer's picture is the one direction where a single lost access unit ends the
-  stream for good -- the decoder abandons its chain at the gap and waits for a
-  keyframe the peer will only send on its own cadence, which for WhatsApp
-  mobile is on demand and therefore never. The official client's own receive
-  path is built on the opposite assumption: `pjmedia_rtcp_build_rtcp_pli`,
-  throttled by `pli_throttle_time_ms`, fired on decode error via
-  `enable_pli_for_dec_err`, with NACK escalating to PLI. Until the library can
-  send one, every drop between the relay and the decoder is a black pane for
-  the rest of the call.
+- **The peer's picture is asked for from exactly two places, and both are
+  above the library.** A dropped access unit used to end the peer's stream for
+  good: the decoder abandons its chain at the gap and waits for a keyframe the
+  peer sends only on its own cadence, which for WhatsApp mobile is on demand
+  and therefore never. The library parsed an inbound PLI to drive our encoder
+  and built none of its own, so the receive path had nothing to say "send me a
+  recovery point" with. It does now (`CallHandle::request_peer_keyframe`,
+  oxidezap/whatsapp-rust#1385), and what matters here is *who is in a position
+  to notice a loss worth asking about*.
+
+  Not the library: it hands each access unit over intact, so by the time one
+  is lost it is above the hand-off and invisible below it. `pump_remote` is
+  where it actually goes -- the window's queue refuses it -- which is why the
+  ask is made there and not deeper. It fires on every dropped unit rather than
+  the first, because a window that sheds sheds a run and coalescing a run into
+  one request is the engine's throttle, not this pump's job.
+
+  The other is `<video state="1">`: the peer's camera coming on mid-call
+  resumes an encoder already running, so the first unit it sends need not be a
+  keyframe at all. This is the mirror of the `peer_can_receive_video` ask
+  beside it, which asks *our* camera for the same reason in the other
+  direction.
+
+  Both pass `KeyframeUrgency::Coalesced`. `Immediate` is for a decoder that
+  has already failed and reset -- the front end is what would know that, and
+  nothing here reports a decode failure back, so there is nowhere to call it
+  honestly yet. The official client draws the same line: `pli_throttle_time_ms`
+  for the routine case, `enable_pli_for_dec_err` for the one that skips it.
 - **Video encoded before the peer accepts is thrown away twice, and poisons
   the channel it is thrown away in.** The camera has to open before the offer
   -- an offer with no camera is not a video offer -- but nothing wants those

@@ -101,10 +101,9 @@ impl H264Encoder {
         // Honoured, but not sooner than the last forced IDR — and the ask is
         // *kept* when it is too soon, so the last request of a burst is
         // never the one lost.
-        if self.force_keyframe && self.since_forced >= self.min_between_forced {
+        let forcing = self.force_keyframe && self.since_forced >= self.min_between_forced;
+        if forcing {
             self.encoder.force_intra_frame();
-            self.force_keyframe = false;
-            self.since_forced = 0;
         }
         let bitstream = self
             .encoder
@@ -119,10 +118,18 @@ impl H264Encoder {
         if data.is_empty() {
             return Ok(None);
         }
-        Ok(Some(EncodedFrame {
-            data,
-            keyframe: matches!(frame_type, FrameType::IDR | FrameType::I),
-        }))
+        let keyframe = matches!(frame_type, FrameType::IDR | FrameType::I);
+        // Spent on the IDR rather than on asking for one. Rate control may
+        // skip the very frame the force was set on, and clearing the ask there
+        // would drop it while starting a cooldown against a keyframe that was
+        // never made — the peer waits the interval out for nothing, which is
+        // the failure the interval exists to prevent, arrived at from the
+        // other side.
+        if forcing && keyframe {
+            self.force_keyframe = false;
+            self.since_forced = 0;
+        }
+        Ok(Some(EncodedFrame { data, keyframe }))
     }
 }
 

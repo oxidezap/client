@@ -917,7 +917,7 @@ fn tick(
     // early, and a tick that arrives before its frame is due does nothing.
     let period_ms = MILLIS_PER_SECOND / f64::from(quality.fps.max(1));
     let due = Rc::new(Cell::new(f64::NEG_INFINITY));
-    /// Frames since the last one that asked for an IDR; see the cadence below.
+    // Frames since the last one that asked for an IDR; see the cadence below.
     let keyed = Rc::new(Cell::new(0u64));
     let complained = Rc::new(RefCell::new(false));
     Closure::<dyn FnMut()>::new(move || {

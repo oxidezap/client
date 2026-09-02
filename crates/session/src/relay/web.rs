@@ -571,7 +571,14 @@ impl RelayTransport for BrowserRelayChannel {
             }
             return Ok(());
         }
-        if self.congested.replace(false) {
+        // Against the ceiling rather than against "this packet went out": the
+        // voice is exempt up to the hard ceiling, so while video is being shed
+        // every accepted audio packet took this exit -- announcing a drain
+        // that had not happened and clearing the count mid-run. What that
+        // costs is not only a wrong line: the flag is what makes the warning
+        // above once-per-run, so re-arming it every 20ms restored exactly the
+        // per-packet spam it exists to prevent.
+        if self.channel.buffered_amount() <= OUTBOUND_CEILING && self.congested.replace(false) {
             debug!(
                 "the relay channel drained; {} outbound packets were dropped while it was behind",
                 self.outbound_dropped.replace(0)
