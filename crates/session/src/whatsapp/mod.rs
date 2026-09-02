@@ -110,28 +110,75 @@ fn logout_message(event: &whatsapp_rust::types::events::LoggedOut) -> String {
     }
 }
 
-/// Shared client handle for accessing the WhatsApp client from UI
-pub type ClientHandle = Arc<Mutex<Option<Arc<Client>>>>;
+/// Where a UI event goes.
+///
+/// Live from construction rather than from `start`, and not an `Option`: the
+/// front end is attached before the session is, and a failure that happens in
+/// between — a send typed into a window whose session is still opening — is
+/// exactly the one it has to hear about. This used to be a slot filled by the
+/// session task, so those failures were sent to nobody and the optimistic
+/// bubble sat pending forever.
+pub type UiEventSender = mpsc::UnboundedSender<UiEvent>;
 
-/// Shared UI event sender for sending events from async operations
-pub type UiEventSender = Arc<Mutex<Option<mpsc::UnboundedSender<UiEvent>>>>;
+/// Everything the session *is*, once it is up.
+///
+/// One value rather than four slots. The client, the history it is recorded
+/// in and the book that names people in it are opened together and go
+/// together, and every caller wants some pair of them: published separately,
+/// a send could hold a live client beside a chat store that was still `None`
+/// and go out on the wire with nothing recording it, and a teardown that took
+/// the store first left the same window open from the other end.
+pub(crate) struct Session {
+    /// The WhatsApp connection.
+    pub(crate) client: Arc<Client>,
+    /// Durable chat history — the same SQLite file as the device store.
+    pub(crate) chat_store: Arc<ChatStore>,
+    /// The session's one address book, so a live bubble, the row it lands in
+    /// and the typing line above it name the same person the same way.
+    pub(crate) names: Arc<NameBook>,
+}
 
-/// Shared chat-store handle (durable message history in the same SQLite file)
-pub type ChatStoreHandle = Arc<Mutex<Option<Arc<ChatStore>>>>;
+/// Where the one session lives: `None` until it is open, and `None` again the
+/// moment it is let go. Nothing observable sits in between.
+pub(crate) type SessionSlot = Arc<Mutex<Option<Arc<Session>>>>;
 
-/// Shared handle on the session's one address book. See [`NameBook`].
-type NameBookHandle = Arc<Mutex<Option<Arc<NameBook>>>>;
+/// How long each phase of a cold start took, so the one line that reports
+/// it can be written after hydration rather than in the middle of it.
+struct ColdStart {
+    prepared: std::time::Duration,
+    opened: std::time::Duration,
+    materialized: std::time::Duration,
+    built: std::time::Duration,
+}
+
+/// What a caller can see of the session right now: whether the client, the
+/// history and the address book are each reachable.
+///
+/// Only the tests ask, and what they ask is whether the answer can ever be
+/// mixed. It cannot be here — there is one value, so the three bools are read
+/// off one `Option` — and that is the invariant, not an accident of this
+/// function: the shape it replaced filled four slots one at a time, and put
+/// back it answers `[false, true, true]` — a store and an address book with no
+/// client — for the whole of the build that follows.
+#[cfg(test)]
+pub(crate) async fn parts_visible(session: &SessionSlot) -> [bool; 3] {
+    let live = session.lock().await.clone();
+    // Each part reached on its own, so that staging the publish again is a
+    // change to this body and to nothing the test says.
+    [
+        live.as_ref().map(|live| live.client.clone()).is_some(),
+        live.as_ref().map(|live| live.chat_store.clone()).is_some(),
+        live.as_ref().map(|live| live.names.clone()).is_some(),
+    ]
+}
 
 /// What the session's own task shares with the handle that started it.
 ///
-/// One struct rather than eight parameters: every one of these is a handle
-/// the caller keeps a copy of, and a list of eight is a list nobody can read.
+/// One struct rather than six parameters: every one of these is a handle the
+/// caller keeps a copy of, and a list of six is a list nobody can read.
 struct Shared {
-    client_handle: ClientHandle,
+    session: SessionSlot,
     calls: CallRegistry,
-    chat_store_handle: ChatStoreHandle,
-    names_handle: NameBookHandle,
-    ui_sender: UiEventSender,
     shutdown: Arc<tokio::sync::Notify>,
     reload: Arc<tokio::sync::Notify>,
 }
@@ -142,10 +189,14 @@ pub struct WhatsAppClient {
     /// Where the session's work runs: a runtime on a thread of its own on a
     /// desktop, the page's event loop in a browser. See [`crate::exec`].
     exec: Executor,
-    /// Shared client reference
-    client_handle: ClientHandle,
-    /// Shared UI event sender for sending events from operations like start_call
+    /// Where UI events go. See [`UiEventSender`].
     ui_sender: UiEventSender,
+    /// The other end of it, until whoever starts the session takes it.
+    ///
+    /// This is also what "already started" *is*: the receiver is the token, so
+    /// the question cannot be answered one way by a flag and another way by
+    /// whether anybody is listening.
+    ui_events: Option<mpsc::UnboundedReceiver<UiEvent>>,
     /// Live/ringing calls
     calls: CallRegistry,
     /// Where a call's video frames are published, once somebody has asked
@@ -162,11 +213,9 @@ pub struct WhatsAppClient {
     /// Whether anybody is drawing what the cameras produce. See
     /// [`Self::set_video_publishing`].
     video_publishing: Arc<portable_atomic::AtomicBool>,
-    /// Durable chat history (same SQLite file as the device store)
-    chat_store: ChatStoreHandle,
-    /// The session's address book, so a page served on request names people
-    /// the way the load that produced the chat list did.
-    names: NameBookHandle,
+    /// The client, the history and the address book, as one value. See
+    /// [`Session`].
+    session: SessionSlot,
     /// Tears down `run_client` on retry: without it the replaced client's
     /// loop would keep the executor and the SQLite pool alive forever
     /// (bot.run() reconnects internally and never returns on its own).
@@ -178,8 +227,6 @@ pub struct WhatsAppClient {
     /// no chats and nothing has changed, so nothing would arrive until the
     /// next message did.
     reload: Arc<tokio::sync::Notify>,
-    /// Whether the client has been started
-    started: bool,
 }
 
 impl WhatsAppClient {
@@ -188,20 +235,19 @@ impl WhatsAppClient {
     /// refuse — so a retry can route to the error screen instead of panicking
     /// the thread that asked.
     pub fn new() -> std::io::Result<Self> {
+        let (ui_sender, ui_events) = mpsc::unbounded_channel::<UiEvent>();
         Ok(Self {
             exec: Executor::new()?,
-            client_handle: Arc::new(Mutex::new(None)),
-            ui_sender: Arc::new(Mutex::new(None)),
+            ui_sender,
+            ui_events: Some(ui_events),
             calls: CallRegistry::default(),
             video_tx: Arc::new(std::sync::Mutex::new(None)),
             // Closed until a window says otherwise: a daemon that starts with
             // nobody attached has nobody to publish to.
             video_publishing: Arc::new(portable_atomic::AtomicBool::new(false)),
-            chat_store: Arc::new(Mutex::new(None)),
-            names: Arc::new(Mutex::new(None)),
+            session: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             reload: Arc::new(tokio::sync::Notify::new()),
-            started: false,
         })
     }
 
@@ -266,10 +312,16 @@ impl WhatsAppClient {
     /// Taking the handle is the other half: it drops the sender the session
     /// held, so nothing enqueues anything after.
     async fn drain_chat_store(&self, grace: std::time::Duration) -> bool {
-        let Some(store) = self.chat_store.lock().await.take() else {
+        // The whole session, not the store alone. Letting go is as much an
+        // ordering question as opening was: a client left behind in a slot
+        // its store had been taken out of is a send that still goes out on
+        // the wire with nothing left to record it — and, on the path that
+        // matters, an `Arc<Client>` still holding the pool over the database
+        // about to be deleted.
+        let Some(session) = self.session.lock().await.take() else {
             return true;
         };
-        match crate::exec::with_timeout(store.close(), grace).await {
+        match crate::exec::with_timeout(session.chat_store.close(), grace).await {
             Some(Ok(())) => true,
             // Answered, and that is what is being asked. A batch that rolled
             // back is a write that never landed and a writer that panicked is
@@ -285,18 +337,6 @@ impl WhatsAppClient {
                 false
             }
         }
-    }
-
-    /// Get the client handle for sending messages
-    #[allow(dead_code)]
-    pub fn client_handle(&self) -> ClientHandle {
-        self.client_handle.clone()
-    }
-
-    /// Durable chat history store, once the client is up (None before init).
-    #[allow(dead_code)]
-    pub fn chat_store(&self) -> ChatStoreHandle {
-        self.chat_store.clone()
     }
 
     /// Subscribe to the video of whatever call is up.
@@ -369,33 +409,22 @@ impl WhatsAppClient {
     ///
     /// Returns a receiver for UI events, or an error if already started
     pub fn start(&mut self) -> Result<mpsc::UnboundedReceiver<UiEvent>, &'static str> {
-        if self.started {
-            return Err("WhatsApp client already started");
-        }
-        self.started = true;
+        let ui_rx = self
+            .take_events()
+            .ok_or("WhatsApp client already started")?;
 
-        let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiEvent>();
-        let client_handle = self.client_handle.clone();
-        let ui_sender = self.ui_sender.clone();
+        let ui_tx = self.ui_sender.clone();
+        let session = self.session.clone();
         let calls = self.calls.clone();
-        let chat_store = self.chat_store.clone();
-        let names = self.names.clone();
         let shutdown = self.shutdown.clone();
         let reload = self.reload.clone();
 
         let started = self.exec.start("oxidezap-session", async move {
-            {
-                let mut guard = ui_sender.lock().await;
-                *guard = Some(ui_tx.clone());
-            }
             Self::run_client(
                 ui_tx,
                 Shared {
-                    client_handle,
+                    session,
                     calls,
-                    chat_store_handle: chat_store,
-                    names_handle: names,
-                    ui_sender: ui_sender.clone(),
                     shutdown,
                     reload,
                 },
@@ -403,24 +432,45 @@ impl WhatsAppClient {
             .await;
         });
         if started.is_err() {
-            self.started = false;
+            // Hand the stream back, so a caller that routes the failure to an
+            // error screen and retries is starting a session again rather
+            // than being told it already has one.
+            self.ui_events = Some(ui_rx);
             return Err("failed to start the WhatsApp session");
         }
 
         Ok(ui_rx)
     }
 
-    /// Internal async function to run the client
-    async fn run_client(ui_tx: mpsc::UnboundedSender<UiEvent>, shared: Shared) {
-        let Shared {
-            client_handle,
-            calls,
-            chat_store_handle,
-            names_handle,
-            ui_sender,
-            shutdown,
-            reload,
-        } = shared;
+    /// Take the stream of UI events, if nobody has.
+    ///
+    /// The receiving half exists from construction, so events sent before the
+    /// session is up are not lost; taking it is what [`Self::start`] does with
+    /// it, and doing so is what makes a second start an error.
+    pub(crate) fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<UiEvent>> {
+        self.ui_events.take()
+    }
+
+    /// Open the store, the history, the address book and the client, and
+    /// publish them as one [`Session`].
+    ///
+    /// A seam rather than the middle of `run_client`, because everything up to
+    /// here runs offline — `Bot::build` opens the store and connects nothing —
+    /// and the ordering it establishes is the session's whole invariant. A
+    /// test can drive it against an in-memory database and watch the slot
+    /// while it does.
+    ///
+    /// Returns the bot, which only the caller runs: `bot.run()` is the network
+    /// and the one thing a test cannot have.
+    async fn open_session(
+        db_path: &str,
+        ui_tx: &UiEventSender,
+        session: &SessionSlot,
+    ) -> Option<(Bot, Arc<Session>, ColdStart)> {
+        // `began` is this function's own, and the caller's total is the
+        // caller's: resolving where the database lives happens before this and
+        // is measured there, so no phase falls outside the line that reports
+        // them.
         // A cold start is the phases below, with an `.await` between each
         // pair — and on a page that is not the pause it looks like. A future
         // that is already ready resolves inside the microtask it was polled
@@ -448,7 +498,7 @@ impl WhatsAppClient {
         // dangerous is ordered elsewhere: `close` raises the shutdown and
         // *joins the executor*, so a wipe waits for this future to return and
         // the forget path is gated on whether it did.
-        let cold_start = wacore::time::Instant::now();
+        let opening_began = wacore::time::Instant::now();
         // Whatever this platform has to do before a database can be opened
         // at all. Here rather than at the caller, because forgetting it is
         // not a failure anybody would see: a browser without its VFS opens a
@@ -457,22 +507,13 @@ impl WhatsAppClient {
         if let Err(e) = crate::store::prepare().await {
             error!("Failed to prepare the store: {e}");
             let _ = ui_tx.send(UiEvent::Error(format!("Database error: {e}")));
-            return;
+            return None;
         }
-        let prepared = cold_start.elapsed();
+        let prepared = opening_began.elapsed();
         crate::exec::breathe().await;
-        // Device store + durable chat history share one SQLite file (one pool,
-        // one WAL writer).
-        let db_path = match crate::exec::unblock(resolve_database_path).await {
-            Ok(path) => path,
-            Err(e) => {
-                error!("Failed to resolve database path: {e}");
-                let _ = ui_tx.send(UiEvent::Error("Database initialization failed".to_string()));
-                return;
-            }
-        };
+
         let opening = wacore::time::Instant::now();
-        let backend = match SqliteStore::with_config(&db_path, store_settings()).await {
+        let backend = match SqliteStore::with_config(db_path, store_settings()).await {
             Ok(store) => store,
             Err(e) => {
                 // With the chain, not just the head. `StoreError`'s own
@@ -482,7 +523,7 @@ impl WhatsAppClient {
                 // database file anybody can open afterwards and look at.
                 error!("Failed to create SQLite backend: {}", because(&e));
                 let _ = ui_tx.send(UiEvent::Error(format!("Database error: {}", e)));
-                return;
+                return None;
             }
         };
         let opened = opening.elapsed();
@@ -494,29 +535,10 @@ impl WhatsAppClient {
             Err(e) => {
                 error!("Failed to open chat store: {}", because(&e));
                 let _ = ui_tx.send(UiEvent::Error(format!("Database error: {}", e)));
-                return;
+                return None;
             }
         };
         let materialized = materializing.elapsed();
-        {
-            let mut guard = chat_store_handle.lock().await;
-            *guard = Some(chat_store.clone());
-        }
-
-        // One book for the whole session, so a live bubble, the row it lands
-        // in and the typing line above it are all naming the same person from
-        // the same answer.
-        let names = Arc::new(NameBook::new(chat_store_handle.clone()));
-        // Published for the paged reads, which run outside this task and have
-        // to name people the same way it does.
-        {
-            let mut guard = names_handle.lock().await;
-            *guard = Some(names.clone());
-        }
-        // After *both* handles, not between them. A yield is a place other
-        // tasks run, and a paged read is one of them: it wants the store and
-        // the book together, and the gap that publishing them either side of
-        // a yield would open is the one thing this change must not add.
         crate::exec::breathe().await;
 
         // Transport, HTTP client and runtime come from whichever platform
@@ -540,25 +562,86 @@ impl WhatsAppClient {
             Err(e) => {
                 error!("Failed to build bot: {}", e);
                 let _ = ui_tx.send(UiEvent::Error(format!("Connection failed: {}", e)));
-                return;
+                // The store is already open, and nothing published means
+                // nothing to take: `drain_chat_store` would find an empty slot
+                // and answer "drained" over a writer still holding the
+                // database — which is the wipe racing the writer that the
+                // whole close path exists to prevent, arrived at from a
+                // failure nobody expected to matter. Closed here instead.
+                if let Err(e) = chat_store.close().await {
+                    warn!("the chat store did not close cleanly: {e}");
+                }
+                return None;
             }
         };
+        let built = building.elapsed();
 
         // Give the client this platform's way onto a call's media wire, before
         // anything can ring. Nothing on a desktop, where the library's own UDP
         // dialler is the default and is right; on a page it is the whole
         // reason a call can be placed at all. See `crate::relay`.
-        let built = building.elapsed();
+        crate::relay::install(&bot.client());
+
+        // One publish, after everything it names exists. There is no order to
+        // get wrong here and no window to observe: what a caller finds is
+        // either no session at all or a client, the history it is recorded in
+        // and the book that names people in it, together. Four slots filled
+        // one at a time is what this replaced, and the gap between any two of
+        // them was a real one — a paged read that had the store but not the
+        // book, a send that had the client but nothing recording it.
+        let live = Arc::new(Session {
+            client: bot.client(),
+            chat_store: chat_store.clone(),
+            names: Arc::new(NameBook::new(Some(chat_store))),
+        });
+        *session.lock().await = Some(live.clone());
         crate::exec::breathe().await;
 
-        crate::relay::install(&bot.client());
+        Some((
+            bot,
+            live,
+            ColdStart {
+                prepared,
+                opened,
+                materialized,
+                built,
+            },
+        ))
+    }
+
+    /// Internal async function to run the client
+    async fn run_client(ui_tx: UiEventSender, shared: Shared) {
+        let Shared {
+            session,
+            calls,
+            shutdown,
+            reload,
+        } = shared;
+        let cold_start = wacore::time::Instant::now();
+        // Device store + durable chat history share one SQLite file (one pool,
+        // one WAL writer).
+        let db_path = match crate::exec::unblock(resolve_database_path).await {
+            Ok(path) => path,
+            Err(e) => {
+                error!("Failed to resolve database path: {e}");
+                let _ = ui_tx.send(UiEvent::Error("Database initialization failed".to_string()));
+                return;
+            }
+        };
+        let resolving = cold_start.elapsed();
+        let Some((bot, live, cold)) = Self::open_session(&db_path, &ui_tx, &session).await else {
+            return;
+        };
+        let Session {
+            chat_store, names, ..
+        } = &*live;
 
         // Hydrate the UI from durable history before the network is even up
         // (bot.run() is what connects). The client is needed here so hydrated
         // JIDs normalize through the same PN->LID mapping live events use.
         let hydrating = wacore::time::Instant::now();
         let mut hydrated = 0;
-        match Self::load_history(&chat_store, &bot.client(), &names).await {
+        match Self::load_history(chat_store, &bot.client(), names).await {
             Ok(loaded) if !loaded.chats.is_empty() => {
                 hydrated = loaded.chats.len();
                 let _ = ui_tx.send(loaded.into_event());
@@ -571,8 +654,12 @@ impl WhatsAppClient {
         // attributable at all, and the numbers are what any change to it has
         // to be argued against.
         info!(
-            "cold start: store {prepared:?}, sqlite {opened:?}, chats {materialized:?}, \
-             client {built:?}, hydration {:?} ({hydrated} chats) — {:?} in total",
+            "cold start: path {resolving:?}, store {:?}, sqlite {:?}, chats {:?}, \
+             client {:?}, hydration {:?} ({hydrated} chats) — {:?} in total",
+            cold.prepared,
+            cold.opened,
+            cold.materialized,
+            cold.built,
             hydrating.elapsed(),
             cold_start.elapsed(),
         );
@@ -624,7 +711,6 @@ impl WhatsAppClient {
             let client = bot.client();
             let ui_tx = ui_tx.clone();
             let calls = calls.clone();
-            let ui_sender = ui_sender.clone();
             let names = names.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
@@ -638,10 +724,9 @@ impl WhatsAppClient {
                         let client = client.clone();
                         let ui_tx = ui_tx.clone();
                         let calls = calls.clone();
-                        let ui_sender = ui_sender.clone();
                         let names = names.clone();
                         async move {
-                            Self::handle_event(event, client, ui_tx, calls, ui_sender, names).await;
+                            Self::handle_event(event, client, ui_tx, calls, names).await;
                         }
                     },
                     stopping.clone(),
@@ -683,15 +768,9 @@ impl WhatsAppClient {
             &bot,
             &ui_tx,
             reload,
-            names,
+            names.clone(),
             stopping,
         );
-
-        // Store client reference for UI to use
-        {
-            let mut guard = client_handle.lock().await;
-            *guard = Some(bot.client());
-        }
 
         // Notify UI that init is complete
         let _ = ui_tx.send(UiEvent::InitComplete);
@@ -721,9 +800,8 @@ impl WhatsAppClient {
     async fn handle_event(
         event: Arc<Event>,
         client: Arc<Client>,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
+        ui_tx: UiEventSender,
         calls: CallRegistry,
-        ui_sender: UiEventSender,
         names: Arc<NameBook>,
     ) {
         match &*event {
@@ -1065,9 +1143,7 @@ impl WhatsAppClient {
                     });
                 }
             }
-            _ => {
-                let _ = ui_sender; // silences unused when no branch needs it
-            }
+            _ => {}
         }
     }
 
@@ -1265,8 +1341,7 @@ impl WhatsAppClient {
         local_id: String,
         quoted: Option<oxidezap_core::QuotedMessage>,
     ) -> Task<()> {
-        let client_handle = self.client_handle.clone();
-        let chat_store = self.chat_store.clone();
+        let session = self.session.clone();
         let ui_sender = self.ui_sender.clone();
         let jid_str = jid_str.to_string();
         let content = content.to_string();
@@ -1278,15 +1353,18 @@ impl WhatsAppClient {
                     error!("Invalid JID {}: {}", observe_str(&jid_str), e);
                     // The optimistic bubble still carries its local id;
                     // without this it would sit unsent with no indicator.
-                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
                     return;
                 }
             };
 
-            // Clone the Arc and release the mutex: a slow network call
-            // here must not queue every other client action behind it.
-            let client = client_handle.lock().await.clone();
-            if let Some(client) = client {
+            // Clone the `Arc` and release the mutex: a slow network call
+            // here must not queue every other client action behind it. What
+            // is cloned is the whole session, so the client that sends and
+            // the store that records the send are the same session's.
+            let live = session.lock().await.clone();
+            if let Some(live) = live {
+                let client = &live.client;
                 // A reply is the same send with a quote attached, which the
                 // wire carries as an extended text message: a bare
                 // `conversation` has nowhere to put the context.
@@ -1315,8 +1393,8 @@ impl WhatsAppClient {
                 let msg_id = client.generate_message_id();
                 // Receipts/reactions arrive keyed by this id; rename the
                 // optimistic bubble before they can race it.
-                notify_message_id(&ui_sender, &jid_str, local_id, &msg_id).await;
-                record_outgoing(&chat_store, &jid, &msg_id, &message).await;
+                notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
+                record_outgoing(&live.chat_store, &jid, &msg_id, &message);
                 let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
                 match client
                     .send_message_with_options(jid.clone(), message, options)
@@ -1327,8 +1405,8 @@ impl WhatsAppClient {
                     }
                     Err(e) => {
                         error!("Failed to send message {}: {}", msg_id, e);
-                        mark_send_failed(&chat_store, &jid, &msg_id).await;
-                        notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
+                        mark_send_failed(&live.chat_store, &jid, &msg_id);
+                        notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string());
                     }
                 }
             } else {
@@ -1339,8 +1417,7 @@ impl WhatsAppClient {
                     &jid_str,
                     &local_id,
                     "client not available".to_string(),
-                )
-                .await;
+                );
             }
         })
     }
@@ -1352,13 +1429,16 @@ impl WhatsAppClient {
         downloadable: DownloadableMedia,
     ) -> tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let client_handle = self.client_handle.clone();
+        let session = self.session.clone();
 
         self.exec.spawn(async move {
-            // Clone the Arc and release the mutex: a slow network call
-            // here must not queue every other client action behind it.
-            let client = client_handle.lock().await.clone();
-            if let Some(client) = client {
+            // Clone the `Arc` and release the mutex: a slow network call
+            // here must not queue every other client action behind it. What
+            // is cloned is the whole session, so the client that sends and
+            // the store that records the send are the same session's.
+            let live = session.lock().await.clone();
+            if let Some(live) = live {
+                let client = &live.client;
                 info!(
                     "Downloading media: {} bytes expected",
                     downloadable.file_length
@@ -1393,9 +1473,8 @@ impl WhatsAppClient {
         local_id: String,
         quoted: Option<oxidezap_core::QuotedMessage>,
     ) -> Task<()> {
-        let chat_store = self.chat_store.clone();
+        let session = self.session.clone();
         let ui_sender = self.ui_sender.clone();
-        let client_handle = self.client_handle.clone();
         let jid_str = jid_str.to_string();
 
         self.exec.spawn(async move {
@@ -1405,15 +1484,18 @@ impl WhatsAppClient {
                     error!("Invalid JID {}: {}", observe_str(&jid_str), e);
                     // The optimistic bubble still carries its local id;
                     // without this it would sit unsent with no indicator.
-                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
                     return;
                 }
             };
 
-            // Clone the Arc and release the mutex: a slow network call
-            // here must not queue every other client action behind it.
-            let client = client_handle.lock().await.clone();
-            if let Some(client) = client {
+            // Clone the `Arc` and release the mutex: a slow network call
+            // here must not queue every other client action behind it. What
+            // is cloned is the whole session, so the client that sends and
+            // the store that records the send are the same session's.
+            let live = session.lock().await.clone();
+            if let Some(live) = live {
+                let client = &live.client;
                 let upload_result = match client
                     .upload(audio_data, DownloadMediaType::Audio, Default::default())
                     .await
@@ -1422,7 +1504,7 @@ impl WhatsAppClient {
                     Err(e) => {
                         error!("Failed to upload audio: {}", e);
                         // Bubble still carries the local id at this point.
-                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
                         return;
                     }
                 };
@@ -1467,8 +1549,8 @@ impl WhatsAppClient {
                 // Same ordering as the text path: record before sending so
                 // the ack can't precede the row in the writer queue.
                 let msg_id = client.generate_message_id();
-                notify_message_id(&ui_sender, &jid_str, local_id, &msg_id).await;
-                record_outgoing(&chat_store, &jid, &msg_id, &message).await;
+                notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
+                record_outgoing(&live.chat_store, &jid, &msg_id, &message);
                 let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
                 match client
                     .send_message_with_options(jid.clone(), message, options)
@@ -1479,8 +1561,8 @@ impl WhatsAppClient {
                     }
                     Err(e) => {
                         error!("Failed to send audio message {}: {}", msg_id, e);
-                        mark_send_failed(&chat_store, &jid, &msg_id).await;
-                        notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
+                        mark_send_failed(&live.chat_store, &jid, &msg_id);
+                        notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string());
                     }
                 }
             } else {
@@ -1491,8 +1573,7 @@ impl WhatsAppClient {
                     &jid_str,
                     &local_id,
                     "client not available".to_string(),
-                )
-                .await;
+                );
             }
         })
     }
@@ -1516,9 +1597,8 @@ impl WhatsAppClient {
         local_id: String,
         quoted: Option<oxidezap_core::QuotedMessage>,
     ) -> Task<()> {
-        let chat_store = self.chat_store.clone();
+        let session = self.session.clone();
         let ui_sender = self.ui_sender.clone();
-        let client_handle = self.client_handle.clone();
         let jid_str = jid_str.to_string();
 
         self.exec.spawn(async move {
@@ -1528,24 +1608,23 @@ impl WhatsAppClient {
                     error!("Invalid JID {}: {}", observe_str(&jid_str), e);
                     // The optimistic bubble still carries its local id;
                     // without this it would sit unsent with no indicator.
-                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
                     return;
                 }
             };
 
-            // Clone the Arc and release the mutex: a slow network call
+            // Clone the `Arc` and release the mutex: a slow network call
             // here must not queue every other client action behind it.
-            let client = client_handle.lock().await.clone();
-            let Some(client) = client else {
-                error!("Client not available for sending media");
+            let live = session.lock().await.clone();
+            let Some(live) = live else {
+                error!("No session available for sending media");
                 // The bubble still carries its local id (no rename ran).
                 notify_send_failed(
                     &ui_sender,
                     &jid_str,
                     &local_id,
                     "client not available".to_string(),
-                )
-                .await;
+                );
                 return;
             };
 
@@ -1576,7 +1655,7 @@ impl WhatsAppClient {
                         // shutting down. Reported rather than dropped: the bubble
                         // is drawn and only an answer resolves it.
                         error!("that file could not be prepared: {e}");
-                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
                         return;
                     }
                 };
@@ -1586,12 +1665,13 @@ impl WhatsAppClient {
             // would be a second whole file in the process holding the account,
             // which in a page is a linear memory with a ceiling.
             let data = std::mem::take(&mut file.data);
+            let client = &live.client;
             let (media_type, options) = file.upload_options();
             let uploaded = match client.upload(data, media_type, options).await {
                 Ok(response) => outgoing::Uploaded::from(response),
                 Err(e) => {
                     error!("Failed to upload {}: {}", file.mime_type, e);
-                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string());
                     return;
                 }
             };
@@ -1605,8 +1685,8 @@ impl WhatsAppClient {
             // Same ordering as the text path: record before sending so
             // the ack can't precede the row in the writer queue.
             let msg_id = client.generate_message_id();
-            notify_message_id(&ui_sender, &jid_str, local_id, &msg_id).await;
-            record_outgoing(&chat_store, &jid, &msg_id, &message).await;
+            notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
+            record_outgoing(&live.chat_store, &jid, &msg_id, &message);
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(jid.clone(), message, options)
@@ -1617,8 +1697,8 @@ impl WhatsAppClient {
                 }
                 Err(e) => {
                     error!("Failed to send media message {}: {}", msg_id, e);
-                    mark_send_failed(&chat_store, &jid, &msg_id).await;
-                    notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
+                    mark_send_failed(&live.chat_store, &jid, &msg_id);
+                    notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string());
                 }
             }
         })
@@ -1626,7 +1706,7 @@ impl WhatsAppClient {
 
     /// Send "composing" chat state (typing indicator)
     pub fn send_composing(&self, jid_str: &str) {
-        let client_handle = self.client_handle.clone();
+        let session = self.session.clone();
         let jid_str = jid_str.to_string();
 
         self.exec.spawn(async move {
@@ -1638,7 +1718,11 @@ impl WhatsAppClient {
                 }
             };
 
-            let client = client_handle.lock().await.clone();
+            let client = session
+                .lock()
+                .await
+                .as_ref()
+                .map(|live| live.client.clone());
             if let Some(client) = client
                 && let Err(e) = client.chatstate().send_composing(&jid).await
             {
@@ -1649,7 +1733,7 @@ impl WhatsAppClient {
 
     /// Send "paused" chat state (stopped typing)
     pub fn send_paused(&self, jid_str: &str) {
-        let client_handle = self.client_handle.clone();
+        let session = self.session.clone();
         let jid_str = jid_str.to_string();
 
         self.exec.spawn(async move {
@@ -1661,7 +1745,11 @@ impl WhatsAppClient {
                 }
             };
 
-            let client = client_handle.lock().await.clone();
+            let client = session
+                .lock()
+                .await
+                .as_ref()
+                .map(|live| live.client.clone());
             if let Some(client) = client
                 && let Err(e) = client.chatstate().send_paused(&jid).await
             {
@@ -1683,7 +1771,7 @@ impl WhatsAppClient {
         chat_jid_str: &str,
         messages: Vec<(String, String)>,
     ) -> Task<()> {
-        let client_handle = self.client_handle.clone();
+        let session = self.session.clone();
         let chat_jid_str = chat_jid_str.to_string();
 
         self.exec.spawn(async move {
@@ -1723,10 +1811,13 @@ impl WhatsAppClient {
             // whatsmeow/WA Web); a plain DM receipt must not.
             let needs_participant = participant_keyed_chat(&chat_jid);
 
-            // Clone the Arc and release the mutex: a slow network call
-            // here must not queue every other client action behind it.
-            let client = client_handle.lock().await.clone();
-            if let Some(client) = client {
+            // Clone the `Arc` and release the mutex: a slow network call
+            // here must not queue every other client action behind it. What
+            // is cloned is the whole session, so the client that sends and
+            // the store that records the send are the same session's.
+            let live = session.lock().await.clone();
+            if let Some(live) = live {
+                let client = &live.client;
                 let mut by_sender: HashMap<Jid, Vec<String>> = HashMap::new();
                 for (msg_id, sender) in parsed_messages {
                     by_sender.entry(sender).or_default().push(msg_id);
@@ -1778,12 +1869,13 @@ impl WhatsAppClient {
     /// the history it already knows how to recover. Nothing has to be told
     /// separately, and nothing is lost if a client is behind.
     pub fn mark_status_watched(&self, message_ids: Vec<String>) -> Task<bool> {
-        let chat_store = self.chat_store.clone();
+        let session = self.session.clone();
         self.exec.spawn(async move {
-            let Some(store) = chat_store.lock().await.clone() else {
-                warn!("no chat store yet; a watched status update was not recorded");
+            let Some(live) = session.lock().await.clone() else {
+                warn!("no session yet; a watched status update was not recorded");
                 return false;
             };
+            let store = &live.chat_store;
             let Ok(broadcast) = oxidezap_core::STATUS_BROADCAST_JID.parse::<Jid>() else {
                 warn!("the status broadcast address does not parse");
                 return false;
@@ -1815,7 +1907,7 @@ impl WhatsAppClient {
         chat_jid_str: &str,
         last_displayed: Option<ReadBoundary>,
     ) -> Task<()> {
-        let client_handle = self.client_handle.clone();
+        let session = self.session.clone();
         let chat_jid_str = chat_jid_str.to_string();
 
         self.exec.spawn(async move {
@@ -1826,10 +1918,11 @@ impl WhatsAppClient {
                     return;
                 }
             };
-            let Some(client) = client_handle.lock().await.clone() else {
-                error!("Client not available for marking chat read");
+            let Some(live) = session.lock().await.clone() else {
+                error!("No session available for marking chat read");
                 return;
             };
+            let client = &live.client;
             let range = last_displayed.map(|boundary| read_message_range(&chat_jid, boundary));
             if let Err(e) = client
                 .chat_actions()
@@ -1843,53 +1936,41 @@ impl WhatsAppClient {
 }
 
 /// Tell the UI which real id a just-sent optimistic bubble got.
-async fn notify_message_id(
+fn notify_message_id(
     ui_sender: &UiEventSender,
     chat_jid: &str,
     local_id: String,
     message_id: &str,
 ) {
-    if let Some(tx) = ui_sender.lock().await.as_ref() {
-        let _ = tx.send(UiEvent::MessageIdAssigned {
-            chat_jid: chat_jid.to_string(),
-            local_id,
-            message_id: message_id.to_string(),
-        });
-    }
+    let _ = ui_sender.send(UiEvent::MessageIdAssigned {
+        chat_jid: chat_jid.to_string(),
+        local_id,
+        message_id: message_id.to_string(),
+    });
 }
 
 /// Tell the UI a send failed so the bubble doesn't sit pending forever.
-async fn notify_send_failed(
-    ui_sender: &UiEventSender,
-    chat_jid: &str,
-    message_id: &str,
-    reason: String,
-) {
-    if let Some(tx) = ui_sender.lock().await.as_ref() {
-        let _ = tx.send(UiEvent::SendFailed {
-            chat_jid: chat_jid.to_string(),
-            message_id: message_id.to_string(),
-            reason,
-        });
-    }
+///
+/// It reaches the front end whether or not a session is up: the bubble is
+/// already drawn, and a send refused before the client exists is precisely the
+/// one nothing else will ever fail.
+fn notify_send_failed(ui_sender: &UiEventSender, chat_jid: &str, message_id: &str, reason: String) {
+    let _ = ui_sender.send(UiEvent::SendFailed {
+        chat_jid: chat_jid.to_string(),
+        message_id: message_id.to_string(),
+        reason,
+    });
 }
 
 /// Best-effort durable record of a message this client just sent; the UI's
 /// optimistic bubble is independent of this.
-async fn record_outgoing(
-    chat_store: &ChatStoreHandle,
-    jid: &Jid,
-    message_id: &str,
-    message: &wa::Message,
-) {
-    if let Some(store) = chat_store.lock().await.as_ref()
-        && let Err(e) = store.record_outgoing(
-            jid,
-            message_id,
-            message,
-            whatsapp_rust::wacore::time::now_utc(),
-        )
-    {
+fn record_outgoing(store: &ChatStore, jid: &Jid, message_id: &str, message: &wa::Message) {
+    if let Err(e) = store.record_outgoing(
+        jid,
+        message_id,
+        message,
+        whatsapp_rust::wacore::time::now_utc(),
+    ) {
         warn!("Failed to record outgoing message {}: {e}", message_id);
     }
 }
@@ -1897,10 +1978,8 @@ async fn record_outgoing(
 /// Best-effort failure mark on the durable row a client-side send error
 /// orphans at Pending (no server nack will come to fail it), so a restart
 /// hydrates the bubble with its failure indicator instead of grey ticks.
-async fn mark_send_failed(chat_store: &ChatStoreHandle, jid: &Jid, message_id: &str) {
-    if let Some(store) = chat_store.lock().await.as_ref()
-        && let Err(e) = store.mark_send_failed(jid, message_id)
-    {
+fn mark_send_failed(store: &ChatStore, jid: &Jid, message_id: &str) {
+    if let Err(e) = store.mark_send_failed(jid, message_id) {
         warn!("Failed to mark send {} as failed: {e}", message_id);
     }
 }

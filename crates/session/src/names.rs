@@ -114,7 +114,12 @@ pub(crate) struct NameBook {
     /// Where the address book is. The book is handed to the event loop, which
     /// has the client but not the store, so it carries its own source rather
     /// than making every caller thread one through.
-    chat_store: crate::whatsapp::ChatStoreHandle,
+    ///
+    /// The store itself, not a slot that might hold one: a book is built
+    /// *after* the store it reads, so there is no moment at which one exists
+    /// without the other. `None` is for the history paths, which are handed a
+    /// store with every call and never read this.
+    chat_store: Option<Arc<ChatStore>>,
     /// Address-book name per *contact* JID, misses included.
     contacts: Mutex<HashMap<String, Option<String>>>,
     /// The PN/LID pair behind a sender JID. A separate map on purpose: the
@@ -125,7 +130,7 @@ pub(crate) struct NameBook {
 }
 
 impl NameBook {
-    pub(crate) fn new(chat_store: crate::whatsapp::ChatStoreHandle) -> Self {
+    pub(crate) fn new(chat_store: Option<Arc<ChatStore>>) -> Self {
         Self {
             chat_store,
             contacts: Mutex::new(HashMap::new()),
@@ -261,7 +266,7 @@ impl NameBook {
         offered: Option<&str>,
     ) -> Option<String> {
         let identity = self.identity(client, jid).await;
-        let Some(store) = self.chat_store.lock().await.clone() else {
+        let Some(store) = self.chat_store.clone() else {
             return offered
                 .filter(|name| usable_name(name, identity.has_phone))
                 .map(str::to_owned);
@@ -379,7 +384,6 @@ fn clear<T>(map: &Mutex<HashMap<String, T>>) {
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use tokio::sync::Mutex as AsyncMutex;
     use whatsapp_rust::lid_pn_cache::LearningSource;
 
     use super::*;
@@ -452,7 +456,7 @@ mod tests {
 
     /// A book with nothing behind its handle: a key costs no address book.
     fn book() -> NameBook {
-        NameBook::new(Arc::new(AsyncMutex::new(None)))
+        NameBook::new(None)
     }
 
     fn jid(text: &str) -> Jid {
