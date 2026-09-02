@@ -535,6 +535,13 @@ fn wire(
         // whether the run of them is still going. See their use below.
         let underran = std::cell::Cell::new(0u32);
         let in_underrun = std::cell::Cell::new(false);
+        // Whether the peer has ever been heard. The ring is deliberately empty
+        // until their first frame primes it -- see `PLAYOUT_PRIME` -- and this
+        // callback runs from the moment the context resumes, through signalling
+        // and relay setup. Every one of those blocks is a ring that could not
+        // be filled and none of them is a late packet, so without this the
+        // diagnostic below fires on every healthy call and says nothing.
+        let ever_fed = std::cell::Cell::new(false);
         Closure::<dyn FnMut(web_sys::AudioProcessingEvent)>::new(
             move |event: web_sys::AudioProcessingEvent| {
                 let Ok(buffer) = event.output_buffer() else {
@@ -549,6 +556,9 @@ fn wire(
                     // the peer stopped sending, or their packet is late.
                     // Silence is what a call sounds like there.
                     let had = ring.len();
+                    if had > 0 {
+                        ever_fed.set(true);
+                    }
                     scratch.extend(
                         std::iter::repeat_with(|| ring.pop_front().unwrap_or(0.0)).take(len),
                     );
@@ -561,7 +571,7 @@ fn wire(
                 // which is the half that is working. The prime and the ceiling
                 // are both sized against this number and neither could be
                 // checked against anything.
-                if short > 0 {
+                if short > 0 && ever_fed.get() {
                     let blocks = underran.get() + 1;
                     underran.set(blocks);
                     // Once when a run begins, and then at each doubling of the
@@ -579,7 +589,7 @@ fn wire(
                              peer's audio is arriving later than it is played"
                         );
                     }
-                } else {
+                } else if short == 0 {
                     in_underrun.set(false);
                 }
                 // JS-owned, and that is the whole of this line. `copyToChannel`
