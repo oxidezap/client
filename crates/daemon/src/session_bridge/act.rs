@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use oxidezap_core::CallOutcome;
-use oxidezap_ipc::{CallAction, ChatSummary, DaemonEvent, DaemonMessage, PageCursor, RequestId};
+use oxidezap_ipc::{
+    CallAction, ChatSummary, DaemonEvent, DaemonMessage, PageCursor, ProtocolError, RequestId,
+};
 use oxidezap_session::{ReadBoundary, WhatsAppClient};
 use tokio::sync::OwnedSemaphorePermit;
 use wacore_binary::jid::observe_str;
@@ -159,8 +161,17 @@ impl Bridge {
                                 next: page.next.map(PageCursor::new),
                             })
                         }
-                        Ok(Err(detail)) => Err(detail),
-                        Err(_) => Err("the session stopped before the page arrived".to_string()),
+                        // The store read failed, which is not the client's
+                        // frame and not something it could ask differently:
+                        // a page it asks for again is a query that could well
+                        // answer. See `finish_download`.
+                        Ok(Err(detail)) => Err(ProtocolError::Failed {
+                            detail,
+                            retryable: true,
+                        }),
+                        Err(_) => Err(ProtocolError::NoSession {
+                            detail: "the session stopped before the page arrived".to_string(),
+                        }),
                     };
                     answer_now(&answer_to, answered(id, answer));
                     let _ = reply.send(CommandOutcome::Accepted);
@@ -228,8 +239,17 @@ impl Bridge {
                                 next: page.next.map(PageCursor::new),
                             })
                         }
-                        Ok(Err(detail)) => Err(detail),
-                        Err(_) => Err("the session stopped before the page arrived".to_string()),
+                        // The store read failed, which is not the client's
+                        // frame and not something it could ask differently:
+                        // a page it asks for again is a query that could well
+                        // answer. See `finish_download`.
+                        Ok(Err(detail)) => Err(ProtocolError::Failed {
+                            detail,
+                            retryable: true,
+                        }),
+                        Err(_) => Err(ProtocolError::NoSession {
+                            detail: "the session stopped before the page arrived".to_string(),
+                        }),
                     };
                     answer_now(&answer_to, answered(id, answer));
                     let _ = reply.send(CommandOutcome::Accepted);
@@ -295,6 +315,13 @@ impl Bridge {
                 local_id,
                 quoted,
             }) => {
+                // The permit first, and the payload only once it is held.
+                // See `too_busy`: taking the bytes first made a refusal
+                // destructive, and the retry it asks for could then only be
+                // refused again for having nothing to send.
+                let Some(permit) = self.permit() else {
+                    return too_busy();
+                };
                 // Through the cache, not the socket: a voice note is the one
                 // thing a client sends that is too big for a frame. Taken
                 // rather than read: the client wrote it directly, so its bytes
@@ -304,9 +331,6 @@ impl Bridge {
                     return CommandOutcome::Refused(format!(
                         "no audio cached under {upload}; write it before sending"
                     ));
-                };
-                let Some(permit) = self.permit() else {
-                    return too_busy();
                 };
                 hold(
                     permit,
@@ -344,6 +368,12 @@ impl Bridge {
                 // answers for both platforms — a thread pool on the desktop,
                 // and a call in a page, where the cache is a map in memory and
                 // there is neither a file to read nor anywhere to hand it.
+                //
+                // The permit is taken first, before anything is consumed:
+                // see `too_busy`.
+                let Some(permit) = self.permit() else {
+                    return too_busy();
+                };
                 let taken = {
                     let upload = upload.clone();
                     oxidezap_session::unblock(move || crate::media::take(&upload)).await
@@ -364,9 +394,6 @@ impl Bridge {
                             "the payload staged under {upload} could not be read: {e}"
                         ));
                     }
-                };
-                let Some(permit) = self.permit() else {
-                    return too_busy();
                 };
                 hold(
                     permit,
@@ -576,7 +603,13 @@ impl Bridge {
                 &answer_to,
                 downloaded(
                     id,
-                    Err("that media carries no content hash to fetch it by".to_string()),
+                    // Refused rather than failed: this one *is* about the
+                    // request. The media named in it carries nothing to fetch
+                    // it by, and asking again with the same media asks the
+                    // same impossible question.
+                    Err(ProtocolError::Refused {
+                        detail: "that media carries no content hash to fetch it by".to_string(),
+                    }),
                 ),
             );
             return CommandOutcome::Accepted;
@@ -597,12 +630,7 @@ impl Bridge {
         };
         let bytes = client.download_downloadable_media(media);
         oxidezap_session::spawn(async move {
-            let result = match bytes.await {
-                Ok(Ok(bytes)) => crate::media::put_owned(&key, bytes).map_err(|e| e.to_string()),
-                Ok(Err(e)) => Err(e),
-                // The session went away mid-download.
-                Err(_) => Err("the session stopped before the download finished".to_string()),
-            };
+            let result = finish_download(bytes.await, |bytes| crate::media::put_owned(&key, bytes));
             // The same rule as a page: an answer nobody delivered leaves the
             // asker waiting on it forever. See `answer_now`.
             answer_now(&answer_to, downloaded(id, result));
@@ -731,8 +759,18 @@ fn hold<const N: usize>(permit: OwnedSemaphorePermit, work: [oxidezap_session::T
     });
 }
 
+/// The answer a command gets when there is no permit for it.
+///
+/// It asks the client to try again, which is a promise about the state this
+/// refusal leaves behind: nothing the retry would need may have been consumed
+/// on the way to it. A send used to take its staged payload out of the cache
+/// *before* asking for a permit — `media::take` removes the only copy — so a
+/// front end told "retry shortly" retried a send whose bytes no longer
+/// existed and was answered "stage it before sending", for a file it had
+/// staged. Every caller therefore takes the permit before it takes anything
+/// else.
 fn too_busy() -> CommandOutcome {
-    CommandOutcome::Refused(format!(
+    CommandOutcome::Busy(format!(
         "{MAX_IN_FLIGHT} operations are already in flight; retry shortly"
     ))
 }
@@ -765,16 +803,61 @@ fn answer_now(answer_to: &Outbox, frame: String) {
     }
 }
 
+/// What a finished download is worth to whoever asked: the key its bytes were
+/// cached under, or why not — in terms that side can act on.
+///
+/// Three failures that were one string. A front end can do nothing with
+/// "refused" but show it, and the only question it actually has is whether
+/// asking again could work: over the network, yes; against a full disk, no,
+/// and the second download would fail exactly as the first did. The session
+/// going away is neither — there is nothing to retry against until it comes
+/// back — and that is what [`ProtocolError::NoSession`] already means
+/// everywhere else in this daemon.
+///
+/// `store` is the write rather than a call to it, so the one failure that
+/// cannot be provoked from a test — a disk with nothing left on it — is still
+/// the failure this classifies.
+fn finish_download(
+    fetched: Result<Result<Vec<u8>, String>, tokio::sync::oneshot::error::RecvError>,
+    store: impl FnOnce(Vec<u8>) -> anyhow::Result<String>,
+) -> Result<String, ProtocolError> {
+    match fetched {
+        // The bytes arrived and the cache would not take them. Nothing about
+        // that is the network's, and nothing about it is the client's: a full
+        // disk, a directory this process may not write into, a cache path
+        // that does not resolve. None of them is answered by downloading the
+        // same media again. `{e:#}` rather than `{e}` because the context
+        // chain is where the actual reason is — the bare error is "renaming
+        // into /…/d-ab12", and its source is the one that says why.
+        Ok(Ok(bytes)) => store(bytes).map_err(|e| ProtocolError::Failed {
+            detail: format!("the download could not be cached: {e:#}"),
+            retryable: false,
+        }),
+        // The network, or the server, or the media having expired on it. The
+        // first two are worth another go and the third is not, but nothing
+        // this side holds can tell them apart, and a download that is offered
+        // again costs one tap.
+        Ok(Err(detail)) => Err(ProtocolError::Failed {
+            detail,
+            retryable: true,
+        }),
+        // The session went away mid-download: its sender was dropped with it.
+        Err(_) => Err(ProtocolError::NoSession {
+            detail: "the session stopped before the download finished".to_string(),
+        }),
+    }
+}
+
 /// The answer to a download, whichever way it went.
 ///
 /// Success names the cache key; failure is the same error frame every other
 /// request gets, under the same id.
-fn downloaded(id: RequestId, result: Result<String, String>) -> String {
+fn downloaded(id: RequestId, result: Result<String, ProtocolError>) -> String {
     let frame = match result {
         Ok(key) => DaemonMessage::Downloaded { id, key },
-        Err(detail) => DaemonMessage::Error {
+        Err(error) => DaemonMessage::Error {
             id: Some(id),
-            error: oxidezap_ipc::ProtocolError::Refused { detail },
+            error,
         },
     };
     // Neither shape can fail to serialize; spelling the fallback out beats an
@@ -788,10 +871,10 @@ fn downloaded(id: RequestId, result: Result<String, String>) -> String {
 /// Success is the frame; failure is the error frame every other request gets,
 /// under the same id. Neither shape can fail to serialize; spelling the
 /// fallback out beats an unwrap in a spawned task.
-fn answered(id: RequestId, result: Result<DaemonMessage, String>) -> String {
-    let frame = result.unwrap_or_else(|detail| DaemonMessage::Error {
+fn answered(id: RequestId, result: Result<DaemonMessage, ProtocolError>) -> String {
+    let frame = result.unwrap_or_else(|error| DaemonMessage::Error {
         id: Some(id),
-        error: oxidezap_ipc::ProtocolError::Refused { detail },
+        error,
     });
     serde_json::to_string(&frame)
         .unwrap_or_else(|e| format!(r#"{{"type":"error","error":"malformed","detail":"{e}"}}"#))
@@ -811,4 +894,377 @@ fn next_local_id() -> String {
         wacore::time::now_millis(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use oxidezap_core::{OutgoingMedia, UiEvent, fixtures};
+    use oxidezap_ipc::{DaemonMessage, ProtocolError};
+    use oxidezap_session::WhatsAppClient;
+
+    use super::super::tests::{bridge, loaded, message, received, saturate, stored_chat};
+    use super::*;
+
+    /// A session that has never been started.
+    ///
+    /// [`WhatsAppClient::new`] builds the executor and nothing else — it opens
+    /// no store and reaches no network — so it is exactly what these tests
+    /// need: the thing `act` hands work to, with no account behind it. It has
+    /// to be let go of through [`WhatsAppClient::close`] rather than dropped,
+    /// because it owns a Tokio runtime and tokio refuses to drop one inside an
+    /// async context.
+    fn client() -> WhatsAppClient {
+        WhatsAppClient::new().expect("an executor")
+    }
+
+    /// A bridge that believes it is connected.
+    ///
+    /// Everything that takes a permit also needs the network, and `act`
+    /// refuses those outright when the hub says the account is unreachable —
+    /// so without this every test below would be answered `NoSession` before
+    /// it reached the line it is about.
+    fn connected() -> Bridge {
+        let mut bridge = bridge();
+        bridge.observe(UiEvent::Connected);
+        bridge
+    }
+
+    /// A key nothing else in this process is using.
+    ///
+    /// The media cache is one directory shared by everything running as this
+    /// user, tests in other crates included, so a fixed key would have two
+    /// tests writing over each other's payload.
+    fn staged_key(what: &str) -> String {
+        use portable_atomic::AtomicU64;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        oxidezap_ipc::staged_key(&format!(
+            "act-test-{what}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn send_media(upload: &str) -> Action {
+        Action::SendMedia(oxidezap_ipc::SendMedia {
+            jid: fixtures::PEER.to_string(),
+            upload: upload.to_string(),
+            kind: OutgoingMedia::Image,
+            mime_type: "image/jpeg".to_string(),
+            file_name: "foto.jpg".to_string(),
+            caption: None,
+            local_id: Some("local-1".to_string()),
+            quoted: None,
+        })
+    }
+
+    fn send_audio(upload: &str) -> Action {
+        Action::SendAudio(oxidezap_ipc::SendAudio {
+            jid: fixtures::PEER.to_string(),
+            upload: upload.to_string(),
+            duration_secs: 3,
+            waveform: vec![1, 2, 3],
+            local_id: Some("local-2".to_string()),
+            quoted: None,
+        })
+    }
+
+    fn send_text() -> Action {
+        Action::SendText(oxidezap_ipc::SendText {
+            jid: fixtures::PEER.to_string(),
+            text: "oi".to_string(),
+            local_id: None,
+            quoted: None,
+        })
+    }
+
+    /// The refusal for being busy asks the client to retry, so it must not
+    /// have spent what the retry would need. `media::take` removes the only
+    /// copy of a staged payload: taking it before the permit meant "retry
+    /// shortly" destroyed the file, and the retry was answered "stage it
+    /// before sending" for a file that had just been staged.
+    #[tokio::test]
+    async fn a_busy_daemon_refuses_a_file_send_without_eating_the_file() {
+        let key = staged_key("media");
+        crate::media::put(&key, b"os bytes que alguem quer enviar").expect("a staged payload");
+
+        let mut bridge = connected();
+        let client = client();
+        let held = saturate(&bridge);
+
+        let outcome = bridge.act(&client, send_media(&key)).await;
+        assert!(
+            matches!(&outcome, CommandOutcome::Busy(detail) if detail.contains("in flight")),
+            "expected a busy answer, got {outcome:?}"
+        );
+        assert!(
+            crate::media::has(&key),
+            "the busy answer ate the payload it asked the client to send again"
+        );
+
+        // And the retry the refusal asked for goes through, which is the
+        // whole of what the promise is worth.
+        drop(held);
+        assert_eq!(
+            bridge.act(&client, send_media(&key)).await,
+            CommandOutcome::Accepted
+        );
+        assert!(
+            !crate::media::has(&key),
+            "an accepted send takes the payload with it"
+        );
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    /// The same rule for a voice note, which takes its payload on this very
+    /// thread rather than off it.
+    #[tokio::test]
+    async fn a_busy_daemon_refuses_a_voice_note_without_eating_the_recording() {
+        let key = staged_key("audio");
+        crate::media::put(&key, b"uma gravacao").expect("a staged payload");
+
+        let mut bridge = connected();
+        let client = client();
+        let held = saturate(&bridge);
+
+        let outcome = bridge.act(&client, send_audio(&key)).await;
+        assert!(
+            matches!(&outcome, CommandOutcome::Busy(detail) if detail.contains("in flight")),
+            "expected a busy answer, got {outcome:?}"
+        );
+        assert!(crate::media::has(&key), "the busy answer ate the recording");
+
+        drop(held);
+        assert_eq!(
+            bridge.act(&client, send_audio(&key)).await,
+            CommandOutcome::Accepted
+        );
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    /// A send naming a key nothing was staged under is a different answer
+    /// from a busy daemon, and it says what to do about it.
+    #[tokio::test]
+    async fn a_send_naming_nothing_staged_is_told_to_stage_it() {
+        let mut bridge = connected();
+        let client = client();
+        let key = staged_key("absent");
+
+        let outcome = bridge.act(&client, send_media(&key)).await;
+        assert!(
+            matches!(&outcome, CommandOutcome::Refused(detail) if detail.contains("stage it")),
+            "got {outcome:?}"
+        );
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    /// The permit decides whether the work runs at all, so a command that
+    /// cannot get one is refused rather than queued behind work nobody can
+    /// see.
+    #[tokio::test]
+    async fn a_command_that_cannot_get_a_permit_is_refused() {
+        let mut bridge = connected();
+        let client = client();
+        let _held = saturate(&bridge);
+
+        assert_eq!(bridge.act(&client, send_text()).await, too_busy());
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    /// Everything that touches the account is refused while there is none,
+    /// and the answer says which of the two kinds of "no" this is.
+    #[tokio::test]
+    async fn a_send_without_a_connection_is_no_session() {
+        let mut bridge = bridge();
+        let client = client();
+
+        let outcome = bridge.act(&client, send_text()).await;
+        assert!(
+            matches!(outcome, CommandOutcome::NoSession(_)),
+            "got {outcome:?}"
+        );
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    /// A store read is answered from a task of its own, so reaching this arm
+    /// at all is a routing mistake rather than something a client did.
+    #[tokio::test]
+    async fn a_store_read_that_reaches_the_command_path_is_refused() {
+        let mut bridge = connected();
+        let client = client();
+
+        let outcome = bridge
+            .act(
+                &client,
+                Action::MarkStatusWatched(oxidezap_ipc::MarkStatusWatched {
+                    message_ids: vec!["3EB0".to_string()],
+                }),
+            )
+            .await;
+        assert!(
+            matches!(&outcome, CommandOutcome::Refused(detail) if detail.contains("wrong path")),
+            "got {outcome:?}"
+        );
+        client.close(Duration::from_secs(1)).await;
+    }
+
+    /// A read is bounded by what the requester saw, and a chat this side has
+    /// never heard of bounds nothing.
+    #[test]
+    fn a_read_for_an_unknown_chat_is_refused() {
+        let bridge = bridge();
+        let refusal = bridge
+            .read_plan(fixtures::PEER, Some("3EB0"))
+            .expect_err("no such chat");
+        assert!(refusal.contains("no such chat"), "{refusal}");
+    }
+
+    /// Naming a message from an older second is a requester that has fallen
+    /// behind, and clearing a whole second on its word would consume the
+    /// arrivals it has not seen.
+    #[test]
+    fn a_read_naming_a_message_the_requester_did_not_see_is_refused() {
+        let mut bridge = bridge();
+        bridge.observe(received(
+            fixtures::PEER,
+            message("m1", fixtures::PEER, 10, false, false),
+            None,
+        ));
+        bridge.observe(received(
+            fixtures::PEER,
+            message("m2", fixtures::PEER, 20, false, false),
+            None,
+        ));
+
+        let refusal = bridge
+            .read_plan(fixtures::PEER, Some("m1"))
+            .expect_err("the preview is behind");
+        assert!(
+            refusal.contains("take a snapshot and ask again"),
+            "{refusal}"
+        );
+
+        // The newest second is an honest claim, and it is what bounds the
+        // read.
+        let (boundary, _) = bridge
+            .read_plan(fixtures::PEER, Some("m2"))
+            .expect("a plan");
+        assert_eq!(boundary.expect("a boundary").0, 20);
+    }
+
+    /// A chat marked unread by hand has nothing behind it, and refusing that
+    /// would leave the badge impossible to clear.
+    #[test]
+    fn a_chat_with_nothing_behind_it_can_still_be_cleared() {
+        let mut bridge = bridge();
+        bridge.observe(loaded(vec![stored_chat(fixtures::PEER, 0, vec![])]));
+
+        let (boundary, _) = bridge.read_plan(fixtures::PEER, None).expect("a plan");
+        assert!(boundary.is_none(), "there is nothing to bound");
+    }
+
+    /// The bytes arrived and the cache would not take them. Nothing about
+    /// that is worth a second download: the disk is as full as it was.
+    #[test]
+    fn a_download_that_could_not_be_cached_is_not_worth_asking_again() {
+        let answer = finish_download(Ok(Ok(vec![1, 2, 3])), |_| {
+            Err(anyhow::anyhow!("No space left on device")
+                .context("writing /run/oxidezap/media/w-1.0"))
+        });
+        match answer {
+            Err(ProtocolError::Failed { detail, retryable }) => {
+                assert!(!retryable, "a full disk is not fixed by downloading again");
+                assert!(
+                    detail.contains("No space left on device"),
+                    "the reason is buried in the context chain: {detail}"
+                );
+            }
+            other => panic!("expected a failure that cannot be retried, got {other:?}"),
+        }
+    }
+
+    /// The network, on the other hand, is worth another go — and this is the
+    /// distinction the front end had no way to make.
+    #[test]
+    fn a_download_that_failed_on_the_network_is_worth_asking_again() {
+        let answer = finish_download(Ok(Err("connection reset by peer".to_string())), |_| {
+            panic!("nothing was downloaded, so nothing is written")
+        });
+        assert_eq!(
+            answer,
+            Err(ProtocolError::Failed {
+                detail: "connection reset by peer".to_string(),
+                retryable: true,
+            })
+        );
+    }
+
+    /// And the third is neither: there is nothing to retry against until the
+    /// account is back, which is what `NoSession` says everywhere else.
+    #[test]
+    fn a_session_that_went_away_mid_download_is_no_session() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<u8>, String>>();
+        drop(tx);
+        let answer = finish_download(rx.blocking_recv(), |_| panic!("nothing to write"));
+        assert!(
+            matches!(answer, Err(ProtocolError::NoSession { .. })),
+            "got {answer:?}"
+        );
+    }
+
+    /// The happy path still answers with the key the bytes were filed under,
+    /// which is how the asker fetches them.
+    #[test]
+    fn a_download_that_landed_answers_with_its_key() {
+        let answer = finish_download(Ok(Ok(vec![7])), |bytes| {
+            assert_eq!(bytes, vec![7]);
+            Ok("d-abc".to_string())
+        });
+        assert_eq!(answer, Ok("d-abc".to_string()));
+    }
+
+    /// The bit has to survive the wire, or the daemon is the only side that
+    /// knows it. This is the frame a front end actually reads.
+    #[test]
+    fn the_frame_a_client_reads_carries_whether_to_retry() {
+        let parse = |frame: &str| match serde_json::from_str::<DaemonMessage>(frame) {
+            Ok(DaemonMessage::Error { error, .. }) => error,
+            other => panic!("expected an error frame, got {other:?}"),
+        };
+
+        let network = parse(&downloaded(
+            7,
+            Err(ProtocolError::Failed {
+                detail: "connection reset by peer".to_string(),
+                retryable: true,
+            }),
+        ));
+        let disk = parse(&downloaded(
+            8,
+            Err(ProtocolError::Failed {
+                detail: "the download could not be cached: No space left on device".to_string(),
+                retryable: false,
+            }),
+        ));
+
+        assert_ne!(
+            network, disk,
+            "the two failures a client has to tell apart read identically"
+        );
+        assert!(matches!(
+            network,
+            ProtocolError::Failed {
+                retryable: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            disk,
+            ProtocolError::Failed {
+                retryable: false,
+                ..
+            }
+        ));
+    }
 }

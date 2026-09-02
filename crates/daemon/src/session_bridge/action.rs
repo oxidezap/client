@@ -117,9 +117,13 @@ pub struct SessionCommand {
 
 /// What became of one command.
 ///
-/// Two ways to say no, because they are different answers: the account being
-/// unreachable is a state the client can already see and wait out, while a
-/// refusal is about this request and tells the client what to change.
+/// Three ways to say no, because they are three different answers, and the
+/// client does a different thing with each: the account being unreachable is
+/// a state it can already see and wait out, a refusal is about this request
+/// and tells it what to change, and being busy is about this *moment* and
+/// tells it to ask again. Folding the last two together was a client told to
+/// "retry shortly" by an answer its own error path had already written down
+/// as permanent.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CommandOutcome {
     /// The session took it. What the network makes of it shows up in the
@@ -129,6 +133,13 @@ pub enum CommandOutcome {
     NoSession(String),
     /// The session is there; the daemon will not do this as asked.
     Refused(String),
+    /// The session is there and has no room right now.
+    ///
+    /// Nothing about the request is wrong and nothing about it has been
+    /// spent: every caller takes its permit before it consumes anything, so
+    /// the same command sent again is a command that can succeed. See
+    /// [`super::act`]'s `too_busy`.
+    Busy(String),
 }
 
 /// The end of the command channel the server holds.

@@ -509,7 +509,11 @@ impl WhatsAppApp {
                     // Said, not only logged: the control goes back to idle
                     // either way, so without this a tap that fetched nothing
                     // is indistinguishable from one that was never noticed.
-                    say(&entity, cx, format!("Could not download that audio: {e}"));
+                    say(
+                        &entity,
+                        cx,
+                        what_went_wrong("Could not download that audio", &e),
+                    );
                     let _ = entity.update(cx, |app, cx| {
                         app.finish_download(&msg_id);
                         cx.notify();
@@ -562,7 +566,7 @@ impl WhatsAppApp {
                     }
                     Err(e) => {
                         error!("Failed to download image: {}", e);
-                        failed = Some(format!("Could not download that image: {e}"));
+                        failed = Some(what_went_wrong("Could not download that image", &e));
                     }
                 }
                 cx.notify();
@@ -629,7 +633,11 @@ impl WhatsAppApp {
                 },
                 Err(e) => {
                     error!("Failed to download document {}: {}", message_id, e);
-                    say(&entity, cx, format!("Could not download that file: {e}"));
+                    say(
+                        &entity,
+                        cx,
+                        what_went_wrong("Could not download that file", &e),
+                    );
                 }
             }
             let _ = entity.update(cx, |app, cx| {
@@ -1088,7 +1096,7 @@ impl WhatsAppApp {
                     error!("Failed to download video: {}", e);
                     let _ = entity.update(cx, |app, cx| {
                         if let Some(player) = app.video_players.get_mut(&msg_id) {
-                            player.set_error(e);
+                            player.set_error(what_went_wrong("Could not download that video", &e));
                         }
                         cx.notify();
                     });

@@ -192,6 +192,78 @@ pub enum FromDaemon {
     StatusViewLost(Vec<String>),
 }
 
+/// Why something a front end asked for did not happen.
+///
+/// `detail` is the sentence somebody reads. `retryable` is the bit no
+/// sentence carries, and the only one a caller can act on: whether asking the
+/// same thing again could work at all. Nothing on this side can work it out —
+/// a full disk and a dropped connection are both "the download failed" from
+/// here — so the daemon says which, through
+/// [`ProtocolError::Failed`](oxidezap_ipc::ProtocolError::Failed), and this
+/// is where that lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub detail: String,
+    /// Whether the same request, sent again, could succeed.
+    pub retryable: bool,
+}
+
+impl Failure {
+    /// Something that could work if it were asked again — a dropped
+    /// connection, a network that was busy.
+    pub fn worth_retrying(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            retryable: true,
+        }
+    }
+
+    /// Something that would fail the same way every time it was asked.
+    pub fn permanent(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            retryable: false,
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl From<&oxidezap_ipc::ProtocolError> for Failure {
+    /// What the daemon said, plus what a front end may do about it.
+    ///
+    /// Only one of these variants carries the answer; the rest are read off
+    /// what the variant *means*. A refusal is about the request, so the same
+    /// request is refused the same way; a malformed frame and a version
+    /// mismatch are about this build, which asking twice does not change. The
+    /// account being unreachable is the one that reads the other way round
+    /// from how it sounds: it is a state that ends — the app is already
+    /// reconnecting — and the download the person asked for works on the
+    /// next tap, so telling them it never will is the worse of the two
+    /// wrong answers. Too many clients clears the same way.
+    ///
+    /// The daemon's own `detail` rather than the whole `Display`, where there
+    /// is one: `thiserror` writes the variant in front of it, and a notice
+    /// built from that reads "Could not download that image: failed:
+    /// connection reset by peer". The prefix is for a log line, which is
+    /// where the full error still goes.
+    fn from(error: &oxidezap_ipc::ProtocolError) -> Self {
+        use oxidezap_ipc::ProtocolError as E;
+        let (detail, retryable) = match error {
+            E::Failed { detail, retryable } => (detail.clone(), *retryable),
+            E::NoSession { detail } => (detail.clone(), true),
+            E::Refused { detail } | E::Malformed { detail } => (detail.clone(), false),
+            E::TooManyClients { .. } => (error.to_string(), true),
+            E::VersionMismatch { .. } => (error.to_string(), false),
+        };
+        Self { detail, retryable }
+    }
+}
+
 /// What to do when a request comes back, by the id it was sent under.
 ///
 /// The daemon answers everything under the id it was asked with, so this is
@@ -199,7 +271,7 @@ pub enum FromDaemon {
 /// is waiting, and a send that was refused becomes the failure the message it
 /// drew is already able to render.
 enum Awaiting {
-    Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, String>>),
+    Download(oneshot::Sender<Result<std::sync::Arc<Vec<u8>>, Failure>>),
     /// What this account occupies on disk, for the Storage pane.
     Storage(oneshot::Sender<StorageUsage>),
     /// A message drawn before it was sent. On refusal it has to stop being
@@ -259,10 +331,14 @@ impl Awaiting {
     /// is [`Session`] on the paths that run before a request leaves and the
     /// reader on the paths that run after. Both call [`Self::staged_key`]
     /// first.
-    fn failed(self, detail: &str, events: Option<&EventSink>) {
+    fn failed(self, failure: &Failure, events: Option<&EventSink>) {
+        let detail = failure.detail.as_str();
         match self {
+            // The only caller that reads more than the sentence: whether
+            // asking again could work decides what the person is told to do
+            // about it. See [`Failure`].
             Self::Download(tx) => {
-                let _ = tx.send(Err(detail.to_string()));
+                let _ = tx.send(Err(failure.clone()));
             }
             // Dropping the sender is the failure: the pane it feeds shows
             // what it knows and says the rest is unavailable.
@@ -1251,7 +1327,7 @@ impl SessionHandle {
     pub fn download_downloadable_media(
         &self,
         media: DownloadableMedia,
-    ) -> oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, String>> {
+    ) -> oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, Failure>> {
         let (tx, rx) = oneshot::channel();
         self.ask(
             ClientRequest::Download(Download {
@@ -1472,7 +1548,9 @@ fn fail_reserved(conn: &Conn, id: RequestId, detail: String) {
             error!("a page request never left this process: {detail}");
             conn.events.try_send(FromDaemon::PageLost { jid });
         }
-        waiting => waiting.failed(&detail, None),
+        // Nothing left this process, so nothing about the request itself
+        // failed: the connection did, and the app reconnects.
+        waiting => waiting.failed(&Failure::worth_retrying(detail), None),
     }
 }
 
@@ -1674,7 +1752,7 @@ mod tests {
         Awaiting::StatusView {
             message_ids: vec!["A".into(), "B".into()],
         }
-        .failed("the store is read-only", Some(&tx));
+        .failed(&Failure::permanent("the store is read-only"), Some(&tx));
 
         match rx.try_recv() {
             Ok(FromDaemon::StatusViewLost(ids)) => assert_eq!(ids, vec!["A", "B"]),

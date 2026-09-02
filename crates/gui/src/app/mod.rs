@@ -262,6 +262,7 @@ fn timeline_sync(
     // the list drawing a bubble at the size it used to be.
     TimelineSync::Remeasure
 }
+pub use notices::what_went_wrong;
 pub use search::ConversationSearch;
 pub use settings::{SettingsSection, SettingsState};
 pub use status::{Destination, StatusPane};
@@ -335,7 +336,7 @@ use log::{debug, error, info, warn};
 use wacore_binary::jid::{Jid, JidExt, observe_str};
 
 use crate::responsive::{MobilePanel, ResponsiveLayout};
-use crate::session::{FromDaemon, Session};
+use crate::session::{Failure, FromDaemon, Session};
 use crate::theme::ActiveProductTheme as _;
 use crate::utils::{contains_ignore_case, mime_to_image_format};
 use crate::video::{VideoPlayer, VideoPlayerState};
@@ -441,12 +442,13 @@ pub(crate) const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 
 /// Download media with timeout - returns Ok(data) or Err(error message)
 async fn download_with_timeout(
-    download_rx: tokio::sync::oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, String>>,
-) -> Result<std::sync::Arc<Vec<u8>>, String> {
+    download_rx: tokio::sync::oneshot::Receiver<Result<std::sync::Arc<Vec<u8>>, Failure>>,
+) -> Result<std::sync::Arc<Vec<u8>>, Failure> {
     let download = async {
-        download_rx
-            .await
-            .unwrap_or(Err("Download cancelled".to_string()))
+        download_rx.await.unwrap_or_else(|_| {
+            // The sender went with the connection, which comes back.
+            Err(Failure::worth_retrying("the download was cancelled"))
+        })
     };
 
     // Race between download and timeout
@@ -455,7 +457,9 @@ async fn download_with_timeout(
         std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS),
     )
     .await
-    .ok_or_else(|| "Download timed out".to_string())?
+    // A minute is long enough that the answer is "the network is not
+    // working", which is a thing that stops being true.
+    .ok_or_else(|| Failure::worth_retrying("the download timed out"))?
 }
 
 /// A name for media the sender never named.
