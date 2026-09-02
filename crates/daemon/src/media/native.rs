@@ -554,8 +554,23 @@ mod tests {
         // Through the entry point, so what is counted is a real cache write
         // with the wipe lock and all: `put` resolves the directory from the
         // environment and there is no seam to hand it a temporary one.
-        if oxidezap_ipc::media_dir().is_none() {
+        let Some(dir) = oxidezap_ipc::media_dir() else {
             return; // Nowhere to write, so nothing to count.
+        };
+        // `put` creates the last component and only that, privately, which
+        // is the right shape for a daemon whose enclosing directory is made
+        // by whoever logged the user in. A CI runner has no login session and
+        // has never run this daemon, so the parent of the media directory is
+        // simply absent -- `/run/user/<uid>/oxidezap` on Linux,
+        // `$TMPDIR/oxidezap-<uid>` on macOS -- and the single `mkdir` answers
+        // `ENOENT`, which is about the machine and not about the walk being
+        // counted. Make the parents or say there is nowhere to write; the
+        // leaf is still `put`'s to create with 700.
+        if dir
+            .parent()
+            .is_some_and(|parent| std::fs::create_dir_all(parent).is_err())
+        {
+            return;
         }
         let keys: Vec<String> = (0..16).map(|i| format!("f-3EB0WALKCOUNT{i:02}")).collect();
         let forget = || {
@@ -586,6 +601,44 @@ mod tests {
             0,
             "{} cache writes walked the media directory {walked} times",
             keys.len()
+        );
+    }
+
+    /// And the same sentence where every machine can hear it.
+    ///
+    /// The test above goes through `put`, which is the honest shape but binds
+    /// it to a media directory resolved from the environment — and a CI
+    /// runner names a path whose parents nobody created, and where making
+    /// them is somebody else's to permit the test skips itself. That is the
+    /// one place this most needs to be asserted, so it is asserted again a
+    /// layer down: the walk was never `put`'s, it was `prepare_dir`'s, and
+    /// `prepare_dir` takes the directory as an argument.
+    #[test]
+    fn preparing_the_directory_never_walks_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "oxidezap-media-prepare-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Something to walk over, so a walk that happened would have work to
+        // do rather than answering an empty listing.
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        for i in 0..8 {
+            std::fs::write(dir.join(format!("f-3EB0PREPARE{i:02}")), b"a photo").expect("a file");
+        }
+
+        let before = walks::so_far();
+        for _ in 0..16 {
+            super::prepare_dir(&dir).expect("the directory is ours and private");
+        }
+        let walked = walks::so_far() - before;
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            walked, 0,
+            "preparing the directory walked it {walked} times"
         );
     }
 
