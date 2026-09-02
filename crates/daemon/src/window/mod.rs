@@ -14,7 +14,7 @@
 //! the whole of what "make sure there is a window" can mean there.
 //!
 //! Hiding has no such half. It is only ever a message, because a window that
-//! is not there needs nothing done to it — so [`hide`] and the [`toggle`]
+//! is not there needs nothing done to it — so [`hide`] and the [`Toggle`]
 //! the tray icon is clicked through are written once, here, and only
 //! [`show`] is split.
 
@@ -22,7 +22,10 @@
 #[cfg_attr(not(target_family = "wasm"), path = "native.rs")]
 mod platform;
 
+use std::time::Duration;
+
 use oxidezap_ipc::DaemonMessage;
+use wacore::time::Instant;
 
 use crate::state::StateHub;
 
@@ -39,18 +42,56 @@ pub fn hide(hub: &StateHub) {
     hub.signal(&DaemonMessage::HideWindow);
 }
 
+/// How long after one click the next is still the same gesture.
+///
+/// A double click reaches the tray as two activations — the protocol has no
+/// other word for it — and the first one's hide can land in full before the
+/// second arrives: the front end quits, its socket closes, the daemon reaps
+/// the window guard, and the second click finds nothing attached and starts
+/// a fresh window over the one that was just put away. Half a second is over
+/// the double-click interval every desktop ships with, and under any second
+/// click a person means as one.
+pub const SAME_GESTURE: Duration = Duration::from_millis(500);
+
 /// What a click on the tray icon means: put the window away if there is
 /// one, bring one up if there is not.
 ///
-/// Decided by who said they own a window (see [`StateHub::windows_attached`]),
-/// not by whether a signal would reach anyone — every client reads the
-/// signal channel, and a notifier watching summaries must not turn the click
-/// into a hide that nothing acts on.
-pub fn toggle(hub: &StateHub) {
-    if hub.windows_attached() {
-        hide(hub);
-    } else {
-        show(hub);
+/// A value rather than a function because a click has to remember the one
+/// before it — see [`SAME_GESTURE`]. One per icon: the tray holds it, and
+/// nothing else is clicked.
+#[derive(Debug, Default)]
+pub struct Toggle {
+    last: Option<Instant>,
+}
+
+impl Toggle {
+    /// The icon was clicked.
+    ///
+    /// Decided by who said they own a window (see
+    /// [`StateHub::windows_attached`]), not by whether a signal would reach
+    /// anyone — every client reads the signal channel, and a notifier
+    /// watching summaries must not turn the click into a hide that nothing
+    /// acts on.
+    pub fn click(&mut self, hub: &StateHub) {
+        self.click_at(hub, Instant::now());
+    }
+
+    /// [`Self::click`], at a moment the caller names. Split so a test can
+    /// place two clicks a known distance apart without sleeping between
+    /// them.
+    fn click_at(&mut self, hub: &StateHub, now: Instant) {
+        if let Some(last) = self.last
+            && now.saturating_duration_since(last) < SAME_GESTURE
+        {
+            log::debug!("the tray was clicked again within {SAME_GESTURE:?}; one gesture");
+            return;
+        }
+        self.last = Some(now);
+        if hub.windows_attached() {
+            hide(hub);
+        } else {
+            show(hub);
+        }
     }
 }
 
@@ -86,7 +127,7 @@ mod tests {
         let mut signals = hub.subscribe_signals();
         let _window = hub.attach_window();
 
-        toggle(&hub);
+        Toggle::default().click(&hub);
 
         assert_eq!(next_signal(&mut signals), DaemonMessage::HideWindow);
     }
@@ -98,7 +139,7 @@ mod tests {
         let hub = StateHub::new();
         let mut signals = hub.subscribe_signals();
 
-        toggle(&hub);
+        Toggle::default().click(&hub);
 
         assert_eq!(next_signal(&mut signals), DaemonMessage::ShowWindow);
     }
@@ -112,7 +153,50 @@ mod tests {
         let mut signals = hub.subscribe_signals();
         let _watcher = hub.subscribe_signals();
 
-        toggle(&hub);
+        Toggle::default().click(&hub);
+
+        assert_eq!(next_signal(&mut signals), DaemonMessage::ShowWindow);
+    }
+
+    /// A double click is two activations, and the window the first one hid
+    /// can be gone before the second lands. That second click must not
+    /// become an Open — the gesture was one, and it meant hide.
+    #[tokio::test]
+    async fn a_double_click_over_a_window_hides_it_once() {
+        let hub = StateHub::new();
+        let mut signals = hub.subscribe_signals();
+        let window = hub.attach_window();
+        let mut toggle = Toggle::default();
+        let first = Instant::now();
+
+        toggle.click_at(&hub, first);
+        assert_eq!(next_signal(&mut signals), DaemonMessage::HideWindow);
+
+        // The front end did as asked and left before the second click.
+        drop(window);
+        toggle.click_at(&hub, first + Duration::from_millis(150));
+
+        assert!(
+            signals.try_recv().is_err(),
+            "the second click of one gesture asks for nothing"
+        );
+    }
+
+    /// A click after the gesture is over is a new one, and with the window
+    /// gone it means Open — which is the person clicking to bring it back.
+    #[tokio::test]
+    async fn a_later_click_is_a_new_gesture() {
+        let hub = StateHub::new();
+        let mut signals = hub.subscribe_signals();
+        let window = hub.attach_window();
+        let mut toggle = Toggle::default();
+        let first = Instant::now();
+
+        toggle.click_at(&hub, first);
+        assert_eq!(next_signal(&mut signals), DaemonMessage::HideWindow);
+
+        drop(window);
+        toggle.click_at(&hub, first + SAME_GESTURE * 2);
 
         assert_eq!(next_signal(&mut signals), DaemonMessage::ShowWindow);
     }

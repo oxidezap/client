@@ -15,6 +15,9 @@ struct Item {
     /// speaks back — and the one thing it asks, whether a window is
     /// attached, is what the first item is named from.
     hub: Arc<StateHub>,
+    /// What a click on the icon does, and when the last one was: a double
+    /// click arrives as two, and the second must not undo the first.
+    click: crate::window::Toggle,
 }
 
 impl KsniTray for Item {
@@ -41,13 +44,13 @@ impl KsniTray for Item {
         Vec::new()
     }
 
-    /// A click on the icon. The host sends this for a left click (a double
-    /// click is two of them, which lands where one does), and what it means
-    /// depends on what is up: away if there is a window, up if there is
-    /// not. The daemon has no window, so both are requests — see
-    /// `crate::window::toggle`.
+    /// A click on the icon. The host sends this for a left click, and what
+    /// it means depends on what is up: away if there is a window, up if
+    /// there is not. The daemon has no window, so both are requests — see
+    /// `crate::window::Toggle`, which is also what keeps a double click,
+    /// which arrives as two of these, from hiding and then reopening.
     fn activate(&mut self, _x: i32, _y: i32) {
-        crate::window::toggle(&self.hub);
+        self.click.click(&self.hub);
     }
 
     /// The host is about to open the menu.
@@ -149,6 +152,7 @@ pub async fn start(hub: Arc<StateHub>) -> Result<Box<dyn super::Tray>> {
             unread: 0,
         },
         hub,
+        click: crate::window::Toggle::default(),
     };
     let handle = item
         .spawn()

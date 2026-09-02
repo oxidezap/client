@@ -194,7 +194,11 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   be withdrawn and brought back by its owner, and minimising is not hiding
   (the issue was reported on exactly that). The icon click toggles on
   `has_window` for the same reason Open launches on it: a subscriber that is
-  not a window must not turn a click into a hide nothing acts on. The menu's
+  not a window must not turn a click into a hide nothing acts on. It also
+  remembers the click before it (`window::Toggle`): a double click reaches
+  the tray as two activations, and the first one's hide lands in full — the
+  front end quits, the guard drops — before the second, which would then
+  find no window and start one over the one just put away. The menu's
   first item is named from the same fact — Open or Hide, each doing only
   what it says — and is re-read when the host opens the menu, which ksni
   does only for a tray that implements `menu_about_to_show`; the tray
