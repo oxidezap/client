@@ -295,7 +295,14 @@ where
                 if video.is_some() => match picture {
                 Ok(frame) => write_line(&mut writer, &frame).await?,
                 Err(RecvError::Lagged(missed)) => {
-                    log::trace!("client missed {missed} video frames");
+                    // Debug, not trace: this is the one event that blanks both
+                    // panes. The client answers it by dropping every reference
+                    // it holds and waiting for a keyframe -- on BOTH streams,
+                    // since the channel that lagged carries both -- so a call
+                    // whose video "does not work" looks from every other log
+                    // line like a call whose video is fine. At trace it was
+                    // absent from the level a page is actually left at.
+                    log::debug!("client missed {missed} video frames");
                     // Said out loud, unlike a state gap: the client's decoder
                     // is holding references to units it will never get, and
                     // the frames that follow are built on them. It has no

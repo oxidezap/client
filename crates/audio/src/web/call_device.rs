@@ -80,8 +80,20 @@ const PLAYOUT_CEILING: usize = 24_000;
 ///
 /// The callback runs on a strict clock and the network does not, so a ring
 /// that starts empty emits a gap on its very first callback and then again on
-/// every packet that is a moment late. 60 ms is one frame of headroom, paid
-/// once.
+/// every packet that is a moment late.
+///
+/// Sized against the peer's PACKET, not against its frame. 60 ms was one
+/// frame of headroom -- and a frame is not the unit that arrives. WhatsApp
+/// provisions the sending side per call, and a capture of one reads
+/// `"frame_ms":"60","max_frames_per_packet":"3"`: three frames travel
+/// together, so the ring is handed 180 ms at once and then nothing for
+/// 180 ms. One frame of headroom against that is a ring that reaches zero as
+/// each packet lands, and every jitter past that instant is a hole punched in
+/// the middle of speech -- heard as a robotic voice rather than as a dropout,
+/// which is why it reads as a codec fault and is not one.
+///
+/// The cost is latency, paid once and only in the direction of hearing; the
+/// alternative is paying it in intelligibility on every packet.
 ///
 /// Added when that first frame arrives rather than when the graph is built,
 /// and the difference is the whole of the headroom. `resume` happens here;
@@ -91,7 +103,7 @@ const PLAYOUT_CEILING: usize = 24_000;
 /// first real frames with exactly the margin this exists to give them. An
 /// empty ring in the meantime costs nothing: the callback writes silence for
 /// a missing sample, which is what a call with no audio yet sounds like.
-const PLAYOUT_PRIME: usize = 60;
+const PLAYOUT_PRIME: usize = 180;
 
 /// What one call's audio graph keeps alive, released together.
 ///
@@ -519,6 +531,17 @@ fn wire(
         let mut scratch: Vec<f32> = Vec::new();
         // Said once, not per block, for the same reason.
         let reported = std::cell::Cell::new(false);
+        // How many blocks the ring could not fill, for the whole call, and
+        // whether the run of them is still going. See their use below.
+        let underran = std::cell::Cell::new(0u32);
+        let in_underrun = std::cell::Cell::new(false);
+        // Whether the peer has ever been heard. The ring is deliberately empty
+        // until their first frame primes it -- see `PLAYOUT_PRIME` -- and this
+        // callback runs from the moment the context resumes, through signalling
+        // and relay setup. Every one of those blocks is a ring that could not
+        // be filled and none of them is a late packet, so without this the
+        // diagnostic below fires on every healthy call and says nothing.
+        let ever_fed = std::cell::Cell::new(false);
         Closure::<dyn FnMut(web_sys::AudioProcessingEvent)>::new(
             move |event: web_sys::AudioProcessingEvent| {
                 let Ok(buffer) = event.output_buffer() else {
@@ -527,14 +550,47 @@ fn wire(
                 let len = buffer.length() as usize;
                 scratch.clear();
                 scratch.reserve(len);
-                {
+                let short = {
                     let mut ring = playout.borrow_mut();
                     // An empty ring is a gap in the network, not an error:
                     // the peer stopped sending, or their packet is late.
                     // Silence is what a call sounds like there.
+                    let had = ring.len();
+                    if had > 0 {
+                        ever_fed.set(true);
+                    }
                     scratch.extend(
                         std::iter::repeat_with(|| ring.pop_front().unwrap_or(0.0)).take(len),
                     );
+                    len.saturating_sub(had)
+                };
+                // Counted, because it was the one thing on this path with no
+                // account of itself. A ring that runs dry writes zeros into
+                // the middle of speech, and the result is described as robotic
+                // rather than as silent -- so the symptom points at the codec,
+                // which is the half that is working. The prime and the ceiling
+                // are both sized against this number and neither could be
+                // checked against anything.
+                if short > 0 && ever_fed.get() {
+                    let blocks = underran.get() + 1;
+                    underran.set(blocks);
+                    // Once when a run begins, and then at each doubling of the
+                    // call's total. A ring that is behind is behind on every
+                    // block, so a line per block is what made the last log
+                    // unreadable -- but a count alone answers the wrong
+                    // question: two runs of one block are a call with a jitter
+                    // problem, and one run of two is a call that hiccuped.
+                    // Only the start of a run tells them apart, and the
+                    // running total is what says how bad it got.
+                    let began = !in_underrun.replace(true);
+                    if began || blocks.is_power_of_two() {
+                        warn!(
+                            "the call's playout ring ran dry on {blocks} block(s) so far; the \
+                             peer's audio is arriving later than it is played"
+                        );
+                    }
+                } else if short == 0 {
+                    in_underrun.set(false);
                 }
                 // JS-owned, and that is the whole of this line. `copyToChannel`
                 // takes a `Float32Array` that "must not be shared", and every

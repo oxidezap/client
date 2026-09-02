@@ -34,8 +34,32 @@ use gpui::RenderImage;
 use oxidezap_core::{CallVideoFrame, VideoStream};
 use smallvec::SmallVec;
 
+use wacore::voip::h264::{au_has_idr, nal_unit_type, split_annexb};
+
 use super::geometry::{Rotation, declares_unreadably};
 use super::webcodecs;
+
+/// The SPS and PPS an access unit carries, if it carries both.
+///
+/// Owned for the PPS because the caller wants the two together and the
+/// borrow of the second outlives the iterator that found the first.
+fn parameter_sets(access_unit: &[u8]) -> Option<(&[u8], Vec<u8>)> {
+    let mut sps = None;
+    let mut pps = None;
+    for nal in split_annexb(access_unit) {
+        match nal_unit_type(nal) {
+            7 => sps = sps.or(Some(nal)),
+            8 => pps = pps.or(Some(nal.to_vec())),
+            _ => {}
+        }
+    }
+    Some((sps?, pps?))
+}
+
+/// Bytes as the hex a capture is compared against.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// Where a decoded picture goes.
 ///
@@ -151,6 +175,8 @@ struct Stream {
     /// Stamps the units, since a call's frames carry no presentation time of
     /// their own and a decoder wants them monotonic.
     fed: std::cell::Cell<i32>,
+    /// Whether this stream's shape has been said once. See [`Stream::describe`].
+    described: std::cell::Cell<bool>,
 }
 
 impl Stream {
@@ -163,6 +189,37 @@ impl Stream {
             started: std::cell::Cell::new(false),
             waiting: std::cell::Cell::new(false),
             fed: std::cell::Cell::new(0),
+            described: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Say what this stream's units are made of, once.
+    ///
+    /// The one thing a pane that draws nothing cannot tell you: whether the
+    /// bitstream is the shape the decoder was configured for. `voip-cli`
+    /// prints exactly this and it is how the peer's stream was established as
+    /// decodable while ours was not -- there, the two lines sit side by side
+    /// and differ. Here every other line said video was fine.
+    fn describe(&self, frame: &CallVideoFrame) {
+        if self.described.get() {
+            return;
+        }
+        let nals: SmallVec<[u8; 8]> = split_annexb(&frame.data).map(nal_unit_type).collect();
+        // Only once a parameter set has been seen: before that there is
+        // nothing to name the decoder's configuration with, and saying so
+        // early would spend the one line on the least useful unit.
+        let sets = parameter_sets(&frame.data);
+        if let Some((sps, pps)) = sets {
+            self.described.set(true);
+            log::debug!(
+                "the {:?} stream carries avc1.{} ({} byte(s), NALs {:?}, SPS {}, PPS {})",
+                self.stream,
+                hex(sps.get(1..4).unwrap_or_default()),
+                frame.data.len(),
+                nals,
+                hex(sps),
+                hex(&pps),
+            );
         }
     }
 
@@ -189,11 +246,26 @@ impl Stream {
     }
 
     fn accept(&self, frame: CallVideoFrame) {
+        self.describe(&frame);
         if frame.gap {
             self.abandon();
         }
+        // The bitstream, not only the flag beside it. `voip-cli` restarts on
+        // `au_has_idr` and recovers where this waited: a unit that carries an
+        // IDR *is* a recovery point whatever the flag says, and a flag that is
+        // wrong once costs the pane every picture until the sender's next
+        // keyframe -- which the peer sent four times in a whole call. Widened
+        // rather than replaced: a keyframe the sender vouches for is still one.
+        //
+        // Read ONCE and used everywhere below, which is the whole of the
+        // reason it is a local. Answering this question in one place and
+        // `frame.keyframe` in the next is worse than either alone: a unit that
+        // starts the stream here and is then submitted as a delta chunk is one
+        // the browser rejects outright, because a key chunk is required first
+        // after `configure`. That is the case this exists to serve, failing.
+        let recovers = frame.keyframe || au_has_idr(&frame.data);
         if !self.started.get() {
-            if !frame.keyframe {
+            if !recovers {
                 // The one silent refusal on this path, and the one that
                 // costs a whole call: a stream that never receives a
                 // keyframe waits here for every unit and draws nothing,
@@ -267,7 +339,7 @@ impl Stream {
             log::debug!("the {:?} video of a call stopped: {e}", self.stream);
             *held = None;
             self.started.set(false);
-            if !frame.keyframe {
+            if !recovers {
                 return;
             }
             self.started.set(true);
@@ -309,7 +381,7 @@ impl Stream {
         decoder.set_rotation(Rotation::to_upright(frame.orientation));
         let stamp = self.fed.get();
         self.fed.set(stamp.wrapping_add(1));
-        decoder.decode(&frame.data, stamp, frame.keyframe);
+        decoder.decode(&frame.data, stamp, recovers);
     }
 
     /// Build a decoder from the parameter sets this keyframe carries.
