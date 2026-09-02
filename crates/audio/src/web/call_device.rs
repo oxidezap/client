@@ -531,8 +531,10 @@ fn wire(
         let mut scratch: Vec<f32> = Vec::new();
         // Said once, not per block, for the same reason.
         let reported = std::cell::Cell::new(false);
-        // How many blocks the ring could not fill. See its use below.
+        // How many blocks the ring could not fill, for the whole call, and
+        // whether the run of them is still going. See their use below.
         let underran = std::cell::Cell::new(0u32);
+        let in_underrun = std::cell::Cell::new(false);
         Closure::<dyn FnMut(web_sys::AudioProcessingEvent)>::new(
             move |event: web_sys::AudioProcessingEvent| {
                 let Ok(buffer) = event.output_buffer() else {
@@ -562,15 +564,23 @@ fn wire(
                 if short > 0 {
                     let blocks = underran.get() + 1;
                     underran.set(blocks);
-                    // Once per run and again at each power of ten: an
-                    // underrunning ring underruns every block, and a line per
-                    // block is what made the last one unreadable.
-                    if blocks.is_power_of_two() {
+                    // Once when a run begins, and then at each doubling of the
+                    // call's total. A ring that is behind is behind on every
+                    // block, so a line per block is what made the last log
+                    // unreadable -- but a count alone answers the wrong
+                    // question: two runs of one block are a call with a jitter
+                    // problem, and one run of two is a call that hiccuped.
+                    // Only the start of a run tells them apart, and the
+                    // running total is what says how bad it got.
+                    let began = !in_underrun.replace(true);
+                    if began || blocks.is_power_of_two() {
                         warn!(
-                            "the call's playout ring ran dry on {blocks} block(s); the peer's \
-                             audio is arriving later than it is played"
+                            "the call's playout ring ran dry on {blocks} block(s) so far; the \
+                             peer's audio is arriving later than it is played"
                         );
                     }
+                } else {
+                    in_underrun.set(false);
                 }
                 // JS-owned, and that is the whole of this line. `copyToChannel`
                 // takes a `Float32Array` that "must not be shared", and every
