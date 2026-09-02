@@ -269,7 +269,9 @@ impl<'a> Frames<'a> {
                 Some(Awaiting::Installed { tell, .. }) => {
                     let _ = tell.send(Ok(plugin));
                 }
-                Some(waiting) => self.fail(waiting, "unexpected install answer"),
+                Some(waiting) => {
+                    self.fail(waiting, &Failure::permanent("unexpected install answer"))
+                }
                 None => debug!("an install answer arrived for {id}, which nobody is waiting on"),
             },
             DaemonMessage::InstalledPlugins { id, plugins } => {
@@ -277,7 +279,9 @@ impl<'a> Frames<'a> {
                     Some(Awaiting::Installable(tx)) => {
                         let _ = tx.send(plugins);
                     }
-                    Some(waiting) => self.fail(waiting, "unexpected plugin listing"),
+                    Some(waiting) => {
+                        self.fail(waiting, &Failure::permanent("unexpected plugin listing"))
+                    }
                     None => debug!("a plugin listing arrived for {id}, which nobody is waiting on"),
                 }
             }
