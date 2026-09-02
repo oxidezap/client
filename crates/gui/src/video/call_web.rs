@@ -250,15 +250,22 @@ impl Stream {
         if frame.gap {
             self.abandon();
         }
+        // The bitstream, not only the flag beside it. `voip-cli` restarts on
+        // `au_has_idr` and recovers where this waited: a unit that carries an
+        // IDR *is* a recovery point whatever the flag says, and a flag that is
+        // wrong once costs the pane every picture until the sender's next
+        // keyframe -- which the peer sent four times in a whole call. Widened
+        // rather than replaced: a keyframe the sender vouches for is still one.
+        //
+        // Read ONCE and used everywhere below, which is the whole of the
+        // reason it is a local. Answering this question in one place and
+        // `frame.keyframe` in the next is worse than either alone: a unit that
+        // starts the stream here and is then submitted as a delta chunk is one
+        // the browser rejects outright, because a key chunk is required first
+        // after `configure`. That is the case this exists to serve, failing.
+        let recovers = frame.keyframe || au_has_idr(&frame.data);
         if !self.started.get() {
-            // The bitstream, not only the flag beside it. `voip-cli` restarts
-            // on `au_has_idr` and recovers where this waited: a unit that
-            // carries an IDR *is* a recovery point whatever the flag says, and
-            // a flag that is wrong once costs the pane every picture until the
-            // sender's next keyframe -- which the peer sent four times in a
-            // whole call. Widened rather than replaced: a keyframe the sender
-            // vouches for is still one.
-            if !frame.keyframe && !au_has_idr(&frame.data) {
+            if !recovers {
                 // The one silent refusal on this path, and the one that
                 // costs a whole call: a stream that never receives a
                 // keyframe waits here for every unit and draws nothing,
@@ -332,7 +339,7 @@ impl Stream {
             log::debug!("the {:?} video of a call stopped: {e}", self.stream);
             *held = None;
             self.started.set(false);
-            if !frame.keyframe {
+            if !recovers {
                 return;
             }
             self.started.set(true);
@@ -374,7 +381,7 @@ impl Stream {
         decoder.set_rotation(Rotation::to_upright(frame.orientation));
         let stamp = self.fed.get();
         self.fed.set(stamp.wrapping_add(1));
-        decoder.decode(&frame.data, stamp, frame.keyframe);
+        decoder.decode(&frame.data, stamp, recovers);
     }
 
     /// Build a decoder from the parameter sets this keyframe carries.
