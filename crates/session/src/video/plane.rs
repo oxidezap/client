@@ -152,6 +152,20 @@ pub(crate) type CameraLost = Arc<dyn Fn(String, CameraId) + Send + Sync>;
 #[cfg(target_family = "wasm")]
 pub(crate) type CameraLost = Arc<dyn Fn(String, CameraId)>;
 
+/// Called when the peer's picture is dropped on this side, so the peer can be
+/// asked for the keyframe that ends the gap.
+///
+/// A callback rather than a handle, for the same reason [`CameraLost`] is one:
+/// a camera is opened *before* the call handle exists on the accept path, so
+/// there is nothing to hold yet. Resolving the call by id when the drop happens
+/// finds whatever is live by then, which on that path is the handle this open
+/// was for.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) type PictureLost = Arc<dyn Fn(&str) + Send + Sync>;
+/// See the desktop half: on a page the bound is empty.
+#[cfg(target_family = "wasm")]
+pub(crate) type PictureLost = Arc<dyn Fn(&str)>;
+
 /// One opened camera, told apart from the next one on the same call.
 ///
 /// A counter rather than the device's own name: two opens of one webcam are
@@ -340,6 +354,7 @@ pub(crate) async fn open(
     call_id: CallIdSlot,
     publisher: VideoPublisher,
     lost: CameraLost,
+    picture_lost: PictureLost,
 ) -> Result<(LocalVideo, Endpoints), String> {
     let quality = VideoQuality::from_environment();
     let camera = oxidezap_video::open_camera(quality)
@@ -373,6 +388,7 @@ pub(crate) async fn open(
         Arc::clone(&call_id),
         sink_rx.clone(),
         publisher,
+        picture_lost,
     ));
 
     Ok((
@@ -577,15 +593,11 @@ async fn pump_remote(
     call_id: CallIdSlot,
     frames: async_channel::Receiver<VideoFrame>,
     publisher: VideoPublisher,
+    picture_lost: PictureLost,
 ) {
     // Runs for as long as the call does, whoever is or is not watching. A
     // pump that stopped at the first frame nobody took would leave the peer's
     // picture gone for good the moment a window closed and reopened.
-    //
-    // A dropped unit here is one the far side has to recover from, and there
-    // is nothing on this side that can ask it to: the library parses the
-    // peer's PLI and FIR but exposes no way to *send* one, so the peer's own
-    // periodic keyframe is what ends the gap.
     let mut gap = false;
     // The counters the local pump has had all along, and this one never did.
     // A remote pane that stays black is the same silence here whether the
@@ -637,24 +649,29 @@ async fn pump_remote(
                     debug!("the peer's video has nobody drawing it; it is not published");
                 }
             }
-            // The expensive one, and the reason it gets a warning rather
-            // than a counter alone: a unit lost here is one the *peer* has
-            // to replace, and nothing on this side can ask it to. The
-            // decoder stops at the gap and waits for whatever keyframe the
-            // peer sends next of its own accord, which on a call that never
-            // recovers is never.
+            // The expensive one, and the reason it gets a warning rather than
+            // a counter alone: a unit lost here is one the *peer* has to
+            // replace. This is the only place that knows it happened -- the
+            // library handed the unit over intact, so nothing below sees a
+            // loss -- which is why the ask is made from here and not left to
+            // the peer's own periodic keyframe.
+            //
+            // Asked on every dropped unit rather than the first: a window that
+            // sheds sheds a run, and coalescing a run into one request is what
+            // the engine's throttle is for.
             Delivery::Dropped => {
                 dropped_by_the_window += 1;
                 if dropped_by_the_window == 1 {
                     warn!(
-                        "the window's video queue refused the peer's picture; its decoder now \
-                         waits for a keyframe only the peer can decide to send"
+                        "the window's video queue refused the peer's picture; asking the peer for \
+                         the keyframe that ends the gap"
                     );
                 }
+                picture_lost(&read(&call_id));
             }
         }
-        // Nothing here can ask the peer for a keyframe, so the most this can
-        // do is tell the decoder not to draw on what it no longer has.
+        // Beside the request above rather than instead of it: the ask takes a
+        // round trip and the frames in between still reference what is gone.
         gap = delivery.still_owes_a_gap(gap);
     }
     debug!(
@@ -712,6 +729,52 @@ mod tests {
         assert!(
             !reported.load(Ordering::Relaxed),
             "stopping the camera ourselves must not report it as lost"
+        );
+    }
+
+    /// A window that could not keep up is the one loss nothing below this can
+    /// see: the library handed the access unit over intact, so the peer is
+    /// never told, and its decoder waits on a reference we threw away.
+    ///
+    /// Asked on every dropped unit rather than the first, because a window
+    /// that sheds sheds a run and coalescing a run into one request is the
+    /// engine's job, not this pump's.
+    #[tokio::test]
+    async fn a_picture_the_window_refused_asks_the_peer_to_start_over() {
+        let (frames_tx, frames) = async_channel::bounded::<VideoFrame>(4);
+        // One slot, filled and never read: every unit after the first is
+        // refused, which is what a window falling behind looks like here.
+        let (sender, _held) = tokio::sync::mpsc::channel(1);
+        let publisher = VideoPublisher {
+            sender: Arc::new(std::sync::Mutex::new(Some(sender))),
+            watched: Arc::new(AtomicBool::new(true)),
+        };
+
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let picture_lost: PictureLost = {
+            let asked = asked.clone();
+            Arc::new(move |call_id: &str| {
+                asked
+                    .lock()
+                    .expect("asked poisoned")
+                    .push(call_id.to_string())
+            })
+        };
+
+        for _ in 0..3 {
+            frames_tx
+                .try_send(VideoFrame::new(vec![0, 0, 0, 1, 0x65]))
+                .expect("the pump has not read yet");
+        }
+        frames_tx.close();
+
+        pump_remote(slot("call-1"), frames, publisher, picture_lost).await;
+
+        let asked = asked.lock().expect("asked poisoned");
+        assert_eq!(
+            *asked,
+            vec!["call-1".to_string(), "call-1".to_string()],
+            "the first frame fills the queue; the two it refused each ask"
         );
     }
 
