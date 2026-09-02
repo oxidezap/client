@@ -15,7 +15,9 @@ use super::super::*;
 // file's business alone: the session's own module has no use for one.
 use crate::video::LocalVideo;
 use oxidezap_audio::open_call_audio;
-use whatsapp_rust::voip::{CallEvent, CallHandle, CallTermination, VideoState, VideoUpgradeToken};
+use whatsapp_rust::voip::{
+    CallEvent, CallHandle, CallTermination, KeyframeUrgency, VideoState, VideoUpgradeToken,
+};
 
 /// Whether an offer asked for video.
 ///
@@ -568,7 +570,7 @@ impl CallRegistry {
         let Some(local) = calls.cameras.get(call_id) else {
             return false;
         };
-        local.drawable();
+        local.live();
         local.request_keyframe();
         true
     }
@@ -649,6 +651,23 @@ impl CallRegistry {
             .get(call_id)
         {
             local.request_keyframe();
+        }
+    }
+
+    /// Ask the PEER for a keyframe, by RTCP PLI: the mirror of
+    /// [`Self::ask_for_keyframe`], and the half that did not exist until the
+    /// library grew a way to send one.
+    ///
+    /// Fire-and-forget by design upstream — the engine throttles, decides and
+    /// says nothing back — so there is no outcome to report and no reason to
+    /// wait. A call that is no longer live simply has nothing to ask.
+    pub(in crate::whatsapp) fn ask_peer_for_keyframe(
+        &self,
+        call_id: &str,
+        urgency: KeyframeUrgency,
+    ) {
+        if let Some(handle) = self.live(call_id) {
+            handle.request_peer_keyframe(urgency);
         }
     }
 
@@ -820,6 +839,7 @@ impl WhatsAppClient {
         let ui_sender = self.ui_sender.clone();
         let publish = self.video_publisher();
         let lost = self.camera_lost();
+        let picture_lost = self.picture_lost();
         let call_id = call_id.to_string();
 
         // On the caller's thread, before the spawn, and it is the same reason
@@ -879,7 +899,7 @@ impl WhatsAppClient {
             // the answer is audio, which is exactly what a phone does when
             // its camera is busy.
             let video = if with_video {
-                match video::open(video::slot(&call_id), publish, lost).await {
+                match video::open(video::slot(&call_id), publish, lost, picture_lost).await {
                     Ok(video) => Some(video),
                     Err(err) => {
                         warn!("Answering call {call_id} without video: {err}");
@@ -985,7 +1005,7 @@ impl WhatsAppClient {
                         // that starts on the first frame to arrive has
                         // nothing to start from until the next one, seconds
                         // away, so it is asked for here.
-                        local.drawable();
+                        local.live();
                         local.request_keyframe();
                         match calls.hold_camera(&call_id, local).await {
                             Camera::Held => {
@@ -1063,6 +1083,7 @@ impl WhatsAppClient {
         let ui_sender = self.ui_sender.clone();
         let publish = self.video_publisher();
         let lost = self.camera_lost();
+        let picture_lost = self.picture_lost();
         let call_id = call_id.to_string();
 
         // Before the spawn, because after it the order is gone. See
@@ -1129,16 +1150,17 @@ impl WhatsAppClient {
                 Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
                 return;
             }
-            let (local, endpoints) = match video::open(video::slot(&call_id), publish, lost).await {
-                Ok(video) => video,
-                Err(err) => {
-                    error!("Camera setup failed for call {call_id}: {err}");
-                    // Said out loud rather than left silent: the front end
-                    // drew the camera as coming on the moment it was asked.
-                    Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
-                    return;
-                }
-            };
+            let (local, endpoints) =
+                match video::open(video::slot(&call_id), publish, lost, picture_lost).await {
+                    Ok(video) => video,
+                    Err(err) => {
+                        error!("Camera setup failed for call {call_id}: {err}");
+                        // Said out loud rather than left silent: the front end
+                        // drew the camera as coming on the moment it was asked.
+                        Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
+                        return;
+                    }
+                };
             // Asked again, because opening a device is where the time goes —
             // tens of milliseconds, the first time a permission prompt — and
             // the lane held whatever came after us off for all of it. Going
@@ -1205,7 +1227,7 @@ impl WhatsAppClient {
                     // draws this starts a decoder on the first frame that
                     // arrives and can do nothing with it until a keyframe,
                     // which is otherwise the periodic one, seconds away.
-                    local.drawable();
+                    local.live();
                     local.request_keyframe();
                     // The announcement landed and the device may not have
                     // survived it: the peer has this direction enabled and is
@@ -1392,6 +1414,7 @@ impl WhatsAppClient {
         let ui_sender = self.ui_sender.clone();
         let publish = self.video_publisher();
         let lost = self.camera_lost();
+        let picture_lost = self.picture_lost();
         let recipient_jid = recipient_jid_str.to_string();
 
         // Before the spawn, on the caller's thread, for the same reason a
@@ -1456,7 +1479,7 @@ impl WhatsAppClient {
             // call yet, and the frames this produces are addressed to the
             // call the front end already drew.
             let video = if is_video {
-                match video::open(video::slot(&placeholder_id), publish, lost).await {
+                match video::open(video::slot(&placeholder_id), publish, lost, picture_lost).await {
                     Ok(video) => Some(video),
                     Err(err) => {
                         warn!(
@@ -1855,6 +1878,12 @@ impl WhatsAppClient {
             // live. Only the two stanzas that are addressed to our request
             // retire it.
             VideoState::Enabled => {
+                // Their camera has just come on, and the first thing it sends
+                // need not be a keyframe -- a peer that turns video on mid-call
+                // resumes an encoder that is already running. Asking now costs
+                // one PLI and turns a pane that stays black until their next
+                // periodic IDR into one that fills on the next frame.
+                calls.ask_peer_for_keyframe(call_id, KeyframeUrgency::Coalesced);
                 Self::announce_video(ui_sender, call_id, VideoStream::Remote, true);
             }
             // Paused is drawn the same as off, and deliberately: a peer whose

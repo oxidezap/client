@@ -917,7 +917,7 @@ fn tick(
     // early, and a tick that arrives before its frame is due does nothing.
     let period_ms = MILLIS_PER_SECOND / f64::from(quality.fps.max(1));
     let due = Rc::new(Cell::new(f64::NEG_INFINITY));
-    /// Frames since the last one that asked for an IDR; see the cadence below.
+    // Frames since the last one that asked for an IDR; see the cadence below.
     let keyed = Rc::new(Cell::new(0u64));
     let complained = Rc::new(RefCell::new(false));
     Closure::<dyn FnMut()>::new(move || {
@@ -988,8 +988,21 @@ fn tick(
         // a requested IDR sends nothing at all for the rest of the call the
         // first time such a request is missed. See `KEYFRAME_SECONDS`.
         let since_key = keyed.get().saturating_add(1);
-        let due_a_key = since_key >= u64::from(quality.fps.max(1) * crate::KEYFRAME_SECONDS);
-        let wanted_key = control.0.keyframe.replace(false) || due_a_key;
+        let fps = u64::from(quality.fps.max(1));
+        let due_a_key = since_key >= fps * u64::from(crate::KEYFRAME_SECONDS);
+        // A request is honoured, but not sooner than the last IDR plus
+        // `MIN_REQUESTED_KEYFRAME_SECONDS` — and *not consumed* when it is
+        // too soon, so the ask survives to the first tick that may serve it.
+        // A burst of requests describing one loss therefore costs one
+        // keyframe, and the last request in a burst is never the one lost.
+        // Counted in frames because the tick already counts them; a page has
+        // no clock this loop can read for free.
+        let asked = control.0.keyframe.get();
+        let may_answer = since_key >= fps * u64::from(crate::MIN_REQUESTED_KEYFRAME_SECONDS);
+        if asked && may_answer {
+            control.0.keyframe.set(false);
+        }
+        let wanted_key = (asked && may_answer) || due_a_key;
         keyed.set(if wanted_key { 0 } else { since_key });
         options.set_key_frame(wanted_key);
         if let Err(e) = encoder.encode_with_options(&frame, &options) {

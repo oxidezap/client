@@ -67,7 +67,8 @@ use oxidezap_core::{
 
 use crate::names::NameBook;
 use crate::quoting::quoted_from;
-use crate::video::{self, CameraLost, VideoPublisher, VideoSenderSlot};
+use crate::video::{self, CameraLost, PictureLost, VideoPublisher, VideoSenderSlot};
+use whatsapp_rust::voip::KeyframeUrgency;
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
 
 use crate::store::settings as store_settings;
@@ -402,6 +403,22 @@ impl WhatsAppClient {
                 // replacement torn down by its predecessor's failure.
                 Self::stop_local_video(&calls, &ui_sender, &call_id, Some(camera_id)).await;
             });
+        })
+    }
+
+    /// What to do when the peer's picture is dropped on this side.
+    ///
+    /// Built per call for the same reason [`Self::camera_lost`] is, and it
+    /// resolves the handle by id rather than closing over one: on the accept
+    /// path the camera is opened before there is a handle to close over.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn picture_lost(&self) -> PictureLost {
+        let calls = self.calls.clone();
+        // No spawner, unlike `camera_lost`: the request is fire-and-forget in
+        // the library and returns without awaiting anything, so a task to run
+        // it on would buy a hop and nothing else.
+        Arc::new(move |call_id: &str| {
+            calls.ask_peer_for_keyframe(call_id, KeyframeUrgency::Coalesced);
         })
     }
 

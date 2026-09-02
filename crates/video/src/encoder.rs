@@ -9,7 +9,7 @@
 
 use anyhow::{Context as _, Result};
 
-use crate::KEYFRAME_SECONDS;
+use crate::{KEYFRAME_SECONDS, MIN_REQUESTED_KEYFRAME_SECONDS};
 use openh264::encoder::{
     BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Level, Profile,
     RateControlMode, SpsPpsStrategy, UsageType,
@@ -25,6 +25,18 @@ use crate::EncodedFrame;
 pub struct H264Encoder {
     encoder: Encoder,
     force_keyframe: bool,
+    /// Frames since the last forced IDR, and how many must pass before
+    /// another request is honoured.
+    ///
+    /// The periodic intra period above hides the cost here — a forced IDR is
+    /// only ever *extra* — but the requests arrive from four uncoordinated
+    /// places, all of them caused by congestion, so answering each one
+    /// individually spends the bitrate budget on the largest frames the
+    /// encoder can make at the worst possible moment. See
+    /// `MIN_REQUESTED_KEYFRAME_SECONDS`; the browser backend rate-limits the
+    /// same requests the same way, and this is the number they share.
+    since_forced: u32,
+    min_between_forced: u32,
 }
 
 impl H264Encoder {
@@ -61,6 +73,11 @@ impl H264Encoder {
         Ok(Self {
             encoder,
             force_keyframe: false,
+            since_forced: 0,
+            min_between_forced: quality
+                .fps
+                .saturating_mul(MIN_REQUESTED_KEYFRAME_SECONDS)
+                .max(1),
         })
     }
 
@@ -80,9 +97,13 @@ impl H264Encoder {
         source: &S,
         at: openh264::Timestamp,
     ) -> Result<Option<EncodedFrame>> {
-        if self.force_keyframe {
+        self.since_forced = self.since_forced.saturating_add(1);
+        // Honoured, but not sooner than the last forced IDR — and the ask is
+        // *kept* when it is too soon, so the last request of a burst is
+        // never the one lost.
+        let forcing = self.force_keyframe && self.since_forced >= self.min_between_forced;
+        if forcing {
             self.encoder.force_intra_frame();
-            self.force_keyframe = false;
         }
         let bitstream = self
             .encoder
@@ -97,10 +118,18 @@ impl H264Encoder {
         if data.is_empty() {
             return Ok(None);
         }
-        Ok(Some(EncodedFrame {
-            data,
-            keyframe: matches!(frame_type, FrameType::IDR | FrameType::I),
-        }))
+        let keyframe = matches!(frame_type, FrameType::IDR | FrameType::I);
+        // Spent on the IDR rather than on asking for one. Rate control may
+        // skip the very frame the force was set on, and clearing the ask there
+        // would drop it while starting a cooldown against a keyframe that was
+        // never made — the peer waits the interval out for nothing, which is
+        // the failure the interval exists to prevent, arrived at from the
+        // other side.
+        if forcing && keyframe {
+            self.force_keyframe = false;
+            self.since_forced = 0;
+        }
+        Ok(Some(EncodedFrame { data, keyframe }))
     }
 }
 

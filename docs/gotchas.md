@@ -720,6 +720,68 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   every path out that is not a camera held withdraws it again, and the
   refusal's own teardown queues on the call's video lane behind the enable it
   is answering.
+- **The peer's picture is asked for from exactly two places, and both are
+  above the library.** A dropped access unit used to end the peer's stream for
+  good: the decoder abandons its chain at the gap and waits for a keyframe the
+  peer sends only on its own cadence, which for WhatsApp mobile is on demand
+  and therefore never. The library parsed an inbound PLI to drive our encoder
+  and built none of its own, so the receive path had nothing to say "send me a
+  recovery point" with. It does now (`CallHandle::request_peer_keyframe`,
+  oxidezap/whatsapp-rust#1385), and what matters here is *who is in a position
+  to notice a loss worth asking about*.
+
+  Not the library: it hands each access unit over intact, so by the time one
+  is lost it is above the hand-off and invisible below it. `pump_remote` is
+  where it actually goes -- the window's queue refuses it -- which is why the
+  ask is made there and not deeper. It fires on every dropped unit rather than
+  the first, because a window that sheds sheds a run and coalescing a run into
+  one request is the engine's throttle, not this pump's job.
+
+  The other is `<video state="1">`: the peer's camera coming on mid-call
+  resumes an encoder already running, so the first unit it sends need not be a
+  keyframe at all. This is the mirror of the `peer_can_receive_video` ask
+  beside it, which asks *our* camera for the same reason in the other
+  direction.
+
+  Both pass `KeyframeUrgency::Coalesced`. `Immediate` is for a decoder that
+  has already failed and reset -- the front end is what would know that, and
+  nothing here reports a decode failure back, so there is nowhere to call it
+  honestly yet. The official client draws the same line: `pli_throttle_time_ms`
+  for the routine case, `enable_pli_for_dec_err` for the one that skips it.
+- **Video encoded before the peer accepts is thrown away twice, and poisons
+  the channel it is thrown away in.** The camera has to open before the offer
+  -- an offer with no camera is not a video offer -- but nothing wants those
+  frames. The window has no live call to draw them into, and the peer opens
+  its pane off the announcement sent at accept, not off the offer, so a unit
+  arriving before it is decoded by nobody. What made this expensive rather
+  than merely wasteful is where the bytes go in the meantime: the relay
+  channel is allocated when the server acks the offer, while the callee is
+  still ringing, and SCTP starts in slow start with a congestion window of
+  about 4 KB. Half a second of 720p at 1980 kbps arrives into that. One call
+  logged the channel 138872 bytes behind before the peer had answered -- 561
+  ms of encoder output, queued in front of every packet that would matter.
+  The plane hand-off is gated on the same flag the self-view uses.
+- **A requested keyframe is not free, and four things request them without
+  knowing about each other**: the peer's PLI, the media plane's gate, an
+  access unit the relay refused, and a self-view frame the window could not
+  take. Each is *caused* by congestion, so answering every one individually
+  spends the whole bitrate budget on the largest frames the encoder can make
+  at the moment the wire has least room for them. One call answered 38 in
+  twelve seconds -- better than one frame in seven was an IDR, on a budget
+  that affords one in sixty. Requests are now rate-limited to one per second
+  in both backends, against the relay's drain time rather than the round trip:
+  at 1980 kbps a channel takes about a quarter-second to clear a keyframe, so
+  a second IDR inside that window cannot be delivered whatever it costs to
+  make. The request is *kept* rather than consumed when it is too soon, so the
+  last ask of a burst is never the one lost, and `KEYFRAME_SECONDS` remains
+  the backstop.
+- **The outbound ceiling is video's, and it was dropping the voice.** One
+  Opus stream is 16 kbps against video's 1980, so audio can never be the cause
+  of a backlog and is what a call least affords to lose -- yet a video
+  keyframe filling the buffer took the voice with it, because both were
+  decided against the same line. Audio is exempt now up to a hard ceiling
+  eight times higher, past which the channel is not congested but wedged.
+
 - **A video call announces its direction; the offer only advertises the
   capability.** A call placed as video enables its plane ungated, encodes, and
   packetises — and the peer shows nothing, because the receiving side brings

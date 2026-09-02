@@ -145,6 +145,9 @@ struct Stream {
     /// Whether the decoder holds a reference chain worth continuing. Cleared
     /// by a gap and by any refusal, and regained at the next keyframe.
     started: std::cell::Cell<bool>,
+    /// Whether the wait for a keyframe has already been reported. One line
+    /// per wait, not one per unit refused while waiting.
+    waiting: std::cell::Cell<bool>,
     /// Stamps the units, since a call's frames carry no presentation time of
     /// their own and a decoder wants them monotonic.
     fed: std::cell::Cell<i32>,
@@ -158,6 +161,7 @@ impl Stream {
             frames,
             decoder: RefCell::new(None),
             started: std::cell::Cell::new(false),
+            waiting: std::cell::Cell::new(false),
             fed: std::cell::Cell::new(0),
         }
     }
@@ -190,8 +194,20 @@ impl Stream {
         }
         if !self.started.get() {
             if !frame.keyframe {
+                // The one silent refusal on this path, and the one that
+                // costs a whole call: a stream that never receives a
+                // keyframe waits here for every unit and draws nothing,
+                // which reads in a log exactly like a stream that received
+                // nothing at all. Said once per wait, not per unit.
+                if !self.waiting.replace(true) {
+                    log::debug!(
+                        "the {:?} stream is waiting for a keyframe before it can decode",
+                        frame.stream
+                    );
+                }
                 return;
             }
+            self.waiting.set(false);
             self.started.set(true);
         }
 
