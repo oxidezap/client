@@ -706,6 +706,157 @@ fn the_local_actions_do_not_need_a_connection() {
     );
 }
 
+/// A connection's own answer channel, with the end that reads it.
+///
+/// Everything about a plugin folder is answered *later*, on this channel,
+/// rather than from the connection's loop — a thirty-two megabyte read and
+/// write in that loop is a window served no state and no call video for as
+/// long as the disk takes. So these tests read the answer where it really
+/// arrives.
+fn answers() -> (Outbox, tokio::sync::mpsc::Receiver<String>) {
+    tokio::sync::mpsc::channel(OUTBOX_CAPACITY)
+}
+
+/// The one answer, wherever it came from: the loop's own frame if there is
+/// one, and otherwise the outbox this request will answer on.
+async fn answered(
+    answer: super::requests::Answer,
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+) -> DaemonMessage {
+    let frame = match answer.frame {
+        Some(frame) => frame,
+        None => tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("every request gets exactly one answer")
+            .expect("and the outbox is still open"),
+    };
+    serde_json::from_str(&frame).expect("a daemon frame")
+}
+
+/// A module is staged and the frame names it, exactly as a file being sent
+/// is — so a frame naming something that is *not* a staged payload is one the
+/// daemon must not act on. The cache holds this account's downloaded photos
+/// under keys derived from content it has already published, so without this
+/// a client could name one of those and have the daemon move it into the
+/// folder it loads code from.
+#[tokio::test]
+async fn a_plugin_install_takes_nothing_but_a_staged_payload() {
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let (outbox, mut answers) = answers();
+
+    let request = Request {
+        id: Some(11),
+        request: ClientRequest::InstallPlugin(oxidezap_ipc::InstallPlugin {
+            file_name: "autoreply.wasm".into(),
+            // A download's key, which is the daemon's own cache and not a
+            // key space a front end writes.
+            upload: "f-3EB0A".into(),
+        }),
+    };
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox).await;
+    assert!(
+        matches!(
+            answered(answer, &mut answers).await,
+            DaemonMessage::Error {
+                id: Some(11),
+                error: ProtocolError::Refused { .. },
+            }
+        ),
+        "a key outside the staged space is refused rather than read"
+    );
+}
+
+/// And one that names a staged key with nothing under it is refused too,
+/// rather than installing an empty module or answering success.
+#[tokio::test]
+async fn a_plugin_install_whose_payload_never_arrived_is_refused() {
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let (outbox, mut answers) = answers();
+
+    let request = Request {
+        id: Some(12),
+        request: ClientRequest::InstallPlugin(oxidezap_ipc::InstallPlugin {
+            file_name: "autoreply.wasm".into(),
+            upload: oxidezap_ipc::staged_key(&format!("no-such-plugin-{}", std::process::id())),
+        }),
+    };
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox).await;
+    assert!(matches!(
+        answered(answer, &mut answers).await,
+        DaemonMessage::Error {
+            id: Some(12),
+            error: ProtocolError::Refused { .. },
+        }
+    ));
+}
+
+/// Both plugin questions whose answer *is* the thing asked for need an
+/// address to answer under, like a download and a page of history: an answer
+/// with no id on it is a frame no waiter can claim.
+#[tokio::test]
+async fn the_plugin_answers_that_are_the_answer_need_an_id() {
+    let hub = connected_hub();
+    let (commands, _taken) = bridge(CommandOutcome::Accepted);
+    let (outbox, mut answers) = answers();
+
+    for request in [
+        ClientRequest::InstallPlugin(oxidezap_ipc::InstallPlugin {
+            file_name: "autoreply.wasm".into(),
+            upload: oxidezap_ipc::staged_key("plugin-1"),
+        }),
+        ClientRequest::ListInstalledPlugins,
+    ] {
+        let named = format!("{request:?}");
+        let answer = handle_request(bare(request), &hub, &no_plugins(), &commands, &outbox).await;
+        assert!(
+            matches!(
+                answered(answer, &mut answers).await,
+                DaemonMessage::Error {
+                    id: None,
+                    error: ProtocolError::Malformed { .. },
+                }
+            ),
+            "{named} was answered without an address"
+        );
+    }
+}
+
+/// Nothing about a plugin folder goes to the session: it is the daemon's own
+/// directory, and installing into it touches no account. A removal is
+/// acknowledged when the file is gone, which is what lets the window ask for
+/// the folder again straight afterwards and get the answer it just caused.
+#[tokio::test]
+async fn removing_a_plugin_is_answered_without_the_session() {
+    // Deliberately not connected: none of these needs the network, and a
+    // front end that could only manage its plugins while online would be one
+    // that cannot take out the plugin that is breaking the connection.
+    let hub = StateHub::new();
+    let (commands, taken) = bridge(CommandOutcome::Accepted);
+    let (outbox, mut answers) = answers();
+
+    let request = Request {
+        id: Some(13),
+        request: ClientRequest::RemovePlugin {
+            plugin: format!("never-installed-{}", std::process::id()),
+        },
+    };
+    let answer = handle_request(request, &hub, &no_plugins(), &commands, &outbox).await;
+    assert!(
+        matches!(
+            answered(answer, &mut answers).await,
+            DaemonMessage::Accepted { id: Some(13) }
+        ),
+        "removing what is not there is the answer a second press deserves"
+    );
+    drop(commands);
+    assert!(
+        taken.await.unwrap().is_none(),
+        "and nothing was asked of the session"
+    );
+}
+
 /// A refused command names the request it refused. Before ids, the only
 /// way to report a refused send was to invent a failure against the
 /// message the client happened to have drawn.

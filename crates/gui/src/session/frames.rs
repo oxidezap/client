@@ -225,8 +225,16 @@ impl<'a> Frames<'a> {
             DaemonMessage::Accepted { id: Some(id) } => {
                 // For most requests this only releases the entry. For the few
                 // whose whole answer is that they were done, it is the answer.
-                if let Some(Awaiting::Acted(tx)) = take_pending(self.pending, id) {
-                    let _ = tx.send(());
+                match take_pending(self.pending, id) {
+                    Some(Awaiting::Acted(tx)) => {
+                        let _ = tx.send(());
+                    }
+                    // A removal is acknowledged when the file is gone, so
+                    // this is the moment the folder is worth reading again.
+                    Some(Awaiting::Removed(tx)) => {
+                        let _ = tx.send(Ok(()));
+                    }
+                    _ => {}
                 }
             }
             // Accepted with no id: a request sent without one, which nobody
@@ -255,6 +263,28 @@ impl<'a> Frames<'a> {
                 return ControlFlow::Break(());
             }
             DaemonMessage::ShowWindow => self.publish(FromDaemon::ShowWindow)?,
+            // The id the module claimed, which is the daemon's answer and not
+            // this window's guess at the file name it sent.
+            DaemonMessage::PluginInstalled { id, plugin } => match take_pending(self.pending, id) {
+                Some(Awaiting::Installed { tell, .. }) => {
+                    let _ = tell.send(Ok(plugin));
+                }
+                Some(waiting) => {
+                    self.fail(waiting, &Failure::permanent("unexpected install answer"))
+                }
+                None => debug!("an install answer arrived for {id}, which nobody is waiting on"),
+            },
+            DaemonMessage::InstalledPlugins { id, plugins } => {
+                match take_pending(self.pending, id) {
+                    Some(Awaiting::Installable(tx)) => {
+                        let _ = tx.send(plugins);
+                    }
+                    Some(waiting) => {
+                        self.fail(waiting, &Failure::permanent("unexpected plugin listing"))
+                    }
+                    None => debug!("a plugin listing arrived for {id}, which nobody is waiting on"),
+                }
+            }
             DaemonMessage::Storage {
                 id,
                 database_bytes,

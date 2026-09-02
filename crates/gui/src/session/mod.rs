@@ -298,6 +298,30 @@ enum Awaiting {
     /// `ClearMediaCache` before it acknowledges, so the ack is the moment the
     /// files are gone and the moment it is worth measuring again.
     Acted(oneshot::Sender<()>),
+    /// A module on its way into the daemon's plugin folder.
+    ///
+    /// Answered with the id it claimed, which is the daemon's to decide: the
+    /// folder is the registry, so what a file may be a plugin under is
+    /// settled on that side and this window prints what came back rather than
+    /// its own guess at the file name.
+    ///
+    /// It carries what it staged for the reason a send does — nothing will
+    /// ever read those bytes once the request is not going to run, and every
+    /// retry would stage another copy.
+    Installed {
+        tell: oneshot::Sender<Result<String, String>>,
+        staged: String,
+    },
+    /// A module on its way out of it. Answered by an acknowledgement, and the
+    /// refusal carries the sentence somebody reads.
+    Removed(oneshot::Sender<Result<(), String>>),
+    /// What that folder holds, for the Plugins pane.
+    ///
+    /// The sender is dropped on a refusal rather than answered, which is what
+    /// tells the pane to keep what it already had: a folder that could not be
+    /// read is not an empty one, and drawing it as empty takes away the Remove
+    /// button somebody was about to press.
+    Installable(oneshot::Sender<Vec<String>>),
     /// A page of history. The timeline holds a request in flight so it does
     /// not ask twice for the same one, and a refusal is what releases it.
     Page {
@@ -313,6 +337,9 @@ impl Awaiting {
             Self::Download(tx) => tx.is_closed(),
             Self::Storage(tx) => tx.is_closed(),
             Self::Acted(tx) => tx.is_closed(),
+            Self::Installed { tell, .. } => tell.is_closed(),
+            Self::Removed(tx) => tx.is_closed(),
+            Self::Installable(tx) => tx.is_closed(),
             // Nor is a ring that has already been taken down: the window is
             // showing the update as watched and only an answer can correct it.
             Self::StatusView { .. } => false,
@@ -354,6 +381,21 @@ impl Awaiting {
             // sender is what tells it the thing did not happen.
             Self::Acted(tx) => {
                 log::warn!("a request was refused: {detail}");
+                drop(tx);
+            }
+            // Answered rather than dropped: somebody pressed Add and is owed
+            // the daemon's own sentence about why the module is not there.
+            Self::Installed { tell, .. } => {
+                let _ = tell.send(Err(detail.to_string()));
+            }
+            Self::Removed(tx) => {
+                let _ = tx.send(Err(detail.to_string()));
+            }
+            // Dropped, like the storage query above and for the same reason:
+            // the pane keeps the listing it had rather than drawing an empty
+            // folder over a read that failed.
+            Self::Installable(tx) => {
+                log::warn!("the plugin folder could not be listed: {detail}");
                 drop(tx);
             }
             Self::Send {
@@ -398,6 +440,7 @@ impl Awaiting {
     fn staged_key(&self) -> Option<&str> {
         match self {
             Self::Send { staged, .. } => staged.as_deref(),
+            Self::Installed { staged, .. } => Some(staged),
             _ => None,
         }
     }
@@ -882,13 +925,40 @@ impl SessionHandle {
     /// in. See [`Self::send_audio_message`].
     fn reserve(&self, waiting: Awaiting) -> RequestId {
         let id = self.conn.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut pending = self.conn.pending.lock().unwrap_or_else(|e| e.into_inner());
-        // Whoever gave up is no longer listening, and its answer may never
-        // come. Swept here rather than on a timer: this is the only thing
-        // that grows the map, so it is the only place that needs to shrink
-        // it.
-        pending.retain(|_, waiting| !waiting.is_abandoned());
-        pending.insert(id, waiting);
+        let abandoned = {
+            let mut pending = self.conn.pending.lock().unwrap_or_else(|e| e.into_inner());
+            // Whoever gave up is no longer listening, and its answer may never
+            // come. Swept here rather than on a timer: this is the only thing
+            // that grows the map, so it is the only place that needs to shrink
+            // it.
+            //
+            // What one of them staged goes with it, which is the rule every
+            // other giving-up path already keeps: nothing is ever going to
+            // read those bytes, and a staged payload is the one thing under
+            // the cache's roof that no sweep of its own will reclaim. Until an
+            // install could be abandoned there was nothing here to drop — a
+            // drawn message is never abandoned — so this is where a
+            // thirty-two megabyte module would have sat until the account was
+            // wiped.
+            let mut abandoned = Vec::new();
+            pending.retain(|_, waiting| {
+                if !waiting.is_abandoned() {
+                    return true;
+                }
+                if let Some(key) = waiting.staged_key() {
+                    abandoned.push(key.to_owned());
+                }
+                false
+            });
+            pending.insert(id, waiting);
+            abandoned
+        };
+        // Outside the lock: a discard is a file removal on one transport and
+        // an HTTP request on another, and that lock is on the path of every
+        // send.
+        for key in abandoned {
+            self.conn.media.discard(&key);
+        }
         id
     }
 
@@ -1289,6 +1359,122 @@ impl SessionHandle {
     pub fn set_log_level(&self, level: oxidezap_core::LogLevel) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
         self.ask(ClientRequest::SetLogLevel { level }, Awaiting::Acted(tx));
+        rx
+    }
+
+    /// Put a `.wasm` somebody chose into the daemon's plugin folder.
+    ///
+    /// Staged like a file being sent, and through the same machinery: the
+    /// module is up to thirty-two megabytes and a request frame is capped at
+    /// one, so the bytes go through the media cache and the frame names them.
+    /// The frame is written from the upload's own completion — the daemon
+    /// opens the payload when it handles the request, so one that overtook its
+    /// own upload would name a payload that is not there yet.
+    ///
+    /// Answered with the id the daemon gave it, or with the sentence it
+    /// refused with.
+    pub fn install_plugin(
+        &self,
+        file_name: String,
+        bytes: Vec<u8>,
+    ) -> oneshot::Receiver<Result<String, String>> {
+        let (tell, rx) = oneshot::channel();
+        let size = bytes.len() as u64;
+        if size > oxidezap_ipc::MAX_STAGED_BYTES {
+            // Refused here rather than staged and refused there: nothing has
+            // been reserved and nothing claimed, so there is no queue to
+            // release and the answer is the whole of it.
+            let _ = tell.send(Err(format!(
+                "that file is {} and the most that can be staged is {}.",
+                crate::utils::format_size(size),
+                crate::utils::format_size(oxidezap_ipc::MAX_STAGED_BYTES)
+            )));
+            return rx;
+        }
+        // Claimed before the key is composed, because the key is composed
+        // from the ticket: two installs in flight must not stage over each
+        // other.
+        let ticket = self
+            .conn
+            .outbox
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .claim();
+        // And the ticket is not enough on its own. It is per connection and
+        // starts again at zero on every reconnect, while the media cache is
+        // shared by every front end talking to one daemon — so a second
+        // window staging its first install would write over the payload this
+        // one is about to name, and each would install the other's bytes. The
+        // same two facts a local id carries, from the same place: this
+        // process's own id, and the clock.
+        let upload = oxidezap_ipc::staged_key(&sanitize(&format!(
+            "plugin_{}_{}_{ticket}",
+            crate::platform::front_end_id(),
+            wacore::time::now_millis()
+        )));
+        let request = ClientRequest::InstallPlugin(oxidezap_ipc::InstallPlugin {
+            file_name,
+            upload: upload.clone(),
+        });
+        let id = self.reserve(Awaiting::Installed {
+            tell,
+            staged: upload.clone(),
+        });
+        // The callback outlives this borrow, so it takes the connection with
+        // it, exactly as a staged send does.
+        let conn = self.conn.clone();
+        self.conn.media.stage_then(
+            &upload,
+            bytes,
+            Box::new(move |staged| match staged {
+                Ok(()) => deliver(&conn, id, request, Delivery::Staged(ticket)),
+                Err(e) => {
+                    // The queue behind this is waiting on a frame that is
+                    // never going to be written, and releasing it can fail in
+                    // turn — which leaves reservations nobody will answer, so
+                    // those are answered here exactly as `deliver` does.
+                    if let Err(Unwritten { lost, reason }) = release(&conn, ticket, None) {
+                        error!("could not reach the daemon: {reason}");
+                        for lost in lost {
+                            fail_reserved(
+                                &conn,
+                                lost,
+                                format!("could not reach the daemon: {reason}"),
+                            );
+                        }
+                    }
+                    fail_reserved(&conn, id, format!("that plugin could not be staged: {e}"));
+                }
+            }),
+        );
+        rx
+    }
+
+    /// Take one back out of that folder.
+    ///
+    /// Answered when the file is gone rather than when the request was read,
+    /// which is what lets the caller ask for the folder again straight
+    /// afterwards and get the answer it just caused.
+    pub fn remove_plugin(&self, plugin: String) -> oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::RemovePlugin { plugin },
+            Awaiting::Removed(tx),
+        );
+        rx
+    }
+
+    /// Every plugin id in that folder, loaded or not.
+    ///
+    /// Not the set of surfaces in the snapshot: a module that fails to parse
+    /// or traps in `oxi_init` publishes no surface at all, and it is exactly
+    /// the file somebody needs listed so they can take it out again.
+    pub fn installed_plugins(&self) -> oneshot::Receiver<Vec<String>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(
+            ClientRequest::ListInstalledPlugins,
+            Awaiting::Installable(tx),
+        );
         rx
     }
 

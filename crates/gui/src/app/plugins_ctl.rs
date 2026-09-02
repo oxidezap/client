@@ -378,19 +378,22 @@ impl WhatsAppApp {
         }
     }
 
-    /// Every plugin id in this front end's own folder, or `None` where the
-    /// folder has not been read yet — and where there is none to read.
+    /// Every plugin id in the daemon's folder, or `None` where nothing has
+    /// answered yet.
     ///
     /// The two are worth telling apart by whoever draws them: "the folder
     /// does not hold this plugin" is a fact about the folder, and an answer
-    /// nobody has asked for yet is not that fact. The read is a task, so the
-    /// first frame after Settings opens has none of it.
+    /// nobody has asked for yet is not that fact. The read is a request, so
+    /// the first frame after Settings opens has none of it — and so does
+    /// every frame after one that was refused, which is the same state and
+    /// deserves the same drawing.
     #[must_use]
     pub fn installed_plugins<'a>(&self, cx: &'a App) -> Option<&'a [String]> {
         self.plugins.read(cx).installed()
     }
 
-    /// Read the folder, so Settings can offer to remove what is in it.
+    /// Ask the daemon what is in its plugin folder, so Settings can offer to
+    /// remove it.
     ///
     /// The list of *surfaces* is not that list. A module that fails to parse,
     /// answers the wrong ABI version or traps in `oxi_init` publishes nothing
@@ -403,46 +406,91 @@ impl WhatsAppApp {
     /// starts on "reading…" every time is worse than one that is already
     /// right.
     pub fn refresh_installed_plugins(&mut self, cx: &mut Context<Self>) {
-        if !crate::platform::plugins::home().can_install() {
+        let Some(asked) = self
+            .client
+            .as_ref()
+            .map(|client| client.installed_plugins())
+        else {
             return;
-        }
+        };
         let plugins = self.plugins.clone();
         cx.spawn(async move |_: gpui::WeakEntity<Self>, cx| {
-            let found = crate::platform::plugins::installed().await;
-            match found {
-                Ok(ids) => {
-                    plugins.update(cx, |plugins, cx| plugins.set_installed(ids, cx));
-                }
-                // Left as it was rather than emptied: a read that failed is
-                // not a folder that is empty, and drawing it as one would
-                // take away the Remove button somebody was about to press.
-                Err(e) => log::warn!("cannot read this page's plugin folder: {e}"),
-            }
+            // A dropped sender is a refusal, which is what the daemon answers
+            // when the folder could not be *read* — left as it was rather
+            // than emptied, because a failed read is not an empty folder and
+            // drawing it as one would take away the Remove button somebody
+            // was about to press.
+            let Ok(ids) = asked.await else {
+                return;
+            };
+            plugins.update(cx, |plugins, cx| plugins.set_installed(ids, cx));
         })
         .detach();
     }
 
-    /// Put a `.wasm` somebody chose into this front end's own plugin folder.
+    /// Put a `.wasm` somebody chose into the daemon's plugin folder.
     ///
-    /// Only a page holding its own session has one; every other front end
-    /// talks to a daemon whose folder is somebody else's, which is why the
-    /// control that calls this is drawn only where
-    /// [`crate::platform::PluginHome::can_install`] says so.
+    /// Every front end may do this, which is the point: the folder belongs to
+    /// whatever runs the plugins, so a window asks for it rather than writing
+    /// one — including the page whose daemon happens to be in its own address
+    /// space, which used to reach in and write the folder itself and was the
+    /// only front end that could install anything at all.
     ///
     /// It also starts it, by asking the daemon to read the folder again. That
     /// is one act from where somebody is standing — they chose a file in
-    /// order to run it — and two here, because the folder is this front end's
-    /// and the host is the daemon's. What the reload costs is every *other*
-    /// plugin restarting with it: the set is retired and loaded whole, since
-    /// an id is what an approval and a settings document are keyed on and two
-    /// generations holding one would be two plugins sharing an identity.
+    /// order to run it — and two here, because installing and loading are two
+    /// different moments: what the reload costs is every *other* plugin
+    /// restarting with it, since the set is retired and loaded whole and an
+    /// id is what an approval and a settings document are keyed on.
     pub fn install_plugin(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
-            let outcome = crate::platform::plugins::install().await;
-            let _ = entity.update(cx, |app, cx| match outcome {
+            // Chosen first, because the choosing is the window's and the
+            // installing is the daemon's. A `WeakEntity` cannot hand out the
+            // client across an await, so the request is made in the update
+            // that follows and its answer awaited in a task of its own.
+            let outcome = cx.update(|cx| crate::platform::plugins::choose(cx)).await;
+            let module = match outcome {
                 // Nobody chose anything. Not a failure, and not worth a line.
-                Ok(None) => {}
-                Ok(Some(id)) => {
+                Ok(None) => return,
+                Ok(Some(module)) => module,
+                Err(e) => {
+                    let _ = entity.update(cx, |app, cx| {
+                        log::warn!("cannot install a plugin: {e}");
+                        app.notify_user(
+                            format!("That plugin could not be installed: {e}"),
+                            super::notices::Tone::Problem,
+                            cx,
+                        );
+                    });
+                    return;
+                }
+            };
+            let asked = entity.update(cx, |app, cx| {
+                let Some(client) = app.client.as_ref() else {
+                    // Between connections, and the button is drawn anyway
+                    // because the folder is not this window's to know about.
+                    // Said rather than dropped: somebody chose a file and
+                    // waited for it to be read, and nothing on screen would
+                    // otherwise change.
+                    app.notify_user(
+                        "There is no daemon to install into right now.".to_string(),
+                        super::notices::Tone::Problem,
+                        cx,
+                    );
+                    return None;
+                };
+                Some(client.install_plugin(module.file_name, module.bytes))
+            });
+            let Ok(Some(asked)) = asked else {
+                return;
+            };
+            // A dropped sender is a connection that ended under the request,
+            // which the window is already about to be told about.
+            let Ok(answer) = asked.await else {
+                return;
+            };
+            let _ = entity.update(cx, |app, cx| match answer {
+                Ok(id) => {
                     app.refresh_installed_plugins(cx);
                     app.reload_plugins(cx);
                     app.notify_user(
@@ -464,7 +512,7 @@ impl WhatsAppApp {
         .detach();
     }
 
-    /// Take one out of this front end's own plugin folder.
+    /// Take one out of the daemon's plugin folder.
     ///
     /// And stops it, by the same reload installing uses: taking a file out of
     /// the folder and leaving its plugin running is the state somebody
@@ -474,8 +522,25 @@ impl WhatsAppApp {
     /// deliberate — an id reinstalled later is the same id, and the answer
     /// was given against the id and its mask rather than against the bytes.
     pub fn remove_plugin(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(asked) = self
+            .client
+            .as_ref()
+            .map(|client| client.remove_plugin(id.clone()))
+        else {
+            // As the install: the folder is the daemon's, so with no
+            // connection there is nothing to ask, and a press that changed
+            // nothing has to say so.
+            self.notify_user(
+                format!("{id} cannot be removed while this window is not attached."),
+                super::notices::Tone::Problem,
+                cx,
+            );
+            return;
+        };
         cx.spawn(async move |entity: gpui::WeakEntity<Self>, cx| {
-            let outcome = crate::platform::plugins::uninstall(&id).await;
+            let Ok(outcome) = asked.await else {
+                return;
+            };
             let _ = entity.update(cx, |app, cx| match outcome {
                 Ok(()) => {
                     app.refresh_installed_plugins(cx);

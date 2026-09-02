@@ -5,6 +5,23 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 25: `ClientRequest::InstallPlugin`, `RemovePlugin` and
+/// `ListInstalledPlugins`, answered by `DaemonMessage::PluginInstalled` and
+/// `DaemonMessage::InstalledPlugins`. A plugin belongs to the daemon that
+/// runs it, so adding one is now a request like approving one is — the module
+/// travels through the media cache under a staged key, exactly as a file
+/// being sent does, because a `.wasm` is up to thirty-two megabytes and a
+/// request frame is capped at a megabyte. What this replaces is a front end
+/// on one target reaching into the daemon crate and writing the folder
+/// itself, which was a second control channel and which is also why the
+/// desktop had no way to install anything at all. A v24 daemon does not know
+/// any of the three and refuses them as malformed — and the daemon is the
+/// half that deliberately outlives an upgrade, so without a version an
+/// upgraded window would offer "Add a plugin…" against a daemon that has been
+/// running since before the request existed, and every install would be
+/// refused after the module had been staged. Exactly the case v15, v21, v23 and
+/// v24 were bumped for.
+///
 /// 24: `ProtocolError::Failed`, which says the daemon tried and something
 /// outside the request went wrong, and carries whether asking again could
 /// work. A download answered a full disk, a dropped connection and a session
@@ -170,7 +187,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

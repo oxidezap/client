@@ -14,7 +14,8 @@
 //! I/O that has to leave the runtime's threads. A page reads OPFS, keeps its
 //! approvals in `localStorage`, and has no blocking pool to move anything to
 //! — nor could it, since a browser agent is one thread. So the two live in
-//! `native` and `web` as the same four functions plus `Bridge::ask`, and
+//! `native` and `web` as the same seven functions plus `Bridge::ask` — start,
+//! reload, detach, approve, and the three a front end asks for by name — and
 //! everything in this file is written once. What is *not* different is
 //! anything below that line: the same host, the same sandbox, the same
 //! bounds, the same protocol carrying the surfaces to whatever is drawing
@@ -26,12 +27,8 @@ use oxidezap_plugin_host::{Commands, Outcome, Plugins, Reloaded, Sink};
 
 #[cfg(not(target_family = "wasm"))]
 mod native;
-/// Public where its sibling is private, and that is the one asymmetry: a
-/// desktop's plugin folder is the operating system's to fill, and a page's is
-/// this module's, so installing, listing and removing are calls a wasm front
-/// end makes.
 #[cfg(target_family = "wasm")]
-pub mod web;
+mod web;
 
 // Named once so nothing below has to ask which one it is. Two `mod` items
 // rather than the `#[cfg_attr(path)]` idiom used elsewhere in the tree,
@@ -103,6 +100,78 @@ pub fn reload_in_background(plugins: &Arc<Plugins>) {
             Reloaded::Failed => log::warn!("plugins were not reloaded"),
         }
     });
+}
+
+/// Put a module in this daemon's plugin folder, and answer the id it claimed.
+///
+/// The folder belongs to whatever runs the plugins, which is this process on
+/// either platform — a directory beside `oxidezapd`, or the page's own origin
+/// storage. So a front end asks for this rather than writing the folder: it
+/// may share no filesystem with the daemon, and on the one target where it
+/// did share an address space it reached past the protocol to do it.
+///
+/// Installing grants nothing and starts nothing. What a plugin may do is
+/// recorded separately and read live, and what is *running* changes only at
+/// [`reload`] — which retires the whole generation before it loads the next,
+/// because an id is what an approval and a settings document are keyed on.
+///
+/// # Errors
+///
+/// The name is not one a plugin can have, there is nowhere to keep it, the
+/// folder is full, or the write failed.
+pub async fn install(file_name: &str, bytes: Vec<u8>) -> Result<String, String> {
+    let id = plugin_id(file_name)
+        .ok_or_else(|| format!("`{file_name}` is not a name a plugin can have"))?;
+    platform::install(id, bytes).await
+}
+
+/// Take one back out of it.
+///
+/// Removing what is not there is not a failure: a second press deserves the
+/// answer the first one produced rather than an error about a file it took
+/// away.
+///
+/// # Errors
+///
+/// There is nowhere to look, or the store refused the removal.
+pub async fn uninstall(id: &str) -> Result<(), String> {
+    platform::uninstall(id).await
+}
+
+/// Every plugin id in that folder, loaded or not.
+///
+/// The order and the uniqueness are decided here rather than in each half: an
+/// id is what a settings row is keyed on, and one folder can hold
+/// `autoreply.wasm` beside `autoreply.WASM` — one plugin as far as the loader
+/// is concerned, two rows if this answered what the directory listed.
+///
+/// # Errors
+///
+/// The folder could not be read. Distinct from an empty one, which is the
+/// ordinary account: a failed read must not be drawn as "nothing installed",
+/// because that is the frame in which every Remove button disappears.
+pub async fn names() -> Result<Vec<String>, String> {
+    let mut ids = platform::names().await?;
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// The id a file carries: `autoreply.wasm` is `autoreply`.
+///
+/// Written once for both folders, because the two must not disagree: the file
+/// name *is* the registry key, so a name one half would keep and the other
+/// would skip is a module that installs and never loads. The host's own rule
+/// decides what an id may contain — asked here so an install is refused at
+/// the moment somebody can still choose another file.
+fn plugin_id(file_name: &str) -> Option<String> {
+    let stem = file_name.strip_suffix(".wasm").or_else(|| {
+        // A file picker hands back whatever the operating system called it,
+        // and an uppercase extension is a file like any other.
+        let (stem, ext) = file_name.rsplit_once('.')?;
+        ext.eq_ignore_ascii_case("wasm").then_some(stem)
+    })?;
+    oxidezap_plugin_host::plugin_id_is_usable(stem).then(|| stem.to_owned())
 }
 
 /// Record what somebody answered about a plugin's permissions.

@@ -332,12 +332,156 @@ pub(super) async fn handle_request(
             crate::plugins::reload_in_background(plugins);
             acted(Ok(()))
         }
+        // The module travels through the media cache, exactly as a file being
+        // sent does and for the same reason: a `.wasm` is megabytes and a
+        // request frame is capped at one. So the frame names a staged payload
+        // and this is where it is opened.
+        //
+        // Not dispatched to the session either — a plugin folder is the
+        // daemon's own, and installing one touches no account. And not awaited
+        // here: this is the connection's own loop, and the work is a
+        // thirty-two megabyte read, a directory listing, a write and two
+        // flushes — seconds of a slow disk in which *this* window would be
+        // served no state, no session events and no call video, which is eight
+        // frames deep and overflows almost at once. The same reason
+        // `ReloadPlugins` is detached, and the answer comes back the way a
+        // download's does: on the connection's outbox, under this id.
+        ClientRequest::InstallPlugin(request) => {
+            // Answered with the id it claimed, so the id is the answer and
+            // this needs an address like a download does.
+            let id = match addressed(id, "an install needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            let answer_to = outbox.clone();
+            oxidezap_session::spawn(async move {
+                let frame = match install(&request).await {
+                    Ok(plugin) => always(
+                        Some(id),
+                        serde_json::to_string(&DaemonMessage::PluginInstalled { id, plugin })
+                            .map_err(anyhow::Error::from),
+                    ),
+                    Err(error) => always(Some(id), error_frame(Some(id), error)),
+                };
+                answer_later(&answer_to, frame);
+            });
+            Answer::frame(None)
+        }
+        // Acknowledged when the file is gone, not when the request was read:
+        // the front end asks for the folder again straight afterwards, and an
+        // acknowledgement that ran ahead of the removal would answer that with
+        // the plugin still in it. Off this loop for the reason the install is,
+        // which is why the acknowledgement can mean that at all.
+        //
+        // What is *running* does not change here. The next reload retires the
+        // generation whole, which is the rule an id being the key of an
+        // approval and a settings document imposes.
+        ClientRequest::RemovePlugin { plugin } => {
+            let answer_to = outbox.clone();
+            oxidezap_session::spawn(async move {
+                let removed = crate::plugins::uninstall(&plugin)
+                    .await
+                    .map_err(|detail| ProtocolError::Refused { detail });
+                answer_later(&answer_to, answer(id, removed));
+            });
+            Answer::frame(None)
+        }
+        ClientRequest::ListInstalledPlugins => {
+            let id = match addressed(id, "a plugin listing needs an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            let answer_to = outbox.clone();
+            oxidezap_session::spawn(async move {
+                let frame = match crate::plugins::names().await {
+                    Ok(plugins) => always(
+                        Some(id),
+                        serde_json::to_string(&DaemonMessage::InstalledPlugins { id, plugins })
+                            .map_err(anyhow::Error::from),
+                    ),
+                    // A folder that could not be read is not an empty folder,
+                    // and the client draws the difference: an empty list takes
+                    // away every Remove button, so this has to arrive as the
+                    // refusal it is.
+                    Err(detail) => always(
+                        Some(id),
+                        error_frame(Some(id), ProtocolError::Refused { detail }),
+                    ),
+                };
+                answer_later(&answer_to, frame);
+            });
+            Answer::frame(None)
+        }
         // The acknowledgement goes out first; see the caller.
         ClientRequest::Shutdown => Answer {
             frame: answer(id, Ok(())),
             shutdown: true,
         },
     }
+}
+
+/// Put an answer that was worked out later on the connection's outbox.
+///
+/// A `try_send` first, and only a task when the outbox is full: this is
+/// exactly what the session's own out-of-band answers do, and for the same
+/// reason — the caller is not the connection, so it must not park on a client
+/// that is not reading.
+fn answer_later(answer_to: &Outbox, frame: Option<String>) {
+    use tokio::sync::mpsc::error::TrySendError;
+
+    let Some(frame) = frame else {
+        return;
+    };
+    if let Err(TrySendError::Full(frame)) = answer_to.try_send(frame) {
+        let answer_to = answer_to.clone();
+        oxidezap_session::spawn(async move {
+            let _ = answer_to.send(frame).await;
+        });
+    }
+}
+
+/// Open the payload a client staged and put it in the plugin folder.
+///
+/// The staged key and nothing else. A key is a name a client chose, and the
+/// cache holds this account's downloaded photos under keys derived from
+/// content it has already published: without this, a frame could name one of
+/// those and have the daemon move it into the folder it loads code from. `u-`
+/// is the one key space a front end writes, which is the same rule the web
+/// bridge's own write endpoint keeps.
+///
+/// Taken rather than read, and taken before anything can refuse the install:
+/// this is the only copy of the payload, nothing else is ever going to read
+/// it, and a refusal that left it staged would keep a module in the cache
+/// until the account was wiped.
+async fn install(request: &oxidezap_ipc::InstallPlugin) -> Result<String, ProtocolError> {
+    if !oxidezap_ipc::is_staged_key(&request.upload) {
+        return Err(ProtocolError::Refused {
+            detail: format!("{} does not name a staged payload", request.upload),
+        });
+    }
+    let key = request.upload.clone();
+    // Off the runtime, for the reason the storage query is: on a desktop this
+    // reads a file of up to thirty-two megabytes off a disk, and a page has
+    // no pool to leave for and does not need one.
+    let staged = oxidezap_session::unblock(move || crate::media::take(&key)).await;
+    let bytes = match staged {
+        Ok(Some(bytes)) => bytes,
+        // Nothing under that key: a client whose upload failed, or one naming
+        // a payload the cache has already swept.
+        Ok(None) => {
+            return Err(ProtocolError::Refused {
+                detail: format!("nothing is staged under {}", request.upload),
+            });
+        }
+        Err(_) => {
+            return Err(ProtocolError::Refused {
+                detail: "the staged module could not be read".to_string(),
+            });
+        }
+    };
+    crate::plugins::install(&request.file_name, bytes)
+        .await
+        .map_err(|detail| ProtocolError::Refused { detail })
 }
 
 /// Hand a command to the session and wait for what became of it.

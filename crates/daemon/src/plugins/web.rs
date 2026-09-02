@@ -41,7 +41,7 @@ use web_sys::{
 
 use oxidezap_plugin_host::{Backing, MAX_PLUGINS, Module, Origin, Outcome, Plugins, Reloaded};
 
-use super::{Bridge, publishing_to};
+use super::{Bridge, plugin_id, publishing_to};
 use crate::session_bridge::{Action, Commands as SessionCommands, SessionCommand};
 use crate::state::StateHub;
 
@@ -171,7 +171,7 @@ const DIR: &str = "plugins";
 /// need it — there the bytes are opened one at a time and dropped after
 /// instantiation — but nothing here can open a file lazily, since every read
 /// in a browser is a promise and the host's loader is not async.
-pub const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
 /// The name one installation is serialized under.
 ///
@@ -196,7 +196,7 @@ const INSTALL_LOCK: &str = "oxidezap-plugins-install";
 /// Failure is an empty list and a line in the log: a page whose storage
 /// refuses it still has an account to open, and a plugin folder is not worth
 /// the session.
-pub async fn installed() -> Vec<Module> {
+async fn installed() -> Vec<Module> {
     // A page that cannot read its own storage starts with no plugins, which
     // is the right answer at *start*: there is nothing running to lose, and a
     // daemon that would not come up because a folder was unreadable is a
@@ -218,7 +218,7 @@ pub async fn installed() -> Vec<Module> {
 /// The origin's filesystem could not be opened, or the folder could not be
 /// listed. A folder that is simply *not there* is `Ok` and empty: nobody has
 /// installed anything, which is the ordinary page.
-pub async fn discover() -> Result<Vec<Module>, String> {
+async fn discover() -> Result<Vec<Module>, String> {
     let dir = match folder(false).await {
         Ok(Some(dir)) => dir,
         // No folder is the ordinary case: nobody has installed anything.
@@ -289,12 +289,8 @@ pub async fn discover() -> Result<Vec<Module>, String> {
     Ok(modules)
 }
 
-/// Put `bytes` in the folder under `file_name`, and answer the id it claimed.
-///
-/// The name is the id, which is the desktop's rule and is why it is checked
-/// here rather than at load: a file this page cannot name a plugin after is
-/// one nothing will ever run, and telling somebody that at the moment they
-/// chose it is the only useful moment.
+/// Put `bytes` in the folder under the id `super::install` read off the file
+/// name, and answer that id.
 ///
 /// The *folder's* budget is checked here too, and against what the folder
 /// would become rather than against this module alone. `installed` stops
@@ -315,9 +311,7 @@ pub async fn discover() -> Result<Vec<Module>, String> {
 ///
 /// The name is not one a plugin may have, the folder has no room for it, or
 /// the browser refused the write — a quota, or a mode with no storage.
-pub async fn install(file_name: &str, bytes: Vec<u8>) -> Result<String, String> {
-    let id = plugin_id(file_name)
-        .ok_or_else(|| format!("`{file_name}` is not a name a plugin can have"))?;
+pub(super) async fn install(id: String, bytes: Vec<u8>) -> Result<String, String> {
     let name = format!("{id}.wasm");
     // Both halves, and neither swallowed: the outer answers whether the lock
     // ran the work at all, the inner what the work made of it.
@@ -464,7 +458,7 @@ async fn occupied(
 ///
 /// The browser refused, which for a removal is either no storage or a handle
 /// something else is holding open.
-pub async fn uninstall(id: &str) -> Result<(), String> {
+pub(super) async fn uninstall(id: &str) -> Result<(), String> {
     let Some(dir) = folder(false).await.map_err(described)? else {
         return Ok(());
     };
@@ -494,7 +488,7 @@ pub async fn uninstall(id: &str) -> Result<(), String> {
 /// # Errors
 ///
 /// The folder could not be read.
-pub async fn names() -> Result<Vec<String>, String> {
+pub(super) async fn names() -> Result<Vec<String>, String> {
     let Some(dir) = folder(false).await.map_err(described)? else {
         return Ok(Vec::new());
     };
@@ -506,20 +500,6 @@ pub async fn names() -> Result<Vec<String>, String> {
         .collect();
     ids.sort();
     Ok(ids)
-}
-
-/// The id a file carries: `autoreply.wasm` is `autoreply`.
-///
-/// The same rule the host holds a desktop file to, asked here so a page
-/// cannot install something it would then silently skip.
-fn plugin_id(file_name: &str) -> Option<String> {
-    let stem = file_name.strip_suffix(".wasm").or_else(|| {
-        // A browser's file picker hands back whatever the operating system
-        // called it, and an uppercase extension is a file like any other.
-        let (stem, ext) = file_name.rsplit_once('.')?;
-        ext.eq_ignore_ascii_case("wasm").then_some(stem)
-    })?;
-    oxidezap_plugin_host::plugin_id_is_usable(stem).then(|| stem.to_owned())
 }
 
 /// The plugin folder inside this origin's filesystem, creating it only when
