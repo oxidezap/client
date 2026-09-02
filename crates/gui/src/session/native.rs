@@ -19,7 +19,7 @@ use oxidezap_ipc::{Endpoint, Link};
 use super::attach;
 use super::frames::Frames;
 use super::media::Directory;
-use super::sink::{EventSink, Events};
+use super::sink::{Events, ReaderSink};
 use super::{Pending, Session, Teardown};
 
 /// How long to give the reader to notice it has been hung up on.
@@ -104,7 +104,7 @@ fn connect_over(endpoint: Endpoint) -> std::io::Result<(Session, Events)> {
 /// spinning on an answer nothing will produce, and no reconnect scheduled.
 fn read_frames(
     stream: oxidezap_ipc::Reader,
-    events: &EventSink,
+    events: &ReaderSink,
     pending: &Pending,
     pictures: &crate::video::LatestFrames,
 ) {

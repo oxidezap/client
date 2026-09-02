@@ -21,12 +21,12 @@ use oxidezap_ipc::{
 };
 
 use super::media::MediaCache;
-use super::sink::EventSink;
+use super::sink::ReaderSink;
 use super::{Awaiting, Failure, Fault, FromDaemon, Pending, StorageUsage};
 
 /// The reader's state, between frames.
 pub(super) struct Frames<'a> {
-    events: &'a EventSink,
+    events: &'a ReaderSink,
     pending: &'a Pending,
     media: &'a dyn MediaCache,
     /// How far the state this side holds has been carried.
@@ -55,13 +55,13 @@ pub(super) struct Frames<'a> {
 
 impl<'a> Frames<'a> {
     pub(super) fn new(
-        events: &'a EventSink,
+        events: &'a ReaderSink,
         pending: &'a Pending,
         media: &'a dyn MediaCache,
         pictures: &crate::video::LatestFrames,
     ) -> Self {
         let decoded: crate::video::FrameSink = {
-            let events = events.clone();
+            let events = events.ui();
             let pictures = pictures.clone();
             std::sync::Arc::new(move |frame| {
                 // Into the slot, replacing whatever that direction was
@@ -71,7 +71,7 @@ impl<'a> Frames<'a> {
                 // already has one in it, and the slot holds the newest
                 // picture either way.
                 pictures.put(frame);
-                events.try_send(FromDaemon::CallFrames);
+                let _ = events.try_send(FromDaemon::CallFrames);
             })
         };
         Self {

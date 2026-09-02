@@ -92,8 +92,8 @@ use portable_atomic::AtomicU64;
 use tokio::sync::oneshot;
 
 use self::media::MediaCache;
-use self::sink::EventSink;
 pub use self::sink::Events;
+use self::sink::{ReaderSink, UiSink};
 
 /// What this account occupies on disk, as the daemon measured it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -331,7 +331,11 @@ impl Awaiting {
     /// is [`Session`] on the paths that run before a request leaves and the
     /// reader on the paths that run after. Both call [`Self::staged_key`]
     /// first.
-    fn failed(self, failure: &Failure, events: Option<&EventSink>) {
+    /// Takes the *reader's* end of the queue, and so is only reachable from
+    /// the reader: publishing here waits for room, which is right on a thread
+    /// of its own and a deadlock on the executor that drains the queue. The
+    /// paths that run there pass `None` and answer through [`fail_reserved`].
+    fn failed(self, failure: &Failure, events: Option<&ReaderSink>) {
         let detail = failure.detail.as_str();
         match self {
             // The only caller that reads more than the sentence: whether
@@ -636,7 +640,7 @@ struct Conn {
     /// could not be staged in the media cache — and the front end has already
     /// drawn the message. Without a way to say so from here those failures had
     /// nowhere to go, and the bubble sat pending for good with no retry.
-    events: EventSink,
+    events: UiSink,
 }
 
 /// A connection to `oxidezapd`, and the one value that ends it.
@@ -782,7 +786,7 @@ impl Session {
     }
 
     /// The parts every transport supplies, assembled.
-    fn new(link: Link, events: EventSink, media: Arc<dyn MediaCache>) -> Self {
+    fn new(link: Link, events: UiSink, media: Arc<dyn MediaCache>) -> Self {
         Self {
             handle: SessionHandle {
                 conn: Conn {
@@ -1531,7 +1535,8 @@ fn fail_reserved(conn: &Conn, id: RequestId, detail: String) {
             chat_jid, local_id, ..
         } => {
             error!("send failed before it left: {detail}");
-            conn.events
+            let _ = conn
+                .events
                 .try_send(FromDaemon::Session(Box::new(UiEvent::SendFailed {
                     chat_jid,
                     message_id: local_id,
@@ -1542,7 +1547,8 @@ fn fail_reserved(conn: &Conn, id: RequestId, detail: String) {
         // this executor drains.
         Awaiting::StatusView { message_ids } => {
             error!("a status view never left this process: {detail}");
-            conn.events
+            let _ = conn
+                .events
                 .try_send(FromDaemon::StatusViewLost(message_ids));
         }
         // And the same rule again, for the same reason it is a rule: a view
@@ -1551,7 +1557,7 @@ fn fail_reserved(conn: &Conn, id: RequestId, detail: String) {
         // the paging state, and a list left `Loading` never asks again.
         Awaiting::Page { jid } => {
             error!("a page request never left this process: {detail}");
-            conn.events.try_send(FromDaemon::PageLost { jid });
+            let _ = conn.events.try_send(FromDaemon::PageLost { jid });
         }
         // Nothing left this process, so nothing about the request itself
         // failed: the connection did, and the app reconnects.
