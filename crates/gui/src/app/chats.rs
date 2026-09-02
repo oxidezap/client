@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::Context;
+use gpui::{App, Context};
 use oxidezap_core::Chat;
 
 use super::chat_row::ChatRow;
@@ -130,7 +130,7 @@ impl WhatsAppApp {
     ///
     /// Never prunes: absence is a claim only a complete load may make, and
     /// only the caller knows whether this was one.
-    pub(super) fn merge_chats(&mut self, chats: Vec<Chat>) {
+    pub(super) fn merge_chats(&mut self, chats: Vec<Chat>, cx: &mut App) {
         // An index, not a scan per incoming chat. A page is a hundred chats
         // and an account is thousands, so the search alone was hundreds of
         // thousands of string comparisons per load, and a history sync
@@ -172,7 +172,7 @@ impl WhatsAppApp {
                             client.mark_chat_read(&jid, Some(newest));
                         }
                     }
-                    self.invalidate_message_cache(&jid);
+                    self.invalidate_message_cache(&jid, cx);
                 }
                 None => {
                     // Into the index too, or the same JID twice in one batch
@@ -204,7 +204,7 @@ impl WhatsAppApp {
         watched: &std::collections::HashSet<String>,
         cx: &mut Context<Self>,
     ) {
-        self.merge_chats(chats);
+        self.merge_chats(chats, cx);
         // A selection that no longer names a chat is a selection of nothing:
         // the conversation pane resolves it every frame and would draw the
         // empty state with no way back on a phone.

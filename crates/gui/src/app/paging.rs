@@ -204,7 +204,7 @@ impl WhatsAppApp {
         // The rows moved, and the timeline's own measurements are keyed to
         // them: see `sync_timeline`, which is what turns this into a splice at
         // the front rather than a reset to the bottom.
-        self.invalidate_message_cache(&jid);
+        self.invalidate_message_cache(&jid, cx);
         self.invalidate_chat_cache();
         cx.notify();
     }

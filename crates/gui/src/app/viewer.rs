@@ -5,7 +5,153 @@
 //! window, and it walks the conversation's other pictures, because that is
 //! what someone who opened one is usually doing.
 
+use gpui::{Context, FocusHandle};
 use oxidezap_core::{ChatMessage, MediaType};
+
+/// The picture on screen full size, and the keyboard it takes while it is.
+///
+/// An entity because a viewer is a *mode*: while one is up it owns the arrow
+/// keys, the conversation behind it is not being read, and every path that
+/// changes a chat has to ask whether what it is showing still exists. Those
+/// are decisions about one thing, and the context its methods take is what
+/// keeps them from being made about everything else at the same time.
+///
+/// It holds no messages. Every method that has to look at one is handed the
+/// conversation's messages by the window, which is also what stops the
+/// alternative: cloning a whole message vector to hand to a viewer that owns
+/// three strings.
+pub(super) struct Viewer {
+    /// The picture being looked at full screen, when one is.
+    showing: Option<MediaViewer>,
+    /// Focus target, which owns the arrow keys only while the viewer is up.
+    ///
+    /// Made once and kept: a handle rebuilt per opening is a handle the
+    /// frame's focus is no longer on, and a transient surface that takes the
+    /// keyboard has to be able to give it back.
+    focus: FocusHandle,
+}
+
+impl Viewer {
+    pub(super) fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            showing: None,
+            focus: cx.focus_handle(),
+        }
+    }
+
+    pub(super) fn focus(&self) -> &FocusHandle {
+        &self.focus
+    }
+
+    pub(super) fn showing(&self) -> Option<&MediaViewer> {
+        self.showing.as_ref()
+    }
+
+    /// Which conversation's pictures are being walked, if any.
+    pub(super) fn jid(&self) -> Option<&str> {
+        self.showing.as_ref().map(|viewer| viewer.jid.as_str())
+    }
+
+    /// The id of the picture on screen, which may not be evicted from the
+    /// decoded cache while it is.
+    pub(super) fn current_id(&self) -> Option<&str> {
+        self.showing.as_ref().and_then(MediaViewer::current_id)
+    }
+
+    pub(super) fn open(&mut self, viewer: MediaViewer, cx: &mut Context<Self>) {
+        self.showing = Some(viewer);
+        cx.notify();
+    }
+
+    pub(super) fn close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.showing.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Walk to the next picture in the conversation.
+    ///
+    /// Re-resolved first: a download finishing adds a picture either side,
+    /// and stepping over a stale list would skip it.
+    pub(super) fn step(
+        &mut self,
+        forward: bool,
+        messages: Option<&[ChatMessage]>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reconcile(messages, cx)
+            && let Some(viewer) = &mut self.showing
+        {
+            viewer.step(forward);
+            cx.notify();
+        }
+    }
+
+    /// Point the viewer at what its chat holds now, closing it when there is
+    /// nothing left to look at. Says whether one is still open.
+    ///
+    /// The viewer names the picture it is showing and resolves it on every
+    /// frame, so a revoke behind it left a modal that drew nothing and still
+    /// swallowed the Escape meant to close it — a window that had stopped
+    /// responding, as far as anyone looking at it could tell.
+    ///
+    /// `None` for the messages is the conversation itself being gone, and so
+    /// is everything it held.
+    pub(super) fn reconcile(
+        &mut self,
+        messages: Option<&[ChatMessage]>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let survives = Self::resolve(&mut self.showing, messages);
+        cx.notify();
+        survives
+    }
+
+    /// The half of [`Self::reconcile`] with no window in it: point the
+    /// viewer at what its chat holds now, and close it when there is nothing
+    /// left to look at.
+    /// Takes the slot rather than `self`, which is what lets a test drive it:
+    /// a [`Viewer`] owns a focus handle, and a focus handle needs a window.
+    fn resolve(showing: &mut Option<MediaViewer>, messages: Option<&[ChatMessage]>) -> bool {
+        let Some(viewer) = showing else {
+            return false;
+        };
+        if viewer.refresh(messages.unwrap_or_default()) {
+            return true;
+        }
+        *showing = None;
+        false
+    }
+
+    /// Close a viewer that is not about `jid`.
+    ///
+    /// One left open over a chat that is no longer on screen draws nothing,
+    /// keeps the keyboard, and swallows the Escape meant to close it.
+    pub(super) fn close_unless_about(&mut self, jid: &str, cx: &mut Context<Self>) {
+        if self
+            .showing
+            .as_ref()
+            .is_some_and(|viewer| viewer.jid != jid)
+        {
+            self.showing = None;
+            cx.notify();
+        }
+    }
+
+    /// Close a viewer whose conversation has gone.
+    pub(super) fn close_if_about_any(&mut self, jids: &[String], cx: &mut Context<Self>) {
+        if self
+            .showing
+            .as_ref()
+            .is_some_and(|viewer| jids.contains(&viewer.jid))
+        {
+            self.showing = None;
+            cx.notify();
+        }
+    }
+}
 
 /// What the viewer is showing.
 pub struct MediaViewer {
@@ -155,6 +301,32 @@ mod tests {
             message("clip", Some(video())),
             message("photo-2", Some(image(false, true))),
         ]
+    }
+
+    /// The conversation itself is gone — a complete load said so, or the
+    /// account was replaced — and so is everything it held. A viewer left
+    /// open over it draws nothing, keeps the keyboard, and swallows the
+    /// Escape meant to close it.
+    #[test]
+    fn a_viewer_whose_conversation_has_gone_closes() {
+        let mut showing = MediaViewer::open("chat".into(), "photo-1", &history());
+        assert!(showing.is_some());
+
+        assert!(!Viewer::resolve(&mut showing, None));
+        assert!(showing.is_none());
+    }
+
+    /// And where the chat is still there but has nothing left to look at,
+    /// the viewer goes: a modal showing no picture is one nobody can read.
+    #[test]
+    fn a_conversation_with_no_pictures_left_closes_it() {
+        let mut showing = MediaViewer::open("chat".into(), "photo-1", &history());
+
+        assert!(!Viewer::resolve(
+            &mut showing,
+            Some(&[message("text", None)])
+        ));
+        assert!(showing.is_none());
     }
 
     #[test]

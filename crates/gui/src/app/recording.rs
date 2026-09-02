@@ -328,7 +328,7 @@ impl WhatsAppApp {
             }
             QuotedMessage::from(draft)
         });
-        self.send_voice_note(&jid, ogg_data, waveform, duration_secs, quoted);
+        self.send_voice_note(cx, &jid, ogg_data, waveform, duration_secs, quoted);
         self.recording_state = RecordingState::Idle;
         self.update_input_recording(cx);
         info!("PTT audio sent successfully");
@@ -342,6 +342,7 @@ impl WhatsAppApp {
     /// and its waveform — and re-encoding is not something a retry can do.
     pub(super) fn send_voice_note(
         &mut self,
+        cx: &mut App,
         jid: &str,
         ogg_data: Vec<u8>,
         waveform: Vec<u8>,
@@ -388,7 +389,7 @@ impl WhatsAppApp {
         // because the selection is deliberately *kept* while the reader is in
         // Status or, on a phone, walking the chat list: coming back to a
         // conversation should land where they left it.
-        if self.add_message_to_chat(jid, msg) && self.visible_chat.as_deref() == Some(jid) {
+        if self.add_message_to_chat(jid, msg, cx) && self.visible_chat.as_deref() == Some(jid) {
             self.scroll_to_last_message();
         }
     }
