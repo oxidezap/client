@@ -230,14 +230,18 @@ pub(crate) async fn receive(
 /// content the account has published, so a file planted under one while the
 /// directory was open is served back as the account's own media.
 ///
-/// Preparing is also what reclaims the uploads nobody came back for, which
-/// used to be a second call from [`receive`]'s tail: the budget sweep runs on
-/// a threshold of *cache* writes and a staged payload advances none of them,
-/// so an orphan's age rule is only ever reached from here and from startup.
-/// One walk of the directory does both, and the walk is the expensive half.
+/// Preparing is *only* the privacy check, and no longer walks anything. It
+/// used to, and a staging request paid for it: the budget sweep runs on a
+/// threshold of *cache* writes and a staged payload advances none of them, so
+/// the orphan age rule was reached from here — a `read_dir` plus a `stat` per
+/// cached file, once per staged upload, on the thread holding the session.
+/// It now runs on a schedule of its own, which also covers the front end that
+/// stages by writing the file itself and never reaches this endpoint at all.
+/// See `media::reclaim_abandoned_writes_periodically`.
 ///
-/// Off the reactor for that reason — this is the thread holding the WhatsApp
-/// session, and `prepare_dir` is `std::fs` throughout.
+/// Still off the reactor, because `prepare_dir` is `std::fs` throughout and
+/// this is the thread holding the WhatsApp session — the check is two
+/// syscalls now rather than a walk, but blocking is blocking.
 async fn stage_to_disk(path: &std::path::Path, key: &str, body: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         let dir = dir.to_path_buf();

@@ -20,16 +20,19 @@ mod platform;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod http;
 
-/// The orphan sweep. Reached through [`prepare_cache_dir`] rather than
-/// called directly — preparing the directory is what every writer and the
-/// startup do, and one walk answers both questions. Native only: a page has
-/// no directory to walk.
+/// The orphan sweep, as the daemon runs it: once at startup and on a schedule
+/// after. Native only — a page has no directory to walk — and a task rather
+/// than a call, because it is a `stat` per cached file and none of the places
+/// an orphan is made can afford one. It used to be reached through
+/// [`prepare_cache_dir`], back when preparing walked the directory; that is
+/// what made every staged upload pay for a walk.
 #[cfg(not(target_family = "wasm"))]
-pub use platform::reclaim_abandoned_writes;
+pub use platform::reclaim_abandoned_writes_periodically;
 
 /// Make the cache directory this account's alone, before anything writes into
 /// it. Called at startup and by every writer; native only, for the reason the
-/// sweep above is.
+/// sweep above is. Two syscalls — the walk that used to follow it is the
+/// scheduled task now.
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use platform::prepare_dir as prepare_cache_dir;
 pub use platform::{cache_usage, claim, has, take};

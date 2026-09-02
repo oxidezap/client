@@ -4,7 +4,7 @@
 //! The process around [`oxidezap_daemon`], which is where everything it
 //! actually does lives — see that crate's own note for why the two are apart.
 
-use oxidezap_daemon::{listener, plugins, server, session_bridge, shutdown, state, tray};
+use oxidezap_daemon::{listener, media, plugins, server, session_bridge, shutdown, state, tray};
 
 use std::sync::Arc;
 
@@ -47,6 +47,18 @@ async fn run() -> Result<()> {
     // have already broken it. Taking the claim here, rather than inside the
     // server, is what keeps that from being a race between two tasks.
     let claim = server::claim()?;
+
+    // The media the daemon is left holding for nobody: a `w-` from a download
+    // that was in flight when a process died, a `u-` staged for a send that
+    // never happened. Both are spared the budget sweep — the bytes are the
+    // only copy, or are not all there yet — so unless an age rule runs
+    // somewhere they are never collected at all, and it used to run on the
+    // write path, which made it a directory walk per cached byte range. It is
+    // a task instead, started here because the schedule is the process's to
+    // keep — the media module says what it does. After the claim, so a second
+    // daemon that is about to fail on the lock does not first walk the
+    // directory of the one holding the account.
+    tokio::spawn(media::reclaim_abandoned_writes_periodically());
 
     let hub = StateHub::new();
 

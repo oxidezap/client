@@ -1228,6 +1228,19 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   `media::epoch` instead: the eager cache of an inbound message loses to a
   clear, and a download somebody asked for does not, because there the file is
   how the bytes are delivered rather than where they are remembered.
+- **Reclaiming abandoned media is a schedule, not a side effect of a write.**
+  A `w-` (a download in flight), a `u-` (a payload staged for a send) and a
+  `.staging-` partial are all spared the budget sweep, because the bytes are
+  the only copy or are not all there yet, so each needs an age rule run
+  somewhere or being spared means never being collected. That rule used to run
+  from `prepare_dir`, under a comment saying it ran once — but `put` is
+  `prepare_dir`'s only caller, so it walked the whole directory on every cached
+  byte range, with the wipe lock held, which is precisely what
+  `SWEEP_INTERVAL_BYTES` exists to prevent. The daemon runs it as a task now:
+  once at startup, then every `RECLAIM_INTERVAL`, on a thread of its own. A
+  hook at any of the places an orphan is *made* would not do — the desktop
+  front end stages a payload by writing the file itself, so the daemon never
+  sees it happen.
 - **Nothing may still be writing this account's media when it is deleted.**
   The publish thread externalizes media behind an unbounded queue, so an
   event accepted before `ForgetSession` can still be in it. `stop_publishing`
