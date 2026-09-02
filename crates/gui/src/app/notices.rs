@@ -28,6 +28,8 @@ use std::time::Duration;
 
 use gpui::{App, Context, Entity, IntoElement, Render, Task, WeakEntity, Window};
 
+use crate::session::Failure;
+
 /// How long a notice stays up.
 ///
 /// Long enough to read a sentence twice, since the reader was not expecting
@@ -230,6 +232,27 @@ impl super::WhatsAppApp {
     }
 }
 
+/// One sentence about a failure, ending in what to do about it.
+///
+/// A notice cannot offer an action — it is one line that expires on its own —
+/// so the only thing it can hand a reader is whether trying again is worth
+/// doing at all. That is exactly the bit a front end used to lose: the daemon
+/// answered a full disk, a dropped connection and a session that went away
+/// with one refusal and one sentence, so every download failure read
+/// identically and a second tap was as good a guess as any. See
+/// [`Failure`] and `docs/roadmap.md`.
+///
+/// A free function rather than a method, because the two callers that cannot
+/// raise a notice — a video player draws its own error in the frame, and a
+/// bubble is not the root — still have to say the same sentence.
+pub fn what_went_wrong(what: &str, failure: &Failure) -> String {
+    if failure.retryable {
+        format!("{what}: {failure}. Try again.")
+    } else {
+        format!("{what}: {failure}. Trying again will not help.")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +282,79 @@ mod tests {
         assert_eq!(
             notices.shown.iter().map(|n| n.id).collect::<Vec<_>>(),
             vec![3, 4, 5]
+        );
+    }
+
+    /// The whole point of the bit: two failures that used to read the same
+    /// now end in different advice. Built from the frames the daemon
+    /// actually sends, so the sentence asserted here is the sentence a person
+    /// reads.
+    #[test]
+    fn a_failure_says_whether_asking_again_is_worth_it() {
+        use oxidezap_ipc::ProtocolError;
+
+        let network = Failure::from(&ProtocolError::Failed {
+            detail: "connection reset by peer".to_string(),
+            retryable: true,
+        });
+        let disk = Failure::from(&ProtocolError::Failed {
+            detail: "the download could not be cached: no space left on device".to_string(),
+            retryable: false,
+        });
+
+        assert_eq!(
+            what_went_wrong("Could not download that image", &network),
+            "Could not download that image: connection reset by peer. Try again."
+        );
+        assert_eq!(
+            what_went_wrong("Could not download that image", &disk),
+            "Could not download that image: the download could not be cached: no space left on \
+             device. Trying again will not help."
+        );
+    }
+
+    /// Where the bit comes from. A refusal is about the request and a
+    /// download that could not be cached is not, so they cannot both be
+    /// `Refused` on the wire — which is what they were.
+    #[test]
+    fn what_the_daemon_said_decides_it() {
+        use oxidezap_ipc::ProtocolError;
+
+        assert!(
+            Failure::from(&ProtocolError::Failed {
+                detail: "connection reset".to_string(),
+                retryable: true,
+            })
+            .retryable
+        );
+        assert!(
+            !Failure::from(&ProtocolError::Failed {
+                detail: "no space left on device".to_string(),
+                retryable: false,
+            })
+            .retryable
+        );
+        assert!(
+            Failure::from(&ProtocolError::NoSession {
+                detail: "the session stopped before the download finished".to_string(),
+            })
+            .retryable,
+            "the account comes back, and the next tap is what works"
+        );
+        assert!(
+            Failure::from(&ProtocolError::Failed {
+                detail: "64 operations are already in flight; retry shortly".to_string(),
+                retryable: true,
+            })
+            .retryable,
+            "a busy daemon asks to be asked again, and the notice has to agree"
+        );
+        assert!(
+            !Failure::from(&ProtocolError::Refused {
+                detail: "that media carries no content hash".to_string(),
+            })
+            .retryable,
+            "the same request is refused the same way"
         );
     }
 

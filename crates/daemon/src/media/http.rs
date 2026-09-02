@@ -201,10 +201,8 @@ pub(crate) async fn receive(
         .await;
     }
 
-    if let Some(dir) = path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(dir).await
-    {
-        log::error!("could not make room for {key}: {e}");
+    if let Err(e) = stage_to_disk(&path, &key, &body).await {
+        log::error!("could not stage {key}: {e}");
         return respond(
             stream.get_mut(),
             500,
@@ -214,6 +212,38 @@ pub(crate) async fn receive(
         )
         .await;
     }
+    log::debug!("staged {} bytes under {key}", body.len());
+    respond(stream.get_mut(), 204, "text/plain", origin, b"").await
+}
+
+/// Put `body` under `path`, directory and all.
+///
+/// Split out of [`receive`] because it is the whole of what staging does to
+/// the filesystem, and both halves of it are worth asserting without a
+/// socket in front of them.
+///
+/// The directory is prepared rather than merely created. `create_dir_all`
+/// leaves it at the umask's mode, and this used to be the only path that made
+/// it on an account which stages uploads and never caches a download — the
+/// repair lives in `put`, so nothing tightened it and nothing swept it. What
+/// that costs is in `platform::prepare_dir`: every name here is derived from
+/// content the account has published, so a file planted under one while the
+/// directory was open is served back as the account's own media.
+///
+/// Preparing is also what reclaims the uploads nobody came back for, which
+/// used to be a second call from [`receive`]'s tail: the budget sweep runs on
+/// a threshold of *cache* writes and a staged payload advances none of them,
+/// so an orphan's age rule is only ever reached from here and from startup.
+/// One walk of the directory does both, and the walk is the expensive half.
+///
+/// Off the reactor for that reason — this is the thread holding the WhatsApp
+/// session, and `prepare_dir` is `std::fs` throughout.
+async fn stage_to_disk(path: &std::path::Path, key: &str, body: &[u8]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || super::platform::prepare_dir(&dir)).await??;
+    }
+
     // Written beside the target and renamed onto it. Reading the whole body
     // first stops a short *client* from leaving a partial file; it does not
     // stop a crash or a full disk part way through the write, and what that
@@ -230,31 +260,49 @@ pub(crate) async fn receive(
         STAGING_SEQUENCE.fetch_add(1, portable_atomic::Ordering::Relaxed)
     ));
     let staged = async {
-        tokio::fs::write(&partial, &body).await?;
-        tokio::fs::rename(&partial, &path).await
+        write_new(&partial, body).await?;
+        tokio::fs::rename(&partial, path).await
     }
     .await;
     if let Err(e) = staged {
-        log::error!("could not stage {key}: {e}");
         let _ = tokio::fs::remove_file(&partial).await;
-        return respond(
-            stream.get_mut(),
-            500,
-            "text/plain",
-            origin,
-            b"could not stage that payload",
-        )
-        .await;
+        return Err(e.into());
     }
-    log::debug!("staged {} bytes under {key}", body.len());
-    // Every staging is also an occasion to notice the ones nobody came back
-    // for. The cache sweep runs on a threshold of *cache* writes, which a
-    // staged upload does not advance, so without this the age rule that
-    // reclaims an orphan is only reachable through unrelated traffic.
-    if let Some(dir) = oxidezap_ipc::media_dir() {
-        super::reclaim_abandoned_writes(&dir);
-    }
-    respond(stream.get_mut(), 204, "text/plain", origin, b"").await
+    Ok(())
+}
+
+/// Write `body` to a name nothing is already using, refusing what is there.
+///
+/// `tokio::fs::write` opens whatever the path resolves to and truncates it,
+/// so through a symlink it fills somebody else's file as the user holding the
+/// session. The name is nothing like a secret: the key is the caller's own and
+/// the sequence in front of it starts at zero every run, so a directory that
+/// was open long enough for one link to be planted is the whole of what this
+/// takes.
+///
+/// The honest way to meet the name is the leftover of a run that died between
+/// the write and the rename — one daemon per user holds the startup lock, so
+/// there is no live writer it could belong to. The entry is unlinked once —
+/// the link, never its target — and the create tried again.
+/// `media::native::write_new` is the same discipline for a download in
+/// flight, where the argument for it was made first.
+async fn write_new(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    let create = async || {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await
+    };
+    let mut file = match create().await {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            tokio::fs::remove_file(path).await?;
+            create().await?
+        }
+        other => other?,
+    };
+    file.write_all(body).await?;
+    file.flush().await
 }
 
 /// Drop a staged payload whose send is not going to happen.
@@ -358,6 +406,89 @@ mod tests {
             Some(413)
         );
         assert_eq!(staging_refusal("u-abc", Some(MAX_UPLOAD_BYTES)), None);
+    }
+
+    /// What the mode assertions below need and Windows has not got: there is
+    /// no mode to read there, and `private_dir::prepare` answers for a
+    /// directory that is already inside the user's own profile. See
+    /// docs/roadmap.md on the half of this that is still open there.
+    #[cfg(unix)]
+    mod modes {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn scratch(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "oxidezap-media-http-{}-{:?}-{name}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        }
+
+        /// The gap this module's staging used to leave open. An account that
+        /// stages a voice note and never caches a download never reaches
+        /// `put`, which is where the repair lives — so the directory kept
+        /// whatever mode the umask gave it, under names another local account
+        /// can predict, with nothing ever sweeping what they left there.
+        #[tokio::test]
+        async fn staging_makes_the_cache_ours_without_a_put() {
+            let dir = scratch("stage");
+            std::fs::create_dir_all(&dir).unwrap();
+            // As `create_dir_all` under a shared-group umask leaves it.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+            let path = dir.join("u-audio_4242_1764000000000_0");
+            super::super::stage_to_disk(&path, "u-audio_4242_1764000000000_0", b"a voice note")
+                .await
+                .expect("the payload is staged");
+
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "the cache was left reachable by other accounts on this machine"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"a voice note");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// And a directory that was open is one whose contents are suspect:
+        /// the staging partial's name is the sequence and the key, both of
+        /// which a caller can work out, so a link planted under one turned
+        /// this write into the daemon truncating somebody else's file as the
+        /// user holding the session.
+        #[tokio::test]
+        async fn a_staging_write_does_not_follow_a_planted_link() {
+            let dir = scratch("link");
+            std::fs::create_dir_all(&dir).unwrap();
+            let victim = dir.join("victim");
+            std::fs::write(&victim, b"somebody else's file").unwrap();
+            let partial = dir.join(".staging-0-u-audio_4242_1764000000000_0");
+            std::os::unix::fs::symlink(&victim, &partial).unwrap();
+
+            super::super::write_new(&partial, b"a voice note")
+                .await
+                .expect("a leftover name is not a failure");
+
+            assert_eq!(
+                std::fs::read(&victim).unwrap(),
+                b"somebody else's file",
+                "the payload was written through the link"
+            );
+            assert_eq!(
+                std::fs::read(&partial).unwrap(),
+                b"a voice note",
+                "and the write went somewhere"
+            );
+            assert!(
+                !std::fs::symlink_metadata(&partial)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the link was kept and written through"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// A discard is narrowed the same way a write is: the daemon's own cache

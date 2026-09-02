@@ -620,6 +620,22 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   per direction, the newest overwriting the last, and the channel carries only
   a nudge; a dropped nudge costs nothing, because the slot still holds the
   newest picture and the next frame nudges again.
+- **A picture's position is where it is shown, not where it was decoded.**
+  An attachment has two orders — `stts` says when a sample is decoded and
+  `ctts` the offset to when it is displayed — and they differ exactly when a
+  stream carries B-frames, because a picture referencing a later one has to
+  be decoded after it and shown before it. So every index above
+  `video::demux` is a **rank** in presentation order: a seek target, a
+  position on the scrubber, `StreamingFrame::index`, and the stamp a unit is
+  fed to WebCodecs under. Only the two feed loops count in decode indices,
+  and `Track::decode_index_of` is the one place the orders meet. Stamping a
+  unit with where it was *fed* is the bug this replaced: a browser answers in
+  presentation order and hands the label back with the picture, so the
+  answers arrive out of sequence and the timeline reads a picture as a
+  position it does not hold. Invisible until it is not — decode order *is*
+  presentation order on every baseline stream, which is every video WhatsApp
+  itself sends, and only an attachment from somewhere else has the shape that
+  breaks it.
 - **A peer's orientation describes their device, not their picture.** The
   camera encodes in the sensor's orientation whatever the phone is doing, so a
   frame arrives already turned by however it is held and `device_orientation`
@@ -1026,7 +1042,23 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   destroyed and a panic there is a panic in a destructor.
 - **Decoded images are cached by message id**, because GPUI tracks animation
   state per `Arc<Image>` and rebuilding one re-decodes the bytes. Whoever
-  replaces a preview with real bytes must evict the entry.
+  replaces a preview with real bytes must evict the entry — and so must
+  whoever *takes* the bytes away, which is the sweep below.
+- **A conversation lets go of media it can fetch again, and only that.** A
+  message holds its own bytes for as long as the row is loaded, so the two
+  media budgets that exist bound what is *cached* rather than what the window
+  is retaining. `Chat::release_media` is the arithmetic and it lives in
+  `oxidezap-core` because the ordering and the budget are about the data; the
+  *judgement* is `WhatsAppApp::sweep_retained_media`, because a viewport is a
+  front end's and core has none. Three things make it safe rather than
+  destructive. Only bytes with a `downloadable` beside them go, so a voice
+  note recorded here or a poster frame that is the row's only picture is
+  never "evicted" into deletion. What the interface is holding open —
+  playing, in the viewer, mid-download — is pinned whatever the budget says.
+  And a released row is left in the state a row whose media never arrived is
+  already in, which is why it costs no protocol change and no new field: the
+  renderer already draws that as an offer to download, and the press that
+  accepts it is the same press it always was.
 - **The daemon's state version is what makes a mid-stream join safe.** The
   server subscribes and then snapshots, so the window between the two is
   delivered twice rather than lost, and the client drops the overlap by

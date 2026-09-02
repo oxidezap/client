@@ -39,12 +39,15 @@ pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
 pub use calls::{ActiveCall, Admission, CallState, Ending, Stage, WaitingCall};
 pub use chat::STATUS_BROADCAST_JID;
 pub use chat::{
-    Chat, ChatMessage, DownloadableMedia, MediaContent, MediaType, OutgoingMedia, Resend,
+    Chat, ChatMessage, DownloadableMedia, MediaContent, MediaType, OutgoingMedia, ReleasedMedia,
+    Resend,
 };
 pub use chat::{fallback_chat_name, fallback_sender_name};
 pub use events::{ReceiptType, UiEvent};
 pub use log_level::{LogLevel, UnknownLogLevel};
-pub use media_budget::{DECODED_IMAGE_BUDGET_BYTES, WEB_MEDIA_BUDGET_BYTES};
+pub use media_budget::{
+    DECODED_IMAGE_BUDGET_BYTES, RETAINED_MEDIA_BUDGET_BYTES, WEB_MEDIA_BUDGET_BYTES,
+};
 pub use message_status::MessageStatus;
 pub use plugin::{PluginAction, PluginNode, PluginRoot, PluginSlot, PluginSurface, PluginWidget};
 pub use presence::{

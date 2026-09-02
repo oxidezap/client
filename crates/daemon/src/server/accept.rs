@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use oxidezap_ipc::{ProtocolError, endpoint_path, lock_path, state_dir};
+use oxidezap_ipc::{ProtocolError, endpoint_path, lock_path, media_dir, state_dir};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{ClientSlots, MAX_CLIENTS, error_frame, serve_client, write_line};
@@ -50,6 +50,13 @@ pub fn claim() -> Result<Claim> {
     let dir = state_dir().context("no per-user directory for the daemon's own state")?;
     prepare_state_dir(&dir)?;
     let lock = acquire_startup_lock(&lock_path().context("no per-user directory for the lock")?)?;
+    // After the lock and not before it, unlike the directory above — that one
+    // is where the lock file lives, so it has to exist first. This one is a
+    // *live* daemon's cache until the lock says otherwise: preparing it sweeps
+    // the writes nobody came back for, and a second process losing the race
+    // would otherwise unlink a download the first one is part way through and
+    // fail the rename it is about to do.
+    prepare_media_dir();
     Ok(Claim { path, _lock: lock })
 }
 
@@ -235,4 +242,27 @@ pub(super) fn prepare_state_dir(dir: &Path) -> Result<()> {
         crate::private_dir::drop_foreign_entries(dir)?;
     }
     Ok(())
+}
+
+/// And the cache one level down, on the one path that always runs.
+///
+/// The media directory used to be made by whoever got there first, and only
+/// the daemon's own `put` asked whether it was ours: a front end's `stage` and
+/// the web bridge's upload both created it with `create_dir_all`, so an
+/// account that stages a voice note and never caches a download kept the
+/// umask's mode under a directory of predictable names. Making it here means
+/// it exists, private, before any of the three can be the one to create it.
+///
+/// A warning rather than a refusal, unlike the socket's directory above: this
+/// is the layer that means nobody else *gets* to create the cache, and every
+/// writer still prepares it before it writes — so a daemon that cannot make
+/// this one has media that fails and a session that works, which is the better
+/// of the two outcomes to hand somebody whose disk is full.
+fn prepare_media_dir() {
+    let Some(dir) = media_dir() else {
+        return;
+    };
+    if let Err(e) = crate::media::prepare_cache_dir(&dir) {
+        log::warn!("the media cache is not usable: {e}");
+    }
 }

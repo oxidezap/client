@@ -124,18 +124,31 @@ impl StreamingVideoDecoder {
         self.seek_to_frame(self.track.index_at(time));
     }
 
-    /// Seek to a specific frame index
-    pub fn seek_to_frame(&mut self, target_index: usize) {
-        if target_index >= self.track.samples.len() {
+    /// Decode what the picture at `target_rank` needs, and keep that picture.
+    ///
+    /// `target_rank` is a position in presentation order — what the player
+    /// and the scrubber count in — while the samples are walked in decode
+    /// order. The two agree on a baseline stream and part company on one with
+    /// B-frames, so the target is translated once here and the walk below is
+    /// the only thing that counts in decode indices.
+    pub fn seek_to_frame(&mut self, target_rank: usize) {
+        if target_rank >= self.track.samples.len() {
             return;
         }
 
         // If we're already at this frame, no need to decode
         if let Some(ref frame) = self.current_frame
-            && frame.index == target_index
+            && frame.index == target_rank
         {
             return;
         }
+
+        // Where the walk has to reach, which is a running maximum over the
+        // ranks up to this one rather than the sample this picture is coded
+        // as: openh264 reorders too, and asking for a sample behind the
+        // cursor would rebuild the decoder and replay the group of pictures
+        // about every third frame of ordinary forward playback.
+        let target_index = self.track.decode_through(target_rank);
 
         // Determine where to start decoding from
         let start_index = if target_index as i32 > self.last_decoded_index {
@@ -149,12 +162,12 @@ impl StreamingVideoDecoder {
             // thirty frames a second re-decoded about 2700 frames, on the
             // thread that draws the window.
             self.reset_decoder();
-            self.track.keyframe_at_or_before(target_index)
+            self.track.keyframe_for(target_rank)
         };
 
         // Decode frames from start_index to target_index
         for idx in start_index..=target_index {
-            self.decode_frame(idx, idx == target_index);
+            self.decode_frame(idx, (idx == target_index).then_some(target_rank));
         }
     }
 
@@ -172,8 +185,13 @@ impl StreamingVideoDecoder {
         }
     }
 
-    /// Decode a single frame
-    fn decode_frame(&mut self, index: usize, keep_output: bool) {
+    /// Decode the sample at `index`, which is a decode index.
+    ///
+    /// `keep` is the presentation rank to publish the picture under when this
+    /// is the sample the seek was after, and `None` for the ones decoded only
+    /// to reach it. A rank rather than a flag because the picture is labelled
+    /// with where it is *shown*, and that is not where it was decoded.
+    fn decode_frame(&mut self, index: usize, keep: Option<usize>) {
         let Some(sample) = self.track.samples.get(index) else {
             return;
         };
@@ -184,10 +202,10 @@ impl StreamingVideoDecoder {
         // Log first frame decode attempt
         if index == 0 {
             log::debug!(
-                "Decoding first frame: keyframe={}, size={} bytes, keep_output={}",
+                "Decoding first frame: keyframe={}, size={} bytes, kept as={:?}",
                 is_keyframe,
                 sample_size,
-                keep_output
+                keep
             );
         }
 
@@ -233,7 +251,7 @@ impl StreamingVideoDecoder {
                 }
 
                 // Only materialize a frame if the caller wants to keep it
-                if keep_output {
+                if let Some(rank) = keep {
                     let (frame_width, frame_height) = yuv.dimensions();
                     let Some(byte_len) = frame_byte_len(frame_width, frame_height) else {
                         log::warn!("refusing a {frame_width}x{frame_height} video frame");
@@ -278,8 +296,11 @@ impl StreamingVideoDecoder {
 
                     self.current_frame = Some(StreamingFrame {
                         image: render_image,
-                        timestamp: self.track.timestamp_of(index),
-                        index,
+                        // Where the picture is shown, not where it was
+                        // decoded: on a stream with B-frames those are
+                        // different positions and the scrubber reads this one.
+                        timestamp: self.track.timestamp_of(rank),
+                        index: rank,
                     });
 
                     if index == 0 {

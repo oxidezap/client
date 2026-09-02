@@ -387,6 +387,13 @@ pub(super) async fn dispatch(
         Ok(CommandOutcome::Accepted) => Ok(()),
         Ok(CommandOutcome::NoSession(detail)) => Err(no_session(detail)),
         Ok(CommandOutcome::Refused(detail)) => Err(ProtocolError::Refused { detail }),
+        // Not a refusal on the wire either: `Refused` promises that its
+        // detail names what the client would have to change, and there is
+        // nothing to change — the answer is the same request, shortly.
+        Ok(CommandOutcome::Busy(detail)) => Err(ProtocolError::Failed {
+            detail,
+            retryable: true,
+        }),
         // The bridge took the command and died before answering.
         Err(_) => Err(no_session("the session stopped before it answered")),
     }

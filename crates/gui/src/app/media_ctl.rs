@@ -6,6 +6,127 @@
 use super::*;
 
 impl WhatsAppApp {
+    /// Let go of the media the conversations are holding beyond their share.
+    ///
+    /// A message keeps its bytes for as long as its row is loaded, and the
+    /// two media budgets that exist bound what is *cached* rather than what
+    /// this window is retaining — so a window open for a week grows by every
+    /// photo it has ever drawn, and a tab does it against a linear memory
+    /// with a ceiling. `Chat::release_media` is the arithmetic; what is here
+    /// is the judgement, because a viewport is a front end's and belongs
+    /// nowhere near `oxidezap-core`.
+    ///
+    /// The judgement is two answers. **Which conversation the reader is in** —
+    /// one at a time, and every other one is holding bytes nobody can see, so
+    /// its allowance is nothing. That is [`Self::retained_chat`] rather than
+    /// [`Self::visible_chat`]: the frame reports no conversation whenever
+    /// Settings is up, the destination is Status, the viewer is open or the
+    /// window is too narrow to draw a chat area, and none of those means the
+    /// reader has left the conversation — sweeping on them emptied the very
+    /// album somebody had just opened.
+    ///
+    /// And **what the interface is holding open**: what is playing, what the
+    /// viewer is showing, the status update on screen, and whatever a
+    /// download is on its way to keep their bytes whatever the budget says,
+    /// because releasing those is not eviction — it is taking something away
+    /// from somebody looking at it. The fullscreen viewer is stronger still:
+    /// it walks a chat's pictures with the arrow keys, and a released row
+    /// leaves that album, so nothing is swept while it is up.
+    ///
+    /// Inside the retained conversation the newest rows keep their bytes and
+    /// the rest let go, which is coarser than a viewport: gpui's list hands
+    /// no visible range out of its render pass, so what is on screen is not
+    /// something this window can ask. A row released out from under a reader
+    /// who has scrolled up into an album draws the offer to download that the
+    /// renderer already draws for media the daemon never cached, and the
+    /// press that accepts it fetches — which is the whole reason the policy
+    /// is allowed to be coarse.
+    pub(super) fn sweep_retained_media(&mut self) {
+        self.sweep_retained_media_keeping(None);
+    }
+
+    /// The same, with one more row nothing may take.
+    ///
+    /// For the download that has just landed: the bytes arrive into a row the
+    /// reader asked for by pressing on it, and the request that named it may
+    /// already have been cleared by the time they do.
+    pub(super) fn sweep_retained_media_keeping(&mut self, also: Option<&str>) {
+        // A viewer open is a reader walking one chat's pictures; see above.
+        if self.media_viewer.is_some() {
+            return;
+        }
+
+        let budget = oxidezap_core::RETAINED_MEDIA_BUDGET_BYTES as usize;
+        let retained = self.retained_chat.clone();
+        // The rows nothing may take: cloned rather than borrowed because the
+        // predicate below runs while `chats` is borrowed mutably.
+        let open: Vec<String> = [
+            self.active_media.message_id().map(str::to_string),
+            self.pending_media_request.clone(),
+            self.status_pane.shown().map(str::to_string),
+            also.map(str::to_string),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        let mut released_rows: Vec<String> = Vec::new();
+        let mut touched: Vec<String> = Vec::new();
+        for chat in &mut self.chats {
+            let allowance = if retained.as_deref() == Some(chat.jid.as_str()) {
+                budget
+            } else {
+                0
+            };
+
+            // Whether there is anything to do, read before anything is
+            // written: writing means `Arc::make_mut`, and a chat shared with
+            // a frame in flight is a whole conversation copied. The
+            // conversation being read is *designed* to sit under its
+            // allowance, so asking only whether it holds releasable bytes
+            // would buy that copy on every message it receives.
+            let mut held = 0usize;
+            let over = chat.messages.iter().rev().any(|message| {
+                let Some(media) = message.media.as_ref() else {
+                    return false;
+                };
+                held = held.saturating_add(media.data.len());
+                media.is_releasable() && held > allowance && !open.contains(&message.id)
+            });
+            if !over {
+                continue;
+            }
+
+            let released = std::sync::Arc::make_mut(chat)
+                .release_media(allowance, |message| open.contains(&message.id));
+            if released.is_empty() {
+                continue;
+            }
+            debug!(
+                "released {} bytes of media across {} rows of {}",
+                released.bytes,
+                released.rows.len(),
+                chat.jid
+            );
+            touched.push(chat.jid.clone());
+            released_rows.extend(released.rows);
+        }
+
+        // Whoever takes a row's bytes away has to take what was decoded from
+        // them too: the picture cache is keyed by message id and holds the
+        // `Arc<Image>` gpui tracks animation against, so an entry left behind
+        // is the very thing this was trying to stop holding.
+        if !released_rows.is_empty() {
+            let mut decoded = self.decoded_images.borrow_mut();
+            for id in &released_rows {
+                decoded.shift_remove(id);
+            }
+        }
+        for jid in touched {
+            self.invalidate_message_cache(&jid);
+        }
+    }
+
     /// Update a message's media data (used to cache downloaded media)
     fn update_message_media_data(&mut self, message_id: &str, data: Arc<Vec<u8>>) {
         // Find the message in any chat and update its media data
@@ -32,6 +153,14 @@ impl WhatsAppApp {
         // bytes in it, so a downloaded update stayed "cannot be shown".
         if let Some(jid) = touched {
             self.invalidate_message_cache(&jid);
+            // This is the other path that adds bytes, and the one that adds
+            // them deliberately: a reader working back through an album,
+            // pressing download on picture after picture, passes the
+            // allowance with no message arriving to notice. The row that
+            // just landed is what the press was for, so it is what the sweep
+            // may not take — the request that named it is often already
+            // cleared by the time the bytes arrive.
+            self.sweep_retained_media_keeping(Some(message_id));
         }
     }
     /// Stop any currently playing media. Does NOT call cx.notify().
@@ -380,7 +509,11 @@ impl WhatsAppApp {
                     // Said, not only logged: the control goes back to idle
                     // either way, so without this a tap that fetched nothing
                     // is indistinguishable from one that was never noticed.
-                    say(&entity, cx, format!("Could not download that audio: {e}"));
+                    say(
+                        &entity,
+                        cx,
+                        what_went_wrong("Could not download that audio", &e),
+                    );
                     let _ = entity.update(cx, |app, cx| {
                         app.finish_download(&msg_id);
                         cx.notify();
@@ -433,7 +566,7 @@ impl WhatsAppApp {
                     }
                     Err(e) => {
                         error!("Failed to download image: {}", e);
-                        failed = Some(format!("Could not download that image: {e}"));
+                        failed = Some(what_went_wrong("Could not download that image", &e));
                     }
                 }
                 cx.notify();
@@ -500,7 +633,11 @@ impl WhatsAppApp {
                 },
                 Err(e) => {
                     error!("Failed to download document {}: {}", message_id, e);
-                    say(&entity, cx, format!("Could not download that file: {e}"));
+                    say(
+                        &entity,
+                        cx,
+                        what_went_wrong("Could not download that file", &e),
+                    );
                 }
             }
             let _ = entity.update(cx, |app, cx| {
@@ -959,7 +1096,7 @@ impl WhatsAppApp {
                     error!("Failed to download video: {}", e);
                     let _ = entity.update(cx, |app, cx| {
                         if let Some(player) = app.video_players.get_mut(&msg_id) {
-                            player.set_error(e);
+                            player.set_error(what_went_wrong("Could not download that video", &e));
                         }
                         cx.notify();
                     });
