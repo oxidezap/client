@@ -5,7 +5,7 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
-/// 24: `ClientRequest::InstallPlugin`, `RemovePlugin` and
+/// 25: `ClientRequest::InstallPlugin`, `RemovePlugin` and
 /// `ListInstalledPlugins`, answered by `DaemonMessage::PluginInstalled` and
 /// `DaemonMessage::InstalledPlugins`. A plugin belongs to the daemon that
 /// runs it, so adding one is now a request like approving one is — the module
@@ -14,13 +14,27 @@ use std::path::PathBuf;
 /// request frame is capped at a megabyte. What this replaces is a front end
 /// on one target reaching into the daemon crate and writing the folder
 /// itself, which was a second control channel and which is also why the
-/// desktop had no way to install anything at all. A v23 daemon does not know
+/// desktop had no way to install anything at all. A v24 daemon does not know
 /// any of the three and refuses them as malformed — and the daemon is the
 /// half that deliberately outlives an upgrade, so without a version an
 /// upgraded window would offer "Add a plugin…" against a daemon that has been
 /// running since before the request existed, and every install would be
-/// refused after the module had been staged. Exactly the case v15, v21 and
-/// v23 were bumped for.
+/// refused after the module had been staged. Exactly the case v15, v21, v23 and
+/// v24 were bumped for.
+///
+/// 24: `ProtocolError::Failed`, which says the daemon tried and something
+/// outside the request went wrong, and carries whether asking again could
+/// work. A download answered a full disk, a dropped connection and a session
+/// that went away with one `Refused` and one sentence — and `Refused`
+/// promises that its detail names what the client would have to change,
+/// which none of the three does. A v23 client does not know the tag: it
+/// reads the frame as unparsable and logs it, so the download it was waiting
+/// on goes unanswered rather than being answered wrongly, which is why this
+/// is a version rather than a field. The daemon is the half that
+/// deliberately outlives an upgrade, so the direction that matters is a v23
+/// window against a v24 daemon — the same case v15, v21 and v23 were bumped
+/// for. The third failure is `NoSession`, which already existed and now
+/// carries the sessions that went away mid-answer.
 ///
 /// 23: `ClientRequest::SendMedia`. A file the user picked — a photo, a
 /// video, a document — staged through the media cache and sent by the daemon,
@@ -173,7 +187,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///
