@@ -203,6 +203,23 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   what it says — and is re-read when the host opens the menu, which ksni
   does only for a tray that implements `menu_about_to_show`; the tray
   otherwise hears only `TrayState`, which a window attaching does not move.
+- **Unread has to reach the icon, not only its tooltip.** StatusNotifierItem
+  carries no badge and no number, so a count can only be spoken as a *state*:
+  the icon takes a themed `mail-unread` while anything is waiting, and the
+  item's status goes to `NeedsAttention`, which is also what keeps it visible
+  in a host that hides passive items. Both are said, because a host may honour
+  one and not the other — the status swaps to `attention_icon_name`, and a
+  host ignoring the status entirely still reads `icon_name` — and both name
+  the same icon so the two answers cannot differ. The category is
+  `Communications` for the same reason: some hosts only emphasise an item
+  that claims to be one. The number itself stays in the tooltip, in the title
+  as well as the description, since a host may render only the first line.
+  The count is read as zero while the connection is down (`Item::unread`,
+  which the icon and the tooltip both go through, so they cannot disagree):
+  what we last heard is then a number nothing is refreshing, and the one
+  useful thing to say at a glance is that the connection is what is wrong.
+  It was reported as an icon that looked idle over a full chat list — the
+  tooltip knew, and nothing a glance reaches did.
 - **What a file is sent as is decided in the front end; what it looks like is
   worked out where the bytes land.** Two questions, and they are answered in
   two places because they have two different pieces of evidence. The *kind* —
