@@ -1,8 +1,8 @@
 //! Messages exchanged over the socket.
 
 use oxidezap_core::{
-    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, LogLevel, OutgoingMedia,
-    PluginAction, PluginSurface, QuotedMessage, UiEvent,
+    CallState, CallVideoFrame, Chat, ChatMessage, DownloadableMedia, GroupRoster, LogLevel,
+    OutgoingMedia, PluginAction, PluginSurface, QuotedMessage, UiEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -366,6 +366,14 @@ pub enum DaemonMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next: Option<PageCursor>,
     },
+    /// Who is in a group, answering [`ClientRequest::GroupMembers`].
+    ///
+    /// Addressed to the client that asked rather than published, like a page
+    /// of history: it is what one window needs to draw the conversation it
+    /// has open, and a second window looking somewhere else has no use for
+    /// it. It is not state either — nothing here changes when it arrives, and
+    /// a front end that never asks is never sent one.
+    GroupMembers { id: RequestId, roster: GroupRoster },
     /// A module was installed, and the id it claimed.
     ///
     /// Addressed to the client that asked, like a page of history: the id is
@@ -705,6 +713,13 @@ pub struct LoadChats {
     pub limit: Option<u32>,
 }
 
+/// The group whose members are being asked for. See
+/// [`ClientRequest::GroupMembers`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupMembers {
+    pub jid: String,
+}
+
 /// What a client asks the daemon to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -829,6 +844,21 @@ pub enum ClientRequest {
     /// window will never draw, and shipping them all on attach is a cost paid
     /// before anything is on screen.
     LoadChats(LoadChats),
+    /// Who is in a group.
+    ///
+    /// Answered with [`DaemonMessage::GroupMembers`] under the request's id.
+    /// A front end cannot work this out for itself: what it holds per chat is
+    /// the senders it has *seen*, which is not a roster and is not a count —
+    /// the header that once derived one from it told a fifty-person group it
+    /// had one member. The membership list lives on the connection, which
+    /// keeps one because sending needs it, so this is the side that has it.
+    ///
+    /// Asked when a group is opened rather than pushed: it is one line in one
+    /// window's header, and the answer normally costs nothing — the library
+    /// holds the list, patches it as membership notifications arrive, and
+    /// only goes to the network when the server has said its snapshot is
+    /// stale.
+    GroupMembers(GroupMembers),
     /// Ask what this account is taking up on disk.
     ///
     /// Answered with [`DaemonMessage::Storage`] under the request's id. The
@@ -1554,6 +1584,12 @@ mod tests {
                 r#"{"request":"load_chats"}"#.to_string(),
             ),
             (
+                ClientRequest::GroupMembers(GroupMembers {
+                    jid: "120363000000000001@g.us".into(),
+                }),
+                r#"{"request":"group_members","jid":"120363000000000001@g.us"}"#.to_string(),
+            ),
+            (
                 ClientRequest::InstallPlugin(InstallPlugin {
                     file_name: "autoreply.wasm".into(),
                     upload: "u-plugin-1".into(),
@@ -1658,6 +1694,45 @@ mod tests {
         let line = serde_json::to_string(&none).unwrap();
         assert!(line.contains(r#""plugins":[]"#), "{line}");
         assert_eq!(serde_json::from_str::<DaemonMessage>(&line).unwrap(), none);
+    }
+
+    /// A group's roster, as the bytes the answer puts on the wire.
+    ///
+    /// Literal rather than a round trip, for the reason the requests above
+    /// are: what this pins is the shape both ends already agreed on, and the
+    /// absences are part of it. A member nobody has named carries no `name`
+    /// key and everybody but the reader carries no `is_self` — a roster is
+    /// one frame per group opened and most of its entries are neither.
+    #[test]
+    fn a_group_roster_survives_both_directions_of_the_wire() {
+        let answered = DaemonMessage::GroupMembers {
+            id: 11,
+            roster: oxidezap_core::GroupRoster {
+                jid: "120363000000000001@g.us".into(),
+                members: vec![
+                    oxidezap_core::GroupMember {
+                        jid: "559900000001@s.whatsapp.net".into(),
+                        name: Some("Ana".into()),
+                        is_self: false,
+                    },
+                    oxidezap_core::GroupMember {
+                        jid: "559900000002@s.whatsapp.net".into(),
+                        name: None,
+                        is_self: true,
+                    },
+                ],
+            },
+        };
+        let line = serde_json::to_string(&answered).expect("an answer is writable");
+        assert_eq!(
+            line,
+            r#"{"type":"group_members","id":11,"roster":{"jid":"120363000000000001@g.us","members":[{"jid":"559900000001@s.whatsapp.net","name":"Ana"},{"jid":"559900000002@s.whatsapp.net","is_self":true}]}}"#,
+            "a roster changed shape on the wire"
+        );
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+            answered
+        );
     }
 
     /// Every send accepts a frame that leaves `local_id` out.

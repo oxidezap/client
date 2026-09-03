@@ -59,6 +59,15 @@ pub enum Action {
         request: oxidezap_ipc::LoadChats,
         answer_to: Outbox,
     },
+    /// Who is in a group, answered on `answer_to`.
+    ///
+    /// Addressed like a page rather than published, and for the same reason:
+    /// it is what one window needs for the conversation it has open.
+    GroupMembers {
+        id: RequestId,
+        request: oxidezap_ipc::GroupMembers,
+        answer_to: Outbox,
+    },
     /// Wipe local state so the user can pair again. The daemon owns the store
     /// file, so it is the only process that may delete it.
     ForgetSession,
@@ -90,6 +99,14 @@ impl Action {
                 | Self::MarkStatusWatched(_)
                 | Self::LoadMessages { .. }
                 | Self::LoadChats { .. }
+                // A group's members, too: the connection holds that list
+                // because sending needs one, so the common answer is a read
+                // of what is already held. Gating it on the network would
+                // empty the header's line for the length of a blip and put it
+                // back only when the conversation was opened again; a query
+                // that does have to go to the wire fails on its own and says
+                // asking again may work.
+                | Self::GroupMembers { .. }
         )
     }
 }

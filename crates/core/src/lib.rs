@@ -6,6 +6,7 @@
 //! - `IncomingCall`, `OutgoingCall`, `OutgoingCallState`: Call state
 //! - `MessageStatus`: how far an outgoing message travelled
 //! - `PresenceRegistry`: who is typing, and who is around
+//! - `GroupRoster`: who is in a group
 //! - `CallVideo`, `CallVideoFrame`: which of a call's cameras are on, and the
 //!   encoded frames they produce
 //! - `PluginSurface`: what a plugin asked to have drawn, and what it may do
@@ -23,6 +24,7 @@ mod call;
 mod calls;
 mod chat;
 mod events;
+mod group;
 mod log_level;
 mod media_budget;
 mod message_status;
@@ -44,6 +46,7 @@ pub use chat::{
 };
 pub use chat::{fallback_chat_name, fallback_sender_name};
 pub use events::{ReceiptType, UiEvent};
+pub use group::{GroupMember, GroupRoster};
 pub use log_level::{LogLevel, UnknownLogLevel};
 pub use media_budget::{
     DECODED_IMAGE_BUDGET_BYTES, RETAINED_MEDIA_BUDGET_BYTES, WEB_MEDIA_BUDGET_BYTES,

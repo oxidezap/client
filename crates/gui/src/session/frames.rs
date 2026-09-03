@@ -196,6 +196,13 @@ impl<'a> Frames<'a> {
                 }
                 self.publish(FromDaemon::Chats { chats, next })?;
             }
+            DaemonMessage::GroupMembers { id, roster } => {
+                if take_pending(self.pending, id).is_none() {
+                    debug!("a group's members arrived for {id}, which nobody is waiting on");
+                    return ControlFlow::Continue(());
+                }
+                self.publish(FromDaemon::Members(roster))?;
+            }
             DaemonMessage::Downloaded { id, key } => {
                 let Some(waiting) = take_pending(self.pending, id) else {
                     debug!("a download answer arrived for {id}, which nobody is waiting on");
