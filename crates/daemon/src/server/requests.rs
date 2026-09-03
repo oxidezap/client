@@ -169,6 +169,26 @@ pub(super) async fn handle_request(
             )
             .await
         }
+        // Answered under this id like a page, and asked for at the same
+        // moment one is: opening a group is what needs the line under its
+        // name.
+        ClientRequest::GroupMembers(request) => {
+            let id = match addressed(id, "a group's members need an id to answer under") {
+                Ok(id) => id,
+                Err(refusal) => return refusal,
+            };
+            out_of_band(
+                hub,
+                commands,
+                id,
+                Action::GroupMembers {
+                    id,
+                    request,
+                    answer_to: outbox.clone(),
+                },
+            )
+            .await
+        }
         ClientRequest::ForgetSession => acted(dispatch(hub, commands, Action::ForgetSession).await),
         ClientRequest::MarkRead(request) => {
             acted(dispatch(hub, commands, Action::MarkRead(request)).await)

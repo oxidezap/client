@@ -257,6 +257,40 @@ impl Bridge {
                 });
                 None
             }
+            Action::GroupMembers {
+                id,
+                request: oxidezap_ipc::GroupMembers { jid },
+                answer_to,
+            } => {
+                // A permit before the call, as above: `group_roster` spawns
+                // its work as it returns, so one taken afterwards would
+                // refuse the request and run it anyway.
+                let Some(permit) = self.permit() else {
+                    let _ = reply.send(too_busy());
+                    return None;
+                };
+                let roster = client.group_roster(jid);
+                oxidezap_session::spawn(async move {
+                    let answer = match roster.await {
+                        Ok(Ok(roster)) => Ok(DaemonMessage::GroupMembers { id, roster }),
+                        // Not the client's frame: the address it named is a
+                        // group it is in, and what failed is a query behind
+                        // it. A group whose list has to be fetched is one
+                        // whose fetch can well answer next time.
+                        Ok(Err(detail)) => Err(ProtocolError::Failed {
+                            detail,
+                            retryable: true,
+                        }),
+                        Err(_) => Err(ProtocolError::NoSession {
+                            detail: "the session stopped before the members arrived".to_string(),
+                        }),
+                    };
+                    answer_now(&answer_to, answered(id, answer));
+                    let _ = reply.send(CommandOutcome::Accepted);
+                    drop(permit);
+                });
+                None
+            }
             action => Some((action, reply)),
         }
     }
@@ -419,7 +453,8 @@ impl Bridge {
             // Answered from a task of its own. See `begin_slow`.
             Action::MarkStatusWatched(_)
             | Action::LoadMessages { .. }
-            | Action::LoadChats { .. } => {
+            | Action::LoadChats { .. }
+            | Action::GroupMembers { .. } => {
                 CommandOutcome::Refused("a store read reached the wrong path".to_string())
             }
             Action::Typing(oxidezap_ipc::Typing { jid, composing }) => {

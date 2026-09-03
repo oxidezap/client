@@ -5,6 +5,18 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 27: `ClientRequest::GroupMembers`, answered by
+/// `DaemonMessage::GroupMembers`. A group's header had no line under its name
+/// because nothing on a front end's side could answer who is in it: what a
+/// chat carries is the senders it has seen, and counting those told a
+/// fifty-person group it had one member. The connection keeps the membership
+/// list because sending needs one, so the daemon is now asked for it. A v26
+/// daemon does not know the request and refuses it as malformed — and the
+/// daemon is the half that deliberately outlives an upgrade, so without a
+/// version an upgraded window would ask on every group it opened and log a
+/// refusal for each. Exactly the case v15, v21, v23, v24 and v25 were bumped
+/// for.
+///
 /// 26: `DaemonMessage::HideWindow`, the mirror of `ShowWindow`. The tray had
 /// an Open and no way back: the icon did nothing when clicked, and the one
 /// way to put the window away was to close it. Now a click on the icon
@@ -199,7 +211,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 26;
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

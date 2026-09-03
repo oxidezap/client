@@ -169,6 +169,15 @@ pub enum FromDaemon {
         /// Where to continue, or `None` at the end of the list.
         next: Option<PageCursor>,
     },
+    /// Who is in a group, for the header that asked.
+    Members(oxidezap_core::GroupRoster),
+    /// A roster that never arrived, so the header stops waiting on it.
+    ///
+    /// Named by the group rather than carrying an error, like a page: a
+    /// window that keeps the request in flight forever is one that never asks
+    /// again, and the line under the name is worth another attempt the next
+    /// time the conversation is opened.
+    MembersLost { jid: String },
     /// A page that never arrived, so whoever is waiting can stop waiting.
     ///
     /// Named by what was asked for rather than carrying an error: a timeline
@@ -325,6 +334,12 @@ enum Awaiting {
     /// read is not an empty one, and drawing it as empty takes away the Remove
     /// button somebody was about to press.
     Installable(oneshot::Sender<Vec<String>>),
+    /// Who is in a group. Held in flight for the reason a page is: the
+    /// header asks once per conversation opened, and only an answer — or a
+    /// refusal — lets it ask again.
+    Members {
+        jid: String,
+    },
     /// A page of history. The timeline holds a request in flight so it does
     /// not ask twice for the same one, and a refusal is what releases it.
     Page {
@@ -350,8 +365,9 @@ impl Awaiting {
             // until something resolves it.
             Self::Send { .. } => false,
             // Nor is a page: the view that asked for it is holding a request
-            // open and only an answer closes it.
-            Self::Page { .. } => false,
+            // open and only an answer closes it. A roster is held the same
+            // way, by the same window.
+            Self::Page { .. } | Self::Members { .. } => false,
         }
     }
 
@@ -422,6 +438,14 @@ impl Awaiting {
                 log::warn!("a page of history did not arrive: {detail}");
                 if let Some(events) = events {
                     let _ = events.send(FromDaemon::PageLost { jid });
+                }
+            }
+            // Same rule as a page, and the same consequence: a header that
+            // is never told holds its request and never asks again.
+            Self::Members { jid } => {
+                log::warn!("a group's members did not arrive: {detail}");
+                if let Some(events) = events {
+                    let _ = events.send(FromDaemon::MembersLost { jid });
                 }
             }
             // The ring is already down over these. Nothing durable exists, so
@@ -1234,6 +1258,22 @@ impl SessionHandle {
         );
     }
 
+    /// Ask who is in a group.
+    ///
+    /// Answered as [`FromDaemon::Members`], and a refusal as
+    /// [`FromDaemon::MembersLost`] — the header is holding the request either
+    /// way, and only one of the two releases it.
+    ///
+    /// What this window holds per chat cannot answer it: `participants` fills
+    /// as senders are seen, so it names whoever has spoken lately and no more.
+    /// The membership list lives on the connection the daemon holds.
+    pub fn load_group_members(&self, jid: String) {
+        self.ask(
+            ClientRequest::GroupMembers(oxidezap_ipc::GroupMembers { jid: jid.clone() }),
+            Awaiting::Members { jid },
+        );
+    }
+
     pub fn mark_status_watched(&self, message_ids: Vec<String>) {
         if message_ids.is_empty() {
             return;
@@ -1747,6 +1787,11 @@ fn fail_reserved(conn: &Conn, id: RequestId, detail: String) {
         Awaiting::Page { jid } => {
             error!("a page request never left this process: {detail}");
             let _ = conn.events.try_send(FromDaemon::PageLost { jid });
+        }
+        // And again, for the header's line: it is holding this request open.
+        Awaiting::Members { jid } => {
+            error!("a request for a group's members never left this process: {detail}");
+            let _ = conn.events.try_send(FromDaemon::MembersLost { jid });
         }
         // Nothing left this process, so nothing about the request itself
         // failed: the connection did, and the app reconnects.

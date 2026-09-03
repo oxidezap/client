@@ -220,6 +220,31 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   useful thing to say at a glance is that the connection is what is wrong.
   It was reported as an icon that looked idle over a full chat list — the
   tooltip knew, and nothing a glance reaches did.
+- **A chat's `participants` is not a roster, and the header's line comes from
+  the daemon.** That map fills as senders are *seen* — one entry per person a
+  live message has supplied a name for — so it answers "who has spoken here
+  lately" and nothing else. A header that counted it told a fifty-person group
+  it had one member, so for a long time the line under a group's name was
+  simply left empty, which is what the issue reported. The membership list
+  lives on the connection: the library keeps one per group because the *send*
+  path needs it, patches it as add/remove notifications arrive, and
+  invalidates it when the server says its snapshot is stale. So the front end
+  asks — `ClientRequest::GroupMembers`, answered with a `GroupRoster` — and
+  the session reads it through `Groups::query_info`, the cached, send-oriented
+  view: a group opened twice costs nothing the second time, and a miss sends
+  the participant hash so an unchanged group is answered `not-modified` rather
+  than downloaded. The fuller `get_metadata` (subject, description, admin
+  roles) has no cache in front of it at all and none of what it adds is drawn
+  anywhere, which is why it is not what this uses. The ask is made every time
+  a conversation is opened rather than once, because that is what keeps the
+  line current after somebody joins, and the answer already held stays on
+  screen until the new one lands. Names come from the same `NameBook` a bubble
+  is named by, so nobody is "Ana" over their message and a number in the line
+  above it; a member nobody has ever named is returned nameless and *counted*
+  rather than spelled out, since a LID-addressed group would otherwise draw
+  "Unknown contact" six times in a row. The count is the one thing that is
+  always true, which is why an all-stranger group reads "50 members" — the
+  answer `participants` could never give.
 - **What a file is sent as is decided in the front end; what it looks like is
   worked out where the bytes land.** Two questions, and they are answered in
   two places because they have two different pieces of evidence. The *kind* —

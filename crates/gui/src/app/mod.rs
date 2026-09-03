@@ -759,6 +759,22 @@ pub struct WhatsAppApp {
     calls: Entity<calls_ctl::Calls>,
     /// Cache of JID -> display name mappings (from notify/pushname attribute)
     name_cache: HashMap<String, String>,
+    /// Who is in each group this window has opened, as the daemon answered.
+    ///
+    /// Nothing here can be derived from [`Chat::participants`]: that map fills
+    /// as senders are *seen*, so it names whoever has spoken lately and says
+    /// nothing about the fifty people who have not. The membership list lives
+    /// on the connection the daemon holds, so it is asked for — once per
+    /// conversation opened, which is also what keeps it current after somebody
+    /// joins or leaves.
+    ///
+    /// Kept while a newer answer is in flight: a roster a moment out of date
+    /// is a better header than an empty one.
+    group_rosters: HashMap<String, oxidezap_core::GroupRoster>,
+    /// The groups an ask is out for, so re-opening a conversation while its
+    /// answer is on the way does not ask again. Emptied by the answer, or by
+    /// the refusal that stands in for one.
+    rosters_in_flight: std::collections::HashSet<String>,
     /// System notices whose conversation has not arrived yet.
     ///
     /// "You were added to a group" reaches this window before the group does,
@@ -892,6 +908,18 @@ impl WhatsAppApp {
                     FromDaemon::Chats { chats, next } => entity.update(cx, |app, cx| {
                         app.apply_chat_page(chats, next, cx);
                     }),
+                    // Who is in a group, for the line under its name.
+                    FromDaemon::Members(roster) => entity.update(cx, |app, cx| {
+                        app.rosters_in_flight.remove(&roster.jid);
+                        app.group_rosters.insert(roster.jid.clone(), roster);
+                        cx.notify();
+                    }),
+                    // Released rather than remembered as a failure: the next
+                    // time this conversation is opened is the next time the
+                    // line is worth asking for.
+                    FromDaemon::MembersLost { jid } => entity.update(cx, |app, _cx| {
+                        app.rosters_in_flight.remove(&jid);
+                    }),
                     // A stream, not an event: the newest picture replaces
                     // the one before it and nothing is queued.
                     FromDaemon::CallFrames => entity.update(cx, |app, cx| {
@@ -985,6 +1013,8 @@ impl WhatsAppApp {
             plugins: cx.new(|_| plugins_ctl::Plugins::new()),
             search: cx.new(|_| search::Search::new()),
             name_cache: HashMap::new(),
+            group_rosters: HashMap::new(),
+            rosters_in_flight: std::collections::HashSet::new(),
             pending_notices: HashMap::new(),
             video_players: HashMap::new(),
             video_update_task: None,
@@ -1563,6 +1593,10 @@ impl WhatsAppApp {
         // Names, watched updates, notices with nowhere to go yet. Presence
         // and the composing state left with `leave_connected_view`, above.
         self.name_cache.clear();
+        // Group membership is the departing account's view of who is where,
+        // and the asks still out belong to a connection that is going.
+        self.group_rosters.clear();
+        self.rosters_in_flight.clear();
         self.watched_status.clear();
         self.pending_notices.clear();
         // Anything mid-flight against a message id that is about to be gone.
@@ -2138,9 +2172,33 @@ impl WhatsAppApp {
             self.invalidate_message_cache(&jid, cx);
         }
 
+        self.request_group_members(&jid);
+
         // Scroll to the last message
         self.scroll_to_last_message();
         cx.notify();
+    }
+
+    /// Ask who is in `jid`, if it is a group and nobody is asking already.
+    ///
+    /// On every open rather than once per session: membership changes while
+    /// the window is running, and the answer normally costs nothing — the
+    /// daemon's connection keeps the list because sending needs one. What is
+    /// already known stays on screen until the new answer lands.
+    fn request_group_members(&mut self, jid: &str) {
+        if !jid.contains("@g.us") || self.rosters_in_flight.contains(jid) {
+            return;
+        }
+        let Some(client) = &self.client else {
+            return;
+        };
+        client.load_group_members(jid.to_string());
+        self.rosters_in_flight.insert(jid.to_string());
+    }
+
+    /// Who is in `jid`, as far as this window has been told.
+    pub fn group_members(&self, jid: &str) -> Option<&oxidezap_core::GroupRoster> {
+        self.group_rosters.get(jid)
     }
 
     /// Retry connection after an error

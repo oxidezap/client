@@ -12,7 +12,7 @@ use crate::app::WhatsAppApp;
 use crate::components::avatar::Presence;
 use crate::responsive::ResponsiveLayout;
 use crate::theme::Metrics;
-use oxidezap_core::{Availability, Chat, TypingSummary};
+use oxidezap_core::{Availability, Chat, GroupRoster, TypingSummary};
 
 use super::{Avatar, ProductIcon, parts};
 
@@ -24,27 +24,92 @@ fn is_callable_user(jid: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// How many names a group's line carries before it starts counting instead.
+///
+/// A line that named everybody would be a paragraph in a bar one line tall,
+/// and the names past the first few are drawn outside the window in any case.
+/// What the reader gets instead is the handful the header has room for and a
+/// true total, which is the fact the rest of them were standing in for.
+const NAMES_IN_A_GROUP_LINE: usize = 6;
+
+/// What the header says under a group's name: who is in it.
+///
+/// Named members first — this account as "You", so the reader finds
+/// themselves without counting — then a tally of everyone left. Members
+/// nobody has a name for are never spelled out: a LID-addressed group answers
+/// with an address and no contact behind it, so naming them would repeat
+/// "Unknown contact" down the line, and each one is already counted in the
+/// total.
+///
+/// The count is the roster's own, so it can be trusted in a way
+/// `Chat::participants` never could: that map fills as senders are *seen*,
+/// and counting it told a fifty-person group it had one member. This is the
+/// membership list the connection holds.
+fn members_line(roster: &GroupRoster) -> Option<String> {
+    let total = roster.size();
+    if total == 0 {
+        return None;
+    }
+    // "You" first rather than last, which is where WhatsApp puts it: the line
+    // is cut short by design, and the one name the reader always recognises
+    // is the one that must not be what falls off the end.
+    let named: Vec<&str> = roster
+        .members
+        .iter()
+        .filter(|member| member.is_self)
+        .map(|_| "You")
+        .chain(
+            roster
+                .members
+                .iter()
+                .filter_map(|member| member.name.as_deref().filter(|_| !member.is_self)),
+        )
+        .take(NAMES_IN_A_GROUP_LINE)
+        .collect();
+
+    if named.is_empty() {
+        return Some(count_of("member", total));
+    }
+    let line = named.join(", ");
+    match total - named.len() {
+        0 => Some(line),
+        rest => Some(format!("{line} and {}", count_of("other", rest))),
+    }
+}
+
+/// `n` of something, pluralised.
+fn count_of(thing: &str, n: usize) -> String {
+    if n == 1 {
+        format!("{n} {thing}")
+    } else {
+        format!("{n} {thing}s")
+    }
+}
+
 /// What the header says under the name.
 ///
 /// Ordered by which fact is most current: someone typing now beats a presence
-/// reading, which beats the static member count.
+/// reading, which beats who is in the group — the roster changes when
+/// somebody joins, and the other two change while you watch.
 ///
-/// A group with nobody typing has no subtitle at all: see below.
+/// A group whose members this window has not been told yet has no subtitle at
+/// all: see below.
 fn subtitle(
     chat: &Chat,
     typing: Option<&TypingSummary>,
     availability: Option<&Availability>,
+    members: Option<&GroupRoster>,
 ) -> Option<(String, bool)> {
     if let Some(summary) = typing {
         return Some((summary.compact_label(chat.is_group), true));
     }
     if chat.is_group {
-        // No member count. `participants` is not a roster — it is filled only
+        // Only from the roster. `chat.participants` is not one — it is filled
         // when a live message supplies that sender's name, so a fifty-person
-        // group with one recently observed sender reported "1 members".
-        // Nothing in the library's public surface answers the real question
-        // yet, and saying nothing beats saying something false.
-        return None;
+        // group with one recently observed sender reported "1 members" — and
+        // until the daemon answers, saying nothing beats saying something
+        // false.
+        return members.and_then(members_line).map(|line| (line, false));
     }
     match availability {
         Some(Availability::Online) => Some(("online".to_string(), false)),
@@ -56,18 +121,18 @@ fn subtitle(
     }
 }
 
-// Nine, and each one is a fact about this header that the app does not hand
-// over as a unit: what the conversation is, what it is doing, and what this
-// window may do to it. A struct here would be a struct with nine fields and
-// one construction site.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "nine facts, none of them a group"
-)]
+// Ten, and each one is a fact about this header that the app does not hand
+// over as a unit: what the conversation is, what it is doing, who is in it,
+// and what this window may do to it. A struct here would be a struct with ten
+// fields and one construction site.
+#[expect(clippy::too_many_arguments, reason = "ten facts, none of them a group")]
 pub fn render_chat_header(
     chat: &Chat,
     typing: Option<&TypingSummary>,
     availability: Option<&Availability>,
+    // Who is in this group, once the daemon has said. `None` for a chat that
+    // is not one, and for a group nobody has been told about yet.
+    members: Option<&GroupRoster>,
     // Whether this conversation is with the account's own number, which is
     // the one case where the name alone does not identify it.
     is_own_number: bool,
@@ -88,7 +153,7 @@ pub fn render_chat_header(
     // one did not — and a user-visible label with two implementations drifts
     // again.
     let name: SharedString = crate::app::chat_row::display_name(&chat.name, is_own_number).into();
-    let subtitle = subtitle(chat, typing, availability);
+    let subtitle = subtitle(chat, typing, availability, members);
     // No badge until presence actually arrives. A contact who has told us
     // nothing is not "away": most contacts are in that state before the first
     // presence event, and a dot claiming otherwise is a made-up fact.
@@ -346,7 +411,37 @@ fn render_overflow_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxidezap_core::{ComposingKind, Typist};
+    use oxidezap_core::{ComposingKind, GroupMember, Typist};
+
+    /// A roster as the daemon answers one: `named` people with names, the
+    /// rest addresses nobody has ever put a name to.
+    fn roster(named: &[&str], unnamed: usize, includes_me: bool) -> GroupRoster {
+        let mut members: Vec<GroupMember> = named
+            .iter()
+            .enumerate()
+            .map(|(i, name)| GroupMember {
+                jid: format!("{i}@s.whatsapp.net"),
+                name: Some((*name).to_string()),
+                is_self: false,
+            })
+            .collect();
+        members.extend((0..unnamed).map(|i| GroupMember {
+            jid: format!("{i}@lid"),
+            name: None,
+            is_self: false,
+        }));
+        if includes_me {
+            members.push(GroupMember {
+                jid: "me@s.whatsapp.net".to_string(),
+                name: None,
+                is_self: true,
+            });
+        }
+        GroupRoster {
+            jid: "group@g.us".to_string(),
+            members,
+        }
+    }
 
     fn group_with(members: usize) -> Chat {
         let mut chat = Chat::new("group@g.us".to_string());
@@ -375,12 +470,14 @@ mod tests {
     #[test]
     fn typing_outranks_every_other_subtitle() {
         let summary = typing("Ana");
-        let (text, is_typing) = subtitle(&group_with(4), Some(&summary), None).unwrap();
+        let members = roster(&["Ana", "Bruno"], 0, true);
+        let (text, is_typing) =
+            subtitle(&group_with(4), Some(&summary), None, Some(&members)).unwrap();
         assert_eq!(text, "Ana typing…");
         assert!(is_typing);
 
         let (text, is_typing) =
-            subtitle(&direct(), Some(&summary), Some(&Availability::Online)).unwrap();
+            subtitle(&direct(), Some(&summary), Some(&Availability::Online), None).unwrap();
         assert_eq!(text, "typing…", "a direct chat needs no name");
         assert!(is_typing);
     }
@@ -389,8 +486,50 @@ mod tests {
     /// length is not the group's size and must never be presented as one.
     #[test]
     fn a_group_does_not_pass_its_known_senders_off_as_a_member_count() {
-        assert!(subtitle(&group_with(4), None, None).is_none());
-        assert!(subtitle(&group_with(0), None, None).is_none());
+        assert!(subtitle(&group_with(4), None, None, None).is_none());
+        assert!(subtitle(&group_with(0), None, None, None).is_none());
+    }
+
+    /// The line the issue asked for: who is in the group, under its name.
+    #[test]
+    fn a_group_names_its_members_once_the_roster_arrives() {
+        let members = roster(&["Ana", "Bruno"], 0, true);
+        let (text, is_typing) = subtitle(&group_with(1), None, None, Some(&members)).unwrap();
+        assert_eq!(text, "You, Ana, Bruno");
+        assert!(!is_typing, "a roster is not somebody typing");
+    }
+
+    /// A group larger than the line names as many as fit and counts the rest,
+    /// with this account's own entry among the ones that fit.
+    #[test]
+    fn a_large_group_counts_whoever_the_line_has_no_room_for() {
+        let named = ["Ana", "Bruno", "Carla", "Davi", "Elena", "Fabio", "Gil"];
+        let members = roster(&named, 40, true);
+        assert_eq!(
+            members_line(&members).unwrap(),
+            "You, Ana, Bruno, Carla, Davi, Elena and 42 others"
+        );
+    }
+
+    /// Nobody named, everybody counted — which is the honest answer for a
+    /// LID-addressed group nothing has resolved a contact in, and the one
+    /// `participants` could never give.
+    #[test]
+    fn a_group_of_strangers_is_counted_rather_than_listed() {
+        assert_eq!(members_line(&roster(&[], 50, false)).unwrap(), "50 members");
+        assert_eq!(members_line(&roster(&[], 1, false)).unwrap(), "1 member");
+        assert_eq!(
+            members_line(&roster(&["Ana"], 1, false)).unwrap(),
+            "Ana and 1 other"
+        );
+    }
+
+    /// An empty roster is not a group with nobody in it; it is an answer that
+    /// says nothing, and a header says nothing back.
+    #[test]
+    fn an_empty_roster_draws_no_line() {
+        assert!(members_line(&roster(&[], 0, false)).is_none());
+        assert!(subtitle(&group_with(3), None, None, Some(&roster(&[], 0, false))).is_none());
     }
 
     /// What a group *does* say is who is typing, which is a fact about now
@@ -406,7 +545,9 @@ mod tests {
             kind: ComposingKind::Text,
         };
         assert_eq!(
-            subtitle(&group_with(4), Some(&summary), None).unwrap().0,
+            subtitle(&group_with(4), Some(&summary), None, None)
+                .unwrap()
+                .0,
             "Ana typing…"
         );
     }
@@ -414,16 +555,16 @@ mod tests {
     #[test]
     fn a_contact_reports_presence_only_when_it_is_shared() {
         assert_eq!(
-            subtitle(&direct(), None, Some(&Availability::Online))
+            subtitle(&direct(), None, Some(&Availability::Online), None)
                 .unwrap()
                 .0,
             "online"
         );
         assert!(
-            subtitle(&direct(), None, Some(&Availability::Unknown)).is_none(),
+            subtitle(&direct(), None, Some(&Availability::Unknown), None).is_none(),
             "a contact who hides last-seen gets no subtitle, not a guess"
         );
-        assert!(subtitle(&direct(), None, None).is_none());
+        assert!(subtitle(&direct(), None, None, None).is_none());
     }
 
     #[test]

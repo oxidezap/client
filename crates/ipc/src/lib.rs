@@ -46,9 +46,9 @@ pub use framing::{FrameRead, MAX_DAEMON_FRAME_BYTES, MAX_REQUEST_BYTES, read_fra
 pub use link::Link;
 pub use protocol::{
     AccountIdentity, CallAction, ChatSummary, ClientRequest, ConnectionState, DaemonEvent,
-    DaemonMessage, Download, InstallPlugin, LoadChats, LoadMessages, MarkRead, MarkStatusWatched,
-    MessagePreview, PageCursor, PairingCode, ProtocolError, Request, RequestId, SendAudio,
-    SendMedia, SendText, StateSnapshot, StateVersion, Typing,
+    DaemonMessage, Download, GroupMembers, InstallPlugin, LoadChats, LoadMessages, MarkRead,
+    MarkStatusWatched, MessagePreview, PageCursor, PairingCode, ProtocolError, Request, RequestId,
+    SendAudio, SendMedia, SendText, StateSnapshot, StateVersion, Typing,
 };
 pub use transport::{
     DEFAULT_WEB_PORT, MAX_STAGED_BYTES, PROTOCOL_VERSION, STAGED_PREFIX, WEB_MEDIA_PATH,

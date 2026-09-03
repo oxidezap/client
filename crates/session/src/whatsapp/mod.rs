@@ -6,6 +6,9 @@ mod calls;
 /// A stored row and a composed quote, read as the other side's shape.
 mod convert;
 
+/// Who is in a group, for the surfaces that name them.
+mod groups;
+
 /// Store rows read back as the chats a front end draws.
 mod history;
 

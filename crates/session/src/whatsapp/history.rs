@@ -692,7 +692,7 @@ impl WhatsAppClient {
 /// A device that has paired but never synced has neither, which is the same
 /// as not recognising itself — and a message of one's own is labelled from
 /// its own `is_from_me` rather than from this, so nothing depends on it.
-fn own_jids(client: &Arc<Client>) -> Vec<String> {
+pub(super) fn own_jids(client: &Arc<Client>) -> Vec<String> {
     let device = client.persistence_manager().get_device_snapshot();
     [device.pn.as_ref(), device.lid.as_ref()]
         .into_iter()

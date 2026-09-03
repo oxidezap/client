@@ -260,6 +260,10 @@ pub fn render_connected_view(
     // the empty state are the only readers of the chat itself, and everything
     // the timeline draws has already been gathered.
     let selected_chat = open_chat.as_deref().and_then(|jid| app.chat_named(jid));
+    // Who is in it, where it is a group and the daemon has said. Asked for
+    // when the conversation was opened; until the answer lands the header
+    // draws the name alone, as it did before there was anything to draw.
+    let members = open_chat.as_deref().and_then(|jid| app.group_members(jid));
     // The two panes, whichever destination they belong to.
     let panes = div()
         .flex()
@@ -289,6 +293,7 @@ pub fn render_connected_view(
                         banner,
                         typing: typing.as_ref(),
                         availability: availability.as_ref(),
+                        members,
                         search_bar,
                         input_area,
                         can_send,
@@ -354,6 +359,9 @@ struct ChatAreaProps<'a> {
     banner: Option<(String, String)>,
     typing: Option<&'a oxidezap_core::TypingSummary>,
     availability: Option<&'a oxidezap_core::Availability>,
+    /// Who is in the open conversation, when it is a group the daemon has
+    /// answered for.
+    members: Option<&'a oxidezap_core::GroupRoster>,
     search_bar: Option<gpui::AnyElement>,
     input_area: Option<Entity<InputAreaView>>,
     /// Whether anything can be sent from here at all.
@@ -383,6 +391,7 @@ fn render_chat_area(
         banner,
         typing,
         availability,
+        members,
         search_bar,
         input_area,
         can_send,
@@ -431,6 +440,7 @@ fn render_chat_area(
                     chat,
                     typing,
                     availability,
+                    members,
                     is_own_number,
                     can_send,
                     entity.clone(),
