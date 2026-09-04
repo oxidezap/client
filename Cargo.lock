@@ -6236,6 +6236,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "chrono",
+ "core-foundation 0.9.4",
  "futures-channel",
  "futures-util",
  "getrandom 0.2.17",

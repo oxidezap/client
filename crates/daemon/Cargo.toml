@@ -132,12 +132,18 @@ ksni = "0.3"
 # access to Everyone.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
-# The tray icon on Windows (Shell_NotifyIcon behind one menu of Open/Hide/Quit),
-# where ksni's StatusNotifierItem has nothing to talk to. `default-features =
-# false` keeps the Linux-only GTK/libxdo halves out: this dependency is only
-# ever built for Windows, and the menu types come along through its muda
-# re-export rather than a second direct dependency.
+# The tray icon where ksni's StatusNotifierItem has nothing to talk to:
+# Shell_NotifyIcon on Windows, NSStatusItem on macOS. `default-features =
+# false` keeps the Linux-only GTK/libxdo halves out, and the menu types come
+# along through its muda re-export rather than a second direct dependency.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 tray-icon = { version = "0.24", default-features = false }
+# The main thread's runloop, which the macOS tray is pumped through. AppKit
+# dispatches a status item's clicks and menus there and nowhere else, and
+# `tray-icon` owns the window but runs no loop of its own. Already in the
+# graph transitively; declared because this crate imports it directly.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }

@@ -61,6 +61,14 @@ impl TrayState {
             (true, n) => format!("{n} unread messages"),
         }
     }
+
+    /// The two above in one line, for the trays that get a single string:
+    /// a notification-area tooltip, a menu-bar title. Composed here rather
+    /// than once per tray so the separator cannot drift between them.
+    #[must_use]
+    pub fn single_line(&self) -> String {
+        format!("{} — {}", self.title(), self.description())
+    }
 }
 
 /// A state change on its way into the hub.
@@ -565,5 +573,14 @@ mod tests {
         assert_eq!(tray(true, 1).description(), "1 unread message");
         assert_eq!(tray(true, 4).title(), "oxidezap (4)");
         assert_eq!(tray(true, 4).description(), "4 unread messages");
+    }
+
+    #[test]
+    fn the_single_line_is_the_two_above_joined() {
+        assert_eq!(tray(false, 3).single_line(), "oxidezap — Disconnected");
+        assert_eq!(
+            tray(true, 4).single_line(),
+            "oxidezap (4) — 4 unread messages"
+        );
     }
 }
