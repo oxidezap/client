@@ -76,7 +76,7 @@ jobs:
           echo "" >> notes.md
           echo "Built from [\`${GITHUB_SHA:0:7}\`](https://github.com/$GH_REPO/commit/$GITHUB_SHA) on $(date -u +"%Y-%m-%d %H:%M") UTC." >> notes.md
           echo "" >> notes.md
-          echo "Verify download integrity with \`sha256sum -c checksums.sha256\`." >> notes.md
+          echo "Verify download integrity with \`sha256sum -c --ignore-missing checksums.sha256\`." >> notes.md
           # Recreate rather than edit: `gh release edit` cannot move a tag, and
           # a stale tag would leave the assets pointing at an older commit.
           gh release delete nightly --yes --cleanup-tag || true

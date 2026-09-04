@@ -55,6 +55,9 @@ jobs:
           (cd artifacts && sha256sum oxidezap-* > checksums.sha256)
           # Create on first run, upload on a re-run of the same tag.
           if gh release view "$TAG" >/dev/null 2>&1; then
+            for asset in $(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null || true); do
+              gh release delete-asset "$TAG" "$asset" --yes 2>/dev/null || true
+            done
             gh release upload "$TAG" artifacts/* --clobber
           else
             gh release create "$TAG" artifacts/* --title "$TAG" --generate-notes

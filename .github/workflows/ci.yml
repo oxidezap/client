@@ -62,7 +62,7 @@ jobs:
             libfontconfig1-dev libfreetype6-dev
       - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
         with:
-          tool: protoc,cargo-nextest,cargo-machete
+          tool: protoc,cargo-nextest@0.9.143,cargo-machete@0.9.2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # The manifest's hash belongs in the key, because a profile setting
