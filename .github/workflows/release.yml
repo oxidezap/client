@@ -52,6 +52,7 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          (cd artifacts && sha256sum oxidezap-* > checksums.sha256)
           # Create on first run, upload on a re-run of the same tag.
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" artifacts/* --clobber

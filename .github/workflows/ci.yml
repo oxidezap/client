@@ -62,7 +62,7 @@ jobs:
             libfontconfig1-dev libfreetype6-dev
       - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
         with:
-          tool: protoc
+          tool: protoc,cargo-nextest,cargo-machete
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # The manifest's hash belongs in the key, because a profile setting
@@ -92,10 +92,17 @@ jobs:
           # entry would push out the one branch every PR restores from.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
+      - name: Check unused dependencies
+        run: cargo machete
       # --all-features so the chat store's `search` feature (FTS5) is covered;
       # a default-features run silently skips its index and query tests.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
+      - name: Run tests
+        run: cargo nextest run --workspace --all-features
+      # nextest cannot run doctests (nextest-rs/nextest#16) and silently reports
+      # none, so they need their own libtest step.
+      - name: Run doctests
+        run: cargo test --workspace --all-features --doc
       # The example plugins, which the workspace steps above compile no line
       # of: `examples/` is excluded from the root workspace so that a host
       # build does not fail at every `oxi_*` import. Nothing checked them, and
