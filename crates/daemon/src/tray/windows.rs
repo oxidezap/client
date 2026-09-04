@@ -1,13 +1,10 @@
 //! The tray icon on Windows, via `tray-icon` (Shell_NotifyIcon).
 //!
-//! The shape mirrors [`super::linux`]: one `Open`/`Hide`/`Quit` menu and an
-//! icon that follows [`TrayState`]. Two things differ, and both are the
-//! platform rather than a choice:
+//! The shape mirrors the menu and the states both other trays speak: one
+//! `Open`/`Hide`/`Quit` menu and the dot [`super::dot`] paints, with the
+//! words from [`TrayState`]'s own methods. What is this module's is only how
+//! a notification-area icon is owned:
 //!
-//! - StatusNotifierItem names icons out of the user's theme; a notification
-//!   area icon carries its own pixels, so this module draws a 32×32 dot —
-//!   grey while disconnected, green while connected, amber while something
-//!   waits to be read — instead of naming one.
 //! - `TrayIcon` is reference-counted but neither `Send` nor `Sync`, so every
 //!   call into it happens on the one OS thread that built it. [`start`]
 //!   returns as soon as that thread reports the icon is up, and [`update`]
@@ -32,19 +29,6 @@ use crate::state::{StateHub, TrayState};
 /// How often the tray thread wakes to drain menu and click events while no
 /// state update is waiting.
 const EVENT_POLL: Duration = Duration::from_millis(100);
-
-/// The icon's size. Small on purpose: the notification area renders it at
-/// sixteen, and a dot needs no more than this to stay round there.
-const ICON_SIDE: u32 = 32;
-
-/// Grey while the connection is down: what we last heard is then a number
-/// nothing is refreshing, and an icon asking to be looked at over a stale
-/// count is worse than one saying the connection is what is wrong.
-const DISCONNECTED: [u8; 4] = [0x80, 0x80, 0x80, 0xFF];
-/// Green while connected with nothing waiting.
-const CONNECTED: [u8; 4] = [0x2E, 0xA0, 0x43, 0xFF];
-/// Amber while something waits to be read.
-const UNREAD: [u8; 4] = [0xD6, 0x45, 0x41, 0xFF];
 
 const OPEN_ID: &str = "oxidezap-open";
 const HIDE_ID: &str = "oxidezap-hide";
@@ -129,7 +113,7 @@ fn build(initial: &TrayState) -> Result<TrayIcon, String> {
     TrayIconBuilder::new()
         .with_id("oxidezap")
         .with_menu_on_left_click(false)
-        .with_tooltip(tooltip_for(initial))
+        .with_tooltip(initial.single_line())
         .with_menu(Box::new(menu))
         .with_icon(icon_for(initial))
         .build()
@@ -213,100 +197,15 @@ fn apply(tray: &TrayIcon, state: &TrayState) {
     if let Err(e) = tray.set_icon(Some(icon_for(state))) {
         log::warn!("the tray icon could not be redrawn: {e}");
     }
-    if let Err(e) = tray.set_tooltip(Some(tooltip_for(state))) {
+    if let Err(e) = tray.set_tooltip(Some(state.single_line())) {
         log::warn!("the tray tooltip could not be redrawn: {e}");
     }
 }
 
-/// The tooltip: the hub's title and sentence in one line, because a
-/// notification area icon gets a single string — the same words the Linux
-/// tooltip renders on two lines.
-fn tooltip_for(state: &TrayState) -> String {
-    format!("{} — {}", state.title(), state.description())
-}
-
-/// A 32×32 dot in the colour the state names.
+/// The shared dot, in this platform's icon type.
 fn icon_for(state: &TrayState) -> tray_icon::Icon {
-    tray_icon::Icon::from_rgba(dot(colour_for(state)), ICON_SIDE, ICON_SIDE)
+    use super::dot::{SIDE, colour_for, dot};
+
+    tray_icon::Icon::from_rgba(dot(colour_for(state)), SIDE, SIDE)
         .expect("the tray icon's bytes match its dimensions")
-}
-
-/// Which dot a state gets. One function rather than the test written twice,
-/// so the icon and anything reasoning about it cannot disagree.
-fn colour_for(state: &TrayState) -> [u8; 4] {
-    match (state.connected, state.shown_unread()) {
-        (false, _) => DISCONNECTED,
-        (true, 0) => CONNECTED,
-        (true, _) => UNREAD,
-    }
-}
-
-/// A filled circle on transparency: the notification area draws it small,
-// and a square of colour would read as a chip off a theme.
-fn dot(colour: [u8; 4]) -> Vec<u8> {
-    let side = ICON_SIDE as f32;
-    let (centre, radius) = ((side - 1.0) / 2.0, (side - 2.0) / 2.0);
-    let mut rgba = Vec::with_capacity((ICON_SIDE * ICON_SIDE * 4) as usize);
-    for y in 0..ICON_SIDE {
-        for x in 0..ICON_SIDE {
-            let distance = ((x as f32 - centre).powi(2) + (y as f32 - centre).powi(2)).sqrt();
-            if distance <= radius {
-                rgba.extend_from_slice(&colour);
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            }
-        }
-    }
-    rgba
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn state(connected: bool, unread: u32) -> TrayState {
-        TrayState { connected, unread }
-    }
-
-    /// The report Linux got first: messages waiting behind an icon that
-    /// looked exactly like an idle one. Three colours, and the waiting one
-    /// is not the idle one.
-    #[test]
-    fn unread_reaches_the_icon_itself() {
-        assert_ne!(
-            dot(colour_for(&state(true, 3))),
-            dot(colour_for(&state(true, 0))),
-            "an icon with something to read must not look like one without"
-        );
-        assert_ne!(
-            dot(colour_for(&state(false, 3))),
-            dot(colour_for(&state(true, 0))),
-            "a disconnected icon must not look connected"
-        );
-    }
-
-    /// A count nothing is refreshing is not news: the icon goes grey rather
-    /// than holding a stale colour. The words are the hub's, tested beside
-    /// it; what is this module's is which colour each state gets.
-    #[test]
-    fn a_disconnected_icon_is_grey_whatever_it_last_heard() {
-        assert_eq!(
-            dot(colour_for(&state(false, 3))),
-            dot(colour_for(&state(false, 0)))
-        );
-        assert_eq!(colour_for(&state(false, 3)), DISCONNECTED);
-    }
-
-    /// Thirty-two by thirty-two of RGBA, with something drawn and something
-    /// transparent: a square of colour would read as a chip off a theme.
-    #[test]
-    fn the_dot_is_round() {
-        let pixels = dot(CONNECTED);
-        assert_eq!(pixels.len(), 32 * 32 * 4);
-        // Corners fall outside the circle.
-        assert_eq!(&pixels[0..4], &[0, 0, 0, 0]);
-        // The centre is the colour.
-        let centre = (16 * 32 + 16) * 4;
-        assert_eq!(&pixels[centre..centre + 4], &CONNECTED);
-    }
 }

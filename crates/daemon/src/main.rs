@@ -17,6 +17,9 @@ use anyhow::{Context, Result};
 
 use crate::state::StateHub;
 
+#[cfg(target_os = "macos")]
+mod macos_main;
+
 fn main() -> Result<()> {
     // The level the last person to change it chose, unless `RUST_LOG` says
     // otherwise for this run — and changeable while the daemon runs, which is
@@ -34,10 +37,20 @@ fn main() -> Result<()> {
         .build()
         .context("building the daemon runtime")?;
 
-    runtime.block_on(run())
+    // The hub is cheap and needs no runtime, so it is made here: on macOS
+    // the tray is built from it on this thread before anything blocks.
+    let hub = StateHub::new();
+
+    // AppKit pins the menu-bar icon to the main thread (see `macos_main`):
+    // there the daemon runs one thread over and this thread pumps the
+    // runloop; everywhere else this thread is what blocks.
+    #[cfg(target_os = "macos")]
+    return macos_main::run(runtime, hub);
+    #[cfg(not(target_os = "macos"))]
+    return runtime.block_on(run(hub));
 }
 
-async fn run() -> Result<()> {
+async fn run(hub: Arc<StateHub>) -> Result<()> {
     // Registered before anything can ask us to stop. Until these handlers
     // exist SIGTERM still has its default disposition: a service manager
     // stopping the daemon during startup would kill it on the spot, without
@@ -65,11 +78,11 @@ async fn run() -> Result<()> {
     // directory of the one holding the account.
     tokio::spawn(media::reclaim_abandoned_writes_periodically());
 
-    let hub = StateHub::new();
-
     // The tray is optional by design: no StatusNotifierItem host (a bare WM, a
     // headless session) is a reason to run without an icon, not to refuse to
-    // start.
+    // start. On macOS the icon lives on the main thread instead (see
+    // `macos_main`), so there is nothing to spawn here.
+    #[cfg(not(target_os = "macos"))]
     let tray = match tray::spawn(Arc::clone(&hub)).await {
         Ok(handle) => Some(handle),
         Err(e) => {
@@ -77,6 +90,8 @@ async fn run() -> Result<()> {
             None
         }
     };
+    #[cfg(target_os = "macos")]
+    let tray: Option<tray::TrayHandle> = None;
 
     // One shutdown signal, watched by the bridge and raised by whoever stops
     // first. The bridge must never be cancelled: it owns the session thread,

@@ -205,7 +205,12 @@ Non-obvious behaviour, and the reasoning behind it. Read the entry before changi
   otherwise hears only `TrayState`, which a window attaching does not move.
   On Windows the menu carries Open and Hide as two fixed items instead:
   muda has no about-to-show, and either request published to nobody is
-  harmless, so there is no label that can go stale there.
+  harmless, so there is no label that can go stale there. On macOS the
+  menu is the same pair, but the thread is not: AppKit pins a status item
+  to the main thread and dispatches its clicks and menus on no other, so
+  the daemon's `block_on` runs one thread over and the main thread pumps
+  the runloop instead — `tray::macos` builds there and is pumped there,
+  and every other platform keeps blocking the main thread.
 - **Unread has to reach the icon, not only its tooltip.** StatusNotifierItem
   carries no badge and no number, so a count can only be spoken as a *state*:
   the icon takes a themed `mail-unread` while anything is waiting, and the
