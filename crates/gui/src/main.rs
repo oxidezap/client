@@ -11,6 +11,11 @@
 //! in its own address space. Everything that differs there lives in
 //! `platform/`, so no component above it learns that browsers exist.
 
+// No console window beside the GUI on Windows release builds: opening
+// `oxidezap.exe` used to pop a terminal with the daemon in it. Debug keeps
+// its console so `cargo run` still shows logs where they can be read.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod assets;
 mod components;

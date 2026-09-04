@@ -941,8 +941,19 @@ impl WhatsAppApp {
                     }),
                     FromDaemon::ShowWindow => {
                         cx.update(|cx| {
-                            if let Some(window) = cx.windows().first() {
-                                let _ = window.update(cx, |_, window, _| window.activate_window());
+                            // Every window on its own: one that closed
+                            // between listing and raising must not fail the
+                            // rest, and a close racing this request is
+                            // ordinary — the person closed the window at the
+                            // same moment the tray asked for it — so a stale
+                            // handle is a debug line, not an error.
+                            for window in cx.windows() {
+                                if window
+                                    .update(cx, |_, window, _| window.activate_window())
+                                    .is_err()
+                                {
+                                    log::debug!("a window went away while being raised");
+                                }
                             }
                         });
                         Ok(())

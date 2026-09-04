@@ -14,6 +14,8 @@ use crate::state::{StateHub, TrayState};
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+mod windows;
 
 /// A live tray presence. Dropping it removes the icon.
 ///
@@ -72,7 +74,12 @@ async fn platform_tray(hub: Arc<StateHub>) -> Result<Box<dyn Tray>> {
     linux::start(hub).await
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+async fn platform_tray(hub: Arc<StateHub>) -> Result<Box<dyn Tray>> {
+    windows::start(hub).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 async fn platform_tray(_hub: Arc<StateHub>) -> Result<Box<dyn Tray>> {
     anyhow::bail!("no tray implementation for this platform yet")
 }

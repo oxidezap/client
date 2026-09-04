@@ -4,6 +4,11 @@
 //! The process around [`oxidezap_daemon`], which is where everything it
 //! actually does lives — see that crate's own note for why the two are apart.
 
+// A background service, not a console program: on Windows release builds no
+// terminal comes with it, whether it was started from the GUI or by hand.
+// Debug keeps its console so `cargo run --bin oxidezapd` still shows logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use oxidezap_daemon::{listener, media, plugins, server, session_bridge, shutdown, state, tray};
 
 use std::sync::Arc;
