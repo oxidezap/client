@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- `user-scalable=0`: the canvas handles its own gestures, and a
+         pinch-zoom over it would scale the whole page away from the pointer
+         positions gpui is tracking. -->
+    <meta
+      name="viewport"
+      content="width=device-width, height=device-height, initial-scale=1.0, user-scalable=0"
+    />
+    <meta name="color-scheme" content="dark light" />
+    <title>oxidezap</title>
+
+    <!-- Cross-origin isolation, which GitHub Pages cannot give us.
+         `gpui_web` runs its background executor on real workers, and workers
+         share memory through a `SharedArrayBuffer` — which a browser only
+         hands to a page that is cross-origin isolated, and that requires two
+         response headers a static host does not let us set. A service worker
+         can add them to its own responses, which is what this does: the
+         first load registers it and reloads once, and every load after that
+         is already isolated. It answers navigations and worker scripts and
+         passes everything else through, because those are the only responses
+         the two headers are read off — and a subresource answered by a
+         service worker is one the page's own preload can no longer be
+         matched against.
+
+         This is the only JavaScript in the build that is not wasm-bindgen's
+         own generated glue, and it is here because the alternative is a
+         header we have no way to send.
+
+         It is declared *before* the module, and that ordering is about
+         the first visit: registering and reloading is how the headers arrive,
+         and a reload that lands after the preload has begun throws away
+         however much of a twenty-megabyte module the browser had got. The
+         registration is asynchronous, so this narrows the window rather
+         than closing it — but the other order guarantees the waste. -->
+    
+    <script src="coi-serviceworker.js"></script>
+
+    <!-- What the window draws emoji with, copied in rather than embedded.
+
+         The page rasterizes every glyph itself, out of a font database that
+         starts empty — a browser hands wasm no font files, and the canvas is
+         not the DOM, so `local()` and the system's emoji font are both out of
+         reach. Without a face that covers them every emoji in a chat name, a
+         reaction or a message drew as a box.
+
+         It is copied beside the module instead of `include_bytes!`d into it
+         because a font is a file a browser caches perfectly well on its own,
+         and 878 KB is 878 KB the module does not have to carry. The window
+         fetches it by this name, relative to the document, before it opens —
+         see `platform/fonts.rs`, which also says why it is the monochrome
+         Noto Emoji and not the colour one. Nothing generates this name from
+         that one, so a test in that file reads this document and fails when
+         the two stop matching. -->
+    
+
+    <!-- The window itself. `data-bin` names the binary; wasm-bindgen turns
+         its `main` into the module's start function.
+
+         `href` because trunk looks for a manifest beside this file and there
+         is none: the page is not a crate, it is how the front end is
+         packaged. Pointing at the crate keeps the bundle's own files in one
+         directory instead of scattering them through the workspace root.
+
+         The `wasm-opt` parameters are the features this module is *built*
+         with. wasm-opt validates before it optimizes and refuses anything it
+         was not told to expect, so without them a release build fails on the
+         first `memory.init` — "Bulk memory operations require bulk memory" —
+         and again on the first atomic. They are not optimizations; they are
+         the shape of the module.
+
+         `data-wasm-opt` is the optimization, and it is declared because the
+         default is trunk's rather than ours and trunk is not pinned — the
+         Pages workflow installs whatever `taiki-e/install-action` resolves to
+         that day, so the level our bundle is built at was a property of the
+         runner. It was also not `z`: measured against the same
+         wasm-bindgen output, trunk's release default produced 29,825,238
+         bytes and `-Oz` produced 29,419,240.
+
+         `--converge` is the other half of that. `-Oz` is one run of the pass
+         pipeline, and a pass that shrinks the module hands the next one a
+         module it has not seen; `--converge` runs the pipeline again until a
+         round changes nothing. Measured on this module, on top of everything
+         else here: 22,280,415 bytes down to 21,976,566, which is 303,849 for
+         a setting whose whole cost is build time. Nothing about what the
+         module does changes — each iteration is the same set of passes that
+         produced the first one, and wasm-opt validates what it emits.
+
+         Nothing here strips anything, because in the shipped build there is
+         nothing left to strip: `strip = true` removes the name section before
+         wasm-opt ever sees the module, and `wasm-objdump -h` on the published
+         artifact lists exactly one custom section, `producers`, at 72 bytes.
+         Which is the warning worth leaving — a DevTools flame graph of this
+         page has no Rust symbols in it and never had.
+         `WEB_PROFILE=debug cargo xtask web build` is the build that does: it selects
+         `[profile.web-debug]`, which is the same profile with `strip` off.
+
+         A third build goes further than either: `WEB_PROFILE=dwarf` keeps
+         the *line table* as well, and a browser that has one can name the
+         file and the line rather than only the function. It is not built
+         from this document — it cannot be, because it needs
+         `data-wasm-opt="0"` and `data-keep-debug` and trunk reads both off
+         the link here rather than from a flag. So `cargo xtask web build`
+         derives a document from this one per build; if these attributes are
+         ever respelled, `dwarf_index` in xtask/src/web.rs is what has to
+         learn the new spelling, and it has a test that fails when it does
+         not.
+
+         `-g` is what carries that through to here. wasm-opt drops the name
+         section unless asked to keep it, so without this the debug profile
+         would produce a module whose symbols rustc emitted and this step
+         threw away — and it costs the shipped build nothing, because there
+         the section it preserves does not exist.
+
+         `data-integrity="none"` turns off trunk's subresource integrity, and
+         what it turns off is a hash nothing checks. Trunk writes one onto
+         both links it injects, and the module's is inert twice over: a
+         browser ignores `integrity` on a preload whose destination does not
+         support it — `as="fetch"`, which is what a `.wasm` preload is
+         (https://crbug.com/981419, and the console says so on every load) —
+         and the fetch that really loads the module is wasm-bindgen's own
+         `fetch()`, which no `<link>` attribute reaches. What is left is the
+         glue's, where SRI is a same-origin hash of a file named by a
+         same-origin document: whoever can change the one can change the
+         other, so it is a warning on every load in exchange for nothing.
+         The build already proves the bundle is the one the page asks for —
+         the file names are content hashes, and the Pages workflow checks
+         every one of them is in `dist`. -->
+    
+<script type="module">
+import init, * as bindings from '/client/oxidezap-383fa0e71cc69b9e.js';
+const wasm = await init({ module_or_path: '/client/oxidezap-383fa0e71cc69b9e_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+
+
+    <style>
+      *,
+      *::before,
+      *::after {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+        /* Behind the canvas until the first frame lands, and behind the
+           notice below if it never does. Matches the product's own deepest
+           surface so the load does not flash white. */
+        background: #1a1b26;
+        color: #a9b1d6;
+        font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        overflow: hidden;
+      }
+
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        /* Positioned, and above the notice below. `#loading` is `fixed`,
+           which makes it a positioned element — and a positioned element
+           paints over a non-positioned one whatever the document order, so
+           without this the notice would cover the window it is there to
+           stand in for. */
+        position: relative;
+        z-index: 1;
+        touch-action: none;
+        outline: none;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+
+      /* What a visitor reads while the module downloads, and what they are
+         left with if it never runs. The canvas covers it completely once gpui
+         has drawn a frame, because the canvas comes later in the document and
+         fills the viewport.
+
+         Not a negative z-index: that would put it behind the body's own
+         background, which is opaque — so the one diagnostic a stalled load
+         has would be invisible under a blank dark surface. */
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem;
+        text-align: center;
+        /* Level zero, not below the root: a negative index would put this
+           behind the body's own opaque background, so the one diagnostic a
+           stalled load has would be invisible. The canvas above is what
+           covers it once there is a window to see. */
+        z-index: 0;
+      }
+
+      #loading h1 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: #c0caf5;
+      }
+
+      #loading p {
+        max-width: 34rem;
+        font-size: 0.9rem;
+      }
+
+      #loading code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.85em;
+        background: #24283b;
+        padding: 0.15em 0.4em;
+        border-radius: 0.25rem;
+      }
+    </style>
+  <link rel="modulepreload" href="/client/oxidezap-383fa0e71cc69b9e.js" crossorigin="anonymous"><link rel="preload" href="/client/oxidezap-383fa0e71cc69b9e_bg.wasm" crossorigin="anonymous" as="fetch" type="application/wasm"></head>
+  <body>
+    <div id="loading">
+      <h1>oxidezap</h1>
+      <p>Starting the window…</p>
+      <p>
+        Loading a few megabytes of WebAssembly. This page runs the whole
+        client — the session, the store and the window — in your browser,
+        under your account and nobody else's.
+      </p>
+      <p>
+        It can talk to <code>oxidezapd</code> on your own machine instead,
+        which is worth preferring: a desktop daemon holds calls, survives the
+        tab, and keeps your keys out of a browser's storage. Point this page
+        at one with <code>#daemon=ws://…</code> — after a <code>#</code>, so
+        the token in it stays in your browser instead of reaching whoever
+        served this page.
+      </p>
+    </div>
+  </body>
+</html>
