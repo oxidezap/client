@@ -44,11 +44,7 @@ pub fn run(runtime: tokio::runtime::Runtime, hub: Arc<StateHub>) -> Result<()> {
         // milliseconds is ages for a click and nothing for a thread that
         // does nothing else; the tray's state is applied from `pump`, not
         // from here.
-        let _ = CFRunLoop::get_current().run_in_mode(
-            kCFRunLoopDefaultMode,
-            Duration::from_millis(50),
-            false,
-        );
+        let _ = CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, Duration::from_millis(50), false);
         if let Some(tray) = tray.as_mut() {
             tray.pump(&hub);
         }
