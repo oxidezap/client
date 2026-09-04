@@ -898,19 +898,18 @@ impl WhatsAppClient {
             // camera that will not open is not a reason to refuse the call:
             // the answer is audio, which is exactly what a phone does when
             // its camera is busy.
+            //
+            // The failure is kept rather than said: the call may end while
+            // the camera is opening, and a notice for a call that never
+            // continued would be news about nothing. It is said where the
+            // call is confirmed live, below.
+            let mut video_err: Option<String> = None;
             let video = if with_video {
                 match video::open(video::slot(&call_id), publish, lost, picture_lost).await {
                     Ok(video) => Some(video),
                     Err(err) => {
                         warn!("Answering call {call_id} without video: {err}");
-                        // Said out loud rather than left in the log: the call
-                        // carries on as voice, so without this the person
-                        // hears a voice call with no account of where the
-                        // picture went.
-                        let _ = ui_sender.send(UiEvent::CallVideoUnavailable {
-                            call_id: call_id.clone(),
-                            reason: err,
-                        });
+                        video_err = Some(err);
                         None
                     }
                 }
@@ -997,6 +996,15 @@ impl WhatsAppClient {
                         return;
                     }
                     info!("Call {} media live", handle.call_id());
+                    // The call is confirmed continuing as voice: now the kept
+                    // failure may be said. Earlier would have toasted for a
+                    // call that ended while its camera opened.
+                    if let Some(reason) = video_err {
+                        let _ = ui_sender.send(UiEvent::CallVideoUnavailable {
+                            call_id: call_id.clone(),
+                            reason,
+                        });
+                    }
                     // What this call turned out to be. The state was built
                     // from the offer the moment the answer was given, and a
                     // camera that would not open answers a video offer as a
@@ -1163,6 +1171,14 @@ impl WhatsAppClient {
                     Ok(video) => video,
                     Err(err) => {
                         error!("Camera setup failed for call {call_id}: {err}");
+                        // Newest request wins: an intent parked behind this
+                        // open settles the UI, and a failure toast for the
+                        // request it replaced would be news about a question
+                        // nobody is asking any more.
+                        if lane.intent.lock().expect("video intent poisoned").seq != seq {
+                            Self::settle_video(&calls, &ui_sender, &call_id, seq, &lane).await;
+                            return;
+                        }
                         // Said out loud rather than left silent: the front end
                         // drew the camera as coming on the moment it was asked.
                         let _ = ui_sender.send(UiEvent::CallVideoUnavailable {
@@ -1490,6 +1506,12 @@ impl WhatsAppClient {
             // Opened under the placeholder id: the server has not named the
             // call yet, and the frames this produces are addressed to the
             // call the front end already drew.
+            //
+            // The failure is kept rather than said: the placement may be
+            // called off while the camera is opening, and a notice for a
+            // call that never went out would be news about nothing. It is
+            // said where the offer is confirmed out, below.
+            let mut video_err: Option<String> = None;
             let video = if is_video {
                 match video::open(video::slot(&placeholder_id), publish, lost, picture_lost).await {
                     Ok(video) => Some(video),
@@ -1498,14 +1520,7 @@ impl WhatsAppClient {
                             "Placing the call to {} without video: {err}",
                             observe_str(&recipient_jid)
                         );
-                        // Said out loud rather than left in the log: the offer
-                        // goes out as voice, so without this the person dials
-                        // a video call and gets a voice one with no account
-                        // of where the picture went.
-                        let _ = ui_sender.send(UiEvent::CallVideoUnavailable {
-                            call_id: placeholder_id.clone(),
-                            reason: err,
-                        });
+                        video_err = Some(err);
                         None
                     }
                 }
@@ -1581,6 +1596,15 @@ impl WhatsAppClient {
                         call_id,
                         observe_str(&recipient_jid)
                     );
+                    // The offer is confirmed out, under the server's id: now
+                    // the kept failure may be said. Earlier would have
+                    // toasted for a placement that was called off.
+                    if let Some(reason) = video_err {
+                        let _ = ui_sender.send(UiEvent::CallVideoUnavailable {
+                            call_id: call_id.clone(),
+                            reason,
+                        });
+                    }
                     if let Some(local) = local {
                         // A camera that died while the offer was going out
                         // reported its loss under the placeholder id, against

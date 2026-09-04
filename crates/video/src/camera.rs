@@ -150,13 +150,17 @@ impl Drop for CameraStream {
 /// to answer a video call learns *here* that there is no camera — rather than
 /// accepting one and then having nothing to send.
 pub fn open(quality: VideoQuality) -> Result<CameraStream> {
-    // First, so every failure below reads against the device list: the open
-    // names only the camera it took, and never what else was there — a
-    // virtual camera sitting at index 0 while the real one waits at 1, a
-    // privacy-blocked device, an empty backend. Enumerating is much cheaper
-    // than opening, and opens happen at call rate.
-    log::info!("cameras in reach: {}", inventory());
+    // After the authorization, not before: on macOS nothing else in the
+    // library may run until `nokhwa_initialize` has answered, so an
+    // inventory read first can report an empty backend over cameras that
+    // are right there.
     authorize()?;
+    // Read against the device list from here on: the open names only the
+    // camera it took, and never what else was there — a virtual camera
+    // sitting at index 0 while the real one waits at 1, a privacy-blocked
+    // device, an empty backend. Enumerating is much cheaper than opening,
+    // and opens happen at call rate.
+    log::info!("cameras in reach: {}", inventory());
 
     let (frames_tx, frames_rx) = async_channel::bounded(QUEUE_DEPTH);
     let control = CameraControl::default();

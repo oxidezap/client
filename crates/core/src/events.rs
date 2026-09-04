@@ -169,6 +169,11 @@ pub enum UiEvent {
     /// video was asked for: the answer path, the placement path, and the
     /// mid-call upgrade.
     ///
+    /// Said only once the call is confirmed continuing. The open races
+    /// cancellation on every path — a call hung up, called off, or
+    /// superseded while its camera opened — and a notice for a call that
+    /// never continued would be news about nothing.
+    ///
     /// Not [`CallMediaFailed`](Self::CallMediaFailed), which is followed by
     /// the call ending: this one is followed by the call carrying on.
     CallVideoUnavailable {
